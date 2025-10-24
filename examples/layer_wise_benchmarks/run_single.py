@@ -1,9 +1,9 @@
 import argparse
-import pathlib
 
 import numpy as np
 import nvtx
 import torch
+import yaml
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
@@ -11,12 +11,26 @@ from tensorrt_llm._utils import local_mpi_rank, mpi_rank, mpi_world_size
 from tensorrt_llm.tools.layer_wise_benchmarks.deepseekv3_runner import (
     BalanceMethod, DeepSeekV3Runner)
 
+
+def comma_separated_ints(s):
+    return [int(x) for x in s.split(",")]
+
+
+# Parse cmdline
 parser = argparse.ArgumentParser()
+parser.add_argument("config_path", type=str)
 parser.add_argument("--test-case",
                     type=str,
                     choices=["CTX", "GEN"],
                     default="GEN")
+parser.add_argument(
+    "--layer-indices",
+    type=comma_separated_ints,
+    default=[5],
+    help="Indices of layers to profile, should be a contiguous range.")
 args = parser.parse_args()
+with open(args.config_path) as f:
+    config = yaml.safe_load(f)[args.test_case]
 
 # MPI args
 rank = mpi_rank()
@@ -24,64 +38,43 @@ world_size = mpi_world_size()
 local_rank = local_mpi_rank()
 torch.cuda.set_device(local_rank)
 
-# Model definition
-model_dir = pathlib.Path(__file__).parent / "DeepSeek-R1-0528-FP4-v2"
-layer_indices = [5, 6]
-
-# KV cache related args
-if args.test_case == "CTX":
-    MAX_BATCH_SIZE = 1024
-    MAX_SEQ_LEN = 8192 + 1024 + 4
-    MAX_NUM_TOKENS = 40960
-    enable_attention_dp = True
-    moe_backend = "CUTLASS"
-elif args.test_case == "GEN":
-    MAX_BATCH_SIZE = 1024
-    MAX_SEQ_LEN = 8192 + 1024 + 4
-    MAX_NUM_TOKENS = 4 * MAX_BATCH_SIZE  # MTP3 as max
-    enable_attention_dp = True
-    moe_backend = "WIDEEP"
-else:
-    raise NotImplementedError(f"Not support test case \"{args.test_case}\"")
-
 # Create KV cache manager
+pretrained_model_name_or_path = config["pretrained_model_name_or_path"]
+max_batch_size = config["max_batch_size"]
+max_seq_len = config["max_seq_len"]
+enable_attention_dp = config["enable_attention_dp"]
 mapping = DeepSeekV3Runner.create_mapping(
     enable_attention_dp=enable_attention_dp)
 kv_cache_manager = DeepSeekV3Runner.create_kv_cache_manager(
-    model_dir,
+    pretrained_model_name_or_path,
     mapping,
-    max_batch_size=MAX_BATCH_SIZE,
-    max_seq_len=MAX_SEQ_LEN,
-    layer_indices=layer_indices)
+    max_batch_size=max_batch_size,
+    max_seq_len=max_seq_len,
+    layer_indices=args.layer_indices)
 attn_workspace = torch.empty((0, ), device="cuda", dtype=torch.int8)
 
 # Create other global objects
-use_cuda_graph = args.test_case == "GEN"
 AutoTuner.get().clear_cache()
 capture_stream = torch.cuda.Stream()
 
 # Create Runner
-runner = DeepSeekV3Runner(model_dir,
+max_num_tokens = config["max_num_tokens"]
+moe_backend = config["moe_backend"]
+use_cuda_graph = config["use_cuda_graph"]
+runner = DeepSeekV3Runner(pretrained_model_name_or_path,
                           mapping,
                           moe_backend=moe_backend,
-                          layer_indices=layer_indices,
-                          max_seq_len=MAX_SEQ_LEN,
-                          max_num_tokens=MAX_NUM_TOKENS,
+                          layer_indices=args.layer_indices,
+                          max_seq_len=max_seq_len,
+                          max_num_tokens=max_num_tokens,
                           use_cuda_graph=use_cuda_graph)
 
 # Warm up
-if args.test_case == "CTX":
-    batch_size = 3
-    seq_len_q = 8193
-    seq_len_kv_cache = 0
-elif args.test_case == "GEN":
-    batch_size = 128
-    seq_len_q = 1  # Set to (1 + MTP)
-    seq_len_kv_cache = 8193
-else:
-    raise NotImplementedError(f"Not support test case \"{args.test_case}\"")
-balance_method = BalanceMethod.Balanced
-balance_ratio = 1.
+batch_size = config["batch_size"]
+seq_len_q = config["seq_len_q"]
+seq_len_kv_cache = config["seq_len_kv_cache"]
+balance_method = BalanceMethod[config["balance_method"]]
+balance_ratio = config["balance_ratio"]
 run_pack = runner.create_run_pack(args.test_case,
                                   batch_size=batch_size,
                                   seq_len_q=seq_len_q,

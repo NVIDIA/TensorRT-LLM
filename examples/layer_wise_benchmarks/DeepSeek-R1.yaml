@@ -1,0 +1,36 @@
+common: &common
+  pretrained_model_name_or_path: ./DeepSeek-R1-0528-FP4-v2
+  enable_attention_dp: true
+  balance_method: Balanced
+  balance_ratio: null
+
+CTX:
+  <<: *common
+
+  # KV cache related args
+  max_batch_size: 1024
+  max_seq_len: 9220  # 8192 + 1024 + 4
+
+  # Model init args
+  max_num_tokens: 40960
+  moe_backend: "CUTLASS"
+  use_cuda_graph: false
+
+  # Per iteration args
+  batch_size: 3
+  seq_len_q: 8193
+  seq_len_kv_cache: 0
+
+GEN:
+  <<: *common
+
+  max_batch_size: 1024
+  max_seq_len: 9220  # 8192 + 1024 + 4
+
+  max_num_tokens: 4096  # MTP3 as max
+  moe_backend: "WIDEEP"
+  use_cuda_graph: true
+
+  batch_size: 128
+  seq_len_q: 1  # Set to (1 + MTP)
+  seq_len_kv_cache: 8193

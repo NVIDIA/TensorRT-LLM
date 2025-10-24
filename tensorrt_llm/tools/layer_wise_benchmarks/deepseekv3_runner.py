@@ -1,6 +1,5 @@
 import functools
 import os
-import pathlib
 import weakref
 from enum import IntEnum
 from typing import List, Optional
@@ -28,9 +27,10 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 
 class BalanceMethod(IntEnum):
-    Balanced = 1
-    ImbalancedRanks = 2
-    ImbalancedExperts = 3
+    NotModified = 1
+    Balanced = 2
+    ImbalancedRanks = 3
+    ImbalancedExperts = 4
 
 
 def ceil_div(a, b):
@@ -54,7 +54,9 @@ class RoutingMethod(DeepseekV3Gate):
         token_selected_experts, token_final_scales = super().apply(
             router_logits)
         num_experts = self.weight.shape[0]
-        if self.balance_method == BalanceMethod.Balanced:
+        if self.balance_method == BalanceMethod.NotModified:
+            pass
+        elif self.balance_method == BalanceMethod.Balanced:
             token_selected_experts = RoutingMethod.get_balanced_selection(
                 token_selected_experts.shape[0],
                 token_selected_experts.shape[1], num_experts,
@@ -109,7 +111,7 @@ class RoutingMethod(DeepseekV3Gate):
     @staticmethod
     def get_all_to_one_selection(num_tokens, top_k, num_experts, balance_ratio,
                                  dtype, world_size, rank):
-        assert num_experts // RoutingMethod.world_size >= top_k
+        assert num_experts // world_size >= top_k
         imbalanced_experts = torch.arange(
             num_tokens * top_k, dtype=dtype, device="cuda").view(
                 num_tokens, top_k) % (num_experts // world_size)
@@ -136,25 +138,22 @@ class RoutingMethod(DeepseekV3Gate):
 
 class DeepSeekV3Runner:
 
-    def __init__(self, model_dir: pathlib.PosixPath, mapping: Mapping, *,
+    def __init__(self, pretrained_model_name_or_path: str, mapping: Mapping, *,
                  moe_backend: str, layer_indices: List[int], max_seq_len: int,
                  max_num_tokens: int, use_cuda_graph: bool):
-
-        self.mapping = mapping
-        self.moe_backend = moe_backend
 
         # Temporally replace the gate class
         gate_cls_orig = tensorrt_llm._torch.models.modeling_deepseekv3.DeepseekV3Gate
         tensorrt_llm._torch.models.modeling_deepseekv3.DeepseekV3Gate = RoutingMethod
 
         self.model_config = ModelConfig.from_pretrained(
-            model_dir,
-            mapping=self.mapping,
+            pretrained_model_name_or_path,
+            mapping=mapping,
             enable_min_latency=False,
             use_cuda_graph=use_cuda_graph,
             force_dynamic_quantization=False,
             spec_config=None,
-            sparse_attention_config=None,  # To be loaded from model_dir
+            sparse_attention_config=None,  # To be loaded from config
             max_num_tokens=max_num_tokens,
             max_seq_len=max_seq_len,
             moe_max_num_tokens=None,
@@ -245,7 +244,7 @@ class DeepSeekV3Runner:
                         seq_len_kv_cache: int,
                         kv_cache_manager: Optional[KVCacheManager] = None,
                         attn_workspace: Optional[torch.Tensor] = None):
-        if self.moe_backend == "TRTLLM" and os.getenv(
+        if self.model_config.moe_backend == "TRTLLM" and os.getenv(
                 "TRTLLM_ENABLE_PDL") != "1":
             raise ValueError(
                 "Suggest to set TRTLLM_ENABLE_PDL=1 when moe_backend is TRTLLM")
@@ -272,7 +271,7 @@ class DeepSeekV3Runner:
                 num_cached_tokens_per_seq=[seq_len_kv_cache] * batch_size,
             ),
             workspace=attn_workspace,
-            mapping=self.mapping,
+            mapping=self.model_config.mapping,
             sparse_attention_config=self.model_config.sparse_attention_config,
         )
         attn_metadata.all_rank_num_tokens = [batch_size * seq_len_q
@@ -308,19 +307,22 @@ class DeepSeekV3Runner:
 
     def replace_routing_method(self, balance_method: BalanceMethod,
                                balance_ratio: float):
-        if self.moe_backend not in ["CUTLASS", "DEEPGEMM", "WIDEEP"]:
+        if self.model_config.moe_backend not in [
+                "CUTLASS", "DEEPGEMM", "TRTLLM", "WIDEEP"
+        ]:
             raise NotImplementedError(
-                f"Not support replace routing method for moe_backend \"{self.moe_backend}\""
-            )
+                f"Not support replace routing method for moe_backend \"{self.model_config.moe_backend}\","
+                f" please set balance_method to \"NotModified\"")
         for layer in self.layers:
             layer.mlp.gate.balance_method = balance_method
             layer.mlp.gate.balance_ratio = balance_ratio
 
     @staticmethod
-    def create_kv_cache_manager(model_dir, mapping, max_batch_size, max_seq_len,
-                                layer_indices):
+    def create_kv_cache_manager(pretrained_model_name_or_path, mapping,
+                                max_batch_size, max_seq_len, layer_indices):
         # Please refer to `tensorrt_llm/_torch/pyexecutor/py_executor_creator.py` for `tokens_per_block`
-        model_config = ModelConfig.from_pretrained(model_dir)
+        model_config = ModelConfig.from_pretrained(
+            pretrained_model_name_or_path)
         tokens_per_block = 32
         if model_config.enable_flash_mla:
             tokens_per_block = 64
