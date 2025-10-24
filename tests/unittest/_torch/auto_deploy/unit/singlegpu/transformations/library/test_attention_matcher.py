@@ -446,10 +446,10 @@ def _get_match_grouped_attention_optimizer() -> Callable:
         "cleanup_noop_slice": {
             "stage": "post_export",
         },
-        "match_grouped_attention_with_repeat_kv": {
+        "match_sdpa_to_torch_attention": {
             "stage": "pattern_matcher",
         },
-        "match_grouped_attention_without_repeat_kv": {
+        "match_grouped_attention": {
             "stage": "pattern_matcher",
         },
     }
