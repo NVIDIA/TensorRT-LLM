@@ -16,8 +16,7 @@ TEST_PORT = 18000
 HEARTBEAT_INTERVAL = 1
 INACTIVE_TIMEOUT = 2
 
-ROUTER_TYPES = ["round_robin",
-                "load_balancing"]  # kv_cache_aware doesn't support auto-scaling
+ROUTER_TYPES = ["round_robin", "load_balancing", "kv_cache_aware"]
 
 
 @pytest.fixture

@@ -159,6 +159,7 @@ class Router(ABC):
     @abstractmethod
     def _on_servers_updated(self, old_servers, new_servers):
         """Called when the server list changes. Override in subclasses to handle index resets.
+        Called with lock already held.
         Args:
             old_servers: The previous server list
             new_servers: The new server list
@@ -639,8 +640,11 @@ class KvCacheAwareRouter(Router):
                                                                 session=session)
 
     def _on_servers_updated(self, old_servers, new_servers):
-        raise NotImplementedError(
-            "KvCacheAwareRouter does not support server updates")
+        for new_server in new_servers:
+            self._server_state[new_server] = KvCacheAwareServerState(
+                new_server, self._use_tokens)
+        for old_server in old_servers:
+            self._server_state.pop(old_server, None)
 
 
 def create_router(router_config: Optional[RouterConfig],

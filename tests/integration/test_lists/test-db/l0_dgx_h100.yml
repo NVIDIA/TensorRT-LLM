@@ -99,8 +99,10 @@ l0_dgx_h100:
   - disaggregated/test_auto_scaling.py::test_disagg_server_restart[etcd-round_robin]
   - disaggregated/test_auto_scaling.py::test_service_discovery[http-round_robin]
   - disaggregated/test_auto_scaling.py::test_service_discovery[http-load_balancing]
+  - disaggregated/test_auto_scaling.py::test_service_discovery[http-kv_cache_aware]
   - disaggregated/test_auto_scaling.py::test_worker_restart[http-round_robin]
   - disaggregated/test_auto_scaling.py::test_worker_restart[http-load_balancing]
+  - disaggregated/test_auto_scaling.py::test_worker_restart[http-kv_cache_aware]
   - disaggregated/test_auto_scaling.py::test_minimal_instances[http-round_robin]
   - disaggregated/test_auto_scaling.py::test_disagg_server_restart[http-round_robin]
 - condition:
