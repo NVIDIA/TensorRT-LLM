@@ -997,7 +997,7 @@ LookupResult KVCachePromptLookupNode::findMatchingNodes(
     }
     auto itr = mNextNodes.find(blockKey);
     // TODO: Skipping nodes that have no blocks only works when looking up blocks.
-    // When looking up nodes and possibly creating new nodes, we must ingore whether node has blocks or not.
+    // When looking up nodes and possibly creating new nodes, we must ignore whether node has blocks or not.
     if (itr != mNextNodes.end() && (!ignoreNodesWithoutBlocks || itr->second->hasBlocks()))
     {
         // found exact match

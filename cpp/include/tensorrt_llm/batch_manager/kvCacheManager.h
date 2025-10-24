@@ -378,7 +378,7 @@ std::string streamPrint(C callable, Args... remainingArgs)
 // Each node in the search tree corresponds to a particular prefix.
 // Each node has a map from window size to KVCacheBlock, if reusable state exists for a given window size,
 // the map will have a pointer to the block containing it.
-// KVCacheBlocks have a pointer back to the node that is refering to them. This makes it easier to remove
+// KVCacheBlocks have a pointer back to the node that is referring to them. This makes it easier to remove
 // blocks from the search tree and also allows searches like getPrevBlock().
 //
 // Notes:
