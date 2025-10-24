@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from importlib.metadata import version
 from pathlib import Path
 from random import choices, shuffle
@@ -187,11 +188,33 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
     }
 
 
-def generate_warmup_dataset(requests, steps) -> List[InferenceRequest]:
-    """Warm up the benchmarker."""
-    warm_up_dataset = choices(requests, k=steps)
-    shuffle(warm_up_dataset)
-    return warm_up_dataset
+def generate_warmup_dataset(requests: List[InferenceRequest],
+                            steps: int,
+                            modality: bool = False) -> List[InferenceRequest]:
+    """Generate a warm-up dataset by randomly sampling requests.
+
+    Args:
+        requests: List of inference requests to sample from.
+        steps: Number of requests to sample for warm-up.
+        modality: Whether to process multimodal parameters.
+
+    Returns:
+        List of shuffled warm-up requests.
+    """
+    warmup_dataset = choices(requests, k=steps)
+
+    if modality:
+        processed_requests = []
+        for request in warmup_dataset:
+            request.prompt['multimodal_params'].to_tensor("multimodal_data")
+            new_request = deepcopy(request)
+            request.prompt['multimodal_params'].to_handle("multimodal_data")
+            new_request.prompt['multimodal_params'].to_handle("multimodal_data")
+            processed_requests.append(new_request)
+        warmup_dataset = processed_requests
+
+    shuffle(warmup_dataset)
+    return warmup_dataset
 
 
 def update_sampler_args_with_extra_options(sampler_args: Dict,
