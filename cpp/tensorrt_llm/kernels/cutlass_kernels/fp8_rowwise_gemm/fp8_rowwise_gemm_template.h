@@ -47,7 +47,6 @@
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 
 #include <algorithm>
-#include <unistd.h>
 #include <vector>
 
 namespace tensorrt_llm
@@ -725,7 +724,6 @@ std::vector<tkc::CutlassGemmConfig> CutlassFp8RowwiseGemmRunner<T>::getConfigs()
     using tkc::SplitKStyle;
 
     std::vector<CutlassGemmConfig> candidateConfigs;
-
     if (mSm == 90)
     {
         tkc::CutlassGemmConfig::CandidateConfigTypeParam config_type_param
