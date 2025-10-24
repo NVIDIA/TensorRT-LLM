@@ -34,6 +34,9 @@ extend_skip_glob = [
     "tests/unittest/_torch/modeling/test_modeling_mistral.py",
     "tests/unittest/_torch/modeling/test_modeling_pixtral.py",
     "tests/unittest/_torch/models/checkpoints/hf/test_weight_loader.py",
+    "tests/unittest/_torch/sampler/test_torch_sampler.py",
+    "tensorrt_llm/_torch/pyexecutor/sampler.py",
+    "tensorrt_llm/_torch/pyexecutor/sampling_utils.py",
 ]
 
 [tool.yapf]
@@ -65,6 +68,9 @@ ignore_patterns = [
     "tests/unittest/_torch/modeling/test_modeling_mistral.py",
     "tests/unittest/_torch/modeling/test_modeling_pixtral.py",
     "tests/unittest/_torch/models/checkpoints/hf/test_weight_loader.py",
+    "tests/unittest/_torch/sampler/test_torch_sampler.py",
+    "tensorrt_llm/_torch/pyexecutor/sampler.py",
+    "tensorrt_llm/_torch/pyexecutor/sampling_utils.py",
 ]
 
 [tool.codespell]
@@ -100,6 +106,8 @@ exclude = [
     "tests/unittest/_torch/modeling/test_modeling_mistral.py",
     "tests/unittest/_torch/modeling/test_modeling_pixtral.py",
     "tests/unittest/_torch/models/checkpoints/hf/test_weight_loader.py",
+    "tensorrt_llm/_torch/pyexecutor/sampler.py",
+    "tensorrt_llm/_torch/pyexecutor/sampling_utils.py",
 ]
 
 
@@ -144,6 +152,9 @@ include = [
     "tests/unittest/_torch/modeling/test_modeling_mistral.py",
     "tests/unittest/_torch/modeling/test_modeling_pixtral.py",
     "tests/unittest/_torch/models/checkpoints/hf/test_weight_loader.py",
+    "tests/unittest/_torch/sampler/test_torch_sampler.py",
+    "tensorrt_llm/_torch/pyexecutor/sampler.py",
+    "tensorrt_llm/_torch/pyexecutor/sampling_utils.py",
 ]
 exclude = [
     "**3rdparty/**",

@@ -19,8 +19,9 @@ l0_a30:
   - unittest/_torch/modeling -k "modeling_qwen"
   - unittest/_torch/modeling -k "modeling_qwen_moe"
   - unittest/_torch/modeling -k "modeling_out_of_tree"
-  - unittest/_torch/auto_deploy/unit/singlegpu -k "not test_trtllm_bench_backend_comparison"
+  - unittest/_torch/auto_deploy/unit/singlegpu
   - unittest/_torch/sampler/test_beam_search.py
+  - unittest/_torch/sampler/test_return_logits.py
   - test_e2e.py::test_openai_completions_with_logit_bias[torch_sampler]
   - test_e2e.py::test_openai_chat_with_logit_bias[torch_sampler]
   - test_e2e.py::test_openai_completions_with_logit_bias[trtllm_sampler]
@@ -156,7 +157,6 @@ l0_a30:
   - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-bart-large-cnn-bfloat16-enable_gemm_plugin-enable_attention_plugin-disable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8] # 1 mins
   - accuracy/test_cli_flow.py::TestLlama7B::test_manage_weights # 2 mins
   - accuracy/test_llm_api.py::TestQwen2_7BInstruct::test_weight_only
-  - examples/test_llama.py::test_llm_llama_v2_1gpu_auto_parallel[llama-v2-7b-hf] # 15 mins
   - accuracy/test_cli_flow.py::TestMistral7B::test_beam_search # 5 mins
   - examples/test_mistral.py::test_llm_mistral_v1_1gpu[mistral-7b-v0.1-float16-max_attention_window_size_4096-summarization_long]
   - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-t5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:2-disable_fp8]

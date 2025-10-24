@@ -143,6 +143,7 @@ def remove_weights(
     for mod in iter_modules(module, ignore_modules):
         mod._parameters.clear()
         mod._buffers.clear()
+        mod._weights_removed = True
 
 
 def skip_forward(
@@ -379,6 +380,8 @@ class DecoderModelForCausalLM(nn.Module,
                 mapping=config.mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 gather_output=True,
+                use_custom_cublas_mm=getattr(model, 'use_custom_cublas_mm',
+                                             False),
             )
 
             if self.has_custom_lm_head:
@@ -955,6 +958,9 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                         module, module_name, module_weights)
 
                 elif hasattr(module, 'load_weights'):
+                    if "linear_attn.conv1d" in name:
+                        module_weights['weight'] = module_weights[
+                            'weight'].squeeze(dim=1)
                     module.load_weights(weights=[module_weights])
                 else:
                     for n, p in module._parameters.items():
@@ -963,7 +969,7 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                                 module_name, module_weights, n, p)
 
     if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
-                      False) in ["True", "true", "1", "yes", "y"]:
+                      "True") in ["True", "true", "1", "yes", "y"]:
         for name, module in tqdm(list(model.named_modules()),
                                  desc="Loading weights"):
             load_single_module(name, module)

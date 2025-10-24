@@ -481,7 +481,7 @@ def quantize(hf_model_dir: str,
     hf_model = AutoModelForCausalLM.from_pretrained(
         hf_model_dir,
         device_map='auto' if device != 'cpu' else 'cpu',
-        torch_dtype='auto'
+        dtype='auto'
         if not config.quantization._use_plugin_sq else torch.float16,
         trust_remote_code=trust_remote_code)
     tokenizer = AutoTokenizer.from_pretrained(

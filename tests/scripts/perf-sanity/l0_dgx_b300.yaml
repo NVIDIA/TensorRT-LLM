@@ -1,0 +1,58 @@
+server_configs:
+  - name: "r1_fp4_dep4"
+    model_name: "deepseek_r1_0528_fp4"
+    tp: 4
+    ep: 4
+    pp: 1
+    attention_backend: "TRTLLM"
+    moe_backend: "CUTLASS"
+    moe_max_num_tokens: ""
+    enable_attention_dp: true
+    enable_chunked_prefill: false
+    max_num_tokens: 2176
+    kv_cache_dtype: "fp8"
+    free_gpu_memory_fraction: 0.8
+    max_batch_size: 256
+    enable_padding: true
+    client_configs:
+      - name: "con1_iter1_1024_1024"
+        concurrency: 1
+        iterations: 1
+        isl: 1024
+        osl: 1024
+        random_range_ratio: 0.0
+      - name: "con8_iter1_1024_1024"
+        concurrency: 8
+        iterations: 1
+        isl: 1024
+        osl: 1024
+        random_range_ratio: 0.0
+
+  - name: "r1_fp4_tep4"
+    model_name: "deepseek_r1_0528_fp4"
+    tp: 4
+    ep: 4
+    pp: 1
+    attention_backend: "TRTLLM"
+    moe_backend: "CUTLASS"
+    moe_max_num_tokens: ""
+    enable_attention_dp: false
+    enable_chunked_prefill: false
+    max_num_tokens: 2176
+    kv_cache_dtype: "fp8"
+    free_gpu_memory_fraction: 0.8
+    max_batch_size: 256
+    enable_padding: true
+    client_configs:
+      - name: "con1_iter1_1024_1024"
+        concurrency: 1
+        iterations: 1
+        isl: 1024
+        osl: 1024
+        random_range_ratio: 0.0
+      - name: "con8_iter1_1024_1024"
+        concurrency: 8
+        iterations: 1
+        isl: 1024
+        osl: 1024
+        random_range_ratio: 0.0

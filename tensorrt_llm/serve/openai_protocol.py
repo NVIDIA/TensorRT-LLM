@@ -6,6 +6,7 @@ import uuid
 from typing import Any, Dict, List, Literal, Optional, Union
 
 import torch
+import xgrammar
 from openai.types.chat import ChatCompletionAssistantMessageParam
 from openai.types.chat import \
     ChatCompletionContentPartParam as OpenAIChatCompletionContentPartParam
@@ -67,10 +68,15 @@ class StreamOptions(OpenAIBaseModel):
     continuous_usage_stats: Optional[bool] = True
 
 
+class PromptTokensDetails(OpenAIBaseModel):
+    cached_tokens: int = 0
+
+
 class UsageInfo(OpenAIBaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
     completion_tokens: Optional[int] = 0
+    prompt_tokens_details: Optional[PromptTokensDetails] = None
 
 
 class ModelCard(OpenAIBaseModel):
@@ -85,18 +91,14 @@ class ModelList(OpenAIBaseModel):
     data: List[ModelCard] = Field(default_factory=list)
 
 
-class StructuralTag(OpenAIBaseModel):
-    begin: str
-    schema_: Optional[dict[str, Any]] = Field(alias="schema")
-    end: str
-
-
 class ResponseFormat(OpenAIBaseModel):
     # type must be one of "text", "json", "json_object", or "structural_tag"
-    type: Literal["text", "json", "json_object", "structural_tag"]
+    type: Literal["text", "json", "json_object", "regex", "ebnf",
+                  "structural_tag"]
     schema: Optional[dict] = None
-    structures: Optional[List[StructuralTag]] = None
-    triggers: Optional[List[str]] = None
+    regex: Optional[str] = None
+    ebnf: Optional[str] = None
+    format: Optional[xgrammar.structural_tag.Format] = None
 
 
 class DisaggregatedParams(OpenAIBaseModel):
@@ -193,6 +195,10 @@ def _response_format_to_guided_decoding_params(
         return GuidedDecodingParams(json=response_format.schema)
     elif response_format.type == "json_object":
         return GuidedDecodingParams(json_object=True)
+    elif response_format.type == "regex":
+        return GuidedDecodingParams(regex=response_format.regex)
+    elif response_format.type == "ebnf":
+        return GuidedDecodingParams(grammar=response_format.ebnf)
     elif response_format.type == "structural_tag":
         return GuidedDecodingParams(
             structural_tag=response_format.model_dump_json(by_alias=True,
@@ -219,8 +225,8 @@ class CompletionRequest(OpenAIBaseModel):
     stream: Optional[bool] = False
     stream_options: Optional[StreamOptions] = None
     suffix: Optional[str] = None
-    temperature: Optional[float] = 1.0
-    top_p: Optional[float] = 1.0
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
     user: Optional[str] = None
     lora_request: Optional[LoRARequest] = None
 
@@ -253,9 +259,9 @@ class CompletionRequest(OpenAIBaseModel):
     response_format: Optional[ResponseFormat] = Field(
         default=None,
         description=
-        ("Similar to chat completion, this parameter specifies the format of "
-         "output. {'type': 'json_object'}, {'type': 'text' }, {'type': 'structural_tag'}, {'type': 'json'} are "
-         "supported."),
+        ("Similar to chat completion, this parameter specifies the format of output. "
+         "{'type': 'text'}, {'type': 'json'}, {'type': 'json_object'}, {'type': 'regex'}, "
+         "{'type': 'ebnf'}, {'type': 'structural_tag'} are supported."),
     )
 
     disaggregated_params: Optional[DisaggregatedParams] = Field(
@@ -274,8 +280,9 @@ class CompletionRequest(OpenAIBaseModel):
             presence_penalty=self.presence_penalty,
             seed=self.seed,
             stop=self.stop,
-            temperature=self.temperature,
-            top_p=self.top_p,
+            temperature=(self.temperature
+                         if self.temperature is not None else 1.0),
+            top_p=(self.top_p if self.top_p is not None else 1.0),
 
             # completion-sampling-params
             use_beam_search=self.use_beam_search,
@@ -509,8 +516,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
     stop: Optional[Union[str, List[str]]] = Field(default_factory=list)
     stream: Optional[bool] = False
     stream_options: Optional[StreamOptions] = None
-    temperature: Optional[float] = 1.0
-    top_p: Optional[float] = 1.0
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
     tools: Optional[List[ChatCompletionToolsParam]] = None
     tool_choice: Optional[Union[Literal["none", "auto"],
                                 ChatCompletionNamedToolChoiceParam]] = "none"
@@ -613,13 +620,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
             presence_penalty=self.presence_penalty,
             seed=self.seed,
             stop=self.stop,
-            temperature=self.temperature,
+            temperature=(self.temperature
+                         if self.temperature is not None else 1.0),
 
             # chat-completion-sampling-params
             best_of=self.best_of,
             use_beam_search=self.use_beam_search,
             top_k=self.top_k,
-            top_p=self.top_p,
+            top_p=(self.top_p if self.top_p is not None else 1.0),
             top_p_min=self.top_p_min if self.top_p_min > 0 else None,
             min_p=self.min_p,
             repetition_penalty=self.repetition_penalty,

@@ -11,11 +11,11 @@ from typing import Any, Callable, List, NamedTuple, Optional
 from strenum import StrEnum
 
 from tensorrt_llm._utils import mpi_rank
-from tensorrt_llm.llmapi.utils import enable_llm_debug, print_colored_debug
+from tensorrt_llm.llmapi.utils import enable_llm_debug, logger_debug
 
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient)
-from ..llmapi.utils import print_colored_debug
+from ..llmapi.utils import logger_debug
 from ..logger import logger
 
 
@@ -52,14 +52,14 @@ def create_mpi_comm_session(
     if get_spawn_proxy_process_env():
         assert get_spawn_proxy_process_ipc_addr_env(
         ), f"{LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR} is not set."
-        print_colored_debug(
+        logger_debug(
             f"Using RemoteMpiPoolSessionClient to bind to external MPI processes at {get_spawn_proxy_process_ipc_addr_env()}\n",
             "yellow")
         get_spawn_proxy_process_ipc_hmac_key_env()
         return RemoteMpiCommSessionClient(
             addr=get_spawn_proxy_process_ipc_addr_env())
     else:
-        print_colored_debug(
+        logger_debug(
             f"Using MpiCommSession to bind to external MPI processes\n",
             "yellow")
         return MpiCommSession(n_workers=n_workers)
@@ -147,7 +147,12 @@ class WorkerCommIpcAddrs(NamedTuple):
 
 
 def is_llm_response(instance):
-    return hasattr(instance, "result")
+    # Duck typing, expect one of:
+    #  tensorrt_llm.bindings.executor.Response
+    #  tensorrt_llm._torch.pyexecutor.llm_request.LlmResponse
+    # Avoid testing for "result", because an error bindings.executor.Response
+    # throws when accessing its result property.
+    return hasattr(instance, "has_error")
 
 
 def print_alive_threads():

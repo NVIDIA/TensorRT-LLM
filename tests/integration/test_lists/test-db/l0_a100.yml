@@ -14,8 +14,13 @@ l0_a100:
       backend: "pytorch"
   tests:
     - unittest/llmapi/test_llm_pytorch.py
-    - unittest/llmapi/test_mpi_session.py # generic tests
+    - unittest/llmapi/test_mpi_session.py ISOLATION
+    - unittest/llmapi/test_memory_profiling.py # profile kvcache for vision encoder
     - unittest/trt/model_api/test_model_quantization.py
+    # executor
+    - unittest/executor/test_base_worker.py
+    - unittest/executor/test_rpc_proxy.py
+    - unittest/executor/test_rpc_worker.py
 - condition:
     ranges:
       system_gpu_count:

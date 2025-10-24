@@ -42,6 +42,16 @@ class InputProcessor(Protocol):
         ...
 
 
+class BaseDummyInputsBuilder:
+    """
+    Base class for generating dummy inputs. Specially for profiling
+    """
+
+    def get_dummy_prompt(self, input_seq_len: int):
+        raise NotImplementedError(
+            "Please ensure this method is implemented in your inherited class")
+
+
 class BaseMultimodalInputProcessor:
     """
     Base class for multimodal input processors with default implementations
@@ -78,7 +88,7 @@ class BaseMultimodalInputProcessor:
                                                   None) is not None:
             return int(self.tokenizer.vocab_size)
 
-        logger.warning(
+        logger.debug(
             f"Cannot determine vocab_size from {self.__class__.__name__}. "
             "Please override this method to provide the vocabulary size. ")
         return None
@@ -93,7 +103,7 @@ class BaseMultimodalInputProcessor:
                                              None) is not None:
             return processor.mm_token_ids
 
-        logger.warning(
+        logger.debug(
             f"Cannot determine mm_token_ids from {self.__class__.__name__}. "
             "If needed, please override this method to return multimodal token ids. "
         )
@@ -379,6 +389,36 @@ class InputProcessorRegistry:
 INPUT_PROCESSOR_REGISTRY = InputProcessorRegistry()
 
 
+def support_multimodal_disaggregated(model_cls: Type[nn.Module]):
+    """
+    Model-class decorator to declare support for multimodal disaggregated inputs.
+
+    Apply this to a model class AFTER its input processor has been registered via
+    @register_input_processor. The decorator will locate the processor class,
+    validate requirements, and set `supports_multimodal_disagg = True` on both
+    the processor class and the model class.
+    """
+    processor_cls = INPUT_PROCESSOR_REGISTRY._input_processors_cls_by_model_type.get(
+        model_cls)
+    if processor_cls is None:
+        raise RuntimeError(
+            f"No input processor registered for {model_cls.__name__}; ensure @register_input_processor is applied closer to the class than @supports_multimodal_disagg."
+        )
+    if not issubclass(processor_cls, BaseMultimodalInputProcessor):
+        raise TypeError(
+            f"{processor_cls.__name__} must inherit from BaseMultimodalInputProcessor to support multimodal disagg"
+        )
+    method = getattr(processor_cls, "get_prompt_token_ids", None)
+    if method is None or not callable(method):
+        raise TypeError(
+            f"{processor_cls.__name__} must implement a callable method `get_prompt_token_ids` to support multimodal disagg"
+        )
+
+    setattr(processor_cls, "support_mm_disagg", True)
+    setattr(model_cls, "support_mm_disagg", True)
+    return model_cls
+
+
 def register_input_processor(
         processor_cls: Type[InputProcessor],
         model_type: str,
@@ -408,20 +448,40 @@ def register_input_processor(
     return wrapper
 
 
-def create_input_processor(model_path_or_dir: str, tokenizer):
-    """
-    Create an input processor for a specific model.
+def create_input_processor(
+    model_path_or_dir: str,
+    tokenizer,
+    checkpoint_format: Optional[str] = "HF",
+) -> InputProcessor:
+    """Create an input processor for a specific model.
+
+    Args:
+        model_path_or_dir: Path or repo id used to locate pretrained config/tokenizer.
+        tokenizer: Tokenizer instance.
+        checkpoint_format: Checkpoint format identifier. "HF" uses Hugging Face-style
+            config loading; any other value skips HF config loading. Default is "HF".
+
+    Returns:
+        An InputProcessor implementation (model-specific if registered; otherwise DefaultInputProcessor).
     """
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.models import get_model_architecture
 
     model_config = None
-    try:
-        config = ModelConfig.from_pretrained(model_path_or_dir,
-                                             trust_remote_code=True)
-        model_config = config.pretrained_config
-    except (ValueError, EnvironmentError):
-        config = None
+
+    if checkpoint_format == "HF":
+        try:
+            config = ModelConfig.from_pretrained(model_path_or_dir,
+                                                 trust_remote_code=True)
+            model_config = config.pretrained_config
+        except (ValueError, EnvironmentError) as e:
+            config = None
+            logger.debug(
+                f"Unable to load HF config from {model_path_or_dir}: {e}. Falling back."
+            )
+    else:
+        logger.debug(
+            f"checkpoint_format={checkpoint_format}; skipping HF config load.")
 
     if model_config is not None:
         try:
@@ -463,45 +523,47 @@ def create_input_processor_with_hash(
         """
         assert 'multi_modal_data' in inputs, "multi_modal_data must be provided for hashing support."
         mm_data = inputs['multi_modal_data']
+        mm_hashes = apply_mm_hashes(mm_data, hash_lib)
+        prompt_token_ids, extra_processed_inputs = input_processor(
+            inputs, sampling_params)
+
         num_mm_tokens = find_mm_token_lengths(mm_data, input_processor)
         # TODO: here we assume there is only one modality for now
         num_mm_tokens = next(iter(num_mm_tokens.values()))
-        if len(num_mm_tokens) > 0:
-            mm_hashes = apply_mm_hashes(mm_data, hash_lib)
-            prompt_token_ids, extra_processed_inputs = input_processor(
-                inputs, sampling_params)
-            vocab_size = input_processor.get_vocab_size()
-            mm_ids = input_processor.get_mm_token_ids()
-            mm_special_token_ids = input_processor.get_mm_special_token_ids()
-            if vocab_size is None and mm_ids is None:
-                raise ValueError(
-                    "Cannot locate vocab_size or mm_token_ids for multimodal token preprocessing"
-                )
-            start_positions, start_special_token_positions = find_mm_token_positions(
-                input_ids=prompt_token_ids,  # token sequence
-                num_mm_tokens=
-                num_mm_tokens,  # list of lengths of each chunk of visual tokens
-                vocab_size=vocab_size,
-                mm_token_ids=mm_ids,
-                mm_special_token_ids=mm_special_token_ids,
-            )
-            # Store special token offsets if available
-            if len(start_special_token_positions
-                   ) > 0 and mm_special_token_ids is not None:
-                extra_processed_inputs["multimodal_data"][
-                    "special_token_offsets"] = start_special_token_positions
-            # flatten the hashes from dict to a single list
-            mm_hashes = [h for hashes in mm_hashes.values() for h in hashes]
-            validate_mm_inputs(prompt_token_ids, mm_hashes, start_positions,
-                               num_mm_tokens)
-            mm_hashes_int32 = [hexdigest_to_int32(h) for h in mm_hashes
-                               ]  # nested list w/ multiple int32 per hash
+        if len(num_mm_tokens) <= 0:
+            return [], None
 
-            extra_processed_inputs[
-                "multimodal_input"] = MultimodalInput.from_components(
-                    mm_hashes_int32, start_positions, num_mm_tokens)
-            return prompt_token_ids, extra_processed_inputs
-        return [], None
+        vocab_size = input_processor.get_vocab_size()
+        mm_ids = input_processor.get_mm_token_ids()
+        mm_special_token_ids = input_processor.get_mm_special_token_ids()
+        if vocab_size is None and mm_ids is None:
+            raise ValueError(
+                "Cannot locate vocab_size or mm_token_ids for multimodal token preprocessing"
+            )
+        start_positions, start_special_token_positions = find_mm_token_positions(
+            input_ids=prompt_token_ids,  # token sequence
+            num_mm_tokens=
+            num_mm_tokens,  # list of lengths of each chunk of visual tokens
+            vocab_size=vocab_size,
+            mm_token_ids=mm_ids,
+            mm_special_token_ids=mm_special_token_ids,
+        )
+        # Store special token offsets if available
+        if len(start_special_token_positions
+               ) > 0 and mm_special_token_ids is not None:
+            extra_processed_inputs["multimodal_data"][
+                "special_token_offsets"] = start_special_token_positions
+        # flatten the hashes from dict to a single list
+        mm_hashes = [h for hashes in mm_hashes.values() for h in hashes]
+        validate_mm_inputs(prompt_token_ids, mm_hashes, start_positions,
+                           num_mm_tokens)
+        mm_hashes_int32 = [hexdigest_to_int32(h) for h in mm_hashes
+                           ]  # nested list w/ multiple int32 per hash
+
+        extra_processed_inputs[
+            "multimodal_input"] = MultimodalInput.from_components(
+                mm_hashes_int32, start_positions, num_mm_tokens)
+        return prompt_token_ids, extra_processed_inputs
 
     def input_processor_wrapper(
         inputs: TextPrompt, sampling_params: SamplingParams

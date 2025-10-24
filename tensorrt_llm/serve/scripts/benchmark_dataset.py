@@ -686,7 +686,7 @@ class RandomImageDataset(BenchmarkDataset):
 
 class CustomDataset(BenchmarkDataset):
     """
-    TensorRT-LLM customized dataset implementation.
+    TensorRT LLM customized dataset implementation.
     It assumes the dataset to be consist of several lines of json, each line is a minimal OpenAI API format request.
     Example format of each sample on each line:
     {
@@ -1119,8 +1119,6 @@ class VisionArenaDataset(HuggingFaceDataset):
         enable_multimodal_chat: bool = False,
         **kwargs,
     ) -> list:
-        if enable_multimodal_chat:
-            raise NotImplementedError
 
         output_len = (output_len
                       if output_len is not None else self.DEFAULT_OUTPUT_LEN)
@@ -1130,7 +1128,6 @@ class VisionArenaDataset(HuggingFaceDataset):
         parser_fn = self.SUPPORTED_DATASET_PATHS.get(self.dataset_path)
         if parser_fn is None:
             raise ValueError(f"Unsupported dataset path: {self.dataset_path}")
-
         sampled_requests = []
         for item in self.data:
             if len(prompts) >= num_requests:

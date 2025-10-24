@@ -135,25 +135,17 @@ def test_llm_return_logprobs_tp2(prompt_logprobs: Optional[int],
                                      tp_size=2)
 
 
-@pytest.mark.parametrize("use_auto_parallel", [True, False],
-                         ids=["enable_auto_parallel", "disable_auto_parallel"])
 @pytest.mark.parametrize("from_ckpt", [True, False],
                          ids=["from_ckpt", "from_hf"])
 @pytest.mark.gpu2
 @pytest.mark.part0
 def test_llm_generate_async_tp2(
-        engine_from_checkpoint: tempfile.TemporaryDirectory, from_ckpt: bool,
-        use_auto_parallel: bool):
-    if use_auto_parallel and from_ckpt:
-        pytest.skip("Skip auto parallel for TP2 checkpoint")
+        engine_from_checkpoint: tempfile.TemporaryDirectory, from_ckpt: bool):
     model_dir = engine_from_checkpoint.name if from_ckpt else get_model_path(
         llama_model_path)
     tokenizer_dir = get_model_path(llama_model_path)
     tokenizer = TransformersTokenizer.from_pretrained(tokenizer_dir)
-    _test_llm_generate_async(model_dir,
-                             tp_size=2,
-                             use_auto_parallel=use_auto_parallel,
-                             tokenizer=tokenizer)
+    _test_llm_generate_async(model_dir, tp_size=2, tokenizer=tokenizer)
 
 
 @skip_gpu_memory_less_than(70 * 1024**3)
@@ -201,7 +193,6 @@ def test_llm_pp2():
                      prompts, ["D E F G H I J K"],
                      sampling_params=SamplingParams(max_tokens=8),
                      pipeline_parallel_size=2,
-                     auto_parallel=False,
                      kv_cache_config=global_kv_cache_config)
 
 
@@ -273,6 +264,8 @@ def test_llama_7b_multi_lora_tp2():
         LLM,
         enable_lora=True,
         build_config=BuildConfig(lora_config=lora_config),
+        lora_config=lora_config,
+        tensor_parallel_size=2,
         fast_build=True,
         kv_cache_config=global_kv_cache_config)
 

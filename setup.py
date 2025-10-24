@@ -50,8 +50,7 @@ def parse_requirements(filename: os.PathLike):
 
 def sanity_check():
     tensorrt_llm_path = Path(__file__).resolve().parent / "tensorrt_llm"
-    if not ((tensorrt_llm_path / "bindings").exists() or
-            (tensorrt_llm_path / "bindings.pyi").exists()):
+    if not (tensorrt_llm_path / "bindings").exists():
         raise ImportError(
             'The `bindings` module does not exist. Please check the package integrity. '
             'If you are attempting to use the pip development mode (editable installation), '
@@ -73,6 +72,17 @@ def get_version():
         raise RuntimeError(f"Could not set version from {version_file}")
 
     return version
+
+
+def get_license():
+    import sysconfig
+    platform_tag = sysconfig.get_platform()
+    if "x86_64" in platform_tag:
+        return ["LICENSE", "ATTRIBUTIONS-CPP-x86_64.md"]
+    elif "arm64" in platform_tag or "aarch64" in platform_tag:
+        return ["LICENSE", "ATTRIBUTIONS-CPP-aarch64.md"]
+    else:
+        raise RuntimeError(f"Unrecognized CPU architecture: {platform_tag}")
 
 
 class BinaryDistribution(Distribution):
@@ -103,12 +113,14 @@ else:
         'bin/executorWorker', 'libs/libtensorrt_llm.so', 'libs/libth_common.so',
         'libs/libnvinfer_plugin_tensorrt_llm.so',
         'libs/libtensorrt_llm_ucx_wrapper.so', 'libs/libdecoder_attention_0.so',
-        'libs/libtensorrt_llm_nixl_wrapper.so',
+        'libs/libtensorrt_llm_nixl_wrapper.so', 'libs/nixl/**/*',
+        'libs/ucx/**/*', 'libs/libpg_utils.so',
         'libs/libdecoder_attention_1.so', 'libs/nvshmem/License.txt',
         'libs/nvshmem/nvshmem_bootstrap_uid.so.3',
         'libs/nvshmem/nvshmem_transport_ibgda.so.103', 'bindings.*.so',
         'deep_ep/LICENSE', 'deep_ep_cpp_tllm.*.so', "include/**/*",
-        'deep_gemm/LICENSE', 'deep_gemm/include/**/*', 'deep_gemm_cpp_tllm.*.so'
+        'deep_gemm/LICENSE', 'deep_gemm/include/**/*',
+        'deep_gemm_cpp_tllm.*.so', 'scripts/install_tensorrt.sh'
     ]
 
 package_data += [
@@ -118,6 +130,8 @@ package_data += [
     'bench/build/benchmark_config.yml',
     'evaluate/lm_eval_tasks/**/*',
     "_torch/auto_deploy/config/*.yaml",
+    # Include CUDA source for fused MoE align extension so runtime JIT can find it in wheels
+    '_torch/auto_deploy/custom_ops/fused_moe/moe_align_kernel.cu',
 ]
 
 
@@ -242,6 +256,7 @@ setup(
     package_data={
         'tensorrt_llm': package_data,
     },
+    license_files=get_license(),
     entry_points={
         'console_scripts': [
             'trtllm-build=tensorrt_llm.commands.build:main',
@@ -260,4 +275,4 @@ setup(
     install_requires=required_deps,
     dependency_links=
     extra_URLs,  # Warning: Dependency links support has been dropped by pip 19.0
-    python_requires=">=3.7, <4")
+    python_requires=">=3.10, <4")

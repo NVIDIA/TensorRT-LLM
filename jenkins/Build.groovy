@@ -16,8 +16,8 @@ AARCH64_TRIPLE = "aarch64-linux-gnu"
 
 LLM_DOCKER_IMAGE = env.dockerImage
 
-LLM_DOCKER_IMAGE_12_9 = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.06-py3-x86_64-ubuntu24.04-trt10.11.0.33-skip-tritondevel-202508051130-6090"
-LLM_SBSA_DOCKER_IMAGE_12_9 = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.06-py3-aarch64-ubuntu24.04-trt10.11.0.33-skip-tritondevel-202508051130-6090"
+LLM_DOCKER_IMAGE_12_9 = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.06-py3-x86_64-ubuntu24.04-trt10.11.0.33-skip-tritondevel-202509091430-7383"
+LLM_SBSA_DOCKER_IMAGE_12_9 = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.06-py3-aarch64-ubuntu24.04-trt10.11.0.33-skip-tritondevel-202509091430-7383"
 
 // Always use x86_64 image for agent
 AGENT_IMAGE = env.dockerImage.replace("aarch64", "x86_64")
@@ -97,22 +97,25 @@ def BUILD_CONFIGS = [
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl",
     (TARNAME) : "TensorRT-LLM-GH200.tar.gz",
     (WHEEL_ARCHS): "90-real;100-real;103-real;120-real",
+    (BUILD_JOBS_FOR_CONFIG): "4", // TODO: Remove after fix the build OOM issue on SBSA
   ],
   (CONFIG_LINUX_AARCH64_CU12): [
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars WARNING_IS_ERROR=ON",
     (TARNAME) : "TensorRT-LLM-GH200-CU12.tar.gz",
     (WHEEL_ARCHS): "90-real;100-real;103-real;120-real",
+    (BUILD_JOBS_FOR_CONFIG): "4", // TODO: Remove after fix the build OOM issue on SBSA
   ],
   (CONFIG_LINUX_AARCH64_PYBIND): [
     (WHEEL_EXTRA_ARGS) : "--binding_type pybind --extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl",
     (TARNAME) : "pybind-TensorRT-LLM-GH200.tar.gz",
     (WHEEL_ARCHS): "90-real;100-real;103-real;120-real",
+    (BUILD_JOBS_FOR_CONFIG): "4", // TODO: Remove after fix the build OOM issue on SBSA
   ],
   (CONFIG_LINUX_AARCH64_LLVM) : [
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars WARNING_IS_ERROR=ON -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_CUDA_HOST_COMPILER=clang -DCMAKE_LINKER_TYPE=LLD",
     (TARNAME) : "llvm-TensorRT-LLM-GH200.tar.gz",
     (WHEEL_ARCHS): "90-real;100-real;103-real;120-real",
-    (BUILD_JOBS_FOR_CONFIG): "6", // TODO: Remove after fix the build OOM issue on SBSA
+    (BUILD_JOBS_FOR_CONFIG): "4", // TODO: Remove after fix the build OOM issue on SBSA
   ],
 ]
 
@@ -132,7 +135,7 @@ def globalVars = [
 BUILD_CORES_REQUEST = "8"
 BUILD_CORES_LIMIT = "8"
 BUILD_MEMORY_REQUEST = "48Gi"
-BUILD_MEMORY_LIMIT = "64Gi"
+BUILD_MEMORY_LIMIT = "96Gi"
 BUILD_JOBS = "8"
 
 TESTER_CORES = "12"

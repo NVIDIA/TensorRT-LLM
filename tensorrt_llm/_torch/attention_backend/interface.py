@@ -3,11 +3,14 @@ import weakref
 from collections import namedtuple
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
-from typing import (Dict, Generic, List, Optional, Protocol, Tuple, Type,
-                    TypeVar, Union)
+from typing import (TYPE_CHECKING, Dict, Generic, List, Optional, Protocol,
+                    Tuple, Type, TypeVar, Union)
 
 import torch
 from typing_extensions import Self
+
+if TYPE_CHECKING:
+    from ..speculative.utils import SpecDecodingTensor
 
 from tensorrt_llm.functional import (PositionEmbeddingType, RopeEmbeddingUtils,
                                      RotaryScalingType)
@@ -140,6 +143,7 @@ class AttentionMetadata:
 
     _saved_tensors: Dict[str, torch.Tensor] = field(init=False,
                                                     default_factory=dict)
+    sparse_attention_config: Optional["SparseAttentionConfig"] = None
 
     def __post_init__(self) -> None:
         if self.is_cross:
@@ -329,8 +333,13 @@ class AttentionMetadata:
             setattr(self, f, v)
         self._saved_tensors.clear()
 
-    def update_spec_dec_param(self, is_spec_decoding_enabled, is_spec_dec_tree,
-                              is_spec_dec_dynamic_tree, max_draft_tokens):
+    def update_spec_dec_param(
+            self,
+            is_spec_decoding_enabled,
+            is_spec_dec_tree,
+            is_spec_dec_dynamic_tree,
+            max_draft_tokens,
+            spec_decoding_tensor: Optional['SpecDecodingTensor'] = None):
         """
         Hook to be called when using TRTLLM attention backend in spec-dec mode.
         """
@@ -511,6 +520,9 @@ class PositionalEmbeddingParams:
     rope: Optional[RopeParams] = None
     is_neox: bool = True
 
+    # mRoPE params (currently, Qwen2/2.5-VL uses it)
+    mrope_section: Optional[List[int]] = None
+
     def __post_init__(self) -> None:
         if self.type.is_deferred():
             assert self.embedder is not None, f"{self.type} requires a not-none external embedder"
@@ -560,6 +572,7 @@ class AttentionBackend(Generic[TMetadata]):
         num_kv_heads: Optional[int] = None,
         quant_config: Optional[QuantConfig] = None,
         skip_create_weights_in_init: bool = False,
+        sparse_attention_config: Optional["SparseAttentionConfig"] = None,
         **kwargs,
     ):
         """
@@ -570,12 +583,14 @@ class AttentionBackend(Generic[TMetadata]):
             head_dim (int): The size of each attention head (hidden_size // num_heads).
             num_kv_heads (int): The number of kv heads. Defaults to num_heads if None.
             quant_config (QuantConfig): Optional quantization configuration. If None, no quantization is applied.
+            sparse_attention_config (SparseAttentionConfig): Optional sparse attention configuration. If None, no sparse attention is applied.
         """
         self.layer_idx = layer_idx
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.num_kv_heads = num_kv_heads or self.num_heads
         self.quant_config = quant_config
+        self.sparse_attention_config = sparse_attention_config
 
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         """

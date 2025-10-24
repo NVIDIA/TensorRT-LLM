@@ -234,13 +234,29 @@ struct BatchedGemmData
         // The dtype is float32.
         void const* mPtrBias{nullptr};
 
-        // The output tensor scaling factor for MxFp{4,8}, Fp8 and NvFp4 quantization.
+        // The output tensor scaling factor for Fp8 (not DeepSeek FP8) and NvFp4 quantization.
         // TensorRT-LLM API requires a scaling factor on the device.
+        // scaleC = dequantA * dequantB * quantC,
+        // where dequantA is global dequantization scaling factor of A
+        //    if dtypeA is FP8, it transforms the range from [-448, 448] to [-amaxA, amaxA]
+        //    if dtypeA is NvFp4, it transforms the range from [-448 * 6, 448 * 6] to [-amaxA, amaxA],
+        //    otherwise it is 1.
+        // dequantB is defined similarly to dequantA.
+        // quantC is the quantization scaling factor of C.
+        //    if dtypeC is FP8, it transforms the range from [-amaxC, amaxC] to [-448, 448]
+        //    if dtypeC is NvFp4, it transforms the range from [-amaxC, amaxC] to [-448 * 6, 448 * 6],
+        //    otherwise it is 1.
         // Shape is [B].
         float const* mPtrScaleC{nullptr};
 
-        // The output gate scale for MxFp{4,8} and NvFp4 quantization.
+        // The output gate scale for Fp8 (not DeepSeek FP8) and NvFp4 quantization.
         // TensorRT-LLM API requires a scaling factor on the device.
+        // scaleGate = dequantA * dequantB,
+        // where dequantA is global dequantization scaling factor of A
+        //    if dtypeA is FP8, it transforms the range from [-448, 448] to [-amaxA, amaxA]
+        //    if dtypeA is NvFp4, it transforms the range from [-448 * 6, 448 * 6] to [-amaxA, amaxA],
+        //    otherwise it is 1.
+        // dequantB is defined similarly to dequantA.
         // Shape is [B].
         float const* mPtrScaleGate{nullptr};
 
@@ -274,7 +290,7 @@ struct BatchedGemmData
         // beta' = beta / dqAb
         // out = scaleC * (x1 + beta') * x0
         //
-        // Note this assumes that scaleAb == scaleGate which is true in TRT-LLM MoE use-case
+        // Note this assumes that dequantScaleAb == scaleGate which is true in TRT-LLM MoE use-case
         //
         float const* mPtrClampLimit{nullptr};
 
@@ -286,6 +302,10 @@ struct BatchedGemmData
         // The formula for SwiGlu (for GeGlu, replace sigmoid with phi):
         //
         //   out_glu  = x_glu * torch.sigmoid(alpha * x_glu) * (x_linear + beta)
+        //
+        // The beta is added before applying the global scaling factor. I.e.
+        // x_linear = (x_linear + beta') * scaleC
+        // Thus, the beta' = beta / (dequantA * dequantB), where the beta is the original beta.
         float const* mPtrGatedActAlpha{nullptr};
         float const* mPtrGatedActBeta{nullptr};
 
@@ -487,11 +507,31 @@ public:
             throw std::invalid_argument("Invalid combination of options");
         }
 
-        int32_t const numCtasTile
+        if (batchM)
+        {
+            numCtasBatch = gemm::divUpMul(numCtasBatch, options.mClusterDimX);
+        }
+        else
+        {
+            numCtasBatch = gemm::divUpMul(numCtasBatch, options.mClusterDimY);
+        }
+
+        int32_t numCtasTile
             = batchM ? gemm::divUp(options.mN, options.mTileN) : gemm::divUp(options.mM, options.mTileM);
+        if (batchM)
+        {
+            numCtasTile = gemm::divUpMul(numCtasTile, options.mClusterDimY);
+        }
+        else
+        {
+            numCtasTile = gemm::divUpMul(numCtasTile, options.mClusterDimX);
+        }
         int32_t const numCtasInner = options.mNumSlicesForSplitK;
         return std::make_tuple(numCtasBatch, numCtasTile, numCtasInner);
     }
+
+    // Creates GemmOptions from kernel and data.
+    BatchedGemmOptions getOptionsFromConfigAndData(BatchedGemmConfig const& config, BatchedGemmData const& data) const;
 
     // Returns the number of CTAs of the current kernel.
     int32_t getNumCtas(
@@ -508,8 +548,6 @@ private:
     // Aligns the pointer to the alignment
     template <typename Dtype>
     inline Dtype* alignPtr(Dtype* ptr, int64_t alignment) const;
-    // Creates GemmOptions from kernel and data.
-    BatchedGemmOptions getOptionsFromConfigAndData(BatchedGemmConfig const& config, BatchedGemmData const& data) const;
 
     // Returns the size of the workspace buffers in bytes
     std::vector<size_t> getWorkspaceSizesInBytes(BatchedGemmConfig const& config, BatchedGemmData const& data) const;
@@ -771,7 +809,9 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
         cuModuleUnload(cuModule);
     }
 #else
-    config.mCudaRunner->run((void*) &kernelParams, (void*) cudaStream, grid);
+    config.mCudaRunner->run((void*) &kernelParams, (void*) cudaStream, grid,
+        /* cluster */ {},
+        /* instanceId */ config.mInstanceIdx);
 #endif
 
     return 0;

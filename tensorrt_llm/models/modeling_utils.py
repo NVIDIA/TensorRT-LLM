@@ -98,6 +98,7 @@ class SpeculativeDecodingMode(IntFlag):
     EAGLE = auto()
     NGRAM = auto()
     USER_PROVIDED = auto()
+    SAVE_HIDDEN_STATES = auto()
     AUTO = auto()
 
     @staticmethod
@@ -120,6 +121,8 @@ class SpeculativeDecodingMode(IntFlag):
             return SpeculativeDecodingMode.USER_PROVIDED
         elif args.speculative_decoding_mode == "auto":
             return SpeculativeDecodingMode.AUTO
+        elif args.speculative_decoding_mode == "save_hidden_states":
+            return SpeculativeDecodingMode.SAVE_HIDDEN_STATES
         else:
             assert False, "Unknown speculative_decoding_mode " + args.speculative_decoding_mode
 
@@ -736,9 +739,7 @@ class PretrainedModel(Module,
             config.set_rank(rank)
 
         rank = config.mapping.rank
-        if config.mapping.auto_parallel:
-            rank = 0
-        elif config.mapping.cp_size > 1:
+        if config.mapping.cp_size > 1:
             # tp_cp_pp rank -> tp_pp rank: because different cp ranks share the same ckpt
             tp_size = config.mapping.tp_size
             cp_size = config.mapping.cp_size
@@ -1304,7 +1305,7 @@ def unfuse_qkv_gemm(model: PretrainedModel) -> PretrainedModel:
 
     for name, layer in model.named_modules():
         if isinstance(layer, Attention) and not layer.cross_attention:
-            assert layer.tp_size == 1, "please disable manual tp when enable auto parallel"
+            assert layer.tp_size == 1, "unfuse_qkv_gemm requires tp_size == 1"
             if layer.qkv is None:
                 continue
             qkv_params = get_init_params(layer.qkv, ColumnLinear)
@@ -1963,7 +1964,7 @@ def save_config(config: PretrainedConfig, *, output_dir: str,
                 log: bool) -> None:
     config_path = Path(output_dir) / "config.json"
     if log:
-        logger.debug(f"Saving TensorRT-LLM configuration to {config_path}")
+        logger.debug(f"Saving TensorRT LLM configuration to {config_path}")
     config_path.parent.mkdir(exist_ok=True, parents=True)
     config_path.write_text(json.dumps(config.to_dict(), indent=4))
 

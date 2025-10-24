@@ -14,19 +14,38 @@ l0_a10:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
+  - unittest/_torch/sampler/test_torch_sampler.py
   - unittest/_torch/modeling/test_modeling_mistral.py
   - unittest/_torch/modeling/test_modeling_pixtral.py
   # NOTE: this is a CPU-only test, but we do not have a dedicated job for this (and therefore no
   # test list either).
   - unittest/_torch/models/checkpoints/hf/test_weight_loader.py
+  - unittest/others/test_time_breakdown.py
+  - unittest/disaggregated/test_disagg_utils.py
+  - unittest/disaggregated/test_router.py
+  - unittest/disaggregated/test_remoteDictionary.py
+  - unittest/disaggregated/test_disagg_cluster_manager_worker.py
+  - unittest/disaggregated/test_cluster_storage.py
   - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun_trt_backend[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_mixed[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_diff_max_tokens[TinyLlama-1.1B-Chat-v1.0]
-  - test_e2e.py::test_openai_chat_structural_tag_example
-  - test_e2e.py::test_openai_chat_json_example
+  - disaggregated/test_disaggregated.py::test_disaggregated_kv_cache_time_output[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_perf_metrics[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_cache_aware_balance[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_conditional[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_ngram[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_workers.py::test_workers_conditional_disaggregation[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_workers.py::test_workers_kv_cache_events[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_workers.py::test_workers_kv_cache_aware_router[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_workers.py::test_workers_kv_cache_aware_router_eviction[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[False-False-TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[False-True-TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[True-False-TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[True-True-TinyLlama-1.1B-Chat-v1.0]
+  - test_e2e.py::test_openai_chat_guided_decoding
   - test_e2e.py::test_openai_chat_multimodal_example
   - test_e2e.py::test_openai_perf_metrics
   - test_e2e.py::test_openai_prometheus
@@ -47,6 +66,9 @@ l0_a10:
   - unittest/llmapi/test_serialization.py
   - unittest/llmapi/test_utils.py
   - unittest/llmapi/test_llm_args.py
+  - unittest/llmapi/test_additional_model_outputs.py
+  # executor
+  - unittest/executor/test_rpc.py
 - condition:
     ranges:
       system_gpu_count:
@@ -88,7 +110,6 @@ l0_a10:
   - examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-use_attention_plugin-enable_context_fmha-tp:1-pp:1-float16-BertModel-bert/bert-base-uncased]
   - unittest/trt/model/test_mistral.py
   - unittest/trt/model/test_llama.py
-  - test_e2e.py::test_gpt3_175b_1layers_build_only # 6 mins
   - llmapi/test_llm_api_connector.py::test_connector_simple[True]
   - llmapi/test_llm_api_connector.py::test_connector_simple[False]
   - llmapi/test_llm_api_connector.py::test_connector_async_onboard[True]
@@ -115,9 +136,7 @@ l0_a10:
   - test_e2e.py::test_trtllm_bench_sanity[--non-streaming-FP16-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
   - test_e2e.py::test_trtllm_bench_latency_sanity[FP16-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
   - unittest/trt/quantization
-  - accuracy/test_cli_flow.py::TestLlama7B::test_streamingllm # 2 mins
   - unittest/trt/functional # 37 mins
-  - test_cache.py::test_cache_sanity # 1 sec
   - llmapi/test_llm_examples.py::test_llmapi_quickstart_atexit
   - unittest/api_stability
   - unittest/bindings
@@ -137,13 +156,9 @@ l0_a10:
   - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle_2[cuda_graph=True-chunked_context=False] # 5 mins
   - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle_2[cuda_graph=True-chunked_context=True] # 5 mins
   - accuracy/test_cli_flow.py::TestLlama2_7B::test_auto_dtype
-  - examples/test_chatglm.py::test_llm_glm_4_9b_single_gpu_summary[glm-4-9b-disable_weight_only]
   - unittest/trt/attention/test_gpt_attention_IFB.py
   - unittest/trt/attention/test_gpt_attention_no_cache.py
-  - unittest/trt/model/test_mamba.py # 3 mins
   - examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-enable_attention_plugin-disable_weight_only-float16-nb:1-use_cpp_runtime]
-  - examples/test_mamba.py::test_llm_mamba_1gpu[mamba2-130m-float16-enable_gemm_plugin]
-  - examples/test_mamba.py::test_llm_mamba_1gpu[mamba-codestral-7B-v0.1-float16-enable_gemm_plugin] # 3 mins
 - condition:
     ranges:
       system_gpu_count:
@@ -202,6 +217,12 @@ l0_a10:
   - accuracy/test_llm_api.py::TestEagle2Vicuna_7B_v1_3::test_auto_dtype
   - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-MAX_UTILIZATION-trt-stress-test]
   - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-GUARANTEED_NO_EVICT-trt-stress-test]
+  - test_e2e.py::test_gpt3_175b_1layers_build_only # 6 mins
+  - examples/test_chatglm.py::test_llm_glm_4_9b_single_gpu_summary[glm-4-9b-disable_weight_only]
+  - unittest/trt/model/test_mamba.py # 3 mins
+  - examples/test_mamba.py::test_llm_mamba_1gpu[mamba2-130m-float16-enable_gemm_plugin]
+  - examples/test_mamba.py::test_llm_mamba_1gpu[mamba-codestral-7B-v0.1-float16-enable_gemm_plugin] # 3 mins
+  - accuracy/test_cli_flow.py::TestLlama7B::test_streamingllm # 2 mins
 - condition:
     ranges:
       system_gpu_count:

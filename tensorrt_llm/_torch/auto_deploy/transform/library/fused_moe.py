@@ -7,7 +7,7 @@ from torch.fx import GraphModule, Node
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
-from ...utils.node_utils import bfs, identify_regions_between_residuals, is_op
+from ...utils.node_utils import bfs, extract_op_args, identify_regions_between_residuals, is_op
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 
@@ -15,47 +15,77 @@ def _insert_fused_moe_ops(gm: GraphModule) -> int:
     fused_key_counter = 0
     graph = gm.graph
 
-    for node in list(graph.nodes):
+    for node in graph.nodes:
         if not is_op(node, torch.ops.auto_deploy.torch_moe):
             continue
 
-        hidden_states, selected_experts, routing_weights, w1_list, w2_list, w3_list = node.args
+        (mlp_style_val,) = extract_op_args(node, "mlp_style")
 
-        fused_w3_w1_experts = torch.stack(
-            [
-                torch.cat(
-                    [gm.get_parameter(w3_node.target), gm.get_parameter(w1_node.target)], dim=-2
-                )
-                for w1_node, w3_node in zip(w1_list, w3_list)
-            ],
-            dim=0,
+        hidden_states, selected_experts, routing_weights, w1_list, w2_list, w3_list = (
+            extract_op_args(
+                node,
+                "x",
+                "selected_experts",
+                "routing_weights",
+                "w1_weight",
+                "w2_weight",
+                "w3_weight",
+            )
         )
+        if mlp_style_val == "gated_mlp":
+            fused_w_up_experts = torch.stack(
+                [
+                    torch.cat(
+                        [gm.get_parameter(w3_node.target), gm.get_parameter(w1_node.target)], dim=-2
+                    )
+                    for w1_node, w3_node in zip(w1_list, w3_list)
+                ],
+                dim=0,
+            )
+            new_key_w_up = f"fused_moe_w3_w1_stacked_{fused_key_counter}"
+            # TRTLLM fused MoE op supports gated MLP only.
+            replacement_op = torch.ops.auto_deploy.trtllm_moe_fused
 
-        fused_w2_experts = torch.stack([gm.get_parameter(n.target) for n in w2_list], dim=0)
+        elif mlp_style_val == "mlp":
+            fused_w_up_experts = torch.stack([gm.get_parameter(n.target) for n in w1_list], dim=0)
+            new_key_w_up = f"fused_moe_w1_stacked_{fused_key_counter}"
+            # Triton fused MoE op supports mlp only.
 
-        new_key_w3_w1 = f"fused_moe_w3_w1_stacked_{fused_key_counter}"
-        new_key_w2 = f"fused_moe_w2_stacked_{fused_key_counter}"
+            replacement_op = torch.ops.auto_deploy.triton_moe_fused
+
+        else:
+            raise ValueError(f"Unknown mlp_style: {mlp_style_val}")
+
+        fused_w_down_experts = torch.stack([gm.get_parameter(n.target) for n in w2_list], dim=0)
+
+        new_key_w_down = f"fused_moe_w2_stacked_{fused_key_counter}"
         fused_key_counter += 1
-        param_w3_w1 = torch.nn.Parameter(fused_w3_w1_experts)
-        param_w2 = torch.nn.Parameter(fused_w2_experts)
-        gm.register_parameter(new_key_w3_w1, param_w3_w1)
-        gm.register_parameter(new_key_w2, param_w2)
+        param_w_up = torch.nn.Parameter(fused_w_up_experts)
+        param_w_down = torch.nn.Parameter(fused_w_down_experts)
+        gm.register_parameter(new_key_w_up, param_w_up)
+        gm.register_parameter(new_key_w_down, param_w_down)
 
         with graph.inserting_before(node):
             new_node = graph.call_function(
                 # TODO(Fridah-nv): torch.ops.auto_deploy.trtllm_moe_fused for quantized models
-                torch.ops.auto_deploy.trtllm_moe_fused,
+                replacement_op,
                 args=(
                     hidden_states,
                     selected_experts,
                     routing_weights,
-                    graph.get_attr(new_key_w3_w1),
-                    graph.get_attr(new_key_w2),
+                    graph.get_attr(new_key_w_up),
+                    graph.get_attr(new_key_w_down),
                 ),
             )
 
         node.replace_all_uses_with(new_node)
         graph.erase_node(node)
+
+        # Delete the unstacked weights immediately to save GPU memory
+        # This will happen automatically after the graph is canonicalized, but for large models we'll run out of memory
+        # during the transformation itself.
+        gm.graph.eliminate_dead_code()
+        gm.delete_all_unused_submodules()
 
     return fused_key_counter
 
@@ -494,7 +524,7 @@ class MatchSimpleMoePattern(MatchMoePattern):
         return torch.ops.auto_deploy.torch_linear_simple
 
     def moe_op(self):
-        return torch.ops.auto_deploy.torch_moe
+        return torch.ops.auto_deploy.torch_moe.default
 
     def scale_arg_indices(self) -> Dict[str, int]:
         return {}
@@ -511,7 +541,7 @@ class MatchFP8MoePattern(MatchMoePattern):
         return torch.ops.auto_deploy.torch_quant_fp8_linear
 
     def moe_op(self):
-        return torch.ops.auto_deploy.torch_quant_fp8_moe
+        return torch.ops.auto_deploy.torch_quant_fp8_moe.default
 
     def scale_arg_indices(self) -> Dict[str, int]:
         return {"input_scale": 3, "weight_scale": 4}
@@ -528,7 +558,7 @@ class MatchNVFP4MoePattern(MatchMoePattern):
         return torch.ops.auto_deploy.torch_quant_nvfp4_linear
 
     def moe_op(self):
-        return torch.ops.auto_deploy.torch_quant_nvfp4_moe
+        return torch.ops.auto_deploy.torch_quant_nvfp4_moe.default
 
     def scale_arg_indices(self) -> Dict[str, int]:
         return {"input_scale": 3, "weight_scale": 4, "alpha": 5}

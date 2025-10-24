@@ -79,6 +79,11 @@ class ParamSnapshot:
     default: Any = None
     status: Optional[str] = None
 
+    def __post_init__(self):
+        # Unify default value of None and inspect._empty
+        if self.default is inspect._empty:
+            self.default = None
+
     @classmethod
     def from_inspect(cls, param: inspect.Parameter):
         return cls(param.annotation, param.default)
@@ -510,7 +515,9 @@ class ApiStabilityTestHarness:
             # step 1: check the method status
             method = getattr(self.TEST_CLASS, method_name)
             if method_name in committed_data.get('methods', {}):
-                continue
+                if method_name != "__init__":
+                    continue
+                # Both committed and non-committed methods have __init__ with different parameters
             if method_name != "__init__":
                 method_status = get_api_status(method)
                 if method_status is None:

@@ -95,7 +95,7 @@ install_rockylinux_requirements() {
         "cuda-toolkit-config-common-${CUDA_RUNTIME}.noarch" \
         "libcublas-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}" \
         "libcublas-devel-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}"; do
-        wget --retry-connrefused --timeout=180 --tries=10 --continue "https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/${ARCH3}/${pkg}.rpm"
+        wget --retry-connrefused --timeout=180 --tries=10 --continue "https://developer.download.nvidia.com/compute/cuda/repos/rhel8/${ARCH3}/${pkg}.rpm"
     done
 
     # Remove old packages
@@ -145,7 +145,7 @@ install_tensorrt() {
           /usr/local/tensorrt/lib/libnvinfer_dispatch_static.a \
           /usr/local/tensorrt/lib/libnvinfer_lean_static.a \
           /usr/local/tensorrt/lib/libnvonnxparser_static.a \
-          /usr/local/tensorrt/lib/libnvinfer_builder_resource_win.so.10.10.0
+          /usr/local/tensorrt/lib/libnvinfer_builder_resource_win.so.*
 }
 
 # Install base packages depending on the base OS

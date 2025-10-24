@@ -76,7 +76,7 @@ def parse_arguments():
     parser.add_argument('--output_dir',
                         type=str,
                         default='tllm_checkpoint',
-                        help='The path to save the TensorRT-LLM checkpoint')
+                        help='The path to save the TensorRT LLM checkpoint')
     parser.add_argument(
         '--workers',
         type=int,
@@ -278,10 +278,10 @@ if __name__ == '__main__':
 
     if args.model_type == 'opt':
         hf_model = AutoModelForCausalLM.from_pretrained(args.model_dir,
-                                                        torch_dtype="auto")
+                                                        dtype="auto")
     elif args.model_type == 'blip2':
         hf_model = Blip2ForConditionalGeneration.from_pretrained(
-            args.model_dir, torch_dtype="auto").language_model
+            args.model_dir, dtype="auto").language_model
 
     hf_config = hf_model.config
     if hf_config.hidden_size != hf_config.word_embed_proj_dim:

@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/executor/serialization.h"
+#include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/requestImpl.h"
@@ -539,9 +540,10 @@ kv_cache::CacheState Serialization::deserializeCacheState(std::istream& is)
     auto dataType = su::deserialize<decltype(CacheState::mDataType)>(is);
     auto attentionType = su::deserialize<decltype(CacheState::AttentionConfig::mAttentionType)>(is);
     auto kvFactor = su::deserialize<decltype(CacheState::AttentionConfig::mKvFactor)>(is);
+    auto enableBlockReuse = su::deserialize<bool>(is);
     return CacheState{nbKvHeadsPerLayer, sizePerHead, tokensPerBlock, tensorParallelism, pipelineParallelism,
         contextParallelism, attentionLayerNumPerPP, dataType, attentionType, kvFactor, enableAttentionDP, DPrank,
-        DPsize};
+        DPsize, enableBlockReuse};
 }
 
 void Serialization::serialize(kv_cache::CacheState const& state, std::ostream& os)
@@ -559,6 +561,7 @@ void Serialization::serialize(kv_cache::CacheState const& state, std::ostream& o
     su::serialize(state.mDataType, os);
     su::serialize(state.mAttentionConfig.mAttentionType, os);
     su::serialize(state.mAttentionConfig.mKvFactor, os);
+    su::serialize(state.mEnableBlockReuse, os);
 }
 
 size_t Serialization::serializedSize(kv_cache::CacheState const& state)
@@ -577,6 +580,7 @@ size_t Serialization::serializedSize(kv_cache::CacheState const& state)
     totalSize += su::serializedSize(state.mDataType);
     totalSize += su::serializedSize(state.mAttentionConfig.mAttentionType);
     totalSize += su::serializedSize(state.mAttentionConfig.mKvFactor);
+    totalSize += su::serializedSize(state.mEnableBlockReuse);
     return totalSize;
 }
 
@@ -2442,6 +2446,40 @@ bool Serialization::deserializeBool(std::istream& is)
 ModelType Serialization::deserializeModelType(std::istream& is)
 {
     return su::deserialize<ModelType>(is);
+}
+
+// BlockKey (KV cache)
+size_t Serialization::serializedSize(tensorrt_llm::batch_manager::kv_cache_manager::BlockKey const& key)
+{
+    size_t totalSize = 0;
+    totalSize += su::serializedSize(key.usesExtraIds);
+    totalSize += su::serializedSize(key.loraTaskId);
+    totalSize += su::serializedSize(key.uniqueTokens);
+    // std::vector<MmKey> where MmKey is pair<std::array<uint8_t,32>, SizeType32>
+    totalSize += su::serializedSize(key.extraKeys);
+    return totalSize;
+}
+
+void Serialization::serialize(tensorrt_llm::batch_manager::kv_cache_manager::BlockKey const& key, std::ostream& os)
+{
+    su::serialize(key.usesExtraIds, os);
+    su::serialize(key.loraTaskId, os);
+    su::serialize(key.uniqueTokens, os);
+    su::serialize(key.extraKeys, os);
+}
+
+tensorrt_llm::batch_manager::kv_cache_manager::BlockKey Serialization::deserializeBlockKey(std::istream& is)
+{
+    auto usesExtraIds = su::deserialize<bool>(is);
+    auto loraTaskId = su::deserialize<std::optional<tensorrt_llm::batch_manager::kv_cache_manager::LoraTaskIdType>>(is);
+    auto uniqueTokens = su::deserialize<std::vector<tensorrt_llm::runtime::UniqueToken>>(is);
+    auto extraKeys = su::deserialize<std::vector<tensorrt_llm::batch_manager::kv_cache_manager::MmKey>>(is);
+    tensorrt_llm::batch_manager::kv_cache_manager::BlockKey key;
+    key.usesExtraIds = usesExtraIds;
+    key.loraTaskId = std::move(loraTaskId);
+    key.uniqueTokens = std::move(uniqueTokens);
+    key.extraKeys = std::move(extraKeys);
+    return key;
 }
 
 } // namespace tensorrt_llm::executor

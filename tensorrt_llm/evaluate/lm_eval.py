@@ -16,7 +16,7 @@ import copy
 import json
 import os
 from contextlib import contextmanager
-from typing import Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import click
 import numpy as np
@@ -51,11 +51,13 @@ class LmEvalWrapper(TemplateLM):
     def __init__(self,
                  llm: Union[LLM, PyTorchLLM],
                  sampling_params: Optional[SamplingParams] = None,
-                 streaming: bool = False):
+                 streaming: bool = False,
+                 chat_template_kwargs: Optional[dict[str, Any]] = None):
         super().__init__()
         self.llm = llm
         self.sampling_params = sampling_params
         self.streaming = streaming
+        self.chat_template_kwargs = chat_template_kwargs
 
     @property
     def eot_token_id(self) -> int:
@@ -72,6 +74,7 @@ class LmEvalWrapper(TemplateLM):
             tokenize=False,
             add_generation_prompt=add_generation_prompt,
             continue_final_message=not add_generation_prompt,
+            **(self.chat_template_kwargs or {}),
         )
 
     @property
@@ -146,7 +149,8 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
                  llm: Union[LLM, PyTorchLLM],
                  sampling_params: Optional[SamplingParams] = None,
                  streaming: bool = False,
-                 max_images: int = 999):
+                 max_images: int = 999,
+                 chat_template_kwargs: Optional[dict[str, Any]] = None):
         """
         Initialize the multimodal wrapper.
 
@@ -161,6 +165,7 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
         # NOTE: Required by lm_eval to identify this as a multimodal model
         self.MULTIMODAL = True
         self.max_images = max_images
+        self.chat_template_kwargs = chat_template_kwargs
         self.model_type = self._get_model_type(llm)
 
         # NOTE: In TRT-LLM, currently we do not support interleaved text and image. Instead, we are adding image placeholders at the end of the text or at the beginning of the text.
@@ -237,7 +242,9 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             mm_placeholder_counts=mm_placeholder_counts,
             tools=None,
             chat_template_kwargs={
-                "continue_final_message": not add_generation_prompt
+                **(self.chat_template_kwargs or {}),
+                "continue_final_message":
+                not add_generation_prompt,
             })
         return output
 
@@ -301,7 +308,8 @@ class LmEvalEvaluator(Evaluator):
                  apply_chat_template: bool = False,
                  fewshot_as_multiturn: bool = False,
                  system_prompt: Optional[str] = None,
-                 is_multimodal: bool = False):
+                 is_multimodal: bool = False,
+                 chat_template_kwargs: Optional[dict[str, Any]] = None):
         try:
             import lm_eval
         except ImportError as e:
@@ -319,7 +327,8 @@ class LmEvalEvaluator(Evaluator):
         super().__init__(random_seed=random_seed,
                          apply_chat_template=apply_chat_template,
                          fewshot_as_multiturn=fewshot_as_multiturn,
-                         system_prompt=system_prompt)
+                         system_prompt=system_prompt,
+                         chat_template_kwargs=chat_template_kwargs)
         self.task_name = task_name
         self.dataset_path = dataset_path
         self.num_samples = num_samples
@@ -390,7 +399,10 @@ class LmEvalEvaluator(Evaluator):
         import lm_eval
         lm_cls = MultimodalLmEvalWrapper if self.MULTIMODAL else LmEvalWrapper
         results = lm_eval.evaluate(
-            lm=lm_cls(llm, sampling_params, streaming),
+            lm=lm_cls(llm,
+                      sampling_params=sampling_params,
+                      streaming=streaming,
+                      chat_template_kwargs=self.chat_template_kwargs),
             task_dict=self.task_dict,
             limit=self.num_samples,
             apply_chat_template=self.apply_chat_template,
@@ -428,7 +440,9 @@ class LmEvalEvaluator(Evaluator):
                         fewshot_as_multiturn=kwargs.pop("fewshot_as_multiturn",
                                                         False),
                         system_prompt=kwargs.pop("system_prompt", None),
-                        is_multimodal=kwargs.pop("is_multimodal", False))
+                        is_multimodal=kwargs.pop("is_multimodal", False),
+                        chat_template_kwargs=kwargs.pop("chat_template_kwargs",
+                                                        None))
         sampling_params = SamplingParams(
             max_tokens=kwargs.pop("max_output_length"),
             truncate_prompt_tokens=kwargs.pop("max_input_length"),
@@ -462,6 +476,13 @@ class GSM8K(LmEvalEvaluator):
                   is_flag=True,
                   default=False,
                   help="Whether to apply chat template.")
+    @click.option(
+        "--chat_template_kwargs",
+        type=str,
+        default=None,
+        callback=lambda ctx, param, value: json.loads(value) if value else None,
+        help=
+        'Chat template kwargs as JSON string, e.g., \'{"thinking_budget": 0}\'')
     @click.option("--fewshot_as_multiturn",
                   is_flag=True,
                   default=False,
@@ -513,6 +534,13 @@ class GPQADiamond(LmEvalEvaluator):
                   is_flag=True,
                   default=False,
                   help="Whether to apply chat template.")
+    @click.option(
+        "--chat_template_kwargs",
+        type=str,
+        default=None,
+        callback=lambda ctx, param, value: json.loads(value) if value else None,
+        help=
+        'Chat template kwargs as JSON string, e.g., \'{"thinking_budget": 0}\'')
     @click.option("--system_prompt",
                   type=str,
                   default=None,
@@ -556,6 +584,13 @@ class GPQAMain(LmEvalEvaluator):
                   is_flag=True,
                   default=False,
                   help="Whether to apply chat template.")
+    @click.option(
+        "--chat_template_kwargs",
+        type=str,
+        default=None,
+        callback=lambda ctx, param, value: json.loads(value) if value else None,
+        help=
+        'Chat template kwargs as JSON string, e.g., \'{"thinking_budget": 0}\'')
     @click.option("--system_prompt",
                   type=str,
                   default=None,
@@ -599,6 +634,13 @@ class GPQAExtended(LmEvalEvaluator):
                   is_flag=True,
                   default=False,
                   help="Whether to apply chat template.")
+    @click.option(
+        "--chat_template_kwargs",
+        type=str,
+        default=None,
+        callback=lambda ctx, param, value: json.loads(value) if value else None,
+        help=
+        'Chat template kwargs as JSON string, e.g., \'{"thinking_budget": 0}\'')
     @click.option("--system_prompt",
                   type=str,
                   default=None,
@@ -638,6 +680,13 @@ class MMMU(LmEvalEvaluator):
                   type=int,
                   default=0,
                   help="Random seed for dataset processing.")
+    @click.option(
+        "--chat_template_kwargs",
+        type=str,
+        default=None,
+        callback=lambda ctx, param, value: json.loads(value) if value else None,
+        help=
+        'Chat template kwargs as JSON string, e.g., \'{"thinking_budget": 0}\'')
     @click.option(
         "--system_prompt",
         type=str,

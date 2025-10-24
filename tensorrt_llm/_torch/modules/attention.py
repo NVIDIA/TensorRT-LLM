@@ -24,7 +24,7 @@ from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from .multi_stream_utils import maybe_execute_in_parallel
 from .rms_norm import RMSNorm
-from .rotary_embedding import RotaryEmbedding
+from .rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 
 
 def extract_extra_attrs(layer_idx: str, attn_type: str):
@@ -65,6 +65,16 @@ def extract_extra_attrs(layer_idx: str, attn_type: str):
         ), "Attention layer must be a subclass of Attention or an instance of Attention"
 
     return metadata, attn_layer
+
+
+@torch.compile
+def compiled_copy_(dst, src):
+    dst.copy_(src)
+
+
+@torch.compile
+def compiled_cat(tensors, dim):
+    return torch.cat(tensors, dim)
 
 
 @torch.library.custom_op("trtllm::attn_custom_op_inplace",
@@ -117,6 +127,8 @@ class Attention(nn.Module):
         q_scaling: float = 1.0,
         attention_chunk_size: Optional[int] = None,
         disable_deep_gemm: bool = False,
+        attn_output_gate: Optional[bool] = None,
+        use_custom_cublas_mm: bool = False,
     ):
         """
         Initialize the Attention module.
@@ -136,6 +148,7 @@ class Attention(nn.Module):
             q_scaling (float): The scaling factor for the qk_scale. The definition is $O = softmax(QK^T * qk_scale) * V, qk_scale = 1 / (sqrt(head_dim) * q_scaling)$. The default value is 1.0.
             attention_chunk_size (Optional[int]): See [Chunked Attention] below.
             disable_deep_gemm (bool): Whether to disable the use of DeepGEMM in Linear layers (currently only matters on SM100 + FP8).
+            attn_output_gate (Optional[bool]): Determines whether to use an output gate in the attention Op. If False, the decision is automatically handled by the attention backend based on its capabilities.
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -162,6 +175,10 @@ class Attention(nn.Module):
         self.pos_embd_params = pos_embd_params
         self.dense_bias = dense_bias
         self.q_scaling = q_scaling
+        self.attn_output_gate = attn_output_gate
+
+        if self.attn_output_gate:
+            logger.info_once("using attn output gate!", key="attn_output_gate")
 
         # [Chunked Attention]
         # Chunked attention is applied to context requests only. Chunked attention will be
@@ -207,7 +224,8 @@ class Attention(nn.Module):
 
         self.qkv_proj = Linear(
             self.hidden_size,
-            tp_size * self.q_size + 2 * tp_size * self.kv_size,
+            tp_size * self.q_size * (2 if self.attn_output_gate else 1) +
+            2 * tp_size * self.kv_size,
             bias=bias,
             dtype=dtype,
             mapping=mapping,
@@ -219,7 +237,7 @@ class Attention(nn.Module):
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
             disable_deep_gemm=disable_deep_gemm,
-        )
+            use_custom_cublas_mm=use_custom_cublas_mm)
 
         self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
                                 [self.hidden_size])
@@ -237,11 +255,13 @@ class Attention(nn.Module):
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
             disable_deep_gemm=disable_deep_gemm,
-        )
+            use_custom_cublas_mm=use_custom_cublas_mm)
 
         self.quant_config = config.get_quant_config()
         self.attn_backend = config.attn_backend
-        attn_cls = get_attention_backend(self.attn_backend)
+        attn_cls = get_attention_backend(
+            self.attn_backend,
+            sparse_attn_config=config.sparse_attention_config)
 
         # These two modules are mutually exclusive - either splitted_qkv_lora or fused_qkv_lora will be used,
         # but never both at the same time. splitted_qkv_lora handles Q,K,V separately while fused_qkv_lora
@@ -259,6 +279,9 @@ class Attention(nn.Module):
         # Whether to fuse RoPE into the attention OP.
         # If true, RoPE will be applied in self.attn.forward.
         # If false, RoPE will be applied in self.apply_rope.
+        if config.sparse_attention_config is not None:
+            logger.warning("disable rope_fusion for sparse attention.")
+            rope_fusion = False
         self.rope_fusion = rope_fusion
         if self.rope_fusion and not attn_cls.support_fused_rope():
             logger.warning(
@@ -271,11 +294,19 @@ class Attention(nn.Module):
 
         self.rotary_emb = None
         if not self.rope_fusion and self.pos_embd_params is not None:
-            self.rotary_emb = RotaryEmbedding(
-                self.pos_embd_params.rope,
-                head_dim=self.head_dim,
-                is_neox=self.pos_embd_params.is_neox,
-            )
+            if self.pos_embd_params.type.is_mrope():
+                self.rotary_emb = MRotaryEmbedding(
+                    self.pos_embd_params.rope,
+                    head_dim=self.head_dim,
+                    is_neox=self.pos_embd_params.is_neox,
+                    mrope_section=self.pos_embd_params.mrope_section,
+                )
+            else:
+                self.rotary_emb = RotaryEmbedding(
+                    self.pos_embd_params.rope,
+                    head_dim=self.head_dim,
+                    is_neox=self.pos_embd_params.is_neox,
+                )
 
         self.attn = create_attention(
             self.attn_backend,
@@ -288,6 +319,7 @@ class Attention(nn.Module):
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             q_scaling=self.q_scaling,
             attention_chunk_size=self.attention_chunk_size,
+            sparse_attention_config=config.sparse_attention_config,
         )
 
         self.support_fused_qkv = self.attn.support_fused_qkv()
@@ -503,24 +535,39 @@ class Attention(nn.Module):
             if qkv_lora is not None:
                 qkv = qkv + qkv_lora
 
-        q, k, v = qkv, None, None
+        if self.attn_output_gate:
+            q_gate, k, v = qkv.split(
+                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
+            orig_shape = q_gate.shape[:-1]
+            # Single line: view -> chunk -> reshape both q and gate
+            q, gate = [
+                t.reshape(*orig_shape, -1) for t in torch.chunk(
+                    q_gate.view(*orig_shape, self.num_heads, -1), 2, dim=-1)
+            ]
+        else:
+            q, k, v = qkv, None, None
+
         q, k, v = self.apply_rope(q, k, v, position_ids)
         q, k, v = self.convert_qkv(q, k, v)
 
         if attention_sinks is not None:
             assert self.attn_backend == "TRTLLM", "Attention sinks are only supported for TRTLLM backend."
 
-        output = self.forward_impl(q,
-                                   k,
-                                   v,
-                                   attn_metadata,
-                                   attention_mask,
-                                   attention_window_size,
-                                   attention_mask_data,
-                                   mrope_config=mrope_config,
-                                   attention_sinks=attention_sinks)
+        attn_output = self.forward_impl(q,
+                                        k,
+                                        v,
+                                        attn_metadata,
+                                        attention_mask,
+                                        attention_window_size,
+                                        attention_mask_data,
+                                        mrope_config=mrope_config,
+                                        attention_sinks=attention_sinks)
 
-        attn_output = self.o_proj(output,
+        if self.attn_output_gate:
+            gate = torch.sigmoid(gate)
+            attn_output = attn_output * gate
+
+        attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params,
                                   lora_params=lora_params,
                                   layer_idx=self.layer_idx)
@@ -813,6 +860,7 @@ class MLA(nn.Module):
             v_head_dim=self.v_head_dim,
             predicted_tokens_per_seq=self.predicted_tokens_per_seq,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
+            sparse_attention_config=config.sparse_attention_config,
         )
 
         self.mqa = create_attention(
@@ -832,6 +880,7 @@ class MLA(nn.Module):
             v_head_dim=self.kv_lora_rank,
             predicted_tokens_per_seq=self.predicted_tokens_per_seq,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
+            sparse_attention_config=config.sparse_attention_config,
         )
 
         self.aux_stream = aux_stream
@@ -1055,8 +1104,8 @@ class MLA(nn.Module):
         )
 
         k = torch.empty_like(q).view(-1, self.num_heads, self.qk_head_dim)
-        k[..., :self.qk_nope_head_dim] = k_nope.view(-1, self.num_heads,
-                                                     self.qk_nope_head_dim)
+        compiled_copy_(k[..., :self.qk_nope_head_dim],
+                       k_nope.view(-1, self.num_heads, self.qk_nope_head_dim))
         if self.apply_rotary_emb:
             k[..., self.qk_nope_head_dim:] = k_pe.view(-1, 1,
                                                        self.qk_rope_head_dim)
@@ -1114,7 +1163,7 @@ class MLA(nn.Module):
         full_k_nope = full_k_nope.view(-1, self.num_heads,
                                        self.qk_nope_head_dim)
         full_k_pe = full_k_pe.view(-1, 1, self.qk_rope_head_dim)
-        full_k = torch.cat(
+        full_k = compiled_cat(
             (full_k_nope, full_k_pe.expand(-1, self.num_heads, -1)), dim=-1)
         full_k = full_k.view(-1, self.num_heads * self.qk_head_dim)
 
@@ -1209,7 +1258,7 @@ class MLA(nn.Module):
             chunked_k_nope = chunked_k_nope.view(-1, self.num_heads,
                                                  self.qk_nope_head_dim)
             chunked_k_pe = chunked_k_pe.view(-1, 1, self.qk_rope_head_dim)
-            chunked_k = torch.cat(
+            chunked_k = compiled_cat(
                 (chunked_k_nope, chunked_k_pe.expand(-1, self.num_heads, -1)),
                 dim=-1)
             chunked_k = chunked_k.view(-1, self.num_heads * self.qk_head_dim)
@@ -1267,7 +1316,7 @@ class MLA(nn.Module):
 
         k_nope = k_nope.view(-1, self.num_heads, self.qk_nope_head_dim)
         k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
-        k = torch.cat((k_nope, k_pe.expand(-1, self.num_heads, -1)), dim=-1)
+        k = compiled_cat((k_nope, k_pe.expand(-1, self.num_heads, -1)), dim=-1)
         k = k.view(-1, self.num_heads * self.qk_head_dim)
 
         # copy q_lens to replace kv_lens_runtime

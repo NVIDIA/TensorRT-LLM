@@ -1,6 +1,6 @@
-# TensorRT-LLM Wide-EP Benchmark Scripts
+# TensorRT LLM Wide-EP Benchmark Scripts
 
-This directory contains scripts for benchmarking TensorRT-LLM wide-ep performance using SLURM job scheduler.
+This directory contains scripts for benchmarking TensorRT LLM wide-ep performance using SLURM job scheduler.
 
 ## ⚠️ DISCLAIMER
 
@@ -19,9 +19,7 @@ Please note that:
 
 Note that, core implementation of the slurm scripts are included in `examples/disaggregated/slurm/benchmark`.
 
-1. `submit_e2e.sh` - Main entry point for submitting E2E benchmark jobs
-2. `submit_gen_only.sh` - Main entry point for submitting gen-only benchmark jobs
-3. `process_gen_iterlog.py` - Processes benchmark results and generates reports
+1. `process_gen_iterlog.py` - Processes benchmark results and generates reports
 
 ## Usage
 
@@ -29,29 +27,13 @@ Note that, core implementation of the slurm scripts are included in `examples/di
 
 Before running the scripts, ensure you have:
 - Access to a SLURM cluster
-- Container image with TensorRT-LLM installed
+- Container image with TensorRT LLM installed
 - Model files accessible on the cluster
 - Required environment variables set
 
-### Run E2E Benchmarks
+### Run Benchmarks
 
 ```bash
-# Refer to `examples/disaggregated/slurm/benchmark/`
-# Please find the `disaggr_torch.slurm` script in the `examples/disaggregated/slurm/benchmark/` directory.
-# Make sure that SLURM parameters are correctly set in `disaggr_torch.slurm` before executing this script.
-./submit_e2e.sh
+# Please find the `submit.py` script and an example `config.yaml` in the `examples/disaggregated/slurm/benchmark/` directory.
+python3 submit.py -c your_config.yaml
 ```
-
-
-### Run gen-only Benchmarks and post-processes the results using `process_gen_iterlog.py`
-
-```bash
-./submit_gen_only.sh
-
-python3 process_gen_iterlog.py --dir_prefix <path>
-```
-`process_gen_iterlog.py` will be responsible for:
-- Parses iteration logs from workers
-- Calculates throughput metrics
-- Generates CSV reports
-- Supports MTP (Multi-Token Prediction) analysis

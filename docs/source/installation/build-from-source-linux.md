@@ -147,6 +147,11 @@ check <https://github.com/NVIDIA/TensorRT-LLM/tree/main/docker>.
 
 ## Build TensorRT LLM
 
+```{tip}
+:name: build-from-source-tip-cuda-version
+TensorRT LLM 1.1 supports both CUDA 12.9 and 13.0 while some dependency changes are required. The `requirements.txt` contains dependencies needed by CUDA 13.0. If you are using CUDA 12.9, please uncomment lines end with `# <For CUDA 12.9>` and comment out the next lines.
+```
+
 ### Option 1: Full Build with C++ Compilation
 
 The following command compiles the C++ code and packages the compiled libraries along with the Python files into a wheel. When developing C++ code, you need this full build command to apply your code changes.
@@ -185,7 +190,7 @@ example:
 python3 ./scripts/build_wheel.py --cuda_architectures "80-real;86-real"
 ```
 
-To use the C++ benchmark scripts under [benchmark/cpp](/benchmarks/cpp/), for example `gptManagerBenchmark.cpp`, add the `--benchmarks` option:
+To use the C++ benchmark scripts under [benchmark/cpp](source:benchmarks/cpp/), for example `gptManagerBenchmark.cpp`, add the `--benchmarks` option:
 
 ```bash
 python3 ./scripts/build_wheel.py --benchmarks
@@ -207,6 +212,7 @@ relevant classes. The associated unit tests should also be consulted for underst
 
 This feature will not be enabled when [`building only the C++ runtime`](#link-with-the-tensorrt-llm-c++-runtime).
 
+(link-with-the-tensorrt-llm-c++-runtime)=
 #### Linking with the TensorRT LLM C++ Runtime
 
 The `build_wheel.py` script will also compile the library containing the C++ runtime of TensorRT LLM. If Python support and `torch` modules are not required, the script provides the option `--cpp_only` which restricts the build to the C++ runtime only.

@@ -1,6 +1,6 @@
 import copy
 import os
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -17,7 +17,8 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 from ...inputs import (BaseMultimodalInputProcessor, ExtraProcessedInputs,
                        InputProcessor, MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
-                       register_input_processor)
+                       register_input_processor,
+                       support_multimodal_disaggregated)
 from ...llmapi.utils import download_hf_model
 from ...logger import logger
 from ...sampling_params import SamplingParams
@@ -139,6 +140,81 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
         mm_features = mm_features.view(-1, mm_features.shape[-1])
         return fused_input_ids, mm_features
 
+    def get_prompt_token_ids(
+        self, inputs: TextPrompt,
+        mm_handles: List[Dict[str,
+                              Any]]) -> Tuple[List[int], List[int], List[int]]:
+        """
+        Build input token ids with multimodal placeholders expanded to the number of MM tokens.
+
+        Args:
+            inputs: Text prompt input container. Must contain a non-empty prompt string.
+            mm_handles: List of multimodal embedding handles. Currently only a single handle is supported.
+
+        Returns:
+            Tuple[List[int], List[int], List[int]]:
+                - expanded_ids: token ids with each image token expanded to a placeholder repeated per MM token
+                - mm_token_length: per-image MM token lengths
+                - mm_token_offsets: start offsets (positions) for each image's MM tokens within expanded_ids
+        """
+        # TODO: Move this function to the base input processor class when extending for more models
+        text_prompt = inputs.get("prompt")
+        if not text_prompt:
+            raise ValueError("Text prompt is required but not provided")
+
+        if not isinstance(mm_handles, list):
+            raise ValueError("mm_handles must be a list")
+
+        if len(mm_handles) != 1:
+            # TODO: only support single multimodal item within a request for now
+            raise NotImplementedError(
+                "Only one mm_handle is supported for LlavaNext for now")
+        hidden_size = mm_handles[0]['tensor_size'][1]
+        assert hidden_size == self.model_config.text_config.hidden_size, "Multimodal embedding hidden size must match model hidden size"
+        input_ids = self.tokenizer(text_prompt,
+                                   return_tensors="pt").input_ids[0]
+
+        vocab_size = self.model_config.text_config.vocab_size
+        image_token_index = self.model_config.image_token_index
+
+        image_mask = input_ids == image_token_index
+        image_positions = torch.where(image_mask)[0]
+        num_images = len(image_positions)
+        assert num_images == len(
+            mm_handles), "Number of images must match number of mm_handles"
+        total_mm_tokens = sum(mm_handle["tensor_size"][0]
+                              for mm_handle in mm_handles)
+        final_length = len(input_ids) - num_images + total_mm_tokens
+        # Create output tensor
+        expanded_ids = torch.empty(final_length, dtype=input_ids.dtype)
+        placeholder_id = vocab_size + 1
+
+        # Fill the expanded sequence
+        write_pos = 0
+        image_cnt = 0
+        mm_token_length = []
+        mm_token_offsets = []
+        for read_pos in range(len(input_ids)):
+            if input_ids[read_pos] == image_token_index:
+                # Replace with placeholder id
+                mm_token_num = mm_handles[image_cnt]["tensor_size"][0]
+                expanded_ids[write_pos:write_pos + mm_token_num] = \
+                    placeholder_id
+                mm_token_offsets.append(write_pos)
+                mm_token_length.append(mm_token_num)
+                write_pos += mm_token_num
+                image_cnt += 1
+            else:
+                # Copy text token as-is
+                expanded_ids[write_pos] = input_ids[read_pos]
+                write_pos += 1
+
+        assert write_pos == final_length, f"Write position mismatch: {write_pos} != {final_length}"
+        assert mm_token_length[-1] + mm_token_offsets[
+            -1] <= final_length, f"mm_token_length[-1] + mm_token_offsets[-1] ({mm_token_length[-1] + mm_token_offsets[-1]}) should be less than or equal to final_length ({final_length})"
+        return expanded_ids.to(
+            torch.int32).tolist(), mm_token_length, mm_token_offsets
+
     def attach_multimodal_embeddings(
         self, inputs: TextPrompt,
         multimodal_embedding: Dict[str, List[torch.Tensor]],
@@ -219,7 +295,8 @@ class LlavaNextVisionModel(nn.Module):
         super().__init__()
         self.model_config = model_config
         self.pretrained_config = model_config.pretrained_config
-        self.device = f"cuda:{model_config.mapping.rank}"
+        # TODO: use config.mapping.get_local_rank() instead
+        self.device = f"cuda:{torch.cuda.current_device()}"
         model_path = self.pretrained_config._name_or_path
 
         # Determine the actual local path for model files
@@ -277,7 +354,6 @@ class LlavaNextVisionModel(nn.Module):
     def post_config(self):
         self.config = self.pretrained_config.vision_config
 
-    # Copied from https://github.com/huggingface/transformers/blob/main/src/transformers/models/llava_next/modeling_llava_next.py#L284
     def pack_image_features(self,
                             image_features,
                             image_sizes,
@@ -340,6 +416,43 @@ class LlavaNextVisionModel(nn.Module):
                                     device=image_features[0].device)
         return new_image_features, feature_lens
 
+    def _pad_for_batching(
+        self,
+        pixel_values: list[torch.Tensor],
+    ):
+        """
+        Pads images on the `num_of_patches` dimension with zeros to form a batch of same number of patches.
+
+        Args:
+            pixel_values (`list[torch.Tensor]`):
+                A list of pixel value tensors, each of shape (`batch`, `num_patches`, `channels`, `height`, `width`)
+
+        Returns:
+            list[`torch.Tensor`]: The padded image tensors.
+        """
+        if not pixel_values:
+            return pixel_values
+
+        # Find max patches across all images
+        max_patches = max(tensor.shape[1] for tensor in pixel_values)
+
+        # Pad each tensor by concatenating zeros on dim=1 (num_patches)
+        padded_values = []
+
+        for pixel_value in pixel_values:
+            current_patches = pixel_value.shape[1]
+            if current_patches < max_patches:
+                pad_len = max_patches - current_patches
+                zeros = pixel_value.new_zeros(
+                    (pixel_value.shape[0], pad_len, *pixel_value.shape[2:]))
+                padded_pixel_value = torch.cat([pixel_value, zeros], dim=1)
+            else:
+                padded_pixel_value = pixel_value
+
+            padded_values.append(padded_pixel_value)
+
+        return padded_values
+
     @torch.inference_mode()
     def forward(self, multimodal_params: List[MultimodalParams]):
         pixel_values = [
@@ -350,6 +463,8 @@ class LlavaNextVisionModel(nn.Module):
             multimodal_param.multimodal_data["image"]["image_sizes"]
             for multimodal_param in multimodal_params
         ]
+        pixel_values = self._pad_for_batching(pixel_values)
+
         pixel_values = torch.cat(pixel_values, dim=0)
         image_sizes = torch.cat(image_sizes, dim=0)
 
@@ -395,6 +510,7 @@ class LlavaNextVisionModel(nn.Module):
         return [image_features]
 
 
+@support_multimodal_disaggregated
 @register_vision_encoder(LlavaNextVisionModel)
 @register_auto_model("LlavaNextForConditionalGeneration")
 @register_input_processor(

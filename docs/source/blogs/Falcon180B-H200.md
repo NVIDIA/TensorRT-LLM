@@ -21,7 +21,7 @@ memory footprint, allows for great performance on Falcon-180B on a single GPU.
 
 <sup>Preliminary measured Performance, subject to change. TP1 does not represent peak performance on H200. </sup>
 <sup>
-TensorRT-LLM v0.7a |
+TensorRT LLM v0.7a |
 Falcon-180B |
 1xH200 TP1 |
 INT4 AWQ |
@@ -38,7 +38,7 @@ while maintaining high accuracy.
 
 <sup>Preliminary measured accuracy, subject to change. </sup>
 <sup>
-TensorRT-LLM v0.7a |
+TensorRT LLM v0.7a |
 Falcon-180B |
 1xH200 TP1 |
 INT4 AWQ
@@ -84,20 +84,20 @@ than A100.
 
 <sup>Preliminary measured performance, subject to change. </sup>
 <sup>
-TensorRT-LLM v0.7a |
+TensorRT LLM v0.7a |
 Llama2-70B |
 1xH200 = TP1, 8xH200 = max TP/PP/DP config |
 FP8 |
 BS: (in order) 960, 960, 192, 560, 96, 640 </sup>
 
 
-**TensorRT-LLM GQA now 2.4x faster on H200**
+**TensorRT LLM GQA now 2.4x faster on H200**
 
 <img src="https://github.com/NVIDIA/TensorRT-LLM/blob/rel/docs/source/blogs/media/Falcon180B-H200_DecvOct.png?raw=true" alt="Llama-70B H200 December vs Oct." width="400" height="auto">
 
 <sup>Preliminary measured performance, subject to change.</sup>
 <sup>
-TensorRT-LLM v0.7a vs TensorRT-LLM v0.6a |
+TensorRT LLM v0.7a vs TensorRT LLM v0.6a |
 Llama2-70B |
 1xH200 TP1 |
 FP8 |

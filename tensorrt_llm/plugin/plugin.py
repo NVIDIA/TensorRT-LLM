@@ -17,13 +17,15 @@ import ctypes
 import os
 import platform
 from collections import OrderedDict
-from dataclasses import asdict, dataclass, field, fields
 from enum import IntEnum
 from pathlib import Path
 from textwrap import dedent
-from typing import List, Optional, Tuple
+from typing import (Any, List, Literal, Optional, Tuple, Union, get_args,
+                    get_origin)
 
 import tensorrt as trt
+from pydantic import (BaseModel, ConfigDict, Field, PrivateAttr, ValidationInfo,
+                      field_validator)
 
 from .._ipc_utils import IpcMemory, can_access_peer
 from .._utils import get_sm_version
@@ -53,7 +55,7 @@ def _load_plugin_lib():
         handle.initTrtLlmPlugins.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
         handle.initTrtLlmPlugins.restype = ctypes.c_bool
     except AttributeError as err:
-        raise ImportError('TensorRT-LLM Plugin is unavailable') from err
+        raise ImportError('TensorRT LLM Plugin is unavailable') from err
 
     try:
         assert handle.initTrtLlmPlugins(
@@ -79,66 +81,11 @@ class ContextFMHAType(IntEnum):
     enabled_with_fp32_acc = 2
 
 
-DEFAULT_PLUGIN_DTYPE_OPTIONS = [
-    "auto", "float16", "float32", "bfloat16", "int32", None
-]
-PLUGIN_DTYPE_OPTIONS_MAP = {
-    "gemm_swiglu_plugin": ["fp8", None],
-    "gemm_plugin":
-    ["auto", "float16", "float32", "bfloat16", "int32", "fp8", "nvfp4", None],
-    "low_latency_gemm_plugin": ["fp8", None],
-    "low_latency_gemm_swiglu_plugin": ["fp8", None],
-    "gemm_allreduce_plugin": ["float16", "bfloat16", None]
-}
+DefaultPluginDtype = Literal["auto", "float16", "float32", "bfloat16", "int32",
+                             None]
 
 
-def _make_plugin_property(field_name: str, field_type: type):
-
-    def bind(field_name):
-        storage_name = f'_{field_name}'
-
-        @property
-        def prop(self):
-            field_value = getattr(self, storage_name)
-            if field_name != 'dtype' and field_value == 'auto':
-                return self.dtype
-            else:
-                return field_value
-
-        @prop.setter
-        def prop(self, value):
-            if field_type is bool:
-                assert isinstance(value, bool), \
-                    f"Plugin {field_name} expects {field_type}, got {type(value)}"
-            elif field_type in (str, Optional[str]):
-                plugin_dtype_options = DEFAULT_PLUGIN_DTYPE_OPTIONS
-                if field_name in PLUGIN_DTYPE_OPTIONS_MAP:
-                    plugin_dtype_options = PLUGIN_DTYPE_OPTIONS_MAP[field_name]
-                assert value in plugin_dtype_options, \
-                    f"Plugin {field_name} expects values in {plugin_dtype_options}, got {value}"
-            if field_name == 'dtype':
-                assert value not in ['auto', None], \
-                    "Plugin dtype cannot be auto or None"
-            setattr(self, storage_name, value)
-            logger.info(f"Set {field_name} to {value}.")
-
-        return prop
-
-    return bind(field_name)
-
-
-class PluginConfigMeta(type):
-
-    def __new__(cls, name, bases, attrs):
-        for storage_name, field_type in attrs['__annotations__'].items():
-            assert storage_name.startswith('_')
-            field_name = storage_name.lstrip('_')
-            attrs[field_name] = _make_plugin_property(field_name, field_type)
-        return super().__new__(cls, name, bases, attrs)
-
-
-@dataclass(slots=True)
-class PluginConfig(metaclass=PluginConfigMeta):
+class PluginConfig(BaseModel):
     """The config that manages plugin-related options.
 
     There are two option categories:
@@ -149,322 +96,250 @@ class PluginConfig(metaclass=PluginConfigMeta):
     * Other features. These options can be assigned with boolean:
         * True, which means the plugin is enabled;
         * False, which means the plugin is disabled.
-
-    Note: All the fields should use a prefix "_"; PluginConfigMeta will wrap each field as a property.
-    This ensures the fields can only be assigned with allowed values.
     """
-    _dtype: str = field(default="float16", init=False)
+    model_config = ConfigDict(validate_assignment=True, extra="ignore")
+
+    dtype: str = Field(default="float16",
+                       description="Base dtype for the model and plugins")
 
     # Plugins
-    _bert_attention_plugin: Optional[str] = field(
+    bert_attention_plugin: Optional[DefaultPluginDtype] = Field(
         default="auto",
-        init=False,
-        metadata={
-            "help":
-            "The plugin that uses efficient kernels and enables an in-place update of the KV cache for attention layer of BERT-like encoder models."
-        })
-    _gpt_attention_plugin: Optional[str] = field(
+        description=
+        "The plugin that uses efficient kernels and enables an in-place update of the KV cache for attention layer of BERT-like encoder models."
+    )
+    gpt_attention_plugin: Optional[DefaultPluginDtype] = Field(
         default="auto",
-        init=False,
-        metadata={
-            "help":
-            "The plugin that uses efficient kernels and enables an in-place update of the KV cache for attention layer of GPT-like decoder models."
-        })
-    _gemm_plugin: Optional[str] = field(
-        default=None,
-        init=False,
-        metadata={
-            "help":
+        description=
+        "The plugin that uses efficient kernels and enables an in-place update of the KV cache for attention layer of GPT-like decoder models."
+    )
+    gemm_plugin: Optional[Literal[
+        "auto", "float16", "float32", "bfloat16", "int32", "fp8", "nvfp4",
+        None]] = Field(
+            default=None,
+            description=
             "The GEMM plugin that utilizes NVIDIA cuBLASLt to perform GEMM operations. "
             "Note: it's only affective for non-quantized gemm operations (except FP8)."
-            "Note: For FP8, it also requires same calibration in checkpoint."
-        })
-    _explicitly_disable_gemm_plugin: bool = False
-    _gemm_swiglu_plugin: Optional[str] = field(
+            "Note: For FP8, it also requires same calibration in checkpoint.")
+    _explicitly_disable_gemm_plugin: bool = PrivateAttr(default=False)
+    gemm_swiglu_plugin: Optional[Literal["fp8", None]] = Field(
         default=None,
-        init=False,
-        metadata={
-            "help":
-            "The GEMM + SwiGLU fusion in Gated-MLP combines two Matmul operations and "
-            "one SwiGLU operation into a single kernel. Currently this is only supported for FP8 precision on Hopper."
-        })
-    _fp8_rowwise_gemm_plugin: Optional[str] = field(
+        description=
+        "The GEMM + SwiGLU fusion in Gated-MLP combines two Matmul operations and "
+        "one SwiGLU operation into a single kernel. Currently this is only supported for FP8 precision on Hopper."
+    )
+    fp8_rowwise_gemm_plugin: Optional[DefaultPluginDtype] = Field(
         default=None,
-        init=False,
-        metadata={
-            "help":
-            "The quantized GEMM for fp8, which uses per token dynamic scales for "
-            "activation and per channel static scales for weights."
-            "Note: It also requires same calibration in checkpoint."
-        })
-    _qserve_gemm_plugin: Optional[str] = field(
+        description=
+        "The quantized GEMM for fp8, which uses per token dynamic scales for "
+        "activation and per channel static scales for weights."
+        "Note: It also requires same calibration in checkpoint.")
+    qserve_gemm_plugin: Optional[DefaultPluginDtype] = Field(
         default=None,
-        init=False,
-        metadata={
-            "help":
-            "The quantized GEMM from [QServe](https://arxiv.org/abs/2405.04532), "
-            "which employs 4-bit quantization for weights and 8-bit quantization for activations."
-        })
-    _identity_plugin: Optional[str] = field(
+        description=
+        "The quantized GEMM from [QServe](https://arxiv.org/abs/2405.04532), "
+        "which employs 4-bit quantization for weights and 8-bit quantization for activations."
+    )
+    identity_plugin: Optional[DefaultPluginDtype] = Field(
         default=None,
-        init=False,
-        metadata={
-            "help":
-            "The identity plugin simply copies inputs to outputs, it's used mostly for debugging purpose."
-        })
-    _nccl_plugin: Optional[str] = field(
+        description=
+        "The identity plugin simply copies inputs to outputs, it's used mostly for debugging purpose."
+    )
+    nccl_plugin: Optional[DefaultPluginDtype] = Field(
         default="auto",
-        init=False,
-        metadata={
-            "help":
-            "The NCCL plugin wraps NCCL operators to support multi-GPU and even multi-nodes."
-        })
-    _lora_plugin: Optional[str] = field(default=None,
-                                        init=False,
-                                        metadata={"help": "Enable LoRA."})
-    _dora_plugin: bool = field(default=False,
-                               init=False,
-                               metadata={"help": "Enable DoRA."})
-    _weight_only_groupwise_quant_matmul_plugin: Optional[str] = field(
+        description=
+        "The NCCL plugin wraps NCCL operators to support multi-GPU and even multi-nodes."
+    )
+    lora_plugin: Optional[DefaultPluginDtype] = Field(
+        default=None, description="Enable LoRA.")
+    dora_plugin: bool = Field(default=False, description="Enable DoRA.")
+    weight_only_groupwise_quant_matmul_plugin: Optional[
+        DefaultPluginDtype] = Field(
+            default=None,
+            description=
+            "Enable weight-only groupwise quantization matmul operators.")
+    weight_only_quant_matmul_plugin: Optional[DefaultPluginDtype] = Field(
         default=None,
-        init=False,
-        metadata={
-            "help":
-            "Enable weight-only groupwise quantization matmul operators."
-        })
-    _weight_only_quant_matmul_plugin: Optional[str] = field(
-        default=None,
-        init=False,
-        metadata={"help": "Enable weight-only quantization matmul operators."})
-    _smooth_quant_plugins: bool = field(
+        description="Enable weight-only quantization matmul operators.")
+    smooth_quant_plugins: bool = Field(
         default=True,
-        init=False,
-        metadata={
-            "help": "Enable a group of plugins to support smooth quantization."
-        })
-    _smooth_quant_gemm_plugin: Optional[str] = field(
+        description="Enable a group of plugins to support smooth quantization.")
+    smooth_quant_gemm_plugin: Optional[DefaultPluginDtype] = Field(
         default=None,
-        init=False,
-        metadata={
-            "help":
-            "Enable plugin that supports smooth quantization gemm kernels."
-        })
-    _layernorm_quantization_plugin: Optional[str] = field(
+        description=
+        "Enable plugin that supports smooth quantization gemm kernels.")
+    layernorm_quantization_plugin: Optional[DefaultPluginDtype] = Field(
         default=None,
-        init=False,
-        metadata={
-            "help":
-            "Enable plugin that supports layernorm quantization kernels."
-        })
-    _rmsnorm_quantization_plugin: Optional[str] = field(
+        description="Enable plugin that supports layernorm quantization kernels."
+    )
+    rmsnorm_quantization_plugin: Optional[DefaultPluginDtype] = Field(
         default=None,
-        init=False,
-        metadata={
-            "help": "Enable plugin that supports rmsnorm quantization kernels."
-        })
-    _quantize_per_token_plugin: bool = field(
+        description="Enable plugin that supports rmsnorm quantization kernels.")
+    quantize_per_token_plugin: bool = Field(
         default=False,
-        init=False,
-        metadata={
-            "help": "Enable plugin that supports per-token quantization."
-        })
-    _quantize_tensor_plugin: bool = field(
+        description="Enable plugin that supports per-token quantization.")
+    quantize_tensor_plugin: bool = Field(
         default=False,
-        init=False,
-        metadata={
-            "help": "Enable plugin that supports per-tensor quantization."
-        })
-    _moe_plugin: Optional[str] = field(
+        description="Enable plugin that supports per-tensor quantization.")
+    moe_plugin: Optional[DefaultPluginDtype] = Field(
         default="auto",
-        init=False,
-        metadata={
-            "help":
-            "Enable some customized kernels to speed up the MoE layer of MoE models."
-        })
-    _mamba_conv1d_plugin: Optional[str] = field(
+        description=
+        "Enable some customized kernels to speed up the MoE layer of MoE models."
+    )
+    mamba_conv1d_plugin: Optional[DefaultPluginDtype] = Field(
         default="auto",
-        init=False,
-        metadata={
-            "help":
-            "Enable customized kernels to speed up conv1d operator for Mamba."
-        })
-    _low_latency_gemm_plugin: Optional[str] = field(
+        description=
+        "Enable customized kernels to speed up conv1d operator for Mamba.")
+    low_latency_gemm_plugin: Optional[Literal["fp8", None]] = Field(
         default=None,
-        init=False,
-        metadata={
-            "help":
-            "The GEMM plugin that optimized specially for low latency scenarios."
-        })
-    _low_latency_gemm_swiglu_plugin: Optional[str] = field(
+        description=
+        "The GEMM plugin that optimized specially for low latency scenarios.")
+    low_latency_gemm_swiglu_plugin: Optional[Literal["fp8", None]] = Field(
         default=None,
-        init=False,
-        metadata={
-            "help":
-            "The GEMM + SwiGLU fusion plugin that optimized specially for low latency scenarios."
-        })
-
-    _gemm_allreduce_plugin: Optional[str] = field(
-        default=None,
-        init=False,
-        metadata={"help": "The GEMM + AllReduce kernel fusion plugin."})
+        description=
+        "The GEMM + SwiGLU fusion plugin that optimized specially for low latency scenarios."
+    )
+    gemm_allreduce_plugin: Optional[Literal[
+        "float16", "bfloat16",
+        None]] = Field(default=None,
+                       description="The GEMM + AllReduce kernel fusion plugin.")
 
     # Features
-    _context_fmha: bool = field(
+    context_fmha: bool = Field(
         default=True,
-        init=False,
-        metadata={
-            "help":
-            "Enable the fused multi-head attention during the context phase, "
-            "will trigger a kernel that performs the MHA/MQA/GQA block using a single kernel."
-        })
-    _bert_context_fmha_fp32_acc: bool = field(
+        description=
+        "Enable the fused multi-head attention during the context phase, "
+        "will trigger a kernel that performs the MHA/MQA/GQA block using a single kernel."
+    )
+    bert_context_fmha_fp32_acc: bool = Field(
         default=False,
-        init=False,
-        metadata={
-            "help":
-            "Enable the FP32 accumulator for context FMHA in the bert_attention_plugin. "
-            "If disabled, FP16 is used, better performance but potentially worse accuracy is expected."
-        })
-    _paged_kv_cache: Optional[bool] = field(
+        description=
+        "Enable the FP32 accumulator for context FMHA in the bert_attention_plugin. "
+        "If disabled, FP16 is used, better performance but potentially worse accuracy is expected."
+    )
+    paged_kv_cache: Optional[bool] = Field(
         default=None,
-        init=False,
-        metadata={
-            "help":
-            "Enable paged KV cache, which helps manage memory for the KV cache more efficiently, "
-            "and usually leads to an increase in the batch size and an improved efficiency."
-        })
-    _remove_input_padding: bool = field(
+        description=
+        "Enable paged KV cache, which helps manage memory for the KV cache more efficiently, "
+        "and usually leads to an increase in the batch size and an improved efficiency."
+    )
+    remove_input_padding: bool = Field(
         default=True,
-        init=False,
-        metadata={
-            "help":
-            "Pack different tokens together, which reduces both the amount of computations and memory consumption."
-        })
-    _norm_quant_fusion: bool = field(
+        description=
+        "Pack different tokens together, which reduces both the amount of computations and memory consumption."
+    )
+    norm_quant_fusion: bool = Field(
         default=False,
-        init=False,
-        metadata={
-            "help":
-            "Fuse the LayerNorm and quantization kernels into a single kernel, "
-            "resulting in improved end-to-end performance."
-        })
-    _reduce_fusion: bool = field(
+        description=
+        "Fuse the LayerNorm and quantization kernels into a single kernel, "
+        "resulting in improved end-to-end performance.")
+    reduce_fusion: bool = Field(
         default=False,
-        init=False,
-        metadata={
-            "help":
-            "Fuse the ResidualAdd and LayerNorm kernels after AllReduce into a single kernel, "
-            "resulting in improved end-to-end performance."
-        })
-    _user_buffer: bool = field(
+        description=
+        "Fuse the ResidualAdd and LayerNorm kernels after AllReduce into a single kernel, "
+        "resulting in improved end-to-end performance.")
+    user_buffer: bool = Field(
         default=False,
-        init=False,
-        metadata={
-            "help":
-            "Eliminate extra copies from the local buffer to the shared buffer "
-            "in the communication kernel, leading to improved end-to-end performance. "
-            "This feature must be enabled with `--reduce_fusion enable` and "
-            "is currently only supported for the FP8 LLAMA model."
-        })
-    _tokens_per_block: int = field(
+        description=
+        "Eliminate extra copies from the local buffer to the shared buffer "
+        "in the communication kernel, leading to improved end-to-end performance. "
+        "This feature must be enabled with `--reduce_fusion enable` and "
+        "is currently only supported for the FP8 LLAMA model.")
+    tokens_per_block: int = Field(
         default=32,
-        init=False,
-        metadata={
-            "help":
-            "Define how many tokens are contained in each paged kv cache block."
-        })
-    _use_paged_context_fmha: bool = field(
+        description=
+        "Define how many tokens are contained in each paged kv cache block.")
+    use_paged_context_fmha: bool = Field(
         default=True,
-        init=False,
-        metadata={
-            "help":
-            "Allow advanced features like KV cache reuse and chunked context."
-        })
-    _use_fp8_context_fmha: bool = field(
+        description=
+        "Allow advanced features like KV cache reuse and chunked context.")
+    use_fp8_context_fmha: bool = Field(
         default=True,
-        init=False,
-        metadata={
-            "help":
-            "When FP8 quantization is activated, the attention can be further accelerated by enabling FP8 Context FMHA"
-        })
-    _fuse_fp4_quant: bool = field(
+        description=
+        "When FP8 quantization is activated, the attention can be further accelerated by enabling FP8 Context FMHA"
+    )
+    fuse_fp4_quant: bool = Field(
         default=False,
-        init=False,
-        metadata={
-            "help": "Whether to fuse FP4 quantization into attention kernel."
-        })
-    _multiple_profiles: bool = field(
+        description="Whether to fuse FP4 quantization into attention kernel.")
+    multiple_profiles: bool = Field(
         default=False,
-        init=False,
-        metadata={
-            "help":
-            "Enables multiple TensorRT optimization profiles in the built engines, "
-            "will benefits the performance especially when GEMM plugin is disabled, "
-            "because more optimization profiles help TensorRT have more chances to select better kernels. "
-            "Note: This feature increases engine build time but no other adverse effects are expected."
-        })
-    _paged_state: bool = field(
+        description=
+        "Enables multiple TensorRT optimization profiles in the built engines, "
+        "will benefits the performance especially when GEMM plugin is disabled, "
+        "because more optimization profiles help TensorRT have more chances to select better kernels. "
+        "Note: This feature increases engine build time but no other adverse effects are expected."
+    )
+    paged_state: bool = Field(
         default=True,
-        init=False,
-        metadata={
-            "help":
-            "Enable paged state, which helps manage memory for the RNN state more efficiently."
-        })
-    _streamingllm: bool = field(
+        description=
+        "Enable paged state, which helps manage memory for the RNN state more efficiently."
+    )
+    streamingllm: bool = Field(
         default=False,
-        init=False,
-        metadata={
-            "help":
-            "Enable [StreamingLLM](https://arxiv.org/abs/2309.17453), which uses a window attention to perform efficient and stable LLM on long texts."
-        })
-    _manage_weights: bool = field(
+        description=
+        "Enable [StreamingLLM](https://arxiv.org/abs/2309.17453), which uses a window attention to perform efficient and stable LLM on long texts."
+    )
+    manage_weights: bool = Field(
         default=False,
-        init=False,
-        metadata={
-            "help":
-            "Enable TensorRT-LLM managed weights to speed up engine building process."
-        })
-    _use_fused_mlp: bool = field(
+        description=
+        "Enable TensorRT LLM managed weights to speed up engine building process."
+    )
+    use_fused_mlp: bool = Field(
         default=True,
-        init=False,
-        metadata={
-            "help":
-            "Enable horizontal fusion in Gated-MLP that combines two Matmul "
-            "operations into a single one followed by a separate SwiGLU kernel."
-        })
-    _pp_reduce_scatter: bool = field(
+        description=
+        "Enable horizontal fusion in Gated-MLP that combines two Matmul "
+        "operations into a single one followed by a separate SwiGLU kernel.")
+    pp_reduce_scatter: bool = Field(
         default=False,
-        init=False,
-        metadata={
-            "help":
-            "Enable a pipeline parallelism optimization with "
-            "ReduceScatter + AllGather targeting large MoE models."
-        })
+        description="Enable a pipeline parallelism optimization with "
+        "ReduceScatter + AllGather targeting large MoE models.")
 
-    def update_from_dict(self, config: dict):
-        for name in config.keys():
-            if hasattr(self, name):
-                value_to_be_update = config[name]
-                if isinstance(getattr(self, name),
-                              bool) or name == 'paged_kv_cache':
-                    if value_to_be_update == "enable":
-                        value_to_be_update = True
-                    elif value_to_be_update == "disable":
-                        value_to_be_update = False
-                elif value_to_be_update == "disable":
-                    value_to_be_update = None
-                setattr(self, name, value_to_be_update)
+    def __getattribute__(self, name: str) -> Any:
+        """Override to resolve 'auto' values to dtype field.
 
+        When a plugin field has value 'auto', return the value of dtype instead.
+        """
+        # Use object.__getattribute__ to avoid infinite recursion
+        value = object.__getattribute__(self, name)
+
+        if name != "dtype" and value == "auto":
+            return self.dtype
+
+        return value
+
+    @field_validator("dtype")
     @classmethod
-    def from_dict(cls, config: dict):
-        plugin_config = cls()
-        plugin_config.update_from_dict(config)
-        return plugin_config
+    def validate_dtype_not_auto(cls, v: str) -> str:
+        if v == "auto":
+            raise ValueError("Plugin dtype cannot be 'auto'")
+        return v
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def convert_enable_disable(cls, value, info: ValidationInfo):
+        """Allow passing enable/disable strings which map to boolean/None values."""
+        if value == "enable":
+            return True
+        elif value == "disable":
+            annotation = cls.model_fields[info.field_name].annotation
+            if annotation is bool or (get_origin(annotation) is Union
+                                      and bool in get_args(annotation)):
+                return False
+            return None
+        return value
+
+    @field_validator("*", mode="after")
+    @classmethod
+    def log_field_changes(cls, v: Any, info: ValidationInfo) -> Any:
+        """Log all field changes for debugging."""
+        logger.info(f"Set {cls.__name__}.{info.field_name} to {v}.")
+        return v
 
     @classmethod
     def from_arguments(cls, args: argparse.Namespace):
+        """Create a PluginConfig from argparse arguments."""
         args = vars(args)
-        obj = cls.from_dict(args)
+        obj = cls(**args)
 
         # We want to know if the user explicitly disabled the gemm_plugin
         # because nvfp4 gemm uses plugin by default currently
@@ -473,27 +348,20 @@ class PluginConfig(metaclass=PluginConfigMeta):
 
         return obj
 
-    def to_dict(self):
-        config = asdict(self)
-        # Remove prefix "_" of the storage name
-        config = {key.lstrip('_'): value for key, value in config.items()}
-        return config
-
     def to_legacy_setting(self):
-        '''Legacy setting means that all of the plugins and features are
+        """Legacy setting means that all of the plugins and features are
         disabled, this is needed for the legacy `build.py` script, which will be
         migrated to the centralized building script `tensorrt_llm/commands/build.py`.
 
         After the migration is done, this function may or may not be deleted.
-        '''
-        for field in fields(self):
-            # Remove prefix "_" of the storage name
-            field_name = field.name.lstrip('_')
-            if field_name == 'dtype':
+        """
+        for field_name, field_value in self:
+            if field_name == "dtype":
                 continue
-            if field.type in (str, Optional[str]):
+            elif isinstance(field_value, str):
                 setattr(self, field_name, None)
-            elif field.type == bool or field_name == 'paged_kv_cache':
+            elif isinstance(field_value,
+                            bool) or field_name == "paged_kv_cache":
                 setattr(self, field_name, False)
 
     def validate(self):
@@ -621,41 +489,47 @@ cli_plugin_args = [
 
 
 def add_plugin_argument(parser: argparse.ArgumentParser):
-    plugin_config = PluginConfig()
-    for field in fields(plugin_config):
-        # Remove prefix "_" of the storage name
-        field_name = field.name.lstrip('_')
+    for field_name, field_info in PluginConfig.model_fields.items():
         if field_name not in cli_plugin_args:
             continue
-        if field.metadata and "help" in field.metadata:
-            help_message = field.metadata["help"]
-        else:
+        help_message = field_info.description
+        if not help_message:
             raise AttributeError(f"Please add help message for {field_name}.")
-        if field.type in (str, Optional[str]):
-            plugin_dtype_options = DEFAULT_PLUGIN_DTYPE_OPTIONS
-            if field_name in PLUGIN_DTYPE_OPTIONS_MAP:
-                plugin_dtype_options = PLUGIN_DTYPE_OPTIONS_MAP[field_name]
+        annotation = field_info.annotation
+
+        # Extract choices from the Optional[Literal[...]] type
+        plugin_dtype_options = None
+        if get_origin(annotation) is Union:
+            args = get_args(annotation)
+            for arg in args:
+                if get_origin(arg) is Literal:
+                    plugin_dtype_options = list(get_args(arg))
+                    if type(None) in args:
+                        plugin_dtype_options.append(None)
+                    break
+
+        if plugin_dtype_options is not None:
             if field_name == "gemm_plugin":
-                default = field.default
+                default = field_info.default
             else:
-                default = field.default if field.default else "disable"
+                default = field_info.default if field_info.default else "disable"
             parser.add_argument(
                 "--" + field_name,
                 type=str,
                 default=default,
                 choices=[x if x else "disable" for x in plugin_dtype_options],
                 help=help_message)
-        elif field.type == bool:
+        elif annotation is bool:
             parser.add_argument(
                 "--" + field_name,
                 type=str,
-                default="enable" if field.default else "disable",
+                default="enable" if field_info.default else "disable",
                 choices=["enable", "disable"],
                 help=help_message)
         else:
             parser.add_argument("--" + field_name,
-                                type=field.type,
-                                default=field.default,
+                                type=annotation,
+                                default=field_info.default,
                                 help=help_message)
     return parser
 

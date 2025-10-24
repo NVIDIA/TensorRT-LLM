@@ -151,7 +151,6 @@ class Network(object):
         self._strongly_typed = trt.INetworkDefinition.get_flag(
             self._trt_network, trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED)
         self._unfilled_weights: Dict[str, Tuple[np.array, np.array]] = {}
-        self._auto_parallel_config: Dict[str, Any] = None
 
         return self
 
@@ -208,10 +207,6 @@ class Network(object):
     @property
     def strongly_typed(self) -> bool:
         return self._strongly_typed
-
-    @property
-    def auto_parallel_config(self) -> Dict[str, Any]:
-        return self._auto_parallel_config
 
     def _add_input(self,
                    tensor,
