@@ -117,8 +117,8 @@ __device__ struct __attribute__((aligned(32))) LamportFlags
         {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000))
             asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" ::"l"(offset_access_ptr), "r"(1) : "memory");
-#elif (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-            asm volatile("red.global.gpu.add.u32 [%0], %1;" ::"l"(offset_access_ptr), "r"(1) : "memory");
+#elif (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700))
+            asm volatile("red.release.global.gpu.add.u32 [%0], %1;" ::"l"(offset_access_ptr), "r"(1) : "memory");
 #else
             atomicAdd(offset_access_ptr, 1);
 #endif
