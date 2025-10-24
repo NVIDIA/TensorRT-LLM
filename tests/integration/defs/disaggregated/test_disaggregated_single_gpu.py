@@ -419,8 +419,9 @@ def test_disaggregated_spec_dec_batch_slot_limit(model, spec_dec_model_path,
              max_batch_size=1))
 
     kv_cache_configs = [
-        KvCacheConfig(max_tokens=128, enable_block_reuse=False)
-        for _ in range(2)
+        KvCacheConfig(max_tokens=128,
+                      enable_block_reuse=False,
+                      free_gpu_memory_fraction=0.4) for _ in range(2)
     ]
     cache_transceiver_configs = [
         CacheTransceiverConfig(backend="DEFAULT") for _ in range(2)

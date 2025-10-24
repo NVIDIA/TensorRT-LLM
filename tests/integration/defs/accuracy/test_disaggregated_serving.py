@@ -185,11 +185,18 @@ def launch_disaggregated_llm(
         gen_servers.append((env_gen, gen_server_args))
 
     @contextlib.contextmanager
-    def multi_popen(server_configs):
+    def multi_popen(server_configs, server_name="", enable_redirect_log=False):
         processes = []
+        log_files = []
         try:
-            for env, args in server_configs:
-                proc = popen(args, env=env)
+            for i, (env, args) in enumerate(server_configs):
+                if enable_redirect_log:
+                    f = open(f"output_{server_name}_{i}.log", "w+")
+                    env["TLLM_LOG_LEVEL"] = "INFO"
+                    proc = popen(args, env=env, stdout=f, stderr=f)
+                    log_files.append(f)
+                else:
+                    proc = popen(args, env=env)
                 processes.append(proc)
 
             with contextlib.ExitStack() as stack:
@@ -197,6 +204,8 @@ def launch_disaggregated_llm(
                     stack.enter_context(proc) for proc in processes
                 ]
                 yield opened_processes
+            for f in log_files:
+                f.close()
         except Exception as e:
             print(
                 f"Failed to start disaggregated server processes in multi_popen: {e}"
@@ -208,13 +217,19 @@ def launch_disaggregated_llm(
         disaggregated_serving_config_path, "--server_start_timeout",
         str(server_waiting_timeout)
     ]
-    with (MyThreadPoolExecutor(max_workers=16) as
-          thread_pool, temp_dir, multi_popen(ctx_servers + gen_servers) as
-          worker_processes, popen(server_cmd) as server_process):
+    with (
+            MyThreadPoolExecutor(max_workers=16) as thread_pool,
+            temp_dir,
+            multi_popen(ctx_servers, "ctx") as ctx_processes,
+            multi_popen(gen_servers, "gen") as gen_processes,
+            multi_popen([(os.environ, server_cmd)], "disagg") as
+            server_processes,
+    ):
         start_time = time.time()
         while time.time() - start_time < server_waiting_timeout:
             time.sleep(5)
-            for process in itertools.chain(worker_processes, [server_process]):
+            for process in itertools.chain(ctx_processes, gen_processes,
+                                           server_processes):
                 if process.poll() is not None:
                     raise Exception(
                         f"process {process.pid} exited with code {process.returncode}"
@@ -304,6 +319,7 @@ def run_parallel_test(model_name: str,
 
     kv_cache_config = {
         "free_gpu_memory_fraction": 0.5,
+        "enable_block_reuse": True
     }
     ctx_server_config = {
         "pipeline_parallel_size": ctx_pp,
@@ -937,12 +953,15 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             },
             "enable_chunked_prefill": True,
             "max_num_tokens": 256,
+            "max_batch_size":
+            1,  # max_batch_size=1 will stabilize the accuracy test result at a cost of speed
         }
         gen_server_config = {
             "cuda_graph_config": None,
             "cache_transceiver_config": {
                 "backend": "DEFAULT"
-            }
+            },
+            "max_batch_size": 1,
         }
         disaggregated_server_config = {
             "hostname": "localhost",
