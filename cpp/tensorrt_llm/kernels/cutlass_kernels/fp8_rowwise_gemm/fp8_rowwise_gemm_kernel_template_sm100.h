@@ -21,6 +21,22 @@
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
 #endif // __GNUC__
 
+#include "cute/tensor.hpp"
+#include "cutlass/conv/convolution.h"
+// Order matters here, packed_stride.hpp is missing cute and convolution includes
+#include "cutlass/util/packed_stride.hpp"
+
+#include "cutlass/epilogue/collective/default_epilogue.hpp"
+#include "cutlass/epilogue/thread/linear_combination.h"
+#include "cutlass/gemm/collective/collective_builder.hpp"
+#include "cutlass/gemm/dispatch_policy.hpp"
+
+#include "cutlass/epilogue/thread/activation.h"
+#include "cutlass/gemm/kernel/gemm_universal.hpp"
+
+#include "cutlass/epilogue/collective/collective_builder.hpp"
+#include "cutlass/gemm/device/gemm_universal_adapter.h"
+
 #include "tensorrt_llm/kernels/archCondition.h"
 
 #ifdef __GNUC__ // Check if the compiler is GCC or Clang
@@ -93,19 +109,38 @@ struct DeviceGemmFp8RowwiseSm100
     //  setting in the Collective Builder
 
     // Implement rowwise scaling epilogue.
-    using XScale = cutlass::epilogue::fusion::Sm90ColBroadcast<0, TileShape, ElementComputeEpilogue>;
+    using XScale = cutlass::epilogue::fusion::Sm90ColBroadcast<0, TileShape, ElementComputeEpilogue,
+        ElementComputeEpilogue, cute::Stride<cute::Int<1>, cute::Int<0>, cute::Int<0>>>;
 
-    using WScale = cutlass::epilogue::fusion::Sm90RowBroadcast<0, TileShape, ElementComputeEpilogue>;
+    using WScale = cutlass::epilogue::fusion::Sm90RowBroadcast<0, TileShape, ElementComputeEpilogue,
+        ElementComputeEpilogue, cute::Stride<cute::Int<0>, cute::Int<1>, cute::Int<0>>>;
 
-    using Bias = cutlass::epilogue::fusion::Sm90RowBroadcast<0, TileShape, ElementBias>;
+    using Bias = cutlass::epilogue::fusion::Sm90RowBroadcast<0, TileShape, ElementBias, ElementBias,
+        cute::Stride<cute::Int<0>, cute::Int<1>, cute::Int<0>>>;
 
     using Accum = cutlass::epilogue::fusion::Sm90AccFetch;
-    using AccumScale = cutlass::epilogue::fusion::Sm90EVT<Multiply, WScale,
-        cutlass::epilogue::fusion::Sm90EVT<Multiply, XScale, Accum>>;
 
-    using EpilogueEVT
-        = cutlass::epilogue::fusion::Sm90EVT<Cast, cutlass::epilogue::fusion::Sm90EVT<Add, Bias, AccumScale>>;
+    using Compute0 = cutlass::epilogue::fusion::Sm90Compute<cutlass::multiplies,
+        ElementComputeEpilogue, // First stage output type.
+        ElementComputeEpilogue, // First stage input types.
+        cutlass::FloatRoundStyle::round_to_nearest>;
 
+    using EVTCompute0 = cutlass::epilogue::fusion::Sm90EVT<Compute0, WScale, Accum>;
+
+    using Compute1 = cutlass::epilogue::fusion::Sm90Compute<cutlass::multiplies, ElementOutput,
+        ElementComputeEpilogue, // Second stage input types.
+        cutlass::FloatRoundStyle::round_to_nearest>;
+
+    using EVTCompute1 = cutlass::epilogue::fusion::Sm90EVT<Compute1, XScale, EVTCompute0>;
+
+    using ComputeBias = cutlass::epilogue::fusion::Sm90Compute<cutlass::plus,
+        ElementOutput, // Final (optional) stage output type.
+        ElementBias,   // Final stage input types.
+        cutlass::FloatRoundStyle::round_to_nearest>;
+
+    using EVTComputeBias = cutlass::epilogue::fusion::Sm90EVT<ComputeBias, Bias, EVTCompute1>;
+
+    using EpilogueEVT = EVTCompute1;
     using EpilogueScheduleTypeOverride = cutlass::epilogue::collective::EpilogueScheduleAuto;
     using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<ArchTag, OperatorClass,
         TileShape, ClusterShape, cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator,
