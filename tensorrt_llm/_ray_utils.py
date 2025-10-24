@@ -26,3 +26,15 @@ def unwrap_ray_errors():
         yield
     except ray.exceptions.RayTaskError as e:
         raise e.as_instanceof_cause() from e
+
+
+def control_action_decorator(func):
+    """
+    Decorator that wraps a method to use control_action context manager.
+    """
+
+    def wrapper(self, *args, **kwargs):
+        with self.engine.control_action():
+            return func(self, *args, **kwargs)
+
+    return wrapper

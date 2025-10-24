@@ -2,7 +2,7 @@ from utils.llm_data import llm_models_root
 from utils.util import get_current_process_gpu_memory
 
 from tensorrt_llm import LLM
-from tensorrt_llm._torch.pyexecutor.py_executor import ExecutorMemoryType
+from tensorrt_llm._torch.virtual_memory import ExecutorMemoryType
 from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
 
 
@@ -14,6 +14,7 @@ def test_llm_sleep(process_gpu_memory_info_available):
     llm = LLM(
         model=llama_model_path,
         enable_sleep=True,
+        worker_extension_cls="tensorrt_llm.rlhf_utils.WorkerExtension",
         cuda_graph_config=None,  # CUDA Graph unsupported yet
         kv_cache_config=kv_cache_config)
 

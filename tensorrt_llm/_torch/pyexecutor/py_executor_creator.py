@@ -28,7 +28,7 @@ from ..attention_backend.interface import AttentionRuntimeFeatures
 from ..distributed import MPIDist, TorchDist
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
-from ..virtual_memory import RestoreMode
+from ..virtual_memory import ExecutorMemoryType, RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
@@ -38,7 +38,7 @@ from .config_utils import is_mla
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
 from .model_engine import PyTorchModelEngine
-from .py_executor import ExecutorMemoryType, PyExecutor
+from .py_executor import PyExecutor
 
 
 class _ExecutorMemoryMonitor:
