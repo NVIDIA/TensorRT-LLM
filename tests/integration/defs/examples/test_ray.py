@@ -14,7 +14,8 @@ def ray_example_root(llm_root):
 
 def test_llm_inference_async_ray(ray_example_root, llm_venv):
     script_path = os.path.join(ray_example_root, "llm_inference_async_ray.py")
-    venv_check_call(llm_venv, [script_path])
+    model_path = f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+    venv_check_call(llm_venv, [script_path, "--model", model_path])
 
 
 @pytest.mark.skip_less_device(2)
