@@ -35,6 +35,10 @@ from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 class TestCudaGraphBatchSizes:
     """Test class for CUDA graph batch size handling."""
 
+    @staticmethod
+    def _raise_error_for_forward(*args, **kwargs):
+        raise RuntimeError("forward method should not be called")
+
     @pytest.fixture
     def simple_model_and_inputs(self):
         """Create a simple model and inputs for testing."""
@@ -192,7 +196,13 @@ class TestCudaGraphBatchSizes:
             test_input = data["input_tensor"][:batch_size]
 
             with torch.inference_mode():
-                output = captured_graph.forward(test_input)
+                # temporarily remove model forward to ensure that the captured graph is used
+                original_forward = captured_graph.model.forward
+                captured_graph.model.forward = self._raise_error_for_forward
+                try:
+                    output = captured_graph.forward(test_input)
+                finally:
+                    captured_graph.model.forward = original_forward
 
                 # Should get valid output
                 assert output is not None
