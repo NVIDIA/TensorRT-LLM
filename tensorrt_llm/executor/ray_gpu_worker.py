@@ -235,12 +235,3 @@ class RayGPUWorker(BaseWorker):
 
     def __del__(self):
         self.shutdown()
-
-    def update_weights(self, ipc_handles: dict):
-        self.engine.update_weights(ipc_handles)
-
-    def sleep(self, sleep_tags: List[str]):
-        self.engine.sleep(sleep_tags)
-
-    def wakeup(self, wakeup_tags: List[str]):
-        self.engine.wakeup(wakeup_tags)

@@ -4,7 +4,6 @@ import functools
 import gc
 import os
 import pickle  # nosec B403
-import queue
 import threading
 import time
 import traceback
@@ -13,7 +12,6 @@ from contextlib import contextmanager
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
-from strenum import StrEnum
 
 from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 
@@ -24,7 +22,6 @@ except ImportError:
 
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManagerType, request_context)
-from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm._utils import (customized_gc_thresholds, is_trace_enabled,
                                  mpi_disabled, nvtx_range, trace_func)
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
@@ -45,7 +42,6 @@ from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.decoder_layer import DecoderLayer
 from ..speculative.drafter import Drafter
 from ..speculative.speculation_gate import SpeculationGate
-from ..virtual_memory import materialize_with_tag, release_with_tag
 from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
 from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
@@ -150,20 +146,6 @@ class BatchStatePP(BatchState):
     scheduled_ctx_reqs: list[LlmRequest] = None
 
 
-class ExecutorMemoryType(StrEnum):
-    SAMPLER = "sampler"
-    DRAFTER = "drafter"
-    GUIDED_DECODER = "guided_decoder"
-    SPEC_RESOURCES = "spec_resource_manager"
-    INIT_KV_CACHE = "_no_capture_init_kv_cache"
-    INIT_EXTRA_RESOURCES = "_no_capture_init_extra_resources"
-    MODEL_EXTRA = "_no_capture_model_extra"  # TODO: remove _no_capture after torch fix crash on torch.cuda.empty_cache()
-    EXTRA_RESOURCES = "executor_extra"
-    KV_CACHE = "kv_cache"
-    MODEL_ENGINE_MAIN = "model"
-    MODEL_ENGINE_DRAFT = "draft_model"
-
-
 class PyExecutor:
 
     def __init__(self,
@@ -238,12 +220,6 @@ class PyExecutor:
         self.num_fetch_requests_cur_rank = 0
         self.num_fetch_requests = 0
         self.shutdown_event = threading.Event()
-        self.weight_update_event = threading.Event()
-        self.sleep_event = threading.Event()
-        self.wakeup_event = threading.Event()
-        # inform main thread of errors from event loop threads (sleep, wakeup, update_weight)
-        self.error_queue = queue.Queue()
-        self.request_accumulator: List[RequestQueueItem] = []
 
         # Rolling acceptance tracking for spec decode (disable speculation if rolling acceptance is below threshold)
         spec_config = getattr(self.model_engine, 'spec_config', None)
@@ -323,8 +299,8 @@ class PyExecutor:
         )
         self.executor_request_queue.set_exclude_last_generation_logits(
             self.disable_overlap_scheduler, self.dist.pp_size)
-        self.is_control_request = False
-        self.control_request_id = 0
+        self.control_request_barrier = threading.Event()
+        self.control_action_done = threading.Event()
 
         self.stats_lock = threading.Lock()
         self.stats = []
@@ -495,24 +471,6 @@ class PyExecutor:
             id (int): The request id for which to cancel the response
         """
         self.executor_request_queue.enqueue_cancel_request(id)
-
-    def update_weights(self, ipc_handles: dict):
-        self.executor_request_queue.enqueue_update_weight_request(ipc_handles)
-        self.weight_update_event.wait()
-        if not self.error_queue.empty():
-            raise self.error_queue.get()
-
-    def sleep(self, sleep_tags: List[str]):
-        self.executor_request_queue.enqueue_sleep_request(sleep_tags)
-        self.sleep_event.wait()
-        if not self.error_queue.empty():
-            raise self.error_queue.get()
-
-    def wakeup(self, wakeup_tags: List[str]):
-        self.executor_request_queue.enqueue_wakeup_request(wakeup_tags)
-        self.wakeup_event.wait()
-        if not self.error_queue.empty():
-            raise self.error_queue.get()
 
     def shutdown(self):
         """
@@ -1344,91 +1302,45 @@ class PyExecutor:
             logger.error(f"Encountered an error in decode: {error_msg}")
             self._handle_errors(error_msg)
 
-    @staticmethod
-    def _get_sleep_wakeup_tags(tags_strs: List[str]):
-        tags = []
-        for tag_str in tags_strs:
-            try:
-                tags.append(ExecutorMemoryType(tag_str))
-            except ValueError:
-                raise ValueError(
-                    f"Unknown memory tag '{tag_str}'."
-                    f"Valid tags are: {[t.value for t in ExecutorMemoryType]}")
-        return tags
-
-    def _handle_sleep(self, sleep_request: RequestQueueItem):
-        try:
-            tags = self._get_sleep_wakeup_tags(sleep_request.sleep_tags)
-            logger.info(f"PyExecutor sleep: {tags}")
-            torch.cuda.synchronize()
-            release_with_tag(*tags)
-            torch.cuda.synchronize()
-        except Exception as e:
-            logger.error(f"Encountered an error in sleep")
-            self.error_queue.put(e)
-        finally:
-            self.sleep_event.set()
-
-    def _handle_wakeup(self, wakeup_request: RequestQueueItem):
-        try:
-            tags = self._get_sleep_wakeup_tags(wakeup_request.wakeup_tags)
-            logger.info(f"PyExecutor wakeup: {tags}")
-            torch.cuda.synchronize()
-            materialize_with_tag(*tags)
-            torch.cuda.synchronize()
-        except Exception as e:
-            logger.error(f"Encountered an error in wakeup")
-            self.error_queue.put(e)
-        finally:
-            self.wakeup_event.set()
-
-    def _handle_update_weight(self, update_weight_request: RequestQueueItem):
-        try:
-            logger.info(
-                f"PyExecutor update_weight_from_ipc_handles: update_weight_request.id: {update_weight_request.id}"
-            )
-            ipc_handles = update_weight_request.weight_ipc_handles
-            device_uuid = get_device_uuid(self.device_id)
-
-            if device_uuid not in ipc_handles:
-                raise ValueError(
-                    f"Device UUID {device_uuid} not found in ipc_handles")
-
-            weights = {}
-            all_handles = ipc_handles[device_uuid]
-
-            for param_name, tensor_handle in all_handles:
-                func, args = tensor_handle
-                list_args = list(args)
-                list_args[6] = self.device_id  # Set target device
-                tensor = func(*list_args)
-                weights[param_name] = tensor
-
-            self.model_engine.model.load_weights(weights)
-            torch.cuda.synchronize()
-            self.reset_prefix_cache()
-
-        except Exception as e:
-            logger.error(f"Encountered an error in update_weight")
-            self.error_queue.put(e)
-        finally:
-            self.weight_update_event.set()
-
     def _handle_control_request(self):
+        if len(self.active_requests) != 0 or \
+            self.executor_request_queue.get_waiting_queue_size() != 0:
+            return
         if len(self.executor_request_queue.control_requests) > 0:
             assert len(
                 self.executor_request_queue.control_requests
             ) == 1, f"control request should be the only request in the list, but got {len(self.executor_request_queue.control_requests)}"
-            control_request = self.executor_request_queue.control_requests.pop(
-                0)
-            if (control_request.is_update_weight_request):
-                self._handle_update_weight(control_request)
-            elif (control_request.is_sleep_request):
-                self._handle_sleep(control_request)
-            elif (control_request.is_wakeup_request):
-                self._handle_wakeup(control_request)
-            else:
-                assert False, "Invalid control request"
+            self.executor_request_queue.control_requests.pop(0)
+            self.control_request_barrier.set()
+            self.control_action_done.wait()
+            self.control_action_done.clear()
+
+    @contextmanager
+    def control_action(self):
+        """
+        Context manager for synchronized control actions.
+
+        Usage:
+            with control_action():
+                # Eventloop thread has finished all previous requests and paused
+                do some actions here
+            # Eventloop thread resumes automatically after exiting
+        """
+
+        if self.dist.rank == 0:
+            self.executor_request_queue.enqueue_control_request()
+
+        # Wait for worker to finish all previous requests
+        self.control_request_barrier.wait()
+
+        try:
+            # Yield control to the with block
+            # Worker is now paused, safe to execute actions
+            yield self
+        finally:
+            # Cleanup: signal worker to resume
+            self.control_action_done.set()
+            self.control_request_barrier.clear()
 
     def _executor_loop_overlap(self):
         torch.cuda.set_device(self.device_id)
