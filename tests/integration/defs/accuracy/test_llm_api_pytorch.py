@@ -3412,7 +3412,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         "apply_chat_template": True,
     }
 
-    MODEL_PATH = f"openai/gpt-oss-120b"
+    MODEL_PATH = f"{llm_models_root()}/gpt_oss/gpt-oss-120b"
 
     @pytest.mark.skip(reason="https://nvbugs/5596343")
     @pytest.mark.parametrize(
