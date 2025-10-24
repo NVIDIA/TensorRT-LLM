@@ -33,11 +33,11 @@
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
-#include <sstream>
-#include <unordered_set>
 #include <algorithm>
 #include <map>
 #include <optional>
+#include <sstream>
+#include <unordered_set>
 #include <utility>
 
 namespace tc = tensorrt_llm::common;
@@ -475,7 +475,7 @@ void KVCacheBlock::detachFromLookupNode()
     if (mLookupNode != nullptr)
     {
         mLookupNode->setBlock(mWindowSize, nullptr);
-	mLookupNode->deleteNodeIfPossible();
+        mLookupNode->deleteNodeIfPossible();
     }
     mLookupNode = nullptr;
     mBlockKey = BlockKey();
@@ -522,14 +522,14 @@ void KVCachePromptLookupNode::printSearchTree(std::ostream& os, SizeType32 inden
     std::stringstream ss;
     for (int i = 0; i < indent; ++i)
     {
-	ss << " ";
+        ss << " ";
     }
     auto indentStr = ss.str();
     os << getBlockKey() << "(" << getNextNodes().size() << " children)" << std::endl;
-    for (auto const& [key,child] : getNextNodes())
+    for (auto const& [key, child] : getNextNodes())
     {
-	os << indentStr << "+ ";
-        child->printSearchTree(os, indent+2);
+        os << indentStr << "+ ";
+        child->printSearchTree(os, indent + 2);
     }
 }
 
@@ -537,9 +537,9 @@ std::string KVCachePromptLookup::printSearchTree() const
 {
     std::stringstream os;
     os << "KVCachePromptLookup cache:" << std::endl;
-    for (auto const& [key,child] : mRoot->getNextNodes())
+    for (auto const& [key, child] : mRoot->getNextNodes())
     {
-	child->printSearchTree(os, 0);
+        child->printSearchTree(os, 0);
     }
     return os.str();
 }
@@ -856,8 +856,8 @@ LookupResults KVCachePromptLookup::lookup(
     auto searchRoot = mRoot;
     for (auto const& blockKey : blockKeys)
     {
-        auto matches
-            = searchRoot != nullptr ? searchRoot->findMatchingNodes(blockKey, enablePartialReuse, false) : LookupResult();
+        auto matches = searchRoot != nullptr ? searchRoot->findMatchingNodes(blockKey, enablePartialReuse, false)
+                                             : LookupResult();
         if (create && matches.empty())
         {
             // No match, create blank prompt node
@@ -986,7 +986,8 @@ void KVCachePromptLookupNode::removeNextNode(BlockKey const& blockKey)
     mNextNodes.erase(blockKey);
 }
 
-LookupResult KVCachePromptLookupNode::findMatchingNodes(BlockKey const& blockKey, bool enablePartialReuse, bool ignoreNodesWithoutBlocks) const
+LookupResult KVCachePromptLookupNode::findMatchingNodes(
+    BlockKey const& blockKey, bool enablePartialReuse, bool ignoreNodesWithoutBlocks) const
 {
     LookupResult result;
     if (blockKey.uniqueTokens.size() == 0 || mNextNodes.size() == 0)
@@ -1137,11 +1138,11 @@ void KVCachePromptLookupNode::deleteNodeIfPossible()
 {
     if (canBeDeleted())
     {
-	TLLM_LOG_DEBUG("Deleted node " + streamPrint(getFullBlockKey()));
-	auto prevNode = mPrevNode;
-	mPrevNode = nullptr;
-	prevNode->removeNextNode(getBlockKey());
-	prevNode->deleteNodeIfPossible();
+        TLLM_LOG_DEBUG("Deleted node " + streamPrint(getFullBlockKey()));
+        auto prevNode = mPrevNode;
+        mPrevNode = nullptr;
+        prevNode->removeNextNode(getBlockKey());
+        prevNode->deleteNodeIfPossible();
     }
 }
 
@@ -1588,7 +1589,7 @@ BlockPtr WindowBlockManager::getFreeBlock(executor::RetentionPriority priority,
         auto offloadBlock = std::get<0>(mEvictionPolicy->getFreeBlock(kSecondaryLevel));
         // Remove block from secondary free queue
         mEvictionPolicy->claimBlock(offloadBlock);
-	TLLM_LOG_DEBUG("Offloading block %d to %d",block->getBlockId(),offloadBlock->getBlockId());
+        TLLM_LOG_DEBUG("Offloading block %d to %d", block->getBlockId(), offloadBlock->getBlockId());
         mTransferManager->offload(block, offloadBlock, mPools, 0, mode, directory);
         // swap linear block offsets (i.e. make block the offload block)
         block->swapMemoryPoolBlockOffset(offloadBlock);
@@ -1614,8 +1615,8 @@ BlockPtr WindowBlockManager::getFreeBlock(executor::RetentionPriority priority,
     // Detach block from search structure
     if (block->getLookupNode() != nullptr)
     {
-	TLLM_LOG_DEBUG("Evicting block %d",block->getBlockId());
-	block->detachFromLookupNode();
+        TLLM_LOG_DEBUG("Evicting block %d", block->getBlockId());
+        block->detachFromLookupNode();
     }
 
     return block;
@@ -1783,12 +1784,13 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(
     auto blockItr = matchedBlocks.begin();
     for (int bi = 0; bi < numSharedContextBlocks; ++bi)
     {
-        auto [partialMatch, numMatched, matchingBlock, matchingNode]
-            = validForReuse && blockItr != matchedBlocks.end() ? *(blockItr++) : std::make_tuple(false, 0, nullptr, nullptr);
-	TLLM_LOG_DEBUG("%s;%d",__FILE__,__LINE__);
-	// Check if matchingBlock is still valid for reuse.
-	// It is possible that a matching block has been evicted after the last scan of search tree.
-	validForReuse = validForReuse && matchingBlock != nullptr && matchingBlock->isValidForReuse();
+        auto [partialMatch, numMatched, matchingBlock, matchingNode] = validForReuse && blockItr != matchedBlocks.end()
+            ? *(blockItr++)
+            : std::make_tuple(false, 0, nullptr, nullptr);
+        TLLM_LOG_DEBUG("%s;%d", __FILE__, __LINE__);
+        // Check if matchingBlock is still valid for reuse.
+        // It is possible that a matching block has been evicted after the last scan of search tree.
+        validForReuse = validForReuse && matchingBlock != nullptr && matchingBlock->isValidForReuse();
         if (validForReuse)
         {
             KVCacheBlock::IdType matchingBlockId = matchingBlock->getBlockId();
@@ -1810,13 +1812,18 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(
                 auto partialBlockKey = matchingNode->getBlockKey().clone(numMatched);
                 if (matchingBlock->hasRefs() || !matchingNode->isLeaf())
                 {
-                    // Somebody else is using block or this is full attention and block is not a leaf, copy reusable tokens
+                    // Somebody else is using block or this is full attention and block is not a leaf, copy reusable
+                    // tokens
                     // TODO: Consider whether non-leaf blocks should be reuse instead of copied for SWA layers.
                     auto newBlock
                         = getFreeBlock(matchingBlock->getPriority(), matchingBlock->getDurationMs(), mode, directory);
                     mTransferManager->onboard(matchingBlock, newBlock, mPools, numMatched, mode, directory);
                     // TODO: (optional) Send out event
-                    TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Copied partially filled block %d into %d. Reserved block %d for sequence %lu", mLogPrefix.c_str(),matchingBlock->getBlockId(),newBlock->getBlockId(),newBlock->getBlockId(),sequence.getRequestId());
+                    TLLM_LOG_DEBUG(
+                        "%s::loadOrAllocateBlocks - Copied partially filled block %d into %d. Reserved block %d for "
+                        "sequence %lu",
+                        mLogPrefix.c_str(), matchingBlock->getBlockId(), newBlock->getBlockId(), newBlock->getBlockId(),
+                        sequence.getRequestId());
                     matchingBlock = newBlock;
                 }
                 else

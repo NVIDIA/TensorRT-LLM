@@ -648,7 +648,7 @@ TEST_F(KVCacheManagerTest, FindBlocksInReuseTreeByBlockKeysTest)
     // Check the chain back to previous blocks
     auto const prev1 = lastBlock->getPrevBlock(); // prev1 = [0,1,2,3,4,5,6,7]
     ASSERT_NE(prev1, nullptr);
-    auto const prev0 = prev1->getPrevBlock(); // prev0 = nullptr
+    auto const prev0 = prev1->getPrevBlock();     // prev0 = nullptr
     ASSERT_EQ(prev0, nullptr);
 }
 
@@ -2493,18 +2493,18 @@ TEST_F(KVCacheManagerTest, KVCacheManagerSecondaryBlockPrimaryChildTest)
     auto inputTokens0 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11});
     auto const inputLength0 = static_cast<SizeType32>(inputTokens0->size());
     auto llmRequest0 = std::make_shared<LlmRequest>(0, maxNewTokens, inputTokens0, samplingConfig, isStreaming);
-    TLLM_LOG_DEBUG("%s;%d\n%s",__FILE__,__LINE__,blockManager.printFreeQueues(maxAttentionWindow).c_str());
+    TLLM_LOG_DEBUG("%s;%d\n%s", __FILE__, __LINE__, blockManager.printFreeQueues(maxAttentionWindow).c_str());
     // Free queues:
     // P : 35 : 0,1,2,3
     // S : 35 : 4,5,6,7
     kvCacheManager.addSequence(0, inputLength0, beamWidth, llmRequest0);
-    TLLM_LOG_DEBUG("%s;%d\n%s",__FILE__,__LINE__,blockManager.printFreeQueues(maxAttentionWindow).c_str());
+    TLLM_LOG_DEBUG("%s;%d\n%s", __FILE__, __LINE__, blockManager.printFreeQueues(maxAttentionWindow).c_str());
     // Reserve blocks 0,1,2 for tokens [0,1,2,3] [4,5,6,7] [8,9,10,11]
     // Free queues:
     // P : 35 : 3
     // S : 35 : 4,5,6,7
     (void) kvCacheManager.removeSequence(0, llmRequest0);
-    TLLM_LOG_DEBUG("%s;%d\n%s",__FILE__,__LINE__,blockManager.printFreeQueues(maxAttentionWindow).c_str());
+    TLLM_LOG_DEBUG("%s;%d\n%s", __FILE__, __LINE__, blockManager.printFreeQueues(maxAttentionWindow).c_str());
     // Store blocks 0,1,2
     // Free queues:
     // P : 35 : 3,2,1,0
@@ -2518,7 +2518,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerSecondaryBlockPrimaryChildTest)
     auto llmRequest1 = std::make_shared<LlmRequest>(1, maxNewTokens, inputTokens1, samplingConfig, isStreaming);
 
     kvCacheManager.addSequence(1, inputLength1, beamWidth, llmRequest1);
-    TLLM_LOG_DEBUG("%s;%d\n%s",__FILE__,__LINE__,blockManager.printFreeQueues(maxAttentionWindow).c_str());
+    TLLM_LOG_DEBUG("%s;%d\n%s", __FILE__, __LINE__, blockManager.printFreeQueues(maxAttentionWindow).c_str());
     // No reuse possible
     // Reserve block 3
     // Offload block 2 to 4. Reserve block 4
@@ -2529,7 +2529,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerSecondaryBlockPrimaryChildTest)
     // Cache:
     // 0=[0,1,2,3] -> 1=[4,5,6,7] -> 2=[8,9,10]
     (void) kvCacheManager.removeSequence(1, llmRequest1);
-    TLLM_LOG_DEBUG("%s;%d\n%s",__FILE__,__LINE__,blockManager.printFreeQueues(maxAttentionWindow).c_str());
+    TLLM_LOG_DEBUG("%s;%d\n%s", __FILE__, __LINE__, blockManager.printFreeQueues(maxAttentionWindow).c_str());
     // Store blocks 3,4,5
     // Free queues:
     // P : 35 : 0,5,4,3
@@ -2542,7 +2542,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerSecondaryBlockPrimaryChildTest)
     auto const inputLength2 = static_cast<SizeType32>(inputTokens2->size());
     auto llmRequest2 = std::make_shared<LlmRequest>(2, maxNewTokens, inputTokens2, samplingConfig, isStreaming);
     kvCacheManager.addSequence(2, inputLength2, beamWidth, llmRequest2);
-    TLLM_LOG_DEBUG("%s;%d\n%s",__FILE__,__LINE__,blockManager.printFreeQueues(maxAttentionWindow).c_str());
+    TLLM_LOG_DEBUG("%s;%d\n%s", __FILE__, __LINE__, blockManager.printFreeQueues(maxAttentionWindow).c_str());
     // Partially reuse block 0 by copy. This involves the following steps:
     //   getFreeBlock to partially copy tokens from block 0 into:
     //     Offload block 0 to 6 (primary -> secondary)
@@ -2569,7 +2569,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerSecondaryBlockPrimaryChildTest)
         llmRequest2->addNewToken(token, 0);
         kvCacheManager.addToken(2);
     }
-    TLLM_LOG_DEBUG("%s;%d\n%s",__FILE__,__LINE__,blockManager.printFreeQueues(maxAttentionWindow).c_str());
+    TLLM_LOG_DEBUG("%s;%d\n%s", __FILE__, __LINE__, blockManager.printFreeQueues(maxAttentionWindow).c_str());
     // Offload block 5 to 7. Reserve block 7
     // Free queues:
     // P : 35 : 4,3
@@ -2583,7 +2583,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerSecondaryBlockPrimaryChildTest)
     kvCacheManager.addToken(2);
     llmRequest2->addNewToken(0, 0);
     kvCacheManager.addToken(2);
-    TLLM_LOG_DEBUG("%s;%d\n%s",__FILE__,__LINE__,blockManager.printFreeQueues(maxAttentionWindow).c_str());
+    TLLM_LOG_DEBUG("%s;%d\n%s", __FILE__, __LINE__, blockManager.printFreeQueues(maxAttentionWindow).c_str());
     // Evict 2
     // Offload block 4 to 2. Reserve block 2
     // Free queues:
@@ -2594,7 +2594,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerSecondaryBlockPrimaryChildTest)
     // 3=[1,1,2,3] -> 4=[4,5,6,7] -> 5=[8,9,10]
 
     (void) kvCacheManager.removeSequence(2, llmRequest2);
-    TLLM_LOG_DEBUG("%s;%d\n%s",__FILE__,__LINE__,blockManager.printFreeQueues(maxAttentionWindow).c_str());
+    TLLM_LOG_DEBUG("%s;%d\n%s", __FILE__, __LINE__, blockManager.printFreeQueues(maxAttentionWindow).c_str());
     // Store blocks 6,7,2. Blocks 6, 7 are not stored since same state is already stored in tree
     // Free queues:
     // P : 35 : 3,2,7,6
@@ -2607,7 +2607,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerSecondaryBlockPrimaryChildTest)
     auto const inputLength3 = static_cast<SizeType32>(inputTokens3->size());
     auto llmRequest3 = std::make_shared<LlmRequest>(3, maxNewTokens, inputTokens3, samplingConfig, isStreaming);
     kvCacheManager.addSequence(3, inputLength3, beamWidth, llmRequest3);
-    TLLM_LOG_DEBUG("%s;%d\n%s",__FILE__,__LINE__,blockManager.printFreeQueues(maxAttentionWindow).c_str());
+    TLLM_LOG_DEBUG("%s;%d\n%s", __FILE__, __LINE__, blockManager.printFreeQueues(maxAttentionWindow).c_str());
     // Reuse blocks 0,1,2 with tokens [0,1,2,3] [4,5,6,7] [0]
     // The following steps are involved:
     // Matched block 0
@@ -4223,9 +4223,9 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStreamWindowSize)
 
     for (int i = 0; i < events.size(); ++i)
     {
-	EXPECT_EQ(events.front().windowSize, slidingWindow);
-	EXPECT_TRUE(std::holds_alternative<tle::KVCacheStoredData>(events.front().data));
-	events.pop_front();
+        EXPECT_EQ(events.front().windowSize, slidingWindow);
+        EXPECT_TRUE(std::holds_alternative<tle::KVCacheStoredData>(events.front().data));
+        events.pop_front();
     }
 }
 

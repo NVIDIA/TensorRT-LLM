@@ -109,30 +109,25 @@ std::string LRUEvictionPolicy::printFreeQueues() const
     os << "Free queues:" << std::endl;
     for (SizeType32 cacheLevel = 0; cacheLevel < 2; cacheLevel++)
     {
-	switch (cacheLevel)
-	{
-	    case 0:
-		os << "  Primary" << std::endl;
-		break;
-	    case 1:
-		os << "  Secondary" << std::endl;
-		break;
-	    default:
-		throw "Unknown cacheLevel";
-	}
+        switch (cacheLevel)
+        {
+        case 0: os << "  Primary" << std::endl; break;
+        case 1: os << "  Secondary" << std::endl; break;
+        default: throw "Unknown cacheLevel";
+        }
         for (SizeType32 level = 0; level < kMaxPriority - kMinPriority + 1; level++)
         {
-	    auto const& blocks = mFreeQueues[cacheLevel][level];
-	    if (!blocks.empty())
-	    {
-		os << "    " << level << std::setw(3) << " : ";
-		for (auto const& block : blocks)
-		{
-		    os << block->getBlockId() << " ";
-		}
-		os << std::endl;
-	    }
-	}
+            auto const& blocks = mFreeQueues[cacheLevel][level];
+            if (!blocks.empty())
+            {
+                os << "    " << level << std::setw(3) << " : ";
+                for (auto const& block : blocks)
+                {
+                    os << block->getBlockId() << " ";
+                }
+                os << std::endl;
+            }
+        }
     }
     return os.str();
 }

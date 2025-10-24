@@ -210,8 +210,8 @@ struct BlockKey
         {
             // Reduce token length (for partial matching)
             TLLM_CHECK_WITH_INFO(newNumberOfTokens <= static_cast<int>(uniqueTokens.size()),
-                "newNumberOfTokens = %d must be <= uniqueTokens.size() = %d",
-		newNumberOfTokens, static_cast<int>(uniqueTokens.size()));
+                "newNumberOfTokens = %d must be <= uniqueTokens.size() = %d", newNumberOfTokens,
+                static_cast<int>(uniqueTokens.size()));
             blockKey.uniqueTokens.insert(
                 blockKey.uniqueTokens.begin(), uniqueTokens.begin(), uniqueTokens.begin() + newNumberOfTokens);
         }
@@ -309,7 +309,8 @@ public:
     //! blockKey.
     //! @return tuple of [partialMatch, numMatched, block], partialMatch is true if not all the tokens of the block were
     //! matched.
-    [[nodiscard]] LookupResult findMatchingNodes(BlockKey const& blockKey, bool enablePartialReuse, bool ignoreNodesWithoutBlocks) const;
+    [[nodiscard]] LookupResult findMatchingNodes(
+        BlockKey const& blockKey, bool enablePartialReuse, bool ignoreNodesWithoutBlocks) const;
 
     void setBlock(SizeType32 windowSize, BlockPtr block);
 
@@ -390,7 +391,8 @@ public:
     explicit KVCachePromptLookup(CacheType cacheType, SizeType32 tokensPerBlock);
 
     //! \brief Return vector of BlockKey for the first inputLength tokens of prompt stored in llmRequest.
-    //! \details If inputLength < 0, effective input length is total number of tokens + inputLength. If you want to skip the last token, you can simply do inputLength = -1.
+    //! \details If inputLength < 0, effective input length is total number of tokens + inputLength. If you want to skip
+    //! the last token, you can simply do inputLength = -1.
     [[nodiscard]] std::vector<BlockKey> getBlockKeys(
         LlmRequest const& llmRequest, SizeType32 inputLength, bool allowPartiallyFilledBlock) const;
 
@@ -430,7 +432,7 @@ public:
     std::string printPrompt(LlmRequest const& llmRequest) const;
 
     //! \brief Print search tree.
-    std::string printSearchTree() const; 
+    std::string printSearchTree() const;
 
 private:
     // Root of search structure
@@ -485,7 +487,8 @@ public:
 
     //! \brief Return previous block in search tree if this block is stored in search tree.
     //! \details Returns nullptr if this block is not in search tree or it is at root level.
-    //! \details Previously this function would have returned pointer to a special 'root' block if already at root level.
+    //! \details Previously this function would have returned pointer to a special 'root' block if already at root
+    //! level.
     BlockPtr getPrevBlock() const;
 
     [[nodiscard]] bool isFull() const;
@@ -523,7 +526,7 @@ public:
     //! \brief Check if block is still valid for reuse.
     [[nodiscard]] bool isValidForReuse() const
     {
-	return mLookupNode != nullptr;
+        return mLookupNode != nullptr;
     }
 
 private:
@@ -1433,7 +1436,7 @@ public:
     //! \details This method is meant for debugging
     [[nodiscard]] std::string printFreeQueues(SizeType32 windowSize) const
     {
-	return mWindowBlockManagers.at(windowSize).printFreeQueues();
+        return mWindowBlockManagers.at(windowSize).printFreeQueues();
     }
 
     //! \brief Print search tree.
