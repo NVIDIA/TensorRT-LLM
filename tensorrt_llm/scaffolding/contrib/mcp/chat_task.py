@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-
+from typing import List, Optional, Dict, Any
 from tensorrt_llm.scaffolding import GenerationTask
 
 
@@ -14,6 +14,13 @@ class ChatTask(GenerationTask):
     def create_from_prompt(messages: list, prompt: str, tools) -> "ChatTask":
         task = ChatTask()
         messages.append({"role": "user", "content": prompt})
+        task.messages = messages
+        task.tools = tools
+        return task
+
+    @staticmethod
+    def from_messages(messages: List[str], tools: Optional[List[Dict[str, Any]]] = None) -> "ChatTask":
+        task = ChatTask()
         task.messages = messages
         task.tools = tools
         return task
