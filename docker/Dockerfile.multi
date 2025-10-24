@@ -91,7 +91,7 @@ RUN if [ -f /etc/redhat-release ]; then \
         grep "^Name:" METADATA; \
     fi
 
-    # Copy all installation scripts at once to reduce layers
+# Copy all installation scripts at once to reduce layers
 COPY docker/common/install_triton.sh \
      docker/common/install_ucx.sh \
      docker/common/install_nixl.sh \
@@ -99,7 +99,7 @@ COPY docker/common/install_triton.sh \
      docker/common/install_mooncake.sh \
      ./
 
-     # Install UCX first
+# Install UCX first
 RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install_ucx.sh && rm install_ucx.sh
 
 # Install NIXL
