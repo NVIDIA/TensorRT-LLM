@@ -470,9 +470,9 @@ class ModelDrafter(Drafter):
                     continue
 
                 # Get the index of the draft/target tokens in the device tensor
-                draft_idx = req_idx if self.use_static_draft_loop else request.py_batch_idx
+                draft_idx = req_idx if self.use_static_draft_loop else request.py_seq_slot
                 target_idx = req_id_to_old_request[
-                    request.py_request_id].py_batch_idx
+                    request.py_request_id].py_seq_slot
                 target_inputs.new_tokens[draft_position + 1:draft_position +
                                          draft_length + 1, target_idx,
                                          0] = draft_tensors[0:draft_length,
