@@ -254,7 +254,7 @@ def setup_llm(args, **kwargs):
         if args.use_torch_compile else None,
         moe_config=MoeConfig(backend=args.moe_backend,
                              use_low_precision_moe_combine=args.use_low_precision_moe_combine,
-                             use_moe_prefetch=args.use_moe_prefetch),
+                             use_prefetch=args.use_moe_prefetch),
         sampler_type=args.sampler_type,
         max_seq_len=args.max_seq_len,
         max_batch_size=args.max_batch_size,

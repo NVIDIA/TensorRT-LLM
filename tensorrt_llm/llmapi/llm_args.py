@@ -280,22 +280,22 @@ class MoeConfig(StrictBaseModel):
     )
 
     # moe weight prefetching config
-    use_moe_prefetch: bool = Field(
-        default=False, description="Whether to use MoE prefetching.")
+    use_prefetch: bool = Field(default=False,
+                               description="Whether to use MoE prefetching.")
 
-    moe_prefetch_capacity: Optional[int] = Field(
+    prefetch_capacity: Optional[int] = Field(
         default=None,
         description=
         "Number of MoE layers (weights) that can be buffered concurrently on device"
     )
 
-    moe_prefetch_stride: Optional[int] = Field(
+    prefetch_stride: Optional[int] = Field(
         default=None,
         description=
         "Stride of MoE prefetching layers -- offload weights for one layer every stride layers"
     )
 
-    moe_prefetch_config: Optional[object] = Field(
+    prefetch_config: Optional[object] = Field(
         default=None,
         description="The configuration for MoE prefetching.",
         json_schema_extra={
@@ -303,7 +303,7 @@ class MoeConfig(StrictBaseModel):
             "Optional[tensorrt_llm._torch.model_config.MoEPrefetchConfig]"
         })
 
-    @field_validator('moe_prefetch_capacity', 'moe_prefetch_stride')
+    @field_validator('prefetch_capacity', 'prefetch_stride')
     @classmethod
     def validate_positive_integers(cls, v):
         if v is not None and (not isinstance(v, int) or v <= 0):
@@ -314,8 +314,8 @@ class MoeConfig(StrictBaseModel):
 
     @model_validator(mode='after')
     def validate_moe_prefetch_backend(self) -> 'MoeConfig':
-        if self.use_moe_prefetch and (self.backend != 'CUTLASS'
-                                      and self.backend != 'TRTLLM'):
+        if self.use_prefetch and (self.backend != 'CUTLASS'
+                                  and self.backend != 'TRTLLM'):
             raise ValueError(
                 f"MoE prefetching is only supported with CUTLASS or TRTLLM MoE backends, but got {self.backend}"
             )
@@ -2715,10 +2715,10 @@ class TorchLlmArgs(BaseLlmArgs):
     @model_validator(mode="after")
     def validate_moe_prefetch_config(self):
         from .._torch.model_config import MoEPrefetchConfig
-        if self.moe_config.use_moe_prefetch and self.moe_config.moe_prefetch_config is None:
-            capacity = self.moe_config.moe_prefetch_capacity or 2
-            stride = self.moe_config.moe_prefetch_stride or 1
-            self.moe_config.moe_prefetch_config = MoEPrefetchConfig(
+        if self.moe_config.use_prefetch and self.moe_config.prefetch_config is None:
+            capacity = self.moe_config.prefetch_capacity or 2
+            stride = self.moe_config.prefetch_stride or 1
+            self.moe_config.prefetch_config = MoEPrefetchConfig(
                 prefetch_capacity=capacity, prefetch_stride=stride)
         return self
 
@@ -2873,7 +2873,7 @@ class TorchLlmArgs(BaseLlmArgs):
             moe_backend=self.moe_config.backend,
             use_low_precision_moe_combine=self.moe_config.
             use_low_precision_moe_combine,
-            moe_prefetch_config=self.moe_config.moe_prefetch_config,
+            moe_prefetch_config=self.moe_config.prefetch_config,
             sampler_type=self.sampler_type,
             kv_cache_dtype=self.kv_cache_config.dtype,
             mamba_ssm_cache_dtype=self.kv_cache_config.mamba_ssm_cache_dtype,

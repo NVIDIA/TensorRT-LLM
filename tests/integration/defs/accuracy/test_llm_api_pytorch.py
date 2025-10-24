@@ -1964,7 +1964,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         pytorch_config = dict(moe_config=MoeConfig(backend=moe_backend,
-                                                   use_moe_prefetch=True), )
+                                                   use_prefetch=True), )
 
         with LLM(model_path,
                  tensor_parallel_size=tp_size,
