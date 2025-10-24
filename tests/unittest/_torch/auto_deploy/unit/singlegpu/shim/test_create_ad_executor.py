@@ -99,13 +99,13 @@ def test_create_autodeploy_executor_with_guided_decoding(
 
     # Mock the engine attributes that are actually used by create_autodeploy_executor
     mock_engine = Mock()
-    mock_engine.vocab_size_padded = vocab_size_padded
     mock_engine.cache_seq_interface.info.num_pages = (
         100  # placeholder to satisfy ADEngine.build_from_config
     )
     mock_engine.cache_seq_interface.info.max_num_tokens = (
         512  # placeholder to satisfy ADEngine.build_from_config
     )
+    mock_engine.cache_seq_interface.info.vocab_size_padded = vocab_size_padded
 
     # Mock the specific dependencies requested, plus minimal additional mocks to prevent errors
     with (
@@ -148,5 +148,4 @@ def test_create_autodeploy_executor_with_guided_decoding(
         assert isinstance(guided_decoder, MockGuidedDecoder)
         assert guided_decoder.guided_decoding_config == mock_guided_decoding_config
         assert guided_decoder.max_num_sequences == ad_config.max_batch_size
-        # vocab_size_padded should be set from the engine instance created during execution
-        assert guided_decoder.vocab_size_padded == mock_engine.vocab_size_padded
+        assert guided_decoder.vocab_size_padded == vocab_size_padded
