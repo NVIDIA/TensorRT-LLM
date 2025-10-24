@@ -20,23 +20,24 @@ if TYPE_CHECKING:
     import tensorrt_llm.bindings as _bindings
 
 
-class KVCacheType(Enum):
+class KVCacheType(str, Enum):
     """Python enum wrapper for KVCacheType.
 
     This is a pure Python enum that mirrors the C++ KVCacheType enum exposed
     through pybind11.
     """
-    CONTINUOUS = 0
-    PAGED = 1
-    DISABLED = 2
+    CONTINUOUS = "continuous"
+    PAGED = "paged"
+    DISABLED = "disabled"
 
     @classmethod
-    def from_string(cls, s: str) -> 'KVCacheType':
-        if s.upper() not in cls.__members__:
-            raise ValueError(
-                f"Invalid string for KVCacheType: '{s}'. Valid options are: {cls.__members__.keys()}"
-            )
-        return cls[s.upper()]
+    def _missing_(cls, value):
+        """Allow case-insensitive string values to be converted to enum members."""
+        if isinstance(value, str):
+            for member in cls:
+                if member.value.lower() == value.lower():
+                    return member
+        return None
 
     def to_cpp(self) -> '_bindings.KVCacheType':
         import tensorrt_llm.bindings as _bindings
@@ -46,4 +47,4 @@ class KVCacheType(Enum):
     def from_cpp(cls, cpp_enum) -> 'KVCacheType':
         # C++ enum's __str__ returns "KVCacheType.PAGED", extract the name
         name = str(cpp_enum).split('.')[-1]
-        return cls[name]
+        return cls(name)

@@ -22,7 +22,7 @@ from typing import Dict, Optional, Union
 
 import numpy as np
 import tensorrt as trt
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
 from ._common import _is_building, check_max_num_tokens, serialize_engine
 from ._utils import (get_sm_version, np_bfloat16, np_float8, str_dtype_to_trt,
@@ -43,9 +43,7 @@ from .version import __version__
 class ConfigEncoder(json.JSONEncoder):
 
     def default(self, obj):
-        if isinstance(obj, KVCacheType):
-            return obj.name
-        elif hasattr(obj, 'model_dump'):
+        if hasattr(obj, 'model_dump'):
             # Handle Pydantic models (including DecodingBaseConfig and subclasses)
             return obj.model_dump(mode='json')
         else:
@@ -558,16 +556,6 @@ class BuildConfig(BaseModel):
         default=False,
         description=
         "Whether to use Multi-RoPE (Rotary Position Embedding) optimization.")
-
-    @field_validator("kv_cache_type", mode="before")
-    @classmethod
-    def validate_kv_cache_type(cls, v):
-        """Convert string or int to KVCacheType enum."""
-        if isinstance(v, str):
-            return KVCacheType.from_string(v)
-        if isinstance(v, int):
-            return KVCacheType(v)
-        return v
 
     # Since we have some overlapping between kv_cache_type, paged_kv_cache, and paged_state (later two will be deprecated in the future),
     # we need to handle it given model architecture.
