@@ -122,7 +122,7 @@ class SpecTreeManager:
         else:
             self.init_tree_info_for_static_tree()
 
-        self.dump_tree_info()
+        # self.dump_tree_info()
 
     def init_tree_info_for_dynamic_tree(self):
         # For the dynamic tree

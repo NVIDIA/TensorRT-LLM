@@ -188,12 +188,22 @@ def test_draft_token_static_tree_prepare_for_generation():
         assert torch.all(
             torch.tensor(attn_metadata.num_contexts) == torch.tensor(
                 ref_attn_metadata['num_contexts']))
-        assert torch.all(attn_metadata.spec_decoding_position_offsets ==
-                         ref_attn_metadata['spec_decoding_position_offsets'])
-        assert torch.all(attn_metadata.spec_decoding_packed_mask ==
-                         ref_attn_metadata['spec_decoding_packed_mask'])
         assert torch.all(attn_metadata.spec_decoding_generation_lengths ==
                          ref_attn_metadata['spec_decoding_generation_lengths'])
+        total_process_tokens = attn_metadata.spec_decoding_generation_lengths.sum(
+        )
+        print(f"total_process_tokens: {total_process_tokens}")
+        assert torch.all(
+            attn_metadata.spec_decoding_position_offsets.reshape(
+                -1)[:total_process_tokens] ==
+            ref_attn_metadata['spec_decoding_position_offsets']
+            [:total_process_tokens])
+        assert torch.all(
+            attn_metadata.spec_decoding_packed_mask.reshape(
+                -1, attn_metadata.spec_decoding_packed_mask.size(
+                    -1))[:total_process_tokens, :] ==
+            ref_attn_metadata['spec_decoding_packed_mask']
+            [:total_process_tokens, :])
 
         assert torch.all(
             torch.tensor(spec_metadata.num_tokens) == torch.tensor(
@@ -267,13 +277,9 @@ def test_draft_token_static_tree_prepare_for_generation():
                                                            device='cuda')
     ref_attn_metadata['num_contexts'] = 0
     ref_attn_metadata['spec_decoding_position_offsets'] = torch.tensor(
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        dtype=torch.int32,
-        device='cuda')
+        [0, 0, 0], dtype=torch.int32, device='cuda')
     ref_attn_metadata['spec_decoding_packed_mask'] = torch.tensor(
-        [1, 2, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        dtype=torch.int32,
-        device='cuda').reshape(1, max_total_draft_tokens + 1, 1)
+        [1, 2, 4], dtype=torch.int32, device='cuda').unsqueeze(1)
     ref_attn_metadata['spec_decoding_generation_lengths'] = torch.tensor(
         [3], dtype=torch.int32, device='cuda')
 
@@ -361,14 +367,9 @@ def test_draft_token_static_tree_prepare_for_generation():
                                                            device='cuda')
     ref_attn_metadata['num_contexts'] = 0
     ref_attn_metadata['spec_decoding_position_offsets'] = torch.tensor(
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        dtype=torch.int32,
-        device='cuda').repeat(max_batch_size, 1)
+        [0, 0, 0, 0, 0, 0], dtype=torch.int32, device='cuda')
     ref_attn_metadata['spec_decoding_packed_mask'] = torch.tensor(
-        [1, 2, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        dtype=torch.int32,
-        device='cuda').reshape(1, max_total_draft_tokens + 1,
-                               1).repeat(max_batch_size, 1, 1)
+        [1, 2, 4, 1, 2, 4], dtype=torch.int32, device='cuda').unsqueeze(1)
     ref_attn_metadata['spec_decoding_generation_lengths'] = torch.tensor(
         [3, 3], dtype=torch.int32, device='cuda')
 
@@ -455,14 +456,9 @@ def test_draft_token_static_tree_prepare_for_generation():
                                                            device='cuda')
     ref_attn_metadata['num_contexts'] = 0
     ref_attn_metadata['spec_decoding_position_offsets'] = torch.tensor(
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        dtype=torch.int32,
-        device='cuda').repeat(max_batch_size, 1)
+        [0, 0, 0, 0, 0, 0], dtype=torch.int32, device='cuda')
     ref_attn_metadata['spec_decoding_packed_mask'] = torch.tensor(
-        [1, 2, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        dtype=torch.int32,
-        device='cuda').reshape(1, max_total_draft_tokens + 1,
-                               1).repeat(max_batch_size, 1, 1)
+        [1, 2, 4, 1, 2, 4], dtype=torch.int32, device='cuda').unsqueeze(1)
     ref_attn_metadata['spec_decoding_generation_lengths'] = torch.tensor(
         [3, 3], dtype=torch.int32, device='cuda')
 
@@ -545,13 +541,9 @@ def test_draft_token_static_tree_prepare_for_generation():
                                                            device='cuda')
     ref_attn_metadata['num_contexts'] = 0
     ref_attn_metadata['spec_decoding_position_offsets'] = torch.tensor(
-        [0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0],
-        dtype=torch.int32,
-        device='cuda')
+        [0, 0, 1, 1, 1], dtype=torch.int32, device='cuda')
     ref_attn_metadata['spec_decoding_packed_mask'] = torch.tensor(
-        [1, 2, 5, 9, 18, 0, 0, 0, 0, 0, 0, 0, 0],
-        dtype=torch.int32,
-        device='cuda').reshape(1, max_total_draft_tokens + 1, 1)
+        [1, 2, 5, 9, 18], dtype=torch.int32, device='cuda').unsqueeze(1)
     ref_attn_metadata['spec_decoding_generation_lengths'] = torch.tensor(
         [5], dtype=torch.int32, device='cuda')
 
@@ -637,13 +629,10 @@ def test_draft_token_static_tree_prepare_for_generation():
                                                            device='cuda')
     ref_attn_metadata['num_contexts'] = 0
     ref_attn_metadata['spec_decoding_position_offsets'] = torch.tensor(
-        [0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0],
-        dtype=torch.int32,
-        device='cuda')
+        [0, 0, 1, 1, 1, 0, 0, 1, 1, 1], dtype=torch.int32, device='cuda')
     ref_attn_metadata['spec_decoding_packed_mask'] = torch.tensor(
-        [1, 2, 5, 9, 18, 0, 0, 0, 0, 0, 0, 0, 0],
-        dtype=torch.int32,
-        device='cuda').reshape(1, max_total_draft_tokens + 1, 1)
+        [1, 2, 5, 9, 18, 1, 2, 5, 9, 18], dtype=torch.int32,
+        device='cuda').unsqueeze(1)
     ref_attn_metadata['spec_decoding_generation_lengths'] = torch.tensor(
         [5, 5], dtype=torch.int32, device='cuda')
 
