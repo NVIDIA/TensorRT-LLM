@@ -408,7 +408,7 @@ test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-BF16-llama-3.1-model/Meta-
 test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-FP8-llama-3.1-model/Llama-3.1-8B-Instruct-FP8]
 test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-NVFP4-nvfp4-quantized/Meta-Llama-3.1-8B]
 test_e2e.py::test_ptp_quickstart_advanced[Qwen3-30B-A3B-Qwen3/Qwen3-30B-A3B]
-test_e2e.py::test_ptp_quickstart_advanced_multi_gpus[Llama3.1-70B-BF16-llama-3.1-model/Meta-Llama-3.1-70B-2]
+test_e2e.py::test_ptp_quickstart_advanced_multi_gpus[Llama3.1-70B-BF16-llama-3.1-model/Meta-Llama-3.1-70B-8]
 test_e2e.py::test_ptp_quickstart_advanced_multi_gpus[Llama3.1-70B-FP8-llama-3.1-model/Llama-3.1-70B-Instruct-FP8-2]
 test_e2e.py::test_ptp_quickstart_advanced_multi_gpus[Llama3.1-405B-FP8-llama-3.1-model/Llama-3.1-405B-Instruct-FP8-8]
 test_e2e.py::test_ptp_quickstart_advanced_multi_gpus[Mixtral-8x7B-BF16-Mixtral-8x7B-v0.1-8]
