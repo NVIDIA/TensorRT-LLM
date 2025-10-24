@@ -197,7 +197,8 @@ bool AgentConnection::recvReadySignal(DataContext const& ctx) const
 }
 
 AgentConnectionManager::AgentConnectionManager(
-    batch_manager::kv_cache_manager::CacheTransBufferManager* cacheTransBufferManager, CacheState cacheState)
+    batch_manager::kv_cache_manager::CacheTransBufferManager* cacheTransBufferManager, CacheState cacheState,
+    std::string const& backendType)
     : mCacheState(std::move(cacheState))
     , mRegMemDescs(MemoryType::kVRAM, {})
 {
@@ -207,7 +208,7 @@ AgentConnectionManager::AgentConnectionManager(
     mAgentName = genUniqueAgentName();
     // Create Agent
     BaseAgentConfig config{mAgentName, true};
-    m_Agent = makeTransferAgent("nixl", &config);
+    m_Agent = makeTransferAgent(backendType, &config);
     mCacheTransBufferManager = cacheTransBufferManager;
     auto recvBufferCount = mCacheTransBufferManager->getRecvBufferCount();
     auto sendBufferCount = mCacheTransBufferManager->getSendBufferCount();

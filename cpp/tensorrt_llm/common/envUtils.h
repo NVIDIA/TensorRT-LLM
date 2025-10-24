@@ -80,11 +80,16 @@ inline void launchWithPdlWhenEnabled(char const* name, KernelFn kernelFn, dim3 g
 bool getEnvUseUCXKvCache();
 
 bool getEnvUseMPIKvCache();
+
 bool getEnvUseNixlKvCache();
+
+bool getEnvUseMooncakeKvCache();
 
 std::string getEnvUCXInterface();
 
 std::string getEnvNixlInterface();
+
+std::string getEnvMooncakeInterface();
 
 bool getEnvDisaggLayerwise();
 
