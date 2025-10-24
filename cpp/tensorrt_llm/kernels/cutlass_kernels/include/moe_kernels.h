@@ -587,7 +587,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface
 public:
     CutlassMoeFCRunner();
 
-    ~CutlassMoeFCRunner() override = default;
+    ~CutlassMoeFCRunner() override;
 
     static_assert(
         std::is_same_v<T, WeightType> || !std::is_same_v<T, float>, "Does not support float with quantized weights");
@@ -894,6 +894,11 @@ private:
 
     TmaWarpSpecializedGroupedGemmInput tma_ws_grouped_gemm1_input_;
     TmaWarpSpecializedGroupedGemmInput tma_ws_grouped_gemm2_input_;
+
+    // Side stream to handle memset for finalize fusion
+    cudaStream_t memset_stream_{};
+    cudaEvent_t memset_start_event_{};
+    cudaEvent_t memset_end_event_{};
 
     struct HostLoraWorkspace
     {

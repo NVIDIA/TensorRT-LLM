@@ -2538,6 +2538,23 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
     : blockscale_gemm_runner_{std::make_unique<
         kernels::fp8_blockscale_gemm::CutlassFp8BlockScaleGemmRunner<__nv_bfloat16, __nv_fp8_e4m3, __nv_bfloat16>>()}
 {
+    if (mayHaveFinalizeFused())
+    {
+        TLLM_CUDA_CHECK(cudaStreamCreateWithFlags(&memset_stream_, cudaStreamNonBlocking));
+        TLLM_CUDA_CHECK(cudaEventCreateWithFlags(&memset_start_event_, cudaEventDisableTiming));
+        TLLM_CUDA_CHECK(cudaEventCreateWithFlags(&memset_end_event_, cudaEventDisableTiming));
+    }
+}
+
+template <class T, class WeightType, class OutputType, class InputType, class BackBoneType, class Enable>
+CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::~CutlassMoeFCRunner()
+{
+    if (memset_stream_)
+    {
+        TLLM_CUDA_CHECK(cudaStreamDestroy(memset_stream_));
+        TLLM_CUDA_CHECK(cudaEventDestroy(memset_start_event_));
+        TLLM_CUDA_CHECK(cudaEventDestroy(memset_end_event_));
+    }
 }
 
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType, class Enable>
@@ -3161,17 +3178,6 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     if (using_tma_ws_gemm2)
     {
         tma_ws_input = tma_ws_input_template;
-        if (tma_ws_input.fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE)
-        {
-            // TODO For some reason this has to be done here, it should not overlap with anything else, but
-            // doing it in setupTmaWarpSpecializedInputs gives a different result. Ideally, we want this to run on a
-            // second stream and overlap with everything else
-            //
-            // This also means it is included in the timing for the profiler, which is probably more representative
-            // until we can overlap it
-            check_cuda_error(
-                cudaMemsetAsync(final_output, 0x0, sizeof(OutputType) * num_rows * unpadded_hidden_size, stream));
-        }
     }
     else if (use_fp8)
     {
@@ -3719,12 +3725,26 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
                 num_valid_tokens_ptr, expanded_num_rows, hidden_size, use_awq, stream);
         }
         sync_check_cuda_error(stream);
+        if (gemm2_tma_ws_input.fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE)
+        {
+            // Overlap memset needed for finalize fusion with FC1 using a side stream
+            cudaEventRecord(memset_start_event_, stream);
+            cudaStreamWaitEvent(memset_stream_, memset_start_event_);
+            check_cuda_error(cudaMemsetAsync(
+                final_output, 0x0, sizeof(OutputType) * num_rows * unpadded_hidden_size, memset_stream_));
+        }
         Self::gemm1(moe_gemm_runner_, blockscale_gemm_runner, gemm1_input, fc1_result_, glu_inter_result_,
             expert_first_token_offset_, gemm1_tma_ws_input, fc1_expert_weights, fc1_expert_biases, num_valid_tokens_ptr,
             fc1_int_scales, fc1_fp8_dequant, use_wfp4afp8 ? fc2_wfp4afp8_quant_scale : fc2_fp8_quant,
             fc1_fp4_act_scale_, fc2_fp4_act_scale_, quant_params, num_rows, expanded_num_rows, hidden_size, inter_size,
             num_experts_per_node, fc1_activation_type, alpha_scale_ptr_array_fc1_, !use_lora, stream, *gemm1_config_,
             false, nullptr, nullptr);
+        if (gemm2_tma_ws_input.fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE)
+        {
+            // Wait for memset to finish before continuing with FC2
+            cudaEventRecord(memset_end_event_, memset_stream_);
+            cudaStreamWaitEvent(stream, memset_end_event_);
+        }
         sync_check_cuda_error(stream);
 
         if (use_lora)
