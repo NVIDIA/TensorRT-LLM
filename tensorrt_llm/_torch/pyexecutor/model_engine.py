@@ -20,7 +20,8 @@ from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             MultimodalRuntimeData)
 from tensorrt_llm.inputs.registry import (create_input_processor,
                                           create_input_processor_with_hash)
-from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, TorchCompileConfig,
+                                          TorchLlmArgs)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraModelConfig
@@ -53,7 +54,7 @@ from ..speculative.utils import SpecDecodingTensor
 from ..utils import (get_model_extra_attrs,
                      set_per_request_piecewise_cuda_graph_flag,
                      set_torch_compiling, with_model_extra_attrs)
-from .config import PyTorchConfig, _construct_checkpoint_loader
+from .config import _construct_checkpoint_loader
 from .config_utils import is_mla
 from .cuda_graph_runner import CUDAGraphRunner
 from .guided_decoder import CapturableGuidedDecoder
@@ -131,7 +132,7 @@ class PyTorchModelEngine(ModelEngine):
         self,
         *,
         model_path: str,
-        pytorch_backend_config: PyTorchConfig,
+        llm_args: TorchLlmArgs,
         mapping: Optional[Mapping] = None,
         attn_runtime_features: Optional[AttentionRuntimeFeatures] = None,
         dist: Optional[MPIDist] = None,
@@ -140,10 +141,7 @@ class PyTorchModelEngine(ModelEngine):
         drafting_loop_wrapper: Optional[Callable[[torch.nn.Module],
                                                  torch.nn.Module]] = None,
         model: Optional[torch.nn.Module] = None,
-        llm_args: Optional[TorchLlmArgs] = None,
     ):
-        assert llm_args is not None, "llm_args must be provided for PyTorchModelEngine"
-
         self.forward_pass_callable = None
         self.ub_buffers = None
         (
@@ -168,7 +166,7 @@ class PyTorchModelEngine(ModelEngine):
         self.dist = dist
         if dist is not None:
             ExpertStatistic.create(self.dist.rank)
-        self.pytorch_backend_config = pytorch_backend_config
+        self.llm_args = llm_args
         self.original_max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
         self.original_max_total_draft_tokens = spec_config.max_total_draft_tokens if spec_config is not None else 0
 
@@ -192,7 +190,7 @@ class PyTorchModelEngine(ModelEngine):
             lora_config: Optional[
                 LoraConfig] = None if is_draft_model else llm_args.lora_config
             loader = ModelLoader(
-                pytorch_backend_config=pytorch_backend_config,
+                llm_args=llm_args,
                 mapping=self.mapping,
                 spec_config=self.spec_config,
                 sparse_attention_config=self.sparse_attention_config,
@@ -215,7 +213,7 @@ class PyTorchModelEngine(ModelEngine):
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):
             self.model.extra_attrs = {}
-        if self.pytorch_backend_config.enable_layerwise_nvtx_marker:
+        if self.llm_args.enable_layerwise_nvtx_marker:
             layerwise_nvtx_marker = LayerwiseNvtxMarker()
             module_prefix = 'Model'
             if self.model.model_config and self.model.model_config.pretrained_config and self.model.model_config.pretrained_config.architectures:
@@ -224,19 +222,39 @@ class PyTorchModelEngine(ModelEngine):
             layerwise_nvtx_marker.register_hooks(self.model, module_prefix)
 
         self.enable_attention_dp = self.model.model_config.mapping.enable_attention_dp
-        self._disable_overlap_scheduler = self.pytorch_backend_config.disable_overlap_scheduler
+        self._disable_overlap_scheduler = self.llm_args.disable_overlap_scheduler
         self._torch_compile_backend = None
         self.dtype = self.model.config.torch_dtype
         self._init_model_capacity()
 
-        self._torch_compile_backend = None
+        self.cuda_graph_config = self.llm_args.cuda_graph_config
+        cuda_graph_batch_sizes = self.cuda_graph_config.batch_sizes if self.cuda_graph_config else CudaGraphConfig.model_fields[
+            'batch_sizes'].default
+        cuda_graph_padding_enabled = self.cuda_graph_config.enable_padding if self.cuda_graph_config else CudaGraphConfig.model_fields[
+            'enable_padding'].default
+
+        self.torch_compile_config = self.llm_args.torch_compile_config
+        torch_compile_enabled = bool(self.torch_compile_config is not None)
+        torch_compile_fullgraph = self.torch_compile_config.enable_fullgraph if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
+            'enable_fullgraph'].default
+        torch_compile_inductor_enabled = self.torch_compile_config.enable_inductor if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
+            'enable_inductor'].default
+        torch_compile_piecewise_cuda_graph = self.torch_compile_config.enable_piecewise_cuda_graph if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
+            'enable_piecewise_cuda_graph'].default
+        torch_compile_piecewise_cuda_graph_num_tokens = self.torch_compile_config.capture_num_tokens if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
+            'capture_num_tokens'].default
+        torch_compile_enable_userbuffers = self.torch_compile_config.enable_userbuffers if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
+            'enable_userbuffers'].default
+        torch_compile_max_num_streams = self.torch_compile_config.max_num_streams if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
+            'max_num_streams'].default
+
         # Eagle3 draft model now does not support torch.compile
-        self._torch_compile_enabled = pytorch_backend_config.torch_compile_enabled and not is_draft_model
-        self._torch_compile_piecewise_cuda_graph = pytorch_backend_config.torch_compile_piecewise_cuda_graph
+        self._torch_compile_enabled = torch_compile_enabled
+        self._torch_compile_piecewise_cuda_graph = torch_compile_piecewise_cuda_graph
 
         piecewise_cuda_graph_num_tokens = (
-            pytorch_backend_config.torch_compile_piecewise_cuda_graph_num_tokens
-            or pytorch_backend_config.cuda_graph_batch_sizes or [])
+            torch_compile_piecewise_cuda_graph_num_tokens
+            or cuda_graph_batch_sizes or [])
 
         self._piecewise_cuda_graph_num_tokens = [
             i for i in piecewise_cuda_graph_num_tokens
@@ -245,33 +263,30 @@ class PyTorchModelEngine(ModelEngine):
 
         try:
             use_ub_for_nccl = (
-                pytorch_backend_config.allreduce_strategy == "NCCL_SYMMETRIC"
+                self.llm_args.allreduce_strategy == "NCCL_SYMMETRIC"
                 and self._init_userbuffers(self.model.config.hidden_size))
             if self._torch_compile_enabled:
                 set_torch_compiling(True)
                 use_ub = not use_ub_for_nccl and (
-                    pytorch_backend_config.torch_compile_enable_userbuffers
+                    torch_compile_enable_userbuffers
                     and self._init_userbuffers(self.model.config.hidden_size))
                 self._torch_compile_backend = Backend(
-                    pytorch_backend_config.torch_compile_inductor_enabled,
+                    torch_compile_inductor_enabled,
                     enable_userbuffers=use_ub,
                     enable_piecewise_cuda_graph=self.
                     _torch_compile_piecewise_cuda_graph,
                     capture_num_tokens=self._piecewise_cuda_graph_num_tokens,
-                    max_num_streams=pytorch_backend_config.
-                    torch_compile_max_num_streams)
+                    max_num_streams=torch_compile_max_num_streams)
                 if isinstance(self.model, DecoderModelForCausalLM):
                     self.model.model = torch.compile(
                         self.model.model,
                         backend=self._torch_compile_backend,
-                        fullgraph=pytorch_backend_config.torch_compile_fullgraph
-                    )
+                        fullgraph=torch_compile_fullgraph)
                 else:
                     self.model = torch.compile(
                         self.model,
                         backend=self._torch_compile_backend,
-                        fullgraph=pytorch_backend_config.torch_compile_fullgraph
-                    )
+                        fullgraph=torch_compile_fullgraph)
                 torch._dynamo.config.cache_size_limit = 16
             else:
                 set_torch_compiling(False)
@@ -283,7 +298,7 @@ class PyTorchModelEngine(ModelEngine):
         self.is_warmup = False
 
         self.attn_backend = get_attention_backend(
-            pytorch_backend_config.attn_backend,
+            self.llm_args.attn_backend,
             sparse_attn_config=self.sparse_attention_config)
 
         if self.is_spec_decode:
@@ -329,13 +344,12 @@ class PyTorchModelEngine(ModelEngine):
         self.iter_states = {}
         self._cuda_graph_mem_pool = self._torch_compile_backend._graph_pool_handle if self._torch_compile_enabled else None
 
-        self._cuda_graph_padding_enabled = pytorch_backend_config.cuda_graph_padding_enabled
+        self._cuda_graph_padding_enabled = cuda_graph_padding_enabled
 
         self._cuda_graph_batch_sizes = _filter_cuda_graph_batch_sizes(
-            pytorch_backend_config.cuda_graph_batch_sizes, self.batch_size,
-            self.max_num_tokens, self.original_max_total_draft_tokens,
-            self._cuda_graph_padding_enabled
-        ) if pytorch_backend_config.cuda_graph_batch_sizes else []
+            cuda_graph_batch_sizes, self.batch_size, self.max_num_tokens,
+            self.original_max_total_draft_tokens,
+            self._cuda_graph_padding_enabled) if cuda_graph_batch_sizes else []
 
         self._max_cuda_graph_batch_size = (self._cuda_graph_batch_sizes[-1] if
                                            self._cuda_graph_batch_sizes else 0)
@@ -554,7 +568,7 @@ class PyTorchModelEngine(ModelEngine):
 
     def _run_autotuner_warmup(self, resource_manager: ResourceManager):
         """Runs a forward pass to populate the autotuner cache."""
-        if not self.pytorch_backend_config.enable_autotuner:
+        if not self.llm_args.enable_autotuner:
             return
 
         logger.info("Running autotuner warmup...")
@@ -2299,7 +2313,7 @@ class PyTorchModelEngine(ModelEngine):
 
             with MoeLoadBalancerIterContext(moe_load_balancer):
                 # Special handling for multimodal encoder only mode
-                if self.pytorch_backend_config.mm_encoder_only:
+                if self.llm_args.mm_encoder_only:
                     return self._forward_step_mm_encoder_only(
                         inputs, scheduled_requests)
                 else:
@@ -2463,7 +2477,7 @@ class PyTorchModelEngine(ModelEngine):
         # Disable UB for unsupported platforms
         if not ub.ub_supported():
             return False
-        use_nccl_symmetric = self.pytorch_backend_config.allreduce_strategy == "NCCL_SYMMETRIC"
+        use_nccl_symmetric = self.llm_args.allreduce_strategy == "NCCL_SYMMETRIC"
         ub.initialize_userbuffers_manager(
             self.mapping.tp_size, self.mapping.pp_size, self.mapping.cp_size,
             self.mapping.rank, self.mapping.gpus_per_node,

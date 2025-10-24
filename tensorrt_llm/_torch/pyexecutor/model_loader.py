@@ -7,6 +7,7 @@ from typing import Callable, Optional, Tuple
 import torch
 
 from tensorrt_llm._utils import str_dtype_to_torch
+from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
@@ -19,7 +20,7 @@ from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_utils import MetaInitMode, timing
 from ..modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, maybe_create_moe_load_balancer)
-from .config import LoadFormat, PyTorchConfig
+from .config import LoadFormat
 
 _KV_CACHE_MAP = {
     "fp8": QuantAlgo.FP8.value,
@@ -157,7 +158,7 @@ class ModelLoader:
     """
 
     def __init__(self,
-                 pytorch_backend_config: PyTorchConfig,
+                 llm_args: TorchLlmArgs,
                  mapping: Mapping,
                  spec_config: Optional["DecodingBaseConfig"],
                  sparse_attention_config: Optional["SparseAttentionConfig"],
@@ -168,14 +169,14 @@ class ModelLoader:
         Initializes the ModelLoader.
 
         Args:
-            pytorch_backend_config: Configuration for the PyTorch backend.
+            llm_args: Configuration for the PyTorch backend.
             mapping: The distributed mapping configuration.
             spec_config: Configuration for speculative decoding.
             max_num_tokens: The maximum number of tokens the engine will handle.
             max_seq_len: The maximum sequence length.
             lora_config: Configuration for LoRA.
         """
-        self.pytorch_backend_config = pytorch_backend_config
+        self.llm_args = llm_args
         self.mapping = mapping
         self.spec_config = spec_config
         self.sparse_attention_config = sparse_attention_config
@@ -200,7 +201,7 @@ class ModelLoader:
         """
         config = self._load_and_validate_config(checkpoint_dir,
                                                 checkpoint_loader)
-        load_format = self.pytorch_backend_config.load_format
+        load_format = self.llm_args.load_format
 
         with timing("Model init total"), maybe_create_moe_load_balancer(
                 config, self.mapping) as moe_load_balancer:
@@ -291,30 +292,29 @@ class ModelLoader:
             checkpoint_dir,
             trust_remote_code=True,
             mapping=self.mapping,
-            enable_min_latency=self.pytorch_backend_config.enable_min_latency,
-            use_cuda_graph=self.pytorch_backend_config.use_cuda_graph,
-            force_dynamic_quantization=self.pytorch_backend_config.
-            force_dynamic_quantization,
+            enable_min_latency=self.llm_args.enable_min_latency,
+            use_cuda_graph=self.llm_args.cuda_graph_config is not None,
+            force_dynamic_quantization=self.llm_args.force_dynamic_quantization,
             spec_config=self.spec_config,
             sparse_attention_config=self.sparse_attention_config,
             max_num_tokens=self.max_num_tokens,
             max_seq_len=self.max_seq_len,
-            moe_max_num_tokens=self.pytorch_backend_config.moe_max_num_tokens,
-            moe_load_balancer=self.pytorch_backend_config.moe_load_balancer,
+            moe_max_num_tokens=self.llm_args.moe_config.max_num_tokens,
+            moe_load_balancer=self.llm_args.moe_config.load_balancer,
             lora_config=self.lora_config,
-            allreduce_strategy=self.pytorch_backend_config.allreduce_strategy,
-            mm_encoder_only=self.pytorch_backend_config.mm_encoder_only,
-            attn_backend=self.pytorch_backend_config.attn_backend,
-            moe_backend=self.pytorch_backend_config.moe_backend,
-            moe_disable_finalize_fusion=self.pytorch_backend_config.
-            moe_disable_finalize_fusion,
-            use_low_precision_moe_combine=self.pytorch_backend_config.
+            allreduce_strategy=self.llm_args.allreduce_strategy,
+            mm_encoder_only=self.llm_args.mm_encoder_only,
+            attn_backend=self.llm_args.attn_backend,
+            moe_backend=self.llm_args.moe_config.backend,
+            moe_disable_finalize_fusion=self.llm_args.moe_config.
+            disable_finalize_fusion,
+            use_low_precision_moe_combine=self.llm_args.moe_config.
             use_low_precision_moe_combine)
 
-        validate_and_set_kv_cache_quant(
-            config, self.pytorch_backend_config.kv_cache_dtype)
+        validate_and_set_kv_cache_quant(config,
+                                        self.llm_args.kv_cache_config.dtype)
         validate_and_set_mamba_ssm_cache_dtype(
-            config, self.pytorch_backend_config.mamba_ssm_cache_dtype)
+            config, self.llm_args.kv_cache_config.mamba_ssm_cache_dtype)
 
         # Allow overriding the number of layers via environment variable
         num_layers_override = int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM",

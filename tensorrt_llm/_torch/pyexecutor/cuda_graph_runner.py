@@ -36,9 +36,8 @@ class CUDAGraphRunner:
         self.engine_ref = weakref.ref(engine)
 
         # High-level configuration
-        config = engine.pytorch_backend_config
-        self.enabled = config.use_cuda_graph
-        self.padding_enabled = config.cuda_graph_padding_enabled
+        self.enabled = engine.llm_args.cuda_graph_config is not None
+        self.padding_enabled = engine._cuda_graph_padding_enabled
         self.supported_batch_sizes = engine._cuda_graph_batch_sizes
         self.max_supported_batch_size = engine._max_cuda_graph_batch_size
         self.max_beam_width = engine.max_beam_width
