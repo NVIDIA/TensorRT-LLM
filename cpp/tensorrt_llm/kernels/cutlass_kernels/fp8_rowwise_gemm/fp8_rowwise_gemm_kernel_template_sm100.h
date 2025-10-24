@@ -132,11 +132,11 @@ struct DeviceGemmFp8RowwiseSm100
     using EVTComputeBias = cutlass::epilogue::fusion::Sm90EVT<ComputeBias, Bias, EVTCompute1>;
 
     using EpilogueEVT = EVTCompute1;
-    using EpilogueScheduleTypeOverride = cutlass::epilogue::collective::EpilogueScheduleAuto;
+
     using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<ArchTag, OperatorClass,
         TileShape, ClusterShape, cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator,
         ElementComputeEpilogue, ElementC, LayoutC, AlignmentC, ElementOutput, LayoutOutput, AlignmentOutput,
-        EpilogueScheduleTypeOverride, EpilogueEVT>::CollectiveOp;
+        EpilogueScheduleType, EpilogueEVT>::CollectiveOp;
 
     using MainLoopSchedule = cutlass::gemm::collective::KernelScheduleAuto;
 
