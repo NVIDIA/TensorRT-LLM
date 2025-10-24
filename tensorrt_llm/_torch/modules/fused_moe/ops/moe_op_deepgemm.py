@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
 
-from ...memory_buffer_utils import get_memory_buffers
+from ....memory_buffer_utils import get_memory_buffers
 from .moe_op import MoEOp
 
 if TYPE_CHECKING:

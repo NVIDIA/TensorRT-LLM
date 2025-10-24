@@ -344,6 +344,7 @@ class AttentionMetadata:
         Hook to be called when using TRTLLM attention backend in spec-dec mode.
         """
 
+    @staticmethod
     def get_empty(buffers, tensor_shape: list[int], dtype: torch.dtype,
                   cache_name: str) -> torch.Tensor:
         """
@@ -370,6 +371,7 @@ class AttentionMetadata:
         return buffers.get_buffer(tensor_shape, dtype, cache_name,
                                   capture_graph)
 
+    @staticmethod
     def get_empty_like(buffers, like_tensor: torch.Tensor,
                        cache_name: str) -> torch.Tensor:
         return get_empty(buffers,
