@@ -142,47 +142,37 @@ def restore_full_output(valid_outputs: List[torch.Tensor],
     return full_outputs
 
 
-def allgather(
+def _allgather(
     input: Union[torch.Tensor, List[torch.Tensor]],
-    mapping: Mapping,
+    group: List[int],
+    rank: int,
+    group_boxed: Optional[object] = None,
     dim: int = -1,
     sizes: Optional[List[int]] = None,
 ) -> Union[torch.Tensor, List[torch.Tensor]]:
     '''
-    Add an operation that performs a collective all-gather.
-
-    If 'sizes' is 'None', the input tensors in the different ranks must have the same shape.
-    Otherwise, 'sizes[i]' must be 'input.shape[dim]' at rank i, and the input tensors in
-    the different ranks can only differ in shape at dimension `dim`.
-
-    The input tensors in the same TP group are concatenated at dimension 'dim' to produce the output tensor.
-    If 'sizes' is 'None', 'output.shape[dim] = input.shape[dim] * tp_group_size'.
-    Otherwise, 'output.shape[dim] = sum(sizes)'.
-
-    That operation is implemented using a torch op that wraps the NCCL all-gather collective operation or
-    the NCCL group call of a series of NCCL broadcast collective operations. See the following materials for details.
-    https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html#allgather,
-    https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html#broadcast,
-    https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/api/group.html.
+    Performs a collective all-gather across the given parallel group, for the given rank.
 
     Args:
         input (Union[Tensor, List[Tensor]]): The input tensor or tensor list.
-        mapping (Mapping):  The parallel mapping.
+        group (List[int]): The list of ranks to participate in the all-gather.
+        rank (int): The rank of the current process.
+        group_boxed (object): The boxed ProcessGroup object for the list of ranks, if available.
         dim (int): Gather along given dimension. By default -1.
         sizes(Optional[List[int]]): An optional list indicating 'input.shape[dim]' in all ranks. By default None.
     Returns:
         The gathered tensor or tensor list.
     '''
-    if mapping.tp_size == 1:
+    if len(group) == 1:
         return input
 
     if sizes is not None:
-        assert len(sizes) == len(mapping.tp_group)
+        assert len(sizes) == len(group)
         if isinstance(input, torch.Tensor):
-            assert input.shape[dim] == sizes[mapping.tp_rank]
+            assert input.shape[dim] == sizes[rank]
         else:
             assert all([
-                val.shape[dim] == sizes[mapping.tp_rank] for val in input
+                val.shape[dim] == sizes[rank] for val in input
                 if val is not None
             ])
     # Inputs are reshaped in this way to pass necessary shape information to the allgather op
@@ -208,17 +198,16 @@ def allgather(
         ]
 
     if mpi_disabled():
-        output = torch_op(input, sizes, mapping.tp_group,
-                          mapping.tp_group_pg.boxed())
+        output = torch_op(input, sizes, group, group_boxed)
     else:
-        output = torch_op(input, sizes, mapping.tp_group)
+        output = torch_op(input, sizes, group)
 
     def convert_output(x, x_info):
         if dim == 0:
             x = x.view(x_info['output_shape'])
         else:
             if sizes is None:
-                x_list = x.chunk(mapping.tp_size)
+                x_list = x.chunk(len(group))
             else:
                 x_list = x.split(sizes)
             x = torch.cat([x.reshape(x_info['output_shape']) for x in x_list],
@@ -234,6 +223,66 @@ def allgather(
         ]
         output = restore_full_output(output, valid)
     return output
+
+
+def allgather(
+    input: Union[torch.Tensor, List[torch.Tensor]],
+    mapping: Mapping,
+    dim: int = -1,
+    sizes: Optional[List[int]] = None,
+) -> Union[torch.Tensor, List[torch.Tensor]]:
+    '''
+    Add an operation that performs a collective all-gather across the TP group.
+
+    If 'sizes' is 'None', the input tensors in the different ranks must have the same shape.
+    Otherwise, 'sizes[i]' must be 'input.shape[dim]' at rank i, and the input tensors in
+    the different ranks can only differ in shape at dimension `dim`.
+
+    The input tensors in the same TP group are concatenated at dimension 'dim' to produce the output tensor.
+    If 'sizes' is 'None', 'output.shape[dim] = input.shape[dim] * tp_group_size'.
+    Otherwise, 'output.shape[dim] = sum(sizes)'.
+
+    That operation is implemented using a torch op that wraps the NCCL all-gather collective operation or
+    the NCCL group call of a series of NCCL broadcast collective operations. See the following materials for details.
+    https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html#allgather,
+    https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html#broadcast,
+    https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/api/group.html.
+
+    Args:
+        input (Union[Tensor, List[Tensor]]): The input tensor or tensor list.
+        mapping (Mapping): The parallel mapping.
+        dim (int): Gather along given dimension. By default -1.
+        sizes(Optional[List[int]]): An optional list indicating 'input.shape[dim]' in all ranks. By default None.
+    Returns:
+        The gathered tensor or tensor list.
+    '''
+    group_boxed = mapping.tp_group_pg.boxed() if mpi_disabled() else None
+    return _allgather(input, mapping.tp_group, mapping.tp_rank, group_boxed,
+                      dim, sizes)
+
+
+def cp_allgather(
+    input: Union[torch.Tensor, List[torch.Tensor]],
+    mapping: Mapping,
+    dim: int = -1,
+    sizes: Optional[List[int]] = None,
+) -> Union[torch.Tensor, List[torch.Tensor]]:
+    '''
+    Add an operation that performs a collective all-gather across the CP group.
+
+    See `allgather` for more details on the inputs and implementation constraints.
+
+    Args:
+        input (Union[Tensor, List[Tensor]]): The input tensor or tensor list.
+        mapping (Mapping): The parallel mapping.
+        dim (int): Gather along given dimension. By default -1.
+        sizes(Optional[List[int]]): An optional list indicating 'input.shape[dim]' in all ranks. By default None.
+    Returns:
+        The gathered tensor or tensor list.
+    '''
+    group_boxed = mapping.cp_group_pg.boxed() if mpi_disabled() else None
+    return _allgather(input, mapping.cp_group, mapping.cp_rank, group_boxed,
+                      dim, sizes)
 
 
 def alltoall_helix(
