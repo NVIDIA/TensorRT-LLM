@@ -9,8 +9,8 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm import internal as _tllm_internal
 from tensorrt_llm._mnnvl_utils import MnnvlMemory
+from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.logger import logger as tllm_logger
 from tensorrt_llm.mapping import Mapping
 

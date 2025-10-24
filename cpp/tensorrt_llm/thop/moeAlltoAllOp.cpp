@@ -567,7 +567,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
     module.def(
         "moe_a2a_dispatch(Tensor token_selected_experts, Tensor[] input_payloads, Tensor(a!->*) workspace, int "
         "max_tokens_per_rank, "
-        "int ep_rank, int ep_size, int top_k, int num_experts) -> (Tensor(a)[], Tensor(a), Tensor(a), Tensor, Tensor, "
+        "int ep_rank, int ep_size, int top_k, int num_experts) -> (Tensor(a!)[], Tensor(a!), Tensor(a!), Tensor, "
+        "Tensor, "
         "int)");
     module.def(
         "moe_a2a_combine(Tensor topk_target_ranks, Tensor topk_send_indices, Tensor(a) recv_counters, Tensor(a) "
