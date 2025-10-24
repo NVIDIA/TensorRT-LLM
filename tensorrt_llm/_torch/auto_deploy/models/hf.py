@@ -115,17 +115,14 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         # a mapping of the parameter names exists and hold that information in this attribute.
         self._checkpoint_conversion_mapping: Optional[Dict[str, str]] = None
 
-        # This is needed for guided decoding in the pyexecutor.
-        model_config, _ = self._get_model_config()
-        self._vocab_size_padded = getattr(model_config, "vocab_size", None)
-
     @property
     def automodel_cls(self) -> Type[_BaseAutoModelClass]:
         return AutoModelForCausalLM
 
     @property
     def vocab_size_padded(self) -> Optional[int]:
-        return self._vocab_size_padded
+        model_config, _ = self._get_model_config()
+        return getattr(model_config, "vocab_size", None)
 
     def _recursive_update_config(
         self, config: PretrainedConfig, update_dict: Dict[str, Any]
@@ -175,6 +172,9 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         return config, nested_unused_kwargs
 
     def _get_model_config(self) -> Tuple[PretrainedConfig, Dict[str, Any]]:
+        # prefetch the model once without weights
+        self.prefetch_checkpoint(skip_loading_weights=True)
+
         # NOTE (lucaslie): HF doesn't recursively update nested PreTrainedConfig objects. Instead,
         # the entire subconfig will be overwritten.
         # we want to recursively update model_config from model_kwargs here.

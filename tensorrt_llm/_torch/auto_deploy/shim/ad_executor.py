@@ -112,15 +112,16 @@ class ADEngine(ModelEngine):
             device = torch.device(f"cuda:{torch.cuda.current_device()}")
         device = str(device)
 
+        factory = ad_config.create_factory()
+
         # initialize seq info object
         seq_info = SequenceInfo(
             max_seq_len=max_seq_len,
             max_batch_size=max_batch_size,
             page_size=attn_page_size,
             max_num_tokens=max_num_tokens,
+            vocab_size_padded=factory.vocab_size_padded,
         )
-
-        factory = ad_config.create_factory()
 
         # TODO (lucaslie): consider how we move args around InferenceOptimizer.__init__,
         # ADEngine.__init__, and ADEngine.build_from_config. Seems a bit unnatural atm.
@@ -424,8 +425,7 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     if (
         (guided_decoding_backend := ad_config.guided_decoding_backend) is not None
     ) and dist_mapping.is_last_pp_rank():
-        factory = ad_config.create_factory()
-        vocab_size_padded = getattr(factory, "vocab_size_padded", None)
+        vocab_size_padded = engine.cache_seq_interface.info.vocab_size_padded
         if vocab_size_padded is None:
             raise RuntimeError(
                 "Could not determine the vocabulary size. Required for guided decoding."
