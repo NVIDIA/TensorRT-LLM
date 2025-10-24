@@ -34,7 +34,6 @@ class ScaffoldingLlm:
         self.task_queue = asyncio.Queue()
         self.main_loop_stop_event = asyncio.Event()
         self.shutdown_event = asyncio.Event()
-        self.streaming_event = asyncio.Event()
         if self.own_loop:
             self._run_main_loop_thread()
         else:
@@ -82,10 +81,10 @@ class ScaffoldingLlm:
         ]
         await asyncio.gather(*async_tasks)
         for task in tasks:
-            if getattr(task, 'streaming', False):
-                await request.result.set_output_async(task.result)
-                self.streaming_event.clear()
-                await self.streaming_event.wait()
+            if task.streaming_output_flag:
+                for output in task.streaming_output_list:
+                    request.result.set_output_streaming(output)
+                task.streaming_output_list = []
 
     async def _handle_parallel_process(self,
                                        tasks: ParallelProcess,
@@ -172,7 +171,7 @@ class ScaffoldingLlm:
         self.main_loop_thread.start()
 
     def generate_async(self, prompt: str) -> ScaffoldingResult:
-        result = ScaffoldingResult(self.streaming_event)
+        result = ScaffoldingResult()
 
         async def put_request():
             try:
