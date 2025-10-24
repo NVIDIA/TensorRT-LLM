@@ -17,7 +17,7 @@ import sys
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Iterable
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent import futures
 from dataclasses import dataclass
 from itertools import repeat
 from typing import Any, Callable, List, Optional, TypeVar, cast
@@ -82,7 +82,7 @@ T = TypeVar("T")
 
 @dataclass(kw_only=True)
 class SampleStateTensors:
-    new_tokens: torch.Tensor | Future[torch.Tensor]
+    new_tokens: torch.Tensor | futures.Future[torch.Tensor]
     log_probs: torch.Tensor | None = None
 
     def values(self):
@@ -574,12 +574,12 @@ class AsyncWorkerMixin:
     def _async_worker_active(self) -> bool:
         return self._async_worker is not None
 
-    def _async_worker_init(self, use_async_worker: bool):
-        self.use_async_worker = use_async_worker
+    def _async_worker_init(self, enable_async_worker: bool):
+        self.enable_async_worker = enable_async_worker
         self._async_worker = None
 
     def async_worker_start(self):
-        assert self.use_async_worker
+        assert self.enable_async_worker
         assert not self._async_worker_active()
 
         def _async_worker_initializer(device_id):
@@ -590,7 +590,7 @@ class AsyncWorkerMixin:
             # blocking copies from gating subsequent async work
             torch.cuda.set_stream(torch.cuda.Stream())
 
-        self._async_worker = ThreadPoolExecutor(
+        self._async_worker = futures.ThreadPoolExecutor(
             max_workers=1,
             initializer=_async_worker_initializer,
             initargs=(torch.cuda.current_device(),),
@@ -653,7 +653,7 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         max_num_sequences: int
         max_beam_width: int
         max_total_draft_tokens: int
-        use_async_worker: Optional[bool] = False
+        enable_async_worker: Optional[bool] = False
 
     def __init__(self, args: Args):
         self.max_seq_len = args.max_seq_len
@@ -674,7 +674,7 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         self._global_seed = 42
         self._generator = None
 
-        self._async_worker_init(args.use_async_worker)
+        self._async_worker_init(args.enable_async_worker)
 
     def get_generator(self, device: torch.device) -> torch.Generator:
         """Get a deterministic generator for the specified device.
@@ -755,9 +755,8 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         if request.py_return_log_probs:
             if self._async_worker_active():
                 # These should be futures if we used the async worker
-                assert isinstance(request.py_topk_logprobs_values, Future) and isinstance(
-                    request.py_topk_logprobs_vals, Future
-                )
+                assert isinstance(request.py_topk_logprobs_values, futures.Future)
+                assert isinstance(request.py_topk_logprobs_vals, futures.Future)
                 topk_log_probs_vals = request.py_topk_logprobs_vals.result()
                 topk_log_probs_indices = request.py_topk_logprobs_indices.result()
             else:
@@ -1079,7 +1078,7 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         assert state.host is not None
 
         if self._async_worker_active():
-            assert isinstance(state.host.new_tokens, Future)
+            assert isinstance(state.host.new_tokens, futures.Future)
             new_tokens = state.host.new_tokens.result()
         else:
             new_tokens = state.host.new_tokens
@@ -1686,7 +1685,9 @@ class SampleStateTensorsHostTRTLLM(SampleStateTensors):
 class SampleStateTRTLLM(SampleState):
     finalize_events: dict[str, CudaEvent] | None = None
     """`Optional` to accommodate `_forward_step_inter_pp` which creates a `SampleState` without `finalize_events`"""
-    host: Optional[SampleStateTensorsHostTRTLLM | Future[SampleStateTensorsHostTRTLLM]] = None
+    host: Optional[SampleStateTensorsHostTRTLLM | futures.Future[SampleStateTensorsHostTRTLLM]] = (
+        None
+    )
 
 
 class TRTLLMSampler(Sampler, AsyncWorkerMixin):
@@ -1709,7 +1710,7 @@ class TRTLLMSampler(Sampler, AsyncWorkerMixin):
         max_beam_width: int,
         decoding_config: Optional[DecodingConfig] = None,
         kv_cache_config: Optional[KvCacheConfig] = None,
-        use_async_worker: Optional[bool] = False,
+        enable_async_worker: Optional[bool] = False,
     ):
         vocab_size = model.config.vocab_size
         num_hidden_layers = model.config.num_hidden_layers
@@ -1760,7 +1761,7 @@ class TRTLLMSampler(Sampler, AsyncWorkerMixin):
         self._initialize_store()
         self._instantiate_algorithms()
 
-        self._async_worker_init(use_async_worker)
+        self._async_worker_init(enable_async_worker)
 
     def _initialize_store(self):
         torch_stream = torch.cuda.current_stream().cuda_stream
@@ -1983,7 +1984,7 @@ class TRTLLMSampler(Sampler, AsyncWorkerMixin):
 
         if self._async_worker_active():
             # Wait for and "unpack" the host tensors
-            assert isinstance(state.host, Future)
+            assert isinstance(state.host, futures.Future)
             state.host = state.host.result()
 
         beam_width = self.beam_width(state.scheduled_requests.all_requests())
