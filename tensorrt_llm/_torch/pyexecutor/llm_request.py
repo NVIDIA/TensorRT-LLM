@@ -43,19 +43,19 @@ class LogitsStorage:
 
     def __init__(
         self,
+        *,
         seq_length: int,
         use_device_memory=True,
-        should_exclude_last=False,
+        extra_token_for_overlap_scheduler=False,
         use_chunked_generation_logits=False,
         chunk_size=8
     ):  # logic adpted from HandleGenerationLogits.cpp to use chunked transfer
-        if should_exclude_last:
+        if extra_token_for_overlap_scheduler:
             # Exclude last logits is used when overlap scheduler is used, that generates one extra token,
             # so we should make sure there's memory for that extra +1.
             seq_length += 1
         self.seq_length = seq_length
         self.use_device_memory = use_device_memory
-        self._should_exclude_last = should_exclude_last
         self.use_chunked_generation_logits = use_chunked_generation_logits
         self.chunk_size = chunk_size
         self._logits_indices = []
@@ -126,14 +126,20 @@ class LogitsStorage:
                                                        non_blocking=True)
             self._logits_indices.append((position, new_position))
 
-    def get(self, all_logits: bool) -> torch.Tensor | None:
+    def get(self, all_logits: bool, exclude_last: bool) -> torch.Tensor | None:
         """Returns the used logits storage if there are any, otherwise, returns None.
-        When all_logits is True then all set logits are returned, otherwise, only the last logits are returned."""
+
+        Args:
+            all_logits: If True, return all logits; if False, return only the last chunk of logits.
+            exclude_last: If True, drop the entire last chunk. Requires at least 2 chunks to have been appended.
+                This is used when overlap scheduler is enabled to discard the extra iteration's logits.
+        """
         if self._storage is None:
             return None
 
         try:
-            last = -2 if self._should_exclude_last else -1
+            # When exclude_last=True, we expect at least 2 chunks and drop the whole last chunk
+            last = -2 if exclude_last else -1
             start = 0 if all_logits else self._logits_indices[last][0]
             end = self._logits_indices[last][1]
             return self._storage[start:end]
@@ -174,9 +180,6 @@ class LogitsStorage:
         """Force transfer of any remaining fragments to host (for chunked mode)"""
         if self.use_chunked_generation_logits and self._device_fragments:
             self._transfer_chunk_to_host()
-
-    def set_exclude_last(self, should_exclude_last: bool) -> None:
-        self._should_exclude_last = should_exclude_last
 
 
 class LogProbStorage:
@@ -225,6 +228,7 @@ class PyResult:
     """PyResult reimplements some features of `bindings.executor.Result` in Python"""
 
     def __init__(self,
+                 *,
                  prompt_len: int,
                  max_new_tokens: int,
                  use_device_memory=True,
@@ -240,16 +244,20 @@ class PyResult:
             assert chunk_size == 1, "chunk_size must be 1 in streaming mode"
         self._streaming = streaming
         self._chunk_size = chunk_size
+        self._exclude_last_generation_logits = exclude_last_generation_logits
 
         # Note that in C++ implemnetation both context logits and generation logits are stored on host memory.
         # Here we only use host memory for generation logits if in chunked model.
         self._context_logits = LogitsStorage(
-            prompt_len, use_device_memory, use_chunked_generation_logits=False
+            seq_length=prompt_len,
+            use_device_memory=use_device_memory,
+            extra_token_for_overlap_scheduler=False,
+            use_chunked_generation_logits=False
         ) if return_context_logits else None
         self._generation_logits = LogitsStorage(
-            max_new_tokens,
-            use_device_memory,
-            exclude_last_generation_logits,
+            seq_length=max_new_tokens,
+            use_device_memory=use_device_memory,
+            extra_token_for_overlap_scheduler=exclude_last_generation_logits,
             use_chunked_generation_logits=use_chunked_generation_logits,
             chunk_size=self._chunk_size) if return_generation_logits else None
         self._log_probs = LogProbStorage() if return_log_probs else None
@@ -262,6 +270,10 @@ class PyResult:
             name: []
             for name in additional_outputs
         } if additional_outputs else None
+
+    def set_exclude_last_generation_logits(
+            self, exclude_last_generation_logits: bool):
+        self._exclude_last_generation_logits = exclude_last_generation_logits
 
     def append_context_logits(self, context_logits: torch.Tensor):
         if self._context_logits:
@@ -309,7 +321,7 @@ class PyResult:
     @property
     def context_logits(self) -> torch.Tensor | None:
         if self._context_logits is None or (storage := self._context_logits.get(
-                all_logits=True)) is None:
+                all_logits=True, exclude_last=False)) is None:
             return None
         return storage[:, 0]  # remove beam_width axis for context
 
@@ -320,7 +332,9 @@ class PyResult:
         if not self._generation_logits:
             return None
 
-        storage = self._generation_logits.get(all_logits=not self._streaming)
+        storage = self._generation_logits.get(
+            all_logits=not self._streaming,
+            exclude_last=self._exclude_last_generation_logits)
         if storage is None:
             return None
         return storage.transpose(0, 1)
@@ -524,14 +538,14 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_stop_words_list = stop_words_list
 
         self.py_result = PyResult(
-            self.py_prompt_len,
-            self.py_max_new_tokens,
-            return_logits_device_memory,
-            self.streaming,
-            return_log_probs,
-            return_context_logits,
-            return_generation_logits,
-            exclude_last_generation_logits,
+            prompt_len=self.py_prompt_len,
+            max_new_tokens=self.py_max_new_tokens,
+            use_device_memory=return_logits_device_memory,
+            streaming=self.streaming,
+            return_log_probs=return_log_probs,
+            return_context_logits=return_context_logits,
+            return_generation_logits=return_generation_logits,
+            exclude_last_generation_logits=exclude_last_generation_logits,
             use_chunked_generation_logits=self.py_use_chunked_generation_logits,
             chunk_size=self.py_logits_chunk_size,
             additional_outputs=additional_outputs)
@@ -544,6 +558,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                 self._py_embedding_bias_1d = self.embedding_bias.squeeze(0)
             else:
                 self._py_embedding_bias_1d = self.embedding_bias
+
+    def set_exclude_last_generation_logits(
+            self, exclude_last_generation_logits: bool):
+        self.py_result.set_exclude_last_generation_logits(
+            exclude_last_generation_logits)
 
     @property
     def cached_tokens(self) -> int:

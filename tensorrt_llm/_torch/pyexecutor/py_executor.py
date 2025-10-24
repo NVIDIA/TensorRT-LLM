@@ -2017,6 +2017,7 @@ class PyExecutor:
             if request.context_remaining_length == 0:
                 if not self.disable_overlap_scheduler and request.will_complete_next_iteration(
                 ):
+                    request.set_exclude_last_generation_logits(False)
                     request.state = LlmRequestState.GENERATION_TO_COMPLETE
                 else:
                     request.state = LlmRequestState.GENERATION_IN_PROGRESS
@@ -2025,6 +2026,7 @@ class PyExecutor:
             if request.state != LlmRequestState.GENERATION_COMPLETE:
                 if not self.disable_overlap_scheduler and request.will_complete_next_iteration(
                 ):
+                    request.set_exclude_last_generation_logits(False)
                     request.state = LlmRequestState.GENERATION_TO_COMPLETE
 
     def _update_request_states_star_attention(
