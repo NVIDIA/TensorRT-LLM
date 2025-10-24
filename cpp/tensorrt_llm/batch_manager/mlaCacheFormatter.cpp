@@ -235,6 +235,8 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
         inputKvCacheBlocksPerWindow, outputSplitCaches, destConfig, selfConfig, selfIdx, bufferManager);
 
     bufferManager.getStream().synchronize();
+    // Record the time when the kv cache kernel ended
+    llmRequest.setKvCacheKernelEndTime(std::chrono::steady_clock::now());
 
     auto preAllocSendBuffer = mCacheTransBufferManager->getSendBuffer(cacheBufferId);
     if (preAllocSendBuffer != nullptr)

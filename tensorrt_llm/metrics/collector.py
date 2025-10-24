@@ -66,6 +66,37 @@ class MetricsCollector:
             ],
             labelnames=self.labels.keys())
 
+        self.histogram_request_metadata_time = Histogram(
+            name="request_metadata_time_seconds",
+            documentation=
+            "Histogram of time spent before kv cache transfer start for request.",
+            buckets=[
+                0.01, 0.05, 0.1, 0.3, 0.5, 0.8, 1.0, 1.5, 2.0, 2.5, 5.0, 10.0,
+                15.0, 20.0, 30.0, 40.0, 50.0, 60.0, 120.0, 240.0, 480.0, 960.0,
+                1920.0, 7680.0
+            ],
+            labelnames=self.labels.keys())
+
+        self.histogram_kv_cache_kernel_time = Histogram(
+            name="kv_cache_kernel_time_seconds",
+            documentation=
+            "Histogram of time spent in concate/split kernel for request.",
+            buckets=[
+                0.3, 0.5, 0.8, 1.0, 1.5, 2.0, 2.5, 5.0, 10.0, 15.0, 20.0, 30.0,
+                40.0, 50.0, 60.0, 120.0, 240.0, 480.0, 960.0, 1920.0, 7680.0
+            ],
+            labelnames=self.labels.keys())
+
+        self.histogram_kv_cache_transfer_time = Histogram(
+            name="kv_cache_transfer_time_seconds",
+            documentation=
+            "Histogram of time spent in kv cache transfer for request.",
+            buckets=[
+                0.3, 0.5, 0.8, 1.0, 1.5, 2.0, 2.5, 5.0, 10.0, 15.0, 20.0, 30.0,
+                40.0, 50.0, 60.0, 120.0, 240.0, 480.0, 960.0, 1920.0, 7680.0
+            ],
+            labelnames=self.labels.keys())
+
     def _label_merge(self, labels: Dict[str, str]) -> Dict[str, str]:
         if labels is None or len(labels) == 0:
             return self.labels
@@ -95,6 +126,18 @@ class MetricsCollector:
         if request_queue_time := data.get(MetricNames.REQUEST_QUEUE_TIME, 0):
             self._log_histogram(self.histogram_queue_time_request,
                                 request_queue_time)
+        if request_metadata_time := data.get(MetricNames.REQUEST_METADATA_TIME,
+                                             0):
+            self._log_histogram(self.histogram_request_metadata_time,
+                                request_metadata_time)
+        if kv_cache_kernel_time := data.get(MetricNames.KV_CACHE_KERNEL_TIME,
+                                            0):
+            self._log_histogram(self.histogram_kv_cache_kernel_time,
+                                kv_cache_kernel_time)
+        if kv_cache_transfer_time := data.get(
+                MetricNames.KV_CACHE_TRANSFER_TIME, 0):
+            self._log_histogram(self.histogram_kv_cache_transfer_time,
+                                kv_cache_transfer_time)
         self.last_log_time = time.time()
 
     def log_metrics_dict(self, metrics_dict: dict[str, float]) -> None:

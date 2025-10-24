@@ -482,8 +482,12 @@ private:
         try
         {
             TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
+            // Record the time when the kv cache transfer started
+            resp.mRequest->setKvCacheTransferStart(std::chrono::steady_clock::now());
             sendSync(*resp.mRequest);
             release(id);
+            // Record the time when the kv cache transfer ended
+            resp.mRequest->setKvCacheTransferEnd(std::chrono::steady_clock::now());
             resp.mPromise.set_value();
         }
         catch (tensorrt_llm::common::RequestSpecificException const& e)
@@ -508,6 +512,8 @@ private:
 
     void sendResponse(std::map<RequestIdType, CacheSender::Impl::Response>::iterator it)
     {
+        // Record the time when the requestinfo was received
+        it->second.mRequest->setRequestInfoTime(std::chrono::steady_clock::now());
         auto reqId = mCurrentRequest.value();
         auto count = --mRemainSendCount[reqId];
         TLLM_CHECK(count >= 0);

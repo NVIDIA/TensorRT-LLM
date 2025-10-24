@@ -1691,22 +1691,42 @@ public:
         mDecodingIter = iter;
     }
 
-    void setKvCacheTransferStart(TimePoint const& time)
+    void setRequestInfoTime(TimePoint const& time) const
+    {
+        mPerfMetrics.timingMetrics.requestInfoTime = maybeToGlobalSteadyClock(time);
+    }
+
+    TimePoint getRequestInfoTime() const
+    {
+        return mPerfMetrics.timingMetrics.requestInfoTime;
+    }
+
+    void setKvCacheKernelEndTime(TimePoint const& time) const
+    {
+        mPerfMetrics.timingMetrics.kvCacheKernelEndTime = maybeToGlobalSteadyClock(time);
+    }
+
+    TimePoint getKvCacheKernelEndTime() const
+    {
+        return mPerfMetrics.timingMetrics.kvCacheKernelEndTime;
+    }
+
+    void setKvCacheTransferStart(TimePoint const& time) const
     {
         mPerfMetrics.timingMetrics.kvCacheTransferStart = maybeToGlobalSteadyClock(time);
     }
 
-    void setKvCacheTransferEnd(TimePoint const& time)
+    void setKvCacheTransferEnd(TimePoint const& time) const
     {
         mPerfMetrics.timingMetrics.kvCacheTransferEnd = maybeToGlobalSteadyClock(time);
     }
 
-    TimePoint getKvCacheTransferStart()
+    TimePoint getKvCacheTransferStart() const
     {
         return mPerfMetrics.timingMetrics.kvCacheTransferStart;
     }
 
-    TimePoint getKvCacheTransferEnd()
+    TimePoint getKvCacheTransferEnd() const
     {
         return mPerfMetrics.timingMetrics.kvCacheTransferEnd;
     }
@@ -2030,7 +2050,7 @@ protected:
 
     // Performance metrics.
     bool mReturnPerfMetrics{false};
-    executor::RequestPerfMetrics mPerfMetrics;
+    mutable executor::RequestPerfMetrics mPerfMetrics;
 
     // Guided decoding params.
     std::optional<executor::GuidedDecodingParams> mGuidedDecodingParams{std::nullopt};
