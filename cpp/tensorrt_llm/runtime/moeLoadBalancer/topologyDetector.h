@@ -18,6 +18,7 @@
 
 #include <map>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <vector>
 #ifdef __linux__
@@ -59,6 +60,8 @@ public:
     // GPUs using C2C link with CPU may have assigned NUMA ID for its memory, like GB200.
     // Returns -1 if it doesn't have NUMA ID.
     int getCurrentGpuMemoryNumaId();
+
+    std::string getNoCurrentGpuMemoryNumaIdReason();
 
     // Returns the number of GPUs associated with the given NUMA node ID.
     int getGpuCountUnderNuma(int numaId);
@@ -104,6 +107,8 @@ private:
     // Precomputed CPU affinity masks
     std::map<int, struct bitmask*> mGpuStrictCpuMasks; // GPU ID -> Strict CPU mask
 #endif
+
+    std::stringstream mDebugStringStream;
 };
 
 } // namespace tensorrt_llm::runtime

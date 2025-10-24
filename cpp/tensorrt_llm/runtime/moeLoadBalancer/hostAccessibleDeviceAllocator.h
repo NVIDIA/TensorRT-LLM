@@ -54,6 +54,8 @@ public:
      */
     static bool isSupported();
 
+    static std::string getUnSupportedReason();
+
     /**
      * @brief Allocate host accessible memory on the device.
      *
