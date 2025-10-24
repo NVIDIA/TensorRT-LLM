@@ -12,11 +12,12 @@ llm_perf_sanity:
   #trt backend
   - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-pytorch-bfloat16-input_output_len:128,128]
   - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-pytorch-bfloat16-input_output_len:512,32]
+  - perf/test_perf.py::test_perf[starcoder2_7b-bench-bfloat16-input_output_len:512,512]
+  #pytorch backend
   - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-pytorch-bfloat16-input_output_len:500,2000]
   - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-pytorch-bfloat16-input_output_len:512,32]
   - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-pytorch-streaming-bfloat16-input_output_len:500,2000]
   - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-pytorch-streaming-bfloat16-input_output_len:512,32]
-  #pytorch backend
   - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-pytorch-bfloat16-input_output_len:128,128]
   # Phi-4-multimodal-instruct
   - perf/test_perf.py::test_perf[phi_4_multimodal_instruct-bench-pytorch-bfloat16-input_output_len:128,128]
@@ -25,6 +26,7 @@ llm_perf_sanity:
   # Ministral-8B
   - perf/test_perf.py::test_perf[ministral_8b-bench-pytorch-bfloat16-input_output_len:500,2000-reqs:500-con:250]
   - perf/test_perf.py::test_perf[phi_4_mini_instruct-bench-pytorch-bfloat16-input_output_len:500,2000]
+  - perf/test_perf.py::test_perf[nemotron_nano_9b_v2-bench-pytorch-bfloat16-input_output_len:512,512]
 
   # Test list validation
   - test_list_validation.py::test_list_validation
