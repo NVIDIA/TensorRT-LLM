@@ -128,7 +128,7 @@ private:
     BaseKVCacheManager const* mManager;
     runtime::ITensor::SharedPtr mPool;
     SizeType32 mWindowSize;
-    const LlmRequest::RequestIdType mRequestId;
+    LlmRequest::RequestIdType const mRequestId;
     std::vector<SizeType32> mBlockIds;
 
     static constexpr SizeType32 kFIRST_AND_ONLY_BEAM = 0;
@@ -203,7 +203,18 @@ private:
     {
         if (mIdx < mRange->mBlockIds.size())
         {
-            mCurrent = runtime::ITensor::slice(mRange->mPool, mRange->mBlockIds.at(mIdx), 1);
+            if (mRange->mManager != nullptr)
+            {
+                BlockPtr const& block
+                    = mRange->mManager->getBlockManager().getBlockById(mRange->mBlockIds.at(mIdx), mRange->mWindowSize);
+                TLLM_CHECK_WITH_INFO(block->isPrimary(), "cache transceiver only supports primary blocks");
+                auto const blockOffset = block->getMemoryPoolBlockIndex();
+                mCurrent = runtime::ITensor::slice(mRange->mPool, blockOffset, 1);
+            }
+            else
+            {
+                mCurrent = runtime::ITensor::slice(mRange->mPool, mRange->mBlockIds.at(mIdx), 1);
+            }
         }
     }
 
