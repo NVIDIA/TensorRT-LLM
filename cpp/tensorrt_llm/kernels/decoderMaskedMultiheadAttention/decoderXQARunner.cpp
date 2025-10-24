@@ -87,10 +87,12 @@ DecoderXQAImpl* DecoderXQARunner::getImplFromXQAParams(XQAParams const& xqaParam
         {
             // Some multi_query kernels are not ported to JIT yet.
             auto const grpSize = xqaParams.num_q_heads / xqaParams.num_kv_heads;
-            // Hopper XQA supports spec dec with JIT, but only for E4M3 kv cache data type. Only allow 64%grpSize==0 for
-            // now.
-            bool const supportedByHopperXqa
-                = (smVersion == 90 && xqaParams.kv_cache_data_type == XQADataType::DATA_TYPE_E4M3 && grpSize <= 64);
+            // Hopper XQA supports spec dec with JIT. Only allow 64%grpSize==0 for now.
+            bool const supportedByHopperXqa = (smVersion == 90
+                && (xqaParams.kv_cache_data_type == XQADataType::DATA_TYPE_E4M3
+                    || xqaParams.kv_cache_data_type == XQADataType::DATA_TYPE_FP16
+                    || xqaParams.kv_cache_data_type == XQADataType::DATA_TYPE_BF16)
+                && grpSize <= 64);
             bool const supportedBySm120Mla = (smVersion == 120 && xqaParams.isMLA()
                 && xqaParams.kv_cache_data_type == XQADataType::DATA_TYPE_E4M3);
             bool const supportedByAmpereXqa = (!xqaParams.isMLA() && (64 % grpSize == 0));

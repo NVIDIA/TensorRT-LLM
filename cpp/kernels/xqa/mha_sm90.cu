@@ -2549,7 +2549,7 @@ __device__ inline void storeGemm0AccToShm(
 #if CACHE_ELEM_ENUM == 0
     uint32_t const idxRow = lane % 8;
     barConsumed.arrive_and_wait();
-    // todo: change to stmatrix_4x
+    // todo: change to stmatrix_4x for better perf
 #pragma unroll
     for (uint32_t m = 0; m < Gemm0Acc::rows; m++)
     {
@@ -2635,7 +2635,6 @@ __device__ inline void transposeVTile(
 #if CACHE_ELEM_ENUM == 0
     uint32_t const idxMat = lane / 8; // only for thread 0-7, 8-15
     uint32_t const idxRow = lane % 8; // only for thread 0-7, 8-15
-    // todo: change to stmatrix_4x
     for (uint32_t m = 0; m < exactDiv(SharedMem::VTBuffer::rows, gmma::instM); m++)
     {
         uint32_t const idxPart = gmma::instM * m / cacheHeadPartElems;
