@@ -482,7 +482,7 @@ class BuildConfig(BaseModel):
     max_prompt_embedding_table_size: int = Field(
         default=0,
         description="Maximum size of prompt embedding table for prompt tuning.")
-    kv_cache_type: KVCacheType = Field(
+    kv_cache_type: Optional[KVCacheType] = Field(
         default=None,
         description=
         "Type of KV cache to use (CONTINUOUS or PAGED). If None, defaults to PAGED."
@@ -518,7 +518,7 @@ class BuildConfig(BaseModel):
     use_refit: bool = Field(
         default=False,
         description="Whether to enable engine refitting capabilities.")
-    input_timing_cache: str = Field(
+    input_timing_cache: Optional[str] = Field(
         default=None,
         description=
         "Path to input timing cache file. If None, no input cache used.")
@@ -546,7 +546,7 @@ class BuildConfig(BaseModel):
         default=False,
         description=
         "Whether to perform a dry run without actually building the engine.")
-    visualize_network: str = Field(
+    visualize_network: Optional[str] = Field(
         default=None,
         description=
         "Path to save network visualization. If None, no visualization generated."
