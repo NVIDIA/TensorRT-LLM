@@ -47,6 +47,10 @@ if [ $SLURM_LOCALID -eq 0 ]; then
     cd $llmSrcNode && pip3 install --retries 1 -r requirements-dev.txt
     cd $resourcePathNode &&  pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl
     git config --global --add safe.directory "*"
+
+    # test machine
+    python3 $llmSrcNode/jenkins/scripts/gemm_test.py || (echo "Machine Error: GEMM test failed, please check CUDA and GPU environment." && exit 1)
+
     gpuUuids=$(nvidia-smi -q | grep "GPU UUID" | awk '{print $4}' | tr '\n' ',' || true)
     hostNodeName="${HOST_NODE_NAME:-$(hostname -f || hostname)}"
     echo "HOST_NODE_NAME = $hostNodeName ; GPU_UUIDS = $gpuUuids ; STAGE_NAME = $stageName"
