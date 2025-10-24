@@ -450,4 +450,9 @@ bool getEnvDisableChunkedAttentionInGenPhase()
     return getBoolEnv("TRTLLM_DISABLE_CHUNKED_ATTENTION_IN_GEN_PHASE");
 }
 
+bool getEnvEplbForceGdrcopy()
+{
+    return getBoolEnv("TRTLLM_EPLB_FORCE_GDRCOPY");
+}
+
 } // namespace tensorrt_llm::common
