@@ -12,27 +12,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import copy
-import dataclasses
 import json
 import math
 import os
 import shutil
 import time
-from dataclasses import dataclass, field
-from functools import cache
 from pathlib import Path
 from typing import Dict, Optional, Union
 
 import numpy as np
 import tensorrt as trt
+from pydantic import BaseModel, Field, field_validator
 
 from ._common import _is_building, check_max_num_tokens, serialize_engine
 from ._utils import (get_sm_version, np_bfloat16, np_float8, str_dtype_to_trt,
                      to_json_file, trt_gte)
-from .bindings import KVCacheType
 from .functional import PositionEmbeddingType
 from .graph_rewriting import optimize
+from .llmapi.kv_cache_type import KVCacheType
 from .logger import logger
 from .lora_helper import LoraConfig
 from .models import PretrainedConfig, PretrainedModel
@@ -47,8 +44,7 @@ class ConfigEncoder(json.JSONEncoder):
 
     def default(self, obj):
         if isinstance(obj, KVCacheType):
-            # For KVCacheType, convert it to string by split of 'KVCacheType.PAGED'.
-            return obj.__str__().split('.')[-1]
+            return obj.name
         elif hasattr(obj, 'model_dump'):
             # Handle Pydantic models (including DecodingBaseConfig and subclasses)
             return obj.model_dump(mode='json')
@@ -456,75 +452,122 @@ class Builder():
         logger.info(f'Config saved to {config_path}.')
 
 
-@dataclass
-class BuildConfig:
+class BuildConfig(BaseModel):
     """Configuration class for TensorRT LLM engine building parameters.
 
     This class contains all the configuration parameters needed to build a TensorRT LLM engine,
     including sequence length limits, batch sizes, optimization settings, and various features.
-
-    Args:
-        max_input_len (int): Maximum length of input sequences. Defaults to 1024.
-        max_seq_len (int, optional): The maximum possible sequence length for a single request, including both input and generated output tokens. Defaults to None.
-        opt_batch_size (int): Optimal batch size for engine optimization. Defaults to 8.
-        max_batch_size (int): Maximum batch size the engine can handle. Defaults to 2048.
-        max_beam_width (int): Maximum beam width for beam search decoding. Defaults to 1.
-        max_num_tokens (int): Maximum number of batched input tokens after padding is removed in each batch. Defaults to 8192.
-        opt_num_tokens (int, optional): Optimal number of batched input tokens for engine optimization. Defaults to None.
-        max_prompt_embedding_table_size (int): Maximum size of prompt embedding table for prompt tuning. Defaults to 0.
-        kv_cache_type (KVCacheType, optional): Type of KV cache to use (CONTINUOUS or PAGED). If None, defaults to PAGED. Defaults to None.
-        gather_context_logits (int): Whether to gather logits during context phase. Defaults to False.
-        gather_generation_logits (int): Whether to gather logits during generation phase. Defaults to False.
-        strongly_typed (bool): Whether to use strongly_typed. Defaults to True.
-        force_num_profiles (int, optional): Force a specific number of optimization profiles. If None, auto-determined. Defaults to None.
-        profiling_verbosity (str): Verbosity level for TensorRT profiling ('layer_names_only', 'detailed', 'none'). Defaults to 'layer_names_only'.
-        enable_debug_output (bool): Whether to enable debug output during building. Defaults to False.
-        max_draft_len (int): Maximum length of draft tokens for speculative decoding. Defaults to 0.
-        speculative_decoding_mode (SpeculativeDecodingMode): Mode for speculative decoding (NONE, MEDUSA, EAGLE, etc.). Defaults to SpeculativeDecodingMode.NONE.
-        use_refit (bool): Whether to enable engine refitting capabilities. Defaults to False.
-        input_timing_cache (str, optional): Path to input timing cache file. If None, no input cache used. Defaults to None.
-        output_timing_cache (str): Path to output timing cache file. Defaults to 'model.cache'.
-        lora_config (LoraConfig): Configuration for LoRA (Low-Rank Adaptation) fine-tuning. Defaults to default LoraConfig.
-        weight_sparsity (bool): Whether to enable weight sparsity optimization. Defaults to False.
-        weight_streaming (bool): Whether to enable weight streaming for large models. Defaults to False.
-        plugin_config (PluginConfig): Configuration for TensorRT LLM plugins. Defaults to default PluginConfig.
-        use_strip_plan (bool): Whether to use stripped plan for engine building. Defaults to False.
-        max_encoder_input_len (int): Maximum encoder input length for encoder-decoder models. Defaults to 1024.
-        dry_run (bool): Whether to perform a dry run without actually building the engine. Defaults to False.
-        visualize_network (str, optional): Path to save network visualization. If None, no visualization generated. Defaults to None.
-        monitor_memory (bool): Whether to monitor memory usage during building. Defaults to False.
-        use_mrope (bool): Whether to use Multi-RoPE (Rotary Position Embedding) optimization. Defaults to False.
     """
-    max_input_len: int = 1024
-    max_seq_len: int = None
-    opt_batch_size: int = 8
-    max_batch_size: int = 2048
-    max_beam_width: int = 1
-    max_num_tokens: int = 8192
-    opt_num_tokens: Optional[int] = None
-    max_prompt_embedding_table_size: int = 0
-    kv_cache_type: KVCacheType = None
-    gather_context_logits: int = False
-    gather_generation_logits: int = False
-    strongly_typed: bool = True
-    force_num_profiles: Optional[int] = None
-    profiling_verbosity: str = 'layer_names_only'
-    enable_debug_output: bool = False
-    max_draft_len: int = 0
-    speculative_decoding_mode: SpeculativeDecodingMode = SpeculativeDecodingMode.NONE
-    use_refit: bool = False
-    input_timing_cache: str = None
-    output_timing_cache: str = 'model.cache'
-    lora_config: LoraConfig = field(default_factory=LoraConfig)
-    weight_sparsity: bool = False
-    weight_streaming: bool = False
-    plugin_config: PluginConfig = field(default_factory=PluginConfig)
-    use_strip_plan: bool = False
-    max_encoder_input_len: int = 1024  # for enc-dec DecoderModel
-    dry_run: bool = False
-    visualize_network: str = None
-    monitor_memory: bool = False
-    use_mrope: bool = False
+    max_input_len: int = Field(default=1024,
+                               description="Maximum length of input sequences.")
+    max_seq_len: Optional[int] = Field(
+        default=None,
+        description=
+        "The maximum possible sequence length for a single request, including both input and generated "
+        "output tokens.")
+    opt_batch_size: int = Field(
+        default=8, description="Optimal batch size for engine optimization.")
+    max_batch_size: int = Field(
+        default=2048, description="Maximum batch size the engine can handle.")
+    max_beam_width: int = Field(
+        default=1, description="Maximum beam width for beam search decoding.")
+    max_num_tokens: int = Field(
+        default=8192,
+        description="Maximum number of batched input tokens after padding is "
+        "removed in each batch.")
+    opt_num_tokens: Optional[int] = Field(
+        default=None,
+        description=
+        "Optimal number of batched input tokens for engine optimization.")
+    max_prompt_embedding_table_size: int = Field(
+        default=0,
+        description="Maximum size of prompt embedding table for prompt tuning.")
+    kv_cache_type: KVCacheType = Field(
+        default=None,
+        description=
+        "Type of KV cache to use (CONTINUOUS or PAGED). If None, defaults to PAGED."
+    )
+    gather_context_logits: bool = Field(
+        default=False,
+        description="Whether to gather logits during context phase.")
+    gather_generation_logits: bool = Field(
+        default=False,
+        description="Whether to gather logits during generation phase.")
+    strongly_typed: bool = Field(default=True,
+                                 description="Whether to use strongly_typed.")
+    force_num_profiles: Optional[int] = Field(
+        default=None,
+        description=
+        "Force a specific number of optimization profiles. If None, auto-determined."
+    )
+    profiling_verbosity: str = Field(
+        default='layer_names_only',
+        description=
+        "Verbosity level for TensorRT profiling ('layer_names_only', 'detailed', 'none')."
+    )
+    enable_debug_output: bool = Field(
+        default=False,
+        description="Whether to enable debug output during building.")
+    max_draft_len: int = Field(
+        default=0,
+        description="Maximum length of draft tokens for speculative decoding.")
+    speculative_decoding_mode: SpeculativeDecodingMode = Field(
+        default=SpeculativeDecodingMode.NONE,
+        description="Mode for speculative decoding (NONE, MEDUSA, EAGLE, etc.)."
+    )
+    use_refit: bool = Field(
+        default=False,
+        description="Whether to enable engine refitting capabilities.")
+    input_timing_cache: str = Field(
+        default=None,
+        description=
+        "Path to input timing cache file. If None, no input cache used.")
+    output_timing_cache: str = Field(
+        default='model.cache', description="Path to output timing cache file.")
+    lora_config: LoraConfig = Field(
+        default_factory=LoraConfig,
+        description="Configuration for LoRA (Low-Rank Adaptation) fine-tuning.")
+    weight_sparsity: bool = Field(
+        default=False,
+        description="Whether to enable weight sparsity optimization.")
+    weight_streaming: bool = Field(
+        default=False,
+        description="Whether to enable weight streaming for large models.")
+    plugin_config: PluginConfig = Field(
+        default_factory=PluginConfig,
+        description="Configuration for TensorRT LLM plugins.")
+    use_strip_plan: bool = Field(
+        default=False,
+        description="Whether to use stripped plan for engine building.")
+    max_encoder_input_len: int = Field(
+        default=1024,
+        description="Maximum encoder input length for encoder-decoder models.")
+    dry_run: bool = Field(
+        default=False,
+        description=
+        "Whether to perform a dry run without actually building the engine.")
+    visualize_network: str = Field(
+        default=None,
+        description=
+        "Path to save network visualization. If None, no visualization generated."
+    )
+    monitor_memory: bool = Field(
+        default=False,
+        description="Whether to monitor memory usage during building.")
+    use_mrope: bool = Field(
+        default=False,
+        description=
+        "Whether to use Multi-RoPE (Rotary Position Embedding) optimization.")
+
+    @field_validator("kv_cache_type", mode="before")
+    @classmethod
+    def validate_kv_cache_type(cls, v):
+        """Convert string or int to KVCacheType enum."""
+        if isinstance(v, str):
+            return KVCacheType.from_string(v)
+        if isinstance(v, int):
+            return KVCacheType(v)
+        return v
 
     # Since we have some overlapping between kv_cache_type, paged_kv_cache, and paged_state (later two will be deprecated in the future),
     # we need to handle it given model architecture.
@@ -574,144 +617,10 @@ class BuildConfig:
             override_attri('paged_state', False)
 
     @classmethod
-    @cache
-    def get_build_config_defaults(cls):
-        return {
-            field.name: field.default
-            for field in dataclasses.fields(cls)
-            if field.default is not dataclasses.MISSING
-        }
-
-    @classmethod
-    def from_dict(cls, config, plugin_config=None):
-        config = copy.deepcopy(
-            config
-        )  # it just does not make sense to change the input arg `config`
-
-        defaults = cls.get_build_config_defaults()
-        max_input_len = config.pop('max_input_len',
-                                   defaults.get('max_input_len'))
-        max_seq_len = config.pop('max_seq_len', defaults.get('max_seq_len'))
-        max_batch_size = config.pop('max_batch_size',
-                                    defaults.get('max_batch_size'))
-        max_beam_width = config.pop('max_beam_width',
-                                    defaults.get('max_beam_width'))
-        max_num_tokens = config.pop('max_num_tokens',
-                                    defaults.get('max_num_tokens'))
-        opt_num_tokens = config.pop('opt_num_tokens',
-                                    defaults.get('opt_num_tokens'))
-        opt_batch_size = config.pop('opt_batch_size',
-                                    defaults.get('opt_batch_size'))
-        max_prompt_embedding_table_size = config.pop(
-            'max_prompt_embedding_table_size',
-            defaults.get('max_prompt_embedding_table_size'))
-
-        if "kv_cache_type" in config and config["kv_cache_type"] is not None:
-            kv_cache_type = KVCacheType.from_string(config.pop('kv_cache_type'))
-        else:
-            kv_cache_type = None
-        gather_context_logits = config.pop(
-            'gather_context_logits', defaults.get('gather_context_logits'))
-        gather_generation_logits = config.pop(
-            'gather_generation_logits',
-            defaults.get('gather_generation_logits'))
-        strongly_typed = config.pop('strongly_typed',
-                                    defaults.get('strongly_typed'))
-        force_num_profiles = config.pop('force_num_profiles',
-                                        defaults.get('force_num_profiles'))
-        weight_sparsity = config.pop('weight_sparsity',
-                                     defaults.get('weight_sparsity'))
-        profiling_verbosity = config.pop('profiling_verbosity',
-                                         defaults.get('profiling_verbosity'))
-        enable_debug_output = config.pop('enable_debug_output',
-                                         defaults.get('enable_debug_output'))
-        max_draft_len = config.pop('max_draft_len',
-                                   defaults.get('max_draft_len'))
-        speculative_decoding_mode = config.pop(
-            'speculative_decoding_mode',
-            defaults.get('speculative_decoding_mode'))
-        use_refit = config.pop('use_refit', defaults.get('use_refit'))
-        input_timing_cache = config.pop('input_timing_cache',
-                                        defaults.get('input_timing_cache'))
-        output_timing_cache = config.pop('output_timing_cache',
-                                         defaults.get('output_timing_cache'))
-        lora_config = LoraConfig(**config.get('lora_config', {}))
-        max_encoder_input_len = config.pop(
-            'max_encoder_input_len', defaults.get('max_encoder_input_len'))
-        weight_streaming = config.pop('weight_streaming',
-                                      defaults.get('weight_streaming'))
-        use_strip_plan = config.pop('use_strip_plan',
-                                    defaults.get('use_strip_plan'))
-
-        if plugin_config is None:
-            plugin_config = PluginConfig()
-        if "plugin_config" in config.keys():
-            plugin_config = plugin_config.model_copy(
-                update=config["plugin_config"], deep=True)
-
-        dry_run = config.pop('dry_run', defaults.get('dry_run'))
-        visualize_network = config.pop('visualize_network',
-                                       defaults.get('visualize_network'))
-        monitor_memory = config.pop('monitor_memory',
-                                    defaults.get('monitor_memory'))
-        use_mrope = config.pop('use_mrope', defaults.get('use_mrope'))
-
-        return cls(
-            max_input_len=max_input_len,
-            max_seq_len=max_seq_len,
-            max_batch_size=max_batch_size,
-            max_beam_width=max_beam_width,
-            max_num_tokens=max_num_tokens,
-            opt_num_tokens=opt_num_tokens,
-            opt_batch_size=opt_batch_size,
-            max_prompt_embedding_table_size=max_prompt_embedding_table_size,
-            kv_cache_type=kv_cache_type,
-            gather_context_logits=gather_context_logits,
-            gather_generation_logits=gather_generation_logits,
-            strongly_typed=strongly_typed,
-            force_num_profiles=force_num_profiles,
-            profiling_verbosity=profiling_verbosity,
-            enable_debug_output=enable_debug_output,
-            max_draft_len=max_draft_len,
-            speculative_decoding_mode=speculative_decoding_mode,
-            use_refit=use_refit,
-            input_timing_cache=input_timing_cache,
-            output_timing_cache=output_timing_cache,
-            lora_config=lora_config,
-            use_strip_plan=use_strip_plan,
-            max_encoder_input_len=max_encoder_input_len,
-            weight_sparsity=weight_sparsity,
-            weight_streaming=weight_streaming,
-            plugin_config=plugin_config,
-            dry_run=dry_run,
-            visualize_network=visualize_network,
-            monitor_memory=monitor_memory,
-            use_mrope=use_mrope)
-
-    @classmethod
-    def from_json_file(cls, config_file, plugin_config=None):
+    def from_json_file(cls, config_file):
         with open(config_file) as f:
             config = json.load(f)
-            return BuildConfig.from_dict(config, plugin_config=plugin_config)
-
-    def to_dict(self):
-        output = copy.deepcopy(self.__dict__)
-        # the enum KVCacheType cannot be converted automatically
-        if output.get('kv_cache_type', None) is not None:
-            output['kv_cache_type'] = str(output['kv_cache_type'].name)
-        output['plugin_config'] = output['plugin_config'].model_dump()
-        output['lora_config'] = output['lora_config'].model_dump()
-        return output
-
-    def update_from_dict(self, config: dict):
-        for name, value in config.items():
-            if not hasattr(self, name):
-                raise AttributeError(
-                    f"{self.__class__} object has no attribute {name}")
-            setattr(self, name, value)
-
-    def update(self, **kwargs):
-        self.update_from_dict(kwargs)
+            return BuildConfig(**config)
 
 
 class EngineConfig:
@@ -731,11 +640,10 @@ class EngineConfig:
     def from_json_str(cls, config_str):
         config = json.loads(config_str)
         return cls(PretrainedConfig.from_dict(config['pretrained_config']),
-                   BuildConfig.from_dict(config['build_config']),
-                   config['version'])
+                   BuildConfig(**config['build_config']), config['version'])
 
     def to_dict(self):
-        build_config = self.build_config.to_dict()
+        build_config = self.build_config.model_dump(mode="json")
         build_config.pop('dry_run', None)  # Not an Engine Characteristic
         build_config.pop('visualize_network',
                          None)  # Not an Engine Characteristic
@@ -1081,7 +989,7 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
     '''
     tic = time.time()
     # avoid changing the input config
-    build_config = copy.deepcopy(build_config)
+    build_config = build_config.model_copy(deep=True)
     build_config.plugin_config.dtype = model.config.dtype
     build_config.update_kv_cache_type(model.config.architecture)
 

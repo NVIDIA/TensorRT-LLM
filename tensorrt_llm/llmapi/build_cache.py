@@ -104,7 +104,7 @@ class BuildCache:
         Get the build step for engine building.
         '''
         build_config_str = json.dumps(self.prune_build_config_for_cache_key(
-            build_config.to_dict()),
+            build_config.model_dump(mode="json")),
                                       sort_keys=True)
 
         kwargs_str = json.dumps(kwargs, sort_keys=True)

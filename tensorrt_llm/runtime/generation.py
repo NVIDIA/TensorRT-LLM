@@ -43,8 +43,9 @@ from tensorrt_llm.runtime.redrafter_utils import *
 from .._utils import (binding_layer_type_to_str, binding_to_str_dtype,
                       pad_vocab_size, str_dtype_to_torch, torch_to_numpy,
                       trt_dtype_to_torch)
-from ..bindings import KVCacheType, ipc_nvls_allocate, ipc_nvls_free
+from ..bindings import ipc_nvls_allocate, ipc_nvls_free
 from ..layers import LanguageAdapterConfig
+from ..llmapi.kv_cache_type import KVCacheType
 from ..logger import logger
 from ..lora_manager import LoraManager
 from ..mapping import Mapping

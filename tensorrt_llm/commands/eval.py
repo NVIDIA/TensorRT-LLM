@@ -50,23 +50,23 @@ from ..logger import logger, severity_map
               help="The logging level.")
 @click.option("--max_beam_width",
               type=int,
-              default=BuildConfig.max_beam_width,
+              default=BuildConfig.model_fields["max_beam_width"].default,
               help="Maximum number of beams for beam search decoding.")
 @click.option("--max_batch_size",
               type=int,
-              default=BuildConfig.max_batch_size,
+              default=BuildConfig.model_fields["max_batch_size"].default,
               help="Maximum number of requests that the engine can schedule.")
 @click.option(
     "--max_num_tokens",
     type=int,
-    default=BuildConfig.max_num_tokens,
+    default=BuildConfig.model_fields["max_num_tokens"].default,
     help=
     "Maximum number of batched input tokens after padding is removed in each batch."
 )
 @click.option(
     "--max_seq_len",
     type=int,
-    default=BuildConfig.max_seq_len,
+    default=BuildConfig.model_fields["max_seq_len"].default,
     help="Maximum total length of one request, including prompt and outputs. "
     "If unspecified, the value is deduced from the model config.")
 @click.option("--tp_size", type=int, default=1, help='Tensor parallelism size.')

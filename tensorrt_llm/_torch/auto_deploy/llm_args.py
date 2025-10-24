@@ -9,7 +9,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ...llmapi.llm_args import BaseLlmArgs, BuildConfig, KvCacheConfig, _ParallelConfig
-from ...llmapi.utils import get_type_repr
 from .models import ModelFactory, ModelFactoryRegistry
 from .utils._config import DynamicYamlMixInForSettings
 from .utils.logger import ad_logger
@@ -318,12 +317,11 @@ class LlmArgs(AutoDeployConfig, BaseLlmArgs, BaseSettings):
 
     model_config = _get_config_dict()
 
-    build_config: Optional[object] = Field(
-        default_factory=lambda: BuildConfig(),
+    build_config: Optional[BuildConfig] = Field(
+        default_factory=BuildConfig,
         description="!!! DO NOT USE !!! Internal only; needed for BaseLlmArgs compatibility.",
         exclude_from_json=True,
         frozen=True,
-        json_schema_extra={"type": f"Optional[{get_type_repr(BuildConfig)}]"},
         repr=False,
     )
     backend: Literal["_autodeploy"] = Field(

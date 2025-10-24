@@ -27,7 +27,7 @@ from utils import add_common_args
 import tensorrt_llm
 import tensorrt_llm.profiler as profiler
 from tensorrt_llm import logger
-from tensorrt_llm.bindings import KVCacheType
+from tensorrt_llm.llmapi.kv_cache_type import KVCacheType
 from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime import (PYTHON_BINDINGS, ModelConfig, ModelRunner,
                                   SamplingConfig, Session, TensorInfo)

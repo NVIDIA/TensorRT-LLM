@@ -33,7 +33,8 @@ import tensorrt_llm
 import tensorrt_llm.logger as logger
 from tensorrt_llm._utils import (str_dtype_to_torch, str_dtype_to_trt,
                                  trt_dtype_to_torch)
-from tensorrt_llm.bindings import GptJsonConfig, KVCacheType
+from tensorrt_llm.bindings import GptJsonConfig
+from tensorrt_llm.llmapi.kv_cache_type import KVCacheType
 from tensorrt_llm.runtime import PYTHON_BINDINGS, ModelConfig, SamplingConfig
 from tensorrt_llm.runtime.session import Session, TensorInfo
 
