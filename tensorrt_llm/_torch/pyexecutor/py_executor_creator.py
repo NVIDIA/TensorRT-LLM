@@ -493,7 +493,9 @@ def create_py_executor(
             raise NotImplementedError(
                 "KV connector is only supported with guaranteed no evict scheduler policy."
             )
-
+        elif spec_config is not None:
+            raise NotImplementedError(
+                "KV connector is not supported with speculative decoding.")
         try:
             module = importlib.import_module(
                 kv_connector_config.connector_module)
