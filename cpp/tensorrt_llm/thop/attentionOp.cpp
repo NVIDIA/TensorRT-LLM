@@ -24,6 +24,7 @@
 #include "tensorrt_llm/runtime/utils/debugUtils.h"
 #include "tensorrt_llm/thop/attentionOp.h"
 #include "tensorrt_llm/thop/thUtils.h"
+#include <assert.h>
 #include <cstdint>
 #include <functional>
 #include <torch/extension.h>
@@ -466,7 +467,8 @@ public:
                     = spec_decoding_tensor_params[1].value().data_ptr<int32_t>();
                 enqueue_params.spec_decoding_packed_mask = spec_decoding_tensor_params[2].value().data_ptr<int32_t>();
                 enqueue_params.spec_decoding_is_generation_length_variable = true;
-                enqueue_params.spec_decoding_max_generation_length = input_seq_length + 1;
+                assert(spec_decoding_tensor_params[1].value().dim() == 2); // [batch_size, max_draft_len + 1]
+                enqueue_params.spec_decoding_max_generation_length = spec_decoding_tensor_params[1].value().sizes()[1];
             }
 
             // Current mlaGeneration will using fmha to do attention, so we don't go into enqueueGeneration
