@@ -24,8 +24,11 @@ PR_PROJECT_NAME = f"{PROJECT_ROOT}-ci-{MODE}-pr_info"
 DISABLE_NVDF_FOR_LOCAL_TEST = False
 
 NVDF_BASE_URL = os.getenv("NVDF_BASE_URL", None)
-if not NVDF_BASE_URL:
-    raise Exception("NVDF_BASE_URL is not set")
+NVDF_USERNAME = os.getenv("NVDF_CREDENTIALS_USR", None)
+NVDF_PASSWORD = os.getenv("NVDF_CREDENTIALS_PWD", None)
+if not NVDF_BASE_URL or not NVDF_USERNAME or not NVDF_PASSWORD:
+    raise Exception(
+        "NVDF_BASE_URL or NVDF_USERNAME or NVDF_PASSWORD is not set")
 
 
 class NVDF:
@@ -129,7 +132,7 @@ class NVDF:
                 url,
                 data=json_data,
                 headers=headers,
-                auth=HTTPProxyAuth("admin", "Trtllm_test1"),
+                auth=HTTPProxyAuth(NVDF_USERNAME, NVDF_PASSWORD),
             )
             if res.status_code in [200, 201, 202]:
                 if res.status_code != 200 and project == JOB_PROJECT_NAME:

@@ -3127,6 +3127,7 @@ pipeline {
         HF_DATASETS_OFFLINE=1
         CMAKE_POLICY_VERSION_MINIMUM="3.5"
         NVDF_BASE_URL=credentials("nvdataflow_base_url")
+        NVDF_CREDENTIALS=credentials("nvdf-credentials")
     }
     stages {
         stage("Setup environment")
