@@ -3743,6 +3743,62 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           sampling_params=sampling_params,
                           extra_evaluator_kwargs=extra_evaluator_kwargs)
 
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.parametrize(
+        "moe_backend",
+        ["CUTLASS",
+         pytest.param("TRTLLM", marks=skip_pre_blackwell), "TRITON"],
+        ids=["cutlass", "trtllm", "triton"])
+    def test_eagle3(self, moe_backend, mocker):
+        if moe_backend == "TRITON":
+            if not IS_TRITON_KERNELS_AVAILABLE:
+                pytest.skip("Triton kernels are not available")
+
+        MAX_OUTPUT_LEN = 128179
+        MAX_INPUT_LEN = 32768
+
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
+                          {"scores_filter": "exact_match,flexible-extract"})
+
+        # https://nvbugs/5590408: 2-Model overlap scheduling has accuracy issue
+        pytorch_config = dict(disable_overlap_scheduler=True,
+                              cuda_graph_config=CudaGraphConfig())
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
+                                        dtype="auto")
+
+        eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
+        draft_len = 3
+        spec_config = EagleDecodingConfig(max_draft_len=draft_len,
+                                          speculative_model_dir=eagle_model_dir,
+                                          eagle3_one_model=False)
+
+        max_seq_len = MAX_INPUT_LEN + MAX_OUTPUT_LEN
+        llm = LLM(self.MODEL_PATH,
+                  tensor_parallel_size=4,
+                  pipeline_parallel_size=1,
+                  moe_expert_parallel_size=1,
+                  kv_cache_config=kv_cache_config,
+                  max_seq_len=max_seq_len,
+                  speculative_config=spec_config,
+                  **pytorch_config,
+                  enable_attention_dp=False,
+                  moe_config=MoeConfig(backend=moe_backend))
+
+        with llm:
+            model_name = "GPT-OSS/MXFP4"
+
+            # GSM8K
+            task = GSM8K(model_name)
+            sampling_params = SamplingParams(
+                temperature=1.0,
+                top_p=1.0,
+                max_tokens=task.MAX_OUTPUT_LEN,
+                truncate_prompt_tokens=task.MAX_INPUT_LEN)
+            task.evaluate(llm,
+                          sampling_params=sampling_params,
+                          extra_evaluator_kwargs=self.extra_evaluator_kwargs)
+
 
 @skip_pre_hopper
 class TestEXAONE4(LlmapiAccuracyTestHarness):
