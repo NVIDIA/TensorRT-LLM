@@ -478,9 +478,9 @@ class PyExecutor:
         del self.model_engine
         if self.draft_model_engine is not None:
             del self.draft_model_engine
-        # Stop the sampler's host copy thread, if it was used
-        if hasattr(self.sampler, 'stop_host_copy_thread'):
-            self.sampler.stop_host_copy_thread()
+        # Stop the sampler's async worker, if it was used
+        if hasattr(self.sampler, 'async_worker_stop'):
+            self.sampler.async_worker_stop()
 
     def can_enqueue_requests(self) -> bool:
         """
