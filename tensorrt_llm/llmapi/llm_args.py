@@ -2577,6 +2577,9 @@ class TorchLlmArgs(BaseLlmArgs):
     # PrivateVars
     _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
 
+    _disable_flash_infer_sampling: bool = PrivateAttr(default=False)
+    """Unless this is set, FlashInfer.sampling is used whenever available."""
+
     @property
     def quant_config(self) -> QuantConfig:
         if self._quant_config is None:

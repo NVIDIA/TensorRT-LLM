@@ -37,6 +37,7 @@ extend_skip_glob = [
     "tests/unittest/_torch/sampler/test_torch_sampler.py",
     "tensorrt_llm/_torch/pyexecutor/sampler.py",
     "tensorrt_llm/_torch/pyexecutor/sampling_utils.py",
+    "tensorrt_llm/_torch/pyexecutor/sampling_utils_flashinfer.py",
 ]
 
 [tool.yapf]
@@ -71,6 +72,7 @@ ignore_patterns = [
     "tests/unittest/_torch/sampler/test_torch_sampler.py",
     "tensorrt_llm/_torch/pyexecutor/sampler.py",
     "tensorrt_llm/_torch/pyexecutor/sampling_utils.py",
+    "tensorrt_llm/_torch/pyexecutor/sampling_utils_flashinfer.py",
 ]
 
 [tool.codespell]
@@ -108,6 +110,7 @@ exclude = [
     "tests/unittest/_torch/models/checkpoints/hf/test_weight_loader.py",
     "tensorrt_llm/_torch/pyexecutor/sampler.py",
     "tensorrt_llm/_torch/pyexecutor/sampling_utils.py",
+    "tensorrt_llm/_torch/pyexecutor/sampling_utils_flashinfer.py",
 ]
 
 
@@ -155,6 +158,7 @@ include = [
     "tests/unittest/_torch/sampler/test_torch_sampler.py",
     "tensorrt_llm/_torch/pyexecutor/sampler.py",
     "tensorrt_llm/_torch/pyexecutor/sampling_utils.py",
+    "tensorrt_llm/_torch/pyexecutor/sampling_utils_flashinfer.py",
 ]
 exclude = [
     "**3rdparty/**",
