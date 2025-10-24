@@ -1366,6 +1366,7 @@ class TorchSampler(Sampler):
         req_num_generation_steps: torch.Tensor,
         num_context_logits_prefix_sum: list[int],
         generation_requests_total_steps: int,
+        num_logits_to_keep: int,
     ) -> torch.Tensor:
         # raw_logits should contain only the generated logits.
         # If return context logits is requested, select only the generated logits.
@@ -1394,9 +1395,10 @@ class TorchSampler(Sampler):
                 req_num_steps_fictitious_cuda = req_num_generation_steps_cuda[
                     : (len(scheduled_requests.context_requests) + 1)
                 ].clone()
-                req_num_steps_fictitious_cuda[-1] = generation_requests_total_steps
-                next_context_req_offsets_cuda[-1] = (
-                    next_context_req_offsets_cuda[-2] + req_num_steps_fictitious_cuda[-1]
+                req_num_steps_fictitious_cuda[-1].fill_(generation_requests_total_steps)
+                next_context_req_offsets_cuda[-1].copy_(
+                    next_context_req_offsets_cuda[-2] + req_num_steps_fictitious_cuda[-1],
+                    non_blocking=True,
                 )
             else:
                 req_num_steps_fictitious_cuda = req_num_generation_steps_cuda[
@@ -1412,6 +1414,7 @@ class TorchSampler(Sampler):
             indices_to_keep_cuda = torch_multi_arange(
                 starts=(next_context_req_offsets_cuda - req_num_steps_fictitious_cuda),
                 ends=next_context_req_offsets_cuda,
+                output_length=num_logits_to_keep,
             )
 
             raw_logits_cuda = raw_logits_cuda[indices_to_keep_cuda]
@@ -1455,6 +1458,7 @@ class TorchSampler(Sampler):
                 if scheduled_requests.generation_requests
                 else 0
             ),
+            num_logits_to_keep=sum_steps,
         )
 
         # Handle embedding bias
