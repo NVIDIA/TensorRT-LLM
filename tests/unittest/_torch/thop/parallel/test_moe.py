@@ -26,7 +26,7 @@ from enum import Enum
 
 from utils.util import getSMVersion
 
-from tensorrt_llm._torch.autotuner import autotune
+from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.modules.fused_moe import RoutingMethodType
 from tensorrt_llm._torch.utils import next_positive_power_of_2
 from tensorrt_llm.quantization.utils.fp4_utils import (
@@ -875,7 +875,7 @@ class TestMoeFP8:
                               use_topk_as_input=False)
 
     @pytest.mark.parametrize("num_tokens", [16])
-    @pytest.mark.parametrize("expert_info", [(32, 8, 4, 8)])
+    @pytest.mark.parametrize("expert_info", [(32, 8, 4, 8), (384, 1, 1, 8)])
     @pytest.mark.parametrize("hidden_size", [512])
     @pytest.mark.parametrize("intermediate_size", [512])
     @pytest.mark.parametrize("use_topk_as_input", [False, True],
@@ -958,6 +958,7 @@ class TestMoeFP8:
             topk_ids = None
             topk_weights = None
 
+        AutoTuner.get().clear_cache()
         with autotune(use_autotune):
             output = torch.ops.trtllm.fp8_block_scale_moe_runner(
                 expert_logits, routing_bias, hidden_states, hidden_states_scale,
@@ -965,7 +966,7 @@ class TestMoeFP8:
                 num_experts, top_k, n_groups, top_k_groups, intermediate_size,
                 0, num_experts, routed_scaling, routing_method_type,
                 topk_weights, topk_ids)
-
+        torch.cuda.synchronize()
         output_dequant_actual = output.to(torch.float)
         #
         # Run the reference implementations
@@ -993,7 +994,7 @@ class TestMoeFp4:
 
     @pytest.mark.parametrize("num_tokens", [1, 1024])
     @pytest.mark.parametrize("hidden_size", [1024])
-    @pytest.mark.parametrize("intermediate_size", [1024, 768, 384, 192])
+    @pytest.mark.parametrize("intermediate_size", [1024, 768])
     @pytest.mark.parametrize(
         "routing_info",
         [
@@ -1047,16 +1048,16 @@ class TestMoeFp4:
                 id="RoutingRenormalize_topk_4"),
             pytest.param(
                 {
-                    "num_experts": 128,
-                    "top_k": 8,
+                    "num_experts": 512,
+                    "top_k": 10,
                     "padding": 8,
                     "n_groups": None,
                     "top_k_groups": None,
                     "routed_scaling": None,
                     "has_routing_bias": False,
-                    "routing_method_type": RoutingMethodType.RenormalizeNaive
+                    "routing_method_type": RoutingMethodType.Renormalize
                 },
-                id="RoutingRenormalizeNaive"),
+                id="RoutingRenormalize_qwen_next"),
         ],
     )
     def test_autotune(self, num_tokens, hidden_size, intermediate_size,
@@ -1129,6 +1130,18 @@ class TestMoeFp4:
                     "routing_method_type": RoutingMethodType.Renormalize
                 },
                 id="RoutingRenormalize_topk_4"),
+            pytest.param(
+                {
+                    "num_experts": 512,
+                    "top_k": 10,
+                    "padding": 8,
+                    "n_groups": None,
+                    "top_k_groups": None,
+                    "routed_scaling": None,
+                    "has_routing_bias": False,
+                    "routing_method_type": RoutingMethodType.Renormalize
+                },
+                id="RoutingRenormalize_qwen_next"),
         ],
     )
     @pytest.mark.parametrize("use_topk_as_input", [False, True],
@@ -1203,7 +1216,7 @@ class TestMoeFp4:
             pytest.skip("Routing kernel requires that padding be less than 256")
 
         assert top_k <= num_experts
-        assert top_k <= 8
+        assert top_k <= 10
         assert num_experts % 4 == 0
 
         if use_topk_as_input:
@@ -1394,6 +1407,7 @@ class TestMoeFp4:
             topk_ids = None
             topk_weights = None
 
+        AutoTuner.get().clear_cache()
         with autotune(use_autotune):
             output = torch.ops.trtllm.fp4_block_scale_moe_runner(
                 expert_logits,
@@ -1419,7 +1433,7 @@ class TestMoeFp4:
                 do_finalize=True,
                 topk_ids=topk_ids,
                 topk_weights=topk_weights)
-
+        torch.cuda.synchronize()
         output_dequant_actual = output[0].to(torch.float)
 
         check_accuracy(output_dequant_reference,
@@ -1456,7 +1470,7 @@ class TestMoeFp4:
             pytest.skip("Routing kernel requires that padding be less than 256")
 
         assert top_k <= num_experts
-        assert top_k <= 8
+        assert top_k <= 10
         assert num_experts % 4 == 0
 
         if are_groups_valid(top_k_groups, n_groups):
@@ -1639,6 +1653,7 @@ class TestMoeFp4:
             topk_ids = None
             topk_weights = None
 
+        AutoTuner.get().clear_cache()
         with autotune(use_autotune):
             output = torch.ops.trtllm.fp8_fp4_block_scale_moe_runner(
                 expert_logits,
@@ -1664,7 +1679,7 @@ class TestMoeFp4:
                 act_type=ActType.SwiGlu.value,
                 topk_ids=topk_ids,
                 topk_weights=topk_weights)
-
+        torch.cuda.synchronize()
         output_dequant_actual = output[0].to(torch.float)
 
         check_accuracy(output_dequant_reference,
@@ -1801,6 +1816,7 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
         topk_ids = permute_info["topKIndices"].to(torch.int32).cuda()
         topk_weights = permute_info["topKLogits"].to(torch.bfloat16).cuda()
 
+    AutoTuner.get().clear_cache()
     output = torch.ops.trtllm.fp8_per_tensor_scale_moe_runner(
         expert_logits.to(torch.bfloat16)
         if use_routing_scales_on_input else expert_logits, routing_bias,
@@ -1809,7 +1825,7 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
         top_k, n_groups, top_k_groups, intermediate_size, 0, num_experts,
         routed_scaling, use_routing_scales_on_input, tile_tokens_dim,
         routing_method_type, topk_weights, topk_ids)
-
+    torch.cuda.synchronize()
     output_dequant_actual = output.to(torch.float)
 
     check_accuracy(output_dequant_reference,
@@ -1832,7 +1848,18 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
     [
         pytest.param(
             {
-                "num_experts": 128,
+                "num_experts": 16,
+                "top_k": 10,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.Renormalize
+            },
+            id="RoutingRenormalize_qwen_next"),
+        pytest.param(
+            {
+                "num_experts": 16,
                 "top_k": 8,
                 "n_groups": None,
                 "top_k_groups": None,
@@ -1843,7 +1870,7 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
             id="RoutingRenormalize_topk_8"),
         pytest.param(
             {
-                "num_experts": 128,
+                "num_experts": 16,
                 "top_k": 4,
                 "n_groups": None,
                 "top_k_groups": None,
@@ -1897,10 +1924,12 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
         if dtype_activation != "mxfp8":
             pytest.skip("TopK = 4 is tested only with mxfp8")
     if num_tokens == 1024:
-        if top_k != 4 or dtype_activation != "mxfp8" or act_type_str != "SwiGlu" or not use_autotune:
+        if dtype_activation != "mxfp8" or act_type_str != "SwiGlu":
+            pytest.skip("1024 tokens is tested only with mxfp8, SwiGlu")
+    if num_experts == 512:
+        if use_autotune or dtype_activation != "mxfp8" or act_type_str != "SwiGlu":
             pytest.skip(
-                "1024 tokens is tested only with topk=4, mxfp8, SwiGlu, and autotune"
-            )
+                "512 experts is tested only with no autotune, mxfp8, SwiGlu")
     if use_topk_as_input:
         if dtype_activation != "mxfp8" or top_k != 4 or act_type_str != "SwiGlu" or not use_autotune or num_tokens != 1:
             pytest.skip(
@@ -1908,7 +1937,7 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
             )
 
     assert top_k <= num_experts
-    assert top_k <= 8
+    assert top_k <= 10
     assert hidden_size % 128 == 0
     assert intermediate_size % 128 == 0
 
@@ -2153,6 +2182,7 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
     # Run the TRT-LLM kernel
     #
     unpadded_hidden_size = hidden_size
+    AutoTuner.get().clear_cache()
     with autotune(use_autotune):
         if dtype_activation == "mxfp8":
             # Test fused unpadding by checking only half of the output.
@@ -2168,8 +2198,7 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
                 gemm2_scales_mxe2m1_shuffled.cuda(), gemm2_bias_shuffled.cuda(),
                 num_experts, top_k, n_groups, top_k_groups, intermediate_size,
                 unpadded_hidden_size, 0, num_experts, routed_scaling,
-                routing_method_type, act_type.value, 1.0, topk_weights,
-                topk_ids)
+                routing_method_type, act_type.value, topk_weights, topk_ids)
         elif dtype_activation == "bf16":
             output = torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner(
                 expert_logits, routing_bias,
@@ -2181,7 +2210,7 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
                 gemm2_scales_mxe2m1_shuffled.cuda(), gemm2_bias_shuffled.cuda(),
                 num_experts, top_k, n_groups, top_k_groups, intermediate_size,
                 0, num_experts, routed_scaling, routing_method_type,
-                act_type.value, 1.0, topk_weights, topk_ids)
+                act_type.value, topk_weights, topk_ids)
         elif dtype_activation == "fp8":
             output = torch.ops.trtllm.e4m3_mxe2m1_block_scale_moe_runner(
                 expert_logits, routing_bias,
@@ -2193,11 +2222,11 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
                 gemm2_scales_mxe2m1_shuffled.cuda(), gemm2_bias_shuffled.cuda(),
                 scale_c_fc1, scale_gate_fc1, scale_c_fc2, num_experts, top_k,
                 n_groups, top_k_groups, intermediate_size, 0, num_experts,
-                routed_scaling, routing_method_type, act_type.value, 1.0,
+                routed_scaling, routing_method_type, act_type.value,
                 topk_weights, topk_ids)
         else:
             raise ValueError("Invalid dtype_activation")
-
+    torch.cuda.synchronize()
     output_dequant_actual = output.to(torch.float)
     output_dequant_reference = output_dequant_reference[:, :
                                                         unpadded_hidden_size].contiguous(

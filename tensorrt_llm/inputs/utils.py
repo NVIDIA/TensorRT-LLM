@@ -1,7 +1,9 @@
 import asyncio
 import base64
+import math
 import tempfile
 from collections import defaultdict
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Coroutine, Dict, List, Optional, Tuple, TypedDict, Union
@@ -17,13 +19,51 @@ from torchvision.transforms import ToTensor
 from transformers import AutoProcessor, ProcessorMixin
 from transformers.utils import logging
 
-from tensorrt_llm.inputs.multimodal import default_hasher
+from tensorrt_llm.inputs.multimodal import (MultimodalServerConfig,
+                                            default_hasher)
 from tensorrt_llm.inputs.registry import (MULTIMODAL_PLACEHOLDER_REGISTRY,
                                           MultimodalPlaceholderPlacement)
 from tensorrt_llm.llmapi.llm_utils import ModelLoader
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase, TransformersTokenizer
 
 logger = logging.get_logger(__name__)
+
+
+@dataclass
+class BaseModalityData:
+    """Base class for modality-specific data.
+
+    This class serves as the foundation for all modality data types (image, video, audio, etc.),
+    providing a common interface for modality-specific data structures.
+
+    Subclasses should define their own attributes based on the specific needs of each modality.
+    """
+
+
+@dataclass
+class VideoData(BaseModalityData):
+    """Data class for video loading results.
+
+    Attributes:
+        frames: List of video frames, either as PIL Images or PyTorch tensors.
+        metadata: Dictionary containing video metadata including:
+            - total_num_frames: Total number of frames in the video
+            - fps: Original frames per second of the video
+            - duration: Duration of the video in seconds
+            - frames_indices: List of indices of the sampled frames
+    """
+    frames: Union[List[Image.Image], List[torch.Tensor]]
+    """The loaded video frames, either as PIL Images or PyTorch tensors."""
+
+    metadata: Dict[str, Any]
+    """Metadata associated with the video (e.g., fps, duration, frame indices)."""
+
+    def __post_init__(self):
+        """Validate that frames list is not empty."""
+        if not self.frames:
+            raise ValueError("frames list cannot be empty")
+        if not isinstance(self.metadata, dict):
+            raise TypeError("metadata must be a dictionary")
 
 
 def rgba_to_rgb(
@@ -124,12 +164,11 @@ async def async_load_image(
         return image
 
 
-def load_video(
-        video: str,
-        num_frames: int = 10,
-        format: str = "pt",
-        device: str = "cpu") -> Union[List[Image.Image], List[torch.Tensor]]:
-
+def _load_video_by_cv2(video: str,
+                       num_frames: int = 10,
+                       fps: int = 30,
+                       format: str = "pt",
+                       device: str = "cpu") -> VideoData:
     # Keep this import local to avoid importing cv2 if not needed
     import cv2
 
@@ -145,6 +184,8 @@ def load_video(
 
     # Find the last frame as frame count might not be accurate
     frame_count = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
+    original_fps = vidcap.get(cv2.CAP_PROP_FPS)
+
     while frame_count > 0:
         vidcap.set(cv2.CAP_PROP_POS_FRAMES, frame_count - 1)
         if vidcap.grab():
@@ -153,12 +194,26 @@ def load_video(
     else:
         raise ValueError(f"Video '{video}' has no frames.")
 
-    # Extract frames uniformly
-    indices = np.round(np.linspace(0, frame_count - 1, num_frames)).astype(int)
+    duration = frame_count / original_fps if original_fps > 0 else 0
+    num_frames_to_sample = frame_count
+    if num_frames > 0:
+        num_frames_to_sample = min(num_frames, frame_count)
+    if fps > 0:
+        num_frames_to_sample = min(num_frames_to_sample,
+                                   math.floor(duration * fps))
+    num_frames_to_sample = max(1, num_frames_to_sample)  # at least one sample
+
+    if num_frames_to_sample == frame_count:
+        indices = list(range(0, num_frames_to_sample))
+    else:
+        uniform_sampled_frames = np.linspace(0,
+                                             frame_count - 1,
+                                             num_frames_to_sample,
+                                             dtype=int)
+        indices = uniform_sampled_frames.tolist()
+
     frames = {}
     for index in indices:
-        if index in frames:
-            continue
         vidcap.set(cv2.CAP_PROP_POS_FRAMES, index)
         success, frame = vidcap.read()
         if not success:
@@ -166,18 +221,68 @@ def load_video(
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         frames[index] = Image.fromarray(frame)
 
-    return [
+    assert len(
+        frames
+    ) == num_frames_to_sample, f"Expected {num_frames_to_sample} frames, got {len(frames)}"
+
+    loaded_frames = [
         ToTensor()(frames[index]).to(
             device=device) if format == "pt" else frames[index]
         for index in indices if index in frames
     ]
 
+    metadata = {
+        "total_num_frames": frame_count,
+        "fps": original_fps,
+        "duration": duration,
+        "frames_indices": list(indices),
+    }
 
-async def async_load_video(
-        video: str,
-        num_frames: int = 10,
-        format: str = "pt",
-        device: str = "cpu") -> Union[List[Image.Image], List[torch.Tensor]]:
+    return VideoData(frames=loaded_frames, metadata=metadata)
+
+
+def load_base64_video(video: str) -> BytesIO:
+    parsed_url = urlparse(video)
+    data_spec, data = parsed_url.path.split(",", 1)
+    media_type, data_type = data_spec.split(";", 1)
+
+    if data_type != "base64":
+        msg = "Only base64 data URLs are supported for now."
+        raise NotImplementedError(msg)
+
+    content = base64.b64decode(data)
+    return content
+
+
+def load_video(video: str,
+               num_frames: int = 10,
+               fps: int = 30,
+               format: str = "pt",
+               device: str = "cpu") -> VideoData:
+    parsed_url = urlparse(video)
+    results = None
+    if parsed_url.scheme in ["http", "https", ""]:
+        results = _load_video_by_cv2(video, num_frames, fps, format, device)
+    elif parsed_url.scheme == "data":
+        decoded_video = load_base64_video(video)
+        # TODO: any ways to read videos from memory, instead of writing to a tempfile?
+        with tempfile.NamedTemporaryFile(delete=True,
+                                         suffix='.mp4') as tmp_file:
+            tmp_file.write(decoded_video)
+            tmp_file.flush()
+            results = _load_video_by_cv2(tmp_file.name, num_frames, fps, format,
+                                         device)
+    else:
+        raise ValueError(f"Unsupported video scheme: {parsed_url.scheme}")
+
+    return results
+
+
+async def async_load_video(video: str,
+                           num_frames: int = 10,
+                           fps: int = 30,
+                           format: str = "pt",
+                           device: str = "cpu") -> VideoData:
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
     parsed_url = urlparse(video)
@@ -185,15 +290,24 @@ async def async_load_video(
     if parsed_url.scheme in ["http", "https"]:
         async with aiohttp.ClientSession() as session:
             async with session.get(video) as response:
-                with tempfile.NamedTemporaryFile(delete=False,
+                with tempfile.NamedTemporaryFile(delete=True,
                                                  suffix='.mp4') as tmp:
                     tmp.write(await response.content.read())
-                    video_path = tmp.name
-    # TODO: add case for video encoded in base64
+                    tmp.flush()
+                    results = _load_video_by_cv2(tmp.name, num_frames, fps,
+                                                 format, device)
+    elif parsed_url.scheme == "data":
+        decoded_video = load_base64_video(video)
+        # TODO: any ways to read videos from memory, instead of writing to a tempfile?
+        with tempfile.NamedTemporaryFile(delete=True,
+                                         suffix='.mp4') as tmp_file:
+            tmp_file.write(decoded_video)
+            tmp_file.flush()
+            results = _load_video_by_cv2(tmp_file.name, num_frames, fps, format,
+                                         device)
     else:
-        video_path = video
-
-    return load_video(video_path, num_frames, format, device)
+        results = _load_video_by_cv2(video, num_frames, fps, format, device)
+    return results
 
 
 def load_audio(
@@ -225,7 +339,6 @@ async def async_load_audio(
     return audio
 
 
-# Copied from https://github.com/vllm-project/vllm/blob/main/examples/online_serving/openai_chat_completion_client_for_multimodal.py#L38
 def encode_base64_content_from_url(content_url: str) -> str:
     """Encode a content retrieved from a remote url to base64 format."""
 
@@ -234,6 +347,21 @@ def encode_base64_content_from_url(content_url: str) -> str:
         result = base64.b64encode(response.content).decode('utf-8')
 
     return result
+
+
+def encode_base64_image(
+    media: Image.Image,
+    *,
+    image_format: str = "JPEG",
+) -> str:
+    image = media
+
+    with BytesIO() as buffer:
+        image = convert_image_mode(image, "RGB")
+        image.save(buffer, image_format)
+        data = buffer.getvalue()
+
+    return base64.b64encode(data).decode("utf-8")
 
 
 """
@@ -310,10 +438,15 @@ class ConversationMessage(TypedDict):
 class MultimodalDataTracker:
     """Tracks and manages multimodal data for both sync and async processing."""
 
-    def __init__(self, model_type: str):
+    def __init__(
+            self,
+            model_type: str,
+            multimodal_server_config: Optional[MultimodalServerConfig] = None):
         self._model_type = model_type
         self._data = defaultdict[str](list)
         self._placeholder_counts = defaultdict[str](int)
+        self._multimodal_server_config = multimodal_server_config if multimodal_server_config is not None else MultimodalServerConfig(
+        )
 
     async def retrieve_all_async(self) -> Optional[Dict[str, List[Any]]]:
         """Retrieve all collected multimodal data."""
@@ -580,10 +713,10 @@ def default_multimodal_input_loader(
             # Check if mdata is a MultimodalData
             if isinstance(mdata,
                           dict) and "modality" in mdata and "data" in mdata:
-                modality = mdata["modality"]
+                mdata_modality = mdata["modality"]
                 if modality == "multiple_image":
-                    modality = "image"
-                mm_data_tracker.add_data(modality, mdata["data"])
+                    mdata_modality = "image"
+                mm_data_tracker.add_data(mdata_modality, mdata["data"])
             else:
                 # Add embeddings to the tracker for placeholder handling
                 mm_data_tracker.add_data(mdata["modality"],

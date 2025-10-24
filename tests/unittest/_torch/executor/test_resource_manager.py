@@ -13,14 +13,13 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
-                                                             PeftCacheConfig,
                                                              PeftCacheManager)
 from tensorrt_llm.bindings import LayerType
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.bindings.internal.batch_manager import \
     PeftTaskNotCachedException
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PeftCacheConfig
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -234,7 +233,7 @@ class TestResourceManager(unittest.TestCase):
             num_ensure_workers=mock_config.ensure_thread_count,
         )
 
-        return peft_cache_config
+        return PeftCacheConfig.from_pybind(peft_cache_config)
 
     def _create_request(self,
                         request_id,

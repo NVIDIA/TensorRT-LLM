@@ -12,6 +12,7 @@ from ...llmapi.llm_args import BaseLlmArgs, BuildConfig, KvCacheConfig, _Paralle
 from ...llmapi.utils import get_type_repr
 from .models import ModelFactory, ModelFactoryRegistry
 from .utils._config import DynamicYamlMixInForSettings
+from .utils.logger import ad_logger
 
 PathLike = Union[str, Path]
 
@@ -248,6 +249,16 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
 
         return self
 
+    @field_validator("kv_cache_config", mode="after")
+    @classmethod
+    def validate_kv_cache_config(cls, kv_cache_config: KvCacheConfig) -> KvCacheConfig:
+        if kv_cache_config.copy_on_partial_reuse:
+            kv_cache_config.copy_on_partial_reuse = False
+            ad_logger.warning(
+                "copy_on_partial_reuse is not supported by AutoDeploy. Setting it to False."
+            )
+        return kv_cache_config
+
     ### UTILITY METHODS ############################################################################
     def create_factory(self) -> ModelFactory:
         """Create a model factory from the arguments."""
@@ -380,10 +391,13 @@ class LlmArgs(AutoDeployConfig, BaseLlmArgs, BaseSettings):
         rank to automatically shard the model. This is just to ensure that other objects in the
         runtime that may read parallel_config can do so.
         """
+
+        # Set tp_size = self.world_size so that _ParallelConfig.world_size will return the
+        # correct value (computed as tp_size * pp_size * cp_size). This does not necessarily
+        # mean that TP will actually be used.
         self._parallel_config = _ParallelConfig(
-            auto_parallel=True, gpus_per_node=self.gpus_per_node
+            tp_size=self.world_size, gpus_per_node=self.gpus_per_node
         )
-        self._parallel_config.world_size = self.world_size
         return self
 
     @model_validator(mode="after")

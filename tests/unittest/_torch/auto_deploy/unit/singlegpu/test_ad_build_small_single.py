@@ -26,9 +26,8 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
     # check expected parallel config
     world_size = expected_ad_config.world_size
     expected_parallel_config = _ParallelConfig(
-        auto_parallel=True, gpus_per_node=expected_llm_args.gpus_per_node
+        tp_size=world_size, gpus_per_node=expected_llm_args.gpus_per_node
     )
-    expected_parallel_config.world_size = world_size
     assert llm_args._parallel_config == expected_parallel_config, (
         f"Expected parallel_config {expected_parallel_config}, got {llm_args._parallel_config}"
     )
@@ -190,8 +189,6 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
     ],
 )
 def test_build_ad(model_hub_id: str, llm_extra_args: dict):
-    if model_hub_id == "meta-llama/Meta-Llama-3.1-8B-Instruct":
-        pytest.skip("https://nvbugs/5595652")
     experiment_config = get_small_model_config(model_hub_id, **llm_extra_args)
     experiment_config["args"]["runtime"] = "demollm"  # Default runtime set to demollm
     experiment_config["args"]["world_size"] = 0  # Default world_size set to 0

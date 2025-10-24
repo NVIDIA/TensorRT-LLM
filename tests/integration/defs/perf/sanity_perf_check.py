@@ -139,6 +139,72 @@ class SanityPerfCheck():
             # Negative threshold: higher is better - regression if target < base
             return target_value < base_value
 
+    def _filter_by_device_subtype(
+            self, base_perf: pd.DataFrame,
+            current_perf: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Filter performance data to match device subtypes for autodeploy tests.
+
+        For autodeploy tests, only compare against baselines with the same device subtype.
+        For non-autodeploy tests, use the original behavior.
+
+        Args:
+            base_perf: Baseline performance DataFrame
+            current_perf: Current performance DataFrame
+
+        Returns:
+            Tuple of (filtered_base_perf, filtered_current_perf)
+        """
+        # If current performance data doesn't have device_subtype column, return as-is
+        if 'device_subtype' not in current_perf.columns:
+            return base_perf, current_perf
+
+        # Get the current device subtype from current performance data
+        current_device_subtypes = current_perf['device_subtype'].dropna(
+        ).unique()
+
+        if len(current_device_subtypes) == 0:
+            # No device subtype info in current data, return as-is
+            return base_perf, current_perf
+
+        current_device_subtype = current_device_subtypes[
+            0]  # Assume single device type per run
+        print(
+            f"Filtering performance data for device subtype: {current_device_subtype}"
+        )
+
+        # Filter base performance data to only include entries with matching device subtype
+        # or entries without device subtype info (for backward compatibility)
+        if 'device_subtype' in base_perf.columns:
+            # Filter base data: keep entries with matching subtype or null subtype
+            base_filtered = base_perf[
+                (base_perf['device_subtype'] == current_device_subtype) |
+                (base_perf['device_subtype'].isna())].copy()
+        else:
+            # Base data doesn't have device subtype column, keep all entries
+            base_filtered = base_perf.copy()
+
+        # For autodeploy tests, only keep current entries with device subtype
+        autodeploy_mask = current_perf['network_name'].str.contains(
+            '_autodeploy', na=False)
+        current_filtered = current_perf.copy()
+
+        # For autodeploy tests, ensure device subtype is present
+        if autodeploy_mask.any():
+            autodeploy_entries = current_perf[autodeploy_mask]
+            non_autodeploy_entries = current_perf[~autodeploy_mask]
+
+            # Keep only autodeploy entries that have device subtype
+            autodeploy_with_subtype = autodeploy_entries[
+                autodeploy_entries['device_subtype'].notna()]
+
+            # Combine filtered autodeploy entries with non-autodeploy entries
+            current_filtered = pd.concat(
+                [autodeploy_with_subtype, non_autodeploy_entries],
+                ignore_index=True)
+
+        return base_filtered, current_filtered
+
     def __call__(self, *args, **kwargs):
         # Check if the base_perf_csv file exists
         if not self.base_perf_csv.exists():
@@ -149,6 +215,10 @@ class SanityPerfCheck():
 
         base_perf = load_file(self.base_perf_csv.as_posix())
         current_perf = load_file(self.target_perf_csv.as_posix())
+
+        # Filter performance data by device subtype for autodeploy tests
+        base_perf, current_perf = self._filter_by_device_subtype(
+            base_perf, current_perf)
 
         full_diff, new_base = get_diff(base_perf, current_perf)
         if not full_diff.empty:

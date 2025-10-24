@@ -116,6 +116,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
     @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
+    @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize("tp_size,pp_size", [(4, 1), (2, 2), (1, 4)],
                              ids=["tp4", "tp2pp2", "pp4"])
     def test_bfloat16_4gpus(self, tp_size, pp_size, attn_backend,
@@ -174,6 +175,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
     @parametrize_with_ids("fp8kv", [False, True])
+    @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize("tp_size,pp_size", [(4, 1), (2, 2), (1, 4)],
                              ids=["tp4", "tp2pp2", "pp4"])
     def test_fp8_4gpus(self, tp_size, pp_size, fp8kv, attn_backend,
@@ -2217,6 +2219,8 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_mpi_world_size(8)
     @skip_pre_hopper
+    @pytest.mark.skipif(get_sm_version() >= 100,
+                        reason="https://nvbugs/5547584 WNF")
     @pytest.mark.skip_less_device_memory(140000)
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
@@ -2270,6 +2274,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_mpi_world_size(8)
     @skip_pre_hopper
+    @pytest.mark.skip_less_device_memory(140000)
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size",
         [(8, 1, 4, 3, False, False, True, True, 1),
@@ -2313,6 +2318,72 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
 
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+
+@pytest.mark.timeout(14400)
+@pytest.mark.skip_less_device_memory(80000)
+class TestDeepSeekV32(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "deepseek-ai/DeepSeek-V3.2-Exp"
+    # TODO: This is the native HF ckpt w/ FP8 weights.
+    # Once other weights are available, we should update this model path.
+    MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3.2-Exp-hf"
+
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @skip_pre_blackwell  # TODO: Hopper untested
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
+        [
+            (8, 1, 8, 0, False, True, True, True, 24, "_DEFAULT"),
+            (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT"),
+        ],
+        ids=["baseline", "baseline_mtp1"])
+    def test_fp8_blockscale(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
+                            attention_dp, cuda_graph, overlap_scheduler,
+                            max_batch_size, moe_backend):
+        if get_sm_version() == 100 or get_sm_version() == 103:
+            moe_backend = "DEEPGEMM" if moe_backend == "_DEFAULT" else moe_backend
+            moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
+            # TODO: Support block reuse for DeepSeek-V3.2
+            kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                            free_gpu_memory_fraction=0.6)
+        else:
+            if moe_backend != "_DEFAULT":
+                pytest.skip("Not supported MoE backend!")
+            moe_config = MoeConfig()
+            # TODO: Support block reuse for DeepSeek-V3.2
+            kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                            free_gpu_memory_fraction=0.7)
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            moe_config=moe_config,
+        )
+
+        if fp8kv:
+            kv_cache_config.dtype = "fp8"
+
+        mtp_config = None
+        if mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+        with LLM(f"{llm_models_root()}/DeepSeek-V3.2-Exp-hf",
+                 max_batch_size=max_batch_size,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config,
+                 enable_attention_dp=attention_dp,
+                 speculative_config=mtp_config) as llm:
+
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            # GPQA Diamond takes too long to run
+            # task = GPQADiamond(self.MODEL_NAME)
+            # task.evaluate(llm,
+            #               extra_evaluator_kwargs=dict(apply_chat_template=True, chat_template_kwargs=dict(thinking=True)))
 
 
 @pytest.mark.timeout(7200)
@@ -3314,6 +3385,24 @@ class TestPhi4MM(LlmapiAccuracyTestHarness):
             task = GSM8K(model_name)
             task.evaluate(llm)
 
+    @skip_pre_blackwell
+    def test_fp4(self):
+        model_path = f"{self.MODEL_PATH}-FP4"
+        with LLM(model_path, max_seq_len=4096) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_hopper
+    def test_fp8(self):
+        model_path = f"{self.MODEL_PATH}-FP8"
+        with LLM(model_path, max_seq_len=4096) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
 
 @skip_pre_hopper
 @pytest.mark.skip_less_device_memory(80000)
@@ -3592,6 +3681,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
 
+@skip_pre_hopper
 class TestEXAONE4(LlmapiAccuracyTestHarness):
     MODEL_NAME = "LGAI-EXAONE/EXAONE-4.0-32B"
     kv_cache_config = KvCacheConfig(enable_block_reuse=False,

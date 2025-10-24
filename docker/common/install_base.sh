@@ -5,6 +5,7 @@ set -ex
 GITHUB_URL="https://github.com"
 if [ -n "${GITHUB_MIRROR}" ]; then
     GITHUB_URL=${GITHUB_MIRROR}
+    export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
 fi
 
 set_bash_env() {
@@ -83,6 +84,9 @@ install_python_rockylinux() {
   PYTHON_VERSION=$1
   PYTHON_MAJOR="3"
   PYTHON_URL="https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tgz"
+  if [ -n "${GITHUB_MIRROR}" ]; then
+    PYTHON_URL="https://urm.nvidia.com/artifactory/api/vcs/downloadTag/vcs-remote/python/cpython/v${PYTHON_VERSION}?ext=tar.gz"
+  fi
   dnf makecache --refresh
   dnf install \
     epel-release \
@@ -103,6 +107,9 @@ install_python_rockylinux() {
     -y
   echo "Installing Python ${PYTHON_VERSION}..."
   curl -L ${PYTHON_URL} | tar -zx -C /tmp
+  if [ -n "${GITHUB_MIRROR}" ]; then
+    mv /tmp/cpython-${PYTHON_VERSION} /tmp/Python-${PYTHON_VERSION}
+  fi
   cd /tmp/Python-${PYTHON_VERSION}
   bash -c "./configure --enable-shared --prefix=/opt/python/${PYTHON_VERSION} --enable-ipv6 \
     LDFLAGS=-Wl,-rpath=/opt/python/${PYTHON_VERSION}/lib,--disable-new-dtags && make -j$(nproc) && make install"
