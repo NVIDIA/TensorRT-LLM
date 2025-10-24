@@ -924,7 +924,8 @@ class AutoTuner:
         # TODO: FIXME, sometimes the content of the tensor can affect the performance, like MOE
         # One solution is to manituplate the tensor content to make it more like the real data
         # during the tuning process. This can by controlled in the preparation phase by the runner.
-        return torch.zeros(shapes, dtype=dtype, device=device)
+        # It must not use all zero tensors. Otherwise the timing results become unreliable.
+        return torch.randint(-5, 5, shapes, device=device).to(dtype)
 
     def _prepare_input_tensors(
             self, profile: OptimizationProfile,
