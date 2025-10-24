@@ -826,7 +826,7 @@ def create_torch_sampler_args(mapping: Mapping, *, max_seq_len: int,
                               speculative_config: SpeculativeConfig,
                               max_beam_width: int,
                               disable_flash_infer_sampling: bool,
-                              use_async_worker: bool):
+                              enable_async_worker: bool):
     max_num_sequences = max_batch_size * mapping.pp_size
     max_draft_len = (0 if speculative_config is None else
                      speculative_config.max_draft_len)
@@ -840,7 +840,7 @@ def create_torch_sampler_args(mapping: Mapping, *, max_seq_len: int,
         max_num_sequences=max_num_sequences,
         max_beam_width=max_beam_width,
         disable_flash_infer_sampling=disable_flash_infer_sampling,
-        use_async_worker=use_async_worker,
+        enable_async_worker=enable_async_worker,
     )
 
 
@@ -858,7 +858,8 @@ def instantiate_sampler(
     kv_cache_config: KvCacheConfig,
     disable_flash_infer_sampling: bool,
 ):
-    use_async_worker = confidential_compute_enabled()
+    enable_async_worker = (confidential_compute_enabled()
+                           or llm_args.sampler_enable_async_worker)
 
     sampler_args = create_torch_sampler_args(
         mapping,
@@ -867,7 +868,7 @@ def instantiate_sampler(
         speculative_config=speculative_config,
         max_beam_width=max_beam_width,
         disable_flash_infer_sampling=disable_flash_infer_sampling,
-        use_async_worker=use_async_worker,
+        enable_async_worker=enable_async_worker,
     )
     decoding_mode = get_decoding_mode(decoding_config=decoding_config,
                                       max_beam_width=max_beam_width)
@@ -895,7 +896,7 @@ def instantiate_sampler(
                              max_beam_width=max_beam_width,
                              decoding_config=decoding_config,
                              kv_cache_config=kv_cache_config,
-                             use_async_worker=use_async_worker)
+                             enable_async_worker=enable_async_worker)
     if not engine.model.model_config.is_generation:
         # NOTE: choose sampler based on model type
         return EarlyStopSampler()
