@@ -218,13 +218,19 @@ if use_precompiled:
 
 sanity_check()
 
+with open("README.md", "r", encoding="utf-8") as fh:
+    long_description = fh.read()
+
 # https://setuptools.pypa.io/en/latest/references/keywords.html
 setup(
     name='tensorrt_llm',
     version=get_version(),
-    description='TensorRT-LLM: A TensorRT Toolbox for Large Language Models',
-    long_description=
-    'TensorRT-LLM: A TensorRT Toolbox for Large Language Models',
+    description=
+    ('TensorRT LLM provides users with an easy-to-use Python API to define Large Language Models (LLMs) and supports '
+     'state-of-the-art optimizations to perform inference efficiently on NVIDIA GPUs.'
+     ),
+    long_description=long_description,
+    long_description_content_type="text/markdown",
     author="NVIDIA Corporation",
     url="https://github.com/NVIDIA/TensorRT-LLM",
     download_url="https://github.com/NVIDIA/TensorRT-LLM/tags",

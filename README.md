@@ -2,7 +2,8 @@
 
 TensorRT LLM
 ===========================
-<h4> A TensorRT Toolbox for Optimized Large Language Model Inference</h4>
+<h4>TensorRT LLM provides users with an easy-to-use Python API to define Large Language Models (LLMs) and supports
+state-of-the-art optimizations to perform inference efficiently on NVIDIA GPUs.</h4>
 
 [![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](https://nvidia.github.io/TensorRT-LLM/)
 [![python](https://img.shields.io/badge/python-3.12-green)](https://www.python.org/downloads/release/python-3123/)
