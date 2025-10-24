@@ -112,8 +112,8 @@ RUN bash ./install_etcd.sh && rm install_etcd.sh
 RUN if [ -f /etc/redhat-release ]; then \
         echo "Rocky8 detected, skipping mooncake installation"; \
     else \
-        bash ./install_mooncake.sh && rm install_mooncake.sh \
-    fi
+        bash ./install_mooncake.sh; \
+    fi && rm install_mooncake.sh
 
 FROM ${TRITON_IMAGE}:${TRITON_BASE_TAG} AS triton
 
