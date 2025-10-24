@@ -192,6 +192,9 @@ def prepare_for_generation_with_tree_decoding(
                                    batch_size] -= prev_layer_gen_len_per_req  # reset to original length before the drafter loop.
         attn_metadata.kv_lens_cuda[:batch_size] += next_layer_gen_len_per_req
 
+    # FIXME, update without D2H
+    # attn_metadata.kv_lens[:batch_size] = attn_metadata.kv_lens_cuda[:batch_size].cpu()
+
     ## 3.2) _seq_lens, _seq_lens_cuda
     attn_metadata._seq_lens[:batch_size].fill_(next_layer_gen_len_per_req)
     attn_metadata._seq_lens_cuda[:batch_size].fill_(next_layer_gen_len_per_req)
@@ -207,23 +210,22 @@ def prepare_for_generation_with_tree_decoding(
         attn_metadata.use_spec_decoding = True
 
     ## 3.6) spec_decoding_position_offsets
-    attn_metadata.spec_decoding_position_offsets[:, :
-                                                 next_layer_gen_len_per_req] = spec_tree_manager.spec_dec_position_offsets_for_drafter_model[
-                                                     prepare_for_layer_idx -
-                                                     1].unsqueeze(0)
-    attn_metadata.spec_decoding_position_offsets[:,
-                                                 next_layer_gen_len_per_req:] = 0
+    attn_metadata.spec_decoding_position_offsets.reshape(
+        -1
+    )[:batch_size *
+      next_layer_gen_len_per_req] = spec_tree_manager.spec_dec_position_offsets_for_drafter_model[
+          prepare_for_layer_idx - 1].repeat(batch_size)
 
     ## 3.7) spec_decoding_packed_mask
-    attn_metadata.spec_decoding_packed_mask[:, :
-                                            next_layer_gen_len_per_req, :] = spec_tree_manager.spec_dec_packed_mask_for_drafter_model[
-                                                prepare_for_layer_idx -
-                                                1].unsqueeze(0)
-    attn_metadata.spec_decoding_packed_mask[:,
-                                            next_layer_gen_len_per_req:, :] = 0
+    attn_metadata.spec_decoding_packed_mask.reshape(
+        -1, attn_metadata.spec_decoding_packed_mask.size(-1)
+    )[:batch_size *
+      next_layer_gen_len_per_req, :] = spec_tree_manager.spec_dec_packed_mask_for_drafter_model[
+          prepare_for_layer_idx - 1].repeat(batch_size, 1)
 
     ## 3.8) spec_decoding_generation_lengths
-    attn_metadata.spec_decoding_generation_lengths[:] = next_layer_gen_len_per_req
+    attn_metadata.spec_decoding_generation_lengths[:
+                                                   batch_size] = next_layer_gen_len_per_req
 
     # 4) spec_metadata
     ## 4.1) num_tokens

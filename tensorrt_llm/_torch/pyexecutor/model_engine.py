@@ -2330,8 +2330,8 @@ class PyTorchModelEngine(ModelEngine):
                 spec_resource_manager, self.is_draft_model, self.attn_backend,
                 self.model_is_wrapped, spec_metadata.is_spec_dec_tree)
             attn_metadata.update_spec_dec_param(
-                is_spec_dec_mode, spec_metadata, spec_tree_manager,
-                self.original_max_draft_len,
+                scheduled_requests.batch_size, is_spec_dec_mode, spec_metadata,
+                spec_tree_manager, self.original_max_draft_len,
                 self.original_max_total_draft_tokens, spec_decoding_tensor)
         else:
             spec_resource_manager = None

@@ -335,6 +335,7 @@ class AttentionMetadata:
 
     def update_spec_dec_param(
             self,
+            batch_size,
             is_spec_decoding_enabled,
             spec_metadata,
             spec_tree_manager,
