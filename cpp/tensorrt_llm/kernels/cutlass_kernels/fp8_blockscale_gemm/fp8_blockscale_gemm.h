@@ -41,6 +41,11 @@ public:
         = 0;
 
     virtual void moeGemm(void* mat_d, void const* mat_a, void const* mat_b, int64_t const* problem_m_offsets,
+        size_t num_problems, size_t expected_m, size_t shape_n, size_t shape_k, cudaStream_t stream,
+        float const* scales_a = nullptr, float const* scales_b = nullptr)
+        = 0;
+
+    virtual void moeGemm(void* mat_d, void const* mat_a, void const* mat_b, int64_t const* problem_m_offsets,
         size_t num_problems, size_t shape_n, size_t shape_k, cudaStream_t stream, float const* scales_a = nullptr,
         float const* scales_b = nullptr)
         = 0;
@@ -94,6 +99,10 @@ public:
     void gemm(__nv_fp8_e4m3 const* mat_a, int ld_a, __nv_fp8_e4m3 const* mat_b, int ld_b, __nv_bfloat16* mat_d,
         int ld_d, int shape_m, int shape_n, int shape_k, float const* scales_a, float const* scales_b,
         cudaStream_t stream) override;
+
+    void moeGemm(void* mat_d, void const* mat_a, void const* mat_b, int64_t const* problem_m_offsets,
+        size_t num_problems, size_t expected_m, size_t shape_n, size_t shape_k, cudaStream_t stream,
+        float const* scales_a = nullptr, float const* scales_b = nullptr) override;
 
     void moeGemm(void* mat_d, void const* mat_a, void const* mat_b, int64_t const* problem_m_offsets,
         size_t num_problems, size_t shape_n, size_t shape_k, cudaStream_t stream, float const* scales_a = nullptr,

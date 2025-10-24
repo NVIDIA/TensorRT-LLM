@@ -230,6 +230,7 @@ torch::Tensor fp8_block_scaling_moe_gemm_hopper(torch::Tensor const& mat1, torch
     auto const num_problems = mat2.sizes()[0];
     auto const n = mat2.sizes()[1];
     auto const k = mat2.sizes()[2];
+    auto const expected_m = (m_total + num_problems - 1) / num_problems;
     TORCH_CHECK(k % 16 == 0, "K must be a multiple of 16, (K=", k, ")");
     TORCH_CHECK(n % 16 == 0, "N must be a multiple of 16, (N=", n, ")");
 
@@ -247,7 +248,8 @@ torch::Tensor fp8_block_scaling_moe_gemm_hopper(torch::Tensor const& mat1, torch
     void* workspace_ptr = workspace.data_ptr();
     gemm_runner->configureWorkspace(static_cast<char*>(workspace_ptr));
     gemm_runner->moeGemm(out.data_ptr(), mat1.data_ptr(), mat2.data_ptr(),
-        static_cast<int64_t*>(token_offset.data_ptr()), num_problems, n, k, stream, mat1ScalePtr, mat2ScalePtr);
+        static_cast<int64_t*>(token_offset.data_ptr()), num_problems, expected_m, n, k, stream, mat1ScalePtr,
+        mat2ScalePtr);
 
     return out;
 }
