@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 import pickle
 import sys
 import traceback
@@ -108,6 +109,8 @@ def row_linear_residual_norm_fusion_forward(
             tensor_parallel_size, 1, 1, tensor_parallel_rank,
             torch.cuda.device_count(),
             x_list[0].nelement() * x_list[0].element_size(), True)
+    elif strategy == AllReduceStrategy.MNNVL:
+        os.environ["TLLM_TEST_MNNVL"] = "1"
 
     MPI.COMM_WORLD.barrier()
 
@@ -165,11 +168,18 @@ def row_linear_residual_norm_fusion_forward(
                     reason="needs 2 GPUs to run this test")
 @pytest.mark.parametrize(
     "seq_len",
-    [[1], [4], [15], [32], [128], [31, 11, 27, 4], [998]
-     ],  # Test for max_num_token fallback
+    [
+        [1],
+        [4],
+        [15],
+        [32],
+        [128],
+        [31, 11, 27, 4],  # Switching one/two shot in MNNVL
+        [12, 2048],  # reallocate workspace in MNNVL
+    ],  # Test for max_num_token fallback
     ids=lambda x: f"seqlen:{x}",
 )
-@pytest.mark.parametrize("hidden_size", [2880, 7168],
+@pytest.mark.parametrize("hidden_size", [8, 2880, 7168, 7176, 8192],
                          ids=lambda x: f"hidden:{x}")
 @pytest.mark.parametrize("dtype", [torch.bfloat16],
                          ids=lambda x: f"dtype:{torch.finfo(x).dtype}")
@@ -183,6 +193,9 @@ def row_linear_residual_norm_fusion_forward(
 )
 def test_row_linear_residual_norm_fusion(seq_len, hidden_size, dtype, strategy,
                                          fusion):
+
+    if strategy == AllReduceStrategy.NCCL_SYMMETRIC and 2048 in seq_len:
+        pytest.skip("https://nvbugspro.nvidia.com/bug/5573856")
 
     torch.manual_seed(42)
     tensor_parallel_size = 2
