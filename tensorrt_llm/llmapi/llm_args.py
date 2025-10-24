@@ -2449,6 +2449,11 @@ class TorchLlmArgs(BaseLlmArgs):
         "The type of sampler to use. Options are TRTLLMSampler, TorchSampler or auto. Defaults to auto, which will use TorchSampler unless BeamSearch is requested.",
         status="beta")
 
+    sampler_enable_async_worker: bool = Field(
+        default=False,
+        description="Enable the async worker in the sampler for D->H copies",
+        status="beta")
+
     enable_iter_perf_stats: bool = Field(
         default=False,
         description="Enable iteration performance statistics.",
@@ -2822,6 +2827,7 @@ class TorchLlmArgs(BaseLlmArgs):
             use_low_precision_moe_combine=self.moe_config.
             use_low_precision_moe_combine,
             sampler_type=self.sampler_type,
+            sampler_enable_async_worker=self.sampler_enable_async_worker,
             kv_cache_dtype=self.kv_cache_config.dtype,
             mamba_ssm_cache_dtype=self.kv_cache_config.mamba_ssm_cache_dtype,
             enable_iter_perf_stats=self.enable_iter_perf_stats,

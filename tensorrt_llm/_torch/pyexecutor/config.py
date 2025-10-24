@@ -69,6 +69,7 @@ class PyTorchConfig:
     The type of sampler to use. Options are TRTLLMSampler, TorchSampler or auto.
     Defaults to auto, which will use TorchSampler unless BeamSearch is requested.
     """
+    sampler_enable_async_worker: bool = False
 
     kv_cache_dtype: str = "auto"
     mamba_ssm_cache_dtype: str = "auto"

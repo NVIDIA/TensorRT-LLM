@@ -52,7 +52,7 @@ from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
                           LlmResponse, get_draft_token_length)
 from .model_engine import ModelEngine
 from .resource_manager import ResourceManager
-from .sampler import Sampler, SampleState, SampleStateTensors
+from .sampler import AsyncWorkerMixin, Sampler, SampleState, SampleStateTensors
 from .scheduler import RequestScheduler, ScheduledRequests
 
 # Environment variable to specify iteration ranges for profiling start/stop.
@@ -478,6 +478,9 @@ class PyExecutor:
         del self.model_engine
         if self.draft_model_engine is not None:
             del self.draft_model_engine
+        # Stop the sampler's async worker, if it was used
+        if isinstance(self.sampler, AsyncWorkerMixin):
+            self.sampler.async_worker_stop()
 
     def can_enqueue_requests(self) -> bool:
         """

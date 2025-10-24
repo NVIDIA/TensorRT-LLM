@@ -38,6 +38,7 @@ from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
+from .sampler import AsyncWorkerMixin
 
 
 class _ExecutorCreationStage(enum.Enum):
@@ -178,6 +179,11 @@ def update_sampler_max_seq_len(max_seq_len, sampler):
     if isinstance(sampler, TRTLLMSampler):
         assert hasattr(sampler, "max_seq_len")
         sampler.max_seq_len = max_seq_len
+
+
+def maybe_start_sampler_async_worker(sampler):
+    if isinstance(sampler, AsyncWorkerMixin) and sampler.enable_async_worker:
+        sampler.async_worker_start()
 
 
 def get_guided_decoding_config(guided_decoding_backend: str,
@@ -669,6 +675,10 @@ def create_py_executor(
             )
 
     _adjust_torch_mem_fraction(pytorch_backend_config)
+
+    # Now that we've got the instance of py_executor that we're going to keep,
+    # start the sampler's async worker, if needed
+    maybe_start_sampler_async_worker(sampler)
 
     py_executor.start_worker()
     return py_executor
