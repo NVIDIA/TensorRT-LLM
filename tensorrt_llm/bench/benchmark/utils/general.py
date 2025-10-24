@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from importlib.metadata import version
 from pathlib import Path
 from random import choices, shuffle
 from typing import Dict, List, Tuple, Union
@@ -170,7 +169,7 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
 
     backend = params.get("backend", "pytorch")
     return {
-        "sw_version": version("tensorrt_llm"),
+        "sw_version": "1.2",
         "model_path": model_path,
         "settings_config": {
             "max_batch_size": int(max_batch_size),

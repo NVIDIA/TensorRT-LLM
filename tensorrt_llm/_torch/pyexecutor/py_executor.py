@@ -1,13 +1,11 @@
 import dataclasses
 import datetime
 import functools
-import gc
 import os
 import pickle  # nosec B403
 import threading
 import time
 import traceback
-import weakref
 from contextlib import contextmanager
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 
@@ -22,8 +20,9 @@ except ImportError:
 
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManagerType, request_context)
-from tensorrt_llm._utils import (customized_gc_thresholds, is_trace_enabled,
-                                 mpi_disabled, nvtx_range, trace_func)
+from tensorrt_llm._utils import (customized_gc_thresholds, gc_nvtx_watcher,
+                                 is_trace_enabled, mpi_disabled, nvtx_range,
+                                 trace_func)
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats,
@@ -59,10 +58,6 @@ from .scheduler import RequestScheduler, ScheduledRequests
 # Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
 PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
 
-# Environment variable to enable garbage collection profiling.
-# Set to "1" to enable recording of garbage collection events during profiling.
-PROFILE_RECORD_GC_ENV_VAR_NAME = "TLLM_PROFILE_RECORD_GC"
-
 # Environment variable to enable PyTorch profiler tracing.
 # Set to a path to save detailed tracing of PyTorch operations.
 PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
@@ -95,40 +90,6 @@ def _load_iteration_indexes(env_var: str):
                 ) from None
 
     return frozenset(starts), frozenset(stops)
-
-
-class _GCNvtxHandle:
-    pass
-
-
-def _gc_nvtx_watcher():
-    enabled = os.environ.get(PROFILE_RECORD_GC_ENV_VAR_NAME, None)
-    if not enabled:
-        return None
-
-    range_id: Optional[int] = None
-
-    def gc_callback(phase, _):
-        nonlocal range_id
-        if phase == "start":
-            assert range_id is None, "Unexpected state in GC callback: another GC while last GC not finished?"
-            range_id = torch.cuda.nvtx.range_start("Python GC")
-        elif phase == "stop":
-            assert range_id is not None, "Unexpected state in GC callback: no active GC but got GC finished?"
-            torch.cuda.nvtx.range_end(range_id)
-            range_id = None
-
-    gc.callbacks.append(gc_callback)
-
-    def gc_cleanup(callback):
-        try:
-            gc.callbacks.remove(callback)
-        except ValueError:
-            pass
-
-    handle = _GCNvtxHandle()
-    weakref.finalize(handle, gc_cleanup, gc_callback)
-    return handle
 
 
 @dataclasses.dataclass
@@ -178,7 +139,7 @@ class PyExecutor:
         # profile config
         self.profile_start_iters, self.profile_stop_iters = _load_iteration_indexes(
             PROFILE_START_STOP_ENV_VAR_NAME)
-        self.gc_nvtx_watcher_handle = _gc_nvtx_watcher()
+        self.gc_nvtx_watcher_handle = gc_nvtx_watcher()
 
         # related modules
         self.resource_manager = resource_manager
