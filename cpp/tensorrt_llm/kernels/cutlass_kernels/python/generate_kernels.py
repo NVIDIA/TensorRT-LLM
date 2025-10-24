@@ -650,7 +650,7 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
     if not is_arch_enabled:
         return []
     arch = 120
-    supported_dtypes = [e2m1]
+    supported_dtypes = [e2m1, (DataType.e4m3, e2m1)]
     quant_ops = [TrtLlm_QuantOp.none]
     epi_tags = [TrtLlm_EpilogueTag.epilogue_op_default]
     cta_shapes_mnk = [[128, 128, 128], [128, 128, 256], [256, 128, 128],
@@ -678,28 +678,40 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
         mainloop_schedule = KernelScheduleType.TmaWarpSpecializedCooperative
         epi_schedule = None
 
-        otypes = [dtype]
-        if dtype in [DataType.e4m3, e2m1]:
+        if isinstance(dtype, tuple):
+            act_type, weight_type = dtype
+        else:
+            act_type, weight_type = dtype, dtype
+
+        # Minimal filter: for mixed FP8xFP4 on SM120, only emit 128x128x128
+        if act_type == DataType.e4m3 and weight_type == e2m1:
+            if cta_shape_mnk != [128, 128, 128]:
+                continue
+
+        otypes = [act_type]
+        if act_type in [DataType.e4m3, e2m1]:
             otypes = [DataType.f16, DataType.bf16]
 
         for otype in otypes:
-            moe_gemm_operation = TrtLlm_GemmLauncher(GemmKind.Grouped,
-                                                     arch,
-                                                     dtype,
-                                                     dtype,
-                                                     dtype,
-                                                     dtype,
-                                                     otype,
-                                                     quant_op,
-                                                     epi_tag,
-                                                     cta_shape_mnk,
-                                                     warp_shape,
-                                                     stages,
-                                                     cga_shape,
-                                                     mainloop_schedule,
-                                                     epi_schedule,
-                                                     epi_fusion,
-                                                     swap_ab=swap_ab)
+            moe_gemm_operation = TrtLlm_GemmLauncher(
+                GemmKind.Grouped,
+                arch,
+                act_type,
+                weight_type,
+                act_type,
+                act_type,
+                otype,
+                quant_op,
+                epi_tag,
+                cta_shape_mnk,
+                warp_shape,
+                stages,
+                cga_shape,
+                mainloop_schedule,
+                epi_schedule,
+                epi_fusion,
+                is_mx_fpx=(act_type == DataType.e4m3 and weight_type == e2m1),
+                swap_ab=swap_ab)
 
             operations.append(moe_gemm_operation)
     return operations
