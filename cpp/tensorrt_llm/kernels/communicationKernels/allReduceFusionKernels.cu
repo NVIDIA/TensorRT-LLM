@@ -134,8 +134,12 @@ public:
             // corresponding CTA has not been launched.
             for (int flag_idx = blockIdx.x; flag_idx < kBarrierFlagCount; flag_idx += gridDim.x)
             {
-                st_flag(m_target_flag + flag_idx * NRanks, m_flag_value);
+                asm volatile(
+                    "st.global.relaxed.sys.b32 [%1], %0;" ::"r"(m_flag_value), "l"(m_target_flag + flag_idx * NRanks));
             }
+            // Single release fence
+            asm volatile("fence.release.sys;");
+
             while (ld_flag(m_current_flag) == prev_flag(m_flag_value))
             {
             }
