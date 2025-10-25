@@ -1,0 +1,19 @@
+name: pytorch
+version: unknown
+description: pytorch libraries and components
+patterns:
+- libc10.so
+- libc10_cuda.so
+- libtorch.so
+- libtorch_cpu.so
+- libtorch_cuda.so
+- libtorch_python.so
+linker_flags:
+- -ltorch_python
+path_components:
+- ATen
+- c10
+- caffe2
+- pytorch
+- torch
+aliases: []

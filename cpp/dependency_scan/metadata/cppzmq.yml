@@ -1,0 +1,17 @@
+name: cppzmq
+version: unknown
+description: Header-only C++ binding for libzmq
+
+license: MIT
+copyright: Copyright (c) 2016-2024 zeromq.org
+homepage: https://github.com/zeromq/cppzmq
+source: bundled
+
+patterns: []
+
+linker_flags: []
+
+path_components:
+- cppzmq
+
+aliases: []

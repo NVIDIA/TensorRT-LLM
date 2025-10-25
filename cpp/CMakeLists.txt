@@ -328,6 +328,11 @@ endif()
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DBUILD_SYSTEM=cmake_oss ")
 
+# Generate dependency files (.d) to track all header dependencies This creates
+# .d files alongside .o files showing all headers used
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -MD -MP")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -MD -MP")
+
 # note: cmake expr generation $<BOOL:${ENABLE_MULTI_DEVICE}> is a build time
 # evaluation so hard to debug at cmake time
 if(ENABLE_MULTI_DEVICE)

@@ -1,0 +1,17 @@
+name: cutlass
+version: unknown
+description: CUDA Templates for Linear Algebra Subroutines
+
+license: BSD-3-Clause
+copyright: Copyright (c) 2017-2024 NVIDIA Corporation
+homepage: https://github.com/NVIDIA/cutlass
+source: bundled
+
+patterns: []
+
+linker_flags: []
+
+path_components:
+- cutlass
+
+aliases: []

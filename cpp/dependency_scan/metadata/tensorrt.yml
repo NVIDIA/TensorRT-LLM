@@ -1,0 +1,15 @@
+name: tensorrt
+version: unknown
+description: tensorrt libraries and components
+patterns:
+- libnvinfer.so
+- libnvinfer.so.10
+linker_flags: []
+path_components:
+- tensorrt
+- tensorrt-10
+- tensorrt-8
+- tensorrt-9
+- tensorrt-plugins
+- tensorrt-plugins-10
+aliases: []
