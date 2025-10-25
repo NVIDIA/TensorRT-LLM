@@ -116,6 +116,9 @@ transforms:
   fuse_moe:
     stage: post_load_fusion
     enabled: true
+  fuse_fp8_moe:
+    stage: post_load_fusion
+    enabled: true
   fuse_allreduce_residual_rmsnorm:
     stage: post_load_fusion
   # TODO (lucaslie): add backend selection as part of configurable inference optimizers

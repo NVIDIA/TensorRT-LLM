@@ -140,10 +140,53 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("enable_chunked_prefill", [False, True])
     def test_auto_dtype(self, enable_chunked_prefill):
-        if enable_chunked_prefill:
-            pytest.skip(
-                "see https://github.com/NVIDIA/TensorRT-LLM/issues/8272")
         kwargs = self.get_default_kwargs(enable_chunked_prefill)
+        sampling_params = self.get_default_sampling_params()
+        with AutoDeployLLM(model=self.MODEL_PATH,
+                           tokenizer=self.MODEL_PATH,
+                           **kwargs) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=sampling_params)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestNemotronMOE(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "nvidia/Nemotron-MOE"
+    MODEL_PATH = f"{llm_models_root()}/Nemotron-MOE/"
+
+    def get_default_kwargs(self):
+        return {
+            "skip_tokenizer_init": False,
+            "trust_remote_code": True,
+            # SSMs do not support cache reuse.
+            "kv_cache_config": {
+                "enable_block_reuse": False
+            },
+            # Keep max_batch_size as in the PyTorch test to avoid OOM
+            "max_batch_size": 128,
+            # Model context length is 8K
+            "max_seq_len": 8192,
+            # Set explicitly to match default build_config behavior
+            "max_num_tokens": 8192,
+            "skip_loading_weights": False,
+            "compile_backend": "torch-cudagraph",
+            "free_mem_ratio": 0.7,
+            "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
+        }
+
+    def get_default_sampling_params(self):
+        eos_id = -1
+        beam_width = 1
+        return SamplingParams(end_id=eos_id,
+                              pad_id=eos_id,
+                              n=beam_width,
+                              use_beam_search=beam_width > 1)
+
+    @pytest.mark.skip_less_device_memory(32000)
+    def test_auto_dtype(self):
+        pytest.skip("Nemotron-MOE is not in CI yet")
+        kwargs = self.get_default_kwargs()
         sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH,
                            tokenizer=self.MODEL_PATH,
