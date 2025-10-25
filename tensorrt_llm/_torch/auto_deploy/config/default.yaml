@@ -34,9 +34,9 @@ transforms:
   match_eager_attention:
     stage: pattern_matcher
     requires_shape_prop: true
-  match_grouped_attention_with_repeat_kv:
+  match_sdpa_to_torch_attention:
     stage: pattern_matcher
-  match_grouped_attention_without_repeat_kv:
+  match_grouped_attention:
     stage: pattern_matcher
   match_attention_layout:
     stage: pattern_matcher
