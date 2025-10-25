@@ -28,6 +28,22 @@ class LlmLauncherEnvs(StrEnum):
     # Whether to use periodical responses handler in await_responses
     TLLM_EXECUTOR_PERIODICAL_RESP_IN_AWAIT = "TLLM_EXECUTOR_PERIODICAL_RESP_IN_AWAIT"
 
+    # Whether to spawn a additional process for the main process, it will optimize
+    # the performance of the main process. Default is 1.
+    TLLM_SPAWN_EXTRA_MAIN_PROCESS = "TLLM_SPAWN_EXTRA_MAIN_PROCESS"
+
+    # TODO: Add other helpers
+
+    @staticmethod
+    def should_spawn_extra_main_process() -> bool:
+        return os.environ.get(LlmLauncherEnvs.TLLM_SPAWN_EXTRA_MAIN_PROCESS,
+                              '1') == '1'
+
+    @staticmethod
+    def set_spawn_extra_main_process(value: bool = True):
+        os.environ[LlmLauncherEnvs.
+                   TLLM_SPAWN_EXTRA_MAIN_PROCESS] = '1' if value else '0'
+
 
 def get_spawn_proxy_process_ipc_addr_env() -> str | None:
     ''' Get the IPC address for the spawn proxy process dynamically. '''
@@ -49,7 +65,7 @@ def create_mpi_comm_session(
         n_workers: int) -> RemoteMpiCommSessionClient | MpiPoolSession:
     assert mpi_rank(
     ) == 0, f"create_mpi_comm_session must be called by rank 0, but it was called by rank {mpi_rank()}"
-    if get_spawn_proxy_process_env():
+    if LlmLauncherEnvs.should_spawn_extra_main_process():
         assert get_spawn_proxy_process_ipc_addr_env(
         ), f"{LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR} is not set."
         logger_debug(

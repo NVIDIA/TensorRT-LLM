@@ -35,6 +35,10 @@
 #      not supported in Slurm mode, you need to download the model and put it in
 #      the LOCAL_MODEL directory.
 
+# Optionally, set TLLM_SPAWN_EXTRA_MAIN_PROCESS to 0 to disable spawning extra
+# processes to offload the LLM frontend to a separate process. This is more
+# stable, but is not recommended for high-throughput streaming generation.
+
 # Adjust the paths to run
 export script=$SOURCE_ROOT/examples/llm-api/quickstart_advanced.py
 
