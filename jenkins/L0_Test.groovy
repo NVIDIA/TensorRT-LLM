@@ -1509,6 +1509,7 @@ def launchTestListCheck(pipeline)
             sh "tar -zxf ${tarName}"
             def llmPath = sh (script: "realpath .", returnStdout: true).trim()
             def llmSrc = "${llmPath}/TensorRT-LLM/src"
+            sh "python3 ${llmSrc}/scripts/nvdf.py"
             sh "NVIDIA_TRITON_SERVER_VERSION=25.04 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa --waive"
         } catch (InterruptedException e) {
             throw e
@@ -3248,6 +3249,8 @@ pipeline {
         // force datasets to be offline mode, to prevent CI jobs are downloading HF dataset causing test failures
         HF_DATASETS_OFFLINE=1
         CMAKE_POLICY_VERSION_MINIMUM="3.5"
+        NVDF_BASE_URL=credentials("nvdataflow_base_url")
+        NVDF_CREDENTIALS=credentials("nvdf-credentials")
     }
     stages {
         stage("Setup environment")
