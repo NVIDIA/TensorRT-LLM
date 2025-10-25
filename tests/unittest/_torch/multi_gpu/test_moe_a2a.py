@@ -482,8 +482,8 @@ def verify_dispatch(all_token_selected_experts, all_payloads, all_recv_buffers,
 
 class TestMoEAlltoAll:
 
-    @pytest.mark.skipif(torch.cuda.device_count() < 2,
-                        reason='needs at least 2 GPUs to run multi-GPU test')
+    @pytest.mark.skipif(torch.cuda.device_count() < 8,
+                        reason='needs at least 8 GPUs to run multi-GPU test')
     @pytest.mark.threadleak(
         enabled=False
     )  # MPI pool executors have known thread cleanup timing issues
@@ -520,7 +520,6 @@ class TestMoEAlltoAll:
         assert ep_size == len(
             all_num_tokens), "ep_size does not match all_num_tokens"
 
-        # Skip if not enough GPUs
         assert torch.cuda.device_count(
         ) >= ep_size, f"Need at least {ep_size} GPUs, found {torch.cuda.device_count()}"
 
@@ -568,8 +567,8 @@ class TestMoEAlltoAll:
                         max_tokens_per_rank, num_experts_per_rank,
                         expert_id_payload_index)
 
-    @pytest.mark.skipif(torch.cuda.device_count() < 2,
-                        reason='needs at least 2 GPUs to run multi-GPU test')
+    @pytest.mark.skipif(torch.cuda.device_count() < 8,
+                        reason='needs at least 8 GPUs to run multi-GPU test')
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize(
         "mpi_pool_executor,all_num_tokens,top_k,dtype",
@@ -595,8 +594,9 @@ class TestMoEAlltoAll:
         ep_size = mpi_pool_executor.num_workers
         assert ep_size == len(
             all_num_tokens), "ep_size does not match all_num_tokens"
+
         assert torch.cuda.device_count(
-        ) >= ep_size, f"Need at least {ep_size} GPUs"
+        ) >= ep_size, f"Need at least {ep_size} GPUs, found {torch.cuda.device_count()}"
 
         hidden_size = 2880  # gpt-oss
         num_experts_per_rank = 8
