@@ -1082,6 +1082,10 @@ class PyExecutor:
         scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
         )
 
+        if self.drafter is not None and not self.use_spec_decode:
+            for request in scheduled_batch.all_requests():
+                request.py_disable_speculative_decoding = True
+
         if self.kv_cache_transceiver:
             # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
             self._prepare_disagg_gen_init(fitting_disagg_gen_init_requests)
@@ -1257,7 +1261,7 @@ class PyExecutor:
                 req.py_last_draft_tokens = req.py_draft_tokens
                 max_total_draft_tokens = self.model_engine.spec_config.max_total_draft_tokens
 
-                if max_total_draft_tokens > 0 and self.use_spec_decode:
+                if max_total_draft_tokens > 0 and self.use_spec_decode and not req.py_disable_speculative_decoding:
                     req.py_draft_tokens = [0] * max_total_draft_tokens
                     req.py_draft_pages_allocated = max_total_draft_tokens
                 else:
@@ -1371,10 +1375,9 @@ class PyExecutor:
                     batch_outputs = self._forward_step(scheduled_batch,
                                                        previous_tensors_device)
 
-                    if target_inputs is not None:
-                        self._process_draft_results(scheduled_batch,
-                                                    draft_outputs, draft_batch)
-                    elif self.previous_batch is not None and not use_previous_draft_tokens:
+                    if target_inputs is None and (
+                            self.previous_batch is not None
+                            and not use_previous_draft_tokens):
                         self._update_requests(self.previous_batch.sample_state)
 
                         if self.block_reuse_enabled and not self.kv_cache_manager.is_vswa and self.kv_cache_transceiver:
@@ -2340,7 +2343,9 @@ class PyExecutor:
                 target_inputs, draft_outputs, draft_batch = self.drafter.generate_draft_tokens_with_overlap(
                     scheduled_batch, self.resource_manager,
                     previous_tensors.device if previous_tensors else None)
-
+                if draft_outputs is not None:
+                    self._process_draft_results(scheduled_batch, draft_outputs,
+                                                draft_batch)
                 self.has_previous_draft_tokens = target_inputs is not None and target_inputs.next_draft_tokens is not None
             else:
                 self.has_previous_draft_tokens = False
