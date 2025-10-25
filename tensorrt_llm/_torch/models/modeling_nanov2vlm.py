@@ -262,6 +262,10 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
             "multi_modal_data", {})
         images = mm_data.get("image", None)
         videos = mm_data.get("video", None)
+        if videos is not None:
+            videos, video_metadata = [
+                video_data.frames for video_data in videos
+            ], [video_data.metadata for video_data in videos]
         if images is not None and videos is not None:
             raise ValueError(
                 "NanoV2VL does not support both images and videos in the same prompt yet."
