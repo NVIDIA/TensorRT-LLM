@@ -567,3 +567,18 @@ def _register_fake():
         m = input.shape[0]
         n = weight.shape[0]
         return input.new_empty((m, n), dtype=input.dtype)
+
+    @torch.library.register_fake("trtllm::cuda_core_nvfp4_gemm")
+    def _(mat_a: torch.Tensor,
+          mat_b: torch.Tensor,
+          scale_a: torch.Tensor,
+          scale_b: torch.Tensor,
+          alpha: torch.Tensor,
+          bias: Optional[torch.Tensor],
+          out_dtype: Optional[torch.dtype],
+          to_userbuffers: bool = False):
+        # mat_a: [M, K/2], mat_b: [N, K/2]
+        # Output should be [M, N] with dtype=out_dtype
+        m = mat_a.shape[0]
+        n = mat_b.shape[0]
+        return mat_a.new_empty((m, n), dtype=out_dtype)
