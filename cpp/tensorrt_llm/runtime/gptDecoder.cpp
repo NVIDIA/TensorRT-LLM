@@ -84,6 +84,7 @@ void GptDecoder<T>::disableLookahead(
     penaltyParams->repetitionPenalty = mSamplingConfig.repetitionPenalty;
     penaltyParams->presencePenalty = mSamplingConfig.presencePenalty;
     penaltyParams->frequencyPenalty = mSamplingConfig.frequencyPenalty;
+    penaltyParams->promptIgnoreLength = mSamplingConfig.promptIgnoreLength;
     penaltyParams->temperature = mSamplingConfig.temperature;
     penaltyParams->minLength = mSamplingConfig.minLength;
 
@@ -136,6 +137,7 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
     penaltyParams->repetitionPenalty = mSamplingConfig.repetitionPenalty;
     penaltyParams->presencePenalty = mSamplingConfig.presencePenalty;
     penaltyParams->frequencyPenalty = mSamplingConfig.frequencyPenalty;
+    penaltyParams->promptIgnoreLength = mSamplingConfig.promptIgnoreLength;
     penaltyParams->temperature = mSamplingConfig.temperature;
     penaltyParams->minLength = mSamplingConfig.minLength;
 

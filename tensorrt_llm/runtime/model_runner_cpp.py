@@ -648,6 +648,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 "repetition_penalty",
                 "presence_penalty",
                 "frequency_penalty",
+                "prompt_ignore_length",
                 "length_penalty",
                 "early_stopping",
                 "no_repeat_ngram_size",
