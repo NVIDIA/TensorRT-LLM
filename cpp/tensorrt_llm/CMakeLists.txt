@@ -298,8 +298,4 @@ if(BUILD_DEEP_GEMM)
   add_subdirectory(deep_gemm)
 endif()
 
-if(BUILD_FLASH_MLA)
-  add_subdirectory(flash_mla)
-endif()
-
 add_subdirectory(plugins)

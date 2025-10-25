@@ -16,9 +16,7 @@ import argparse
 import json
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import (CudaGraphConfig, DeepSeekSparseAttentionConfig,
-                                 KvCacheConfig, MoeConfig,
-                                 RocketSparseAttentionConfig)
+from tensorrt_llm.llmapi import KvCacheConfig, RocketSparseAttentionConfig
 
 
 def read_input(input_file):
@@ -47,7 +45,7 @@ def parse_arguments():
     parser.add_argument('--algo',
                         type=str,
                         default='ROCKETKV',
-                        choices=['ROCKETKV', 'DSA'])
+                        choices=['ROCKETKV'])
     parser.add_argument('--attention_backend',
                         type=str,
                         default='TRTLLM',
@@ -64,10 +62,6 @@ def parse_arguments():
                         type=int,
                         default=2048,
                         help="The prompt budget for RocketKV.")
-    parser.add_argument('--index_max_chunk_size',
-                        type=int,
-                        default=32768,
-                        help="The maximum chunk size for the indexer.")
     parser.add_argument("--max_seq_len",
                         type=int,
                         default=8192,
@@ -87,44 +81,18 @@ def parse_arguments():
         help=
         "The maximum total tokens (context + generation) across all sequences in a batch."
     )
-
-    # Parallelism
-    parser.add_argument('--moe_backend',
-                        type=str,
-                        default='CUTLASS',
-                        choices=[
-                            'CUTLASS', 'TRTLLM', 'VANILLA', 'WIDEEP',
-                            'DEEPGEMM', 'CUTEDSL', 'TRITON'
-                        ])
-    parser.add_argument('--tp_size', type=int, default=1)
-    parser.add_argument('--moe_ep_size', type=int, default=-1)
-    parser.add_argument('--enable_attention_dp',
-                        default=False,
-                        action='store_true')
+    parser.add_argument('--tensor_parallel_size', type=int, default=1)
 
     # KV cache
     parser.add_argument('--kv_cache_dtype', type=str, default='auto')
     parser.add_argument("--kv_cache_fraction", type=float, default=None)
     parser.add_argument('--num_samples', type=int, default=10)
 
-    # Runtime
-    parser.add_argument('--print_iter_log',
-                        default=False,
-                        action='store_true',
-                        help='Print iteration logs during execution')
-    parser.add_argument('--use_cuda_graph', default=False, action='store_true')
-    parser.add_argument('--cuda_graph_padding_enabled',
-                        default=False,
-                        action='store_true')
-    parser.add_argument('--cuda_graph_batch_sizes',
-                        nargs='+',
-                        type=int,
-                        default=None)
     args = parser.parse_args()
     return args
 
 
-def run_llm(args, sparse_attention_config):
+def run_RocketKV(args):
     data = read_input(args.input_file)
     num_samples = args.num_samples if args.num_samples is not None else len(
         data)
@@ -136,11 +104,11 @@ def run_llm(args, sparse_attention_config):
         free_gpu_memory_fraction=args.kv_cache_fraction,
         dtype=args.kv_cache_dtype,
     )
-
-    cuda_graph_config = CudaGraphConfig(
-        batch_sizes=args.cuda_graph_batch_sizes,
-        enable_padding=args.cuda_graph_padding_enabled,
-    ) if args.use_cuda_graph else None
+    sparse_attention_config = RocketSparseAttentionConfig(
+        window_size=args.window_size,
+        kernel_size=args.kernel_size,
+        prompt_budget=args.prompt_budget,
+    )
 
     llm = LLM(
         model=args.model_path,
@@ -151,13 +119,9 @@ def run_llm(args, sparse_attention_config):
         max_batch_size=args.max_batch_size,
         max_seq_len=args.max_seq_len,
         max_num_tokens=args.max_num_tokens,
-        tensor_parallel_size=args.tp_size,
-        moe_expert_parallel_size=args.moe_ep_size,
-        enable_attention_dp=args.enable_attention_dp,
-        cuda_graph_config=cuda_graph_config,
-        print_iter_log=args.print_iter_log,
-        enable_iter_perf_stats=args.print_iter_log,
-        moe_config=MoeConfig(backend=args.moe_backend),
+        tensor_parallel_size=args.tensor_parallel_size,
+        cuda_graph_config=
+        None,  # sparse attention does not support cuda graph now
     )
 
     prompts = []
@@ -179,27 +143,10 @@ def run_llm(args, sparse_attention_config):
         )
 
 
-def run_RocketKV(args):
-    sparse_attention_config = RocketSparseAttentionConfig(
-        window_size=args.window_size,
-        kernel_size=args.kernel_size,
-        prompt_budget=args.prompt_budget,
-    )
-    run_llm(args, sparse_attention_config)
-
-
-def run_DSA(args):
-    sparse_attention_config = DeepSeekSparseAttentionConfig(
-        indexer_max_chunk_size=args.index_max_chunk_size, )
-    run_llm(args, sparse_attention_config)
-
-
 def main():
     args = parse_arguments()
     if args.algo == 'ROCKETKV':
         run_RocketKV(args)
-    elif args.algo == 'DSA':
-        run_DSA(args)
     else:
         raise ValueError(f"Invalid algorithm: {args.algo}")
 

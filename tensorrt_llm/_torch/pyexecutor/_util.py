@@ -49,12 +49,15 @@ GB = 1 << 30
 def get_kv_cache_manager_cls(model_config: ModelConfig):
     config = model_config.pretrained_config
     sparse_attn_config = model_config.sparse_attention_config
-    if sparse_attn_config is not None:
-        return get_sparse_attn_kv_cache_manager(sparse_attn_config)
-    elif is_nemotron_hybrid(config) or is_qwen3_next(config):
+    if is_mla(config):
+        return KVCacheManager
+    elif is_nemotron_hybrid(config):
         return MambaHybridCacheManager
     else:
-        return KVCacheManager
+        if sparse_attn_config is not None:
+            return get_sparse_attn_kv_cache_manager(sparse_attn_config)
+        else:
+            return KVCacheManager
 
 
 class KvCacheCreator:
@@ -463,7 +466,6 @@ class KvCacheCreator:
                 is_draft=model_engine.is_draft_model,
                 kv_connector_manager=self._kv_connector_manager
                 if not estimating_kv_cache else None,
-                sparse_attn_config=sparse_attn_config,
             )
         elif is_nemotron_hybrid(config):
             if self._max_beam_width > 1:
@@ -535,7 +537,7 @@ class KvCacheCreator:
             num_mamba_layers = num_hidden_layers // config.full_attention_interval * (
                 config.full_attention_interval - 1)
             num_layers = num_hidden_layers - num_mamba_layers
-            kv_cache_manager = self._kv_cache_manager_cls(
+            kv_cache_manager = MambaHybridCacheManager(
                 # mamba cache parameters
                 config.linear_key_head_dim,
                 config.linear_conv_kernel_dim,

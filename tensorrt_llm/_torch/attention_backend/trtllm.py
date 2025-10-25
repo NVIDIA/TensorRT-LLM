@@ -765,11 +765,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     pin_memory=True,
                 )
 
-    def on_update_kv_lens(self):
-        # After changing the kv_lens/kv_lens_cuda, we may need to update other metadata.
-        # Especially for the changes in the _preprocess_inputs() of model_engine.py.
-        pass
-
     def prepare(self) -> None:
         extra_attrs = get_model_extra_attrs()
         # If model extra attrs is set, attention_metadata is setup in executor.
@@ -1298,9 +1293,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets = None, None, None, None
         if self.sparse_attention_config is not None:
             sparse_kv_indices, sparse_kv_offsets = self.sparse_kv_predict(
-                q, k, metadata, **kwargs)
+                q, k, metadata)
             sparse_attn_indices, sparse_attn_offsets = self.sparse_attn_predict(
-                q, k, metadata, **kwargs)
+                q, k, metadata)
 
         self.wrapper.plan(
             layer_idx=self.get_local_layer_idx(metadata),
@@ -1422,7 +1417,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self,
         metadata: TrtllmAttentionMetadata,
         out_dtype: torch.dtype,
-        **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert out_dtype in [torch.float16, torch.bfloat16, torch.float32]
         assert self.is_mla_enable and self.mla_params is not None
@@ -1511,7 +1505,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         q: torch.Tensor,
         latent_cache: torch.Tensor,
         metadata: TrtllmAttentionMetadata,
-        **kwargs,
     ) -> None:
         assert self.is_mla_enable and self.mla_params is not None
         assert metadata.kv_cache_manager is not None
