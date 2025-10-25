@@ -14894,6 +14894,20 @@ Chen, Tianqi
 - **Repository URL**: https://github.com/kvcache-ai/Mooncake
 - **License URL**: https://github.com/kvcache-ai/Mooncake/blob/main/LICENSE-APACHE
 - **License name**: Apache 2.0
+
+### Authors
+
+© Copyright 2025, Mooncake Team.
+Copyright (c) Meta Platforms, Inc. and affiliates.
+Copyright 2024 KVCache.AI
+Ruoyu Qin
+Zheming Li
+Weiran He
+Mingxing Zhang
+Yongwei Wu
+Weimin Zheng
+Xinran Xu
+
 ### License Text
 ```
                                  Apache License
