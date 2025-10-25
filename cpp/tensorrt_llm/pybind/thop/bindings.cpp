@@ -19,6 +19,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <tensorrt_llm/thop/attentionOp.h>
+#include <tensorrt_llm/thop/moeAlltoAllMeta.h>
 #include <torch/extension.h>
 
 namespace py = pybind11;
@@ -28,6 +29,12 @@ namespace tensorrt_llm::pybind::thop
 
 void initBindings(pybind11::module_& m)
 {
+    // Export MoE A2A constants
+    for (auto const& kv : torch_ext::getMoeA2AMetaInfoIndexPairs())
+    {
+        m.attr(kv.first) = py::int_(kv.second);
+    }
+
     m.def("attention", &torch_ext::attention,
         // Parameters with default values using std::nullopt for optional arguments
         py::arg("q"), py::arg("k") = std::nullopt, py::arg("v") = std::nullopt, py::arg("output"),
