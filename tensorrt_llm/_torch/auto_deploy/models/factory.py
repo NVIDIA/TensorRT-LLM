@@ -131,6 +131,18 @@ class ModelFactory(ABC):
         """The tokenizer path."""
         return self._prefetched_tokenizer_path or self._tokenizer or self.model
 
+    @property
+    def vocab_size_padded(self) -> Optional[int]:
+        """Return the padded vocabulary size of the model.
+
+        This is needed for guided decoding in the pyexecutor. If the factory does not support this,
+        then this method should return None.
+
+        Returns:
+            The padded vocabulary size of the model.
+        """
+        return None
+
     def build_model(self, device: str) -> nn.Module:
         """Build the model on the desired device.
 
@@ -164,10 +176,7 @@ class ModelFactory(ABC):
         the factory.
         """
         # make sure model architecture is pre-fetched (no weights needed at this point)
-        skip_loading_weights = self.skip_loading_weights
-        self.skip_loading_weights = True
-        self.prefetch_checkpoint()
-        self.skip_loading_weights = skip_loading_weights
+        self.prefetch_checkpoint(skip_loading_weights=True)
 
         # build the model
         return self._build_model(device)
@@ -211,15 +220,18 @@ class ModelFactory(ABC):
         """
         return None
 
-    def prefetch_checkpoint(self, force: bool = False):
+    def prefetch_checkpoint(self, force: bool = False, skip_loading_weights: Optional[bool] = None):
         """Try or skip prefetching the checkpoint for the model and tokenizer.
 
         Args:
             force: Whether to force prefetching the checkpoint.
+            skip_loading_weights: Whether to skip loading weights. If not provided, it will use
+                the factory's skip_loading_weights value.
         """
         if not self._prefetched_model_path or force:
             self._prefetched_model_path = self._prefetch_checkpoint(
-                self._model, self.skip_loading_weights
+                self._model,
+                self.skip_loading_weights if skip_loading_weights is None else skip_loading_weights,
             )
         if self._tokenizer and (not self._prefetched_tokenizer_path or force):
             self._prefetched_tokenizer_path = self._prefetch_checkpoint(self._tokenizer, True)

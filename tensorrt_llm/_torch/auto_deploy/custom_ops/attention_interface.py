@@ -87,6 +87,7 @@ class SequenceInfo:
         max_batch_size: int = 1,
         page_size: int = 0,
         max_num_tokens: Optional[int] = None,
+        vocab_size_padded: Optional[int] = None,
     ):
         """Initialize the SequenceInfo object.
 
@@ -104,7 +105,7 @@ class SequenceInfo:
                 batch is min (max_batch_size, max_num_tokens // ISL). Similarly, if a batch is
                 composed of generate-only requests, then the maximum number of sequences possible in
                 the batch is min (max_batch_size, max_num_tokens).
-
+            vocab_size_padded: corresponds to the padded vocabulary size of the model.
         Returns:
             None
         """
@@ -112,6 +113,7 @@ class SequenceInfo:
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
         self.page_size = page_size if page_size > 0 else max_seq_len
+        self.vocab_size_padded = vocab_size_padded
 
         # NOTE (lucaslie): WAR to address issue when using flashinfer attention with
         # (max_batch_size, max_seq_len) input in trtllm runtime.
