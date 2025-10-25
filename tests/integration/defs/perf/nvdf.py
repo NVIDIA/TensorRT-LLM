@@ -48,7 +48,7 @@ SERVER_FIELDS = [
     "l_timeout_iters",
     "s_kv_cache_dtype",
     "b_enable_block_reuse",
-    "f_free_gpu_memory_fraction",
+    "d_free_gpu_memory_fraction",
     "l_max_batch_size",
     "b_enable_padding",
 ]
@@ -88,9 +88,8 @@ MINIMIZE_METRICS = [
 
 
 def get_nvdf_config() -> dict:
-    gpu_type, gpu_count, build_id, build_url, job_name, job_id, job_url,
-    branch, commit, is_post_merge, is_pr_job, trigger_mr_user,
-    trigger_mr_link, trigger_mr_id, trigger_mr_commit = get_job_info()
+    gpu_type, gpu_count, host_node_name, build_id, build_url, job_name, job_id, job_url, branch, commit, is_post_merge, is_pr_job, trigger_mr_user, trigger_mr_link, trigger_mr_id, trigger_mr_commit = get_job_info(
+    )
     create_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return {
         # Unique identifier
@@ -126,15 +125,15 @@ def get_job_info():
     """Get job info from environment variables
 
     Returns:
-        Tuple of (gpu_type, gpu_count, build_id, build_url, job_name, job_id, job_url,
+        Tuple of (gpu_type, gpu_count, host_node_name, build_id, build_url, job_name, job_id, job_url,
                   branch, commit, is_post_merge, is_pr_job, trigger_mr_user,
                   trigger_mr_link, trigger_mr_id, trigger_mr_commit)
     """
     # Read environment variables
-    os.getenv("HOST_NODE_NAME", "")
     build_id = os.getenv("BUILD_ID", "")
     build_url = os.getenv("BUILD_URL", "")
     job_name = os.getenv("JOB_NAME", "")
+    host_node_name = os.getenv("HOST_NODE_NAME", "")
 
     # Get gpu_type and gpu_count from nvidia-smi
     gpu_type = ""
@@ -153,7 +152,7 @@ def get_job_info():
                 # Get GPU type and countfrom first GPU
                 gpu_type = gpu_names[0]
                 # Replace spaces with hyphens
-                gpu_type = gpu_type.replace(" ", "")
+                gpu_type = gpu_type.replace(" ", "").lower()
                 gpu_count = len(gpu_names)
         else:
             print_error(f"nvidia-smi query failed: {result.stderr}")
@@ -167,7 +166,7 @@ def get_job_info():
     except:
         global_vars = {}
 
-    # Get job_url and job_id from globalVars["action_info"]["parents"][-1]
+    # Get job_url and job_id
     job_url = ""
     job_id = ""
     parents = global_vars.get("action_info", {}).get("parents", [])
@@ -177,10 +176,8 @@ def get_job_info():
         job_id = str(last_parent.get("build_number", ""))
 
     # Determine job type from job_url
-    is_post_merge = "PostMerge" in job_url or bool(
-        global_vars.get("github_pr_api_url"))
-    is_pr_job = "MergeRequest_PR" in job_url
-    assert is_post_merge != is_pr_job, "Only one of is_post_merge and is_pr_job can be True"
+    is_post_merge = "PostMerge" in job_url
+    is_pr_job = not is_post_merge
 
     # Extract branch from job_url
     # Pattern: LLM/job/main/job -> branch is "main"
@@ -200,7 +197,7 @@ def get_job_info():
         # Get PR info from github_pr_api_url
         github_pr_api_url = global_vars.get("github_pr_api_url", "")
         if github_pr_api_url:
-            # Extract PR ID from URL like "https://api.github.com/repos/NVIDIA/TensorRT-LLM/pulls/8488"
+            # Extract PR ID from URL like "https://api.github.com/repos/NVIDIA/TensorRT-LLM/pulls/xxxx"
             pr_match = re.search(r"/pulls/(\d+)", github_pr_api_url)
             if pr_match:
                 trigger_mr_id = pr_match.group(1)
@@ -221,9 +218,13 @@ def get_job_info():
         # Set trigger_mr_commit to commit
         trigger_mr_commit = commit
 
-    return (gpu_type, gpu_count, build_id, build_url, job_name, job_id, job_url,
-            branch, commit, is_post_merge, is_pr_job, trigger_mr_user,
-            trigger_mr_link, trigger_mr_id, trigger_mr_commit)
+    print_info(
+        f"gpu_type: {gpu_type}, gpu_count: {gpu_count}, host_node_name: {host_node_name}, build_id: {build_id}, build_url: {build_url}, job_name: {job_name}, job_id: {job_id}, job_url: {job_url}, branch: {branch}, commit: {commit}, is_post_merge: {is_post_merge}, is_pr_job: {is_pr_job}, trigger_mr_user: {trigger_mr_user}, trigger_mr_link: {trigger_mr_link}, trigger_mr_id: {trigger_mr_id}, trigger_mr_commit: {trigger_mr_commit}"
+    )
+
+    return (gpu_type, gpu_count, host_node_name, build_id, build_url, job_name,
+            job_id, job_url, branch, commit, is_post_merge, is_pr_job,
+            trigger_mr_user, trigger_mr_link, trigger_mr_id, trigger_mr_commit)
 
 
 def _id(data):
@@ -436,13 +437,14 @@ def prepare_baseline_data(new_data_dict, model_to_cmd_idx_group, gpu_type):
     # Query history data from database
     for model_name, cmd_idxs in model_to_cmd_idx_group.items():
         history_data_list = query_data(gpu_type, model_name)
-        # Filter out the data that matches each cmd from history_data_list
+        # Put history data that matches each cmd into a group
         cmd_to_history_data_group = {}
+        for cmd_idx in cmd_idxs:
+            cmd_to_history_data_group[cmd_idx] = []
+
         for history_data in history_data_list:
             for cmd_idx in cmd_idxs:
                 if match(history_data, new_data_dict[cmd_idx]):
-                    if cmd_idx not in cmd_to_history_data_group:
-                        cmd_to_history_data_group[cmd_idx] = []
                     cmd_to_history_data_group[cmd_idx].append(history_data)
                     break
 

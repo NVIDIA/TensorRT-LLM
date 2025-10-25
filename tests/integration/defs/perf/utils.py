@@ -360,6 +360,9 @@ class PerfServerClientBenchmarkCmds(NamedTuple):
                     timeout=5400)  # 90 minutes for large models
                 output += subprocess.check_output(self.client_cmds[cmd_idx],
                                                   env=venv._new_env).decode()
+                # Write output to client file path
+                with open(client_file_path, 'w') as client_ctx:
+                    client_ctx.write(output)
         finally:
             server_proc.terminate()
             server_proc.wait()

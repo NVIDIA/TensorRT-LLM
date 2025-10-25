@@ -525,7 +525,7 @@ class ServerConfig:
         enable_chunked_prefill: bool = False,
         disable_overlap_scheduler: bool = False,
         moe_backend: str = "",
-        moe_max_num_tokens: str = "",
+        moe_max_num_tokens: int = 0,
         stream_interval: int = 10,
         enable_attention_dp: bool = False,
         attention_dp_balance: bool = False,
@@ -575,7 +575,7 @@ class ServerConfig:
     def to_nvdf_data(self) -> dict:
         """Convert ServerConfig to NVDataFlow data"""
         return {
-            "s_model_name": self.name,
+            "s_model_name": self.model_name.lower(),
             "l_tp": self.tp,
             "l_ep": self.ep,
             "l_pp": self.pp,
@@ -624,7 +624,7 @@ class ServerConfig:
         if self.moe_backend:
             config_lines.append("moe_config:")
             config_lines.append(f"  backend: {self.moe_backend}")
-            if self.moe_max_num_tokens:
+            if self.moe_max_num_tokens > 0:
                 config_lines.append(
                     f"  max_num_tokens: {self.moe_max_num_tokens}")
 
@@ -770,7 +770,7 @@ def parse_config_file(config_file_path: str, select_pattern: str = None):
             attention_backend=server_config_data.get('attention_backend',
                                                      'TRTLLM'),
             moe_backend=server_config_data.get('moe_backend', ''),
-            moe_max_num_tokens=server_config_data.get('moe_max_num_tokens', ''),
+            moe_max_num_tokens=server_config_data.get('moe_max_num_tokens', 0),
             stream_interval=server_config_data.get('stream_interval', 10),
             enable_attention_dp=server_config_data.get('enable_attention_dp',
                                                        False),
@@ -933,6 +933,7 @@ class PerfTestConfig:
         # Used for perf sanity test
         # config_file: YAML path, select_pattern: server/client selection string
         # server_configs: list[ServerConfig], server_client_configs: dict[server_id -> list[ClientConfig]]
+        self.upload = False
         self.config_file = None
         self.config_path = None
         self.select_pattern = None
@@ -1133,9 +1134,10 @@ class PerfTestConfig:
         labels = test_param_labels.split("-")
 
         # Used for perf sanity test
-        if labels[0] == "perf_sanity":
+        if "perf_sanity" in labels[0]:
             assert len(labels) > 1, "perf_sanity test must have a config file!"
             self.runtime = "server-benchmark"
+            self.upload = "upload" in labels[0]
             self.config_file = labels[1]
             self.config_path = os.path.join(
                 "tests/scripts/perf-sanity", f"{labels[1]}.yaml"
@@ -2310,8 +2312,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                     errors.append(self.get_error())
                     del self._test_results[self._current_cmd_idx]
 
-            # Upload the test results to database
-            self.upload_test_results_to_database(llm_venv)
+            if self._config.upload:
+                # Upload the test results to database
+                self.upload_test_results_to_database()
 
         finally:
             # Clean up engine dir after use.
