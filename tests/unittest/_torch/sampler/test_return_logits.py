@@ -107,7 +107,7 @@ def llm(
             yield llm
 
 
-@force_ampere  # Save H100 resource
+# @force_ampere  # Save H100 resource
 @pytest.mark.parametrize("reuse_cache", [False, True])
 @pytest.mark.parametrize("return_log_probs", [False, True])
 # FIXME: sometimes LLM shutdown hangs, might be related to https://nvbugs/5577178

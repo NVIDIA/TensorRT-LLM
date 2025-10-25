@@ -698,7 +698,7 @@ class TorchSampler(Sampler):
             assert beam == 0, (
                 "The following call relies on beam_width to be 1 - hence the list with a single element"
             )
-            request.py_result.append_log_probs([token_log_probs])
+            request.py_log_probs.append_log_probs([token_log_probs])
 
     def _process_draft_tokens_greedy(
         self,
@@ -1919,7 +1919,7 @@ class TRTLLMSampler(Sampler):
                     }
                 ]
                 cum_log_probs = [cum_log_probs_host[seq_slot]]
-                request.py_result.append_log_probs([log_probs], cum_log_probs)
+                request.py_log_probs.append_log_probs([log_probs], cum_log_probs)
 
         for request in reqs:
             request.py_decoding_iter += 1
@@ -1999,7 +1999,7 @@ class TRTLLMSampler(Sampler):
                     request.set_finished_reason(finish_reason, beam)
 
             if request.py_return_log_probs:
-                request.py_result.append_log_probs(log_probs, cum_log_probs)
+                request.py_log_probs.append_log_probs(log_probs, cum_log_probs)
 
             # Set number of tokens predicted per runtime iteration. Will be > 1 for speculative decoding.
             request.update_num_tokens_per_iteration(
@@ -2077,6 +2077,6 @@ class TRTLLMSampler(Sampler):
                         }
                     )
         if request.py_return_log_probs:
-            request.py_result.set_log_probs(log_probs, cum_log_probs)
+            request.py_log_probs.set_log_probs(log_probs, cum_log_probs)
 
         request.set_generated_tokens(generated_tokens)
