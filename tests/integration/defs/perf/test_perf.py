@@ -28,7 +28,7 @@ from defs.trt_test_alternative import (is_linux, is_windows, print_info,
                                        print_warning)
 
 from ..conftest import get_llm_root, llm_models_root, trt_environment
-from .nvdf import _id, get_nvdf_config, post_data, prepare_baseline_data
+from .nvdf import _id, get_job_info, post_data, prepare_baseline_data
 from .pytorch_model_config import get_model_yaml_config
 from .utils import (AbstractPerfScriptTestClass, PerfBenchScriptTestCmds,
                     PerfDisaggScriptTestCmds, PerfMetricType,
@@ -516,6 +516,7 @@ class ServerConfig:
         self,
         name: str,
         model_name: str,
+        gpus: int,
         tp: int,
         ep: int,
         max_num_tokens: int,
@@ -538,6 +539,7 @@ class ServerConfig:
     ):
         self.name = name
         self.model_name = model_name
+        self.gpus = gpus
         self.tp = tp
         self.ep = ep
         self.pp = pp
@@ -576,6 +578,7 @@ class ServerConfig:
         """Convert ServerConfig to NVDataFlow data"""
         return {
             "s_model_name": self.model_name.lower(),
+            "l_gpus": self.gpus,
             "l_tp": self.tp,
             "l_ep": self.ep,
             "l_pp": self.pp,
@@ -764,6 +767,7 @@ def parse_config_file(config_file_path: str, select_pattern: str = None):
         server_config = ServerConfig(
             name=server_config_data['name'],
             model_name=server_config_data['model_name'],
+            gpus=server_config_data['gpus'],
             tp=server_config_data['tp'],
             ep=server_config_data['ep'],
             pp=server_config_data.get('pp', 1),
@@ -933,8 +937,9 @@ class PerfTestConfig:
         # Used for perf sanity test
         # config_file: YAML path, select_pattern: server/client selection string
         # server_configs: list[ServerConfig], server_client_configs: dict[server_id -> list[ClientConfig]]
-        self.upload = False
+        self.upload_to_db = False
         self.config_file = None
+        self.gpu_type = None
         self.config_path = None
         self.select_pattern = None
         self.server_configs = []
@@ -1137,8 +1142,9 @@ class PerfTestConfig:
         if "perf_sanity" in labels[0]:
             assert len(labels) > 1, "perf_sanity test must have a config file!"
             self.runtime = "server-benchmark"
-            self.upload = "upload" in labels[0]
+            self.upload_to_db = "upload" in labels[0]
             self.config_file = labels[1]
+            self.gpu_type = labels[1].replace("l0_", "").lower()
             self.config_path = os.path.join(
                 "tests/scripts/perf-sanity", f"{labels[1]}.yaml"
                 if not labels[1].endswith(".yaml") else labels[1])
@@ -2312,7 +2318,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                     errors.append(self.get_error())
                     del self._test_results[self._current_cmd_idx]
 
-            if self._config.upload:
+            if self._config.upload_to_db:
                 # Upload the test results to database
                 self.upload_test_results_to_database()
 
@@ -2341,8 +2347,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         """
         # Currently only server-benchmark need to store the test result.
         if self._config.runtime == "server-benchmark":
-            base_config = get_nvdf_config()
-            gpu_type = base_config["s_gpu_type"]
+            job_config = get_job_info()
+            job_config["s_gpu_type"] = self._config.gpu_type
 
             new_data_dict = {}
             cmd_idx = 0
@@ -2359,7 +2365,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                         assert metric_type in self._test_results[
                             cmd_idx], f"Metric {metric_type} not found in test results for command {cmd_idx}!"
                     new_data = {}
-                    new_data.update(base_config)
+                    new_data.update(job_config)
                     new_data.update(server_config_dict)
                     new_data.update(client_config_dict)
                     for metric_type in SERVER_BENCHMARK_METRICS:
@@ -2381,10 +2387,10 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             # Prepare baseline data
             baseline_data_dict = prepare_baseline_data(new_data_dict,
                                                        model_to_cmd_idx_group,
-                                                       gpu_type)
+                                                       self._config.gpu_type)
             # Upload the new sample data to database
             post_data(baseline_data_dict, new_data_dict, model_to_cmd_idx_group,
-                      gpu_type)
+                      self._config.gpu_type)
         else:
             return
 

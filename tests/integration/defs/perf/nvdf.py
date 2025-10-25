@@ -19,7 +19,6 @@ import hashlib
 import json
 import os
 import re
-import subprocess
 import time
 
 import requests
@@ -31,6 +30,7 @@ PROJECT_ROOT = "sandbox-temp-1-perf-test"
 # Server config fields to compare
 SERVER_FIELDS = [
     "s_model_name",
+    "l_gpus",
     "l_tp",
     "l_ep",
     "l_pp",
@@ -86,97 +86,15 @@ MINIMIZE_METRICS = [
 ]
 
 
-def get_nvdf_config() -> dict:
-    (
-        gpu_type,
-        gpu_count,
-        host_node_name,
-        build_id,
-        build_url,
-        job_name,
-        job_id,
-        job_url,
-        branch,
-        commit,
-        is_post_merge,
-        is_pr_job,
-        trigger_mr_user,
-        trigger_mr_link,
-        trigger_mr_id,
-        trigger_mr_commit,
-    ) = get_job_info()
-    return {
-        # Unique identifier
-        "_id": "",
-        "b_is_baseline": False,
-        "b_is_valid": True,
-
-        # GPU and Host Config
-        "s_gpu_type": gpu_type,
-        "l_gpu_count": gpu_count,
-        "s_gpu_uuids": "",
-        "s_host_node_name": host_node_name,
-
-        # Job Config
-        "s_build_id": build_id,
-        "s_build_url": build_url,
-        "s_job_name": job_name,
-        "s_job_id": job_id,
-        "s_job_url": job_url,
-        "s_branch": branch,
-        "s_commit": commit,
-        "b_is_post_merge": is_post_merge,
-        "b_is_pr_job": is_pr_job,
-        "s_trigger_mr_user": trigger_mr_user,
-        "s_trigger_mr_link": trigger_mr_link,
-        "s_trigger_mr_id": trigger_mr_id,
-        "s_trigger_mr_commit": trigger_mr_commit,
-    }
-
-
 def get_job_info():
-    """Get job info from environment variables
-
-    Returns:
-        Tuple of (gpu_type, gpu_count, host_node_name, build_id, build_url, job_name, job_id, job_url,
-                  branch, commit, is_post_merge, is_pr_job, trigger_mr_user,
-                  trigger_mr_link, trigger_mr_id, trigger_mr_commit)
+    """
+    Get job info from environment variables
     """
     # Read environment variables
+    host_node_name = os.getenv("HOST_NODE_NAME", "")
     build_id = os.getenv("BUILD_ID", "")
     build_url = os.getenv("BUILD_URL", "")
     job_name = os.getenv("JOB_NAME", "")
-    host_node_name = os.getenv("HOST_NODE_NAME", "")
-
-    # Get gpu_type and gpu_count from nvidia-smi
-    gpu_type = ""
-    gpu_count = 1
-    stage_name = os.getenv("STAGE_NAME", "")
-    if stage_name:
-        # 1. Get gpu info from STAGE_NAME
-        parts = stage_name.split('-')
-        assert len(parts) >= 2, f"Invalid stage_name: {stage_name}"
-        gpu_count = int(parts[1].split('_')[0]) if "_GPUs" in parts[1] else 1
-        gpu_type = f"{parts[0].replace('_', '-').lower()}-x{gpu_count}"
-    else:
-        # 2. Get gpu info from nvidia-smi
-        try:
-            result = subprocess.run(
-                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-                capture_output=True,
-                text=True,
-                timeout=10)
-            if result.returncode == 0:
-                gpu_names = result.stdout.strip().split("\n")
-                gpu_names = [name.strip() for name in gpu_names if name.strip()]
-                gpu_type = gpu_names[0].replace(" ", "").lower()
-                gpu_count = len(gpu_names)
-            else:
-                print_error(f"nvidia-smi query failed: {result.stderr}")
-        except Exception as e:
-            print_error(f"Failed to get GPU info from nvidia-smi: {e}")
-    assert gpu_type and gpu_count > 0, "Failed to get GPU info from nvidia-smi"
-
     global_vars_str = os.getenv("globalVars", "{}")
     try:
         global_vars = json.loads(global_vars_str)
@@ -236,12 +154,32 @@ def get_job_info():
         trigger_mr_commit = commit
 
     print_info(
-        f"gpu_type: {gpu_type}, gpu_count: {gpu_count}, host_node_name: {host_node_name}, build_id: {build_id}, build_url: {build_url}, job_name: {job_name}, job_id: {job_id}, job_url: {job_url}, branch: {branch}, commit: {commit}, is_post_merge: {is_post_merge}, is_pr_job: {is_pr_job}, trigger_mr_user: {trigger_mr_user}, trigger_mr_link: {trigger_mr_link}, trigger_mr_id: {trigger_mr_id}, trigger_mr_commit: {trigger_mr_commit}"
+        f"host_node_name: {host_node_name}, build_id: {build_id}, build_url: {build_url}, job_name: {job_name}, job_id: {job_id}, job_url: {job_url}, branch: {branch}, commit: {commit}, is_post_merge: {is_post_merge}, is_pr_job: {is_pr_job}, trigger_mr_user: {trigger_mr_user}, trigger_mr_link: {trigger_mr_link}, trigger_mr_id: {trigger_mr_id}, trigger_mr_commit: {trigger_mr_commit}"
     )
 
-    return (gpu_type, gpu_count, host_node_name, build_id, build_url, job_name,
-            job_id, job_url, branch, commit, is_post_merge, is_pr_job,
-            trigger_mr_user, trigger_mr_link, trigger_mr_id, trigger_mr_commit)
+    return {
+        "b_is_baseline": False,
+        "b_is_valid": True,
+
+        # Unique identifier
+        "_id": "",
+
+        # Job Config
+        "s_host_node_name": host_node_name,
+        "s_build_id": build_id,
+        "s_build_url": build_url,
+        "s_job_name": job_name,
+        "s_job_id": job_id,
+        "s_job_url": job_url,
+        "s_branch": branch,
+        "s_commit": commit,
+        "b_is_post_merge": is_post_merge,
+        "b_is_pr_job": is_pr_job,
+        "s_trigger_mr_user": trigger_mr_user,
+        "s_trigger_mr_link": trigger_mr_link,
+        "s_trigger_mr_id": trigger_mr_id,
+        "s_trigger_mr_commit": trigger_mr_commit,
+    }
 
 
 def _id(data):
