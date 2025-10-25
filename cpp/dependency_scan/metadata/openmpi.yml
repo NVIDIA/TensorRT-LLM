@@ -1,0 +1,11 @@
+name: openmpi
+version: unknown
+description: openmpi libraries and components
+patterns:
+- libmpi.so.40
+linker_flags: []
+path_components:
+- ompi
+- openmpi
+- openmpi-hpcx
+aliases: []

@@ -1,0 +1,17 @@
+name: nanobind
+version: unknown
+description: Tiny and efficient C++/Python bindings
+
+license: BSD-3-Clause
+copyright: Copyright (c) 2022-2024 Wenzel Jakob
+homepage: https://github.com/wjakob/nanobind
+source: bundled
+
+patterns: []
+
+linker_flags: []
+
+path_components:
+- nanobind
+
+aliases: []

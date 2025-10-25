@@ -1,0 +1,14 @@
+name: deepgemm
+version: unknown
+description: DeepGEMM optimized matrix multiplication library
+
+source: bundled
+
+patterns: []
+
+linker_flags: []
+
+path_components:
+- DeepGEMM
+
+aliases: []

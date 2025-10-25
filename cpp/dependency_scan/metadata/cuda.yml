@@ -1,0 +1,18 @@
+dependencies:
+- name: cuda-cudart-dev
+  version: 13.0.48-1
+  description: CUDA Runtime API development libraries and headers
+  patterns: []
+  linker_flags:
+  - -lcudadevrt
+  path_components: []
+  aliases: []
+- name: cuda-cudart-static
+  version: 13.0.48-1
+  description: CUDA Runtime static library for device code linking
+  patterns:
+  - libcudart_static.a
+  linker_flags:
+  - -lcudart_static
+  path_components: []
+  aliases: []

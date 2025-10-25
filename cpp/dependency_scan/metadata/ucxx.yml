@@ -1,0 +1,15 @@
+name: ucxx
+version: unknown
+description: C++ bindings for UCX (Unified Communication X)
+
+homepage: https://github.com/rapidsai/ucxx
+source: bundled
+
+patterns: []
+
+linker_flags: []
+
+path_components:
+- ucxx
+
+aliases: []

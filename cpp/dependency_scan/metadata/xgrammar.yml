@@ -1,0 +1,15 @@
+name: xgrammar
+version: unknown
+description: XGrammar library for structured text generation
+
+homepage: https://github.com/mlc-ai/xgrammar
+source: bundled
+
+patterns: []
+
+linker_flags: []
+
+path_components:
+- xgrammar
+
+aliases: []

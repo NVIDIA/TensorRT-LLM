@@ -1,0 +1,29 @@
+dependencies:
+- name: libc6
+  version: 2.39-0ubuntu8.6
+  description: GNU C Library - shared libraries and system calls
+  patterns: []
+  linker_flags:
+  - -lc
+  - -ldl
+  - -lm
+  - -lpthread
+  - -lrt
+  path_components: []
+  aliases: []
+- name: libnuma1
+  version: 2.0.18-1build1
+  description: NUMA memory allocation library
+  patterns: []
+  linker_flags:
+  - -lnuma
+  path_components: []
+  aliases: []
+- name: libzmq5
+  version: 4.3.5-1build2
+  description: ZeroMQ lightweight messaging kernel library
+  patterns: []
+  linker_flags:
+  - -lzmq
+  path_components: []
+  aliases: []

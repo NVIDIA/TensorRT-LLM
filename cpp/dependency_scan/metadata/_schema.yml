@@ -1,0 +1,83 @@
+# JSON Schema for validating dependency YAML files
+# Used by scanner to validate structure and required fields
+
+type: object
+
+required:
+  - name
+  - version
+  - description
+
+properties:
+  name:
+    type: string
+    pattern: "^[a-z0-9-+]+$"
+    description: "Canonical dependency name (lowercase, hyphenated, + allowed)"
+    minLength: 1
+
+  version:
+    type: string
+    description: "Version string (semantic versioning recommended)"
+    minLength: 1
+
+  description:
+    type: string
+    description: "Brief description of the dependency"
+    minLength: 10
+
+  license:
+    type: string
+    description: "SPDX license identifier or license name"
+
+  copyright:
+    type: string
+    description: "Copyright notice"
+
+  homepage:
+    type: string
+    format: uri
+    description: "URL to project homepage or repository"
+
+  source:
+    type: string
+    enum: ["apt", "pip", "built-from-source", "bundled", "download", "other"]
+    description: "How this dependency is obtained"
+
+  patterns:
+    type: array
+    items:
+      type: string
+      minLength: 1
+    uniqueItems: true
+    description: "Artifact patterns (exact or substring match)"
+
+  linker_flags:
+    type: array
+    items:
+      type: string
+      pattern: "^-l"
+      minLength: 3
+    uniqueItems: true
+    description: "Linker flags (-l flags)"
+
+  path_components:
+    type: array
+    items:
+      type: string
+      minLength: 1
+    uniqueItems: true
+    description: "Path components that indicate this dependency"
+
+  aliases:
+    type: array
+    items:
+      type: string
+      minLength: 1
+    uniqueItems: true
+    description: "Other names that map to this dependency"
+
+# At least one pattern matching section required
+anyOf:
+  - required: ["patterns"]
+  - required: ["linker_flags"]
+  - required: ["path_components"]
