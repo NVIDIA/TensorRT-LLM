@@ -145,8 +145,9 @@ def get_job_info():
         # Pattern: target="_blank">Barry-Delaney</a><br/>Git Commit:
         trigger_info = global_vars.get("action_info",
                                        {}).get("trigger_info", "")
-        # Try to extract username from patterns like 'target="_blank">username</a>'
-        user_match = re.search(r'target="_blank">([^<]+)</a>', trigger_info)
+        # Try to extract username from patterns like 'target="_blank">username</a><br/>Git Commit:'
+        user_match = re.search(r'target="_blank">([^<]+)</a><br/>Git Commit:',
+                               trigger_info)
         if user_match:
             trigger_mr_user = user_match.group(1)
 
