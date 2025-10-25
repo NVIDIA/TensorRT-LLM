@@ -33,6 +33,7 @@ from tensorrt_llm.llmapi.mpi_session import find_free_port
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
+from tensorrt_llm.serve.tool_parser import ToolParserFactory
 
 # Global variable to store the Popen object of the child process
 _child_p_global: Optional[subprocess.Popen] = None
@@ -90,6 +91,7 @@ def get_llm_args(model: str,
                  num_postprocess_workers: int = 0,
                  trust_remote_code: bool = False,
                  reasoning_parser: Optional[str] = None,
+                 tool_parser: Optional[str] = None,
                  fail_fast_on_attention_window_too_large: bool = False,
                  enable_chunked_prefill: bool = False,
                  **llm_args_extra_dict: Any):
@@ -132,6 +134,7 @@ def get_llm_args(model: str,
         "num_postprocess_workers": num_postprocess_workers,
         "postprocess_tokenizer_dir": tokenizer or model,
         "reasoning_parser": reasoning_parser,
+        "tool_parser": tool_parser,
         "fail_fast_on_attention_window_too_large":
         fail_fast_on_attention_window_too_large,
         "enable_chunked_prefill": enable_chunked_prefill,
@@ -305,6 +308,12 @@ class ChoiceWithAlias(click.Choice):
     default=None,
     help="[Experimental] Specify the parser for reasoning models.",
 )
+@click.option(
+    "--tool_parser",
+    type=click.Choice(ToolParserFactory.parsers.keys()),
+    default=None,
+    help="[Experimental] Specify the parser for tool models.",
+)
 @click.option("--metadata_server_config_file",
               type=str,
               default=None,
@@ -342,7 +351,8 @@ def serve(
         gpus_per_node: Optional[int], kv_cache_free_gpu_memory_fraction: float,
         num_postprocess_workers: int, trust_remote_code: bool,
         extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
-        metadata_server_config_file: Optional[str], server_role: Optional[str],
+        tool_parser: Optional[str], metadata_server_config_file: Optional[str],
+        server_role: Optional[str],
         fail_fast_on_attention_window_too_large: bool,
         enable_chunked_prefill: bool, disagg_cluster_uri: Optional[str],
         media_io_kwargs: Optional[str]):
@@ -369,6 +379,7 @@ def serve(
         num_postprocess_workers=num_postprocess_workers,
         trust_remote_code=trust_remote_code,
         reasoning_parser=reasoning_parser,
+        tool_parser=tool_parser,
         fail_fast_on_attention_window_too_large=
         fail_fast_on_attention_window_too_large,
         enable_chunked_prefill=enable_chunked_prefill)

@@ -1685,6 +1685,11 @@ class BaseLlmArgs(StrictBaseModel):
         description="The parser to separate reasoning content from output.",
         status="prototype")
 
+    tool_parser: Optional[str] = Field(
+        default=None,
+        description="The parser to separate tool calls from output.",
+        status="prototype")
+
     # TODO[Superjomn]: To deprecate this config.
     decoding_config: Optional[object] = Field(
         default=None,
