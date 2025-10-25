@@ -112,7 +112,6 @@ class ModelDrafter(Drafter):
         num_draft_tokens = len(
             request.py_last_draft_tokens
         ) if request.py_last_draft_tokens is not None else 0
-        request.py_draft_tokens = []
 
         num_accepted_tokens = request.py_num_accepted_draft_tokens
         num_rejected_tokens = num_draft_tokens - num_accepted_tokens
@@ -581,6 +580,7 @@ class ModelDrafter(Drafter):
                 # Chunked prefill request in progress; no need to append draft tokens
                 continue
             py_draft_logits = []
+            target_model_req.py_draft_tokens = []
             for token_idx in range(self.max_draft_len):
                 target_model_req.py_draft_tokens.append(
                     draft_tokens_host[token_idx][req_idx])
@@ -780,6 +780,8 @@ class ModelDrafter(Drafter):
         self.update_request_states(draft_batch)
 
         # Execute the iterative draft loop
+        for req in scheduled_batch.generation_requests:
+            req.py_draft_tokens = []
         previous_draft_state = self._execute_draft_loop(
             draft_batch, resource_manager, req_id_to_old_request, target_inputs,
             num_draft_reqs, draft_sample_state)
@@ -834,6 +836,8 @@ class ModelDrafter(Drafter):
             self.update_request_states(draft_batch)
 
             # Execute the iterative draft loop
+            for req in scheduled_requests.generation_requests:
+                req.py_draft_tokens = []
             previous_draft_state = self._execute_draft_loop(
                 draft_batch, resource_manager, req_id_to_old_request, None,
                 None, sample_state)

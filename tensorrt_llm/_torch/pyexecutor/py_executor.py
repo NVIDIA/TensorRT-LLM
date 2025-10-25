@@ -1360,10 +1360,9 @@ class PyExecutor:
                     batch_outputs = self._forward_step(scheduled_batch,
                                                        previous_tensors_device)
 
-                    if target_inputs is not None:
-                        self._process_draft_results(scheduled_batch,
-                                                    draft_outputs, draft_batch)
-                    elif self.previous_batch is not None and not use_previous_draft_tokens:
+                    if target_inputs is None and (
+                            self.previous_batch is not None
+                            and not use_previous_draft_tokens):
                         self._update_requests(self.previous_batch.sample_state)
 
                         if self.block_reuse_enabled and not self.kv_cache_manager.is_vswa and self.kv_cache_transceiver:
@@ -2313,7 +2312,9 @@ class PyExecutor:
                 target_inputs, draft_outputs, draft_batch = self.drafter.generate_draft_tokens_with_overlap(
                     scheduled_batch, self.resource_manager,
                     previous_tensors.device if previous_tensors else None)
-
+                if draft_outputs is not None:
+                    self._process_draft_results(scheduled_batch, draft_outputs,
+                                                draft_batch)
                 self.has_previous_draft_tokens = target_inputs is not None and target_inputs.next_draft_tokens is not None
             else:
                 self.has_previous_draft_tokens = False
