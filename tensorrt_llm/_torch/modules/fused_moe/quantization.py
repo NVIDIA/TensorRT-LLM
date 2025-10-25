@@ -2558,8 +2558,8 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
                                  w1_weight: torch.Tensor,
                                  w3_weight: torch.Tensor,
                                  dst_w3_w1_weight: torch.Tensor):
-        device = dst_w3_w1_weight.device
-        assert device.type == "cuda"
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        non_blocking = dst_w3_w1_weight.device.type == "cuda"
 
         # We pad before the sharding. This is done to avoid fractional scaling factors
         # per shard.
@@ -2621,13 +2621,13 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
         # Copy the result into device buffer
         dst_w3_w1_weight.copy_(processed_w31_weight_shard.view(
             dst_w3_w1_weight.dtype),
-                               non_blocking=True)
+                               non_blocking=non_blocking)
 
     def load_expert_w2_weight(self, module: torch.nn.Module,
                               w2_weight: torch.Tensor,
                               dst_w2_weight: torch.Tensor):
-        device = dst_w2_weight.device
-        assert device.type == "cuda"
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        non_blocking = dst_w2_weight.device.type == "cuda"
 
         shard_w2_weight_dim = 2 * w2_weight.shape[1] if len(
             w2_weight.shape) == 2 else w2_weight.shape[0]
@@ -2658,7 +2658,7 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
 
         # Keep weights in device buffer
         dst_w2_weight.copy_(w2_weight_shard.view(dst_w2_weight.dtype),
-                            non_blocking=True)
+                            non_blocking=non_blocking)
         # Get permuted indices
         permute_indices = trtllmgen_maybe_get_cached_w2_permute_indices(
             dst_w2_weight, self._cache_permute_indices, epilogue_tile_m)
@@ -2669,14 +2669,13 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
 
         # Copy the result into device buffer
         dst_w2_weight.copy_(processed_w2_weight.view(dst_w2_weight.dtype),
-                            non_blocking=True)
+                            non_blocking=non_blocking)
 
     def load_expert_w3_w1_weight_scale_mxfp4(
             self, module: torch.nn.Module, w1_weight_scale: torch.Tensor,
             w3_weight_scale: torch.Tensor,
             dst_w3_w1_weight_scale: torch.Tensor):
-        device = dst_w3_w1_weight_scale.device
-        assert device.type == "cuda"
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
         alignment = _get_weight_alignment(self.weight_alignment,
                                           module.scaling_vector_size,
@@ -2738,8 +2737,7 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
     def load_expert_w2_weight_scale_mxfp4(self, module: torch.nn.Module,
                                           w2_weight_scale: torch.Tensor,
                                           dst_w2_weight_scale: torch.Tensor):
-        device = dst_w2_weight_scale.device
-        assert device.type == "cuda"
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
         alignment = _get_weight_alignment(self.weight_alignment,
                                           module.scaling_vector_size,
