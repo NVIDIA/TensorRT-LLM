@@ -168,6 +168,7 @@ def fused_mlp_moe_kernel_w8a8(
     topk_weights_ptr,
     sorted_token_ids_ptr,
     expert_ids_ptr,
+    num_tokens_post_padded_ptr,
     # Matrix dimensions
     N,
     K,
@@ -202,6 +203,10 @@ def fused_mlp_moe_kernel_w8a8(
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
+
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+        return
 
     offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     token_id_mask = offs_token_id < EM
@@ -269,7 +274,7 @@ def fused_mlp_moe_kernel_w8a8(
     accumulator = (accumulator * a_scale * b_scale).to(compute_type)
 
     if MUL_ROUTED_WEIGHT:
-        moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
+        moe_weight = tl.load(topk_weights_ptr + offs_token_clamped, mask=token_mask, other=0)
         accumulator = accumulator * moe_weight[:, None]
 
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
