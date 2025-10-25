@@ -417,7 +417,7 @@ PERF_METRIC_STRING = {
     PerfMetricType.MEDIAN_INTER_TOKEN_TIME: "median_itl",
     PerfMetricType.P99_INTER_TOKEN_TIME: "p99_itl",
     PerfMetricType.SEQ_LATENCY: "seq_latency",
-    PerfMetricType.TOKEN_THROUGHPUT: "mean_throughput",
+    PerfMetricType.TOKEN_THROUGHPUT: "token_throughput",
     PerfMetricType.TOTAL_TOKEN_THROUGHPUT: "total_token_throughput",
     PerfMetricType.USER_THROUGHPUT: "user_throughput",
     PerfMetricType.SEQ_THROUGHPUT: "seq_throughput",

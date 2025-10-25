@@ -21,13 +21,12 @@ import os
 import re
 import subprocess
 import time
-from datetime import datetime
 
 import requests
 from defs.trt_test_alternative import print_error, print_info
 
 NVDF_BASE_URL = "http://gpuwa.nvidia.com"
-PROJECT_ROOT = "sandbox-tmp-perf-test"
+PROJECT_ROOT = "sandbox-temp-1-perf-test"
 
 # Server config fields to compare
 SERVER_FIELDS = [
@@ -88,13 +87,27 @@ MINIMIZE_METRICS = [
 
 
 def get_nvdf_config() -> dict:
-    gpu_type, gpu_count, host_node_name, build_id, build_url, job_name, job_id, job_url, branch, commit, is_post_merge, is_pr_job, trigger_mr_user, trigger_mr_link, trigger_mr_id, trigger_mr_commit = get_job_info(
-    )
-    create_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    (
+        gpu_type,
+        gpu_count,
+        host_node_name,
+        build_id,
+        build_url,
+        job_name,
+        job_id,
+        job_url,
+        branch,
+        commit,
+        is_post_merge,
+        is_pr_job,
+        trigger_mr_user,
+        trigger_mr_link,
+        trigger_mr_id,
+        trigger_mr_commit,
+    ) = get_job_info()
     return {
         # Unique identifier
         "_id": "",
-        "s_create_time": create_time,
         "b_is_baseline": False,
         "b_is_valid": True,
 
@@ -401,25 +414,29 @@ def query_data(gpu_type, model_name):
     data_list = []
     try:
         res = query(json_data, project_name)
-        if res:
-            data = res.json()
-            for data in data["hits"]["hits"]:
-                data_dict = data["_source"]
-                data_dict["_id"] = data["_id"]
-                data_dict["_index"] = data["_index"]
-                data_dict["_score"] = data["_score"]
+        if res is None:
+            print_error(f"NVDF query returned no response for {project_name}")
+            return []
+        else:
+            payload = res.json().get("hits", {}).get("hits", [])
+            if len(payload) == 0:
+                print_error(f"NVDF query returned no data for {project_name}")
+                return []
+            for hit in payload:
+                data_dict = hit.get("_source", {})
+                data_dict["_id"] = hit.get("_id", "")
+                if data_dict["_id"] == "":
+                    print_error(
+                        f"NVDF query returned data with no _id for {project_name}"
+                    )
+                    continue
                 data_list.append(data_dict)
             print_info(
                 f"NVDF query successfully to {project_name}, queried {len(data_list)} entries"
             )
             return data_list
-        else:
-            print_error(
-                f"NVDF query failed to {project_name}, status code: {res.status_code}, error: {res.text}"
-            )
-            return []
     except Exception as e:
-        print_error(f"NVDF query error to {project_name}, error: {e}")
+        print_error(f"NVDF query returned error for {project_name}: {e}")
         return []
 
 
