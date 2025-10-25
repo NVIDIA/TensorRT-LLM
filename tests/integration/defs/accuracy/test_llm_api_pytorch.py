@@ -3450,7 +3450,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                   moe_config=MoeConfig(backend=moe_backend))
 
         with llm:
-            model_name = "GPT-OSS/MXFP4"
+            model_name = "GPT-OSS/20B-MXFP4"
             task = GSM8K(model_name)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
@@ -3461,7 +3461,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             load_format="dummy",
         )
         with llm:
-            model_name = "GPT-OSS/MXFP4"
+            model_name = "GPT-OSS/20B-MXFP4"
             task = GSM8K(model_name)
             task.evaluate(llm, is_integration_test=True)
 
@@ -3509,7 +3509,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                   moe_config=MoeConfig(backend=moe_backend))
 
         with llm:
-            model_name = "GPT-OSS/MXFP4"
+            model_name = "GPT-OSS/120B-MXFP4"
             task = GSM8K(model_name)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
@@ -3636,7 +3636,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                   moe_config=MoeConfig(backend=moe_backend))
 
         with llm:
-            model_name = "GPT-OSS/MXFP4"
+            model_name = "GPT-OSS/20B-MXFP4"
             task = GSM8K(model_name)
             mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
             mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
@@ -3663,7 +3663,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         dtype=kv_cache_dtype)
 
-        model_name = "GPT-OSS/MXFP4"
+        model_name = "GPT-OSS/120B-MXFP4"
         with LLM(self.MODEL_PATH,
                  tensor_parallel_size=4,
                  pipeline_parallel_size=1,
