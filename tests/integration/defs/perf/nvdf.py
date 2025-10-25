@@ -150,27 +150,32 @@ def get_job_info():
 
     # Get gpu_type and gpu_count from nvidia-smi
     gpu_type = ""
-    gpu_count = 0
-    try:
-        # Get GPU names from nvidia-smi
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-            capture_output=True,
-            text=True,
-            timeout=10)
-        if result.returncode == 0:
-            gpu_names = result.stdout.strip().split("\n")
-            gpu_names = [name.strip() for name in gpu_names if name.strip()]
-            if gpu_names:
-                # Get GPU type and countfrom first GPU
-                gpu_type = gpu_names[0]
-                # Replace spaces with hyphens
-                gpu_type = gpu_type.replace(" ", "").lower()
+    gpu_count = 1
+    stage_name = os.getenv("STAGE_NAME", "")
+    if stage_name:
+        # 1. Get gpu info from STAGE_NAME
+        parts = stage_name.split('-')
+        assert len(parts) >= 2, f"Invalid stage_name: {stage_name}"
+        gpu_count = int(parts[1].split('_')[0]) if "_GPUs" in parts[1] else 1
+        gpu_type = f"{parts[0].replace('_', '-').lower()}-x{gpu_count}"
+    else:
+        # 2. nvidia-smi --query-gpu=count --format=csv,noheader
+        try:
+            # Get GPU names from nvidia-smi
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                capture_output=True,
+                text=True,
+                timeout=10)
+            if result.returncode == 0:
+                gpu_names = result.stdout.strip().split("\n")
+                gpu_names = [name.strip() for name in gpu_names if name.strip()]
+                gpu_type = gpu_names[0].replace(" ", "").lower()
                 gpu_count = len(gpu_names)
-        else:
-            print_error(f"nvidia-smi query failed: {result.stderr}")
-    except Exception as e:
-        print_error(f"Failed to get GPU info from nvidia-smi: {e}")
+            else:
+                print_error(f"nvidia-smi query failed: {result.stderr}")
+        except Exception as e:
+            print_error(f"Failed to get GPU info from nvidia-smi: {e}")
     assert gpu_type and gpu_count > 0, "Failed to get GPU info from nvidia-smi"
 
     global_vars_str = os.getenv("globalVars", "{}")
