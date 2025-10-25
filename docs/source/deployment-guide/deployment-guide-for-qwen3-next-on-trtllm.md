@@ -1,4 +1,4 @@
-# Quick Start Recipe for Qwen3 Next on TensorRT LLM - Blackwell & Hopper Hardware
+# Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell & Hopper Hardware
 
 ## Introduction
 
@@ -29,27 +29,31 @@ make -C docker release_build IMAGE_TAG=qwen3-next-local
 make -C docker release_run IMAGE_NAME=tensorrt_llm IMAGE_TAG=qwen3-next-local LOCAL_USER=1
 ```
 
-### Creating the TensorRT LLM Server config
+### Recommended Performance Settings
 
-We create a YAML configuration file `/tmp/config.yml` for the TensorRT LLM Server with the following content:
+We maintain YAML configuration files with recommended performance settings in the [`examples/configs`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/configs) directory. These config files are present in the TensorRT LLM container at the path `/app/tensorrt_llm/examples/configs`. You can use these out-of-the-box, or adjust them to your specific use case.
 
 ```shell
-EXTRA_LLM_API_FILE=/tmp/config.yml
-
-cat << EOF > ${EXTRA_LLM_API_FILE}
-enable_attention_dp: false
-cuda_graph_config:
-  enable_padding: true
-  max_batch_size: 720
-moe_config:
-    backend: TRTLLM
-stream_interval: 20
-num_postprocess_workers: 4
-kv_cache_config:
-    enable_block_reuse: false
-    free_gpu_memory_fraction: 0.6
-EOF
+TRTLLM_DIR=/app/tensorrt_llm # change as needed to match your environment
+EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/qwen3-next.yaml
 ```
+
+Note: if you don't have access to the source code locally, you can manually create the YAML config file using the code in the dropdown below.
+
+````{admonition} Show code
+:class: dropdown
+
+```{literalinclude} ../../../examples/configs/qwen3-next.yaml
+---
+language: shell
+prepend: |
+  EXTRA_LLM_API_FILE=/tmp/config.yml
+
+  cat << EOF > ${EXTRA_LLM_API_FILE}
+append: EOF
+---
+```
+````
 
 
 ### Launch the TensorRT LLM Server
@@ -57,58 +61,46 @@ EOF
 Below is an example command to launch the TensorRT LLM server with the Qwen3-Next model from within the container.
 
 ```shell
-trtllm-serve Qwen/Qwen3-Next-80B-A3B-Thinking \
-    --host 0.0.0.0 \
-    --port 8000 \
-    --max_batch_size 16 \
-    --max_num_tokens 4096 \
-    --tp_size 4 \
-    --pp_size 1 \
-    --ep_size 4 \
-    --trust_remote_code \
-    --extra_llm_api_options ${EXTRA_LLM_API_FILE}
+trtllm-serve Qwen/Qwen3-Next-80B-A3B-Thinking --host 0.0.0.0 --port 8000 --extra_llm_api_options ${EXTRA_LLM_API_FILE}
 ```
 
 After the server is set up, the client can now send prompt requests to the server and receive results.
 
-### Configs and Parameters
+### LLM API Options (YAML Configuration)
 
-These options are used directly on the command line when you start the `trtllm-serve` process.
+<!-- TODO: this section is duplicated across the deployment guides; they should be consolidated to a central file and imported as needed, or we can remove this and link to LLM API reference -->
 
-#### `--tp_size`
+These options provide control over TensorRT LLM's behavior and are set within the YAML file passed to the `trtllm-serve` command via the `--extra_llm_api_options` argument.
+
+#### `tensor_parallel_size`
 
 * **Description:** Sets the **tensor-parallel size**. This should typically match the number of GPUs you intend to use for a single model instance.
 
-#### `--ep_size`
+#### `moe_expert_parallel_size`
 
-* **Description:** Sets the **expert-parallel size** for Mixture-of-Experts (MoE) models. Like `tp_size`, this should generally match the number of GPUs you're using. This setting has no effect on non-MoE models.
+* **Description:** Sets the **expert-parallel size** for Mixture-of-Experts (MoE) models. Like `tensor_parallel_size`, this should generally match the number of GPUs you're using. This setting has no effect on non-MoE models.
 
-#### `--kv_cache_free_gpu_memory_fraction`
+#### `kv_cache_config.free_gpu_memory_fraction`
 
 * **Description:** A value between `0.0` and `1.0` that specifies the fraction of free GPU memory to reserve for the KV cache after the model is loaded. Since memory usage can fluctuate, this buffer helps prevent out-of-memory (OOM) errors.
 * **Recommendation:** If you experience OOM errors, try reducing this value to `0.7` or lower.
 
 
-#### `--max_batch_size`
+#### `max_batch_size`
 
 * **Description:** The maximum number of user requests that can be grouped into a single batch for processing. The actual max batch size that can be achieved depends on total sequence length (input + output).
 
-#### `--max_num_tokens`
+#### `max_num_tokens`
 
 * **Description:** The maximum total number of tokens (across all requests) allowed inside a single scheduled batch.
 
-#### `--max_seq_len`
+#### `max_seq_len`
 
 * **Description:** The maximum possible sequence length for a single request, including both input and generated output tokens. We won't specifically set it. It will be inferred from model config.
 
-#### `--trust_remote_code`
+#### `trust_remote_code`
 
 * **Description:** Allows TensorRT LLM to download models and tokenizers from Hugging Face. This flag is passed directly to the Hugging Face API.
-
-
-#### Extra LLM API Options (YAML Configuration)
-
-These options provide finer control over performance and are set within a YAML file passed to the `trtllm-serve` command via the `--extra_llm_api_options` argument.
 
 #### `cuda_graph_config`
 
