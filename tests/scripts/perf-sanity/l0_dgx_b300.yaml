@@ -6,7 +6,6 @@ server_configs:
     pp: 1
     attention_backend: "TRTLLM"
     moe_backend: "CUTLASS"
-    moe_max_num_tokens: ""
     enable_attention_dp: true
     enable_chunked_prefill: false
     max_num_tokens: 2176
@@ -35,7 +34,6 @@ server_configs:
     pp: 1
     attention_backend: "TRTLLM"
     moe_backend: "CUTLASS"
-    moe_max_num_tokens: ""
     enable_attention_dp: false
     enable_chunked_prefill: false
     max_num_tokens: 2176

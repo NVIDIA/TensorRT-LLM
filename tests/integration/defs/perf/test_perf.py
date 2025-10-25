@@ -624,7 +624,7 @@ class ServerConfig:
         if self.moe_backend:
             config_lines.append("moe_config:")
             config_lines.append(f"  backend: {self.moe_backend}")
-            if self.moe_max_num_tokens > 0:
+            if self.moe_max_num_tokens:
                 config_lines.append(
                     f"  max_num_tokens: {self.moe_max_num_tokens}")
 
