@@ -159,9 +159,8 @@ def get_job_info():
         gpu_count = int(parts[1].split('_')[0]) if "_GPUs" in parts[1] else 1
         gpu_type = f"{parts[0].replace('_', '-').lower()}-x{gpu_count}"
     else:
-        # 2. nvidia-smi --query-gpu=count --format=csv,noheader
+        # 2. Get gpu info from nvidia-smi
         try:
-            # Get GPU names from nvidia-smi
             result = subprocess.run(
                 ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
                 capture_output=True,
