@@ -21,6 +21,7 @@ _BACKEND_OPS = {
     "agent": torch.ops.auto_deploy.cuda_moe,
     "trtllm": torch.ops.auto_deploy.trtllm_moe_fused,
     "triton": torch.ops.auto_deploy.triton_moe_fused,
+    "cutedsl": torch.ops.auto_deploy.cutedsl_moe_fused,
 }
 
 
@@ -66,7 +67,9 @@ def _insert_fused_moe_ops(gm: GraphModule, backend: str) -> int:
             fused_w_up_experts = torch.stack([gm.get_parameter(n.target) for n in w1_list], dim=0)
             new_key_w_up = f"fused_moe_w1_stacked_{fused_key_counter}"
             # Triton fused MoE op supports mlp only.
-            assert backend in ["triton", "agent"], "Backend must be triton or agent for mlp style."
+            assert backend in ["triton", "agent", "cutedsl"], (
+                "Backend must be triton or agent or cutedsl for mlp style."
+            )
 
         else:
             raise ValueError(f"Unknown mlp_style: {mlp_style_val}")
