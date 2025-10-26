@@ -22,7 +22,7 @@ from .postproc_worker import PostprocWorkerConfig
 from .ray_gpu_worker import RayGPUWorker, RayWorkerWrapper
 from .request import GenerationRequest
 from .result import GenerationResult, RayAsyncQueue, RaySyncQueue
-from .rpc_proxy import RpcExecutorMixin
+from .rpc_proxy_mixin import RpcExecutorMixin
 
 __all__ = [
     "RayExecutor",

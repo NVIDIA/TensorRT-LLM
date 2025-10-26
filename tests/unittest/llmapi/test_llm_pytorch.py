@@ -938,7 +938,8 @@ class TestLlmError:
 
 
 @skip_ray
-def test_llm_rpc():
+@pytest.mark.parametrize("num_requests", [1, 5, 10])
+def test_llm_rpc(num_requests: int):
     # TODO: remove the with-statement when shutdown hang issue is fixed
     with LLM(model=llama_model_path,
              kv_cache_config=global_kvcache_config,
