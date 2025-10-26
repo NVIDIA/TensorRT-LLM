@@ -65,9 +65,16 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
 
         self.main_loop_task_obj = None
         self.main_loop = None
-        self.main_loop_thread = None
+        self.main_loop_started = threading.Event()
 
         self.launch_workers()
+
+        # Start the response reader early to avoid race conditions
+        if hasattr(self.rpc_client, '_start_response_reader_lazily'):
+            self.rpc_client._start_response_reader_lazily()
+            # Give response reader time to start
+            import time
+            time.sleep(0.1)
 
         # Invoke model creation on the remote
         # TBD: Move model creation to the mpi task, or left in RPC?
@@ -127,11 +134,9 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         async def main_loop_task():
             tasks = [
                 self._fetch_responses_loop_async(),
-                self._fetch_stats_loop_async(),
-                self._fetch_kv_cache_events_loop_async(),
+                self._fetch_stats_loop_async()
             ]
-            # Only add kv_cache_events loop if it's enabled
-            if self._iter_kv_events_result:
+            if self._iter_kv_events_result is not None:
                 tasks.append(self._fetch_kv_cache_events_loop_async())
             await asyncio.gather(*tasks)
 
@@ -142,6 +147,8 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
 
             self.main_loop_task_obj = self.main_loop.create_task(
                 main_loop_task())
+            # Signal that the main loop is ready
+            self.main_loop_started.set()
             try:
                 self.main_loop.run_until_complete(self.main_loop_task_obj)
             except asyncio.CancelledError:
@@ -153,6 +160,9 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
                                                  daemon=True,
                                                  name="rpc_proxy_main_loop")
         self.main_loop_thread.start()
+        # Wait for the main loop to be ready before continuing
+        if not self.main_loop_started.wait(timeout=5.0):
+            raise RuntimeError("Main loop failed to start within timeout")
         atexit.register(self.shutdown)
 
     def handle_responses(self, responses: list[GenerationResult]) -> bool:
@@ -287,13 +297,8 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
         request.set_id(self._get_next_client_id())
+        client_id = request.id
         logprob_params = self._get_logprob_params(request)
-
-        # submit is a fire-and-forget operation, don't need to wait for response
-        with nvtx_range_debug("GenerationExecutorRpcProxy.submit",
-                              color="green",
-                              category="Proxy"):
-            self.rpc_client.submit(request).remote(need_response=False)
 
         result = GenerationResult(
             request,
@@ -301,7 +306,20 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
             executor=self,
             disaggregated_params=request.disaggregated_params,
             logprob_params=logprob_params)
-        self._results[request.id] = result
+
+        # Register the result before sending the request to avoid race condition
+        self._results[client_id] = result
+
+        with nvtx_range_debug("GenerationExecutorRpcProxy.submit",
+                              color="green",
+                              category="Proxy"):
+            try:
+                # submit is a fire-and-forget operation, don't need to wait for response
+                self.rpc_client.submit(request).remote(need_response=False)
+            except Exception as e:
+                # Clean up on error
+                self._results.pop(client_id, None)
+                raise
 
         return result
 
@@ -329,31 +347,40 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         self.shutdown_remote()
 
         # 2. stop the main loop, so that no new rpc requests
-        if self.main_loop and self.main_loop_task_obj:
-            logger_debug("Cancelling main loop task.", color="yellow")
-            # The cancel() is thread-safe
+        if self.main_loop:
             try:
-                self.main_loop.call_soon_threadsafe(
-                    self.main_loop_task_obj.cancel)
-            except Exception as e:
-                logger_debug(f"Error cancelling main loop task: {e}",
-                             color="yellow")
+                # Cancel all tasks gracefully
+                if self.main_loop_task_obj and not self.main_loop_task_obj.done(
+                ):
+                    self.main_loop.call_soon_threadsafe(
+                        self.main_loop_task_obj.cancel)
 
-        # Only join if we're not calling from the main_loop_thread itself
-        # (e.g., during garbage collection in that thread)
-        if self.main_loop_thread and threading.current_thread(
-        ) != self.main_loop_thread:
-            self.main_loop_thread.join()
+                # Stop the event loop
+                self.main_loop.call_soon_threadsafe(self.main_loop.stop)
+
+                # Wait for the thread to complete with timeout
+                self.main_loop_thread.join(timeout=5.0)
+                if self.main_loop_thread.is_alive():
+                    logger.warning("Main loop thread did not exit cleanly")
+            except Exception as e:
+                logger.warning(f"Error during main loop shutdown: {e}")
 
         # 3. shutdown the mpi session, this should wait until all the PyExecutor
         # processes are shutdown
-        if self.mpi_session is not None:
-            logger_debug(f"Shutting down mpi session", color="yellow")
-            self.mpi_session.shutdown()
-            logger_debug(f"Mpi session shutdown", color="yellow")
-            self.mpi_session = None
+        if hasattr(self, 'mpi_session') and self.mpi_session is not None:
+            try:
+                logger_debug(f"Shutting down mpi session", color="yellow")
+                self.mpi_session.shutdown()
+                logger_debug(f"Mpi session shutdown", color="yellow")
+                self.mpi_session = None
+            except Exception as e:
+                logger.warning(f"Error during MPI session shutdown: {e}")
 
-        self.rpc_client.close()
+        try:
+            if hasattr(self, 'rpc_client'):
+                self.rpc_client.close()
+        except Exception as e:
+            logger.warning(f"Error during RPC client close: {e}")
 
     def __enter__(self):
         return self

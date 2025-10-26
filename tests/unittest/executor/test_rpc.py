@@ -214,17 +214,19 @@ class TestRpcError:
         server.start()
         time.sleep(0.1)
 
-        with RPCClient(addr) as client:
+        client = RPCClient(addr)
+        try:
             client.shutdown_server()
             pending_futures = [client.task().remote_future() for _ in range(10)]
 
             for future in pending_futures:
                 with pytest.raises(RPCCancelled):
                     future.result()
-
-        time.sleep(5)
-
-        client.close()
+        finally:
+            # Ensure proper cleanup
+            client.close()
+            # Wait for background threads to exit
+            time.sleep(1.0)
 
     def test_timeout_error(self):
         """Test that requests that exceed timeout are handled with proper error."""
@@ -279,17 +281,19 @@ def test_rpc_shutdown_server():
             return "world"
 
     addr = get_unique_ipc_addr()
-    with RPCServer(App()) as server:
-        server.bind(addr)
-        server.start()
-        time.sleep(0.1)
+    server = RPCServer(App())
+    server.bind(addr)
+    server.start()
+    time.sleep(0.1)
+    try:
         with RPCClient(addr) as client:
             ret = client.hello().remote()
             assert ret == "world"
 
             client.shutdown_server()
-
-    time.sleep(5)  # the server dispatcher thread need some time to quit
+    finally:
+        # Wait for the server dispatcher thread to quit
+        time.sleep(1.0)
 
 
 def test_rpc_without_response_performance():
@@ -367,9 +371,8 @@ class TestRpcTimeout:
 
     def setup_method(self, method):
         """Setup RPC server and client for timeout tests."""
-        # Use unique address based on the test parameter to avoid socket conflicts
-        test_name = method.__name__
-        self.address = f"ipc:///tmp/rpc_test_timeout_{test_name}_{id(self)}"
+        # Use unique address to avoid socket conflicts
+        self.address = get_unique_ipc_addr()
         self.server = RPCServer(self.App())
         self.server.bind(self.address)
         self.server.start()
@@ -378,10 +381,14 @@ class TestRpcTimeout:
 
     def teardown_method(self):
         """Shutdown server and close client."""
-        self.client.close()
-        self.server.shutdown()
-        # Add a small delay to ensure the socket is fully released before the next test
-        time.sleep(0.5)
+        # Shutdown server first to stop accepting new requests
+        if hasattr(self, 'server') and self.server:
+            self.server.shutdown()
+        # Then close client to clean up connections
+        if hasattr(self, 'client') and self.client:
+            self.client.close()
+        # Wait longer to ensure all background threads exit completely
+        time.sleep(1.0)
 
     def run_sync_timeout_test(self):
         with pytest.raises(RPCTimeout) as exc_info:

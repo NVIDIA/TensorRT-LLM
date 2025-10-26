@@ -1,6 +1,7 @@
 import asyncio
 import concurrent.futures
 import threading
+import time
 import uuid
 from typing import Any, AsyncIterator, Dict, Optional
 
@@ -327,18 +328,23 @@ class RPCClient:
 
     def _start_response_reader_lazily(self):
         if self._reader_task is None or self._reader_task.done():
-            # Ensure we have a persistent background loop
-            self._ensure_event_loop()
-
-            # Wrapper to track the asyncio task
-            async def run_reader():
-                self._reader_asyncio_task = asyncio.current_task()
-                await self._response_reader()
-
-            # Start the reader task on the persistent loop
-            future = asyncio.run_coroutine_threadsafe(run_reader(), self._loop)
-            # Store the concurrent.futures.Future
-            self._reader_task = future
+            try:
+                # Ensure we have a persistent background loop
+                self._ensure_event_loop()
+                # Ensure the loop is running before creating tasks
+                if self._loop and self._loop.is_running():
+                    # Always create the reader task on the persistent loop
+                    future = asyncio.run_coroutine_threadsafe(
+                        self._response_reader(), self._loop)
+                    # Store the concurrent.futures.Future
+                    self._reader_task = future
+                else:
+                    logger_debug(
+                        "Event loop not running yet, deferring reader start")
+            except Exception as e:
+                logger_debug(f"Error starting response reader: {e}")
+                # Don't raise here, let it retry on next call
+                self._reader_task = None
 
     async def _call_async(self, method_name, *args, **kwargs):
         """Async version of RPC call.
@@ -416,8 +422,7 @@ class RPCClient:
             self._loop_thread.start()
 
             # Give the loop a moment to start
-            import time
-            time.sleep(0.1)
+            time.sleep(0.2)
 
     def _call_sync(self, method_name, *args, **kwargs):
         """Synchronous version of RPC call."""
