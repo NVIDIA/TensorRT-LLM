@@ -307,6 +307,7 @@ exclude = [
     "tensorrt_llm/_torch/attention_backend/flashinfer.py",
     "tensorrt_llm/_torch/attention_backend/interface.py",
     "tensorrt_llm/_torch/attention_backend/sparse/__init__.py",
+    "tensorrt_llm/_torch/attention_backend/sparse/dsa.py",
     "tensorrt_llm/_torch/attention_backend/sparse/kernel.py",
     "tensorrt_llm/_torch/attention_backend/sparse/rocket.py",
     "tensorrt_llm/_torch/attention_backend/sparse/utils.py",
@@ -326,6 +327,7 @@ exclude = [
     "tensorrt_llm/_torch/compilation/recover_pass.py",
     "tensorrt_llm/_torch/compilation/remove_copy_pass.py",
     "tensorrt_llm/_torch/compilation/utils.py",
+    "tensorrt_llm/_torch/configs/deepseek_v3.py",
     "tensorrt_llm/_torch/cublaslt_utils.py",
     "tensorrt_llm/_torch/custom_ops/__init__.py",
     "tensorrt_llm/_torch/custom_ops/cpp_custom_ops.py",
@@ -622,6 +624,7 @@ exclude = [
     "tensorrt_llm/functional.py",
     "tensorrt_llm/inputs/__init__.py",
     "tensorrt_llm/inputs/data.py",
+    "tensorrt_llm/inputs/evs.py",
     "tensorrt_llm/inputs/multimodal.py",
     "tensorrt_llm/inputs/registry.py",
     "tensorrt_llm/inputs/utils.py",
@@ -1013,7 +1016,10 @@ exclude = [
     "tests/scripts/iteration_log_parser.py",
     "tests/scripts/perf-sanity/parse_benchmark_results.py",
     "tests/scripts/perf-sanity/run_benchmark_serve.py",
+    "tests/unittest/_torch/attention/sparse/test_dsa_indexer.py",
+    "tests/unittest/_torch/attention/sparse/test_flash_mla.py",
     "tests/unittest/_torch/attention/sparse/test_rocketkv.py",
+    "tests/unittest/_torch/attention/sparse/test_sparse_mla_forward.py",
     "tests/unittest/_torch/attention/test_attention_mla.py",
     "tests/unittest/_torch/attention/test_attention_no_cache.py",
     "tests/unittest/_torch/attention/test_attention.py",
@@ -1080,8 +1086,10 @@ exclude = [
     "tests/unittest/_torch/multimodal/test_share_multiparams.py",
     "tests/unittest/_torch/pattern_watcher.py",
     "tests/unittest/_torch/ray_orchestrator/conftest.py",
+    "tests/unittest/_torch/ray_orchestrator/multi_gpu/test_executor.py",
     "tests/unittest/_torch/ray_orchestrator/multi_gpu/test_mapping.py",
     "tests/unittest/_torch/ray_orchestrator/multi_gpu/test_ops_ray.py",
+    "tests/unittest/_torch/ray_orchestrator/multi_gpu/test_ops.py",
     "tests/unittest/_torch/ray_orchestrator/multi_gpu/test_placement.py",
     "tests/unittest/_torch/ray_orchestrator/single_gpu/test_cache_transceiver_comm.py",
     "tests/unittest/_torch/sampler/test_beam_search.py",
@@ -1425,6 +1433,7 @@ exclude = [
     "triton_backend/tools/utils/utils.py",
     "triton_backend/tools/whisper/client.py"
 ]
+
 
 [tool.ruff.format]
 # Like Black, respect magic trailing commas.
