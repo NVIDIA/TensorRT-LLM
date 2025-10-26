@@ -106,10 +106,10 @@ def get_quantization_params_from_linear_node(linear_op: torch.fx.node.Node):
     return input_params, weight_params, output_params
 
 
-def extract_weight_node(mm_node: Node) -> int:
-    """Extracts the weight node from the given linear or BMM node. We assume torch.bmm(activation, weight)"""
+def extract_weight_node(node: Node) -> int:
+    """Extracts the weight node from the given parametrized node"""
 
-    def find_get_attr_node(node: Node) -> Node:
+    def find_get_attr_node(weight_node: Node) -> Node:
         """Recursively traverse inputs of allowed nodes to find a node with 'get_attr' op."""
         # If node is a get_attr node return node
         # List of nodes allowed in between a get_attr node and the matmul node
@@ -118,40 +118,47 @@ def extract_weight_node(mm_node: Node) -> int:
             torch.ops.aten.view.default,
         }
 
-        if node.op == "get_attr":
-            return node
+        if weight_node.op == "get_attr":
+            return weight_node
 
         # If node is not in the list of allowable ops then return None
-        if node.target not in allowed_ops:
+        if weight_node.target not in allowed_ops:
             return None
 
-        for input_node in node.all_input_nodes:
+        for input_node in weight_node.all_input_nodes:
             result = find_get_attr_node(input_node)
             if result:
                 return result
         return None
 
-    weight_node = mm_node.args[1]
+    if is_op(node, torch.ops.aten.bmm):
+        weight_node = node.args[1]
+    # for other parametrized nodes, we need to find the weight node
+    else:
+        weight_nodes = [n for n in node.args if isinstance(n, Node) and n.op == "get_attr"]
+        # can be two weights (if bias weight is present)
+        assert len(weight_nodes) >= 1, "Expected exactly one weight node in the parametrized node"
+        weight_node = weight_nodes[0]
     # for modelopt quantized graph, there will be a quantize_op
-    _, weight_params, _ = get_quantization_params_from_linear_node(mm_node)
+    _, weight_params, _ = get_quantization_params_from_linear_node(node)
     weight_node = weight_params.input_node if weight_params else weight_node
 
     return find_get_attr_node(weight_node)
 
 
-def num_users_of_weight_node(mm_node: Node) -> int:
-    """Returns the number of users of the weight node of the given matmul node."""
-    weight_node = extract_weight_node(mm_node)
+def num_users_of_weight_node(node: Node) -> int:
+    """Returns the number of users of the weight node of the given parametrized node."""
+    weight_node = extract_weight_node(node)
     return len(weight_node.users) if weight_node is not None else 0
 
 
-def extract_param_names_from_lin_node(mm_node: Node) -> Tuple[str, Optional[str]]:
-    """Extracts the name of the parameter associated with the given matmul node.
+def extract_param_names_from_node(node: Node) -> Tuple[str, Optional[str]]:
+    """Extracts the name of the parameter associated with the given parametrized node.
 
     Args:
-        mm_node: Matmul node in the graph.
+        node: node with weight parameters in the graph.
     """
-    weight_node = extract_weight_node(mm_node)
+    weight_node = extract_weight_node(node)
 
     assert weight_node, "Cannot identify weight parameter of linear node."
 
@@ -159,7 +166,14 @@ def extract_param_names_from_lin_node(mm_node: Node) -> Tuple[str, Optional[str]
     weight_name = weight_node.target
 
     # check for bias
-    bias_node = mm_node.args[2] if len(mm_node.args) > 2 else None
+    if is_op(node, torch.ops.aten.bmm):
+        bias_node = node.args[2] if len(node.args) > 2 else None
+    else:
+        weight_nodes = [n for n in node.args if isinstance(n, Node) and n.op == "get_attr"]
+        if len(weight_nodes) > 1:
+            bias_node = weight_nodes[1]
+        else:
+            bias_node = None
     assert bias_node is None or bias_node.op == "get_attr"
     bias_name = bias_node.target if bias_node is not None else None
 
@@ -386,12 +400,13 @@ def bfs(
             continue  # Skip the boundary node.
         if target(cur_node) and (include_root or depth > 0):
             return cur_node, depth
-        for next_node in getattr(cur_node, attr_next):
-            if boundary is not None and next_node == boundary:
-                continue  # Do not expand past the boundary.
-            if next_node not in visited:
-                visited.add(next_node)
-                queue_at_depth_next.append(next_node)
+        if hasattr(cur_node, attr_next):
+            for next_node in getattr(cur_node, attr_next):
+                if boundary is not None and next_node == boundary:
+                    continue  # Do not expand past the boundary.
+                if next_node not in visited:
+                    visited.add(next_node)
+                    queue_at_depth_next.append(next_node)
         if not queue_at_depth:
             queue_at_depth = queue_at_depth_next
             queue_at_depth_next = []
