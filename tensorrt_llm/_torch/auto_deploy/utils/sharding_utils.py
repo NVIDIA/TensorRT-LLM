@@ -6,7 +6,7 @@ import re
 from abc import ABC, abstractmethod
 from enum import Enum, IntEnum
 from functools import partial
-from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -339,7 +339,7 @@ def _insert_sharded_mamba(
     ##############################################################
     ####### shard the entry_node (the first linear layer) ########
     ##############################################################
-    _insert_sharded_matmul(
+    _shard_parameter_node(
         gm=gm,
         node=entry_node,
         dim=dim,
@@ -405,7 +405,7 @@ def _insert_sharded_mamba(
         )
 
 
-def _insert_sharded_matmul(
+def _shard_parameter_node(
     gm: GraphModule,
     node: Node,
     dim: int,
@@ -418,7 +418,7 @@ def _insert_sharded_matmul(
         Callable[[GraphModule, nn.Module, Node, str, torch.Size, int, int, int], None]
     ] = None,
 ) -> None:
-    """Replace the matmul node with a new matmul node that accepts sharded weights.
+    """Replace the node with parametrized weight tensor with a new node that accepts sharded weights.
 
     The state_dict is also updated to contain the sharded weights.
     """
@@ -487,10 +487,10 @@ def _insert_sharded_matmul(
             world_size=world_size,
         )
 
-    # column shard with no gather: the output is sharded
-    if not add_dist:
-        _validate_sharded_shapes(node, fused_weight_dims=fused_weight_dims, world_size=world_size)
-        return
+    # # # column shard with no gather: the output is sharded
+    # if not add_dist:
+    #     _validate_sharded_shapes(node, fused_weight_dims=fused_weight_dims, world_size=world_size)
+    #     return
 
     # figure out the right dist op
     dist_lookup = {
@@ -504,6 +504,14 @@ def _insert_sharded_matmul(
         dist_node = gm.graph.call_function(fn_dist, args=(node, *dist_args))
         node.replace_all_uses_with(dist_node)
         dist_node.replace_input_with(dist_node, node)
+
+
+def _update_node_args(node: Node, args: tuple) -> None:
+    """Update the node's arguments with the new sharded arguments."""
+    node.args = args
+    ad_logger.debug(
+        f"Updated node {node}: replaced original arguments {node.args} with sharded arguments {args}."
+    )
 
 
 class SplitDimension(IntEnum):
@@ -560,20 +568,17 @@ class LayerType(Enum):
     MOE = "moe"
 
 
-class TPShardingInfo(ShardingTransformInfo):
+class WeightShardingInfo(ShardingTransformInfo):
     """Configuration for TP sharding transformations."""
 
     split_dim: SplitDimension
     dist_op: Optional[Literal["all_reduce", "all_gather"]] = None
     min_local_shape: int = 1
-    layer_type: LayerType = LayerType.MLP
     # used for TP sharding of fused weights
-    # For MLP/Attention: list of dimensions for fused weights (e.g., [dim1, dim2] for QKV)
-    # For Mamba: dict mapping weight keys to their fused dimensions
-    fused_weight_dims: Optional[Union[list, Dict[str, list]]] = None
+    fused_weight_dims: Optional[list] = None
 
     @classmethod
-    def from_node(cls, node: Node, **kwargs) -> "TPShardingInfo":
+    def from_node(cls, node: Node, **kwargs) -> "WeightShardingInfo":
         """
         Create the correct TPShardingInfo subclass (FP8/FP4/base) based on `node`.
         """
@@ -600,30 +605,47 @@ class TPShardingInfo(ShardingTransformInfo):
     def apply(self, gm: GraphModule, node: Node) -> None:
         """Apply TP sharding transformation to the graph module."""
 
-        if self.layer_type == LayerType.MAMBA:
-            _insert_sharded_mamba(
-                gm=gm,
-                entry_node=node,
-                dim=self.split_dim.value,
-                rank=self.rank,
-                world_size=self.world_size,
-                add_dist=self.dist_op is not None,
-                min_local_shape=self.min_local_shape,
-                fused_weight_dims=self.fused_weight_dims
-                if isinstance(self.fused_weight_dims, dict)
-                else None,
-            )
-        else:
-            _insert_sharded_matmul(
-                gm=gm,
-                node=node,
-                dim=self.split_dim.value,
-                rank=self.rank,
-                world_size=self.world_size,
-                add_dist=self.dist_op is not None,
-                min_local_shape=self.min_local_shape,
-                fused_weight_dims=self.fused_weight_dims,
-            )
+        # if self.layer_type == LayerType.MAMBA:
+        #     _insert_sharded_mamba(
+        #         gm=gm,
+        #         entry_node=node,
+        #         dim=self.split_dim.value,
+        #         rank=self.rank,
+        #         world_size=self.world_size,
+        #         add_dist=self.dist_op is not None,
+        #         min_local_shape=self.min_local_shape,
+        #         fused_weight_dims=self.fused_weight_dims
+        #         if isinstance(self.fused_weight_dims, dict)
+        #         else None,
+        #     )
+        # else:
+        _shard_parameter_node(
+            gm=gm,
+            node=node,
+            dim=self.split_dim.value,
+            rank=self.rank,
+            world_size=self.world_size,
+            add_dist=self.dist_op is not None,
+            min_local_shape=self.min_local_shape,
+            fused_weight_dims=self.fused_weight_dims,
+        )
+
+
+class ParameterUpdateInfo(ShardingTransformInfo):
+    """Configuration for node args sharding transformations."""
+
+    target_node: str
+    rank: int
+    world_size: int
+    args: tuple
+
+    def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
+        """Validate the transformation configuration."""
+        return len(node.args) == len(self.args)
+
+    def apply(self, gm: GraphModule, node: Node) -> None:
+        """Apply the transformation to the graph module."""
+        _update_node_args(node, self.args)
 
 
 class QuantizationShardingMixin(ABC):
@@ -687,7 +709,7 @@ class QuantizationShardingMixin(ABC):
         )
 
 
-class FP8TPShardingInfo(QuantizationShardingMixin, TPShardingInfo):
+class FP8TPShardingInfo(QuantizationShardingMixin, WeightShardingInfo):
     """Tensor-parallel sharding for FP8-quantized linears."""
 
     def scale_names(self) -> List[str]:
@@ -722,7 +744,7 @@ class FP8TPShardingInfo(QuantizationShardingMixin, TPShardingInfo):
         return
 
     def apply(self, gm: GraphModule, node: Node) -> None:
-        _insert_sharded_matmul(
+        _shard_parameter_node(
             gm=gm,
             node=node,
             dim=self.split_dim.value,
@@ -747,7 +769,7 @@ def _shard_fp4_weight_scale(weight_scale, sharded_uint8_weight_shape, dim, rank,
     )
 
 
-class FP4TPShardingInfo(QuantizationShardingMixin, TPShardingInfo):
+class FP4TPShardingInfo(QuantizationShardingMixin, WeightShardingInfo):
     """Tensor-parallel sharding for FP4-quantized linears."""
 
     def scale_names(self) -> List[str]:
@@ -790,7 +812,7 @@ class FP4TPShardingInfo(QuantizationShardingMixin, TPShardingInfo):
             )
 
     def apply(self, gm: GraphModule, node: Node) -> None:
-        _insert_sharded_matmul(
+        _shard_parameter_node(
             gm=gm,
             node=node,
             dim=self.split_dim.value,
@@ -815,7 +837,7 @@ def _resolve_tp_cls_from_node(node: Node):
                 return cls
         except Exception:
             pass
-    return TPShardingInfo
+    return WeightShardingInfo
 
 
 class BMMShardingInfo(ShardingTransformInfo):
@@ -1177,7 +1199,8 @@ class ShardingConfig(BaseModel):
     use_sharding_from_factory: bool = False
     support_partial_config: bool = False
     sharding_dims: List[str] = Field(default_factory=list)
-    tp_transforms: List[TPShardingInfo] = Field(default_factory=list)
+    weight_sharding_transforms: List[WeightShardingInfo] = Field(default_factory=list)
+    parameter_update_transforms: List[ParameterUpdateInfo] = Field(default_factory=list)
     bmm_transforms: List[BMMShardingInfo] = Field(default_factory=list)
     ep_transforms: List[EPShardingInfo] = Field(default_factory=list)
 
