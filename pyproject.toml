@@ -32,6 +32,14 @@ remove_unused_variables = true
 [tool.ruff]
 line-length = 100 # Line length limit for code
 fix = true
+# Exclude 3rdparty and files to be formatted by isort, yapf, and autoflake.
+# Keep this list in sync with .pre-commit-config.yaml.
+# Progressively enable ruff on all the repo to keep individual changes reasonably-sized, and
+# keep merge conflicts manageable.
+# Since keeping both `yapf` and `ruff` makes no sense (given that their formatting philosophies
+# are quite different), we should move towards removing one in favor of the other. ruff's
+# formatting mirrors black's, and both are much more widely adopted than yapf. ruff is also
+# orders of magnitude faster, so we should move to deprecate `yapf`.
 exclude = [
     "**3rdparty/**",
     ".devcontainer/make_env.py",
