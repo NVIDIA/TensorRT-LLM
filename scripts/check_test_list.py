@@ -145,6 +145,10 @@ def verify_waive_list(llm_src, args):
         if line.startswith("full:"):
             line = line.split("/", 1)[1].lstrip("/")
 
+        # Skip unittests due to we don't need to have an entry in test-db yml
+        if line.startswith("unittest/"):
+            continue
+
         # Check waived cases also in l0_text.txt and qa_text.txt
         found_in_l0_qa = False
         if args.l0:
