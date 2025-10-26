@@ -56,6 +56,7 @@ def print_colored(message,
         bold_red="\x1b[31;1m",
         bold_green="\033[1;32m",
         green="\033[0;32m",
+        cyan="\033[0;36m",
     )
     reset = "\x1b[0m"
 
@@ -113,6 +114,7 @@ def logger_debug(message,
             location) > 50 else location
         print_colored(f"{timestamp} [{cur_dualname}]", "bold_green", writer)
         print_colored(f" {message}\n", color, writer)
+        writer.flush()
     else:
         # Fallback to logger.debug
         logger.debug(message)

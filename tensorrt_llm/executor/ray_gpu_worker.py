@@ -23,7 +23,7 @@ from .base_worker import BaseWorker
 from .postproc_worker import PostprocWorkerConfig
 from .request import GenerationRequest
 from .result import GenerationResult
-from .rpc_worker import RpcWorkerMixin
+from .rpc_worker_mixin import RpcWorkerMixin
 
 __all__ = [
     "RayGPUWorker",
