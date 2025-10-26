@@ -171,7 +171,7 @@ def test_llm_update_weights():
     hf_model = HFModel(llama_model_path)
 
     llm = LLM(model=llama_model_path,
-              worker_extension_cls="tensorrt_llm.rlhf_utils.WorkerExtension",
+              ray_worker_extension_cls="tensorrt_llm.rlhf_utils.WorkerExtension",
               tensor_parallel_size=1,
               pipeline_parallel_size=1,
               kv_cache_config=kv_cache_config)

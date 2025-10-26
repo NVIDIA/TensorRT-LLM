@@ -14,7 +14,7 @@ def test_llm_sleep(process_gpu_memory_info_available):
     llm = LLM(
         model=llama_model_path,
         enable_sleep=True,
-        worker_extension_cls="tensorrt_llm.rlhf_utils.WorkerExtension",
+        ray_worker_extension_cls="tensorrt_llm.rlhf_utils.WorkerExtension",
         cuda_graph_config=None,  # CUDA Graph unsupported yet
         kv_cache_config=kv_cache_config)
 
