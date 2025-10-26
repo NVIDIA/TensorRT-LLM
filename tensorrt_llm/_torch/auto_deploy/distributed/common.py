@@ -101,6 +101,10 @@ def is_torchelastic():
     return "TORCHELASTIC_RUN_ID" in os.environ
 
 
+def is_initialized():
+    return dist.is_initialized()
+
+
 def cleanup():
     """Destroy process group when the program exits."""
     if dist.is_initialized():

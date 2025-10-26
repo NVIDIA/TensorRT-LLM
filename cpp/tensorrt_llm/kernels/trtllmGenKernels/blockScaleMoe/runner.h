@@ -52,6 +52,13 @@ enum class RoutingMethodType : int64_t
     Unspecified = 5,
 };
 
+inline int32_t maybeGetMinTokenCount(int32_t numPaddedTokens, int32_t hiddenSize, int32_t dtypeSizeBits)
+{
+    // Pad so total size exceeds 128KiB for performance reasons
+    int32_t minNumTokensRequired = common::divUp(128 * 1024 * 8, hiddenSize * dtypeSizeBits);
+    return std::max(numPaddedTokens, minNumTokensRequired);
+}
+
 inline std::string serializeMoeRoutingMethodType(RoutingMethodType routingMethodType)
 {
     switch (routingMethodType)

@@ -14,8 +14,10 @@ from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
+from tensorrt_llm._utils import is_device_integrated
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy)
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
@@ -25,6 +27,7 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 
 from ..._utils import is_sm_100f
 from ...models.modeling_utils import QuantConfig
+from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..utils import Fp4QuantizedTensor
 
@@ -66,6 +69,15 @@ def load_weight_shard(
         tensor_parallel_mode: Optional[TensorParallelMode] = None,
         device: torch.device = torch.device('cpu'),
 ) -> torch.Tensor:
+    # Skip device transfers on integrated GPUs to conserve shared memory
+    if weight.device.type != device.type and is_device_integrated():
+        # For integrated GPU systems (e.g., DGX Spark), CPU and GPU share limited physical memory.
+        # Avoiding device transfers reduces memory consumption and unnecessary data copies,
+        # enabling support for larger models on memory-constrained systems.
+        logger.warning(
+            f"[load_weight_shard] Skipping device transfer from {weight.device} to {device} on integrated GPU to conserve shared memory."
+        )
+        device = weight.device
     if isinstance(weight, torch.Tensor):
         tensor_shape = weight.shape
 
@@ -794,10 +806,15 @@ class NVFP4LinearMethod(LinearMethodBase):
             output = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
                 act_fp4, module.weight, act_sf, module.weight_scale,
                 module.scalar_alpha, module.dtype)
+        elif IS_CUBLASLT_AVAILABLE and module.use_cublaslt_nvfp4_blockscaling_mm:
+            output = torch.ops.trtllm.nvfp4_gemm_cublaslt(
+                act_fp4, module.weight, act_sf, module.weight_scale,
+                module.alpha, module.dtype)
         else:
             output = torch.ops.trtllm.nvfp4_gemm(act_fp4, module.weight, act_sf,
                                                  module.weight_scale,
                                                  module.alpha, module.dtype)
+
         if bias is not None:
             output = output + bias
         return output
@@ -1822,6 +1839,7 @@ class Linear(nn.Module):
         force_dynamic_quantization: bool = False,
         use_cute_dsl_blockscaling_mm: bool = False,
         use_cute_dsl_nvfp4_blockscaling_mm: bool = False,
+        use_cublaslt_nvfp4_blockscaling_mm: bool = False,
         disable_deep_gemm: bool = False,
     ):
         from ..distributed import AllReduce
@@ -1841,6 +1859,7 @@ class Linear(nn.Module):
         self.force_dynamic_quantization = force_dynamic_quantization
         self.use_cute_dsl_blockscaling_mm = use_cute_dsl_blockscaling_mm
         self.use_cute_dsl_nvfp4_blockscaling_mm = use_cute_dsl_nvfp4_blockscaling_mm
+        self.use_cublaslt_nvfp4_blockscaling_mm = use_cublaslt_nvfp4_blockscaling_mm
         self.disable_deep_gemm = disable_deep_gemm
 
         local_in_features = in_features

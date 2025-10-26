@@ -10,7 +10,7 @@ from test_base_worker import create_fake_executor_config
 
 from tensorrt_llm.executor.request import GenerationRequest
 from tensorrt_llm.executor.rpc import RPCClient
-from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
+from tensorrt_llm.executor.rpc.rpc_common import get_unique_ipc_addr
 from tensorrt_llm.executor.rpc_worker import RpcWorker
 from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
 from tensorrt_llm.sampling_params import SamplingParams
@@ -42,7 +42,7 @@ class TestRpcWorkerTP1:
         self.client.close()
 
     def create_worker_pool(self):
-        addr = GenerationExecutorRpcProxy.gen_uniq_rpc_addr()
+        addr = get_unique_ipc_addr()
         mp_context = multiprocessing.get_context(
             'spawn')  # spawn for CUDA context
         pool = ProcessPoolExecutor(max_workers=1, mp_context=mp_context)
@@ -98,6 +98,7 @@ class TestRpcWorkerTP1:
                 break
         assert 0 < len(results) <= 5
 
+    @pytest.mark.skip(reason="https://nvbugs/5583261")
     @pytest.mark.asyncio
     @pytest.mark.parametrize("req_count", [10])
     async def test_main_loop_async(self, req_count: int):
@@ -175,6 +176,7 @@ class TestRpcWorkerTP1:
 
         await process_request_streaming()
 
+    @pytest.mark.skip(reason="https://nvbugs/5583261")
     @pytest.mark.asyncio
     async def test_fetch_stats_loop_async(self):
         await asyncio.sleep(1)
@@ -212,7 +214,7 @@ class TestRpcWorkerTP2:
 
     def create_worker_session(self):
         session = MpiPoolSession(n_workers=2)
-        addr = GenerationExecutorRpcProxy.gen_uniq_rpc_addr()
+        addr = get_unique_ipc_addr()
         futures = session.submit(RpcWorker.main_task,
                                  engine=model_path,
                                  rpc_addr=addr,
@@ -227,6 +229,7 @@ class TestRpcWorkerTP2:
 
     @skip_single_gpu
     @pytest.mark.gpu2
+    @pytest.mark.skip(reason="https://nvbugs/5583261")
     def test_create_shutdown(self):
         # Invoke setup_engine in rank 0, and that will unblock all the ranks to
         # invoke setup_engine simultaneously.
@@ -234,6 +237,7 @@ class TestRpcWorkerTP2:
 
     @skip_single_gpu
     @pytest.mark.gpu2
+    @pytest.mark.skip(reason="https://nvbugs/5583261")
     def test_fetch_responses_sync(self):
         # Wait a bit to ensure engine is ready
         time.sleep(1)

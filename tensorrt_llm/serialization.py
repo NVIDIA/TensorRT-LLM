@@ -50,17 +50,12 @@ BASE_EXAMPLE_CLASSES = {
     "tensorrt_llm._torch.models.modeling_siglip": ["SiglipVisionModel"],
     "tensorrt_llm._torch.models.modeling_vila": ["VilaModel"],
     "tensorrt_llm._torch.models.modeling_gpt_oss": ["GptOssForCausalLM"],
-    ### ending import of torch models classes
     "tensorrt_llm._torch.pyexecutor.config": ["PyTorchConfig", "LoadFormat"],
     "tensorrt_llm._torch.pyexecutor.llm_request":
     ["LogitsStorage", "PyResult", "LlmResult", "LlmResponse", "LogProbStorage"],
     "tensorrt_llm._torch.speculative.mtp": ["MTPConfig"],
     "tensorrt_llm._torch.speculative.interface": ["SpeculativeDecodingMode"],
-    "tensorrt_llm._torch.pyexecutor.config": ["PyTorchConfig", "LoadFormat"],
-    "tensorrt_llm.auto_parallel.config": ["AutoParallelConfig", "CostModel"],
-    "tensorrt_llm.auto_parallel.cluster_info":
-    ["ClusterInfo", "MathThroughput"],
-    "tensorrt_llm._torch.pyexecutor.config": ["PyTorchConfig", "LoadFormat"],
+    ### ending import of torch models classes
     "tensorrt_llm.bindings.executor": [
         "BatchingType", "CacheTransceiverConfig", "CapacitySchedulerPolicy",
         "ContextPhaseParams", "ContextChunkingPolicy", "DynamicBatchConfig",
@@ -70,8 +65,6 @@ BASE_EXAMPLE_CLASSES = {
         "KvCacheRetentionConfig.TokenRangeRetentionConfig", "PeftCacheConfig",
         "SchedulerConfig"
     ],
-    "tensorrt_llm._torch.pyexecutor.config": ["PyTorchConfig"],
-    "tensorrt_llm._torch.model_config": ["MoeLoadBalancerConfig"],
     "tensorrt_llm.builder": ["BuildConfig"],
     "tensorrt_llm.disaggregated_params": ["DisaggregatedParams"],
     "tensorrt_llm.inputs.multimodal": ["MultimodalInput"],

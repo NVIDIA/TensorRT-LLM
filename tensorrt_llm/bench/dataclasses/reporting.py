@@ -336,10 +336,10 @@ class ReportUtility:
 
         # World and runtime info
         stats_dict["world_info"] = {
-            "tp_size": self.rt_cfg.world_config.tp_size,
-            "pp_size": self.rt_cfg.world_config.pp_size,
-            "ep_size": self.rt_cfg.world_config.ep_size,
-            "world_size": self.rt_cfg.world_config.world_size,
+            "tp_size": self.rt_cfg.mapping["tp_size"],
+            "pp_size": self.rt_cfg.mapping["pp_size"],
+            "ep_size": self.rt_cfg.mapping["moe_ep_size"],
+            "world_size": self.rt_cfg.mapping["world_size"],
             "max_batch_size": self.rt_cfg.settings_config.max_batch_size,
             "max_num_tokens": self.rt_cfg.settings_config.max_num_tokens,
             "scheduling_policy": self.rt_cfg.settings_config.scheduler_policy,
@@ -380,7 +380,7 @@ class ReportUtility:
             self.per_user_output_throughput_tok_s,
             # Output throughput per GPU (total throughput / world size)
             "output_throughput_per_gpu_tok_s":
-            self.output_throughput_tok_s / self.rt_cfg.world_config.world_size,
+            self.output_throughput_tok_s / self.rt_cfg.mapping["world_size"],
             # Request latency percentiles
             "request_latency_percentiles_ms":
             self.statistics.request_latency_percentiles.model_dump(

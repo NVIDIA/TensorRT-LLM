@@ -176,6 +176,12 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::optional<torch::Tensor> con
     int32_t max_num_padded_tokens
         = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::getMaxPermutedPaddedCount(
             args.num_tokens, top_k, num_experts, tile_tokens_dim);
+    int32_t max_num_padded_tokens_gemm1
+        = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::maybeGetMinTokenCount(
+            max_num_padded_tokens, args.intermediate_size, btg::dtypeGetNumBits(args.mDtypeElt));
+    int32_t max_num_padded_tokens_gemm2
+        = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::maybeGetMinTokenCount(
+            max_num_padded_tokens, args.hidden_size, btg::dtypeGetNumBits(args.mDtypeOut));
     at::Tensor total_num_padded_tokens
         = at::empty({}, at::TensorOptions().device(routing_device).dtype(at::ScalarType::Int));
     at::Tensor expanded_idx_to_permuted_idx
@@ -192,16 +198,16 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::optional<torch::Tensor> con
         = at::detail::empty_cuda({size_of_expert_count_histogram}, at::ScalarType::Int, routing_device, std::nullopt);
 
     // allocate workspace for activation/gemm/finalize kernels
-    at::Tensor gemm1_output = at::detail::empty_cuda(
-        {max_num_padded_tokens, 2 * intermediate_size}, at::ScalarType::Float8_e4m3fn, routing_device, std::nullopt);
-    at::Tensor gemm1_output_scale = at::detail::empty_cuda(
-        {2 * intermediate_size / 128, max_num_padded_tokens}, at::ScalarType::Float, routing_device, std::nullopt);
+    at::Tensor gemm1_output = at::detail::empty_cuda({max_num_padded_tokens_gemm1, 2 * intermediate_size},
+        at::ScalarType::Float8_e4m3fn, routing_device, std::nullopt);
+    at::Tensor gemm1_output_scale = at::detail::empty_cuda({2 * intermediate_size / 128, max_num_padded_tokens_gemm1},
+        at::ScalarType::Float, routing_device, std::nullopt);
     at::Tensor activation_output = at::detail::empty_cuda(
-        {max_num_padded_tokens, intermediate_size}, at::ScalarType::Float8_e4m3fn, routing_device, std::nullopt);
+        {max_num_padded_tokens_gemm2, intermediate_size}, at::ScalarType::Float8_e4m3fn, routing_device, std::nullopt);
     at::Tensor activation_output_scale = at::detail::empty_cuda(
-        {intermediate_size / 128, max_num_padded_tokens}, at::ScalarType::Float, routing_device, std::nullopt);
+        {intermediate_size / 128, max_num_padded_tokens_gemm2}, at::ScalarType::Float, routing_device, std::nullopt);
     at::Tensor gemm2_output = at::detail::empty_cuda(
-        {max_num_padded_tokens, args.hidden_size}, at::ScalarType::BFloat16, routing_device, std::nullopt);
+        {max_num_padded_tokens_gemm2, args.hidden_size}, at::ScalarType::BFloat16, routing_device, std::nullopt);
 
     int32_t max_num_ctas = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::getMaxNumCtasInBatchDim(
         args.num_tokens, args.top_k, args.num_experts, tile_tokens_dim);
