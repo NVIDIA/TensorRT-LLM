@@ -7,24 +7,45 @@ task_with_command=("$@")
 # the performance of the main process.
 spawn_extra_main_process=${TLLM_SPAWN_EXTRA_MAIN_PROCESS:-1}
 
-native_mpi_rank=$OMPI_COMM_WORLD_RANK
-mpi_rank=${SLURM_PROCID:-${OMPI_COMM_WORLD_RANK:-${PMI_RANK:-${PMI_ID:-0}}}}
+function get_mpi_rank {
+    # Try different environment variables in order of preference
+    if [ -n "$SLURM_PROCID" ]; then
+        echo "$SLURM_PROCID"
+    elif [ -n "$OMPI_COMM_WORLD_RANK" ]; then
+        echo "$OMPI_COMM_WORLD_RANK"
+    elif [ -n "$PMIX_RANK" ]; then
+        echo "$PMIX_RANK"
+    elif [ -n "$PMI_RANK" ]; then
+        echo "$PMI_RANK"
+    elif [ -n "$PMI_ID" ]; then
+        echo "$PMI_ID"
+    elif [ -n "$RANK" ]; then
+        echo "$RANK"
+    else
+        echo "0"
+    fi
+}
 
-log_stderr() { echo -e "\033[33m$@\033[0m" >&2; }
-log_stderr "mpi_rank: $mpi_rank"
 
-# Tell TRTLLM to use the MPI Comm Session.
-export TLLM_SPAWN_PROXY_PROCESS=1
-
-function mpi_world_size {
+function get_mpi_world_size {
+    # Try different environment variables in order of preference
     if [ -n "$SLURM_NTASKS" ]; then
         echo "$SLURM_NTASKS"
     elif [ -n "$OMPI_COMM_WORLD_SIZE" ]; then
         echo "$OMPI_COMM_WORLD_SIZE"
+    elif [ -n "$OMPI_APP_CTX_NUM_PROCS" ]; then
+        echo "$OMPI_APP_CTX_NUM_PROCS"
+    elif [ -n "$WORLD_SIZE" ]; then
+        echo "$WORLD_SIZE"
     else
         echo "1"
     fi
 }
+
+readonly mpi_rank=$(get_mpi_rank)
+readonly mpi_world_size=$(get_mpi_world_size)
+log_stderr() { echo -e "\033[33m$@\033[0m" >&2; }
+log_stderr "mpi_rank [$mpi_rank] of world_size [$mpi_world_size]"
 
 function export_free_tcp_addr_for_spawn_proxy_process {
     # find free port starting from 10012
@@ -48,6 +69,9 @@ print(port); s.close()')
 # This will optimize the LLM frontend performance, which is critical for the
 # streaming generation performance when throughput is high.
 function run_with_spawn_extra_main_process {
+    # Tell TRTLLM to use the MPI Comm Session when spawning extra main process.
+    export TLLM_SPAWN_PROXY_PROCESS=1
+
     log_stderr "Rank${mpi_rank} run with spawn extra main process"
 
     if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
@@ -104,7 +128,7 @@ function run_with_spawn_extra_main_process {
         subshell_pid=$!
         log_stderr "Rank${mpi_rank} Subshell PID: $subshell_pid"
 
-        log_stderr "Rank${mpi_rank} run mgmn leader node with mpi_world_size: $(mpi_world_size) ..."
+        log_stderr "Rank${mpi_rank} run mgmn leader node with mpi_world_size: $mpi_world_size ..."
         log_stderr "Rank0 host: $HOSTNAME"
         python3 -m tensorrt_llm.llmapi.mgmn_leader_node
         mgmn_leader_node_exit_code=$?
@@ -126,7 +150,7 @@ function run_with_spawn_extra_main_process {
         # Turn off "exit on error" so the following lines always run
         set +e
 
-        log_stderr "Rank${mpi_rank} run mgmn worker node with mpi_world_size: $(mpi_world_size) ..."
+        log_stderr "Rank${mpi_rank} run mgmn worker node with mpi_world_size: $mpi_world_size ..."
         python3 -m tensorrt_llm.llmapi.mgmn_worker_node
         mgmn_worker_node_exit_code=$?
         log_stderr "Rank${mpi_rank} MGMN worker node exit code: $mgmn_worker_node_exit_code"
@@ -138,6 +162,10 @@ function run_with_spawn_extra_main_process {
 # Run both the LLM frontend and Worker0 task in the main process.
 # NOTE, this method is not recommended for high-throughput streaming generation.
 function run_without_spawn_extra_main_process {
+    # Do NOT use MPI Comm Session when not spawning extra main process.
+    # This allows the Python code to use MpiPoolSession instead.
+    export TLLM_SPAWN_PROXY_PROCESS=0
+
     log_stderr "Rank${mpi_rank} run without spawn extra main process"
 
     if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
@@ -153,8 +181,6 @@ function run_without_spawn_extra_main_process {
 
 
 # main logic ==
-export tllm_mpi_size=$(mpi_world_size)
-log_stderr "tllm_mpi_size: $tllm_mpi_size"
 
 if [ "$spawn_extra_main_process" -eq 1 ]; then
     run_with_spawn_extra_main_process
