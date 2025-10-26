@@ -79,7 +79,7 @@ transforms:
     simple_shard_only: false
     use_sharding_from_factory: false
     support_partial_config: false
-    sharding_dims: ['tp', 'ep', 'bmm']
+    sharding_dims: ['ep', 'bmm', 'ssm', 'tp']
     requires_shape_prop: true
   # TODO: (hg) need to ensure run_shape_prop after sharding.
   sharding_transform_executor:

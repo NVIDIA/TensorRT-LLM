@@ -17,7 +17,7 @@ from ..models.factory import ShardingConfigSource
 from ..utils.logger import ad_logger
 from .node_utils import (
     bfs,
-    extract_param_names_from_lin_node,
+    extract_param_names_from_node,
     is_linear_op,
     is_op,
     num_users_of_weight_node,
@@ -171,10 +171,10 @@ def shard_weight_tensor(
     # Handle fused weights
     if fused_weight_dims is not None:
         # Split fused weights, apply TP sharding to each, then concatenate back
-        sharded_weight = torch.cat(
-            [split_tensor(w) for w in torch.split(weight_tensor, fused_weight_dims, dim=dim)],
-            dim=dim,
-        )
+        # sharded_weight = torch.cat(
+        #     [split_tensor(w) for w in torch.split(weight_tensor, fused_weight_dims, dim=dim)],
+        #     dim=dim,
+        # )
 
         # Create a function that applies the same logic for loading
         def split_fused_tensor(
@@ -189,9 +189,10 @@ def shard_weight_tensor(
 
         f_split = split_fused_tensor
     else:
-        sharded_weight = split_tensor(weight_tensor)
+        # sharded_weight = split_tensor(weight_tensor)
         f_split = split_tensor
 
+    sharded_weight = f_split(weight_tensor)
     sharded_shape = sharded_weight.shape
 
     # Register load hook
@@ -330,7 +331,7 @@ def _insert_sharded_mamba(
     # Extract entry node's fused_weight_dims by matching weight name against patterns
     entry_fused_dims = None
     if fused_weight_dims:
-        entry_weight_key, _ = extract_param_names_from_lin_node(entry_node)
+        entry_weight_key, _ = extract_param_names_from_node(entry_node)
         for pattern, dims in fused_weight_dims.items():
             if re.search(pattern, entry_weight_key):
                 entry_fused_dims = dims
@@ -432,7 +433,7 @@ def _shard_parameter_node(
         )
         return
     # get weight and bias key
-    weight_key, bias_key = extract_param_names_from_lin_node(node)
+    weight_key, bias_key = extract_param_names_from_node(node)
 
     modname = weight_key.rpartition(".")[0]
     submod = gm.get_submodule(modname)
@@ -488,9 +489,9 @@ def _shard_parameter_node(
         )
 
     # # # column shard with no gather: the output is sharded
-    # if not add_dist:
-    #     _validate_sharded_shapes(node, fused_weight_dims=fused_weight_dims, world_size=world_size)
-    #     return
+    if not add_dist:
+        _validate_sharded_shapes(node, fused_weight_dims=fused_weight_dims, world_size=world_size)
+        return
 
     # figure out the right dist op
     dist_lookup = {
@@ -1204,6 +1205,15 @@ class ShardingConfig(BaseModel):
     bmm_transforms: List[BMMShardingInfo] = Field(default_factory=list)
     ep_transforms: List[EPShardingInfo] = Field(default_factory=list)
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._transform_list_dict = {
+            WeightShardingInfo: self.weight_sharding_transforms,
+            BMMShardingInfo: self.bmm_transforms,
+            EPShardingInfo: self.ep_transforms,
+            ParameterUpdateInfo: self.parameter_update_transforms,
+        }
+
     @model_validator(mode="after")
     def _validate_and_normalize(self):
         # Normalize empty dict to None for "no config"
@@ -1213,6 +1223,18 @@ class ShardingConfig(BaseModel):
         if self.predefined_config is not None:
             self.validate_config()
         return self
+
+    def add(self, transform: ShardingTransformInfo) -> bool:
+        """Append a TP transform only if that node was
+        not sharded before. Do not overwrite existing transforms.
+        """
+        # try to add to appropriate transformation list
+        transform_list = self._transform_list_dict[type(transform)]
+        for existing_transform in transform_list:
+            if existing_transform.target_node == transform.target_node:
+                return False
+        transform_list.append(transform)
+        return True
 
     def validate_config(self) -> bool:
         if self.factory_source != ShardingConfigSource.HUGGINGFACE:
