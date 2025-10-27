@@ -2327,7 +2327,7 @@ std::optional<KVCacheBlock::IdType> BlockManager::notThreadSafeStoreBlocksForReu
         {
             auto cacheBlockIds = sequence.getCacheBlockIds(windowSize);
             std::tie(numBlocksStoredForReuse, lastStoredId)
-                = manager.storeBlocks(matchedPromptNodes, cacheBlockIds[beamIdx]);
+                = manager.storeBlocks(matchedPromptNodes, cacheBlockIds[beamIdx], pinBlocks);
         }
     }
     return lastStoredId;
