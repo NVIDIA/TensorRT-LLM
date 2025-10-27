@@ -35,14 +35,17 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
         if self.sparse_attention_config is None:
             raise ValueError("Sparse attention config is not set")
         self.prompt_budget = self.sparse_attention_config.prompt_budget
-        self.kt_cache_block_offsets = torch.empty(
-            [
+
+        capture_graph = torch.cuda.is_current_stream_capturing()
+        self.kt_cache_block_offsets = self.get_empty(
+            self.cuda_graph_buffers, [
                 self.max_num_sequences,
                 self.kv_cache_manager.max_kt_blocks_per_seq
             ],
             dtype=torch.int32,
-            device='cuda',
-        )
+            cache_name="kt_cache_block_offsets",
+            capture_graph=capture_graph)
+
         self.host_kt_cache_block_offsets = torch.zeros_like(
             self.kt_cache_block_offsets,
             device='cpu',
