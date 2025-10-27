@@ -6,6 +6,7 @@ import socket
 import tempfile
 import time
 import weakref
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, List, Literal, Optional, Sequence, Union
 
@@ -17,6 +18,8 @@ from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.inputs.data import TextPrompt
 from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams
 from tensorrt_llm.inputs.registry import DefaultInputProcessor
+from tensorrt_llm.llmapi import tracing
+from tensorrt_llm.metrics.enums import MetricNames
 
 from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
@@ -230,6 +233,15 @@ class BaseLLM:
                 self.mpi_session.shutdown()
             raise
 
+        try:
+            if self.args.otlp_traces_endpoint:
+                tracing.init_tracer("trt.llm", self.args.otlp_traces_endpoint)
+                logger.info(
+                    f"Initialized OTLP tracer successfully, endpoint: {self.args.otlp_traces_endpoint}"
+                )
+        except Exception as e:
+            logger.error(f"Failed to initialize OTLP tracer: {e}")
+
         exception_handler.register(self, 'shutdown')
         atexit.register(LLM._shutdown_wrapper, weakref.ref(self))
 
@@ -338,6 +350,7 @@ class BaseLLM:
         streaming: bool = False,
         kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
         disaggregated_params: Optional[DisaggregatedParams] = None,
+        trace_headers: Optional[Mapping[str, str]] = None,
         _postproc_params: Optional[PostprocParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
         cache_salt: Optional[str] = None,
@@ -354,6 +367,7 @@ class BaseLLM:
             streaming (bool): Whether to use the streaming mode for the generation. Defaults to False.
             kv_cache_retention_config (tensorrt_llm.bindings.executor.KvCacheRetentionConfig, optional): Configuration for the request's retention in the KV Cache. Defaults to None.
             disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Disaggregated parameters. Defaults to None.
+            trace_headers (Mapping[str, str], optional): Trace headers. Defaults to None.
             scheduling_params (tensorrt_llm.scheduling_params.SchedulingParams, optional): Scheduling parameters. Defaults to None.
             cache_salt (str, optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.
         Returns:
@@ -486,12 +500,17 @@ class BaseLLM:
             streaming=streaming,
             kv_cache_retention_config=kv_cache_retention_config,
             disaggregated_params=disaggregated_params,
+            trace_headers=trace_headers,
             postproc_params=_postproc_params,
             multimodal_params=multimodal_params,
             scheduling_params=scheduling_params,
             cache_salt_id=cache_salt_id,
             arrival_time=arrival_time,
         )
+
+        if sampling_params.return_perf_metrics:
+            result.metrics_dict.update(
+                {MetricNames.ARRIVAL_TIMESTAMP: time.time()})
 
         return RequestOutput._from_generation_result(result, prompt,
                                                      self.tokenizer)
@@ -1034,8 +1053,10 @@ class _TorchLLM(BaseLLM):
         # Multimodal special handling:
         # 1. Default load_tokenizer may fail because MM has different tokenizer configuration. Hence we initialize it inside input processor
         # 2. May need to modify model weights for MM (e.g., resize vocab embedding). We must do such operation via input processor's __init__
+        checkpoint_format = getattr(self.args, "checkpoint_format", None)
         self.input_processor = create_input_processor(self._hf_model_dir,
-                                                      self.tokenizer)
+                                                      self.tokenizer,
+                                                      checkpoint_format)
         self._tokenizer = self.input_processor.tokenizer
 
         # TODO: revisit gather_context_logits

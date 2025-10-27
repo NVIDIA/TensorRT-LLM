@@ -115,7 +115,7 @@ TEST_F(CacheTransBufferTest, TestPreAllocBufferSize)
         tensorrt_llm::executor::CacheTransceiverConfig cacheTransceiverConfig{
             tensorrt_llm::executor::CacheTransceiverConfig::BackendType::UCX, maxNumTokens};
         size_t bufferSizeBytes = CacheTransBufferManager::preAllocBufferSize(
-            tokensPerBlock, cacheSizeBytesPerTokenPerWindow, cacheTransceiverConfig);
+            cacheSizeBytesPerTokenPerWindow, tokensPerBlock, cacheTransceiverConfig);
         auto bufferId = mTransBufferManager->assignBufferIndexForSend();
         EXPECT_TRUE(bufferId.has_value());
         EXPECT_EQ(bufferId.value(), 0);
@@ -157,7 +157,7 @@ TEST_F(CacheTransBufferTest, TestPreAllocBufferSize2)
         std::map<SizeType32, SizeType32> cacheSizeBytesPerTokenPerWindow{
             {maxBlocksPerSeq * tokensPerBlock, cacheSizeBytesPerToken}};
         size_t bufferSizeBytes = CacheTransBufferManager::preAllocBufferSize(
-            tokensPerBlock, cacheSizeBytesPerTokenPerWindow, cacheTransceiverConfig);
+            cacheSizeBytesPerTokenPerWindow, tokensPerBlock, cacheTransceiverConfig);
         auto bufferId = mTransBufferManager->assignBufferIndexForSend();
         EXPECT_TRUE(bufferId.has_value());
         EXPECT_EQ(bufferId.value(), 0);
