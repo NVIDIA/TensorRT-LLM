@@ -217,6 +217,7 @@ class CutlassMoEOp(MoEOp):
             min_latency_mode,
             self.gemm_tactics,
             unpadded_hidden_size,
+            tuner_num_tokens,
         )
 
         # Return output based on latency mode
