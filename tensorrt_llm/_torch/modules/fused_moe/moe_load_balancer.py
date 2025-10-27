@@ -957,6 +957,7 @@ class MoeLoadBalancer:
 
 moe_model_arch_list = [
     'DeepseekV3ForCausalLM',
+    'GptOssForCausalLM',
     'MixtralForCausalLM',
     'Llama4ForConditionalGeneration',
     'Qwen2MoeForCausalLM',

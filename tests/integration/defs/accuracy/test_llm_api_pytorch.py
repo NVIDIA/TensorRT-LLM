@@ -1617,14 +1617,15 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_device_not_contain(["GB200"])
+    @parametrize_with_ids("moe_backend", ["WIDEEP"])
     @parametrize_with_ids("mtp_nextn", [0, 2])
-    def test_bfloat16_4gpus_online_eplb(self, mtp_nextn):
+    def test_bfloat16_4gpus_online_eplb(self, moe_backend, mtp_nextn):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
         num_slots = 80
         eplb_config = MoeLoadBalancerConfig(num_slots=num_slots,
                                             layer_updates_per_iter=2)
         pytorch_config = dict(cuda_graph_config=CudaGraphConfig(),
-                              moe_config=MoeConfig(backend="WIDEEP",
+                              moe_config=MoeConfig(backend=moe_backend,
                                                    load_balancer=eplb_config))
         mtp_config = None
         if mtp_nextn > 0:
@@ -1641,14 +1642,15 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_device_not_contain(["GB200"])
+    @parametrize_with_ids("moe_backend", ["WIDEEP", "TRTLLM"])
     @parametrize_with_ids("fp8kv", [True, False])
-    def test_nvfp4_4gpus_online_eplb(self, fp8kv):
+    def test_nvfp4_4gpus_online_eplb(self, moe_backend, fp8kv):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
         num_slots = 80
         eplb_config = MoeLoadBalancerConfig(num_slots=num_slots,
                                             layer_updates_per_iter=2)
         pytorch_config = dict(cuda_graph_config=CudaGraphConfig(),
-                              moe_config=MoeConfig(backend="WIDEEP",
+                              moe_config=MoeConfig(backend=moe_backend,
                                                    load_balancer=eplb_config))
         if fp8kv:
             kv_cache_config.dtype = "fp8"
@@ -3915,7 +3917,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             chat_template_kwargs = dict(reasoning_effort="medium")
             extra_evaluator_kwargs = {
                 **self.extra_evaluator_kwargs, "chat_template_kwargs":
-                chat_template_kwargs
+                    chat_template_kwargs
             }
 
             sampling_params = SamplingParams(
@@ -3928,6 +3930,42 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           sampling_params=sampling_params,
                           extra_evaluator_kwargs=extra_evaluator_kwargs)
 
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_device_not_contain(["GB200"])
+    @pytest.mark.parametrize(
+        "kv_cache_dtype",
+        ["auto", pytest.param("fp8", marks=skip_pre_blackwell)])
+    def test_w4_4gpus_online_eplb(self, kv_cache_dtype, mocker):
+        """Test GPTOSS with online expert parallel load balancer using TRTLLM backend and attention DP."""
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
+                          {"scores_filter": "exact_match,flexible-extract"})
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
+                                        dtype=kv_cache_dtype)
+
+        # Configure online expert parallel load balancer
+        num_slots = 144
+        eplb_config = MoeLoadBalancerConfig(num_slots=num_slots,
+                                            layer_updates_per_iter=2)
+
+        pytorch_config = dict(disable_overlap_scheduler=False,
+                              cuda_graph_config=CudaGraphConfig(),
+                              moe_config=MoeConfig(backend="TRTLLM",
+                                                   load_balancer=eplb_config))
+
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=4,
+                 pipeline_parallel_size=1,
+                 moe_expert_parallel_size=4,
+                 kv_cache_config=kv_cache_config,
+                 enable_attention_dp=True,
+                 **pytorch_config) as llm:
+            model_name = "GPT-OSS/120B-MXFP4"
+            task = GSM8K(model_name)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
 @skip_pre_hopper
 class TestEXAONE4(LlmapiAccuracyTestHarness):

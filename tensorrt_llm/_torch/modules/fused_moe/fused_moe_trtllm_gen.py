@@ -13,6 +13,7 @@ from tensorrt_llm.logger import logger
 from ...custom_ops.trtllm_gen_custom_ops import \
     fp4_block_scale_fake_output_without_finalize
 from ...distributed import allgather
+from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
 from ...utils import AuxStreamType, Fp4QuantizedTensor, ceil_div
 from .interface import AlltoallMethodType, MoE, MoEWeightLoadingMode
@@ -347,6 +348,34 @@ class TRTLLMGenFusedMoE(MoE):
             token_selected_experts = token_selected_experts.to(torch.int32)
             if token_final_scales is not None:
                 token_final_scales = token_final_scales.to(torch.bfloat16)
+
+            # Apply load balancer routing if available
+            if self.layer_load_balancer:
+                # Determine if this is first/last call (TRTLLMGenFusedMoE doesn't use chunking)
+                is_first_call = self.repeat_idx == 0
+                is_last_call = self.repeat_idx == self.repeat_count - 1
+
+                # Start GPU stage for first call
+                self._load_balancer_start_wait_gpu_stage(is_first_call)
+                self._load_balancer_done_wait_gpu_stage(is_first_call)
+
+                # Update load balancer statistics (TRTLLMGenFusedMoE doesn't use MNNVL)
+                self._load_balancer_update_statistic(token_selected_experts,
+                                                     is_first_call,
+                                                     is_last_call,
+                                                     use_mnnvl=False)
+
+                # Route tokens to slots
+                token_selected_slots = self._load_balancer_route(
+                    token_selected_experts, self.use_dp)
+
+                # Update expert statistics
+                ExpertStatistic.set_layer(self.layer_idx)
+                ExpertStatistic.maybe_add_info(self.num_slots,
+                                               token_selected_slots)
+
+                # Use routed slots for subsequent processing
+                token_selected_experts = token_selected_slots
 
             x, x_sf, x_row, x_col = self._quantize_for_post_quant_comm(x)
 
@@ -763,10 +792,21 @@ class TRTLLMGenFusedMoE(MoE):
             use_dp_padding=use_dp_padding,
         )
 
+        # Handle load balancer CPU stage if needed
+        if self.layer_load_balancer:
+            is_last_call = self.repeat_idx == self.repeat_count - 1
+            self._load_balancer_start_set_cpu_stage(is_last_call)
+            self._load_balancer_done_set_cpu_stage(is_last_call)
+
         if use_dp_padding:
             rank = self.mapping.tp_rank
             final_hidden_states = final_hidden_states[:
                                                       all_rank_num_tokens[rank]]
+
+        # Update repeat index for load balancer
+        if self.layer_load_balancer:
+            self.repeat_idx = 0 if self.repeat_idx == self.repeat_count - 1 else self.repeat_idx + 1
+
         return final_hidden_states
 
     def forward_fake(

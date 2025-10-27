@@ -14,8 +14,6 @@ from ...model_config import ModelConfig
 from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from .deep_ep_utils import buffer_pool, deep_ep_installed
 from .interface import AlltoallMethodType, MoE
-from .moe_load_balancer import get_moe_load_balancer
-from .interface import MoE
 from .ops import MoEOp, MoEOpSelector
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
                            DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
@@ -935,12 +933,6 @@ class WideEPMoE(MoE):
     def _supports_load_balancer(self) -> bool:
         """WideEPMoE supports load balancer."""
         return True
-
-    def _get_load_balancer_aux_stream(self) -> Optional[torch.cuda.Stream]:
-        """Get auxiliary stream for load balancer from aux_stream_dict."""
-        if self.aux_stream_dict is not None:
-            return self.aux_stream_dict.get(AuxStreamType.MoeBalancer)
-        return None
 
     def load_weights(self, weights: List[Dict]):
         assert self._weights_created

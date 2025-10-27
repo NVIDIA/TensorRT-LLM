@@ -300,10 +300,12 @@ class MoE(nn.Module):
         return False
 
     def _get_load_balancer_aux_stream(self) -> Optional[torch.cuda.Stream]:
-        """Get auxiliary stream for load balancer.
+        """Get auxiliary stream for load balancer from aux_stream_dict.
 
-        Subclasses can override this to provide the appropriate stream.
+        Returns the MoeBalancer stream from aux_stream_dict if available.
         """
+        if self.aux_stream_dict is not None:
+            return self.aux_stream_dict.get(AuxStreamType.MoeBalancer)
         return None
 
     def _load_balancer_start_wait_gpu_stage(self, is_first_call: bool):
