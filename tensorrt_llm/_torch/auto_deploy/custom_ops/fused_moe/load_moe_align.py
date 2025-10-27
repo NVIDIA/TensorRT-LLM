@@ -93,3 +93,71 @@ def moe_align_block_size(
     moe_align_ext.moe_align_block_size(
         topk_ids, num_experts, block_size, sorted_token_ids, expert_ids, num_tokens_post_pad
     )
+
+
+def moe_align_cutedsl(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    sorted_token_ids: torch.Tensor,
+    sorted_weights: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    num_tokens_post_pad: torch.Tensor,
+):
+    """
+    Wrapper for the CuTeDSL-optimized moe_align_cutedsl CUDA function.
+
+    Sorts tokens by expert and outputs token IDs, sorted weights, and cu_seqlens
+    directly for use with CuTeDSL's grouped GEMM API.
+
+    Args:
+        topk_ids: Tensor of shape [M, top_k] with expert indices (flattened)
+        topk_weights: Tensor of shape [M, top_k] with routing weights (flattened)
+        num_experts: Total number of experts
+        top_k: Number of experts per token
+        sorted_token_ids: Output tensor [capacity] for token IDs sorted by expert
+        sorted_weights: Output tensor [capacity] for weights sorted by expert
+        cu_seqlens: Output tensor [num_experts + 1] for cumulative sequence lengths
+        num_tokens_post_pad: Output scalar tensor [1] for total valid tokens
+    """
+    # Basic validation
+    if not topk_ids.is_cuda:
+        raise ValueError("topk_ids must be a CUDA tensor")
+    if not topk_weights.is_cuda:
+        raise ValueError("topk_weights must be a CUDA tensor")
+    if topk_ids.shape != topk_weights.shape:
+        raise ValueError("topk_ids and topk_weights must have the same shape")
+
+    if not topk_ids.is_contiguous():
+        topk_ids = topk_ids.contiguous()
+    if not topk_weights.is_contiguous():
+        topk_weights = topk_weights.contiguous()
+
+    for t, name in [
+        (sorted_token_ids, "sorted_token_ids"),
+        (cu_seqlens, "cu_seqlens"),
+        (num_tokens_post_pad, "num_tokens_post_pad"),
+    ]:
+        if not t.is_cuda:
+            raise ValueError(f"{name} must be a CUDA tensor")
+        if not t.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+        if t.dtype != torch.int32:
+            raise TypeError(f"{name} must be int32 tensor")
+
+    if not sorted_weights.is_cuda or not sorted_weights.is_contiguous():
+        raise ValueError("sorted_weights must be a contiguous CUDA tensor")
+    if sorted_weights.dtype != topk_weights.dtype:
+        raise TypeError("sorted_weights must have same dtype as topk_weights")
+
+    moe_align_ext.moe_align_cutedsl(
+        topk_ids,
+        topk_weights,
+        num_experts,
+        top_k,
+        sorted_token_ids,
+        sorted_weights,
+        cu_seqlens,
+        num_tokens_post_pad,
+    )

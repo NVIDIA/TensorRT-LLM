@@ -20,31 +20,20 @@ def _pack_routed_tokens(
     *,
     num_experts: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    """Group token/expert assignments by expert id and build CuTeDSL offsets."""
+    """
+    Group token/expert assignments by expert id and build CuTeDSL offsets.
 
-    if topk_ids.numel() == 0:
-        device = topk_ids.device
-        return (
-            torch.empty(0, dtype=torch.int64, device=device),
-            torch.empty(0, dtype=topk_weights.dtype, device=device),
-            torch.zeros(num_experts + 1, dtype=torch.int32, device=device),
-            0,
-        )
+    Uses fast CUDA kernel (moe_align_cutedsl) for efficient sorting and direct
+    output of token IDs, sorted weights, and cu_seqlens.
+
+    Returns the maximum buffer size (not actual count) for CUDA graph compatibility.
+    The actual valid range is encoded in cu_seqlens.
+    """
+    from ..fused_moe.load_moe_align import moe_align_cutedsl
 
     device = topk_ids.device
-    tokens, top_k = topk_ids.shape
 
-    token_indices = torch.arange(tokens, device=device, dtype=torch.int64).repeat_interleave(top_k)
-    expert_ids = topk_ids.reshape(-1).to(torch.int64)
-    weights = topk_weights.reshape(-1)
-
-    valid = (expert_ids >= 0) & (expert_ids < num_experts)
-    if not bool(torch.all(valid)):
-        expert_ids = expert_ids[valid]
-        token_indices = token_indices[valid]
-        weights = weights[valid]
-
-    if expert_ids.numel() == 0:
+    if topk_ids.numel() == 0:
         return (
             torch.empty(0, dtype=torch.int64, device=device),
             torch.empty(0, dtype=topk_weights.dtype, device=device),
@@ -52,18 +41,37 @@ def _pack_routed_tokens(
             0,
         )
 
-    sort_idx = torch.argsort(expert_ids, stable=True)
-    expert_sorted = expert_ids[sort_idx]
-    tokens_sorted = token_indices[sort_idx]
-    weights_sorted = weights[sort_idx]
+    tokens, top_k = topk_ids.shape
+    T = tokens * top_k
 
-    counts = torch.bincount(expert_sorted, minlength=num_experts)
-    cu_seqlens = torch.zeros(num_experts + 1, dtype=torch.int32, device=device)
-    if counts.numel() != 0:
-        cu_seqlens[1:] = torch.cumsum(counts.to(torch.int32), dim=0)
+    # Allocate output buffers (full size, no dynamic slicing)
+    sorted_token_ids = torch.empty((T,), dtype=torch.int32, device=device)
+    sorted_weights = torch.empty((T,), dtype=topk_weights.dtype, device=device)
+    cu_seqlens = torch.empty((num_experts + 1,), dtype=torch.int32, device=device)
+    num_tokens_post_pad = torch.empty((1,), dtype=torch.int32, device=device)
 
-    total_pairs = int(cu_seqlens[-1].item())
-    return tokens_sorted, weights_sorted, cu_seqlens, total_pairs
+    # Flatten inputs
+    topk_ids_flat = topk_ids.reshape(-1).contiguous()
+    topk_weights_flat = topk_weights.reshape(-1).contiguous()
+
+    # Call optimized CUDA kernel - outputs everything we need!
+    moe_align_cutedsl(
+        topk_ids_flat,
+        topk_weights_flat,
+        num_experts,
+        top_k,
+        sorted_token_ids,
+        sorted_weights,
+        cu_seqlens,
+        num_tokens_post_pad,
+    )
+
+    # Convert sorted_token_ids from int32 to int64 for indexing
+    sorted_token_ids = sorted_token_ids.to(torch.int64)
+
+    # Return T (full buffer size) - cu_seqlens defines actual valid ranges
+    # This avoids any dynamic operations for CUDA graph compatibility
+    return sorted_token_ids, sorted_weights, cu_seqlens, T
 
 
 def fused_mlp_relu2_unquantized(
@@ -95,6 +103,10 @@ def fused_mlp_relu2_unquantized(
     tokens_sorted, weights_sorted, cu_seqlens, total_pairs = _pack_routed_tokens(
         topk_ids, topk_weights, num_experts=num_experts
     )
+
+    # CUDA graph safe: use full buffers (no dynamic slicing)
+    # Padding entries have token_id=0 and weight=0 (set by kernel)
+    # cu_seqlens defines valid data ranges for CuTeDSL GEMMs
     if total_pairs == 0:
         return torch.zeros_like(hidden_states)
 
@@ -127,6 +139,7 @@ def fused_mlp_relu2_unquantized(
         expert_outputs.mul_(weights_sorted.unsqueeze(1))
 
     final = torch.zeros((tokens, hidden_size), device=device, dtype=dtype)
+    # Padding entries (if any) have weight=0, so adding them has no effect
     final.index_add_(0, tokens_sorted, expert_outputs)
     return final.view_as(hidden_states)
 
