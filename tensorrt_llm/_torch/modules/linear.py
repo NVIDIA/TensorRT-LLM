@@ -14,8 +14,10 @@ from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
+from tensorrt_llm._utils import is_device_integrated
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy)
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
@@ -67,6 +69,15 @@ def load_weight_shard(
         tensor_parallel_mode: Optional[TensorParallelMode] = None,
         device: torch.device = torch.device('cpu'),
 ) -> torch.Tensor:
+    # Skip device transfers on integrated GPUs to conserve shared memory
+    if weight.device.type != device.type and is_device_integrated():
+        # For integrated GPU systems (e.g., DGX Spark), CPU and GPU share limited physical memory.
+        # Avoiding device transfers reduces memory consumption and unnecessary data copies,
+        # enabling support for larger models on memory-constrained systems.
+        logger.warning(
+            f"[load_weight_shard] Skipping device transfer from {weight.device} to {device} on integrated GPU to conserve shared memory."
+        )
+        device = weight.device
     if isinstance(weight, torch.Tensor):
         tensor_shape = weight.shape
 

@@ -225,9 +225,9 @@ def test_get_num_tokens_per_video(model_key, multimodal_model_configs):
         for video_idx, test_video in enumerate(example_videos):
 
             # Get test video dimensions
-            test_video = load_video(test_video, num_frames=8, format="pil")
-            # load_video returns a list of frames, we only have one video
-            video_width, video_height = test_video[0].size
+            video_data = load_video(test_video, num_frames=8, format="pil")
+            # load_video returns VideoData with frames and metadata
+            video_width, video_height = video_data.frames[0].size
 
             # Get actual embedding tensor for this image
             actual_embedding = SharedTensorContainer.from_dict(
@@ -240,10 +240,10 @@ def test_get_num_tokens_per_video(model_key, multimodal_model_configs):
             # Get predicted number of tokens using get_num_tokens_per_video
             if model_type == 'llava_next':
                 predicted_num_tokens = input_processor.get_num_tokens_per_video(
-                    video=test_video)
+                    video=video_data.frames)
             elif model_type == 'qwen2_5_vl':
                 predicted_num_tokens = input_processor.get_num_tokens_per_video(
-                    video=test_video)
+                    video=video_data.frames)
 
             # The key assertion: predicted should match actual
             assert predicted_num_tokens == actual_num_tokens, \

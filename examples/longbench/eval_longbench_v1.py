@@ -23,7 +23,8 @@ from transformers import AutoTokenizer
 
 # Add tensorrt_llm imports
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import KvCacheConfig, RocketSparseAttentionConfig
+from tensorrt_llm.llmapi import (CudaGraphConfig, KvCacheConfig, MoeConfig,
+                                 RocketSparseAttentionConfig)
 from tensorrt_llm.logger import logger
 
 LONGBENCH_DATASETS = ["narrativeqa", "qasper", "multifieldqa_en", "multifieldqa_zh", "hotpotqa", "2wikimqa", "musique", \
@@ -118,10 +119,20 @@ def parse_arguments() -> argparse.Namespace:
         type=int,
         default=133120,
         help='Maximum total tokens across all sequences in a batch')
-    parser.add_argument('--tensor_parallel_size',
-                        type=int,
-                        default=1,
-                        help='Tensor parallel size')
+
+    # Parallelism
+    parser.add_argument('--moe_backend',
+                        type=str,
+                        default='CUTLASS',
+                        choices=[
+                            'CUTLASS', 'TRTLLM', 'VANILLA', 'WIDEEP',
+                            'DEEPGEMM', 'CUTEDSL', 'TRITON'
+                        ])
+    parser.add_argument('--tp_size', type=int, default=1)
+    parser.add_argument('--moe_ep_size', type=int, default=-1)
+    parser.add_argument('--enable_attention_dp',
+                        default=False,
+                        action='store_true')
 
     # RocketKV configuration
     parser.add_argument('--rocket_sparse',
@@ -153,6 +164,20 @@ def parse_arguments() -> argparse.Namespace:
                         type=float,
                         default=0.7,
                         help='Fraction of GPU memory for KV cache')
+
+    # Runtime
+    parser.add_argument('--print_iter_log',
+                        default=False,
+                        action='store_true',
+                        help='Print iteration logs during execution')
+    parser.add_argument('--use_cuda_graph', default=False, action='store_true')
+    parser.add_argument('--cuda_graph_padding_enabled',
+                        default=False,
+                        action='store_true')
+    parser.add_argument('--cuda_graph_batch_sizes',
+                        nargs='+',
+                        type=int,
+                        default=None)
 
     # Evaluation parameters
     parser.add_argument('--num_samples',
@@ -292,9 +317,18 @@ def initialize_llm(args: argparse.Namespace) -> Tuple[LLM, AutoTokenizer]:
     try:
         # Configure KV cache
         kv_cache_config = KvCacheConfig(
-            enable_block_reuse=False,  # RocketKV doesn't support KV cache reuse
+            # sparse attention doesn't support KV cache reuse
+            enable_block_reuse=False,
+            free_gpu_memory_fraction=args.kv_cache_fraction,
         )
 
+        # Configure CUDA graph
+        cuda_graph_config = CudaGraphConfig(
+            batch_sizes=args.cuda_graph_batch_sizes,
+            enable_padding=args.cuda_graph_padding_enabled,
+        ) if args.use_cuda_graph else None
+
+        # Configure sparse attention
         if args.rocket_sparse:
             # Configure RocketKV sparse attention
             sparse_attention_config = RocketSparseAttentionConfig(
@@ -316,11 +350,15 @@ def initialize_llm(args: argparse.Namespace) -> Tuple[LLM, AutoTokenizer]:
             max_batch_size=args.max_batch_size,
             attn_backend=args.attention_backend,
             sparse_attention_config=sparse_attention_config,
-            tensor_parallel_size=args.tensor_parallel_size,
+            tensor_parallel_size=args.tp_size,
+            moe_expert_parallel_size=args.moe_ep_size,
+            enable_attention_dp=args.enable_attention_dp,
             max_seq_len=args.max_seq_len,
             max_num_tokens=args.max_num_tokens,
-            cuda_graph_config=None,
+            cuda_graph_config=cuda_graph_config,
             torch_compile_config=None,
+            print_iter_log=args.print_iter_log,
+            moe_config=MoeConfig(backend=args.moe_backend),
         )
 
         # Initialize tokenizer
