@@ -117,93 +117,6 @@ class PerfMetricType(str, Enum):
     DISAGG_SERVER_TTFT = "DISAGG_SERVER_TTFT"
 
 
-class PerfScriptTestCmds(NamedTuple):
-    convert_cmd: List[str]
-    build_cmd: List[str]
-    data_cmds: List[List[str]]
-    benchmark_cmds: List[List[str]]
-    mpi_cmd: List[str]
-    is_python: bool
-
-    def run_cmd(self, cmd_idx: int, venv) -> str:
-        output = ""
-        mpi_cmd = self.mpi_cmd
-        build_cmd_str = self.get_cmd_str(0)
-        current_cmd_str = self.get_cmd_str(cmd_idx)
-        if cmd_idx == 0:
-            if self.build_cmd[0].endswith('.py'):
-                print_info(
-                    f'Running engine building command: "{build_cmd_str}"')
-                if len(mpi_cmd) > 0:
-                    output += venv_mpi_check_output(venv, mpi_cmd,
-                                                    self.build_cmd)
-                else:
-                    output += venv.run_cmd(self.build_cmd, caller=check_output)
-            else:
-                envs = copy.deepcopy(os.environ)
-                if len(self.convert_cmd) > 0:
-                    convert_cmd_str = " ".join(self.convert_cmd)
-                    convert_cmds = convert_cmd_str.split(';')
-                    for convert_cmd in convert_cmds:
-                        print_info(
-                            f'Running convert weights command: "{convert_cmd}"')
-                        output += subprocess.check_output(convert_cmd.split(),
-                                                          env=envs).decode()
-                print_info(
-                    f'Running engine building command: "{build_cmd_str}"')
-                command = self.build_cmd
-                output += subprocess.check_output(command, env=envs).decode()
-        else:
-            print_info(f'Engine building command was: "{build_cmd_str}"')
-
-            if len(self.data_cmds) >= cmd_idx:
-                prepare_cmd = self.data_cmds[cmd_idx - 1]
-                prepare_cmd_str = " ".join(prepare_cmd)
-                envs = copy.deepcopy(os.environ)
-                prepare_cmds = prepare_cmd_str.split(';')
-                for cmd in prepare_cmds:
-                    print(f'Now running prepare data command: "{cmd}"')
-                    output += subprocess.check_output(cmd.split(),
-                                                      env=envs).decode()
-
-            print(f'Now running benchmarking command: "{current_cmd_str}"')
-            command = self.benchmark_cmds[cmd_idx - 1]
-            if self.is_python:
-                if len(mpi_cmd) > 0:
-                    output += venv_mpi_check_output(venv, mpi_cmd, command)
-                else:
-                    output += venv.run_cmd(command, caller=check_output)
-            else:
-                envs = copy.deepcopy(os.environ)
-                # Set LD_LIBRARY_PATH to the directory where the binary is located to find libtensorrt_llm.so and
-                # libnvinfer_plugin_tensorrt_llm.so.x.
-                envs[
-                    "LD_LIBRARY_PATH"] = f'{get_trt_llm_lib_dir(venv)}:{os.path.dirname(command[0])}:{envs.get("LD_LIBRARY_PATH", "")}'
-                print(
-                    f'Augmented cpp runtime LD_LIBRARY_PATH={envs["LD_LIBRARY_PATH"]}'
-                )
-                benchmark_cmd = mpi_cmd + command
-                output += subprocess.check_output(benchmark_cmd,
-                                                  env=envs).decode()
-        return output
-
-    def get_cmd_str(self, cmd_idx) -> List[str]:
-        mpi_cmd_str = (" ".join(self.mpi_cmd) +
-                       " ") if len(self.mpi_cmd) > 0 else ""
-
-        if cmd_idx == 0:
-            if self.build_cmd[0].endswith('.py'):
-                cmd_str = mpi_cmd_str + "python3 " + " ".join(self.build_cmd)
-            else:
-                cmd_str = mpi_cmd_str + "  " + " ".join(self.build_cmd)
-        else:
-            python_str = "python3 " if self.is_python else ""
-            cmd_str = mpi_cmd_str + python_str + " ".join(
-                self.benchmark_cmds[cmd_idx - 1])
-
-        return cmd_str
-
-
 @contextlib.contextmanager
 def temp_wd(path):
     """A context manager to temporarily change the working directory."""
@@ -453,7 +366,7 @@ class AbstractPerfScriptTestClass(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def get_commands(self) -> PerfScriptTestCmds:
+    def get_commands(self) -> PerfBenchScriptTestCmds:
         """
         Get the commands to run the test. Should return an PerfScriptTestCmds instance.
         """
@@ -549,7 +462,6 @@ class AbstractPerfScriptTestClass(abc.ABC):
                                 buf), self._gpu_clock_lock, tmpDir:
                             output = commands.run_cmd(cmd_idx, venv)
                             # Print the output log to buf.
-                            # if not is_prepare_dataset_cmd:
                             print(collect_and_clean_myelin_time(output))
                     else:
                         with contextlib.redirect_stdout(buf), tmpDir:
@@ -559,7 +471,12 @@ class AbstractPerfScriptTestClass(abc.ABC):
                             print(collect_and_clean_myelin_time(output))
 
                     # Print the output log to stdout and cache it.
-                    if not is_prepare_dataset_cmd:
+                    if is_prepare_dataset_cmd:
+                        # For prepare_dataset commands, only print the prepare command info
+                        for line in buf.getvalue().split('\n'):
+                            if 'Now running prepare data command' in line:
+                                print(line)
+                    else:
                         print(buf.getvalue())
                     outputs[cmd_idx] = buf.getvalue()
             else:
@@ -633,13 +550,19 @@ class AbstractPerfScriptTestClass(abc.ABC):
             gpu_idx = gpu_prop.get("index", self._gpu_clock_lock.get_gpu_id())
         # Remove the prefix, which includes the platform info, for network_hash.
         short_test_name = full_test_name.split("::")[-1]
+        # Get device subtype for autodeploy tests
+        device_subtype = None
+        if self._gpu_clock_lock:
+            device_subtype = self._gpu_clock_lock.get_device_subtype()
+
         test_description_dict = {
             "network_name": self.get_test_name(),
             "network_hash":
             short_test_name,  # This is used by the PerfDB to identify a test.
             "sm_clk": gpu_clocks.get("gpu_clock__MHz", None),
             "mem_clk": gpu_clocks.get("memory_clock__MHz", None),
-            "gpu_idx": gpu_idx
+            "gpu_idx": gpu_idx,
+            "device_subtype": device_subtype
         }
 
         # Serialize the commands.

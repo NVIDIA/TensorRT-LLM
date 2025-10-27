@@ -20,6 +20,7 @@
 
 #include "tensorrt_llm/batch_manager/contextProgress.h"
 #include "tensorrt_llm/batch_manager/dataTransceiver.h"
+#include "tensorrt_llm/batch_manager/kvCacheEventManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheUtils.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -44,13 +45,41 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager
 BlockRange getBlockRangeForSending(
     BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest, BlockKey const& lastBlockKey, int32_t indexFromEnd)
 {
-    constexpr SizeType32 beam{0};
     auto poolNum = cacheManager->getBlockManager().getNumPools();
     if (poolNum > 1 || !cacheManager->isEnableBlockReuse() || lastBlockKey.uniqueTokens.size() == 0)
     {
-        auto blockRange = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId, beam);
+        // disable reuse path, and vwsa don't support reuse.
+        bool needSendAllForWindow = common::getEnvKVCacheTransferAllBlocksForWindow();
+
+        auto blockRange = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId);
+        // auto inputLen = llmRequest.getPromptLen();
+
+        auto const& windowsMetadata = cacheManager->getBlockManager().getWindowSizesMetadata();
+
+        if ((windowsMetadata.size() == 1 || needSendAllForWindow))
+        {
+            return blockRange;
+        }
+        auto const& blockIdsPerWindow = blockRange.getBlockIdsPerWindow();
+
+        for (auto const& [windowSize, metadata] : windowsMetadata)
+        {
+            auto windowStartBlockIdx = needSendAllForWindow
+                ? 0
+                : static_cast<SizeType32>(blockIdsPerWindow.at(windowSize).size())
+                    - (windowSize / cacheManager->getBlockManager().getTokensPerBlock() + 1);
+            // TODO: promptLen to get the startBlockIdx
+            SizeType32 startBlockIdx = std::max(0, windowStartBlockIdx);
+            TLLM_LOG_DEBUG("getBlockRangeForSending windowSize: %d, startBlockIdx: %d  windowStartBlockIdx: %d",
+                windowSize, startBlockIdx, windowStartBlockIdx);
+            blockRange.setBlockIdsForWindow(windowSize,
+                std::vector<SizeType32>(
+                    blockIdsPerWindow.at(windowSize).begin() + startBlockIdx, blockIdsPerWindow.at(windowSize).end()));
+        }
+
         return blockRange;
     }
+
     TLLM_CHECK_WITH_INFO(lastBlockKey.uniqueTokens.size() > 0, "lastBlockKey must be non-empty when reuse is enabled");
     return BlockRange::fromReuseTree(*cacheManager, lastBlockKey, indexFromEnd);
 }
@@ -62,9 +91,9 @@ BlockRange getBlockRangeForReceiving(
     if (poolNum == 1 && srcEnableBlockReuse)
     {
         // Build from all block ids, then slice off the reused blocks so we only transfer newly allocated ones.
-        constexpr SizeType32 beam{0};
-        auto range = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId, beam);
-        auto const& allBlockIds = range.getBlockIds();
+        auto windowSize = cacheManager->getBlockManager().getWindowSizesMetadata().begin()->first;
+        auto range = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId);
+        auto const& allBlockIds = range.getBlockIdsPerWindow().at(windowSize);
         auto const totalBlocks = static_cast<SizeType32>(allBlockIds.size());
         // Derive reused blocks count from number of unique prepopulated tokens
         auto const tokensPerBlock = cacheManager->getBlockManager().getTokensPerBlock();
@@ -87,14 +116,29 @@ BlockRange getBlockRangeForReceiving(
                 newBlockIds.push_back(allBlockIds[usedBlocks - 1]);
             }
         }
-        range.setBlockIds(std::move(newBlockIds));
+        range.setBlockIdsForWindow(windowSize, std::move(newBlockIds));
         return range;
     }
-    else
+
+    auto const& windowsMetadata = cacheManager->getBlockManager().getWindowSizesMetadata();
+    if (windowsMetadata.size() == 1 || common::getEnvKVCacheTransferAllBlocksForWindow())
     {
-        constexpr SizeType32 beam{0};
-        return BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId, beam);
+
+        return BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId);
     }
+    auto blockRange = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId);
+
+    for (auto const& [windowSize, metadata] : windowsMetadata)
+    {
+        auto const& blockIdsPerWindow = blockRange.getBlockIdsPerWindow();
+        auto windowStartBlockIdx = static_cast<SizeType32>(blockIdsPerWindow.at(windowSize).size())
+            - (windowSize / cacheManager->getBlockManager().getTokensPerBlock() + 1);
+        SizeType32 startBlockIdx = std::max(0, windowStartBlockIdx);
+        blockRange.setBlockIdsForWindow(windowSize,
+            std::vector<SizeType32>(
+                blockIdsPerWindow.at(windowSize).begin() + startBlockIdx, blockIdsPerWindow.at(windowSize).end()));
+    }
+    return blockRange;
 }
 
 bool CacheFormatter::needSendCache(
@@ -223,20 +267,24 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
             {
                 progress->wait(layerIdx);
             }
-            blockRange.updatePoolIdx(poolIdx);
-            for (auto it = blockRange.begin(); it != blockRange.end(); ++it)
+            auto const& windowSizes = blockRange.getWindowSizes();
+            for (auto const& windowSize : windowSizes)
             {
-                // Block dim: [1, numLayersInPool, ...], offset = {0, layerIndexInPool}
-                auto layer = runtime::ITensor::slice(it, offset, 1);
-                if (offset.d[1] == 0)
+                auto blockRangeForWindow = blockRange.getBlockRangeForWindow(windowSize);
+                for (auto it = blockRangeForWindow.begin(); it != blockRangeForWindow.end(); ++it)
                 {
-                    TLLM_LOG_DEBUG("Block %p of pool %d shape = %s", it->data(), poolIdx,
-                        runtime::ITensor::toString(it->getShape()).c_str());
-                }
-                for (size_t i = 0; i < connections.size(); i++)
-                {
-                    TLLM_LOG_DEBUG("Send layer %d(%d-%d)", layerIdx, poolIdx, layerIdxInPool);
-                    session.send(i, layer->data(), layer->getSizeInBytes());
+                    // Block dim: [1, numLayersInPool, ...], offset = {0, layerIndexInPool}
+                    auto layer = runtime::ITensor::slice(it, offset, 1);
+                    if (offset.d[1] == 0)
+                    {
+                        TLLM_LOG_DEBUG("Block %p of pool %d shape = %s", it->data(), poolIdx,
+                            runtime::ITensor::toString(it->getShape()).c_str());
+                    }
+                    for (size_t i = 0; i < connections.size(); i++)
+                    {
+                        TLLM_LOG_DEBUG("Send layer %d(%d-%d)", layerIdx, poolIdx, layerIdxInPool);
+                        session.send(i, layer->data(), layer->getSizeInBytes());
+                    }
                 }
             }
         }
@@ -246,33 +294,29 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         int blockNum = 0;
 
         size_t allCacheBlockSize = 0;
-        // gather cache blocks of the request.
+        auto const& windowSizes = blockRange.getWindowSizes();
+        TLLM_LOG_DEBUG(
+            mpi::MpiComm::world().getRank(), " blockRange.getWindowSizes(); windowSizes size: %d", windowSizes.size());
+        TLLM_CHECK_WITH_INFO(
+            static_cast<int>(windowSizes.size()) == numPools, "window sizes should be the same as numPools");
+
         std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>> inputKvCacheBlocksPerWindow;
-        for (auto poolIdx = 0; poolIdx < numPools; poolIdx++)
+
+        for (auto const& windowSize : windowSizes)
         {
-            if (numPools > 1)
+            auto blockRangeForWindow = blockRange.getBlockRangeForWindow(windowSize);
+            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " format  windowSize: %d blockRangeForWindow size: %d",
+                windowSize, blockRangeForWindow.size());
+            inputKvCacheBlocksPerWindow.emplace(windowSize, std::vector<runtime::ITensor::SharedPtr>());
+            for (auto it = blockRangeForWindow.begin(); it != blockRangeForWindow.end(); ++it)
             {
-                blockRange.updatePoolIdx(poolIdx);
-            }
-            SizeType32 window = mCacheManager->getBlockManager().getPoolWindowSize(poolIdx);
-            TLLM_CHECK_WITH_INFO(inputKvCacheBlocksPerWindow.find(window) == inputKvCacheBlocksPerWindow.end(),
-                "window size already exists, which is not supported");
-            inputKvCacheBlocksPerWindow.emplace(window, std::vector<runtime::ITensor::SharedPtr>());
-            auto maxBlockThisWindow = window / selfConfig.getModelConfig().mTokensPerBlock;
-            // only block in window will be sent.
-            SizeType32 blockNumThisWindow = 0;
-            for (auto it = blockRange.begin(); it != blockRange.end(); ++it)
-            {
-                blockNum++;
-                inputKvCacheBlocksPerWindow.at(window).push_back(it);
+                inputKvCacheBlocksPerWindow.at(windowSize).push_back(it);
                 allCacheBlockSize += it->getSize();
-                blockNumThisWindow++;
-                if (blockNumThisWindow >= maxBlockThisWindow)
-                {
-                    break;
-                }
+                blockNum++;
             }
         }
+        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "inputKvCacheBlocks size: %ld,blockNum: %d , windowSizes: %ld",
+            inputKvCacheBlocksPerWindow.size(), blockNum, windowSizes.size());
 
         if (inputKvCacheBlocksPerWindow.size() > 1)
         {
@@ -523,30 +567,25 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
     // TODO(oargov): are we sure the other side has the same number of pools? this might not hold for pp_size>1...
     size_t blockNum = 0;
     size_t cacheBlockSizeSum = 0;
-    for (auto poolIdx = 0; poolIdx < numPools; poolIdx++)
+
+    auto windowSizes = blockRange.getWindowSizes();
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " unformat windowSizes size: %d", windowSizes.size());
+    for (auto const& windowSize : windowSizes)
     {
-        if (numPools > 1)
+        auto blockRangeForWindow = blockRange.getBlockRangeForWindow(windowSize);
+        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "  unformat windowSize: %d blockRangeForWindow size: %d",
+            windowSize, blockRangeForWindow.size());
+        outputBuffersPerWindow.emplace(windowSize, std::vector<runtime::ITensor::SharedPtr>());
+
+        for (auto it = blockRangeForWindow.begin(); it != blockRangeForWindow.end(); ++it)
         {
-            blockRange.updatePoolIdx(poolIdx);
-        }
-        SizeType32 window = mCacheManager->getBlockManager().getPoolWindowSize(poolIdx);
-        TLLM_CHECK_WITH_INFO(outputBuffersPerWindow.find(window) == outputBuffersPerWindow.end(),
-            "window size already exists, which is not supported");
-        outputBuffersPerWindow.emplace(window, std::vector<runtime::ITensor::SharedPtr>());
-        auto maxBlockThisWindow = window / selfConfig.getModelConfig().mTokensPerBlock;
-        SizeType32 blockNumThisWindow = 0;
-        for (auto it = blockRange.begin(); it != blockRange.end(); ++it)
-        {
-            blockNum++;
-            blockNumThisWindow++;
-            outputBuffersPerWindow.at(window).push_back(it);
+            outputBuffersPerWindow.at(windowSize).push_back(it);
             cacheBlockSizeSum += it->getSize();
-            if (blockNumThisWindow >= maxBlockThisWindow)
-            {
-                break;
-            }
+            blockNum++;
         }
     }
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "outputBuffersPerWindow size: %ld,blockNum: %d , windowSizes: %ld",
+        outputBuffersPerWindow.size(), blockNum, windowSizes.size());
     TLLM_CHECK(!outputBuffersPerWindow.empty());
     if (outputBuffersPerWindow.size() > 1)
     {
@@ -591,8 +630,10 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                 auto const poolIdx = 0;
                 auto const layerIdxInPool = layerIdx;
                 int idx = 0;
-                blockRange.updatePoolIdx(poolIdx);
-                for (auto it = blockRange.begin(); it != blockRange.end(); ++it)
+                // blockRange.updatePoolIdx(poolIdx);
+                auto const window = mCacheManager->getBlockManager().getPoolLayerIdx(layerIdx);
+                auto blockRangeForWindow = blockRange.getBlockRangeForWindow(window);
+                for (auto it = blockRangeForWindow.begin(); it != blockRangeForWindow.end(); ++it)
                 {
                     if (layerIdxInPool == 0)
                     {

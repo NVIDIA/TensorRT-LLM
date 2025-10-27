@@ -50,8 +50,7 @@ def parse_requirements(filename: os.PathLike):
 
 def sanity_check():
     tensorrt_llm_path = Path(__file__).resolve().parent / "tensorrt_llm"
-    if not ((tensorrt_llm_path / "bindings").exists() or
-            (tensorrt_llm_path / "bindings.pyi").exists()):
+    if not (tensorrt_llm_path / "bindings").exists():
         raise ImportError(
             'The `bindings` module does not exist. Please check the package integrity. '
             'If you are attempting to use the pip development mode (editable installation), '
@@ -121,7 +120,8 @@ else:
         'libs/nvshmem/nvshmem_transport_ibgda.so.103', 'bindings.*.so',
         'deep_ep/LICENSE', 'deep_ep_cpp_tllm.*.so', "include/**/*",
         'deep_gemm/LICENSE', 'deep_gemm/include/**/*',
-        'deep_gemm_cpp_tllm.*.so', 'scripts/install_tensorrt.sh'
+        'deep_gemm_cpp_tllm.*.so', 'scripts/install_tensorrt.sh',
+        'flash_mla/LICENSE', 'flash_mla_cpp_tllm.*.so'
     ]
 
 package_data += [
