@@ -1,5 +1,4 @@
 import os
-from enum import IntEnum
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -13,7 +12,8 @@ from tensorrt_llm.mapping import Mapping
 from ...distributed import AllReduce, allgather, reducescatter
 from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
-from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor
+from ...utils import (AlltoallMethodType, AuxStreamType, EventType,
+                      Fp4QuantizedTensor)
 from .deep_ep_utils import buffer_pool, deep_ep_installed
 from .interface import MoE
 from .moe_load_balancer import get_moe_load_balancer
@@ -24,18 +24,6 @@ from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
                            MoEWeightLoadingMode, NVFP4CutlassFusedMoEMethod,
                            UnquantizedFusedMoEMethod, WInt4AFP8FusedMoEMethod)
 from .routing import BaseMoeRoutingMethod
-
-
-# The type of alltoall method
-class AlltoallMethodType(IntEnum):
-    # Not available
-    NotEnabled = 0
-    # MNNVL
-    MNNVL = 1
-    # DeepEP intranode or internode: CUDA Graphs are supported, IBGDA is required by internode
-    DeepEP = 2
-    # DeepEP low latency: CUDA Graphs are supported, IBGDA is required
-    DeepEPLowLatency = 3
 
 
 class WideEPMoE(MoE):

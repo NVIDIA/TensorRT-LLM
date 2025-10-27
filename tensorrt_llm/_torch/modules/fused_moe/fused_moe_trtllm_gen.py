@@ -7,12 +7,13 @@ from torch import nn
 
 from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.logger import logger
 
 from ...custom_ops.trtllm_gen_custom_ops import \
     fp4_block_scale_fake_output_without_finalize
 from ...distributed import allgather
 from ...model_config import ModelConfig
-from ...utils import Fp4QuantizedTensor, ceil_div
+from ...utils import AlltoallMethodType, Fp4QuantizedTensor, ceil_div
 from .interface import MoE, MoEWeightLoadingMode
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
                            NVFP4TRTLLMGenFusedMoEMethod,
@@ -109,27 +110,70 @@ class TRTLLMGenFusedMoE(MoE):
         assert len(
             self.initial_local_expert_ids) == self.expert_size_per_partition
 
+        # TODO: AlltoAll code is largely duplicated with WideEPMoE. Consider refactor and reuse in the future.
+        self.alltoall_method_type = self.select_alltoall_method_type(
+            model_config.mapping, routing_method.experts_per_token, dtype,
+            model_config.use_cuda_graph)
+        logger.info_once(
+            f"{self.__class__.__name__} selects alltoall_method_type {self.alltoall_method_type!r}",
+            key="alltoall_method_type")
         self.alltoall_workspace = None
         self.alltoall_prepare_workspace = None
+        self.use_low_precision_combine = False
         if self.enable_alltoall:
-            MnnvlMemory.initialize()
-            self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
-                model_config.mapping)
-            self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
-                model_config.mapping)
+            self.use_low_precision_combine = model_config.use_low_precision_moe_combine
+
+            if self.alltoall_method_type == AlltoallMethodType.MNNVL:
+                MnnvlMemory.initialize()
+                self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
+                    model_config.mapping)
+                self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
+                    model_config.mapping)
+            elif self.alltoall_method_type == AlltoallMethodType.DeepEP or self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
+                raise NotImplementedError(
+                    "DeepEP and DeepEPLowLatency are not supported for CutlassFusedMoE yet"
+                )
+            else:
+                raise NotImplementedError(
+                    f"Not available alltoall method type: {self.alltoall_method_type!r}"
+                )
 
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
 
+    def select_alltoall_method_type(self) -> AlltoallMethodType:
+        all2all_method_type = os.environ.get("TRTLLM_FORCE_ALLTOALL_METHOD")
+        if all2all_method_type is not None:
+            if AlltoallMethodType[all2all_method_type] in [
+                    AlltoallMethodType.DeepEP,
+                    AlltoallMethodType.DeepEPLowLatency
+            ]:
+                raise NotImplementedError(
+                    "DeepEP and DeepEPLowLatency are not supported for CutlassFusedMoE yet"
+                )
+            return AlltoallMethodType[all2all_method_type]
+
+        if not self.mapping.enable_attention_dp:
+            return AlltoallMethodType.NotEnabled
+
+        if self.mapping.tp_size == 1:
+            return AlltoallMethodType.NotEnabled
+
+        if os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") == "1":
+            return AlltoallMethodType.NotEnabled
+
+        if not (self.mapping.moe_ep_size > self.routing_method.experts_per_token
+                and MnnvlMemory.supports_mnnvl()):
+            return AlltoallMethodType.NotEnabled
+
+        return AlltoallMethodType.MNNVL
+
     @cached_property
     def enable_alltoall(self):
-        mapping = self.mapping
-        routing_experts = self.routing_method.experts_per_token
-        return (mapping.moe_ep_size > routing_experts
-                and mapping.enable_attention_dp and mapping.tp_size > 1
-                and os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") != "1"
-                and MnnvlMemory.supports_mnnvl())
+        """ enable_alltoall (bool): whether to enable alltoall instead of allgather/reducescatter
+        """
+        return self.alltoall_method_type != AlltoallMethodType.NotEnabled
 
     def _check_configs(self):
         assert self.has_deepseek_fp8_block_scales \
@@ -608,6 +652,7 @@ class TRTLLMGenFusedMoE(MoE):
                 ep_rank=self.ep_rank,
                 ep_size=self.ep_size,
                 top_k=top_k,
+                use_low_precision_combine=self.use_low_precision_combine,
                 token_count=token_count,
             )
 

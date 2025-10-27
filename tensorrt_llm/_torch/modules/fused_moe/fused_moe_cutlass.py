@@ -6,10 +6,12 @@ import torch
 
 from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe
 from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
+from tensorrt_llm.logger import logger
 
 from ...distributed import allgather
 from ...model_config import ModelConfig
-from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor, ceil_div
+from ...utils import (AlltoallMethodType, AuxStreamType, EventType,
+                      Fp4QuantizedTensor, ceil_div)
 from .interface import MoE
 
 # isort: off
@@ -140,28 +142,46 @@ class CutlassFusedMoE(MoE):
         self.has_been_profiled_min_latency = False
 
         # TODO: AlltoAll code is largely duplicated with WideEPMoE. Consider refactor and reuse in the future.
+        self.alltoall_method_type = self.select_alltoall_method_type(
+            model_config.mapping, routing_method.experts_per_token, dtype,
+            model_config.use_cuda_graph)
+        logger.info_once(
+            f"{self.__class__.__name__} selects alltoall_method_type {self.alltoall_method_type!r}",
+            key="alltoall_method_type")
         self.alltoall_workspace = None
         self.alltoall_prepare_workspace = None
+        self.use_low_precision_combine = False
         if self.enable_alltoall:
-            if self.moe_alltoall_backend == "mnnvllatency":
-                MnnvlMemory.initialize()
-                self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
-                    model_config.mapping)
-                self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
-                    model_config.mapping)
-            elif self.moe_alltoall_backend == "mnnvlthroughput":
-                workspace_mb = int(
-                    os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB", "512"))
-                self.moe_a2a = MoeAlltoAll(
-                    mapping=self.mapping,
-                    max_num_tokens_per_rank=model_config.max_num_tokens,
-                    top_k=self.routing_method.experts_per_token,
-                    num_experts=self.num_experts,
-                    workspace_size_per_rank=workspace_mb * 1024 * 1024,
+            self.use_low_precision_combine = model_config.use_low_precision_moe_combine
+
+            if self.alltoall_method_type == AlltoallMethodType.MNNVL:
+                if self.moe_alltoall_backend == "mnnvllatency":
+                    MnnvlMemory.initialize()
+                    self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
+                        model_config.mapping)
+                    self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
+                        model_config.mapping)
+                elif self.moe_alltoall_backend == "mnnvlthroughput":
+                    workspace_mb = int(
+                        os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB", "512"))
+                    self.moe_a2a = MoeAlltoAll(
+                        mapping=self.mapping,
+                        max_num_tokens_per_rank=model_config.max_num_tokens,
+                        top_k=self.routing_method.experts_per_token,
+                        num_experts=self.num_experts,
+                        workspace_size_per_rank=workspace_mb * 1024 * 1024,
+                    )
+                else:
+                    raise ValueError(
+                        f"Unsupported moe alltoall backend: {self.moe_alltoall_backend}"
+                    )
+            elif self.alltoall_method_type == AlltoallMethodType.DeepEP or self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
+                raise NotImplementedError(
+                    "DeepEP and DeepEPLowLatency are not supported for CutlassFusedMoE yet"
                 )
             else:
-                raise ValueError(
-                    f"Unsupported moe alltoall backend: {self.moe_alltoall_backend}"
+                raise NotImplementedError(
+                    f"Not available alltoall method type: {self.alltoall_method_type!r}"
                 )
 
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
@@ -204,13 +224,38 @@ class CutlassFusedMoE(MoE):
         return self.quant_config.layer_quant_mode.is_int8_weight_only(
         ) and not self.quant_config.layer_quant_mode.has_per_group_scaling()
 
+    def select_alltoall_method_type(self) -> AlltoallMethodType:
+        all2all_method_type = os.environ.get("TRTLLM_FORCE_ALLTOALL_METHOD")
+        if all2all_method_type is not None:
+            if AlltoallMethodType[all2all_method_type] in [
+                    AlltoallMethodType.DeepEP,
+                    AlltoallMethodType.DeepEPLowLatency
+            ]:
+                raise NotImplementedError(
+                    "DeepEP and DeepEPLowLatency are not supported for CutlassFusedMoE yet"
+                )
+            return AlltoallMethodType[all2all_method_type]
+
+        if not self.mapping.enable_attention_dp:
+            return AlltoallMethodType.NotEnabled
+
+        if self.mapping.tp_size == 1:
+            return AlltoallMethodType.NotEnabled
+
+        if os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") == "1":
+            return AlltoallMethodType.NotEnabled
+
+        if not (self.mapping.moe_ep_size > self.routing_method.experts_per_token
+                and MnnvlMemory.supports_mnnvl()):
+            return AlltoallMethodType.NotEnabled
+
+        return AlltoallMethodType.MNNVL
+
     @cached_property
     def enable_alltoall(self):
-        return (self.mapping.moe_ep_size > self.routing_method.experts_per_token
-                and self.mapping.enable_attention_dp
-                and self.mapping.tp_size > 1
-                and os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") != "1"
-                and MnnvlMemory.supports_mnnvl())
+        """ enable_alltoall (bool): whether to enable alltoall instead of allgather/reducescatter
+        """
+        return self.alltoall_method_type != AlltoallMethodType.NotEnabled
 
     @cached_property
     def moe_alltoall_backend(self):
@@ -510,6 +555,7 @@ class CutlassFusedMoE(MoE):
                         ep_rank=self.ep_rank,
                         ep_size=self.ep_size,
                         top_k=top_k,
+                        use_low_precision_combine=self.use_low_precision_combine,
                         token_count=token_count)
             elif self.moe_alltoall_backend == "mnnvlthroughput":
                 hidden = final_hidden_states.shape[-1]
