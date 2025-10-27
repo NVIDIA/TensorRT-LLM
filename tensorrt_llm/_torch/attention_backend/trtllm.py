@@ -695,7 +695,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 dtype=torch.int8,
             )
 
-        if self.is_cuda_graph:
+        if self.is_cuda_graph and self.cuda_graph_workspace is None:
             self.cuda_graph_workspace = torch.empty(
                 (0, ),
                 device='cuda',
