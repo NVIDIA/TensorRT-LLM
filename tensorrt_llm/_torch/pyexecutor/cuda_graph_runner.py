@@ -109,6 +109,8 @@ class CUDAGraphRunner:
             key = (batch.batch_size, draft_len,
                    spec_resource_manager.is_first_draft)
         else:
+            # With dynamic spec decode, the draft length maybe zero even when enable_spec_decode is True,
+            # so we need to get the draft length from the batch instead of using enable_spec_decode.
             draft_len_list = []
             for request in batch.generation_requests:
                 draft_len_list.append(len(request.py_draft_tokens))

@@ -112,7 +112,6 @@ class ModelDrafter(Drafter):
         num_draft_tokens = len(
             request.py_last_draft_tokens
         ) if request.py_last_draft_tokens is not None else 0
-        request.py_draft_tokens = []
 
         num_accepted_tokens = request.py_num_accepted_draft_tokens
         num_rejected_tokens = num_draft_tokens - num_accepted_tokens
@@ -387,9 +386,9 @@ class ModelDrafter(Drafter):
         """Update requests with sample state."""
         self.sampler.update_requests(sample_state, resource_manager)
 
-    def process_decoded_tokens(
-            self, draft_batch: ScheduledRequests,
-            req_id_to_old_request: Dict[int, LlmRequest]) -> List[LlmRequest]:
+    def process_decoded_tokens(self, draft_batch: ScheduledRequests,
+                               req_id_to_old_request: Dict[int, LlmRequest],
+                               draft_position: int) -> List[LlmRequest]:
         """Process decoded tokens and determine which requests to continue processing."""
         new_requests = []
         for req in draft_batch.all_requests():
@@ -400,11 +399,10 @@ class ModelDrafter(Drafter):
                 self.draft_seq_slot_manager.free_resources(req)
                 continue
 
-            target_model_req.py_draft_tokens.append(req.get_last_tokens(0))
+            target_model_req.py_draft_tokens[draft_position -
+                                             1] = req.get_last_tokens(0)
             target_model_req.py_draft_logits = req.py_result.generation_logits  # forwards Nones
-            if req.state != LlmRequestState.GENERATION_COMPLETE and len(
-                    target_model_req.py_draft_tokens
-            ) < target_model_req.py_draft_pages_allocated:
+            if req.state != LlmRequestState.GENERATION_COMPLETE and draft_position < self.max_draft_len:
                 new_requests.append(req)
             else:
                 self.draft_seq_slot_manager.free_resources(req)
@@ -580,6 +578,7 @@ class ModelDrafter(Drafter):
             if target_model_req.state != LlmRequestState.GENERATION_IN_PROGRESS:
                 # Chunked prefill request in progress; no need to append draft tokens
                 continue
+            target_model_req.py_draft_tokens = []
             py_draft_logits = []
             for token_idx in range(self.max_draft_len):
                 target_model_req.py_draft_tokens.append(
@@ -601,7 +600,7 @@ class ModelDrafter(Drafter):
         """
         self.update_requests(outputs, resource_manager)
         self.process_decoded_tokens(outputs.scheduled_requests,
-                                    req_id_to_old_request)
+                                    req_id_to_old_request, self.max_draft_len)
 
     def _execute_draft_iteration(
             self, draft_batch: ScheduledRequests,
@@ -685,7 +684,8 @@ class ModelDrafter(Drafter):
             if sample_state is not None and previous_draft_state is not None:
                 new_requests = self.process_decoded_tokens(
                     previous_draft_state.scheduled_requests,
-                    req_id_to_old_request)
+                    req_id_to_old_request,
+                    draft_position=i + 1)
             else:
                 new_requests = []
 
