@@ -5,13 +5,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List
 
-import pytest
 import torch
 from _torch.helpers import create_mock_engine
 from parameterized import parameterized
 from transformers import AutoProcessor, AutoTokenizer, Qwen2_5_VLConfig
 from transformers import \
     Qwen2_5_VLForConditionalGeneration as HFQwen2_5_VLForConditionalLM
+from utils.llm_data import llm_models_root
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
@@ -27,16 +27,6 @@ from tensorrt_llm.inputs import (create_input_processor,
                                  default_multimodal_input_loader, prompt_inputs)
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.mapping import Mapping
-
-
-def llm_models_root() -> str:
-    '''return LLM_MODELS_ROOT path if it is set in env, assert when it's set but not a valid path
-    '''
-    DEFAULT_LLM_MODEL_ROOT = os.path.join("/scratch.trt_llm_data", "llm-models")
-    LLM_MODELS_ROOT = os.environ.get("LLM_MODELS_ROOT", DEFAULT_LLM_MODEL_ROOT)
-
-    return LLM_MODELS_ROOT
-
 
 QWEN2_5_VL_7B_CONFIG = {
     "architectures": ["Qwen2_5_VLForConditionalGeneration"],
@@ -240,7 +230,6 @@ class TestQwen2_5_VL(unittest.TestCase):
         ).to(device)
         return processor_inputs
 
-    @pytest.mark.skip(reason="https://nvbugs/5550722")
     def test_qwen2_5_vl_sanity(self):
 
         config_dict = deepcopy(QWEN2_5_VL_7B_CONFIG)
@@ -359,7 +348,6 @@ class TestQwen2_5_VL(unittest.TestCase):
                  use_cuda_graph=False,
                  disable_fuse_rope=False),
     ])
-    @pytest.mark.skip(reason="https://nvbugs/5550722")
     @torch.no_grad()
     def test_qwen2_5_vl_allclose_to_hf(self, scenario: Scenario) -> None:
         """
