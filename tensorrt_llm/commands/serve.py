@@ -90,7 +90,7 @@ def get_llm_args(
         pipeline_parallel_size: int = 1,
         moe_expert_parallel_size: Optional[int] = None,
         gpus_per_node: Optional[int] = None,
-        free_gpu_memory_fraction: Optional[float] = None,
+        free_gpu_memory_fraction: float = 0.9,
         num_postprocess_workers: int = 0,
         trust_remote_code: bool = False,
         reasoning_parser: Optional[str] = None,
