@@ -421,7 +421,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
             "get_indexer_k_cache_pool_data",
             [](tbk::BaseKVCacheManager& self, SizeType32 layer_idx) -> at::Tensor
             {
-                auto pool = self.getIndexerKCachePool();
+                auto pool = tr::Torch::tensor(self.getIndexerKCachePool());
                 return pool.index({torch::indexing::Slice(), layer_idx});
             },
             py::call_guard<py::gil_scoped_release>())
@@ -508,9 +508,9 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
             py::arg_v("cache_type", tbk::CacheType::kSELF, "bindings.internal.batch_manager.CacheType.SELF"),
             py::arg("secondary_offload_min_priority") = std::nullopt, py::arg("event_manager") = nullptr,
             py::arg("enable_partial_reuse") = true, py::arg("copy_on_partial_reuse") = true,
-            py::arg("kv_connector_manager") = nullptr, 
-            py::arg("enable_indexer_k_cache") = false, py::arg("indexer_k_cache_quant_block_size") = 128,
-            py::arg("indexer_k_cache_index_head_dim") = 0, py::call_guard<py::gil_scoped_release>());
+            py::arg("kv_connector_manager") = nullptr, py::arg("enable_indexer_k_cache") = false,
+            py::arg("indexer_k_cache_quant_block_size") = 128, py::arg("indexer_k_cache_index_head_dim") = 0,
+            py::call_guard<py::gil_scoped_release>());
 }
 
 void tb::BasePeftCacheManagerBindings::initBindings(py::module_& m)
