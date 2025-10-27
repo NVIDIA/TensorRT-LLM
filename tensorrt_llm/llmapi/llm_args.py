@@ -2903,6 +2903,10 @@ def update_llm_args_with_extra_dict(
     # For trtllm-bench or trtllm-serve, build_config may be passed for the PyTorch
     # backend, overwriting the knobs there since build_config always has the highest priority
     if "build_config" in llm_args:
+        # Ensure build_config is a BuildConfig object, not a dict
+        if isinstance(llm_args["build_config"], dict):
+            llm_args["build_config"] = BuildConfig(**llm_args["build_config"])
+
         for key in [
                 "max_batch_size",
                 "max_num_tokens",
