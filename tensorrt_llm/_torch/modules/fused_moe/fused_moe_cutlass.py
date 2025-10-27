@@ -142,9 +142,7 @@ class CutlassFusedMoE(MoE):
         self.has_been_profiled_min_latency = False
 
         # TODO: AlltoAll code is largely duplicated with WideEPMoE. Consider refactor and reuse in the future.
-        self.alltoall_method_type = self.select_alltoall_method_type(
-            model_config.mapping, routing_method.experts_per_token, dtype,
-            model_config.use_cuda_graph)
+        self.alltoall_method_type = self.select_alltoall_method_type()
         logger.info_once(
             f"{self.__class__.__name__} selects alltoall_method_type {self.alltoall_method_type!r}",
             key="alltoall_method_type")
