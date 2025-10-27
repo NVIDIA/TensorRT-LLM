@@ -1216,7 +1216,9 @@ class ShardingConfig(BaseModel):
     sharding_source: List[ShardingSource] = Field(
         default_factory=lambda: [ShardingSource.HEURISTIC]
     )
-    sharding_dims: List[str] = Field(default_factory=list)
+    sharding_dims: List[ShardingDim] = Field(
+        default_factory=lambda: [ShardingDim.SSM, ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
+    )
     weight_sharding_transforms: List[WeightShardingInfo] = Field(default_factory=list)
     parameter_update_transforms: List[ParameterUpdateInfo] = Field(default_factory=list)
     bmm_transforms: List[BMMShardingInfo] = Field(default_factory=list)
