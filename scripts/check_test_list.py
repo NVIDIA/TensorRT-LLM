@@ -124,6 +124,7 @@ def verify_waive_list(llm_src, args):
     for line_no, line in enumerate(lines, 1):
         original_line = line.strip()
         line = line.strip()
+        ut_line = False
 
         if not line:
             continue
@@ -147,29 +148,30 @@ def verify_waive_list(llm_src, args):
 
         # Skip unittests due to we don't need to have an entry in test-db yml
         if line.startswith("unittest/"):
-            continue
+            ut_line = True
 
         # Check waived cases also in l0_text.txt and qa_text.txt
-        found_in_l0_qa = False
-        if args.l0:
-            with open(f"{llm_src}/l0_test.txt", "r") as f:
-                l0_lines = f.readlines()
-                for l0_line in l0_lines:
-                    if line == l0_line.strip():
-                        found_in_l0_qa = True
-                        break
-        if args.qa:
-            with open(f"{llm_src}/qa_test.txt", "r") as f:
-                qa_lines = f.readlines()
-                for qa_line in qa_lines:
-                    if line == qa_line.strip():
-                        found_in_l0_qa = True
-                        break
-        if not found_in_l0_qa:
-            with open(non_existent_cases_record, "a") as f:
-                f.write(
-                    f"Non-existent test name in l0 or qa list found in waives.txt: {line}\n"
-                )
+        if not ut_line:
+            found_in_l0_qa = False
+            if args.l0:
+                with open(f"{llm_src}/l0_test.txt", "r") as f:
+                    l0_lines = f.readlines()
+                    for l0_line in l0_lines:
+                        if line == l0_line.strip():
+                            found_in_l0_qa = True
+                            break
+            if args.qa:
+                with open(f"{llm_src}/qa_test.txt", "r") as f:
+                    qa_lines = f.readlines()
+                    for qa_line in qa_lines:
+                        if line == qa_line.strip():
+                            found_in_l0_qa = True
+                            break
+            if not found_in_l0_qa:
+                with open(non_existent_cases_record, "a") as f:
+                    f.write(
+                        f"Non-existent test name in l0 or qa list found in waives.txt: {line}\n"
+                    )
 
         processed_lines.add(line)
 
