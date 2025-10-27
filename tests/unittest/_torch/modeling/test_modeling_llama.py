@@ -513,7 +513,7 @@ class TestLlama(unittest.TestCase):
         use_spec_decoding = True
         is_spec_dec_tree = True
         is_spec_dec_dynamic_tree = True
-        max_draft_tokens = gen_input_ids_0.size(-1) - 1
+        max_total_draft_tokens = gen_input_ids_0.size(-1) - 1
 
         attn_metadata_gen_phase_0 = metadata_cls(
             seq_lens=torch.tensor([gen_input_ids_0.size(-1)], dtype=torch.int),
@@ -537,10 +537,12 @@ class TestLlama(unittest.TestCase):
             packed_mask=spec_decoding_packed_mask)
 
         attn_metadata_gen_phase_0.update_spec_dec_param(
+            batch_size=batch_size,
             is_spec_decoding_enabled=is_spec_decoding_enabled,
             is_spec_dec_dynamic_tree=is_spec_dec_dynamic_tree,
             is_spec_dec_tree=is_spec_dec_tree,
-            max_draft_tokens=max_draft_tokens,
+            max_draft_len=max_total_draft_tokens,
+            max_total_draft_tokens=max_total_draft_tokens,
             spec_decoding_tensor=spec_decoding_tensor,
         )
 
@@ -583,10 +585,12 @@ class TestLlama(unittest.TestCase):
             [gen_input_ids_1.size(-1)], dtype=torch.int)
         attn_metadata_gen_phase_0.kv_cache_params.num_cached_tokens_per_seq = num_cached_tokens_per_seq_1
         attn_metadata_gen_phase_0.update_spec_dec_param(
+            batch_size=batch_size,
             is_spec_decoding_enabled=is_spec_decoding_enabled,
             is_spec_dec_tree=is_spec_dec_tree,
             is_spec_dec_dynamic_tree=False,
-            max_draft_tokens=gen_input_ids_1.size(-1) - 1)
+            max_draft_len=gen_input_ids_1.size(-1) - 1,
+            max_total_draft_tokens=gen_input_ids_1.size(-1) - 1)
 
         gen_position_ids_1 = [
             torch.full(
@@ -627,10 +631,12 @@ class TestLlama(unittest.TestCase):
             is_spec_dec_tree=is_spec_dec_tree,
             is_spec_dec_dynamic_tree=False)
         attn_metadata_ref.update_spec_dec_param(
+            batch_size=batch_size,
             is_spec_decoding_enabled=is_spec_decoding_enabled,
             is_spec_dec_tree=is_spec_dec_tree,
             is_spec_dec_dynamic_tree=False,
-            max_draft_tokens=gen_input_ids_ref.size(-1) - 1,
+            max_draft_len=gen_input_ids_ref.size(-1) - 1,
+            max_total_draft_tokens=gen_input_ids_ref.size(-1) - 1,
         )
 
         gen_position_ids_ref = [

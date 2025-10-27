@@ -48,10 +48,10 @@ class Eagle3ResourceManager(BaseResourceManager):
             self.max_total_draft_tokens = self.max_draft_len
 
         # empty hidden states tensor
-        max_num_tokens = min(
-            max_num_tokens, max_num_requests *
-            (self.max_total_draft_tokens + 1)) + (self.max_total_draft_tokens +
-                                                  1)
+        max_num_tokens = min(max_num_tokens, max_num_requests *
+                             self.max_seq_len) + (self.max_total_draft_tokens +
+                                                  1) * max_num_requests
+
         self.hidden_states = torch.empty(
             (max_num_tokens, self.hidden_size * config.num_capture_layers),
             dtype=self.dtype,
@@ -165,6 +165,7 @@ class Eagle3SpecMetadata(SpecMetadata):
 
     def prepare(self):
         is_first_draft = self.eagle3_resource_manager.is_first_draft
+        spec_tree_manager = self.eagle3_resource_manager.spec_tree_manager
         # Update start indices
         # Here, we assume the sequence lengths (seq_lens) during the draft model
         # forward will not exceed those of the target model. So pre-allocate
@@ -186,18 +187,19 @@ class Eagle3SpecMetadata(SpecMetadata):
         for req_id, seq_len in zip(self.request_ids, self.seq_lens):
             slot_id = self.eagle3_resource_manager.slot_manager.get_slot(req_id)
             start_idx = self.eagle3_resource_manager.start_indices[slot_id]
-            # 1) target model
+            # 1) target model or (is_first_draft and is_linear_tree)
             # If this is the first draft or the target model forward, we need to
             # read/write all of the hidden states
-            if not self.is_draft_model:
+            if not self.is_draft_model or (is_first_draft
+                                           and spec_tree_manager is None):
                 hidden_states_read_indices.extend(
                     list(range(start_idx, start_idx + seq_len)))
                 hidden_states_write_indices.extend(
                     list(range(start_idx, start_idx + seq_len)))
-            # 2）is_first_draft
+            # 2）is_first_draft and draft_token_tree
             # After target model forward, some draft tokens will be accepted.
             # These draft tokens' hidden states will be used for draft model's first drafter layer.
-            elif is_first_draft:
+            elif is_first_draft and spec_tree_manager is not None:
                 assert req_id in self.request_accepted_path.keys(
                 ), f"Request {req_id} not found in request_accepted_path"
                 accepted_path = self.request_accepted_path[req_id]

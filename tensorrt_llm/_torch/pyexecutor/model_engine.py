@@ -1437,7 +1437,9 @@ class PyTorchModelEngine(ModelEngine):
         if spec_config is not None:
             spec_resource_manager = resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
-            spec_tree_manager = spec_resource_manager.spec_tree_manager
+            if spec_resource_manager is not None and hasattr(
+                    spec_resource_manager, 'spec_tree_manager'):
+                spec_tree_manager = spec_resource_manager.spec_tree_manager
 
         # will contain previous batch indices of generation requests
         previous_batch_indices = []
@@ -2595,9 +2597,15 @@ class PyTorchModelEngine(ModelEngine):
                 spec_resource_manager, self.is_draft_model, self.attn_backend,
                 self.model_is_wrapped, spec_metadata.is_spec_dec_tree)
             attn_metadata.update_spec_dec_param(
-                scheduled_requests.batch_size, is_spec_dec_mode, spec_metadata,
-                spec_tree_manager, self.original_max_draft_len,
-                self.original_max_total_draft_tokens, spec_decoding_tensor)
+                batch_size=scheduled_requests.batch_size,
+                is_spec_decoding_enabled=is_spec_dec_mode,
+                is_spec_dec_tree=spec_metadata.is_spec_dec_tree,
+                is_spec_dec_dynamic_tree=spec_metadata.is_spec_dec_dynamic_tree,
+                max_draft_len=spec_metadata.max_draft_len,
+                max_total_draft_tokens=spec_metadata.max_total_draft_tokens,
+                spec_metadata=spec_metadata,
+                spec_tree_manager=spec_tree_manager,
+                spec_decoding_tensor=spec_decoding_tensor)
         else:
             spec_resource_manager = None
             spec_metadata = None
