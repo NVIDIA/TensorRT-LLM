@@ -1,5 +1,4 @@
 import os
-import random
 from typing import Dict, List, Optional
 
 import torch
@@ -170,10 +169,9 @@ class KvCacheCreator:
                 request.py_multimodal_data = multimodal_data
             else:
                 # Fall back to text-only prompt when we could not find the small image size.
-                prompt_token_ids = [
-                    random.randint(0, vocab_size - 1)
-                    for _ in range(input_seq_len)
-                ]
+                prompt_token_ids = torch.randint(low=0,
+                                                 high=vocab_size,
+                                                 size=(input_seq_len, ))
                 request = trtllm.Request(prompt_token_ids,
                                          max_tokens=1,
                                          streaming=False,
@@ -217,9 +215,9 @@ class KvCacheCreator:
         remaining_tokens = max_num_tokens
         while remaining_tokens > 0:
             input_seq_len = min(input_seq_len, remaining_tokens)
-            input_tokens = [
-                random.randint(0, vocab_size - 1) for _ in range(input_seq_len)
-            ]
+            input_tokens = torch.randint(low=0,
+                                         high=vocab_size,
+                                         size=(input_seq_len, ))
             request = trtllm.Request(input_tokens,
                                      max_tokens=1,
                                      streaming=False,
