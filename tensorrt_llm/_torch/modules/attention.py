@@ -419,7 +419,9 @@ class Attention(nn.Module):
         # and keeps attention output in BF16 for better precision when applying pre_quant_scale
         if self.has_quant_scale and not self.attn_output_gate and self.o_proj.pre_quant_scale is None:
             out_scale = self.o_proj.inv_input_scale
-        if self.o_proj.pre_quant_scale is not None:
+        if hasattr(
+                self.o_proj,
+                'pre_quant_scale') and self.o_proj.pre_quant_scale is not None:
             enable_attn_nvfp4_output = False
         if self.o_proj.has_nvfp4 and self.support_nvfp4_output and enable_attn_nvfp4_output and not self.attn_output_gate:
             out_scale_sf = self.o_proj.input_scale
