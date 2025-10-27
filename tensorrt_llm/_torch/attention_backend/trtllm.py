@@ -639,41 +639,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.max_num_sequences is None:
             self.max_num_sequences = self.max_num_requests
 
-        capture_graph = torch.cuda.is_current_stream_capturing()
+        torch.cuda.is_current_stream_capturing()
 
-        def get_empty(tensor_shape: list[int], dtype: torch.dtype,
-                      cache_name: str) -> torch.Tensor:
-            """
-            Finds a compatible, reusable buffer from a cache or creates a new one.
-
-            This function searches for a pre-allocated tensor (buffer) that can be
-            reused for an operation involving a tensor with the shape of `tensor_shape`.
-
-            The compatibility rules are: The buffer's total elements must be >= tensor_shape's.
-
-            If a compatible buffer is found, it's returned immediately. Otherwise, a new
-            buffer is allocated on the 'cuda' device with the give properties of 'tensor_shape' and 'dtype'.
-
-            Args:
-                tensor_shape: The required shape.
-                dtype: The required dtype.
-                cache_name: The key for the specific list of buffers to search in.
-            Returns:
-                An existing compatible buffer or a newly created one.
-            """
-            if buffers is None:
-                return torch.zeros(tensor_shape, device='cuda', dtype=dtype)
-
-            return buffers.get_buffer(tensor_shape, dtype, cache_name,
-                                      capture_graph)
-
-        def get_empty_like(like_tensor: torch.Tensor,
-                           cache_name: str) -> torch.Tensor:
-            return get_empty(like_tensor.shape,
-                             cache_name=cache_name,
-                             dtype=like_tensor.dtype)
-
-        self.prompt_lens_cuda = get_empty(
+        self.prompt_lens_cuda = self.get_empty(
+            buffers,
             (self.max_num_sequences, ),
             cache_name="prompt_lens_cuda",
             dtype=torch.int,
@@ -683,8 +652,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             device='cpu',
             pin_memory=True,
         )
-        self.kv_lens_cuda = get_empty_like(self.prompt_lens_cuda,
-                                           cache_name="kv_lens_cuda")
+        self.kv_lens_cuda = self.get_empty_like(buffers,
+                                                self.prompt_lens_cuda,
+                                                cache_name="kv_lens_cuda")
         self.kv_lens = torch.empty_like(self.kv_lens_cuda,
                                         device='cpu',
                                         pin_memory=True)
@@ -699,7 +669,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 dtype=torch.int8,
             )
         if self.kv_cache_manager is not None:
-            self.kv_cache_block_offsets = get_empty(
+            self.kv_cache_block_offsets = self.get_empty(
+                buffers,
                 [
                     self.kv_cache_manager.num_pools, self.max_num_sequences, 2,
                     self.kv_cache_manager.max_blocks_per_seq
@@ -715,7 +686,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.block_ids_per_seq = None
             self.kv_block_ids_per_seq = None
             if self.enable_flash_mla:
-                self.block_ids_per_seq = get_empty(
+                self.block_ids_per_seq = self.get_empty(
+                    buffers,
                     [
                         self.kv_cache_manager.max_batch_size,
                         self.kv_cache_manager.max_blocks_per_seq
@@ -723,7 +695,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     cache_name="block_ids_per_seq",
                     dtype=torch.int32,
                 )
-                self.kv_block_ids_per_seq = get_empty(
+                self.kv_block_ids_per_seq = self.get_empty(
+                    buffers,
                     [
                         self.kv_cache_manager.max_batch_size,
                         self.kv_cache_manager.max_blocks_per_seq
@@ -733,7 +706,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 )
             if self.enable_context_mla_with_cached_kv:
                 # for kv cache reuse/chunked context in MLA
-                self.ctx_cached_token_indptr = get_empty(
+                self.ctx_cached_token_indptr = self.get_empty(
+                    buffers,
                     (self.max_num_requests + 1, ),
                     cache_name="ctx_cached_token_indptr",
                     dtype=torch.int64,
@@ -743,7 +717,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     device='cpu',
                     pin_memory=True,
                 )
-                self.ctx_uncached_token_indptr = get_empty(
+                self.ctx_uncached_token_indptr = self.get_empty(
+                    buffers,
                     (self.max_num_requests + 1, ),
                     cache_name="ctx_uncached_token_indptr",
                     dtype=torch.int64,
@@ -754,7 +729,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     pin_memory=True,
                 )
                 # context full seqlens include cached tokens and uncached tokens
-                self.ctx_kv_indptr = get_empty(
+                self.ctx_kv_indptr = self.get_empty(
+                    buffers,
                     (self.max_num_requests + 1, ),
                     cache_name="ctx_kv_indptr",
                     dtype=torch.int64,

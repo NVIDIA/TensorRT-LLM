@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
 
+from ....memory_buffer_utils import get_memory_buffers
 from .moe_op import MoEOp
 
 if TYPE_CHECKING:
@@ -24,6 +25,7 @@ if TYPE_CHECKING:
 
 class DeepGemmMoEOp(MoEOp):
     """DeepGemm-based MoE op for GB200 block FP8."""
+    buffers = get_memory_buffers()
 
     def __init__(self):
         """Initialize DeepGemm op."""
@@ -85,23 +87,30 @@ class DeepGemmMoEOp(MoEOp):
         workspace = {}
 
         # Workspace for FP8 activations
-        workspace["workspace_0"] = torch.empty(
+        capture_graph = torch.cuda.is_current_stream_capturing()
+        workspace["workspace_0"] = DeepGemmMoEOp.buffers.get_buffer(
             (expert_size_per_partition * m_max * fp8_dim),
             dtype=torch.float8_e4m3fn,
-            device='cuda')
+            device='cuda',
+            buffer_name='workspace_0',
+            reserve_buffer=capture_graph)
 
         # Workspace for intermediate results
-        workspace["workspace_1"] = torch.empty(
+        workspace["workspace_1"] = DeepGemmMoEOp.buffers.get_buffer(
             (expert_size_per_partition * m_max *
              max(intermediate_size * 2, hidden_size)),
             dtype=torch.bfloat16,
-            device='cuda')
+            device='cuda',
+            buffer_name='workspace_1',
+            reserve_buffer=capture_graph)
 
         # Workspace for scaling factors
-        workspace["workspace_sf"] = torch.empty(
+        workspace["workspace_sf"] = DeepGemmMoEOp.buffers.get_buffer(
             expert_size_per_partition * (scale_k_padded // 4) * m_padded,
             dtype=torch.int32,
-            device='cuda')
+            device='cuda',
+            buffer_name='workspace_sf',
+            reserve_buffer=capture_graph)
 
         return workspace
 

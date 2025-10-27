@@ -349,6 +349,41 @@ class AttentionMetadata:
         Hook to be called during forward when using spec-dec one-model mode.
         """
 
+    @staticmethod
+    def get_empty(buffers, tensor_shape: list[int], dtype: torch.dtype,
+                  cache_name: str) -> torch.Tensor:
+        """
+        Finds a compatible, reusable buffer from a cache or creates a new one.
+
+        This function searches for a pre-allocated tensor (buffer) that can be
+        reused for an operation involving a tensor with the shape of `tensor_shape`.
+
+        The compatibility rules are: The buffer's total elements must be >= tensor_shape's.
+
+        If a compatible buffer is found, it's returned immediately. Otherwise, a new
+        buffer is allocated on the 'cuda' device with the give properties of 'tensor_shape' and 'dtype'.
+
+        Args:
+            tensor_shape: The required shape.
+            dtype: The required dtype.
+            cache_name: The key for the specific list of buffers to search in.
+        Returns:
+            An existing compatible buffer or a newly created one.
+        """
+        if buffers is None:
+            return torch.zeros(tensor_shape, device='cuda', dtype=dtype)
+
+        return buffers.get_buffer(tensor_shape, dtype, cache_name,
+                                  capture_graph)
+
+    @staticmethod
+    def get_empty_like(buffers, like_tensor: torch.Tensor,
+                       cache_name: str) -> torch.Tensor:
+        return get_empty(buffers,
+                         like_tensor.shape,
+                         cache_name=cache_name,
+                         dtype=like_tensor.dtype)
+
 
 class PositionalEmbedder(Protocol):
     """
