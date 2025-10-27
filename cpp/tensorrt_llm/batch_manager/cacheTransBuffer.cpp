@@ -189,14 +189,22 @@ bool FabricMemory::supportFbaricMemory()
 }
 
 CacheTransBufferManager::CacheTransBufferManager(
-    KVCacheManager::BaseKVCacheManager* cacheManager, std::optional<size_t> maxNumTokens)
+    KVCacheManager::BaseKVCacheManager* cacheManager, std::optional<size_t> maxNumTokens, bool transferIndexerKCache)
     : mCacheManager{cacheManager}
     , mBufferManager{std::make_shared<runtime::CudaStream>()}
+    , mTransferIndexerKCache{transferIndexerKCache}
+    , mMaxNumTokens{maxNumTokens}
 {
-
     // TODO: FP4 dataSize
     TLLM_CHECK(mCacheManager);
-    mDataType = mCacheManager->getPrimaryPool(0)->getDataType();
+    if (transferIndexerKCache)
+    {
+        mDataType = mCacheManager->getIndexerKCachePool()->getDataType();
+    }
+    else
+    {
+        mDataType = mCacheManager->getPrimaryPool(0)->getDataType();
+    }
 
     auto tokensPerBlock = mCacheManager->getBlockManager().getTokensPerBlock();
     size_t bufferSizeFromMaxNumToken = 0;

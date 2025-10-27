@@ -1093,7 +1093,8 @@ __global__ void concatKVCacheForWindowKernel(T const** __restrict__ inputCaches,
 template <typename T>
 void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>> const& kVCacheBlocksPerWindow,
     std::vector<runtime::ITensor::SharedPtr>& outputSplitBlocks, kv_cache::CacheState const& destCacheState,
-    kv_cache::CacheState const& selfCacheState, int selfIdx, runtime::BufferManager const& bufferManager)
+    kv_cache::CacheState const& selfCacheState, int selfIdx, runtime::BufferManager const& bufferManager,
+    bool isIndexerKCache = false)
 {
 
     size_t inputBlockNumSum = 0;
@@ -1124,7 +1125,15 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
     std::vector<SizeType32> layersInWindow;
     size_t cacheBlockSizeSum = 0;
     size_t inputBlockLayerNumSum = 0;
-    auto cacheDataType = kVCacheBlocksPerWindow.begin()->second.front()->getDataType();
+    nvinfer1::DataType cacheDataType = nvinfer1::DataType::kINT64;
+    if (isIndexerKCache)
+    {
+        cacheDataType = nvinfer1::DataType::kUINT8;
+    }
+    else
+    {
+        cacheDataType = kVCacheBlocksPerWindow.begin()->second.front()->getDataType();
+    }
 
     for (auto const& [window, blocks] : kVCacheBlocksPerWindow)
     {
@@ -1148,7 +1157,9 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
 
     for (auto&& outputSplitBlock : outputSplitBlocks)
     {
-        TLLM_CHECK(outputSplitBlock->getDataType() == cacheDataType);
+        TLLM_CHECK_WITH_INFO(outputSplitBlock->getDataType() == cacheDataType,
+            "outputSplitBlock data type mismatch expected: %d, actual: %d", static_cast<int>(cacheDataType),
+            static_cast<int>(outputSplitBlock->getDataType()));
         cachePtrs.push_back(reinterpret_cast<uint64_t>(outputSplitBlock->data()));
     }
     std::vector<uint64_t> prefixLayerNum(targetRankInfo.mDomainPPSize + 1, 0);
@@ -1224,7 +1235,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
 
     dim3 gridDim{gridDimx, gridDimy};
 
-    int const sizePerHead = selfModelConfig.mSizePerHead;
+    int sizePerHead = selfModelConfig.mSizePerHead;
     T const** inputBlockPtrsDev = static_cast<T const**>(PtrsDeviceBuffer->data());
     T** outputCachePtrsDev = static_cast<T**>(PtrsDeviceBuffer->data()) + inputBlockNumSum;
     uint64_t* prefixLayerNumDevPtr
@@ -1236,7 +1247,14 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
     int const selfPPRank = selfIdx / (selfParallelConfig.mTensorParallelism * selfParallelConfig.mContextParallelism);
     int const numLayers = selfParallelConfig.mAttentionLayerNumPerPP.at(selfPPRank);
     int const headNum = selfModelConfig.mNbKvHeadsPerLayer[0];
-    int const dimsPerHead = selfModelConfig.mSizePerHead;
+
+    int dimsPerHead = selfModelConfig.mSizePerHead;
+    if (isIndexerKCache)
+    {
+        dimsPerHead = selfCacheState.getIndexerDimPerHead()
+            + selfCacheState.getIndexerDimPerHead() / selfCacheState.getIndexerKCacheQuantBlockSize() * 4;
+        sizePerHead = dimsPerHead;
+    }
     int const domainPPSize = targetRankInfo.mDomainPPSize;
     int const domainTPSize = targetRankInfo.mDomainTPSize;
     int const domainCPSize = targetRankInfo.mDomainCPSize;
@@ -1404,35 +1422,44 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
 }
 
 void splitKVCacheDispatch(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>> const& kVCacheBlocksPerWindow,
-    std::vector<runtime::ITensor::SharedPtr>& ouputSplitBlocks, kv_cache::CacheState const& iCacheState,
-    kv_cache::CacheState const& oCacheState, int selfIdx, runtime::BufferManager const& bufferManager)
+    std::vector<runtime::ITensor::SharedPtr>& outputSplitBlocks, kv_cache::CacheState const& iCacheState,
+    kv_cache::CacheState const& oCacheState, int selfIdx, runtime::BufferManager const& bufferManager,
+    bool isIndexerKCache)
 {
-    auto dataType = kVCacheBlocksPerWindow.begin()->second.front()->getDataType();
+    auto dataType = nvinfer1::DataType::kINT64;
+    if (isIndexerKCache)
+    {
+        dataType = nvinfer1::DataType::kUINT8;
+    }
+    else
+    {
+        dataType = kVCacheBlocksPerWindow.begin()->second.front()->getDataType();
+    }
     auto dataSize = tensorrt_llm::common::getDTypeSize(dataType);
     switch (dataSize)
     {
     case 8:
     {
-        splitKVCache<int64_t>(
-            kVCacheBlocksPerWindow, ouputSplitBlocks, iCacheState, oCacheState, selfIdx, bufferManager);
+        splitKVCache<int64_t>(kVCacheBlocksPerWindow, outputSplitBlocks, iCacheState, oCacheState, selfIdx,
+            bufferManager, isIndexerKCache);
         break;
     }
     case 4:
     {
-        splitKVCache<int32_t>(
-            kVCacheBlocksPerWindow, ouputSplitBlocks, iCacheState, oCacheState, selfIdx, bufferManager);
+        splitKVCache<int32_t>(kVCacheBlocksPerWindow, outputSplitBlocks, iCacheState, oCacheState, selfIdx,
+            bufferManager, isIndexerKCache);
         break;
     }
     case 2:
     {
-        splitKVCache<int16_t>(
-            kVCacheBlocksPerWindow, ouputSplitBlocks, iCacheState, oCacheState, selfIdx, bufferManager);
+        splitKVCache<int16_t>(kVCacheBlocksPerWindow, outputSplitBlocks, iCacheState, oCacheState, selfIdx,
+            bufferManager, isIndexerKCache);
         break;
     }
     case 1:
     {
-        splitKVCache<int8_t>(
-            kVCacheBlocksPerWindow, ouputSplitBlocks, iCacheState, oCacheState, selfIdx, bufferManager);
+        splitKVCache<int8_t>(kVCacheBlocksPerWindow, outputSplitBlocks, iCacheState, oCacheState, selfIdx,
+            bufferManager, isIndexerKCache);
         break;
     }
     default:
@@ -1446,7 +1473,7 @@ template <typename T>
 void concatKVCache(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlocks,
     std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>& outputKvCacheBlocksPerWindow,
     kv_cache::CacheState const& destCacheState, kv_cache::CacheState const& selfCacheState, int selfIdx,
-    runtime::BufferManager const& bufferManager)
+    runtime::BufferManager const& bufferManager, bool isIndexerKCache)
 {
 
     size_t outputBlockNumSum = 0;
@@ -1554,7 +1581,7 @@ void concatKVCache(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlo
         layersPerWindowDevPtr = static_cast<int const*>(windowInfoDeviceBuffer->data()) + windowSizes.size();
     }
     dim3 gridDim{gridDimx, gridDimy};
-    int const sizePerHead = selfModelConfig.mSizePerHead;
+    int sizePerHead = selfModelConfig.mSizePerHead;
     int const endLayerId = selfModelConfig.mNbKvHeadsPerLayer.size() / oPPNum;
     T** ouptutBlockPtrsDev = static_cast<T**>(PtrsDeviceBuffer->data());
     T const** inputSplitBlockPtrsDev = static_cast<T const**>(PtrsDeviceBuffer->data()) + outputBlockNumSum;
@@ -1565,7 +1592,14 @@ void concatKVCache(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlo
     int const numLayers = selfParallelConfig.mAttentionLayerNumPerPP.at(selfPPRank);
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "concatKVCache numLayers:%d", numLayers);
     int const headNum = selfModelConfig.mNbKvHeadsPerLayer[0];
-    int const dimsPerHead = selfModelConfig.mSizePerHead;
+    int dimsPerHead = selfModelConfig.mSizePerHead;
+    if (isIndexerKCache)
+    {
+        dimsPerHead = selfCacheState.getIndexerDimPerHead()
+            + selfCacheState.getIndexerDimPerHead() / selfCacheState.getIndexerKCacheQuantBlockSize() * 4;
+        sizePerHead = dimsPerHead;
+    }
+
     int const domainPPSize = targetRankInfo.mDomainPPSize;
     int const domainTPSize = targetRankInfo.mDomainTPSize;
 
@@ -1735,7 +1769,7 @@ void concatKVCache(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlo
 void concatKvCacheV2Dispatch(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlocks,
     std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>& outputKvCacheBlocksPerWindow,
     kv_cache::CacheState const& iCacheState, kv_cache::CacheState const& oCacheState, int selfIdx,
-    runtime::BufferManager const& bufferManager)
+    runtime::BufferManager const& bufferManager, bool isIndexerKCache)
 {
 
     auto dataType = outputKvCacheBlocksPerWindow.begin()->second.front()->getDataType();
@@ -1744,26 +1778,26 @@ void concatKvCacheV2Dispatch(std::vector<runtime::ITensor::SharedPtr> const& inp
     {
     case 8:
     {
-        concatKVCache<int64_t>(
-            inputSplitBlocks, outputKvCacheBlocksPerWindow, iCacheState, oCacheState, selfIdx, bufferManager);
+        concatKVCache<int64_t>(inputSplitBlocks, outputKvCacheBlocksPerWindow, iCacheState, oCacheState, selfIdx,
+            bufferManager, isIndexerKCache);
         break;
     }
     case 4:
     {
-        concatKVCache<int32_t>(
-            inputSplitBlocks, outputKvCacheBlocksPerWindow, iCacheState, oCacheState, selfIdx, bufferManager);
+        concatKVCache<int32_t>(inputSplitBlocks, outputKvCacheBlocksPerWindow, iCacheState, oCacheState, selfIdx,
+            bufferManager, isIndexerKCache);
         break;
     }
     case 2:
     {
-        concatKVCache<int16_t>(
-            inputSplitBlocks, outputKvCacheBlocksPerWindow, iCacheState, oCacheState, selfIdx, bufferManager);
+        concatKVCache<int16_t>(inputSplitBlocks, outputKvCacheBlocksPerWindow, iCacheState, oCacheState, selfIdx,
+            bufferManager, isIndexerKCache);
         break;
     }
     case 1:
     {
-        concatKVCache<int8_t>(
-            inputSplitBlocks, outputKvCacheBlocksPerWindow, iCacheState, oCacheState, selfIdx, bufferManager);
+        concatKVCache<int8_t>(inputSplitBlocks, outputKvCacheBlocksPerWindow, iCacheState, oCacheState, selfIdx,
+            bufferManager, isIndexerKCache);
         break;
     }
     default:

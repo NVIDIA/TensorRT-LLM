@@ -57,8 +57,8 @@ private:
 class CacheTransBufferManager
 {
 public:
-    CacheTransBufferManager(
-        KVCacheManager::BaseKVCacheManager* cacheManager, std::optional<size_t> maxNumTokens = std::nullopt);
+    CacheTransBufferManager(KVCacheManager::BaseKVCacheManager* cacheManager,
+        std::optional<size_t> maxNumTokens = std::nullopt, bool transferIndexerKCache = false);
 
     static size_t preAllocBufferSize(std::map<SizeType32, SizeType32> const& cacheSizeBytesPerTokenPerWindow,
         SizeType32 tokensPerBlock,
@@ -81,6 +81,11 @@ public:
     runtime::ITensor::SharedPtr getRecvBuffer(std::optional<int> bufferId);
     size_t getRecvBufferCount();
     size_t getSendBufferCount();
+
+    std::optional<size_t> getMaxNumTokens()
+    {
+        return mMaxNumTokens;
+    }
 
 private:
     struct ConcurrenceResource
@@ -114,6 +119,8 @@ private:
     KVCacheManager::BaseKVCacheManager* mCacheManager;
     runtime::BufferManager mBufferManager;
     std::vector<std::unique_ptr<FabricMemory>> mFabricMemory;
+    bool mTransferIndexerKCache;
+    std::optional<size_t> mMaxNumTokens;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

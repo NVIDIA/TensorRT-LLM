@@ -45,9 +45,8 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager
 BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
     BlockKey const& lastBlockKey, int32_t indexFromEnd, bool recvSideHasCP)
 {
-    auto poolNum = cacheManager->getBlockManager().getNumPools();
-    // Note: When recv side has CP, the requested seqLen is lesser than seqLen on the sender side as seqLen is
-    // distributed among CP ranks. So, we transfer all blocks from send side.
+    auto poolNum = cacheManager->getBlockManager().getNumPools(
+        /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
     if (poolNum > 1 || !cacheManager->isEnableBlockReuse() || lastBlockKey.uniqueTokens.size() == 0 || recvSideHasCP)
     {
         // disable reuse path, and vwsa don't support reuse.
@@ -88,8 +87,9 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest 
 BlockRange getBlockRangeForReceiving(
     BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest, bool srcEnableBlockReuse, bool recvSideHasCP)
 {
-    auto poolNum = cacheManager->getBlockManager().getNumPools();
     // Note: When recv side has CP, we request all blocks from send side right now.
+    auto poolNum = cacheManager->getBlockManager().getNumPools(
+        /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
     if (poolNum == 1 && srcEnableBlockReuse && !recvSideHasCP)
     {
         // Build from all block ids, then slice off the reused blocks so we only transfer newly allocated ones.
@@ -171,7 +171,8 @@ void checkAlternateWindow(BaseKVCacheManager* cacheManager, BaseCacheFormatter::
     // if gen PP and context PP are different, cache formatter only support alternative window like gpt-oss.
     // which is one layer is WSA, and another layer is Full attention.
 
-    auto numPools = cacheManager->getBlockManager().getNumPools();
+    auto numPools = cacheManager->getBlockManager().getNumPools(
+        /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
     auto layerNum = cacheManager->getBlockManager().getNumLayers();
 
     auto selfPPNum = selfConfig.getParallelConfig().mPipelineParallelism;
@@ -248,7 +249,8 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
     auto& blockManager = mCacheManager->getBlockManager();
     auto const& lastBlockKey = session.getLastBlockKey();
     auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest, lastBlockKey, indexFromEnd);
-    auto const numPools = blockManager.getNumPools();
+    auto const numPools
+        = blockManager.getNumPools(/*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
     // TODO(oargov): are we sure the other side has the same number of pools? this might not hold for pp_size>1...
 
     bool layerWise = common::getEnvDisaggLayerwise() && numPools == 1;
@@ -556,7 +558,8 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
     TLLM_LOG_DEBUG("pickUpConnections size: %d connections size: %d", pickUpConnections.size(), connections.size());
     std::vector<runtime::ITensor::SharedPtr> recvBufferTmps;
     std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>> outputBuffersPerWindow;
-    auto const numPools = mCacheManager->getBlockManager().getNumPools();
+    auto const numPools = mCacheManager->getBlockManager().getNumPools(
+        /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
     // TODO(oargov): are we sure the other side has the same number of pools? this might not hold for pp_size>1...
     size_t blockNum = 0;
     size_t cacheBlockSizeSum = 0;
@@ -970,7 +973,13 @@ std::unique_ptr<BaseCacheFormatter> createCacheFormatter(
 {
     if (isMLA)
     {
-        return std::make_unique<MLACacheFormatter>(cacheManager, cacheTransBufferManager);
+        std::vector<CacheTransBufferManager*> cacheTransBufferManagers = {cacheTransBufferManager};
+        auto maxNumTokens = cacheTransBufferManager->getMaxNumTokens();
+        if (cacheManager->isEnableIndexerKCache())
+        {
+            cacheTransBufferManagers.push_back(new CacheTransBufferManager(cacheManager, maxNumTokens, true));
+        }
+        return std::make_unique<MLACacheFormatter>(cacheManager, cacheTransBufferManagers);
     }
     return std::make_unique<CacheFormatter>(cacheManager, cacheTransBufferManager);
 }
