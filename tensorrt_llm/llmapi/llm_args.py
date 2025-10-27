@@ -45,8 +45,7 @@ from ..bindings.executor import (BatchingType as _BatchingType,
                                  KvCacheConfig as _KvCacheConfig,
                                  LookaheadDecodingConfig as _LookaheadDecodingConfig,
                                  PeftCacheConfig as _PeftCacheConfig,
-                                 SchedulerConfig as _SchedulerConfig,
-                                 GuidedDecodingConfig as _GuidedDecodingConfig) # isort: skip
+                                 SchedulerConfig as _SchedulerConfig) # isort: skip
 # isort: on
 
 # yapf: enable
@@ -163,6 +162,26 @@ class CudaGraphConfig(StrictBaseModel):
             batch_sizes.append(max_batch_size)
 
         return batch_sizes
+
+
+class GuidedDecodingConfig(StrictBaseModel):
+
+    class GuidedDecodingBackend(Enum):
+        XGRAMMAR = 0
+        LLGUIDANCE = 1
+
+    backend: GuidedDecodingBackend = Field(
+        default=GuidedDecodingBackend.XGRAMMAR,
+        description="The backend for guided decoding config.")
+    encoded_vocab: Optional[List[str]] = Field(
+        default=None,
+        description="The encoded vocab for guided decoding config.")
+    tokenizer_str: Optional[str] = Field(
+        default=None,
+        description="The tokenizer string for guided decoding config.")
+    stop_token_ids: Optional[List[int]] = Field(
+        default=None,
+        description="The stop token ids for guided decoding config.")
 
 
 class BaseSparseAttentionConfig(StrictBaseModel):
