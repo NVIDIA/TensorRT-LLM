@@ -917,8 +917,8 @@ def detect_column_row_shard(
         # We are inserting column-row shard for each group of linear enodes
         # This may require parameter update of nodes whose args depend on (sharded) dimensions,
         # such as view or split nodes.
-        nodes_to_column_shard = nodes_linear.values()[0]
-        nodes_to_row_shard = nodes_linear.values()[1]
+        nodes_to_column_shard = list(nodes_linear.values())[0]
+        nodes_to_row_shard = list(nodes_linear.values())[1]
         if len(nodes_to_row_shard) != 1:
             ad_logger.warning(
                 "Expecting only one linear node for row sharding, but got %s",
@@ -930,11 +930,14 @@ def detect_column_row_shard(
             continue
 
         # column-row sharding
-        weight_sharding_transforms, parameter_update_transforms = _process_column_sharding(
-            gm, nodes_to_column_shard, rank, world_size, min_local_shape
+        _process_column_sharding(
+            gm,
+            linear_nodes=nodes_to_column_shard,
+            sharding_config=sharding_config,
+            rank=rank,
+            world_size=world_size,
+            min_local_shape=min_local_shape,
         )
-        sharding_config.weight_sharding_transforms.extend(weight_sharding_transforms)
-        sharding_config.parameter_update_transforms.extend(parameter_update_transforms)
 
         # shard single row node
         sharding_config.weight_sharding_transforms.append(
