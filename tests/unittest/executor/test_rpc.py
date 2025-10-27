@@ -469,13 +469,15 @@ class TestRpcShutdown:
 
         time.sleep(0.1)
         with RPCClient(addr) as client:
-            # This task should be continued after server shutdown
+            # This task should be cancelled when server shuts down
             res = client.foo(10).remote_future(timeout=12)
 
-            # The shutdown will block until all pending requests are finished
+            # The shutdown will now immediately cancel pending requests
             server.shutdown()
 
-            assert res.result() == "foo"
+            # Verify the request was cancelled
+            with pytest.raises(RPCCancelled):
+                res.result()
 
 
 class TestApp:
