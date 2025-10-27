@@ -193,33 +193,14 @@ class CutlassMoEOp(MoEOp):
                                        x.shape[1])
 
         # Run the actual MoE computation
-        output = run_moe(
-            x,
-            token_selected_slots,
-            token_final_scales,
-            w3_w1_weight.view(weight_dtype),
-            w3_w1_bias,
-            w2_weight.view(weight_dtype),
-            w2_bias,
-            quant_scales,
-            input_sf,
-            swizzled_input_sf,
-            swiglu_alpha,
-            swiglu_beta,
-            swiglu_limit,
-            tp_size,
-            tp_rank,
-            ep_size,
-            ep_rank,
-            cluster_size,
-            cluster_rank,
-            use_all_to_all,
-            min_latency_mode,
-            self.gemm_tactics,
-            unpadded_hidden_size,
-            tuner_num_tokens,
-            None
-        )
+        output = run_moe(x, token_selected_slots, token_final_scales,
+                         w3_w1_weight.view(weight_dtype), w3_w1_bias,
+                         w2_weight.view(weight_dtype), w2_bias, quant_scales,
+                         input_sf, swizzled_input_sf, swiglu_alpha, swiglu_beta,
+                         swiglu_limit, tp_size, tp_rank, ep_size, ep_rank,
+                         cluster_size, cluster_rank, use_all_to_all,
+                         min_latency_mode, self.gemm_tactics,
+                         unpadded_hidden_size, tuner_num_tokens, None)
 
         # Return output based on latency mode
         return output if min_latency_mode else [output]
