@@ -1382,6 +1382,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     server: 10.20.162.212
                     path: /vol/scratch26/scratch.trt_llm_data
         """
+    }
 
     def podConfig = [
         cloud: targetCould,
