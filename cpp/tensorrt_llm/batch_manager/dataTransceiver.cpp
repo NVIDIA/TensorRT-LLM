@@ -26,6 +26,7 @@
 #include "tensorrt_llm/common/tllmException.h"
 #include "tensorrt_llm/common/utils.h"
 #include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
+#include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <future>
 #include <map>
@@ -795,7 +796,7 @@ public:
                 lastBlockKey.extraKeys = std::move(extraKeys);
             }
             // Compute indexFromEnd from the number of requested blocks
-            int32_t requestedBlockSize = requestedBlockRange.getBlockIds().size();
+            int32_t requestedBlockSize = requestedBlockRange.getBlockIdsPerWindow().begin()->second.size();
             TLLM_CHECK_WITH_INFO(requestedBlockSize > 0, "requestedBlockSize must be > 0");
             int32_t indexFromEnd = requestedBlockSize - 1;
 

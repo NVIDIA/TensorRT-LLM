@@ -66,6 +66,8 @@ class RequestData:
     new_block_ids: List[int]
     # The position of the latest token with computed (valid) kv cache values.
     computed_position: int
+    # The number of scheduled tokens for the upcoming forward pass.
+    num_scheduled_tokens: int
 
 
 # A class to store some basic data regarding all inflight requests.
@@ -301,12 +303,17 @@ class KvCacheConnectorSchedulerOutputRequest:
         self.block_ids.extend(new_block_ids)
         self.tokens.extend(new_tokens)
 
-        computed_position = len(
-            tokens
-        ) - 1 if req.state != LlmRequestState.CONTEXT_INIT and req.state != LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS else req.context_current_position
+        if req.state in (LlmRequestState.CONTEXT_INIT,
+                         LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS):
+            computed_position = req.context_current_position
+            num_scheduled_tokens = min(req.context_remaining_length,
+                                       req.context_chunk_size)
+        else:
+            computed_position = len(tokens) - 1
+            num_scheduled_tokens = 1  # Specdec with draft tokens is not supported yet.
 
         return RequestData(req.request_id, new_tokens, new_block_ids,
-                           computed_position)
+                           computed_position, num_scheduled_tokens)
 
 
 class KvCacheConnectorSchedulerOutputManager:
@@ -404,6 +411,10 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
     def get_num_new_matched_tokens(self, request: LlmRequest,
                                    num_computed_tokens: int) -> int:
+        if request.is_generation_only_request:
+            raise RuntimeError(
+                "Connector API is not supported for generation-only requests!")
+
         num_tokens, load_kv_async = self._run_on_leader(
             lambda: self.scheduler.get_num_new_matched_tokens(
                 request, num_computed_tokens))

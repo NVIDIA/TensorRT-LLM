@@ -493,6 +493,8 @@ accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus_corner_c
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale[throughput]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale_chunked_prefill[latency]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale_chunked_prefill[throughput]
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_fp8_blockscale[baseline]
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_fp8_blockscale[baseline_mtp1]
 accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_fp8_block_scales[latency]
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_fp8_block_scales[latency-torch_compile=False]
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_fp8_block_scales[latency-torch_compile=True]
@@ -738,7 +740,25 @@ examples/test_eagle.py::test_phi_eagle_1gpu[phi-2-eagle2]
 examples/test_eagle.py::test_phi_eagle_1gpu[Phi-3-mini-128k-instruct-eagle2]
 examples/test_eagle.py::test_phi_eagle_1gpu[Phi-3-small-128k-instruct-eagle2]
 examples/test_eagle.py::test_phi_eagle_1gpu[Phi-3.5-mini-instruct-eagle2]
+
 examples/serve/test_serve.py::test_extra_llm_api_options
+examples/serve/test_serve_negative.py::test_invalid_max_tokens
+examples/serve/test_serve_negative.py::test_invalid_temperature
+examples/serve/test_serve_negative.py::test_invalid_top_p[-0.1]
+examples/serve/test_serve_negative.py::test_invalid_top_p[1.1]
+examples/serve/test_serve_negative.py::test_empty_messages_array
+examples/serve/test_serve_negative.py::test_missing_message_role
+examples/serve/test_serve_negative.py::test_invalid_token_ids
+examples/serve/test_serve_negative.py::test_extremely_large_token_id
+examples/serve/test_serve_negative.py::test_server_stability_under_invalid_requests
+examples/serve/test_serve_negative.py::test_concurrent_invalid_requests
+examples/serve/test_serve_negative.py::test_mixed_valid_invalid_requests
+examples/serve/test_serve_negative.py::test_health_check_during_errors
+examples/serve/test_serve_negative.py::test_request_exceeds_context_length
+examples/serve/test_serve_negative.py::test_malformed_json_request
+examples/serve/test_serve_negative.py::test_missing_content_type_header
+examples/serve/test_serve_negative.py::test_extremely_large_batch
+
 
 # PyTorch flow disaggregated tests
 disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0]

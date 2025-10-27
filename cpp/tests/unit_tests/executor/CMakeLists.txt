@@ -32,6 +32,7 @@ add_gtest(intervalSetTest intervalSetTest.cpp)
 add_gtest(dynamicBatchTunerTest dynamicBatchTunerTest.cpp)
 add_gtest(ucxCommTest ucxCommTest.cpp)
 target_link_libraries(ucxCommTest PRIVATE ${Python3_LIBRARIES})
+target_link_libraries(serializeUtilsTest PRIVATE ${Python3_LIBRARIES})
 
 # Skip MOONCAKE related tests on Rocky8
 set(IS_ROCKY8 FALSE)
@@ -45,6 +46,8 @@ if(NIXL_ROOT OR (MOONCAKE_ROOT AND NOT IS_ROCKY8))
 
   if(NIXL_ROOT)
     target_link_libraries(transferAgentTest PRIVATE tensorrt_llm_nixl_wrapper)
+    target_link_libraries(agentCommTest PRIVATE tensorrt_llm_nixl_wrapper
+                                                ${Python3_LIBRARIES})
     target_compile_definitions(transferAgentTest PRIVATE TEST_NIXL_BACKEND=1)
     target_compile_definitions(agentCommTest PRIVATE TEST_NIXL_BACKEND=1)
   endif()
@@ -52,6 +55,8 @@ if(NIXL_ROOT OR (MOONCAKE_ROOT AND NOT IS_ROCKY8))
   if(MOONCAKE_ROOT)
     target_link_libraries(transferAgentTest
                           PRIVATE tensorrt_llm_mooncake_wrapper)
+    target_link_libraries(agentCommTest PRIVATE tensorrt_llm_mooncake_wrapper
+                                                ${Python3_LIBRARIES})
     target_compile_definitions(transferAgentTest
                                PRIVATE TEST_MOONCAKE_BACKEND=1)
     target_compile_definitions(agentCommTest PRIVATE TEST_MOONCAKE_BACKEND=1)
