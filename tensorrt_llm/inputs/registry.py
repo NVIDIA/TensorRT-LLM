@@ -61,8 +61,8 @@ class BaseDummyInputsBuilder:
         return image
 
     def get_dummy_prompt(self, input_seq_len: int):
-        # we use the max resolution as starting point
-        # img_max_dim = 9999  # TODO: Find better starting resolution
+        # TODO(yechank): We use the max resolution as starting point and keep reducing the resolution until the prompt length is less than the input sequence length.
+        # Need to find better way to calculate the dummy prompt length as this iteration may not be efficient.
         while self.image_max_dim >= self.img_min_dim:
             image = self.get_dummy_image(max_width=self.image_max_dim,
                                          max_height=self.image_max_dim)
