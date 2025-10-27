@@ -2610,31 +2610,37 @@ TEST_F(KVCacheManagerTest, KVCacheManagerSecondaryBlockPrimaryChildTest)
     TLLM_LOG_DEBUG("%s;%d\n%s", __FILE__, __LINE__, blockManager.printFreeQueues(maxAttentionWindow).c_str());
     // Reuse blocks 0,1,2 with tokens [0,1,2,3] [4,5,6,7] [0]
     // The following steps are involved:
+    //
+    // Claim blocks 0,1,2 so they cannot be evicted implicitly
+    // P : 35 : 3,7,6
+    // S : 35 : 5,4
+    //
     // Matched block 0
     // Block 0 needs onboarding.
-    //   Evict block 1. Note that this will prevent further reuse
-    // P : 35 : 3,2,7,6
-    // S : 45 : 0,5,4
-    //   Offload block 3 to 1. Return block 1.
-    // P : 35 : 2,7,6
-    // S : 45 : 0,5,4,3
-    //   Onboard block 0 to 1. Reserve block 0.
-    // P : 35 : 2,7,6
-    // S : 45 : 5,4,3,1
-    // Matched block 1, but it has been evicted.
-    // Evict block 5
-    // Offload block 2 to block 5. Reserve block 5
-    // Note that this is wasted effort, since block 2's parent block was evicted
+    //   Evict block 3. Block 3 needs offloading.
+    //   Offload block 3
+    //     Evict block 5
+    //     Copy block 3 to 5.
+    //     Blocks 3 and 5 swap pointers (block 3 is now secondary, block 5 is free primary)
+    //   Copy block 0 to block 5
+    //   Blocks 0 and 5 swap pointers (block 0 now primary, block 5 is free secondary)
     // P : 35 : 7,6
-    // S : 45 : 4,3,1,2
-    // Matched block 2, but previous block has been evicted so no longer valid for reuse.
-    // No need to offload block 7, it has no stored state
+    // S : 35 : 4,3,5
+    //
+    // Matched block 1
+    // Block 1 needs onboarding
+    //   Evict block 7. Block 7 does not need offloading.
+    //   Copy block 1 to 7.
+    //   Blocks 1 and 7 swap pointers (block 1 now primary, block 7 is free secondary)
     // P : 35 : 6
-    // S : 45 : 4,3,1,2
-    // Cache:
-    // 0=[0,1,2,3] -> nil         -> 2=[0]
-    // 3=[1,1,2,3] -> 4=[4,5,6,7] -> nil
-    EXPECT_EQ(llmRequest3->getContextCurrentPosition(), 4);
+    // S : 35 : 4,3,5,7
+    //
+    // Matched block 2
+    // Block 2 does not need onboarding
+    // P : 35 : 6
+    // S : 35 : 4,3,5,7
+    //
+    EXPECT_EQ(llmRequest3->getContextCurrentPosition(), 9);
 }
 
 TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockTest)
