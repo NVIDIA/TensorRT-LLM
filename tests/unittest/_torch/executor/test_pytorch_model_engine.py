@@ -102,7 +102,6 @@ def _create_request(num_tokens, req_id: int):
 
 
 def create_model_engine_and_kvcache(llm_args: TorchLlmArgs = None):
-    max_num_requests = 15
     tokens_per_block = 1
     max_tokens = 258  # Atleast 1 more than the max seq len
     num_layers = 1
@@ -121,7 +120,7 @@ def create_model_engine_and_kvcache(llm_args: TorchLlmArgs = None):
     assert (8 in llm_args.cuda_graph_config.batch_sizes
             and 16 in llm_args.cuda_graph_config.batch_sizes)
 
-    model_engine = DummyModelEngine(llm_args, max_num_requests, torch.half)
+    model_engine = DummyModelEngine(llm_args, torch.half)
 
     kv_cache_config = KvCacheConfig(max_tokens=max_tokens)
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
@@ -289,7 +288,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             cuda_graph_config=CudaGraphConfig(
                 enable_padding=True,
                 batch_sizes=[1, 2, 3, 1000000000000000000000000]))
-        model_engine = DummyModelEngine(llm_args, 32, torch.half)
+        model_engine = DummyModelEngine(llm_args, torch.half)
 
         self.assertEqual(model_engine._cuda_graph_batch_sizes,
                          [1, 2, 3, model_engine.max_seq_len])
@@ -319,9 +318,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         mock_callable.assert_called_once()
 
     def test_forward_pass_callable_on_cuda_graph_off(self):
-        llm_args = TorchLlmArgs(model="dummy")
-        model_engine, kv_cache_manager = create_model_engine_and_kvcache(
-            llm_args)
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
 
         mock_callable = Mock()
         model_engine.register_forward_pass_callable(mock_callable)
@@ -341,9 +338,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         mock_callable.assert_called_once()
 
     def test_foward_pass_callable_off(self):
-        llm_args = TorchLlmArgs(model="dummy")
-        model_engine, kv_cache_manager = create_model_engine_and_kvcache(
-            llm_args)
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
         self.assertTrue(model_engine.forward_pass_callable is None,
                         "forward_pass_callback should be None by default")
 
@@ -361,9 +356,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         model_engine.forward(batch, resource_manager)
 
     def test_foward_pass_callable_backward_compat(self):
-        llm_args = TorchLlmArgs(model="dummy")
-        model_engine, kv_cache_manager = create_model_engine_and_kvcache(
-            llm_args)
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
         self.assertTrue(model_engine.forward_pass_callable is None,
                         "forward_pass_callback should be None by default")
 
@@ -386,9 +379,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         # Create model engine with helix parallelism.
         llm_args = TorchLlmArgs(model="dummy")
-        model_engine = DummyModelEngine(llm_args,
-                                        batch_size=4,
-                                        dtype=torch.half)
+        model_engine = DummyModelEngine(llm_args, dtype=torch.half)
 
         # Provide mapping for model engine.
         cp_size = 2
