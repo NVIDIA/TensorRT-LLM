@@ -314,6 +314,8 @@ unittest/_torch/multi_gpu_modeling/test_llama3.py::test_llama_3_3 SKIP (https://
 examples/test_eagle.py::test_llm_eagle_1gpu_modelopt_ckpt[llama3.1-eagle-8b-hf_v0.5-float16-bs8] SKIP (https://nvbugs/5546507)
 examples/test_eagle.py::test_llm_eagle_1gpu[EAGLE-Vicuna-7B-v1.3-float16-bs1-eagle1] SKIP (https://nvbugs/5546507)
 examples/test_eagle.py::test_llm_eagle_1gpu[EAGLE-Vicuna-7B-v1.3-float16-bs1-eagle2] SKIP (https://nvbugs/5546507)
+examples/test_eagle.py::test_mistral_nemo_eagle_1gpu[Mistral-Nemo-12b-Base-eagle1] SKIP (https://nvbugs/5546507)
+examples/test_eagle.py::test_mistral_nemo_eagle_1gpu[Mistral-Nemo-12b-Base-eagle2] SKIP (https://nvbugs/5546507)
 examples/test_ngram.py::test_llm_ngram_1gpu[no_streaming-gpt2-use_cpp_session-use_tokens-max_matching_ngram_size_2-max_draft_len_8-float16-bs1] SKIP (https://nvbugs/5546507)
 examples/test_ngram.py::test_llm_ngram_1gpu[no_streaming-gpt2-use_cpp_session-use_tokens-max_matching_ngram_size_2-max_draft_len_8-float16-bs2] SKIP (https://nvbugs/5546507)
 examples/test_ngram.py::test_llm_ngram_1gpu[streaming-gpt2-use_cpp_session-use_tokens-max_matching_ngram_size_2-max_draft_len_8-float16-bs1] SKIP (https://nvbugs/5546507)
