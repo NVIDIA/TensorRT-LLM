@@ -6,10 +6,11 @@ This example demonstrates how to use sparse attention with TensorRT-LLM.
 
 Supported sparse attention algorithms:
 - RocketKV
+- DSA
 
 Usage:
 ```bash
-python llm_sparse_attention.py --algo RocketKV --attention_backend TRTLLM --window_size 32 --kernel_size 63 --prompt_budget 2048
+python llm_sparse_attention.py --algo ROCKETKV --attention_backend TRTLLM --window_size 32 --kernel_size 63 --prompt_budget 2048
 ```
 """
 import argparse
@@ -104,7 +105,7 @@ def parse_arguments():
 
     # KV cache
     parser.add_argument('--kv_cache_dtype', type=str, default='auto')
-    parser.add_argument("--kv_cache_fraction", type=float, default=None)
+    parser.add_argument("--kv_cache_fraction", type=float, default=0.7)
     parser.add_argument('--num_samples', type=int, default=10)
 
     # Runtime

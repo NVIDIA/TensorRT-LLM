@@ -257,7 +257,8 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.kv_cache_manager.copy_kt_block_offsets(
                 self.request_ids, self.host_kt_cache_block_offsets)
             self.kt_cache_block_offsets[:self.num_seqs].copy_(
-                self.host_kt_cache_block_offsets, non_blocking=True)
+                self.host_kt_cache_block_offsets[:self.num_seqs],
+                non_blocking=True)
 
         self.context_lens_cuda[:self.num_contexts].copy_(
             self.context_lens[:self.num_contexts], non_blocking=True)
@@ -428,7 +429,8 @@ class RocketTrtllmAttention(TrtllmAttention):
 
     def sparse_kv_predict(
         self,
-        qkv: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
         metadata: TrtllmAttentionMetadata,
         **kwargs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -443,7 +445,10 @@ class RocketTrtllmAttention(TrtllmAttention):
         if num_ctx_tokens == 0:
             return None, None
 
-        qkv_input = qkv[:num_ctx_tokens]
+        if k is None:
+            qkv_input = q[:num_ctx_tokens]
+        else:
+            qkv_input = torch.cat([q, k], dim=1)
 
         if metadata.valid_batch_size > 0:
             q_window, k_context = triton_rocket_qk_split(
@@ -538,14 +543,21 @@ class RocketTrtllmAttention(TrtllmAttention):
 
     @torch.compile(dynamic=True)
     def preprocess_for_gen(
-        self, qkv: torch.Tensor, metadata: RocketTrtllmAttentionMetadata
+        self, q: torch.Tensor, k: torch.Tensor,
+        metadata: RocketTrtllmAttentionMetadata
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        qkv_input = qkv[metadata.num_ctx_tokens:]
-        q, k = qkv_input[:, :self.num_heads * self.
-                         head_dim], qkv_input[:, self.num_heads *
-                                              self.head_dim:self.num_heads *
-                                              self.head_dim +
-                                              self.num_kv_heads * self.head_dim]
+        if k is None:
+            qkv_input = q[metadata.num_ctx_tokens:]
+            q, k = qkv_input[:, :self.num_heads *
+                             self.head_dim], qkv_input[:, self.num_heads * self.
+                                                       head_dim:self.num_heads *
+                                                       self.head_dim +
+                                                       self.num_kv_heads *
+                                                       self.head_dim]
+        else:
+            q = q[metadata.num_ctx_tokens:]
+            k = k[metadata.num_ctx_tokens:]
+
         q = q.view(-1, self.num_kv_heads, self.num_heads // self.num_kv_heads,
                    self.head_dim)
 
@@ -566,14 +578,15 @@ class RocketTrtllmAttention(TrtllmAttention):
 
     def sparse_attn_predict(
         self,
-        qkv: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
         metadata: TrtllmAttentionMetadata,
         **kwargs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         if metadata.num_generations == 0:
             return None, None
 
-        q, k, dim_pos = self.preprocess_for_gen(qkv, metadata)
+        q, k, dim_pos = self.preprocess_for_gen(q, k, metadata)
 
         scores = triton_kt_cache_update_and_bmm(
             q,

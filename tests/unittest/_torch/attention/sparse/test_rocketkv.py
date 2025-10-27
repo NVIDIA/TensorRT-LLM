@@ -250,7 +250,7 @@ def test_sparse_kv_predict(batch_size, num_contexts):
                       device=device)
 
     trtllm_sparse_kv_indices, trtllm_sparse_kv_offsets = trtllm_attn.sparse_kv_predict(
-        qkv, trtllm_metadata)
+        qkv, None, trtllm_metadata)
 
     vanilla_sparse_kv_indices_list = []
     offset = 0
@@ -454,10 +454,8 @@ def test_sparse_attn_predict(batch_size, num_contexts):
         trtllm_kt_tokens_per_block = trtllm_kv_cache_manager.kt_tokens_per_block
         vanilla_kv_cache_manager.kt_tokens_per_block
 
-        trtllm_block_offsets = trtllm_kv_cache_manager.get_kt_block_offsets(
-            request_ids)
-        vanilla_block_offsets = vanilla_kv_cache_manager.get_kt_block_offsets(
-            request_ids)
+        trtllm_block_offsets = trtllm_metadata.kt_cache_block_offsets
+        vanilla_block_offsets = vanilla_metadata.kt_cache_block_offsets
 
         for req_idx in range(num_contexts, batch_size):
             # Get the number of KT tokens for this request
@@ -496,7 +494,7 @@ def test_sparse_attn_predict(batch_size, num_contexts):
                 kt_token_idx += kt_tokens_in_this_block
 
     trtllm_sparse_attn_indices, trtllm_sparse_attn_offsets = trtllm_attn.sparse_attn_predict(
-        qkv, trtllm_metadata)
+        qkv, None, trtllm_metadata)
 
     vanilla_sparse_attn_indices_list = []
     offset = sum(seq_lens[:num_contexts])  # Skip context tokens
