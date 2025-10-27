@@ -881,7 +881,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 )
 
                 // Generate Pytest command
-                String pytestUtil = ""
+                String pytestUtil = "mpirun -n 1 --allow-run-as-root --oversubscribe"
                 if (nodeCount > 1) {
                     pytestUtil = "$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"
                 }
