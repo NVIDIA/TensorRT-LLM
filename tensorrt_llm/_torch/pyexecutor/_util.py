@@ -49,15 +49,12 @@ GB = 1 << 30
 def get_kv_cache_manager_cls(model_config: ModelConfig):
     config = model_config.pretrained_config
     sparse_attn_config = model_config.sparse_attention_config
-    if is_mla(config):
-        return KVCacheManager
-    elif is_nemotron_hybrid(config):
+    if sparse_attn_config is not None:
+        return get_sparse_attn_kv_cache_manager(sparse_attn_config)
+    elif is_nemotron_hybrid(config) or is_qwen3_next(config):
         return MambaHybridCacheManager
     else:
-        if sparse_attn_config is not None:
-            return get_sparse_attn_kv_cache_manager(sparse_attn_config)
-        else:
-            return KVCacheManager
+        return KVCacheManager
 
 
 class KvCacheCreator:
@@ -101,12 +98,6 @@ class KvCacheCreator:
         self._profiling_stage_data = profiling_stage_data
         self._kv_cache_manager_cls = get_kv_cache_manager_cls(
             model_engine.model.model_config)
-
-    def _get_free_gpu_memory_fraction(self) -> float:
-        fraction = self._kv_cache_config.free_gpu_memory_fraction
-        if fraction is None:
-            fraction = 0.9
-        return fraction
 
     def _get_kv_size_per_token(self):
         model_config = self._model_engine.model.model_config
@@ -300,7 +291,7 @@ class KvCacheCreator:
         # TODO: support CP by generating dummy requests for it.
         assert 'cp_type' not in mapping.cp_config
 
-        fraction = self._get_free_gpu_memory_fraction()
+        fraction = self._kv_cache_config.free_gpu_memory_fraction
 
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
@@ -472,6 +463,7 @@ class KvCacheCreator:
                 is_draft=model_engine.is_draft_model,
                 kv_connector_manager=self._kv_connector_manager
                 if not estimating_kv_cache else None,
+                sparse_attn_config=sparse_attn_config,
             )
         elif is_nemotron_hybrid(config):
             if self._max_beam_width > 1:
@@ -543,7 +535,7 @@ class KvCacheCreator:
             num_mamba_layers = num_hidden_layers // config.full_attention_interval * (
                 config.full_attention_interval - 1)
             num_layers = num_hidden_layers - num_mamba_layers
-            kv_cache_manager = MambaHybridCacheManager(
+            kv_cache_manager = self._kv_cache_manager_cls(
                 # mamba cache parameters
                 config.linear_key_head_dim,
                 config.linear_conv_kernel_dim,

@@ -150,13 +150,10 @@ def parse_arguments():
     parser = argparse.ArgumentParser(
         description="Multimodal models with the PyTorch workflow.")
     parser = add_llm_args(parser)
+    parser.add_argument("--kv_cache_fraction", type=float, default=0.6)
     parser = add_multimodal_args(parser)
     parser = add_lora_args(parser)
     args = parser.parse_args()
-
-    if args.kv_cache_fraction is None:
-        args.kv_cache_fraction = 0.6  # lower the default kv cache fraction for multimodal
-
     return args
 
 
