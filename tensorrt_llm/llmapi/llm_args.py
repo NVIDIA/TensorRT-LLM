@@ -169,14 +169,13 @@ class BaseSparseAttentionConfig(StrictBaseModel):
     """
     Configuration for sparse attention.
     """
-    algorithm: Literal["rocket"] = Field(
-        default="rocket", description="The algorithm for sparse attention.")
 
     @classmethod
     def from_dict(cls, data: dict):
         # dispatch to the correct sparse attention config
         config_classes = {
             "rocket": RocketSparseAttentionConfig,
+            "dsa": DeepSeekSparseAttentionConfig,
         }
 
         algorithm = data.get("algorithm", None)
@@ -187,6 +186,9 @@ class BaseSparseAttentionConfig(StrictBaseModel):
         if config_class is None:
             raise ValueError(f"Invalid algorithm: {algorithm}")
 
+        # Remove 'algorithm' before passing to subclass constructor
+        # It's a ClassVar in subclasses, and used for dispatching to the correct subclass
+        data = {k: v for k, v in data.items() if k != 'algorithm'}
         return config_class(**data)
 
     def _check_fields(self):
@@ -202,8 +204,9 @@ class BaseSparseAttentionConfig(StrictBaseModel):
 
 class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
     """
-    Configuration for rocket sparse attention.
+    Configuration for RocketKV sparse attention.
     """
+    algorithm: ClassVar[str] = "rocket"
     window_size: Optional[int] = Field(
         default=None, description="The window size for snap KV.")
     kernel_size: Optional[int] = Field(
@@ -213,6 +216,28 @@ class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
     prompt_budget: Optional[int] = Field(default=1266,
                                          description="Prompt budget")
     page_size: Optional[int] = Field(default=3, description="Page size")
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+
+class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
+    """
+    Configuration for DeepSeek Sparse Attention.
+    """
+    algorithm: ClassVar[str] = "dsa"
+    index_n_heads: Optional[int] = Field(
+        default=None, description="The number of heads for the indexer.")
+    index_head_dim: Optional[int] = Field(
+        default=None, description="The dimension of the indexer heads.")
+    index_topk: Optional[int] = Field(default=None,
+                                      description="The topk for the indexer.")
+    indexer_max_chunk_size: Optional[int] = Field(
+        default=None, description="The maximum chunk size for the indexer.")
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -1214,6 +1239,7 @@ SpeculativeConfig: TypeAlias = Optional[Union[
 
 SparseAttentionConfig: TypeAlias = Union[
     RocketSparseAttentionConfig,
+    DeepSeekSparseAttentionConfig,
 ]
 
 
@@ -1241,7 +1267,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "Number of sink tokens (tokens to always keep in attention window).")
     free_gpu_memory_fraction: Optional[float] = Field(
-        default=None,
+        default=0.9,
         description=
         "The fraction of GPU memory fraction that should be allocated for the KV cache. Default is 90%. If both `max_tokens` and `free_gpu_memory_fraction` are specified, memory corresponding to the minimum will be used."
     )
@@ -1322,6 +1348,16 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             attention_dp_events_gather_period_ms=self.
             attention_dp_events_gather_period_ms,
             max_gpu_total_bytes=self.max_gpu_total_bytes)
+
+    @field_validator('free_gpu_memory_fraction')
+    @classmethod
+    def validate_free_gpu_memory_fraction(cls, v: float):
+        """Validates that the fraction is between 0.0 and 1.0."""
+        if not 0 <= v <= 1:
+            raise ValueError(
+                "kv_cache_config.free_gpu_memory_fraction must be a float between 0 and 1"
+            )
+        return v
 
     @field_validator('max_gpu_total_bytes')
     @classmethod
@@ -2506,7 +2542,13 @@ class TorchLlmArgs(BaseLlmArgs):
                                    status="beta")
     checkpoint_loader: Optional[object] = Field(
         default=None,
-        description="The checkpoint loader to use for this LLM instance.",
+        description=
+        "The checkpoint loader to use for this LLM instance. You may use a custom checkpoint loader by subclassing "
+        "`BaseCheckpointLoader` and providing an instance of the subclass here to load weights from a custom "
+        "checkpoint format.\n"
+        "If neither checkpoint_format nor checkpoint_loader are provided, checkpoint_format will be set to HF "
+        "and the default HfCheckpointLoader will be used.\n"
+        "If checkpoint_format and checkpoint_loader are both provided, checkpoint_loader will be ignored.",
         json_schema_extra={
             "type":
             "Optional[tensorrt_llm._torch.models.checkpoints.BaseCheckpointLoader]"
@@ -2516,7 +2558,12 @@ class TorchLlmArgs(BaseLlmArgs):
 
     checkpoint_format: Optional[str] = Field(
         default=None,
-        description="The format of the provided checkpoint.",
+        description=
+        "The format of the provided checkpoint. You may use a custom checkpoint format by subclassing "
+        "`BaseCheckpointLoader` and registering it with `register_checkpoint_loader`.\n"
+        "If neither checkpoint_format nor checkpoint_loader are provided, checkpoint_format will be set to HF "
+        "and the default HfCheckpointLoader will be used.\n"
+        "If checkpoint_format and checkpoint_loader are both provided, checkpoint_loader will be ignored.",
         status="prototype",
     )
 
@@ -2532,6 +2579,12 @@ class TorchLlmArgs(BaseLlmArgs):
         "Only load/execute the vision encoder part of the full model. Defaults to False.",
         status="prototype",
     )
+
+    ray_worker_extension_cls: Optional[str] = Field(
+        default=None,
+        description="The full worker extension class name including module path."
+        "Allows users to extend the functions of the RayGPUWorker class.",
+        status="prototype")
 
     # PrivateVars
     _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
@@ -2748,6 +2801,14 @@ class TorchLlmArgs(BaseLlmArgs):
             )
         return self
 
+    @model_validator(mode='after')
+    def validate_ray_worker_extension_cls(self) -> 'TorchLlmArgs':
+        if self.ray_worker_extension_cls is not None and self.orchestrator_type != "ray":
+            raise ValueError(
+                f"ray_worker_extension_cls is only supported with orchestrator_type='ray'"
+            )
+        return self
+
     def get_executor_config(
         self,
         _hf_model_dir: Optional[Path] = None,
@@ -2845,11 +2906,15 @@ def update_llm_args_with_extra_dict(
         "lora_config": LoraConfig,
         "moe_config": MoeConfig,
         "attention_dp_config": AttentionDpConfig,
+        "sparse_attention_config": BaseSparseAttentionConfig,
     }
     for field_name, field_type in field_mapping.items():
         if field_name in llm_args_dict:
             # Some fields need to be converted manually.
-            if field_name in ["speculative_config", "build_config"]:
+            if field_name in [
+                    "speculative_config", "build_config",
+                    "sparse_attention_config"
+            ]:
                 llm_args_dict[field_name] = field_type.from_dict(
                     llm_args_dict[field_name])
             else:

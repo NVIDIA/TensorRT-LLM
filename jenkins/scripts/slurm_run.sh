@@ -99,10 +99,6 @@ echo "Full Command: $pytestCommand"
     done
  fi
 
-# Turn off "exit on error" so the following lines always run
-set +e
-trap - ERR
-
 eval $pytestCommand
 echo "Rank${SLURM_PROCID} Pytest finished execution"
 

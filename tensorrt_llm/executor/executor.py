@@ -467,6 +467,9 @@ class GenerationExecutor(ABC):
         orchestrator_type = None if not isinstance(
             llm_args, TorchLlmArgs) else llm_args.orchestrator_type
         if orchestrator_type == "ray":
+            if llm_args and hasattr(llm_args, 'ray_worker_extension_cls'):
+                worker_kwargs[
+                    "ray_worker_extension_cls"] = llm_args.ray_worker_extension_cls
             return GenerationExecutor._create_ray_executor(
                 worker_kwargs,
                 model_world_size,

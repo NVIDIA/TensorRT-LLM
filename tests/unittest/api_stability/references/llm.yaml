@@ -191,6 +191,10 @@ methods:
         annotation: Optional[str]
         default: null
         status: prototype
+      ray_worker_extension_cls:
+        annotation: Optional[str]
+        default: null
+        status: prototype
     return_annotation: None
   generate:
     parameters:
