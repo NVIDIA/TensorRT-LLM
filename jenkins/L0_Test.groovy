@@ -2172,13 +2172,16 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         """
         echoNodeAndGpuInfo(pipeline, stageName)
         sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C || true; fi'
+
+        String pytestUtil = "mpirun -n 1 --allow-run-as-root --oversubscribe"
         def pytestCommand = getPytestBaseCommandLine(
             llmSrc,
             stageName,
             perfMode,
             "${WORKSPACE}/${stageName}",
             TRTLLM_WHL_PATH,
-            coverageConfigFile
+            coverageConfigFile,
+            pytestUtil
         )
 
         // Only add --test-list if there are regular tests to run
