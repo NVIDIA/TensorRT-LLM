@@ -5,6 +5,7 @@ import platform
 import signal
 import traceback
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from pathlib import Path
 from queue import Queue
 from typing import (TYPE_CHECKING, AsyncIterable, Dict, Generator, List,
@@ -123,6 +124,7 @@ class GenerationExecutor(ABC):
         streaming: bool = False,
         kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
         disaggregated_params: Optional[DisaggregatedParams] = None,
+        trace_headers: Optional[Mapping[str, str]] = None,
         postproc_params: Optional[PostprocParams] = None,
         multimodal_params: Optional[MultimodalParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
@@ -150,6 +152,7 @@ class GenerationExecutor(ABC):
             streaming=streaming,
             kv_cache_retention_config=kv_cache_retention_config,
             disaggregated_params=disaggregated_params,
+            trace_headers=trace_headers,
             multimodal_params=multimodal_params,
             scheduling_params=scheduling_params,
             cache_salt_id=cache_salt_id,
@@ -464,6 +467,9 @@ class GenerationExecutor(ABC):
         orchestrator_type = None if not isinstance(
             llm_args, TorchLlmArgs) else llm_args.orchestrator_type
         if orchestrator_type == "ray":
+            if llm_args and hasattr(llm_args, 'ray_worker_extension_cls'):
+                worker_kwargs[
+                    "ray_worker_extension_cls"] = llm_args.ray_worker_extension_cls
             return GenerationExecutor._create_ray_executor(
                 worker_kwargs,
                 model_world_size,
