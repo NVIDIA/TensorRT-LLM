@@ -584,7 +584,6 @@ class Indexer(nn.Module):
         )
 
         self.softmax_scale = self.head_dim**-0.5
-        self.scale_fmt = "ue8m0"
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
@@ -905,7 +904,8 @@ class Indexer(nn.Module):
         metadata: DSAtrtllmAttentionMetadata,
         hidden_states: torch.Tensor,
         q_fp8: torch.Tensor,
-        k: torch.Tensor,
+        k_fp8: torch.Tensor,
+        k_scale: torch.Tensor,
         weights: torch.Tensor,
     ) -> torch.Tensor:
 
@@ -924,15 +924,7 @@ class Indexer(nn.Module):
             device=hidden_states.device)
         topk_indices_buffer[:hidden_states.shape[0]] = -1
 
-        # Quantize k and store into indexer k cache
-        k_fp8, k_scale = torch.ops.trtllm.fp8_quantize_1x128(k[:num_tokens])
-        # Handle SM version differences (SM90: 1D padded, SM100+: 2D)
-        if k_scale.ndim == 1:
-            num_blocks = (k.shape[1] + 127) // 128
-            m_padded = (num_tokens + 3) // 4 * 4
-            k_scale = k_scale[:num_blocks * m_padded].view(
-                num_blocks, m_padded)[:, :num_tokens]
-        k_scale = k_scale.contiguous().transpose(0, 1)
+        # Store k_fp8 and k_scale into indexer k cache
         self._update_k_cache(k_fp8, k_scale, metadata)
 
         if has_prefill:
@@ -1068,7 +1060,7 @@ class Indexer(nn.Module):
     def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
                 metadata: DSAtrtllmAttentionMetadata,
                 position_ids: torch.Tensor):
-        quant_block_size = metadata.kv_cache_manager.quant_block_size
+        metadata.kv_cache_manager.quant_block_size
 
         q, k = maybe_execute_in_parallel(
             lambda: self.wq_b(qr),
@@ -1099,8 +1091,16 @@ class Indexer(nn.Module):
         )
         # we only quant q here since k quant is fused with cache insertion
         q = q.view(-1, self.head_dim)
-        q_fp8, q_scale = fp8_utils.per_token_quant_and_transform(
-            q, quant_block_size, scale_ue8m0=self.scale_fmt == "ue8m0")
+
+        q, k = maybe_execute_in_parallel(
+            lambda: fp8_utils.fp8_quantize_1x128_sf_transpose(q),
+            lambda: fp8_utils.fp8_quantize_1x128_sf_transpose(k),
+            self.ln_events[0],
+            self.ln_events[1],
+            self.aux_stream,
+        )
+        q_fp8, q_scale = q
+        k_fp8, k_scale = k
         q_fp8 = q_fp8.view(-1, self.n_heads, self.head_dim)
         q_scale = q_scale.view(-1, self.n_heads, 1)
 
@@ -1110,8 +1110,8 @@ class Indexer(nn.Module):
         weights = weights.squeeze(-1)
 
         # Return topk indices buffer for sparse attention [num_tokens, index_topk]
-        return self.sparse_attn_indexer(metadata, hidden_states, q_fp8, k,
-                                        weights.to(torch.float32))
+        return self.sparse_attn_indexer(metadata, hidden_states, q_fp8, k_fp8,
+                                        k_scale, weights.to(torch.float32))
 
 
 class DSATrtllmAttention(TrtllmAttention):
