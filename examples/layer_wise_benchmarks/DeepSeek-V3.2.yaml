@@ -1,5 +1,5 @@
 common: &common
-  pretrained_model_name_or_path: nvidia/DeepSeek-R1-0528-FP4-v2
+  pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3.2-Exp
   enable_attention_dp: true
   balance_method: Balanced
   balance_ratio: null
@@ -13,7 +13,7 @@ CTX:
 
   # Model init args
   max_num_tokens: 40960
-  moe_backend: "CUTLASS"
+  moe_backend: "DEEPGEMM"
   use_cuda_graph: false
 
   # Per iteration args
@@ -28,7 +28,7 @@ GEN:
   max_seq_len: 9220  # 8192 + 1024 + 4
 
   max_num_tokens: 4096  # MTP3 as max
-  moe_backend: "WIDEEP"
+  moe_backend: "DEEPGEMM"
   use_cuda_graph: true
 
   batch_size: 128
