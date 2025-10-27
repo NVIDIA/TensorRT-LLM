@@ -1361,14 +1361,27 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     path: /vol/scratch1/scratch.svc_tensorrt_blossom
         """
     }
-    if (type.contains("6000d")) {
+    /* if (type.contains("6000d")) {
         pvcVolume = """
                 - name: sw-tensorrt-pvc
                   nfs:
                     server: 10.20.162.212
                     path: /vol/scratch26/scratch.trt_llm_data
         """
-    }
+    } */
+    def llmModelVolume = """
+                - name: scratch-trt-llm-data
+                  nfs:
+                    server: 10.117.145.14
+                    path: /vol/scratch1/scratch.michaeln_blossom
+    """
+    if (type.contains("6000d")) {
+        llmModelVolume = """
+                - name: scratch-trt-llm-data
+                  nfs:
+                    server: 10.20.162.212
+                    path: /vol/scratch26/scratch.trt_llm_data
+        """
 
     def podConfig = [
         cloud: targetCould,
@@ -1415,10 +1428,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                 - name: dshm
                   emptyDir:
                     medium: Memory
-                - name: scratch-trt-llm-data
-                  nfs:
-                    server: 10.117.145.14
-                    path: /vol/scratch1/scratch.michaeln_blossom
+                ${llmModelVolume}
                 ${pvcVolume}
         """.stripIndent(),
     ]
