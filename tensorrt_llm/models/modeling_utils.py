@@ -45,7 +45,8 @@ from ..quantization.layers import (FP8Linear, Fp8RowwiseFusedGatedMLP,
                                    WeightOnlyQuantLinear,
                                    WeightOnlyQuantRowLinear)
 from ..quantization.mode import (KV_CACHE_QUANT_ALGO_LIST, QUANT_ALGO_LIST,
-                                 W8A8_SQ_PLUGIN_LIST, QuantAlgo, ActivationScheme)
+                                 W8A8_SQ_PLUGIN_LIST, ActivationScheme,
+                                 QuantAlgo)
 from ..quantization.utils import fp4_utils
 from ..top_model_mixin import TopModelMixin
 from .convert_utils import weight_only_quantize_dict
