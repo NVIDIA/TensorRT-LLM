@@ -349,10 +349,6 @@ def enable_llmapi_debug() -> bool:
     return _enable_llmapi_debug_
 
 
-def orchestrator_type_env() -> Optional[str]:
-    return os.environ.get("TLLM_ORCHESTRATOR_TYPE", None)
-
-
 @cache
 def enable_worker_single_process_for_tp1() -> bool:
     ''' Tell whether to make worker use single process for TP1.
