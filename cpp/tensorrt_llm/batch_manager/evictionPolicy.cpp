@@ -214,9 +214,8 @@ void LRUEvictionPolicy::claimBlock(BlockPtr block, std::optional<executor::Reten
         mNumFreeBlocksPerLevel[cacheLevel] -= 1;
         TLLM_LOG_DEBUG("Decreased mNumFreeBlocksPerLevel[%d] from %d to %d", cacheLevel,
             mNumFreeBlocksPerLevel[cacheLevel] + 1, mNumFreeBlocksPerLevel[cacheLevel]);
+        mFreeBlockIterators[id] = std::nullopt;
     }
-
-    mFreeBlockIterators[id] = std::nullopt;
 
     // Explicitly set priority, if provided
     if (priority.has_value())
@@ -226,7 +225,10 @@ void LRUEvictionPolicy::claimBlock(BlockPtr block, std::optional<executor::Reten
 
     // Detach block from expiring heap (processing of time limited retention priority)
     mExpiringBlockHeap.erase(block);
-    block->setDurationMs(durationMs);
+    if (durationMs.has_value())
+    {
+        block->setDurationMs(durationMs);
+    }
 }
 
 std::chrono::steady_clock::time_point::duration LRUEvictionPolicy::getTime() const

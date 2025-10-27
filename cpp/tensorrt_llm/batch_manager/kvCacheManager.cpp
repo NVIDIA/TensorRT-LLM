@@ -1780,6 +1780,15 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(
     auto const beamWidth = sequence.getBeamWidth();
     SizeType32 numSharedContextBlocks = beamWidth > 1 ? numContextBlocks - 1 : numContextBlocks;
 
+    // Claim all reusable blocks to prevent them from accidentally being overwritten by offloading/onboarding logic
+    for (auto& [partialMatch, numMatched, matchingBlock, matchingNode] : matchedBlocks)
+    {
+        if (matchingBlock != nullptr && !matchingBlock->hasRefs())
+        {
+            mEvictionPolicy->claimBlock(matchingBlock);
+        }
+    }
+
     bool validForReuse = true;
     auto blockItr = matchedBlocks.begin();
     for (int bi = 0; bi < numSharedContextBlocks; ++bi)
@@ -1824,6 +1833,13 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(
                         "sequence %lu",
                         mLogPrefix.c_str(), matchingBlock->getBlockId(), newBlock->getBlockId(), newBlock->getBlockId(),
                         sequence.getRequestId());
+                    if (!matchingBlock->hasRefs())
+                    {
+                        // Release the matching block 
+                        // TODO: Pending copy of matchingBlock to newBlock. Can releasing it cause race condition?
+                        // TODO: Is the entire offload/onboard logic sound? In situations with low free block count, do we know that multiple offload/onboard to same block don't trample?
+                        mEvictionPolicy->releaseBlock(matchingBlock);
+                    }
                     matchingBlock = newBlock;
                 }
                 else
@@ -2186,7 +2202,7 @@ std::pair<SizeType32, std::optional<KVCacheBlock::IdType>> WindowBlockManager::s
     }
     if (mEventManager)
     {
-        TLLM_LOG_DEBUG("%s;%d - mEventManager->enqueueStoredEvent(storedBlocks=%d)", __FILE__, __LINE__, storedBlocks);
+        TLLM_LOG_DEBUG("%s;%d - mEventManager->enqueueStoredEvent(storedBlocks=%d)", __FILE__, __LINE__, static_cast<int>(storedBlocks.size()));
         mEventManager->enqueueStoredEvent(storedBlocks, mWindowSize);
     }
     return {numBlocksStoredForReuse, lastStoredId};
@@ -2379,7 +2395,7 @@ void WindowBlockManager::unpinBlocksById(KVCacheBlock::IdType blockId)
         {
             mEvictionPolicy->releaseBlock(block);
         }
-        block = std::move(block->getPrevBlock());
+        block = block->getPrevBlock();
     }
 }
 
