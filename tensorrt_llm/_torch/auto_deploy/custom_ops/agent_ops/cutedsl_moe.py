@@ -67,8 +67,8 @@ def _pack_routed_tokens(
 
 def fused_mlp_relu2_unquantized(
     hidden_states: torch.Tensor,  # [M, H]
-    w_up: torch.Tensor,  # [E, I, H]
-    w_down: torch.Tensor,  # [E, H, I]
+    w_up: torch.Tensor,  # [E, H, I]
+    w_down: torch.Tensor,  # [E, H, I] -> [E, I, H]
     topk_ids: torch.Tensor,  # [M, top_k]
     topk_weights: torch.Tensor,  # [M, top_k]
     *,
@@ -84,8 +84,8 @@ def fused_mlp_relu2_unquantized(
     device = hidden_states.device
     dtype = hidden_states.dtype
     tokens, hidden_size = hidden_states.shape
-    num_experts, intermediate_size, hidden_size_up = w_up.shape
-    num_experts_down, hidden_size_down, intermediate_size_down = w_down.shape
+    num_experts, hidden_size_up, intermediate_size = w_up.shape
+    num_experts_down, intermediate_size_down, hidden_size_down = w_down.shape
 
     assert num_experts == num_experts_down, "Mismatch in expert count"
     assert hidden_size == hidden_size_up == hidden_size_down, "Hidden size mismatch"
@@ -103,23 +103,21 @@ def fused_mlp_relu2_unquantized(
     if apply_router_weight_on_input:
         gathered = gathered * weights_sorted.unsqueeze(1)
 
-    w_up_gemm = w_up.transpose(1, 2).contiguous()
     preact = torch.empty((total_pairs, intermediate_size), device=device, dtype=dtype)
     postact = torch.empty((total_pairs, intermediate_size), device=device, dtype=dtype)
     gemm_act_tuned(
         A=gathered,
-        B=w_up_gemm,
+        B=w_up,
         preact_out=preact,
         postact_out=postact,
         activation="relu_sq",
         cu_seqlens_m=cu_seqlens,
     )
 
-    w_down_gemm = w_down.transpose(1, 2).contiguous()
     expert_outputs = torch.empty((total_pairs, hidden_size), device=device, dtype=dtype)
     gemm_tuned(
         A=postact,
-        B=w_down_gemm,
+        B=w_down,
         out=expert_outputs,
         cu_seqlens_m=cu_seqlens,
     )

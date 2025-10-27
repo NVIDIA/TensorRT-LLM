@@ -78,6 +78,15 @@ def _insert_fused_moe_ops(gm: GraphModule, backend: str) -> int:
 
         new_key_w_down = f"fused_moe_w2_stacked_{fused_key_counter}"
         fused_key_counter += 1
+        if backend == "cutedsl":
+            # CuteDSL expects the weights to be transposed.
+            fused_w_up_experts = fused_w_up_experts.transpose(
+                1, 2
+            ).contiguous()  # [E, H, I] -> [E, I, H]
+            fused_w_down_experts = fused_w_down_experts.transpose(
+                1, 2
+            ).contiguous()  # [E, I, H] -> [E, H, I]
+
         param_w_up = torch.nn.Parameter(fused_w_up_experts)
         param_w_down = torch.nn.Parameter(fused_w_down_experts)
         gm.register_parameter(new_key_w_up, param_w_up)
