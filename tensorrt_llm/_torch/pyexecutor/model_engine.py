@@ -531,14 +531,17 @@ class PyTorchModelEngine(ModelEngine):
             return result
 
         def get_warmup_request(num_tokens: int,
-                               num_gen_tokens: int,
+                               num_gen_requests: int,
                                least_requests: bool = True):
             available_tokens = kv_cache_manager.get_num_available_tokens(
                 self.runtime_draft_len)
             available_blocks = kv_cache_manager.get_num_free_blocks()
             if num_tokens > self.max_num_tokens or num_tokens > available_tokens:
                 return None
-            if num_gen_tokens > self.batch_size:
+            if num_gen_requests > self.batch_size:
+                return None
+            num_gen_tokens = num_gen_requests * (1 + self.runtime_draft_len)
+            if num_gen_tokens > self.max_num_tokens:
                 return None
 
             num_extra_decoding_steps = get_num_extra_decoding_steps()
@@ -548,7 +551,8 @@ class PyTorchModelEngine(ModelEngine):
                 # during warmup.
                 return None
 
-            num_ctx_tokens = num_tokens - num_gen_tokens
+            num_ctx_tokens = num_tokens - num_gen_requests * (
+                1 + self.runtime_draft_len)
             num_ctx_requests = 0
             ctx_requests = []
             gen_requests = []
@@ -557,7 +561,7 @@ class PyTorchModelEngine(ModelEngine):
             num_full_seqs = 0
             num_left_over_tokens = 0
 
-            max_context_requests = self.batch_size - num_gen_tokens
+            max_context_requests = self.batch_size - num_gen_requests
             if max_context_requests * max_seq_len < num_ctx_tokens:
                 return None
 
@@ -572,7 +576,7 @@ class PyTorchModelEngine(ModelEngine):
 
                 else:
                     max_bs = min(num_ctx_tokens,
-                                 self.batch_size - num_gen_tokens)
+                                 self.batch_size - num_gen_requests)
                     if num_ctx_tokens % max_bs == 0:
                         num_full_seqs = max_bs
                     else:
@@ -583,13 +587,13 @@ class PyTorchModelEngine(ModelEngine):
                                                     > 0 else 0)
 
             # We do not have enough batch to fill the request
-            if num_ctx_requests + num_gen_tokens > self.batch_size:
+            if num_ctx_requests + num_gen_requests > self.batch_size:
                 return None
 
             blocks_to_use = num_full_seqs * math.ceil(
                 max_seq_len / kv_cache_manager.tokens_per_block) + math.ceil(
                     num_left_over_tokens /
-                    kv_cache_manager.tokens_per_block) + num_gen_tokens
+                    kv_cache_manager.tokens_per_block) + num_gen_requests
 
             if blocks_to_use > available_blocks:
                 return None
@@ -604,18 +608,20 @@ class PyTorchModelEngine(ModelEngine):
                     token_nums=ctx_token_nums,
                     is_gen=False,
                     max_num_draft_tokens=self.runtime_draft_len,
-                    use_mrope=self.use_mrope)
+                    use_mrope=self.use_mrope,
+                    max_beam_width=self.max_beam_width,
+                    num_extra_decoding_steps=num_extra_decoding_steps)
 
                 if spec_resource_manager is not None:
                     spec_resource_manager.add_dummy_requests(
                         request_ids=list(range(num_ctx_requests)))
 
-            if num_gen_tokens > 0:
+            if num_gen_requests > 0:
                 gen_requests = kv_cache_manager.add_dummy_requests(
                     list(
                         range(num_ctx_requests,
-                              num_ctx_requests + num_gen_tokens)),
-                    token_nums=[1] * num_gen_tokens,
+                              num_ctx_requests + num_gen_requests)),
+                    token_nums=[1] * num_gen_requests,
                     is_gen=True,
                     max_num_draft_tokens=self.max_draft_len,
                     use_mrope=self.use_mrope,
@@ -624,7 +630,7 @@ class PyTorchModelEngine(ModelEngine):
                 if spec_resource_manager is not None:
                     spec_resource_manager.add_dummy_requests(request_ids=list(
                         range(num_ctx_requests, num_ctx_requests +
-                              num_gen_tokens)))
+                              num_gen_requests)))
 
             result = ScheduledRequests()
             result.context_requests = ctx_requests
@@ -657,10 +663,13 @@ class PyTorchModelEngine(ModelEngine):
             return
 
         def general_warmup(reverse: bool = False):
+            max_batch_size = min(
+                self.batch_size,
+                curr_max_num_tokens // (1 + self.runtime_draft_len))
             warmup_requests = set([
                 (1, 1),  # Specialize for 1 token.
-                (self.batch_size,
-                 self.batch_size),  # max_batch_size, pure generation
+                (max_batch_size,
+                 max_batch_size),  # max_batch_size, pure generation
                 (2, 0),  # Non-one, pure context
                 (curr_max_num_tokens, 0),  # max_num_tokens, pure context
             ])
@@ -816,11 +825,11 @@ class PyTorchModelEngine(ModelEngine):
 
                     torch.cuda.synchronize()
 
-        # Also, we run a general warmup from large to small to make sure that blocks are allocated well.
-        # The cudagraph and piecewise cuda graph capture calls torch.cuda.empty_cache() and block may already
-        # be freed even we calls general_warmup for torch compile.
-        # Also the additional warmup helps trigger the runtime jit to avoid runtime jit overhead.
-        general_warmup(reverse=True)
+            # Also, we run a general warmup from large to small to make sure that blocks are allocated well.
+            # The cudagraph and piecewise cuda graph capture calls torch.cuda.empty_cache() and block may already
+            # be freed even we calls general_warmup for torch compile.
+            # Also the additional warmup helps trigger the runtime jit to avoid runtime jit overhead.
+            general_warmup(reverse=True)
 
         # Set the value back to the original value
         self.enable_spec_decode = self.is_spec_decode
