@@ -515,8 +515,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::arg("event_manager") = nullptr, nb::arg("enable_partial_reuse") = true,
             nb::arg("copy_on_partial_reuse") = true, nb::arg("kv_connector_manager") = nullptr,
             nb::arg("enable_indexer_k_cache") = false, nb::arg("indexer_k_cache_quant_block_size") = 128,
-            nb::arg("indexer_k_cache_index_head_dim") = 0,
-            nb::call_guard<nb::gil_scoped_release>());
+            nb::arg("indexer_k_cache_index_head_dim") = 0, nb::call_guard<nb::gil_scoped_release>());
 }
 
 void tb::BasePeftCacheManagerBindings::initBindings(nb::module_& m)

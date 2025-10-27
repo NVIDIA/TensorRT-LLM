@@ -46,6 +46,24 @@ except ImportError:
     HAS_FAST_HADAMARD = False
 
 
+def _unravel_indices(flat_indices: torch.Tensor,
+                     shape: Tuple[int, ...]) -> Tuple[torch.Tensor, ...]:
+    """
+    Unravel indices into multiple dimensions.
+    """
+    d3 = shape[3]
+    i3 = flat_indices % d3
+    flat_indices = flat_indices // d3
+    d2 = shape[2]
+    i2 = flat_indices % d2
+    flat_indices = flat_indices // d2
+    d1 = shape[1]
+    i1 = flat_indices % d1
+    flat_indices = flat_indices // d1
+    i0 = flat_indices
+    return i0, i1, i2, i3
+
+
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     assert x.dtype == torch.bfloat16
 
@@ -838,8 +856,8 @@ class Indexer(nn.Module):
             0)  # [1, head_dim]
         scatter_indices_fp8 = flat_indices_fp8.unsqueeze(
             1) + byte_offsets  # [num_tokens, head_dim]
-        scatter_indices_fp8 = torch.unravel_index(scatter_indices_fp8,
-                                                  k_cache.shape)
+        scatter_indices_fp8 = _unravel_indices(scatter_indices_fp8,
+                                               k_cache.shape)
         k_cache[scatter_indices_fp8] = k_fp8_bytes
 
         flat_indices_scale = metadata.slot_mapping_scale[:num_tokens]
@@ -847,8 +865,8 @@ class Indexer(nn.Module):
             scale_size, device=k_cache.device).unsqueeze(0)  # [1, scale_size]
         scatter_indices_scale = flat_indices_scale.unsqueeze(
             1) + byte_offsets  # [num_tokens, scale_size]
-        scatter_indices_scale = torch.unravel_index(scatter_indices_scale,
-                                                    k_cache.shape)
+        scatter_indices_scale = _unravel_indices(scatter_indices_scale,
+                                                 k_cache.shape)
         k_cache[scatter_indices_scale] = k_scale_bytes
 
     def _gather_k_cache_for_chunk(
@@ -892,8 +910,7 @@ class Indexer(nn.Module):
             head_dim, device=k_cache.device).unsqueeze(0)  # [1, head_dim]
         gather_indices_fp8 = slot_mapping_fp8_chunk.unsqueeze(
             1) + byte_offsets_fp8  # [num_k_tokens, head_dim]
-        gather_indices_fp8 = torch.unravel_index(gather_indices_fp8,
-                                                 k_cache.shape)
+        gather_indices_fp8 = _unravel_indices(gather_indices_fp8, k_cache.shape)
         k_fp8_bytes = k_cache[gather_indices_fp8]
         k_fp8 = k_fp8_bytes.view(torch.float8_e4m3fn).view(
             num_k_tokens, head_dim)
@@ -903,8 +920,8 @@ class Indexer(nn.Module):
             scale_size, device=k_cache.device).unsqueeze(0)  # [1, 4]
         gather_indices_scale = slot_mapping_scale_chunk.unsqueeze(
             1) + byte_offsets_scale  # [num_k_tokens, 4]
-        gather_indices_scale = torch.unravel_index(gather_indices_scale,
-                                                   k_cache.shape)
+        gather_indices_scale = _unravel_indices(gather_indices_scale,
+                                                k_cache.shape)
         k_scale_bytes = k_cache[gather_indices_scale]
         k_scale = k_scale_bytes.view(torch.float32).view(num_k_tokens, 1)
 

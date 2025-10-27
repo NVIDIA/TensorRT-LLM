@@ -537,9 +537,11 @@ public:
     // FP4 KV caches have extra pools that contain second level scales for dequantization.
     bool containsBlockScales;
     bool containsIndexerKCache;
+
     KVCacheBlockPool(SizeType32 numLayers, SizeType32 kvFactor, SizeType32 numKvHeads, SizeType32 sizePerHead,
         SizeType32 tokensPerBlock, runtime::ITensor::SharedPtr primaryPtr = nullptr,
-        runtime::ITensor::SharedPtr secondaryPtr = nullptr, bool containsBlockScales = false, bool containsIndexerKCache = false)
+        runtime::ITensor::SharedPtr secondaryPtr = nullptr, bool containsBlockScales = false,
+        bool containsIndexerKCache = false)
         : numLayers(numLayers)
         , kvFactor(kvFactor)
         , numKvHeads(numKvHeads)
@@ -725,7 +727,8 @@ public:
 #endif
     }
 
-    [[nodiscard]] SizeType32 getNumPools(bool includeBlockScalePools = true, bool includeIndexerKCachePools = true) const noexcept
+    [[nodiscard]] SizeType32 getNumPools(
+        bool includeBlockScalePools = true, bool includeIndexerKCachePools = true) const noexcept
     {
         if (includeBlockScalePools && includeIndexerKCachePools)
         {
@@ -1008,7 +1011,8 @@ public:
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enablePartialReuse = true,
         bool copyOnPartialReuse = true,
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
-        std::optional<kvc::BaseAgentConfig> agentConfig = std::nullopt, bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128, SizeType32 indexerKCacheIndexHeadDim = 0);
+        std::optional<kvc::BaseAgentConfig> agentConfig = std::nullopt, bool enableIndexerKCache = false,
+        SizeType32 indexerKCacheQuantBlockSize = 128, SizeType32 indexerKCacheIndexHeadDim = 0);
 
     BlockManager(BlockManager const&) = delete;
     BlockManager& operator=(BlockManager const&) = delete;
@@ -1188,9 +1192,11 @@ public:
         return getPool(poolIdx).blockSize;
     }
 
-    [[nodiscard]] SizeType32 getNumPools(bool includeBlockScalePools = true, bool includeIndexerKCachePools = true) const
+    [[nodiscard]] SizeType32 getNumPools(
+        bool includeBlockScalePools = true, bool includeIndexerKCachePools = true) const
     {
-        return sumWindows([includeBlockScalePools, includeIndexerKCachePools](auto const& manager) { return manager.getNumPools(includeBlockScalePools, includeIndexerKCachePools); });
+        return sumWindows([includeBlockScalePools, includeIndexerKCachePools](auto const& manager)
+            { return manager.getNumPools(includeBlockScalePools, includeIndexerKCachePools); });
     }
 
     [[nodiscard]] std::map<SizeType32, WindowSizeMetadata> const& getWindowSizesMetadata() const noexcept
@@ -1615,7 +1621,9 @@ public:
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enablePartialReuse = true,
         bool copyOnpartialReuse = true,
-        std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr, bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128, SizeType32 indexerKCacheIndexHeadDim = 0);
+        std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
+        bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
+        SizeType32 indexerKCacheIndexHeadDim = 0);
 
     KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
@@ -1626,7 +1634,9 @@ public:
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enablePartialReuse = true,
         bool copyOnpartialReuse = true,
-        std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr, bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128, SizeType32 indexerKCacheIndexHeadDim = 0);
+        std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
+        bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
+        SizeType32 indexerKCacheIndexHeadDim = 0);
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
@@ -1637,7 +1647,9 @@ public:
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enablePartialReuse = true,
         bool copyOnpartialReuse = true,
-        std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr, bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128, SizeType32 indexerKCacheIndexHeadDim = 0);
+        std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
+        bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
+        SizeType32 indexerKCacheIndexHeadDim = 0);
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
@@ -1645,7 +1657,8 @@ public:
         std::optional<TempAttentionWindowInputs> const& tempAttentionWindowInputs, nvinfer1::DataType dtype,
         SizeType32 sinkTokenLength, int64_t stream, SizeType32 maxSequenceLength, bool enableBlockReuse = false,
         bool onboardBlocks = true, CacheType cacheType = CacheType::kSELF, bool enablePartialReuse = true,
-        bool copyOnpartialReuse = true, bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128, SizeType32 indexerKCacheIndexHeadDim = 0);
+        bool copyOnpartialReuse = true, bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
+        SizeType32 indexerKCacheIndexHeadDim = 0);
 
     ~KVCacheManager() override = default;
 
