@@ -169,13 +169,14 @@ class BaseSparseAttentionConfig(StrictBaseModel):
     """
     Configuration for sparse attention.
     """
+    algorithm: Literal["rocket"] = Field(
+        default="rocket", description="The algorithm for sparse attention.")
 
     @classmethod
     def from_dict(cls, data: dict):
         # dispatch to the correct sparse attention config
         config_classes = {
             "rocket": RocketSparseAttentionConfig,
-            "dsa": DeepSeekSparseAttentionConfig,
         }
 
         algorithm = data.get("algorithm", None)
@@ -186,9 +187,6 @@ class BaseSparseAttentionConfig(StrictBaseModel):
         if config_class is None:
             raise ValueError(f"Invalid algorithm: {algorithm}")
 
-        # Remove 'algorithm' before passing to subclass constructor
-        # It's a ClassVar in subclasses, and used for dispatching to the correct subclass
-        data = {k: v for k, v in data.items() if k != 'algorithm'}
         return config_class(**data)
 
     def _check_fields(self):
@@ -204,9 +202,8 @@ class BaseSparseAttentionConfig(StrictBaseModel):
 
 class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
     """
-    Configuration for RocketKV sparse attention.
+    Configuration for rocket sparse attention.
     """
-    algorithm: ClassVar[str] = "rocket"
     window_size: Optional[int] = Field(
         default=None, description="The window size for snap KV.")
     kernel_size: Optional[int] = Field(
@@ -216,28 +213,6 @@ class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
     prompt_budget: Optional[int] = Field(default=1266,
                                          description="Prompt budget")
     page_size: Optional[int] = Field(default=3, description="Page size")
-
-    @classmethod
-    def from_dict(cls, data: dict):
-        return cls(**data)
-
-    def supports_backend(self, backend: str) -> bool:
-        return backend == "pytorch"
-
-
-class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
-    """
-    Configuration for DeepSeek Sparse Attention.
-    """
-    algorithm: ClassVar[str] = "dsa"
-    index_n_heads: Optional[int] = Field(
-        default=None, description="The number of heads for the indexer.")
-    index_head_dim: Optional[int] = Field(
-        default=None, description="The dimension of the indexer heads.")
-    index_topk: Optional[int] = Field(default=None,
-                                      description="The topk for the indexer.")
-    indexer_max_chunk_size: Optional[int] = Field(
-        default=None, description="The maximum chunk size for the indexer.")
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -1239,7 +1214,6 @@ SpeculativeConfig: TypeAlias = Optional[Union[
 
 SparseAttentionConfig: TypeAlias = Union[
     RocketSparseAttentionConfig,
-    DeepSeekSparseAttentionConfig,
 ]
 
 
@@ -2900,15 +2874,11 @@ def update_llm_args_with_extra_dict(
         "lora_config": LoraConfig,
         "moe_config": MoeConfig,
         "attention_dp_config": AttentionDpConfig,
-        "sparse_attention_config": BaseSparseAttentionConfig,
     }
     for field_name, field_type in field_mapping.items():
         if field_name in llm_args_dict:
             # Some fields need to be converted manually.
-            if field_name in [
-                    "speculative_config", "build_config",
-                    "sparse_attention_config"
-            ]:
+            if field_name in ["speculative_config", "build_config"]:
                 llm_args_dict[field_name] = field_type.from_dict(
                     llm_args_dict[field_name])
             else:

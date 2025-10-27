@@ -384,7 +384,6 @@ def create_py_executor(
 
     max_seq_len = model_engine_max_seq_len
     max_num_tokens = model_engine.max_num_tokens
-    sparse_attention_config = model_engine.sparse_attention_config
 
     config = model_engine.model.model_config.pretrained_config
     if is_mla(config):
@@ -555,7 +554,7 @@ def create_py_executor(
             pytorch_backend_config=pytorch_backend_config,
             speculative_config=spec_config,
             profiling_stage_data=profiling_stage_data,
-            sparse_attention_config=sparse_attention_config,
+            sparse_attention_config=llm_args.sparse_attention_config,
         )
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
         with mem_monitor.observe_creation_stage(
