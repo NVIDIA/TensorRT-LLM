@@ -159,6 +159,7 @@ SamplingConfig Serialization::deserializeSamplingConfig(std::istream& is)
     auto repetitionPenalty = su::deserialize<std::optional<FloatType>>(is);
     auto presencePenalty = su::deserialize<std::optional<FloatType>>(is);
     auto frequencyPenalty = su::deserialize<std::optional<FloatType>>(is);
+    auto promptIgnoreLength = su::deserialize<std::optional<SizeType32>>(is);
     auto lengthPenalty = su::deserialize<std::optional<FloatType>>(is);
     auto earlyStopping = su::deserialize<std::optional<SizeType32>>(is);
     auto noRepeatNgramSize = su::deserialize<std::optional<SizeType32>>(is);
@@ -167,8 +168,8 @@ SamplingConfig Serialization::deserializeSamplingConfig(std::istream& is)
     auto beamWidthArray = su::deserialize<std::optional<std::vector<SizeType32>>>(is);
 
     return SamplingConfig{beamWidth, topK, topP, topPMin, topPResetIds, topPDecay, randomSeed, temperature, minLength,
-        beamSearchDiversityRate, repetitionPenalty, presencePenalty, frequencyPenalty, lengthPenalty, earlyStopping,
-        noRepeatNgramSize, numReturnSequences, minP, beamWidthArray};
+        beamSearchDiversityRate, repetitionPenalty, presencePenalty, frequencyPenalty, promptIgnoreLength,
+        lengthPenalty, earlyStopping, noRepeatNgramSize, numReturnSequences, minP, beamWidthArray};
 }
 
 void Serialization::serialize(SamplingConfig const& config, std::ostream& os)
@@ -186,6 +187,7 @@ void Serialization::serialize(SamplingConfig const& config, std::ostream& os)
     su::serialize(config.mRepetitionPenalty, os);
     su::serialize(config.mPresencePenalty, os);
     su::serialize(config.mFrequencyPenalty, os);
+    su::serialize(config.mPromptIgnoreLength, os);
     su::serialize(config.mLengthPenalty, os);
     su::serialize(config.mEarlyStopping, os);
     su::serialize(config.mNoRepeatNgramSize, os);
@@ -210,6 +212,7 @@ size_t Serialization::serializedSize(SamplingConfig const& config)
     totalSize += su::serializedSize(config.mRepetitionPenalty);
     totalSize += su::serializedSize(config.mPresencePenalty);
     totalSize += su::serializedSize(config.mFrequencyPenalty);
+    totalSize += su::serializedSize(config.mPromptIgnoreLength);
     totalSize += su::serializedSize(config.mLengthPenalty);
     totalSize += su::serializedSize(config.mEarlyStopping);
     totalSize += su::serializedSize(config.mNoRepeatNgramSize);
