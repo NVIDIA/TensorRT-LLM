@@ -161,25 +161,6 @@ l0_dgx_h100:
       - '*h100*'
       linux_distribution_name: ubuntu*
     terms:
-      stage: post_merge
-      backend: pytorch
-      auto_trigger: deepseek
-      orchestrator: mpi
-  tests:
-  - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[DeepSeek-V3-Lite-bf16]
-  - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[llama-v3-8b-hf]
-  - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[llama-3.1-8b-instruct-hf-fp8]
-  - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[DeepSeek-V3-Lite-fp8]
-- condition:
-    ranges:
-      system_gpu_count:
-        gte: 4
-        lte: 4
-    wildcards:
-      gpu:
-      - '*h100*'
-      linux_distribution_name: ubuntu*
-    terms:
       stage: pre_merge
       backend: pytorch
       auto_trigger: gpt_oss
