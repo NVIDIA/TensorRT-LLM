@@ -35,10 +35,11 @@ python scan_build_artifacts.py --validate
 
 ```yaml
 summary:
-  total_artifacts: 6198
-  mapped: 6198
+  total_artifacts: 6200
+  mapped: 6200
   unmapped: 0
-  coverage: "100.0%"
+  coverage: 100.0%
+  unique_dependencies: 48
 
 dependencies:
   cuda-cudart:
@@ -59,12 +60,9 @@ dependencies:
 
 ```yaml
 summary:
-  count: 36
-  action_required: "Add patterns to YAML files in metadata/"
-
-artifacts:
-  - /build/3rdparty/newlib/include/foo.h
-  - /build/unknown/libmystery.so
+  count: 0
+  action_required: Add patterns to YAML files in metadata/ for these artifacts
+artifacts: []
 ```
 
 ## Iterative Workflow
@@ -89,18 +87,16 @@ Edit existing or create new YAML file in `metadata/`:
 
 ```yaml
 name: newlib
-version: "4.0"
 description: Newlib C library for embedded systems
 
-patterns:
+basename_matches:
   - libnewlib.so
 
-linker_flags:
+linker_flags_matches:
   - -lnewlib
 
-path_components:
+directory_matches:
   - newlib
-  - 3rdparty/newlib
 ```
 
 See `metadata/_template.yml` and `metadata/README.md` for details.
@@ -111,23 +107,23 @@ Each dependency file contains:
 
 ```yaml
 name: pytorch
-version: "2.0"
 description: PyTorch machine learning framework
 license: BSD-3-Clause
 copyright: Copyright (c) PyTorch Contributors
 homepage: https://pytorch.org/
 source: pip
 
-patterns:
+basename_matches:
   - libtorch.so
   - libc10.so
 
-linker_flags:
-  - -ltorch
-  - -lc10
+linker_flags_matches:
+  - -ltorch_python
 
-path_components:
-  - pytorch
+directory_matches:
+  - ATen
+  - c10
+  - caffe2
   - torch
 
 aliases:
@@ -188,7 +184,7 @@ scan_build_artifacts.py (1,000 lines)
 ## Files
 
 - `scan_build_artifacts.py` - Main scanner script
-- `metadata/*.yml` - Dependency patterns (8 dependencies defined)
+- `metadata/*.yml` - Dependency patterns (48 dependencies defined)
 - `metadata/_template.yml` - Template for new dependencies
 - `metadata/_schema.yml` - YAML validation schema
 - `metadata/README.md` - Pattern documentation

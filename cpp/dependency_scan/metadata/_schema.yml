@@ -66,7 +66,7 @@ properties:
       type: string
       minLength: 1
     uniqueItems: true
-    description: "Path components that indicate this dependency"
+    description: "Path components that indicate this dependency (exact match of subdirectory)"
 
   aliases:
     type: array

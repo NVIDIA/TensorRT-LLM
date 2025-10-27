@@ -351,6 +351,9 @@ class ArtifactCollector:
         context_dir = d_file.parent
 
         for header_path in header_paths:
+            # Store original relative path before joining (for 3rdparty resolution)
+            original_header_path = header_path
+
             # Resolve relative paths
             if not os.path.isabs(header_path):
                 header_path = os.path.join(context_dir, header_path)
@@ -361,14 +364,17 @@ class ArtifactCollector:
 
                 # If path doesn't exist and contains '3rdparty/', try resolving from tensorrt_llm root
                 if not os.path.exists(
-                        canonical_path) and '3rdparty/' in header_path:
-                    # Extract the part starting from '3rdparty/'
-                    parts = header_path.split('3rdparty/')
-                    if len(parts) >= 2:
+                        canonical_path) and '3rdparty/' in original_header_path:
+                    # Extract the part starting from FIRST '3rdparty/' in ORIGINAL path (handles nested 3rdparty dirs)
+                    # e.g., ../../../../3rdparty/xgrammar/3rdparty/picojson/picojson.h
+                    # should extract: xgrammar/3rdparty/picojson/picojson.h
+                    idx = original_header_path.find('3rdparty/')
+                    if idx != -1:
+                        relative_part = original_header_path[idx +
+                                                             len('3rdparty/'):]
                         # Find tensorrt_llm root (go up from cpp/build or cpp/dependency_scan)
                         tensorrt_llm_root = Path(__file__).parent.parent.parent
-                        alternative_path = tensorrt_llm_root / '3rdparty' / parts[
-                            -1]
+                        alternative_path = tensorrt_llm_root / '3rdparty' / relative_part
                         alternative_canonical = os.path.realpath(
                             str(alternative_path))
 
@@ -422,11 +428,12 @@ class ArtifactCollector:
 
                 if os.path.exists(canonical_path):
                     artifacts.append(
-                        Artifact(path=canonical_path,
-                                 type='header',
-                                 source=str(d_file),
-                                 context_dir=str(context_dir),
-                                 metadata={'original_path': header_path}))
+                        Artifact(
+                            path=canonical_path,
+                            type='header',
+                            source=str(d_file),
+                            context_dir=str(context_dir),
+                            metadata={'original_path': original_header_path}))
             except Exception:
                 continue
 
@@ -619,8 +626,8 @@ class PatternMatcher:
     Resolves artifacts using YAML files from dependencies/ directory (FALLBACK strategy for non-dpkg packages).
 
     Provides 3-tier resolution strategy:
-      1. Exact pattern matching (patterns and linker_flags)
-      2. Path alias matching (path_components and aliases - rightmost match wins)
+      1. Exact pattern matching (basename_matches and linker_flags_matches)
+      2. Path alias matching (directory_matches and aliases - rightmost match wins)
       3. Generic library name inference (fallback)
 
     YAML files are loaded from dependencies/ directory:
@@ -640,8 +647,16 @@ class PatternMatcher:
         """
         self.pattern_mappings: Dict[str, str] = {}
         self.path_aliases: Dict[str, str] = {}
+        self.known_names: Set[str] = set(
+        )  # Track all known dependency names/aliases
         self._schema = None
         self._duplicate_warnings: Set[str] = set()
+
+        # Vendor directory magic strings (industry-standard patterns)
+        self.vendor_patterns = [
+            '3rdparty/', 'third-party/', 'thirdparty/', 'third_party/',
+            'external/', 'externals/', 'vendor/', 'vendored/', 'deps/'
+        ]
 
         # Load schema if available
         schema_file = metadata_dir / "_schema.yml"
@@ -660,10 +675,10 @@ class PatternMatcher:
           1. Find all *.yml files (except those starting with '_')
           2. Load each file and validate against schema
           3. Handle two formats:
-             - Individual dependency files (with name, patterns, etc.)
+             - Individual dependency files (with name, basename_matches, etc.)
              - dpkg.yml with dependencies: list format
-          4. Merge all patterns/linker_flags into pattern_mappings
-          5. Merge all path_components/aliases into path_aliases
+          4. Merge all basename_matches/linker_flags_matches into pattern_mappings
+          5. Merge all directory_matches/aliases into path_aliases
           6. Warn about validation errors and duplicates
         """
         yaml_files = sorted([
@@ -675,8 +690,9 @@ class PatternMatcher:
                 with open(yaml_file, 'r') as f:
                     data = yaml.safe_load(f)
 
-                # Handle dpkg.yml format (list of dependencies)
-                if yaml_file.name == "dpkg.yml" and "dependencies" in data:
+                # Handle files with dependencies list (e.g., dpkg.yml, cuda.yml)
+                if "dependencies" in data and isinstance(
+                        data["dependencies"], list):
                     for dep_data in data["dependencies"]:
                         self._process_dependency(dep_data, yaml_file)
                 # Handle individual dependency files
@@ -710,7 +726,7 @@ class PatternMatcher:
                 print(
                     f"Warning: Validation error in {source_file.name}: {e.message}",
                     file=sys.stderr)
-                return
+                # Continue processing despite validation errors
 
         dependency_name = dep_data.get("name")
         if not dependency_name:
@@ -718,20 +734,20 @@ class PatternMatcher:
                   file=sys.stderr)
             return
 
-        # Merge patterns into pattern_mappings
-        patterns = dep_data.get("patterns", [])
-        for pattern in patterns:
+        # Merge basename_matches into pattern_mappings
+        basename_matches = dep_data.get("basename_matches", [])
+        for pattern in basename_matches:
             if pattern in self.pattern_mappings and pattern not in self._duplicate_warnings:
                 print(
-                    f"Warning: Duplicate pattern '{pattern}' found in {source_file.name} "
+                    f"Warning: Duplicate basename match '{pattern}' found in {source_file.name} "
                     f"(previously mapped to '{self.pattern_mappings[pattern]}', now '{dependency_name}')",
                     file=sys.stderr)
                 self._duplicate_warnings.add(pattern)
             self.pattern_mappings[pattern] = dependency_name
 
-        # Merge linker_flags into pattern_mappings
-        linker_flags = dep_data.get("linker_flags", [])
-        for flag in linker_flags:
+        # Merge linker_flags_matches into pattern_mappings
+        linker_flags_matches = dep_data.get("linker_flags_matches", [])
+        for flag in linker_flags_matches:
             if flag in self.pattern_mappings and flag not in self._duplicate_warnings:
                 print(
                     f"Warning: Duplicate linker flag '{flag}' found in {source_file.name} "
@@ -740,9 +756,9 @@ class PatternMatcher:
                 self._duplicate_warnings.add(flag)
             self.pattern_mappings[flag] = dependency_name
 
-        # Merge path_components into path_aliases
-        path_components = dep_data.get("path_components", [])
-        for component in path_components:
+        # Merge directory_matches into path_aliases
+        directory_matches = dep_data.get("directory_matches", [])
+        for component in directory_matches:
             if component in self.path_aliases and component not in self._duplicate_warnings:
                 print(
                     f"Warning: Duplicate path component '{component}' found in {source_file.name} "
@@ -762,18 +778,25 @@ class PatternMatcher:
                 self._duplicate_warnings.add(alias)
             self.path_aliases[alias] = dependency_name
 
+        # Track known dependency names (for nested vendor detection)
+        self.known_names.add(dependency_name.lower())
+        for alias in aliases:
+            self.known_names.add(alias.lower())
+        for component in directory_matches:
+            self.known_names.add(component.lower())
+
     def match(self, artifact: Artifact) -> Optional[Mapping]:
         """
         Match artifact using 3-tier strategy.
 
         Algorithm:
-          1. Try exact pattern matching (patterns and linker_flags - highest confidence)
-          2. Try path alias matching (path_components and aliases - rightmost directory wins)
+          1. Try pattern matching (basename_matches and linker_flags_matches - exact match only - highest confidence)
+          2. Try path alias matching (directory_matches and aliases - rightmost directory wins)
           3. Try generic library name inference (lowest confidence)
           4. Return first match or None
         """
-        # Strategy 1: Exact pattern matching
-        result = self._match_exact_library(artifact)
+        # Strategy 1: Pattern matching (exact match only)
+        result = self._match_patterns(artifact)
         if result:
             return result
 
@@ -789,20 +812,24 @@ class PatternMatcher:
 
         return None
 
-    def _match_exact_library(self, artifact: Artifact) -> Optional[Mapping]:
+    def _match_patterns(self, artifact: Artifact) -> Optional[Mapping]:
         """
-        Match using exact pattern_mappings dictionary (exact match first, then substring).
+        Match using pattern_mappings dictionary (exact match only).
+
+        Only performs exact matching against basename_matches from YAML files.
+        Substring matching has been removed to prevent false positives.
 
         Algorithm:
           1. Try exact match on basename (e.g., "libcudart.so.12")
           2. Try exact match on full path (e.g., "-lpthread")
-          3. Try substring match on path (e.g., "deep_ep_cpp_tllm.cpython" in path)
-          4. Return mapped dependency with HIGH confidence
+          3. Return mapped dependency with HIGH confidence
 
         Examples:
-          -lpthread → libc6 (exact match - high confidence)
-          libcudart.so.12 → cuda-cudart-12 (exact match - high confidence)
-          deep_ep_cpp_tllm.cpython-312-x86_64-linux-gnu.so → deepep (substring match - high confidence)
+          -lpthread → libc6 (exact basename match)
+          libcudart.so.12 → cuda-cudart-12 (exact basename match)
+
+        Note: For partial path matching, use directory_matches in YAML files.
+              Directory matches work on whole directory names (e.g., "fmt/" in path).
 
         Reference: dep-detective/dep_detective/providers/utilities/library_mapper.py:37-53
         """
@@ -824,14 +851,8 @@ class PatternMatcher:
                            strategy='exact_pattern_match',
                            metadata={'matched_key': artifact.path})
 
-        # Try substring match (for bundled binaries and other substring patterns)
-        for pattern, dependency in self.pattern_mappings.items():
-            if pattern in artifact.path:
-                return Mapping(artifact=artifact,
-                               dependency=dependency,
-                               confidence='high',
-                               strategy='substring_pattern_match',
-                               metadata={'matched_pattern': pattern})
+        # Substring matching removed - too high risk for false positives
+        # Use directory_matches instead for safe partial path matching
 
         return None
 
@@ -898,6 +919,78 @@ class PatternMatcher:
                            confidence='low',
                            strategy='generic_library_inference',
                            metadata={'inferred_from': basename})
+
+        return None
+
+    def extract_vendor_components(self, path: str) -> List[tuple]:
+        """
+        Extract all vendor components from a path using magic strings.
+
+        Args:
+            path: Artifact path to scan
+
+        Returns:
+            List of (pattern, component) tuples for each vendor boundary found
+
+        Example:
+            "/3rdparty/xgrammar/3rdparty/picojson/file.h" →
+            [("3rdparty/", "xgrammar"), ("3rdparty/", "picojson")]
+        """
+        components = []
+        path_lower = path.lower()
+
+        for pattern in self.vendor_patterns:
+            idx = 0
+            while True:
+                idx = path_lower.find(pattern, idx)
+                if idx == -1:
+                    break
+
+                # Extract component name after the pattern
+                start = idx + len(pattern)
+                end = path_lower.find('/', start)
+                if end == -1:
+                    end = len(path_lower)
+
+                component = path[start:end]  # Use original case
+                if component:  # Skip empty components
+                    components.append((pattern, component))
+
+                idx = end
+
+        return components
+
+    def find_unknown_vendor_boundaries(self,
+                                       artifact: Artifact) -> Optional[str]:
+        """
+        Check if artifact contains any unknown vendor boundaries.
+
+        Unified vendor boundary policy: ANY component following a vendor pattern
+        (3rdparty/, vendor/, external/, etc.) MUST be in the known allowlist.
+
+        Returns:
+            Name of unknown vendor boundary component, or None if all are known
+
+        Examples:
+            Path: "/3rdparty/xgrammar/src/file.h"
+            Components: ["xgrammar"]
+            If "xgrammar" is known → returns None (OK)
+
+            Path: "/3rdparty/unknown-lib/file.h"
+            Components: ["unknown-lib"]
+            If "unknown-lib" is NOT known → returns "unknown-lib" (REJECT)
+
+            Path: "/3rdparty/xgrammar/3rdparty/picojson/file.h"
+            Components: ["xgrammar", "picojson"]
+            If "picojson" is NOT known → returns "picojson" (REJECT)
+        """
+        components = self.extract_vendor_components(artifact.path)
+
+        # Check ALL vendor boundaries (rightmost has priority for detection)
+        for pattern, component in reversed(components):
+            component_lower = component.lower()
+            if component_lower not in self.known_names:
+                return component
 
         return None
 
@@ -1225,7 +1318,17 @@ Examples:
     for artifact in remaining_artifacts:
         mapping = pattern_matcher.match(artifact)
         if mapping:
-            pattern_mappings.append(mapping)
+            # Check for unknown vendor boundaries BEFORE accepting the mapping
+            unknown_vendor = pattern_matcher.find_unknown_vendor_boundaries(
+                artifact)
+            if unknown_vendor:
+                # Artifact has unknown vendor boundary - treat as unknown
+                # Don't add to pattern_mappings (will be in unknown.yml)
+                print(
+                    f"  WARNING: Unknown vendor boundary '{unknown_vendor}' found in: {artifact.path}",
+                    file=sys.stderr)
+            else:
+                pattern_mappings.append(mapping)
 
     print(
         f"  Resolved {len(pattern_mappings)} additional artifacts via patterns ({len(pattern_mappings) / len(artifacts) * 100:.1f}%)"

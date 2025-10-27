@@ -1,71 +1,15 @@
-# Template for creating new dependency files
-#
-# Usage:
-#   1. Copy this file: cp _template.yml my-dependency.yml
-#   2. Fill in the fields below
-#   3. Run scanner to validate
-#
-# Example:
-#   cp _template.yml my-library.yml
-#   vim my-library.yml  # Edit fields
-#   python ../scan_build_artifacts.py --build-dir /path --output-dir validation_output
-
-# === Required Fields ===
-
-# Canonical dependency name (lowercase, hyphenated)
 name: my-dependency
-
-# Version string (semantic versioning recommended)
-version: "1.0.0"
-
-# Brief description of what this dependency does
 description: Brief description of the dependency (minimum 10 characters)
-
-# === Optional Metadata ===
-
-# SPDX license identifier (e.g., "Apache-2.0", "MIT", "GPL-3.0", "Proprietary")
-license: ""
-
-# Copyright notice
-copyright: ""
-
-# URL to project homepage or repository
-homepage: ""
-
-# How this dependency is obtained
-# Options: "apt", "pip", "built-from-source", "bundled", "download", "other"
-source: ""
-
-# === Pattern Matching (at least one section required) ===
-
-# Artifact patterns (library/binary filenames)
-# Scanner tries exact match first, then substring match
-# Examples:
-#   - libexample.so           # Exact match
-#   - libexample.so.1         # Exact match
-#   - example.cpython         # Substring match (for bundled Python extensions)
-patterns:
-  - libexample.so
-  - libexample.so.1
-
-# Linker flags that map to this dependency
-# Examples:
-#   - -lexample
-#   - -lpthread
-linker_flags:
-  - -lexample
-
-# Path components that indicate this dependency
-# When these strings appear in a binary path, map to this dependency
-# Examples:
-#   - example_dir
-#   - example-lib
-path_components:
-  - example_dir
-
-# Other names that should normalize to this dependency
-# Examples:
-#   - example-dev  (development package)
-#   - libexample-dev
+license: ''
+copyright: ''
+homepage: ''
+source: ''
 aliases:
-  - example-dev
+- example-dev
+basename_matches:
+- libexample.so
+- libexample.so.1
+linker_flags_matches:
+- -lexample
+directory_matches:
+- example_dir

@@ -1,20 +1,9 @@
 name: nvshmem
-version: unknown
 description: NVIDIA Shared Memory (NVSHMEM) library for inter-GPU communication
-
 license: NVIDIA
 homepage: https://developer.nvidia.com/nvshmem
 source: bundled
-
-patterns:
-- nvshmem_bootstrap_uid.so
-- nvshmem_transport_ibgda.so
-
-linker_flags: []
-
-path_components:
-- nvshmem-build
-- nvshmem_project-prefix
-- libs/nvshmem
-
 aliases: []
+basename_matches: []
+linker_flags_matches: []
+directory_matches: []

@@ -1,0 +1,14 @@
+name: fmt
+description: A modern formatting library for C++
+license: MIT (with exception)
+copyright: Copyright (c) 2012-2024 Victor Zverovich
+homepage: https://github.com/fmtlib/fmt
+source: bundled
+aliases:
+- fmtlib
+- libfmt
+basename_matches: []
+linker_flags_matches:
+- -lfmt
+directory_matches:
+- fmt

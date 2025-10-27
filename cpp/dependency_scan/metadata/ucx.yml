@@ -1,31 +1,7 @@
 name: ucx
-version: unknown
 description: ucx libraries and components
-patterns:
-- libucm.so.0
-- libucp.so.0
-- libucs.so.0
-- libuct.so.0
-- libuct_cuda.so.0
-- libuct_ib.so.0
-linker_flags: []
-path_components:
-- ucx
-- ucx_ucm
-- ucx_ucm_cuda
-- ucx_ucp
-- ucx_ucs
-- ucx_ucs_fuse
-- ucx_ucs_signal
-- ucx_uct
-- ucx_uct_cma
-- ucx_uct_cuda
-- ucx_uct_cuda_gdrcopy
-- ucx_uct_ib
-- ucx_uct_ib_efa
-- ucx_uct_ib_mlx5
-- ucx_uct_rdmacm
-- ucx_uct_xpmem
-- ucx_ucx_perftest_cuda
-- ucx_ucx_perftest_mad
 aliases: []
+basename_matches: []
+linker_flags_matches: []
+directory_matches:
+- ucx

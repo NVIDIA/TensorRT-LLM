@@ -1,41 +1,10 @@
 name: tensorrt-llm
-version: 1.2.0rc1
 description: TensorRT-LLM core libraries and Python bindings built by this project
-
 license: Apache-2.0
 homepage: https://github.com/NVIDIA/TensorRT-LLM
 source: built-from-source
-
-patterns:
-# Core TensorRT-LLM libraries
-- libtensorrt_llm.so
-- libtensorrt_llm_ucx_wrapper.so
-- libnvinfer_plugin_tensorrt_llm.so
-- libth_common.so
-- libpg_utils.so
-- libdecoder_attention_0.so
-- libdecoder_attention_1.so
-
-# Python bindings
-- bindings.cpython-312-x86_64-linux-gnu.so
-- bindings.cpython-310-x86_64-linux-gnu.so
-- bindings.cpython-311-x86_64-linux-gnu.so
-
-# Deep learning integration bindings
-- deep_ep_cpp_tllm.cpython-312-x86_64-linux-gnu.so
-- deep_ep_cpp_tllm.cpython-310-x86_64-linux-gnu.so
-- deep_ep_cpp_tllm.cpython-311-x86_64-linux-gnu.so
-- deep_gemm_cpp_tllm.cpython-312-x86_64-linux-gnu.so
-- deep_gemm_cpp_tllm.cpython-310-x86_64-linux-gnu.so
-- deep_gemm_cpp_tllm.cpython-311-x86_64-linux-gnu.so
-
-linker_flags: []
-
-path_components:
-- tensorrt_llm/libs
-- tensorrt_llm
-- cpp/tensorrt_llm
-- build/tensorrt_llm
-
 aliases:
 - trtllm
+basename_matches: []
+linker_flags_matches: []
+directory_matches: []

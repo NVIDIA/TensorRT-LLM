@@ -1,0 +1,11 @@
+name: hedley
+description: Header-only C/C++ compatibility library (vendored in nlohmann-json)
+license: CC0-1.0
+copyright: Copyright 2016-2021 Evan Nemerson
+homepage: https://nemequ.github.io/hedley/
+source: bundled
+aliases: []
+basename_matches: []
+linker_flags_matches: []
+directory_matches:
+- hedley

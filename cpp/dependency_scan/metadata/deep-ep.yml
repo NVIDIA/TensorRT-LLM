@@ -1,14 +1,8 @@
 name: deep-ep
-version: unknown
 description: DeepEP distributed execution platform for distributed training
-
 source: bundled
-
-patterns: []
-
-linker_flags: []
-
-path_components:
-- deep_ep_download-src
-
 aliases: []
+basename_matches: []
+linker_flags_matches: []
+directory_matches:
+- deep_ep_download-src
