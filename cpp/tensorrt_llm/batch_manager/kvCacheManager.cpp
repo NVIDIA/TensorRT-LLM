@@ -1835,9 +1835,10 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(
                         sequence.getRequestId());
                     if (!matchingBlock->hasRefs())
                     {
-                        // Release the matching block 
+                        // Release the matching block
                         // TODO: Pending copy of matchingBlock to newBlock. Can releasing it cause race condition?
-                        // TODO: Is the entire offload/onboard logic sound? In situations with low free block count, do we know that multiple offload/onboard to same block don't trample?
+                        // TODO: Is the entire offload/onboard logic sound? In situations with low free block count, do
+                        // we know that multiple offload/onboard to same block don't trample?
                         mEvictionPolicy->releaseBlock(matchingBlock);
                     }
                     matchingBlock = newBlock;
@@ -2202,7 +2203,8 @@ std::pair<SizeType32, std::optional<KVCacheBlock::IdType>> WindowBlockManager::s
     }
     if (mEventManager)
     {
-        TLLM_LOG_DEBUG("%s;%d - mEventManager->enqueueStoredEvent(storedBlocks=%d)", __FILE__, __LINE__, static_cast<int>(storedBlocks.size()));
+        TLLM_LOG_DEBUG("%s;%d - mEventManager->enqueueStoredEvent(storedBlocks=%d)", __FILE__, __LINE__,
+            static_cast<int>(storedBlocks.size()));
         mEventManager->enqueueStoredEvent(storedBlocks, mWindowSize);
     }
     return {numBlocksStoredForReuse, lastStoredId};
