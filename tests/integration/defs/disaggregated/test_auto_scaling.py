@@ -37,7 +37,7 @@ def service_discovery(request):
         except Exception:
             pass
     else:
-        return None, f"http://localhost:{TEST_PORT}"
+        yield None, f"http://localhost:{TEST_PORT}"
 
 
 @pytest.fixture

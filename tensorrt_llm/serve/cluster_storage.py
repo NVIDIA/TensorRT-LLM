@@ -36,22 +36,25 @@ class WatchEvent:
 
 class WatchEventQueue:
 
-    def __init__(self, key_prefixes: List[str],
-                 events: asyncio.Queue[WatchEvent]):
+    def __init__(self, key_prefixes: List[str]):
         self.key_prefixes = key_prefixes
-        self.events = events
+        self.events = asyncio.Queue()
 
     async def drain(self):
         events = []
         event = await self.events.get()
-        logger.debug(f"Draining watch event: {self.events.qsize()}")
         events.append(event)
         while not self.events.empty():
             event = self.events.get_nowait()
             events.append(event)
         self.events.task_done()
-        logger.debug(f"after draining watch event: {self.events.qsize()}")
         return events
+
+    async def add_events(self, events: List[WatchEvent]):
+        loop = asyncio.get_event_loop()
+        for event in events:
+            self.events.put_nowait(event)
+        loop._write_to_self()
 
 
 class ClusterStorage(abc.ABC):
@@ -241,7 +244,7 @@ class HttpClusterStorageServer(ClusterStorage):
                 )
             else:
                 self._watch_handles[key_prefix] = WatchEventQueue(
-                    key_prefixes=[key_prefix], events=asyncio.Queue())
+                    key_prefixes=[key_prefix])
             return self._watch_handles[key_prefix]
 
     async def unwatch(self, key_prefix: str) -> None:
@@ -397,8 +400,8 @@ class Etcd3WatchEventQueue(WatchEventQueue):
                  key_prefix: str,
                  cancel_event: Callable[[], None] = None):
         self.key_prefix = key_prefix
-        self._cancel_event = cancel_event
         self.events = asyncio.Queue()
+        self._cancel_event = cancel_event
 
     def cancel_event(self):
         if self._cancel_event:
@@ -410,7 +413,7 @@ class Etcd3WatchEventQueue(WatchEventQueue):
     def __del__(self):
         self.cancel_event()
 
-    def add_event(self, watch_resp):
+    def add_events_from_resp(self, watch_resp):
         try:
             for event in watch_resp.events:
                 # Event type is not in public interface of etcd3
@@ -507,7 +510,7 @@ class Etcd3ClusterStorage(ClusterStorage):
         try:
             lease = self._get_lease(key, ttl)
             # TTL will be ignored since it can only be set when creating a lease
-            self.client.refresh_lease(lease_id=lease.id)
+            next(self.client.refresh_lease(lease_id=lease.id), None)
         except etcd3.Etcd3Exception as e:
             logger.error(f"Error refreshing lease {key}: {e}")
             return False
@@ -517,7 +520,7 @@ class Etcd3ClusterStorage(ClusterStorage):
                          key_prefix: str,
                          keys_only: bool = False) -> Dict[str, str]:
         try:
-            resp = self.client.get_prefix(key_prefix, keys_only=keys_only)
+            resp = self.client.get_prefix(key_prefix)
             return {
                 metadata.key.decode("utf-8"):
                 "" if keys_only else v.decode("utf-8")
@@ -533,7 +536,7 @@ class Etcd3ClusterStorage(ClusterStorage):
                 return self._watch_handles[key_prefix]
             watch_handle = Etcd3WatchEventQueue(key_prefix=key_prefix)
             watch_id = self.client.add_watch_prefix_callback(
-                key_prefix, watch_handle.add_event)
+                key_prefix, watch_handle.add_events_from_resp)
             watch_handle.set_cancel_event(
                 lambda: self.client.cancel_watch(watch_id))
             self._watch_handles[key_prefix] = watch_handle
