@@ -7,7 +7,6 @@ import torch.nn as nn
 
 import tensorrt_llm
 import tensorrt_llm.bindings
-import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm._torch.attention_backend.interface import (
     MLAParams, PositionalEmbeddingParams)
 from tensorrt_llm._torch.attention_backend.trtllm import (
@@ -28,6 +27,7 @@ from tensorrt_llm.bindings.internal.batch_manager import \
     CacheType as CacheTypeCpp
 from tensorrt_llm.deep_gemm import (fp8_mqa_logits, fp8_paged_mqa_logits,
                                     get_paged_mqa_logits_metadata)
+from tensorrt_llm.quantization.utils import fp8_utils
 from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -1060,7 +1060,8 @@ class Indexer(nn.Module):
     def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
                 metadata: DSAtrtllmAttentionMetadata,
                 position_ids: torch.Tensor):
-        metadata.kv_cache_manager.quant_block_size
+        quant_block_size = metadata.kv_cache_manager.quant_block_size
+        assert quant_block_size == 128, "Only support quant_block_size = 128 for now"
 
         q, k = maybe_execute_in_parallel(
             lambda: self.wq_b(qr),

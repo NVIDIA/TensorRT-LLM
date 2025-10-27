@@ -55,8 +55,12 @@ public:
         int shape_k, cudaStream_t stream, float* scales_a, int stride_scales_a, float* scales_b)
         = 0;
 
+    // Backward compatibility to support old signature
     virtual void fp8CS1x128(__nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x, int shape_y,
         cudaStream_t stream)
+        = 0;
+    virtual void fp8CS1x128(__nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x, int shape_y,
+        cudaStream_t stream, bool use_ue8m0)
         = 0;
     virtual void fp8CS1x128Reshape(__nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x,
         int shape_h, int shape_y, int stride_x, cudaStream_t stream)
@@ -113,7 +117,13 @@ public:
         cudaStream_t stream, float* scales_a, int stride_scales_a, float* scales_b) override;
 
     void fp8CS1x128(__nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x, int shape_y,
-        cudaStream_t stream) override;
+        cudaStream_t stream) override
+    {
+        fp8CS1x128(mat_quant, scales, mat, shape_x, shape_y, stream, false);
+    }
+
+    void fp8CS1x128(__nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x, int shape_y,
+        cudaStream_t stream, bool use_ue8m0) override;
     void fp8CS1x128Reshape(__nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x, int shape_h,
         int shape_y, int stride_x, cudaStream_t stream) override;
     void fp8CS128x128(__nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x, int shape_y,
