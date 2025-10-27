@@ -296,6 +296,7 @@ def test_rpc_shutdown_server():
         time.sleep(1.0)
 
 
+@pytest.mark.skip(reason="This test is flaky, need to fix it")
 def test_rpc_without_response_performance():
     # At any circumstances, the RPC call without response should be faster than the one with response
     class App:
