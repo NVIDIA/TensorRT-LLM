@@ -209,11 +209,14 @@ class TestQwen2_5_VL(unittest.TestCase):
         videos = None
 
         if modality in ["image", "multiple_image", "mixture_text_image"]:
-            images = [input['multi_modal_data']['image'] for input in inputs]
-        elif modality == "video":
-            videos = [
+            images = [
                 input['multi_modal_data'][f'{modality}'] for input in inputs
             ]
+        elif modality == "video":
+            videos = [
+                input['multi_modal_data'][f'{modality}'][0] for input in inputs
+            ]
+            frames = [video.frames for video in videos]
         elif modality == "text":
             # For text-only modality, no images or videos needed
             pass
@@ -223,7 +226,7 @@ class TestQwen2_5_VL(unittest.TestCase):
         processor_inputs = processor(
             text=[input['prompt'] for input in inputs],
             images=images,
-            videos=videos,
+            videos=frames,
             padding=True,
             return_tensors="pt",
             do_rescale=False,
