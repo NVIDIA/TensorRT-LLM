@@ -147,7 +147,7 @@ class ShardingTransformConfig(TransformConfig):
     support_partial_config: bool = Field(default=False)
     # Which sharding dimensions to run: any subset of {"tp", "ep", "bmm"}
     sharding_dims: List[ShardingDim] = Field(
-        default_factory=lambda: [ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
+        default_factory=lambda: [ShardingDim.SSM, ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
     )
 
 
@@ -319,9 +319,7 @@ def _process_ssm_sharding(
     # ############# update conv1d num output channels ##############
     # ##############################################################
     conv1d_nodes = [
-        n
-        for n in subgraph_nodes
-        if is_op(n, [torch.ops.aten.conv1d, torch.ops.auto_deploy.torch_causal_conv1d])
+        n for n in subgraph_nodes if is_op(n, [torch.ops.auto_deploy.torch_causal_conv1d])
     ]
     assert len(conv1d_nodes) == 1, "Expecting exactly one conv1d node"
     conv1d_node = conv1d_nodes[0]
@@ -453,7 +451,7 @@ def _process_column_sharding(
     # get the subgraph of this module. Subgraph boundary is the next linear node.
     next_lin_node, depth = bfs(linear_nodes[0], is_linear_op, include_root=False)
     subgraph_nodes = subgraph(
-        [linear_nodes],
+        linear_nodes,
         [next_lin_node],
     )
 
@@ -484,7 +482,7 @@ def _process_column_sharding(
         assert world_size is not None, "World size is required to update the split node params"
         assert len(node.users) == 1, "Fused linear node should have only one user: a split node"
         user = list(node.users)[0]
-        if is_op(user, [torch.ops.aten.split, torch.ops.aten.split_with_sizes]):
+        if is_op(user, [torch.ops.aten.split_with_sizes]):
             orig_sizes = user.args[1]
             new_sizes = [orig_sizes[i] // world_size for i in range(len(orig_sizes))]
             args = list(user.args)
@@ -731,7 +729,6 @@ def detect_ssm_shard(
 
     # find all ssm nodes in the graph
     ssm_nodes = filtered_nodes(gm.graph.nodes, ops=torch.ops.auto_deploy.torch_ssm)
-    # ssm_nodes = list(ssm_nodes)[1:2]
     num_ssm_shards = 0
     for ssm_node in ssm_nodes:
         # We assume that one ssm node defines a subgraph corresponding

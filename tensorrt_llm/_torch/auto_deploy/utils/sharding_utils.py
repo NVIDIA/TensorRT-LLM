@@ -65,7 +65,7 @@ def _load_hook_remove(
 
 
 def _validate_sharded_shapes(
-    node: Node, fused_weight_dims: Optional[list] = None, world_size: int = None
+    node: Node, fused_weight_dims: Optional[list] = None, world_size: Optional[int] = None
 ) -> None:
     """
     Update the shapes of the view nodes and the split node parameters to account for the TP sharding.
@@ -80,7 +80,7 @@ def _validate_sharded_shapes(
     """
 
     # get the subgraph of this module. Subgraph boundary is the next linear node.
-    next_lin_node, depth = bfs(node, is_linear_op, include_root=False)
+    next_lin_node, _ = bfs(node, is_linear_op, include_root=False)
     nodes_to_validate = subgraph(
         [node],
         [next_lin_node],
@@ -132,6 +132,7 @@ def shard_weight_tensor(
     fused_weight_dims: Optional[list] = None,
     requires_grad: bool = False,
     update_param: bool = True,
+    custom_shard_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Size]:
     """Shard a weight tensor across ranks and register load hook.
 
@@ -889,25 +890,28 @@ class BMMShardingInfo(ShardingTransformInfo):
                 end_idx: End index for sharding
             """
 
+            # Define slice function for the sharding
+            def slice_tensor(t: torch.Tensor) -> torch.Tensor:
+                return t[start_idx:end_idx]
+
             if tensor_node.op == "get_attr":
-                # Handle parameter tensor using unified shard_weight_tensor
+                # Handle parameter tensor
                 weight_key = tensor_node.target
+                modname, _, param_name = weight_key.rpartition(".")
                 param = gm.get_parameter(weight_key)
 
-                # Define slice function for the sharding
-                def slice_tensor(t: torch.Tensor) -> torch.Tensor:
-                    return t[start_idx:end_idx]
+                # Update the parameter with its shard
+                param_new = nn.Parameter(slice_tensor(param).detach().clone(), requires_grad=True)
+                gm.get_submodule(modname).register_parameter(param_name, param_new)
 
-                # Use shard_weight_tensor with custom shard function (also updates the parameter)
-                shard_weight_tensor(
-                    gm=gm,
-                    weight_tensor=param,
-                    param_key=weight_key,
-                    dim=0,  # BMM slices along batch dimension
-                    rank=self.rank,
-                    world_size=self.world_size,
-                    custom_shard_fn=slice_tensor,
-                    requires_grad=True,  # BMM parameters require gradients
+                # Register load state dict hook
+                gm._register_load_state_dict_pre_hook(
+                    partial(
+                        _load_hook,
+                        f_split=slice_tensor,
+                        param_key=weight_key,
+                        param_shape=param_new.shape,
+                    )
                 )
             else:
                 # Handle dynamic tensor

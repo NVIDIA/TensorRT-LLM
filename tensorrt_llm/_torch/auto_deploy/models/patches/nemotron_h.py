@@ -89,6 +89,34 @@ def _nemotron_h_block_forward(
         return hidden_states
 
 
+# Note: we assume experts have no bias for now
+def _nemotron_h_moe_forward(self, hidden_states: torch.Tensor):
+    """
+    Uses NemotronH router (returns indices, weights) and dispatches through auto_deploy::torch_moe
+    with act_fn='relu2'. Falls back to original forward if any expert has bias.
+    """
+
+    residuals = hidden_states
+    orig_shape = hidden_states.shape
+    topk_indices, topk_weights = self.gate(hidden_states)
+    x_flat = hidden_states.view(-1, hidden_states.shape[-1])
+
+    out_flat = torch.ops.auto_deploy.torch_moe(
+        x_flat,
+        topk_indices,
+        topk_weights,
+        w1_weight=[e.up_proj.weight for e in self.experts],
+        w2_weight=[e.down_proj.weight for e in self.experts],
+        w3_weight=[],
+        act_fn="relu2",
+        mlp_style="mlp",
+    )
+
+    out = out_flat.view(*orig_shape)
+    out = out + self.shared_experts(residuals)
+    return out
+
+
 _from_config_original = AutoModelForCausalLM.from_config
 
 CUSTOM_MODULE_PATCHES: Dict[str, List[Tuple[str, Callable]]] = {
@@ -98,6 +126,7 @@ CUSTOM_MODULE_PATCHES: Dict[str, List[Tuple[str, Callable]]] = {
         ("_update_mamba_mask", _nemotron_h_model_update_mamba_mask),
     ],
     "NemotronHBlock": [("forward", _nemotron_h_block_forward)],
+    "NemotronHMOE": [("forward", _nemotron_h_moe_forward)],
 }
 
 
@@ -118,9 +147,9 @@ def _set_sharding_config_patched(self, *args, **kwargs):
     self._sharding_config["tp_plan"] = {
         "in_proj": "mamba",
         "out_proj": "rowwise",
-        # "up_proj": "colwise",
-        # "down_proj": "rowwise",
-        # "*": "gather",
+        "up_proj": "colwise",
+        "down_proj": "rowwise",
+        "*": "gather",
     }
 
 
