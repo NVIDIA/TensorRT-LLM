@@ -924,6 +924,13 @@ class PyExecutor:
 
                     self.micro_batches[microbatch_id] = batch_state
 
+                prev_microbatch_id = (microbatch_id -
+                                      1) % self.num_micro_batches
+                previous_batch = self.micro_batches[prev_microbatch_id]
+                if previous_batch is not None:
+                    with nvtx_range("sync_previous_sampler_event"):
+                        previous_batch.sample_state.sampler_event.synchronize()
+
                 # Stage 2: Communicate new tokens for previous batch between ranks
                 # send/recv chain: (pp_size - 1) -> 0 -> 1 -> ... -> (pp_size - 2)
                 # last rank: sync sampler for previous microbatch to start new tokens comm chain.
@@ -946,17 +953,17 @@ class PyExecutor:
                         )
                     else:
                         torch.cuda.nvtx.range_push("_handle_new_tokens_last_pp")
-                        sample_state.sampler_event.synchronize()
 
                     # Send tokens to next pp rank (w.r.t model forward direction)
                     # Second last rank does not need to since last rank has original decoded tokens
                     if not self.dist.is_second_last_pp_rank:
                         self.wait_on_pp_send_handles(prev_microbatch_id)
-                        self.send_handles[
-                            prev_microbatch_id] = self.dist.isend_object(
-                                sample_state.host,
-                                dest=self.dist.next_pp_rank,
-                                tag=prev_microbatch_id)
+                        with nvtx_range("send_sample_state"):
+                            self.send_handles[
+                                prev_microbatch_id] = self.dist.isend_object(
+                                    sample_state.host,
+                                    dest=self.dist.next_pp_rank,
+                                    tag=prev_microbatch_id)
                     torch.cuda.nvtx.range_pop()
 
                 # Stage 3: Finalize previous batch that finished tokens communication
@@ -1413,7 +1420,6 @@ class PyExecutor:
         sampler_event = torch.cuda.Event()
         sampler_event.record()
         self._update_request_states(scheduled_batch)
-        sampler_event.synchronize()
         return self.sampler.SampleState(
             scheduled_requests=scheduled_batch,
             sampler_event=sampler_event,
