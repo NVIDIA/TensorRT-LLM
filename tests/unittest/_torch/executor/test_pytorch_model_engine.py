@@ -70,23 +70,13 @@ class DummyModel(torch.nn.Module):
 
 class DummyModelEngine(PyTorchModelEngine):
 
-    def __init__(self,
-                 llm_args: TorchLlmArgs,
-                 batch_size: int,
-                 dtype: torch.dtype,
-                 max_seq_len: int = 32) -> None:
+    def __init__(self, llm_args: TorchLlmArgs, dtype: torch.dtype) -> None:
         self.dtype = dtype
         mapping = Mapping(world_size=tensorrt_llm.mpi_world_size(),
                           tp_size=tensorrt_llm.mpi_world_size(),
                           rank=tensorrt_llm.mpi_rank())
         model = DummyModel(self.dtype)
-        from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
-
-        model_path = "dummy"
-        llm_args = TorchLlmArgs(model=model_path,
-                                max_batch_size=batch_size,
-                                max_seq_len=max_seq_len)
-        super().__init__(model_path=model_path,
+        super().__init__(model_path="dummy",
                          mapping=mapping,
                          model=model,
                          llm_args=llm_args)
