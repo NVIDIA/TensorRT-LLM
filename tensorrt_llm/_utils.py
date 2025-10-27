@@ -28,13 +28,14 @@ from contextlib import contextmanager
 from enum import EnumMeta
 from functools import lru_cache, partial, wraps
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 
 import numpy as np
 import nvtx
 from mpi4py import MPI
 from mpi4py.util import pkl5
 from packaging import version
+from typing_extensions import ParamSpec
 
 # isort: off
 import torch
@@ -1153,6 +1154,21 @@ def set_prometheus_multiproc_dir() -> object:
         os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
     logger.info(
         f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")
+
+
+P = ParamSpec("P")
+
+
+# From: https://stackoverflow.com/a/4104188/2749989
+def run_once(f: Callable[P, None]) -> Callable[P, None]:
+
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> None:
+        if not wrapper.has_run:  # type: ignore[attr-defined]
+            wrapper.has_run = True  # type: ignore[attr-defined]
+            return f(*args, **kwargs)
+
+    wrapper.has_run = False  # type: ignore[attr-defined]
+    return wrapper
 
 
 TORCH_PYBIND11_ABI = None

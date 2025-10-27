@@ -44,6 +44,12 @@ class ConditionalDisaggConfig():
 
 
 @dataclass
+class OtlpConfig():
+    otlp_traces_endpoint: Optional[
+        str] = None  # Target URL to which OpenTelemetry traces will be sent
+
+
+@dataclass
 class MinimalInstances:
     context_servers: int = 1  # the minimal number of context servers
     generation_servers: int = 1  # the minimal number of generation servers
@@ -66,6 +72,7 @@ class DisaggServerConfig():
     ctx_router_config: Optional[RouterConfig] = None
     gen_router_config: Optional[RouterConfig] = None
     conditional_disagg_config: Optional[ConditionalDisaggConfig] = None
+    otlp_config: Optional[OtlpConfig] = None
     max_retries: int = 1
     perf_metrics_max_requests: int = 0
     disagg_cluster_config: Optional[DisaggClusterConfig] = None
@@ -112,6 +119,7 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                        context_servers: Optional[dict] = None,
                        generation_servers: Optional[dict] = None,
                        conditional_disagg_config: Optional[dict] = None,
+                       otlp_config: Optional[dict] = None,
                        disagg_cluster: Optional[dict] = None,
                        **kwargs: Any) -> DisaggServerConfig:
     context_servers = context_servers or {}
@@ -149,10 +157,12 @@ def extract_disagg_cfg(hostname: str = 'localhost',
     conditional_disagg_config = ConditionalDisaggConfig(
         **conditional_disagg_config) if conditional_disagg_config else None
 
+    otlp_config = OtlpConfig(**otlp_config) if otlp_config else None
+
     config = DisaggServerConfig(server_configs, hostname, port,
                                 ctx_router_config, gen_router_config,
-                                conditional_disagg_config, max_retries,
-                                perf_metrics_max_requests,
+                                conditional_disagg_config, otlp_config,
+                                max_retries, perf_metrics_max_requests,
                                 disagg_cluster_config)
 
     return config
