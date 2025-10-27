@@ -259,7 +259,7 @@ public:
         torch::optional<torch::Tensor> const& swiglu_limit, int64_t const tp_size, int64_t const tp_rank,
         int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank,
         bool const enable_alltoall, bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> const& profile_ids,
-        torch::optional<int64_t> const& unpadded_hidden_size)
+        torch::optional<int64_t> const& unpadded_hidden_size, torch::optional<int64_t> const& num_valid_tokens)
     {
         std::lock_guard<std::mutex> lock(mMutex);
         // Free the profile workspace to save memory
@@ -428,10 +428,11 @@ public:
             fc1_expert_biases.has_value() ? fc1_expert_biases.value().const_data_ptr() : nullptr, activation_params,
             fc2_expert_weights.const_data_ptr(),
             fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr, quant_params,
-            num_rows, hidden_size, unpadded_hidden_size_val, inter_size, num_experts_total,
-            static_cast<int>(experts_per_token), static_cast<char*>(workspace_info.workspace.data_ptr()),
-            output.data_ptr(), static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, enable_alltoall,
-            false, lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
+            num_rows, num_valid_tokens.has_value() ? num_valid_tokens.value() : num_rows, hidden_size,
+            unpadded_hidden_size_val, inter_size, num_experts_total, static_cast<int>(experts_per_token),
+            static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
+            static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, enable_alltoall, false, lora_params,
+            mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
 #else
         mKernelRunner->runMoe(input.const_data_ptr(),
             input_sf.has_value() ? input_sf.value().const_data_ptr() : nullptr, swizzled_input_sf,
@@ -442,7 +443,8 @@ public:
             fc1_expert_biases.has_value() ? fc1_expert_biases.value().const_data_ptr() : nullptr, activation_params,
             fc2_expert_weights.const_data_ptr(),
             fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr, quant_params,
-            num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
+            num_rows, num_valid_tokens.has_value() ? num_valid_tokens.value() : num_rows, hidden_size, inter_size,
+            num_experts_total, static_cast<int>(experts_per_token),
             static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
             static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, false, lora_params,
             mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
@@ -461,7 +463,7 @@ public:
         torch::optional<torch::Tensor> const& swiglu_limit, int64_t const tp_size, int64_t const tp_rank,
         int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank,
         bool const enable_alltoall, bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> const& profile_ids,
-        torch::optional<int64_t> const& unpadded_hidden_size)
+        torch::optional<int64_t> const& unpadded_hidden_size, torch::optional<int64_t> const& num_valid_tokens)
     {
         std::lock_guard<std::mutex> lock(mMutex);
 
@@ -588,10 +590,11 @@ public:
             fc1_expert_biases.has_value() ? fc1_expert_biases.value().const_data_ptr() : nullptr, activation_params,
             fc2_expert_weights.const_data_ptr(),
             fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr, quant_params,
-            num_rows, hidden_size, unpadded_hidden_size_val, inter_size, num_experts_total,
-            static_cast<int>(experts_per_token), static_cast<char*>(workspace_info.workspace.data_ptr()),
-            output.data_ptr(), static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, enable_alltoall,
-            false, lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
+            num_rows, num_valid_tokens.has_value() ? num_valid_tokens.value() : num_rows, hidden_size,
+            unpadded_hidden_size_val, inter_size, num_experts_total, static_cast<int>(experts_per_token),
+            static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
+            static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, enable_alltoall, false, lora_params,
+            mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
 #else
         mKernelRunner->runMoe(input.const_data_ptr(),
             input_sf.has_value() ? input_sf.value().const_data_ptr() : nullptr, swizzled_input_sf,
@@ -602,7 +605,8 @@ public:
             fc1_expert_biases.has_value() ? fc1_expert_biases.value().const_data_ptr() : nullptr, activation_params,
             fc2_expert_weights.const_data_ptr(),
             fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr, quant_params,
-            num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
+            num_rows, num_valid_tokens.has_value() ? num_valid_tokens.value() : num_rows, hidden_size, inter_size,
+            num_experts_total, static_cast<int>(experts_per_token),
             static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
             static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, false, lora_params,
             mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);

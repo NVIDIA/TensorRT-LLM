@@ -52,7 +52,6 @@ using BaseKVCacheManager = kv_cache_manager::BaseKVCacheManager;
 using CacheTransBufferManager = kv_cache_manager::CacheTransBufferManager;
 using BlockRange = kv_cache_manager::BlockRange;
 
-BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest);
 BlockRange getBlockRangeForReceiving(
     BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest, bool srcEnableBlockReuse);
 

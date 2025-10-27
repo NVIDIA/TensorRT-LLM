@@ -3,11 +3,14 @@ import weakref
 from collections import namedtuple
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
-from typing import (Dict, Generic, List, Optional, Protocol, Tuple, Type,
-                    TypeVar, Union)
+from typing import (TYPE_CHECKING, Dict, Generic, List, Optional, Protocol,
+                    Tuple, Type, TypeVar, Union)
 
 import torch
 from typing_extensions import Self
+
+if TYPE_CHECKING:
+    from ..speculative.utils import SpecDecodingTensor
 
 from tensorrt_llm.functional import (PositionEmbeddingType, RopeEmbeddingUtils,
                                      RotaryScalingType)
@@ -330,10 +333,20 @@ class AttentionMetadata:
             setattr(self, f, v)
         self._saved_tensors.clear()
 
-    def update_spec_dec_param(self, is_spec_decoding_enabled, is_spec_dec_tree,
-                              is_spec_dec_dynamic_tree, max_draft_tokens):
+    def update_spec_dec_param(
+            self,
+            is_spec_decoding_enabled,
+            is_spec_dec_tree,
+            is_spec_dec_dynamic_tree,
+            max_draft_tokens,
+            spec_decoding_tensor: Optional['SpecDecodingTensor'] = None):
         """
         Hook to be called when using TRTLLM attention backend in spec-dec mode.
+        """
+
+    def update_for_spec_dec(self) -> None:
+        """
+        Hook to be called during forward when using spec-dec one-model mode.
         """
 
 
@@ -643,3 +656,4 @@ class MLAParams:
     v_head_dim: int = 0
     predicted_tokens_per_seq: int = 1
     chunked_prefill_buffer_batch_size: int = 1
+    hidden_size: int = 0

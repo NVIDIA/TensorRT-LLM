@@ -46,6 +46,26 @@ def _rms_norm_pattern(data: torch.Tensor, weight: torch.Tensor, eps: float) -> t
     return weight * data.to(input_dtype)
 
 
+def _rms_norm_pattern_float32_weights(
+    data: torch.Tensor, weight: torch.Tensor, eps: float
+) -> torch.Tensor:
+    """Implements the RMSNorm pattern for pattern matching.
+
+    Args:
+        data: Input tensor to normalize.
+        weight: Scaling weights for the normalized output.
+        eps: Small constant for numerical stability.
+
+    Returns:
+        Normalized and scaled tensor.
+    """
+    input_dtype = data.dtype
+    data = data.to(torch.float32)
+    variance = data.pow(2).mean(-1, keepdim=True)
+    data = data * torch.rsqrt(variance + eps)
+    return (weight.to(torch.float32) * data).to(input_dtype)
+
+
 def _rms_norm_replacement(
     data: torch.Tensor, weight: torch.Tensor, eps: float, backend: str
 ) -> torch.Tensor:
@@ -132,15 +152,20 @@ class FuseRMSNorm(BaseTransform):
         ]
 
         # Register patterns for each configuration
-        for input_dtype, weight_dtype in configs:
-            register_ad_pattern(
-                search_fn=_rms_norm_pattern,
-                replace_fn=partial(_rms_norm_replacement, backend=self.config.backend),
-                patterns=patterns,
-                dummy_args=dummy_args(input_dtype, weight_dtype),
-                op_ignore_types={},
-                scalar_workaround={"eps": 1e-6},
-            )
+        search_fns = [
+            _rms_norm_pattern,
+            _rms_norm_pattern_float32_weights,
+        ]
+        for search_fn in search_fns:
+            for input_dtype, weight_dtype in configs:
+                register_ad_pattern(
+                    search_fn=search_fn,
+                    replace_fn=partial(_rms_norm_replacement, backend=self.config.backend),
+                    patterns=patterns,
+                    dummy_args=dummy_args(input_dtype, weight_dtype),
+                    op_ignore_types={},
+                    scalar_workaround={"eps": 1e-6},
+                )
 
         cnt = patterns.apply(graph)
 

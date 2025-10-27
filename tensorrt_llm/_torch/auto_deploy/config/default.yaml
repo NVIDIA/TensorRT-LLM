@@ -116,6 +116,9 @@ transforms:
   fuse_moe:
     stage: post_load_fusion
     enabled: true
+  fuse_fp8_moe:
+    stage: post_load_fusion
+    enabled: true
   fuse_allreduce_residual_rmsnorm:
     stage: post_load_fusion
   # TODO (lucaslie): add backend selection as part of configurable inference optimizers
@@ -124,7 +127,7 @@ transforms:
     # TODO (lucaslie): add backend selection as part of configurable inference optimizers
     # check if we can fuse rmsnorm
     stage: post_load_fusion
-    backend: flashinfer
+    backend: triton
     requires_shape_prop: true
   fuse_gated_rmsnorm:
     stage: post_load_fusion

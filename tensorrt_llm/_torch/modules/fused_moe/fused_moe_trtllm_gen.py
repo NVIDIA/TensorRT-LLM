@@ -466,7 +466,6 @@ class TRTLLMGenFusedMoE(MoE):
                 routed_scaling_factor,
                 self.routing_method.routing_method_type,
                 0,  # act_type
-                1.3,  # imbalance_factor
                 token_final_scales,
                 token_selected_experts,
             )
@@ -550,7 +549,6 @@ class TRTLLMGenFusedMoE(MoE):
                 routed_scaling_factor,
                 self.routing_method.routing_method_type,
                 0,  # act_type
-                1.3,  # imbalance_factor
                 token_final_scales,
                 token_selected_experts,
             )
@@ -593,7 +591,6 @@ class TRTLLMGenFusedMoE(MoE):
                 routed_scaling_factor,
                 self.routing_method.routing_method_type,
                 0,  # act_type
-                1.3,  # imbalance_factor
                 token_final_scales,
                 token_selected_experts,
             )
