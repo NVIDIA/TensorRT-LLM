@@ -536,6 +536,7 @@ class TrtllmAttentionWrapper:
 @dataclass(kw_only=True)
 class TrtllmAttentionMetadata(AttentionMetadata):
     workspace: Optional[torch.Tensor] = None
+    cuda_graph_workspace: Optional[torch.Tensor] = None
 
     # TrtllmAttention needs to know the beam width to access to the cache indirection buffer,
     # when beam search is enabled.
@@ -693,6 +694,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 device='cuda',
                 dtype=torch.int8,
             )
+
+        if self.is_cuda_graph:
+            self.cuda_graph_workspace = torch.empty(
+                (0, ),
+                device='cuda',
+                dtype=torch.int8,
+            )
+
         if self.kv_cache_manager is not None:
             self.kv_cache_block_offsets = get_empty(
                 [
@@ -1276,8 +1285,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             host_kv_cache_pool_pointers=metadata.host_kv_cache_pool_pointers,
             host_kv_cache_pool_mapping=metadata.host_kv_cache_pool_mapping,
             block_ids_per_seq=metadata.block_ids_per_seq,
-            workspace=metadata.
-            workspace,  # re-enable it, if pass None to it, fp8 mla will encounter invalid cuda free issue.
+            # re-enable it, if pass None to it, fp8 mla will encounter invalid cuda free issue.
+            workspace=metadata.workspace
+            if not metadata.is_cuda_graph else metadata.cuda_graph_workspace,
             cache_indirection=metadata.cache_indirection,
             kv_scale_orig_quant=self.kv_scale_orig_quant,
             kv_scale_quant_orig=self.kv_scale_quant_orig,
