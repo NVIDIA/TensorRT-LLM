@@ -272,7 +272,7 @@ def main():
         with open(non_existent_cases_file, "r") as f:
             print(f.read())
         print(
-            "Test name in waives.txt but not in l0 test list or qa list, please delete them first!!!\n"
+            "Non-unit test test name in waives.txt but not in l0 test list or qa list, please delete them first!!!\n"
         )
         pass_flag = False
 
