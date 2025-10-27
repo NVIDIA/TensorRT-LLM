@@ -129,7 +129,7 @@ class TRTLLMGenFusedMoE(MoE):
                     model_config.mapping)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP or self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
                 raise NotImplementedError(
-                    "DeepEP and DeepEPLowLatency are not supported for CutlassFusedMoE yet"
+                    "DeepEP and DeepEPLowLatency are not supported for TRTLLMGenFusedMoE yet"
                 )
             else:
                 raise NotImplementedError(
