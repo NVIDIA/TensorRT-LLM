@@ -14,7 +14,7 @@ from ...custom_ops.trtllm_gen_custom_ops import \
     fp4_block_scale_fake_output_without_finalize
 from ...distributed import allgather
 from ...model_config import ModelConfig
-from ...utils import Fp4QuantizedTensor, ceil_div
+from ...utils import AuxStreamType, Fp4QuantizedTensor, ceil_div
 from .interface import AlltoallMethodType, MoE, MoEWeightLoadingMode
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
                            NVFP4TRTLLMGenFusedMoEMethod,
@@ -37,6 +37,7 @@ class TRTLLMGenFusedMoE(MoE):
         dtype (Optional[torch.dtype]): Data type for the weights.
         reduce_results (bool): Whether to reduce the results across devices.
         model_config (ModelConfig): Configuration object for the model.
+        aux_stream_dict (Optional[Dict[AuxStreamType, torch.cuda.Stream]]): Auxiliary CUDA streams for overlapping.
 
     MoE torch custom op:
         Only support min-latency mode now (SM100 Blackwell only).
@@ -66,6 +67,8 @@ class TRTLLMGenFusedMoE(MoE):
         dtype: Optional[torch.dtype] = None,
         reduce_results: bool = False,
         model_config: ModelConfig = ModelConfig(),
+        aux_stream_dict: Optional[Dict[AuxStreamType,
+                                       torch.cuda.Stream]] = None,
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
         VANILLA,
         layer_idx: Optional[int] = None,
@@ -82,6 +85,7 @@ class TRTLLMGenFusedMoE(MoE):
             dtype=dtype,
             reduce_results=reduce_results,
             model_config=model_config,
+            aux_stream_dict=aux_stream_dict,
             weight_loading_mode=weight_loading_mode,
             bias=bias,
             swiglu_alpha=swiglu_alpha,
@@ -97,19 +101,11 @@ class TRTLLMGenFusedMoE(MoE):
 
         assert not self.smart_router, "Smart router is not supported in TRTLLMGenFusedMoE."
 
-        self.num_slots = self.num_experts
-        self.expert_size_per_partition = self.num_experts // self.ep_size
-        self.initial_global_assignments = [
-            (ep_rank * self.num_experts // self.ep_size + local_slot_id) %
-            self.num_experts for ep_rank in range(self.ep_size)
-            for local_slot_id in range(self.expert_size_per_partition)
-        ]
-        self.slot_start = self.ep_rank * self.expert_size_per_partition
-        self.slot_end = self.slot_start + self.expert_size_per_partition
-        self.initial_local_expert_ids = self.initial_global_assignments[
-            self.slot_start:self.slot_end]
-        assert len(
-            self.initial_local_expert_ids) == self.expert_size_per_partition
+        # Note: Load balancer initialization is handled by base class _init_load_balancer()
+        # If no load balancer is available, the base class will set:
+        # - self.num_slots = self.num_experts
+        # - self.expert_size_per_partition = self.num_experts // self.ep_size
+        # - self.initial_global_assignments, self.slot_start, self.slot_end, etc.
 
         # TODO: AlltoAll code is largely duplicated with WideEPMoE. Consider refactor and reuse in the future.
         self.alltoall_method_type = self.select_alltoall_method_type()
@@ -182,6 +178,10 @@ class TRTLLMGenFusedMoE(MoE):
             return AlltoallMethodType.NotEnabled
 
         return AlltoallMethodType.MNNVL
+
+    def _supports_load_balancer(self) -> bool:
+        """TRTLLMGenFusedMoE supports load balancer."""
+        return True
 
     @cached_property
     def enable_alltoall(self):

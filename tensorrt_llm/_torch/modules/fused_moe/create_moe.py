@@ -79,7 +79,9 @@ def create_moe(
 
     moe_load_balancer = get_moe_load_balancer()
     if moe_load_balancer is not None:
-        assert moe_cls == WideEPMoE, "MoE Load Balance is only supported in WideEPMoE now."
+        assert moe_cls in [
+            WideEPMoE, TRTLLMGenFusedMoE
+        ], "MoE Load Balance is only supported in WideEPMoE and TRTLLMGenFusedMoE now."
 
     if bias:
         assert moe_cls in [CutlassFusedMoE, TritonFusedMoE, TRTLLMGenFusedMoE
@@ -106,6 +108,7 @@ def create_moe(
             dtype=dtype,
             reduce_results=reduce_results,
             model_config=model_config,
+            aux_stream_dict=aux_stream_dict,
             weight_loading_mode=weight_loading_mode,
             bias=bias,
             layer_idx=layer_idx,

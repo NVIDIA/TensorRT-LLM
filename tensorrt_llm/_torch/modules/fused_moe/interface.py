@@ -8,7 +8,7 @@ from torch import nn
 
 from ...distributed.ops import reducescatter
 from ...model_config import ModelConfig
-from ...utils import (Fp4QuantizedTensor, get_model_extra_attrs,
+from ...utils import (AuxStreamType, Fp4QuantizedTensor, get_model_extra_attrs,
                       is_torch_compiling)
 from .routing import BaseMoeRoutingMethod
 
@@ -122,6 +122,7 @@ class MoE(nn.Module):
         dtype (Optional[torch.dtype]): Data type for the weights.
         reduce_results (bool): Whether to reduce the results across devices.
         model_config (ModelConfig): Configuration object for the model.
+        aux_stream_dict (Optional[Dict[AuxStreamType, torch.cuda.Stream]]): Auxiliary CUDA streams for overlapping.
     """
 
     def __init__(
@@ -134,6 +135,8 @@ class MoE(nn.Module):
         dtype: Optional[torch.dtype] = None,
         reduce_results: bool = False,
         model_config: ModelConfig = ModelConfig(),
+        aux_stream_dict: Optional[Dict[AuxStreamType,
+                                       torch.cuda.Stream]] = None,
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
         VANILLA,
         bias: bool = False,
@@ -187,6 +190,254 @@ class MoE(nn.Module):
         self.all_reduce = AllReduce(mapping=self.mapping,
                                     strategy=model_config.allreduce_strategy,
                                     dtype=self.dtype)
+
+        # Initialize load balancer related attributes
+        self._init_load_balancer(model_config, aux_stream_dict)
+
+    def _init_load_balancer(
+        self,
+        model_config: ModelConfig,
+        aux_stream_dict: Optional[Dict[AuxStreamType,
+                                       torch.cuda.Stream]] = None,
+    ):
+        """Initialize load balancer related attributes."""
+        from .moe_load_balancer import get_moe_load_balancer
+
+        # Store aux_stream_dict for load balancer
+        self.aux_stream_dict = aux_stream_dict
+
+        # Initialize load balancer attributes
+        self.layer_load_balancer = None
+        self.repeat_idx = 0
+        self.repeat_count = 1
+
+        # Get global load balancer instance
+        moe_load_balancer = get_moe_load_balancer()
+        moe_load_balancer_config = model_config.moe_load_balancer
+
+        # Calculate initial expert assignments
+        init_expert_size_per_partition = (
+            moe_load_balancer_config.num_local_slots
+            if moe_load_balancer_config else self.num_experts // self.ep_size)
+
+        self.initial_global_assignments = [
+            (ep_rank * self.num_experts // self.ep_size + local_slot_id) %
+            self.num_experts for ep_rank in range(self.ep_size)
+            for local_slot_id in range(init_expert_size_per_partition)
+        ]
+
+        # Setup load balancer if available
+        if moe_load_balancer and self._supports_load_balancer():
+            assert moe_load_balancer_config is not None
+            top_k = self.routing_method.experts_per_token
+            self.expert_size_per_partition = moe_load_balancer_config.num_local_slots
+
+            # Add this layer to the load balancer
+            aux_stream = getattr(self, '_get_load_balancer_aux_stream',
+                                 lambda: None)()
+            self.layer_load_balancer = moe_load_balancer.add_layer(
+                self.num_experts,
+                top_k,
+                self.expert_size_per_partition,
+                aux_stream=aux_stream)
+
+            self.repeat_count = self.layer_load_balancer.get_repeat_count()
+
+            # Handle initial global assignments
+            loaded_initial_global_assignments = (
+                moe_load_balancer_config.get_layer_initial_global_assignments(
+                    self.layer_idx))
+            self.num_slots = moe_load_balancer_config.num_slots
+
+            if loaded_initial_global_assignments is not None:
+                assert isinstance(loaded_initial_global_assignments, list)
+                assert len(loaded_initial_global_assignments) == self.num_slots
+                assert self.num_slots >= self.num_experts
+                assert set(loaded_initial_global_assignments) == set(
+                    range(self.num_experts))
+                self.initial_global_assignments = loaded_initial_global_assignments
+
+            self.layer_load_balancer.set_initial_weight_assignments(
+                self.initial_global_assignments)
+
+            from tensorrt_llm.logger import logger
+            logger.info(
+                f"MoE load balancer enabled. num_experts = {self.num_experts}, "
+                f"num_slots = {self.num_slots}, ep_size = {self.ep_size}")
+            logger.info(
+                f"initial_global_assignments (layer {self.layer_idx}) = {self.initial_global_assignments}"
+            )
+        else:
+            # Fallback when no load balancer
+            assert self.num_experts % self.ep_size == 0
+            self.expert_size_per_partition = self.num_experts // self.ep_size
+            self.num_slots = self.num_experts
+
+        # Calculate slot boundaries
+        self.slot_start = self.ep_rank * self.expert_size_per_partition
+        self.slot_end = self.slot_start + self.expert_size_per_partition
+        self.initial_local_expert_ids = self.initial_global_assignments[
+            self.slot_start:self.slot_end]
+        assert len(
+            self.initial_local_expert_ids) == self.expert_size_per_partition
+
+        # Setup AllReduce for dynamic routing if needed
+        if (self.layer_load_balancer
+                and not self.layer_load_balancer.is_static_routing()):
+            from tensorrt_llm.functional import AllReduceStrategy
+
+            from ...distributed import AllReduce
+            self.allreduce = AllReduce(mapping=model_config.mapping,
+                                       strategy=AllReduceStrategy.NCCL)
+        else:
+            self.allreduce = None
+
+    def _supports_load_balancer(self) -> bool:
+        """Check if this MoE implementation supports load balancer.
+
+        Subclasses can override this to indicate load balancer support.
+        """
+        return False
+
+    def _get_load_balancer_aux_stream(self) -> Optional[torch.cuda.Stream]:
+        """Get auxiliary stream for load balancer.
+
+        Subclasses can override this to provide the appropriate stream.
+        """
+        return None
+
+    def _load_balancer_start_wait_gpu_stage(self, is_first_call: bool):
+        """Start waiting for GPU stage in load balancer."""
+        if self.layer_load_balancer and is_first_call:
+            self.layer_load_balancer.start_wait_gpu_stage()
+
+    def _load_balancer_done_wait_gpu_stage(self, is_first_call: bool):
+        """Mark GPU wait stage as done in load balancer."""
+        if self.layer_load_balancer and is_first_call:
+            self.layer_load_balancer.done_wait_gpu_stage()
+
+    def _load_balancer_update_statistic(self,
+                                        token_selected_experts: torch.Tensor,
+                                        is_first_call: bool,
+                                        is_last_call: bool,
+                                        use_mnnvl: bool = False):
+        """Update load balancer statistics."""
+        if self.layer_load_balancer:
+            if use_mnnvl:
+                self.layer_load_balancer.update_local_statistic(
+                    token_selected_experts,
+                    is_first_stage=is_first_call,
+                    is_last_stage=is_last_call)
+            else:
+                self.layer_load_balancer.update_statistic_with_local_ids(
+                    token_selected_experts,
+                    is_first_stage=is_first_call,
+                    is_last_stage=is_last_call,
+                    allreduce=self.allreduce)
+
+    def _load_balancer_route(self, token_selected_experts: torch.Tensor,
+                             use_dp: bool) -> torch.Tensor:
+        """Route tokens using load balancer."""
+        if self.layer_load_balancer:
+            return self.layer_load_balancer.route(token_selected_experts,
+                                                  use_dp)
+        else:
+            return token_selected_experts
+
+    def _load_balancer_start_set_cpu_stage(self, is_last_call: bool):
+        """Start CPU stage in load balancer."""
+        if self.layer_load_balancer and is_last_call:
+            self.layer_load_balancer.start_set_cpu_stage()
+
+    def _load_balancer_done_set_cpu_stage(self, is_last_call: bool):
+        """Mark CPU stage as done in load balancer."""
+        if self.layer_load_balancer and is_last_call:
+            self.layer_load_balancer.done_set_cpu_stage()
+
+    def _load_balancer_get_local_statistic_tensor(self):
+        """Get local statistic tensor from load balancer."""
+        if (self.layer_load_balancer
+                and not self.layer_load_balancer.is_static_routing()):
+            return self.layer_load_balancer.get_local_statistic_tensor()
+        return None
+
+    def _load_balancer_update_statistic_with_gathered_statistic(
+            self, gathered_statistic):
+        """Update load balancer with gathered statistics."""
+        if self.layer_load_balancer:
+            self.layer_load_balancer.update_statistic_with_gathered_statistic(
+                gathered_statistic)
+
+    def register_parameter_weight_slot_fn(self, weight_name: str,
+                                          local_slot_id: int):
+        """Register parameter weight slot function for load balancer."""
+        if not self.layer_load_balancer:
+            return
+
+        assert hasattr(
+            self, weight_name), f"MoE doesn't have weight attr: {weight_name}"
+        weight_tensor = getattr(self, weight_name).data[local_slot_id]
+        self.layer_load_balancer.register_weight_slot(local_slot_id,
+                                                      weight_name,
+                                                      weight_tensor)
+
+    def register_to_fix_weight_fn(self, weight_name: str):
+        """Register weight fixing function for load balancer."""
+        if not self.layer_load_balancer:
+            return
+
+        assert hasattr(
+            self, weight_name), f"MoE doesn't have weight attr: {weight_name}"
+        param = getattr(self, weight_name)
+        weight_tensor = param.detach()
+        assert isinstance(
+            weight_tensor,
+            torch.Tensor), f'weight {weight_name} should be a tensor'
+        assert weight_tensor.is_contiguous(), (
+            f'weight {weight_name} should be contiguous, '
+            f'shape={weight_tensor.shape}, strides={weight_tensor.stride()}')
+        assert weight_tensor.numel() * weight_tensor.element_size(
+        ) == weight_tensor.untyped_storage().size(), (
+            f'weight {weight_name} shape={weight_tensor.shape} '
+            f'storage_size = {weight_tensor.untyped_storage().size()}, '
+            f'numel={weight_tensor.numel()}, eltsize={weight_tensor.element_size()}, '
+            f'dtype={weight_tensor.dtype}')
+        self.layer_load_balancer.make_tensor_host_accessible(weight_tensor)
+        param.data = weight_tensor
+
+    def register_all_parameter_slot_and_to_fix_weight_fns(
+            self, weight_and_tensor_dict: Dict[str, torch.Tensor]):
+        """Register all parameter slot and weight fixing functions for load balancer."""
+        if not self.layer_load_balancer:
+            return
+
+        # Register weight functions for each local slot
+        for local_slot_id, expert_id in enumerate(
+                self.initial_local_expert_ids):
+            for weight_name in weight_and_tensor_dict:
+                self.layer_load_balancer.add_register_weight_fn(
+                    self.register_parameter_weight_slot_fn,
+                    (weight_name, local_slot_id))
+
+        # Register weight migration functions
+        for weight_name in weight_and_tensor_dict:
+            self.layer_load_balancer.add_to_migrate_weight_fn(
+                self.register_to_fix_weight_fn, (weight_name, ))
+
+        # Setup host tensor sharing
+        local_shared_load_expert_ids = self.layer_load_balancer.get_load_expert_ids(
+        )
+        for expert_id in range(self.num_experts):
+            for weight_name, weight_tensor in weight_and_tensor_dict.items():
+                if expert_id in local_shared_load_expert_ids:
+                    local_slot_id = local_shared_load_expert_ids.index(
+                        expert_id)
+                    self.layer_load_balancer.host_tensor_sharer.share_host_tensor_with_shape(
+                        expert_id, weight_name, weight_tensor[local_slot_id])
+                else:
+                    self.layer_load_balancer.host_tensor_sharer.pre_register_host_tensor_with_shape(
+                        expert_id, weight_name, weight_tensor.dtype,
+                        weight_tensor[0].shape)
 
     def _register_layer(self, model_config: ModelConfig):
         self.register_to_config = False
