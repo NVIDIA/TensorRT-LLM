@@ -14,7 +14,7 @@ from .postproc_worker import PostprocWorkerConfig
 from .request import GenerationRequest
 from .result import GenerationResult
 from .rpc import RPCClient
-from .rpc.rpc_common import get_unique_ipc_addr
+from .rpc.rpc_common import RPCCancelled, get_unique_ipc_addr
 from .rpc_worker import RpcWorker
 from .utils import (ErrorResponse, create_mpi_comm_session,
                     get_spawn_proxy_process_env, is_llm_response)
@@ -106,6 +106,8 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
                     return
                 handler_method(data)
         except asyncio.CancelledError:
+            logger.debug(f"{method_name} task cancelled")
+        except RPCCancelled:
             logger.debug(f"{method_name} task cancelled")
         except Exception as e:
             logger.error(f"Error in {method_name}: {e}")
