@@ -104,8 +104,9 @@ class TritonDecoder(Decoder):
             "return_context_logits", "return_generation_logits", "beam_width",
             "stream", "prompt_vocab_size", "num_draft_tokens",
             "use_draft_logits", "exclude_input_in_output",
-            "return_perf_metrics", "lora_weights", "lora_config", "lora_task_id",
-            "return_num_input_tokens", "return_num_output_tokens"
+            "return_perf_metrics", "lora_weights", "lora_config",
+            "lora_task_id", "return_num_input_tokens",
+            "return_num_output_tokens"
         }
 
     def _exec_triton_request(self, request):
