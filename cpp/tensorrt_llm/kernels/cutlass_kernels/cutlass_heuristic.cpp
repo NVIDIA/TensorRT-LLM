@@ -304,27 +304,30 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm90(CutlassGemmConfig::Can
         if (has_w4afp8)
         {
             bool const has_coop_supported = sm90_supports_coop(tile_config);
-            std::set<MainloopScheduleType> mainloop_schedules{MainloopScheduleType::PINGPONG};
-            if (has_coop_supported)
-            {
-                mainloop_schedules.insert(MainloopScheduleType::COOPERATIVE);
-            }
+
+            // It seems that ping-pong scheduler will never be selected.
+            // To shorten the tactic time, remove all alternative options involving ping-pong scheduler.
+            if (!has_coop_supported)
+                continue;
+            // Due to the limitation on the number of registers on SM,
+            // cooperative scheduler does not support CtaShape128x128x128B.
+            if (tile_config == CutlassTileConfigSM90::CtaShape128x128x128B)
+                continue;
+            MainloopScheduleType mainloop_schedule = MainloopScheduleType::COOPERATIVE;
             auto const epilogue_schedule = EpilogueScheduleType::AUTO;
-            for (auto const& mainloop_schedule : mainloop_schedules)
-            {
-                CutlassGemmConfig candidate(
-                    tile_config, mainloop_schedule, epilogue_schedule, ClusterShape::ClusterShape_1x1x1);
-                candidate_configs.push_back(candidate);
-                candidate = CutlassGemmConfig(
-                    tile_config, mainloop_schedule, epilogue_schedule, ClusterShape::ClusterShape_2x1x1);
-                candidate_configs.push_back(candidate);
-                candidate = CutlassGemmConfig(
-                    tile_config, mainloop_schedule, epilogue_schedule, ClusterShape::ClusterShape_1x2x1);
-                candidate_configs.push_back(candidate);
-                candidate = CutlassGemmConfig(
-                    tile_config, mainloop_schedule, epilogue_schedule, ClusterShape::ClusterShape_2x2x1);
-                candidate_configs.push_back(candidate);
-            }
+
+            CutlassGemmConfig candidate(
+                tile_config, mainloop_schedule, epilogue_schedule, ClusterShape::ClusterShape_1x1x1);
+            candidate_configs.push_back(candidate);
+            candidate = CutlassGemmConfig(
+                tile_config, mainloop_schedule, epilogue_schedule, ClusterShape::ClusterShape_2x1x1);
+            candidate_configs.push_back(candidate);
+            candidate = CutlassGemmConfig(
+                tile_config, mainloop_schedule, epilogue_schedule, ClusterShape::ClusterShape_1x2x1);
+            candidate_configs.push_back(candidate);
+            candidate = CutlassGemmConfig(
+                tile_config, mainloop_schedule, epilogue_schedule, ClusterShape::ClusterShape_2x2x1);
+            candidate_configs.push_back(candidate);
         }
         else
         {
