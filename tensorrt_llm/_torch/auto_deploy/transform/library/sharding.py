@@ -43,6 +43,8 @@ from ...utils.sharding_utils import (
     LayerType,
     ParameterUpdateInfo,
     ShardingConfig,
+    ShardingDim,
+    ShardingSource,
     ShardingTransformInfo,
     SplitDimension,
     WeightShardingInfo,
@@ -104,6 +106,7 @@ class ShardingTransformExecutor(BaseTransform):
         info = TransformInfo(
             skipped=False, num_matches=num_matches, is_clean=False, has_valid_shapes=False
         )
+        # exit()
         return gm, info
 
 
@@ -137,10 +140,13 @@ class ShardingTransformConfig(TransformConfig):
     """Configuration for sharding transformations."""
 
     simple_shard_only: bool = Field(default=False)
-    use_sharding_from_factory: bool = Field(default=False)
-    support_partial_config: bool = Field(default=False)
-    # Which sharding families to run: any subset of {"tp", "ep", "bmm"}
-    sharding_dims: List[str] = Field(default_factory=lambda: ["tp", "ep", "bmm"])
+    sharding_source: List[ShardingSource] = Field(
+        default_factory=lambda: [ShardingSource.HEURISTIC]
+    )
+    # Which sharding dimensions to run: any subset of {"tp", "ep", "bmm"}
+    sharding_dims: List[ShardingDim] = Field(
+        default_factory=lambda: [ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
+    )
 
 
 @TransformRegistry.register("detect_sharding")
@@ -176,7 +182,7 @@ class Sharding(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         local_rank, world_size = shared_config.local_rank, shared_config.world_size
-        world_size = 2
+        # world_size = 2
 
         if world_size < 2:
             ad_logger.info("Skipping sharding for single device")
@@ -195,54 +201,41 @@ class Sharding(BaseTransform):
             else ShardingConfigSource.UNKNOWN
         )
         sharding_config.simple_shard_only = self.config.simple_shard_only
-        sharding_config.support_partial_config = self.config.support_partial_config
         sharding_config.sharding_dims = self.config.sharding_dims
-
-        sharding_config.use_sharding_from_factory = self.config.use_sharding_from_factory
+        sharding_config.sharding_source = self.config.sharding_source
 
         sharding_config.validate_config()
-        # sharding_config.predefined_config = predefined_config
 
-        if (
-            sharding_config.use_sharding_from_factory
-            and len(sharding_config.get_predefined_config()) > 0
-        ):
-            ad_logger.info("Applying sharding from config")
-            factory_info = detect_sharding_from_factory_config(gm, sharding_config)
-            return gm, factory_info
+        info = TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
+        for source in shared_config.sharding_config.sharding_source:
+            if source == ShardingSource.FACTORY:
+                if len(shared_config.sharding_config.get_predefined_config()) == 0:
+                    ad_logger.warning(
+                        "No factory config found. Skipping sharding from factory config"
+                    )
+                    continue
+                ad_logger.info("Applying sharding from factory config")
+                info += detect_sharding_from_factory_config(gm, sharding_config)
 
-        ad_logger.info(f"Running autodeploy sharding heuristics: {sharding_config.sharding_dims}")
-        # run TP sharding across ranks
-        if "tp" in sharding_config.sharding_dims:
-            tp_info = detect_column_row_shard(gm, sharding_config)
-        else:
-            tp_info = TransformInfo(
-                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
-            )
-        if "ssm" in sharding_config.sharding_dims:
-            ssm_info = detect_ssm_shard(gm, sharding_config)
-        else:
-            ssm_info = TransformInfo(
-                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
-            )
+            elif source == ShardingSource.HEURISTIC:
+                ad_logger.info(
+                    f"Running autodeploy sharding heuristics: {sharding_config.sharding_dims}"
+                )
+                if ShardingDim.SSM in sharding_config.sharding_dims:
+                    info += detect_ssm_shard(gm, sharding_config)
 
-        # run EP sharding across ranks
-        if "ep" in sharding_config.sharding_dims:
-            ep_info = detect_ep_shard(gm, sharding_config)
-        else:
-            ep_info = TransformInfo(
-                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
-            )
+                # run TP sharding across ranks
+                if ShardingDim.TP in sharding_config.sharding_dims:
+                    info += detect_column_row_shard(gm, sharding_config)
 
-        # run BMM sharding across ranks
-        if "bmm" in sharding_config.sharding_dims:
-            dp_bmm_info = detect_dp_bmm_shard(gm, sharding_config)
-        else:
-            dp_bmm_info = TransformInfo(
-                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
-            )
+                # run EP sharding across ranks
+                if ShardingDim.EP in sharding_config.sharding_dims:
+                    info += detect_ep_shard(gm, sharding_config)
 
-        info = tp_info + ssm_info + ep_info + dp_bmm_info
+                # run BMM sharding across ranks
+                if ShardingDim.BMM in sharding_config.sharding_dims:
+                    info += detect_dp_bmm_shard(gm, sharding_config)
+
         return gm, info
 
 
@@ -295,9 +288,9 @@ def _process_ssm_sharding(
         "conv1d": split_sizes_1,
     }
 
-    ##############################################################
-    ############## update split nodes ############################
-    ##############################################################
+    # ##############################################################
+    # ############## update split nodes ############################
+    # ##############################################################
     split_args_0 = list(split_nodes[0].args)
     split_args_0[1] = [s // world_size for s in split_args_0[1]]
     split_args_1 = list(split_nodes[1].args)
@@ -319,9 +312,9 @@ def _process_ssm_sharding(
         )
     )
 
-    ##############################################################
-    ############# update conv1d num output channels ##############
-    ##############################################################
+    # ##############################################################
+    # ############# update conv1d num output channels ##############
+    # ##############################################################
     conv1d_nodes = [
         n
         for n in subgraph_nodes
@@ -358,7 +351,6 @@ def _process_ssm_sharding(
     ############## shard the remaining weights ###################
     ##############################################################
     # Get all weight nodes in the subgraph except for out_proj (it has to be row-sharded)
-    # weight_nodes = [n for n in subgraph_nodes if is_op(n, [torch.ops.aten.get_attr])]
     weight_nodes = [n for n in subgraph_nodes if n.op == "get_attr" and "out_proj" not in n.target]
     for weight_node in weight_nodes:
         weight_key = weight_node.target
@@ -732,6 +724,7 @@ def detect_ssm_shard(
 
     # find all ssm nodes in the graph
     ssm_nodes = filtered_nodes(gm.graph.nodes, ops=torch.ops.auto_deploy.torch_ssm)
+    ssm_nodes = list(ssm_nodes)[1:2]
     num_ssm_shards = 0
     for ssm_node in ssm_nodes:
         # We assume that one ssm node defines a subgraph corresponding
