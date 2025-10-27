@@ -379,6 +379,10 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
     return boundary_nodes
 
 
+def identify_layer_subgraphs(gm: GraphModule) -> None:
+    pass
+
+
 def bfs(
     node: Node,
     target: Callable,

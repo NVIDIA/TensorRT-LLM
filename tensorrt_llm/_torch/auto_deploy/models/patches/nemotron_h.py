@@ -118,9 +118,9 @@ def _set_sharding_config_patched(self, *args, **kwargs):
     self._sharding_config["tp_plan"] = {
         "in_proj": "mamba",
         "out_proj": "rowwise",
-        "up_proj": "colwise",
-        "down_proj": "rowwise",
-        "*": "gather",
+        # "up_proj": "colwise",
+        # "down_proj": "rowwise",
+        # "*": "gather",
     }
 
 

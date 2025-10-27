@@ -48,6 +48,7 @@ from ...utils.sharding_utils import (
     ShardingTransformInfo,
     SplitDimension,
     WeightShardingInfo,
+    get_all_weights_in_subgraph,
 )
 from ..interface import (
     BaseTransform,
@@ -143,6 +144,7 @@ class ShardingTransformConfig(TransformConfig):
     sharding_source: List[ShardingSource] = Field(
         default_factory=lambda: [ShardingSource.HEURISTIC]
     )
+    support_partial_config: bool = Field(default=False)
     # Which sharding dimensions to run: any subset of {"tp", "ep", "bmm"}
     sharding_dims: List[ShardingDim] = Field(
         default_factory=lambda: [ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
@@ -201,15 +203,16 @@ class Sharding(BaseTransform):
             else ShardingConfigSource.UNKNOWN
         )
         sharding_config.simple_shard_only = self.config.simple_shard_only
+        sharding_config.support_partial_config = self.config.support_partial_config
         sharding_config.sharding_dims = self.config.sharding_dims
         sharding_config.sharding_source = self.config.sharding_source
 
         sharding_config.validate_config()
 
         info = TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
-        for source in shared_config.sharding_config.sharding_source:
+        for source in sharding_config.sharding_source:
             if source == ShardingSource.FACTORY:
-                if len(shared_config.sharding_config.get_predefined_config()) == 0:
+                if len(sharding_config.get_predefined_config()) == 0:
                     ad_logger.warning(
                         "No factory config found. Skipping sharding from factory config"
                     )
@@ -252,7 +255,7 @@ def _process_ssm_sharding(
     """
     # Find next linear node to define subgraph boundary
     try:
-        out_proj_node, depth = bfs(entry_node, is_linear_op, include_root=False)
+        out_proj_node, _ = bfs(entry_node, is_linear_op, include_root=False)
     except RuntimeError:
         ad_logger.warning("Could not find next linear node after entry_node for Mamba sharding")
         return 0
@@ -288,9 +291,9 @@ def _process_ssm_sharding(
         "conv1d": split_sizes_1,
     }
 
-    # ##############################################################
-    # ############## update split nodes ############################
-    # ##############################################################
+    # # ##############################################################
+    # # ############## update split nodes ############################
+    # # ##############################################################
     split_args_0 = list(split_nodes[0].args)
     split_args_0[1] = [s // world_size for s in split_args_0[1]]
     split_args_1 = list(split_nodes[1].args)
@@ -332,9 +335,9 @@ def _process_ssm_sharding(
         )
     )
 
-    ##############################################################
-    ####### shard the entry_node (the first linear layer) ########
-    ##############################################################
+    # ##############################################################
+    # ####### shard the entry_node (the first linear layer) ########
+    # ##############################################################
     sharding_config.add(
         WeightShardingInfo.from_node(
             entry_node,
@@ -347,11 +350,15 @@ def _process_ssm_sharding(
         )
     )
 
-    ##############################################################
-    ############## shard the remaining weights ###################
-    ##############################################################
-    # Get all weight nodes in the subgraph except for out_proj (it has to be row-sharded)
-    weight_nodes = [n for n in subgraph_nodes if n.op == "get_attr" and "out_proj" not in n.target]
+    # ##############################################################
+    # ############## shard the remaining weights ###################
+    # ##############################################################
+    # # Get all weight nodes in the subgraph except for out_proj (it has to be row-sharded)
+    weight_nodes = [
+        n
+        for n in get_all_weights_in_subgraph([entry_node], [out_proj_node])
+        if "out_proj" not in str(n)
+    ]
     for weight_node in weight_nodes:
         weight_key = weight_node.target
         # Get the weight parameter
@@ -381,9 +388,9 @@ def _process_ssm_sharding(
             )
         )
 
-    ##############################################################
-    ############## update the view and reshape nodes #############
-    ##############################################################
+    # ##############################################################
+    # ############## update the view and reshape nodes #############
+    # ##############################################################
     nodes_to_validate = [
         n for n in subgraph_nodes if is_op(n, [torch.ops.aten.view, torch.ops.aten.reshape])
     ]
@@ -724,7 +731,7 @@ def detect_ssm_shard(
 
     # find all ssm nodes in the graph
     ssm_nodes = filtered_nodes(gm.graph.nodes, ops=torch.ops.auto_deploy.torch_ssm)
-    ssm_nodes = list(ssm_nodes)[1:2]
+    # ssm_nodes = list(ssm_nodes)[1:2]
     num_ssm_shards = 0
     for ssm_node in ssm_nodes:
         # We assume that one ssm node defines a subgraph corresponding
