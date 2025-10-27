@@ -3,7 +3,7 @@ from typing import Dict, Tuple
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm.llmapi.llm_args import CudaGraphConfig, TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 
 def ceil_div(x: int, y: int) -> int:
@@ -192,8 +192,8 @@ def create_mock_engine(batch_size: int):
         spec_dec_mode = SpecDecMode()
 
     return MockEngine(
-        llm_args=TorchLlmArgs(cuda_graph_config=CudaGraphConfig(
-            enable_padding=True)),
+        llm_args=TorchLlmArgs(model="dummy"),
+        _cuda_graph_padding_enabled=True,
         _cuda_graph_batch_sizes=[batch_size],
         _max_cuda_graph_batch_size=batch_size,
         max_beam_width=1,
