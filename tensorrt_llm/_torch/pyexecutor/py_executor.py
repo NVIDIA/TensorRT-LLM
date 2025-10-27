@@ -198,7 +198,7 @@ class PyExecutor:
         self.max_beam_width = max_beam_width
         self.max_draft_len = max_draft_len
         self.max_total_draft_tokens = max_total_draft_tokens
-        self.max_num_tokens = model_engine.llm_args.max_num_tokens
+        self.max_num_tokens = model_engine.max_num_tokens
         self.print_log = model_engine.llm_args.print_iter_log
         self.enable_iter_perf_stats = model_engine.llm_args.enable_iter_perf_stats
         self.enable_iter_req_stats = model_engine.llm_args.enable_iter_req_stats
