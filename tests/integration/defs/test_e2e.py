@@ -1665,6 +1665,7 @@ def test_openai_lora(llm_root, llm_venv):
     llm_venv.run_cmd(["-m", "pytest", str(test_root / "_test_openai_lora.py")])
 
 
+@pytest.mark.skip(reason="https://nvbugs/5596377")
 def test_openai_chat_multimodal_example(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd(

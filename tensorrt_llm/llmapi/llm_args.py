@@ -1703,6 +1703,12 @@ class BaseLlmArgs(StrictBaseModel):
         exclude=True,
         alias="_mpi_session")
 
+    otlp_traces_endpoint: Optional[str] = Field(
+        default=None,
+        description="Target URL to which OpenTelemetry traces will be sent.",
+        alias="otlp_traces_endpoint",
+        status="prototype")
+
     backend: Optional[str] = Field(
         default=None,
         description="The backend to use for this LLM instance.",
@@ -2574,6 +2580,12 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
+    ray_worker_extension_cls: Optional[str] = Field(
+        default=None,
+        description="The full worker extension class name including module path."
+        "Allows users to extend the functions of the RayGPUWorker class.",
+        status="prototype")
+
     # PrivateVars
     _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
 
@@ -2786,6 +2798,14 @@ class TorchLlmArgs(BaseLlmArgs):
         if self.batch_wait_max_tokens_ratio < 0 or self.batch_wait_max_tokens_ratio > 1:
             raise ValueError(
                 f"batch_wait_max_tokens_ratio must be in range [0, 1], got {self.batch_wait_max_tokens_ratio}"
+            )
+        return self
+
+    @model_validator(mode='after')
+    def validate_ray_worker_extension_cls(self) -> 'TorchLlmArgs':
+        if self.ray_worker_extension_cls is not None and self.orchestrator_type != "ray":
+            raise ValueError(
+                f"ray_worker_extension_cls is only supported with orchestrator_type='ray'"
             )
         return self
 

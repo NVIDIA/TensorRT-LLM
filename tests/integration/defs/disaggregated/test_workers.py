@@ -509,6 +509,7 @@ def background_workers(llm_venv, config_file: str, num_ranks: int = None):
             proc.wait()
 
 
+@pytest.mark.skip(reason="https://nvbugs/5372970")
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
 def test_workers_conditional_disaggregation(disaggregated_test_root,

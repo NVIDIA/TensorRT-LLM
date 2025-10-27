@@ -70,6 +70,7 @@ Welcome to TensorRT LLM's Documentation!
    features/parallel-strategy.md
    features/quantization.md
    features/sampling.md
+   features/additional-outputs.md
    features/speculative-decoding.md
    features/checkpoint-loading.md
    features/auto_deploy/auto-deploy.md
