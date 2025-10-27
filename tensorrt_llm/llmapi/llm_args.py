@@ -2609,7 +2609,8 @@ class TorchLlmArgs(BaseLlmArgs):
 
     enable_sleep: bool = Field(
         default=False,
-        description="Enable extra setup to support sleep feature.")
+        description="Enable extra setup to support sleep feature.",
+        status="prototype")
 
     @field_validator('load_format', mode='before')
     @classmethod
