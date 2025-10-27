@@ -20,12 +20,7 @@ def _pack_routed_tokens(
     *,
     num_experts: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    """
-    Group token/expert assignments by expert id and build CuTeDSL offsets.
-
-    CUDA graph compatible: no .item(), no bool(), no boolean indexing.
-    Assumes all expert IDs are valid (router output should be in [0, num_experts)).
-    """
+    """Group token/expert assignments by expert id and build CuTeDSL offsets."""
 
     if topk_ids.numel() == 0:
         device = topk_ids.device
@@ -43,25 +38,31 @@ def _pack_routed_tokens(
     expert_ids = topk_ids.reshape(-1).to(torch.int64)
     weights = topk_weights.reshape(-1)
 
-    # Skip validation for CUDA graph compatibility
-    # Boolean indexing creates dynamic shapes which breaks graphs
-    # Assume router outputs valid expert IDs in range [0, num_experts)
+    valid = (expert_ids >= 0) & (expert_ids < num_experts)
+    if not bool(torch.all(valid)):
+        expert_ids = expert_ids[valid]
+        token_indices = token_indices[valid]
+        weights = weights[valid]
+
+    if expert_ids.numel() == 0:
+        return (
+            torch.empty(0, dtype=torch.int64, device=device),
+            torch.empty(0, dtype=topk_weights.dtype, device=device),
+            torch.zeros(num_experts + 1, dtype=torch.int32, device=device),
+            0,
+        )
 
     sort_idx = torch.argsort(expert_ids, stable=True)
     expert_sorted = expert_ids[sort_idx]
     tokens_sorted = token_indices[sort_idx]
     weights_sorted = weights[sort_idx]
 
-    # Build cu_seqlens using searchsorted (CUDA graph compatible, no bincount)
-    # expert_sorted is sorted, so we can find where each expert ends
+    counts = torch.bincount(expert_sorted, minlength=num_experts)
     cu_seqlens = torch.zeros(num_experts + 1, dtype=torch.int32, device=device)
-    expert_range = torch.arange(num_experts, device=device, dtype=expert_sorted.dtype)
-    # searchsorted with right=True gives us the end position (exclusive) for each expert
-    ends = torch.searchsorted(expert_sorted, expert_range, right=True)
-    cu_seqlens[1:] = ends.to(torch.int32)
+    if counts.numel() != 0:
+        cu_seqlens[1:] = torch.cumsum(counts.to(torch.int32), dim=0)
 
-    # Use .shape[0] instead of .item() for CUDA graph compatibility
-    total_pairs = tokens_sorted.shape[0]
+    total_pairs = int(cu_seqlens[-1].item())
     return tokens_sorted, weights_sorted, cu_seqlens, total_pairs
 
 
