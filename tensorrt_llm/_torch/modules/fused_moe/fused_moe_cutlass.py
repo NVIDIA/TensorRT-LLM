@@ -552,7 +552,8 @@ class CutlassFusedMoE(MoE):
                         ep_rank=self.ep_rank,
                         ep_size=self.ep_size,
                         top_k=top_k,
-                        use_low_precision_combine=self.use_low_precision_combine,
+                        use_low_precision_combine=self.
+                        use_low_precision_combine,
                         token_count=token_count)
             elif self.moe_alltoall_backend == "mnnvlthroughput":
                 hidden = final_hidden_states.shape[-1]
