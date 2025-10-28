@@ -47,6 +47,12 @@ WRITE_ACCESS_PROJECT_NAME = []
 
 DISABLE_NVDF_FOR_LOCAL_TEST = False
 
+DEFAULT_QUERY_SIZE = 3000
+DEFAULT_RETRY_COUNT = 5
+DEFAULT_LOOKBACK_DAYS = 7
+POST_TIMEOUT_SECONDS = 20
+QUERY_TIMEOUT_SECONDS = 10
+
 NVDF_BASE_URL = os.getenv("NVDF_BASE_URL", "")
 NVDF_USERNAME = os.getenv("NVDF_CREDENTIALS_USR", "")
 NVDF_PASSWORD = os.getenv("NVDF_CREDENTIALS_PSW", "")
@@ -57,8 +63,7 @@ class NVDF:
     query_build_id_cache: dict = {}
 
     def __init__(self) -> None:
-        if not NVDF_BASE_URL:
-            raise Exception("NVDF_BASE_URL is not set")
+        pass
 
     @staticmethod
     def typeCheckForNVDataFlow(json_data):
@@ -66,44 +71,57 @@ class NVDF:
             for data in json_data:
                 NVDF.typeCheckForNVDataFlow(data)
             return json_data
-        assert isinstance(json_data, dict)
+        if not isinstance(json_data, dict):
+            raise TypeError(f"Expected dict, got {type(json_data).__name__}")
         for key, value in json_data.items():
             if key.startswith("l_"):
                 if not isinstance(value, int):
                     NVDF.logger.fatal(
                         "NVDF type check failed! key:{}, value:{} value_type:{}"
                         .format(key, value, type(value)))
-                    raise Exception("typeCheckForNVDataFlow Failed")
+                    raise Exception(
+                        "typeCheckForNVDataFlow Failed, key:{}, value:{} value_type:{}"
+                        .format(key, value, type(value)))
             elif key.startswith("s_"):
                 if not isinstance(value, str):
                     NVDF.logger.fatal(
                         "NVDF type check failed! key:{}, value:{} value_type:{}"
                         .format(key, value, type(value)))
-                    raise Exception("typeCheckForNVDataFlow Failed")
+                    raise Exception(
+                        "typeCheckForNVDataFlow Failed, key:{}, value:{} value_type:{}"
+                        .format(key, value, type(value)))
             elif key.startswith("b_"):
                 if not isinstance(value, bool):
                     NVDF.logger.fatal(
                         "NVDF type check failed! key:{}, value:{} value_type:{}"
                         .format(key, value, type(value)))
-                    raise Exception("typeCheckForNVDataFlow Failed")
+                    raise Exception(
+                        "typeCheckForNVDataFlow Failed, key:{}, value:{} value_type:{}"
+                        .format(key, value, type(value)))
             elif key.startswith("ts_"):
                 if not isinstance(value, int):
                     NVDF.logger.fatal(
                         "NVDF type check failed! key:{}, value:{} value_type:{}"
                         .format(key, value, type(value)))
-                    raise Exception("typeCheckForNVDataFlow Failed")
+                    raise Exception(
+                        "typeCheckForNVDataFlow Failed, key:{}, value:{} value_type:{}"
+                        .format(key, value, type(value)))
             elif key.startswith("flat_"):
                 if not isinstance(value, dict):
                     NVDF.logger.fatal(
                         "NVDF type check failed! key:{}, value_type:{}".format(
                             key, type(value)))
-                    raise Exception("typeCheckForNVDataFlow Failed")
+                    raise Exception(
+                        "typeCheckForNVDataFlow Failed, key:{}, value:{} value_type:{}"
+                        .format(key, value, type(value)))
             elif key.startswith("ni_"):
                 if not isinstance(value, (str, int, float)):
                     NVDF.logger.fatal(
                         "NVDF type check failed! key:{}, value_type:{}".format(
                             key, type(value)))
-                    raise Exception("typeCheckForNVDataFlow Failed")
+                    raise Exception(
+                        "typeCheckForNVDataFlow Failed, key:{}, value:{} value_type:{}"
+                        .format(key, value, type(value)))
             else:
                 NVDF.logger.fatal(
                     "Unknown key type! key:{}, value_type:{}".format(
@@ -111,17 +129,25 @@ class NVDF:
         return json_data
 
     @staticmethod
+    def _calculate_timestamp(days_ago):
+        return int(time.time() -
+                   24 * 3600 * days_ago) // (24 * 3600) * 24 * 3600 * 1000
+
+    @staticmethod
     def add_id_of_json(data):
         if isinstance(data, list):
             for d in data:
                 NVDF.add_id_of_json(d)
             return
-        assert isinstance(data, dict)
+        if not isinstance(data, dict):
+            raise TypeError("data is not a dict, type:{}".format(type(data)))
         data_str = json.dumps(data, sort_keys=True, indent=2).encode("utf-8")
         data["_id"] = hashlib.md5(data_str).hexdigest()
 
     @staticmethod
-    def postToNVDataFlow(json_data, project, rtn=True):
+    def postToNVDataFlow(json_data, project):
+        if not NVDF_BASE_URL:
+            raise Exception("NVDF_BASE_URL is not set")
         if not NVDF_USERNAME or not NVDF_PASSWORD:
             raise Exception("NVDF_USERNAME or NVDF_PASSWORD is not set")
         if project not in WRITE_ACCESS_PROJECT_NAME:
@@ -135,20 +161,20 @@ class NVDF:
             NVDF.logger.info(
                 "NVDF is disabled for local test, skip posting to NVDataFlow: {}"
                 .format(json_data))
-            return
+            return None
         url = "{}/dataflow2/{}/posting".format(NVDF_BASE_URL, project)
         headers = {
             "Content-Type": "application/json",
             "Accept-Charset": "UTF-8"
         }
-        retry_time = 5
+        retry_time = DEFAULT_RETRY_COUNT
         while retry_time:
             res = requests.post(
                 url,
                 data=json_data,
                 headers=headers,
                 auth=HTTPProxyAuth(NVDF_USERNAME, NVDF_PASSWORD),
-                timeout=20,
+                timeout=POST_TIMEOUT_SECONDS,
             )
             if res.status_code in [200, 201, 202]:
                 if res.status_code != 200 and project == JOB_PROJECT_NAME:
@@ -161,9 +187,12 @@ class NVDF:
         NVDF.logger.error(
             "Fail to postToNVDataFlow after {} retry: {}, json: {}, error: {}".
             format(retry_time, url, json_data, res.text))
+        return None
 
     @staticmethod
     def queryFromNVDataFlow(json_data, project):
+        if not NVDF_BASE_URL:
+            raise Exception("NVDF_BASE_URL is not set")
         if project not in READ_ACCESS_PROJECT_NAME:
             raise Exception(
                 "project {} is not in read access project list: {}".format(
@@ -175,9 +204,12 @@ class NVDF:
             "Content-Type": "application/json",
             "Accept-Charset": "UTF-8"
         }
-        retry_time = 5
+        retry_time = DEFAULT_RETRY_COUNT
         while retry_time:
-            res = requests.get(url, data=json_data, headers=headers, timeout=10)
+            res = requests.get(url,
+                               data=json_data,
+                               headers=headers,
+                               timeout=QUERY_TIMEOUT_SECONDS)
             if res.status_code in [200, 201, 202]:
                 return res.json()
             NVDF.logger.info(
@@ -187,37 +219,40 @@ class NVDF:
         NVDF.logger.error(
             "Fail to queryFromNVDataFlow after {} retry: {}, json: {}, error: {}"
             .format(retry_time, url, json_data, res.text))
+        return None
 
     @staticmethod
-    def queryBuildIdFromNVDataFlow(job_name, last_days=10):
+    def queryBuildIdFromNVDataFlow(job_name, last_days=DEFAULT_LOOKBACK_DAYS):
         if DISABLE_NVDF_FOR_LOCAL_TEST:
             return []
         if job_name in NVDF.query_build_id_cache:
             return NVDF.query_build_id_cache[job_name]
         json_data = {
-            "size": 3000,
+            "size": DEFAULT_QUERY_SIZE,
             "query": {
                 "range": {
                     "ts_created": {
-                        "gte":
-                        int(time.time() - 24 * 3600 * last_days) //
-                        (24 * 3600) * 24 * 3600 * 1000,
+                        "gte": NVDF._calculate_timestamp(last_days),
                     }
                 }
             },
             "_source": ["ts_created", "s_job_name", "s_status", "s_build_id"],
         }
         build_ids = []
-        query_res = NVDF.queryFromNVDataFlow(json_data, JOB_PROJECT_NAME)
-        for job in query_res["hits"]["hits"]:
-            job_info = job.get("_source", {})
-            if job_name == job_info.get("s_job_name"):
-                build_ids.append(job_info.get("s_build_id"))
-        NVDF.query_build_id_cache[job_name] = build_ids
-        return build_ids
+        try:
+            query_res = NVDF.queryFromNVDataFlow(json_data, JOB_PROJECT_NAME)
+            for job in query_res["hits"]["hits"]:
+                job_info = job.get("_source", {})
+                if job_name == job_info.get("s_job_name"):
+                    build_ids.append(job_info.get("s_build_id"))
+            NVDF.query_build_id_cache[job_name] = build_ids
+            return build_ids
+        except Exception as e:
+            NVDF.logger.warning(f"Failed to query build IDs from NVDF: {e}")
+            return []
 
     @staticmethod
-    def queryPRIdsFromNVDataFlow(repo_name, last_days=10):
+    def queryPRIdsFromNVDataFlow(repo_name, last_days=DEFAULT_LOOKBACK_DAYS):
         """
         Query existing PR IDs from NVDF for a specific repository.
         Mirrors queryBuildIdFromNVDataFlow for PR monitoring.
@@ -230,16 +265,14 @@ class NVDF:
             return NVDF.query_build_id_cache[cache_key]
 
         json_data = {
-            "size": 3000,
+            "size": DEFAULT_QUERY_SIZE,
             "query": {
                 "bool": {
                     "must": [
                         {
                             "range": {
                                 "ts_created": {
-                                    "gte":
-                                    int(time.time() - 24 * 3600 * last_days) //
-                                    (24 * 3600) * 24 * 3600 * 1000,
+                                    "gte": NVDF._calculate_timestamp(last_days),
                                 }
                             }
                         },
@@ -263,12 +296,8 @@ class NVDF:
                     pr_number = pr_info.get("l_pr_number")
                     if pr_number and pr_number not in pr_numbers:
                         pr_numbers.append(pr_number)
+            NVDF.query_build_id_cache[cache_key] = pr_numbers
+            return pr_numbers
         except Exception as e:
             NVDF.logger.warning(f"Failed to query PR IDs from NVDF: {e}")
             return []
-
-        NVDF.query_build_id_cache[cache_key] = pr_numbers
-        return pr_numbers
-
-
-print(NVDF.queryBuildIdFromNVDataFlow("LLM/main/L0_MergeRequest_PR"))
