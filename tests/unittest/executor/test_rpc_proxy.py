@@ -55,7 +55,7 @@ class TestRpcProxy:
 
         return proxy
 
-    @pytest.mark.parametrize("num_reqs", [1, 10])
+    @pytest.mark.parametrize("num_reqs", [1, 5, 10])
     def test_tp1(self, num_reqs):
         tokenizer = TransformersTokenizer.from_pretrained(model_path)
         prompt = "A B C D"

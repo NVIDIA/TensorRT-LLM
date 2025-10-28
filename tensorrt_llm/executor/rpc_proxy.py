@@ -1,5 +1,6 @@
 import asyncio
 import atexit
+import concurrent.futures
 import json
 import threading
 from typing import Optional
@@ -43,6 +44,14 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         """
         GenerationExecutorRpcProxy.INSTANCE_COUNTER += 1
         self.rpc_addr = get_unique_ipc_addr()
+
+        # Initialize event loop components first
+        self._shutdown_event = threading.Event()
+        self.main_loop_task_obj = None
+        self.main_loop = None
+        self.main_loop_started = threading.Event()
+
+        # Create RPC client without event loop first (it will create its own)
         self.rpc_client = RPCClient(self.rpc_addr)
 
         postproc_worker_config = postproc_worker_config or PostprocWorkerConfig(
@@ -59,22 +68,9 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         self._results = {}
 
         self._create_mpi_session(model_world_size, mpi_session)
-
-        self._shutdown_event = threading.Event()
         self.worker_kwargs = worker_kwargs
 
-        self.main_loop_task_obj = None
-        self.main_loop = None
-        self.main_loop_started = threading.Event()
-
         self.launch_workers()
-
-        # Start the response reader early to avoid race conditions
-        if hasattr(self.rpc_client, '_start_response_reader_lazily'):
-            self.rpc_client._start_response_reader_lazily()
-            # Give response reader time to start
-            import time
-            time.sleep(0.1)
 
         # Invoke model creation on the remote
         # TBD: Move model creation to the mpi task, or left in RPC?
@@ -142,29 +138,47 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
                 tasks.append(self._fetch_kv_cache_events_loop_async())
             await asyncio.gather(*tasks)
 
-        def _run_main_loop_task():
-            """Local method to run the main loop task."""
-            self.main_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self.main_loop)
-
-            self.main_loop_task_obj = self.main_loop.create_task(
-                main_loop_task())
-            # Signal that the main loop is ready
+        # Check if there's already a running event loop in the current thread
+        try:
+            existing_loop = asyncio.get_running_loop()
+            # If we're already in an async context, schedule the task on the existing loop
+            logger_debug(
+                "Found existing event loop, scheduling main loop task on it",
+                color="yellow")
+            self.main_loop = existing_loop
+            self.main_loop_task_obj = asyncio.create_task(main_loop_task())
             self.main_loop_started.set()
-            try:
-                self.main_loop.run_until_complete(self.main_loop_task_obj)
-            except asyncio.CancelledError:
-                pass  # Task cancellation is expected during shutdown
-            finally:
-                self.main_loop.close()
+            # No need to create a new thread since we're using the existing loop
+            self.main_loop_thread = None
+        except RuntimeError:
+            # No running loop, create one in a separate thread
+            logger_debug(
+                "No existing event loop, creating new one in separate thread",
+                color="yellow")
 
-        self.main_loop_thread = threading.Thread(target=_run_main_loop_task,
-                                                 daemon=True,
-                                                 name="rpc_proxy_main_loop")
-        self.main_loop_thread.start()
-        # Wait for the main loop to be ready before continuing
-        if not self.main_loop_started.wait(timeout=5.0):
-            raise RuntimeError("Main loop failed to start within timeout")
+            def _run_main_loop_task():
+                """Local method to run the main loop task."""
+                self.main_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(self.main_loop)
+
+                self.main_loop_task_obj = self.main_loop.create_task(
+                    main_loop_task())
+                # Signal that the main loop is ready
+                self.main_loop_started.set()
+                try:
+                    self.main_loop.run_until_complete(self.main_loop_task_obj)
+                except asyncio.CancelledError:
+                    pass  # Task cancellation is expected during shutdown
+                finally:
+                    self.main_loop.close()
+
+            self.main_loop_thread = threading.Thread(target=_run_main_loop_task,
+                                                     daemon=True)
+            self.main_loop_thread.start()
+            # Wait for the main loop to be ready before continuing
+            if not self.main_loop_started.wait(timeout=5.0):
+                raise RuntimeError("Main loop failed to start within timeout")
+
         atexit.register(self.shutdown)
 
     def handle_responses(self, responses: list[GenerationResult]) -> bool:
@@ -351,19 +365,29 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         # 2. stop the main loop, so that no new rpc requests
         if self.main_loop:
             try:
-                # Cancel all tasks gracefully
+                # Cancel the main task if it exists
                 if self.main_loop_task_obj and not self.main_loop_task_obj.done(
                 ):
-                    self.main_loop.call_soon_threadsafe(
-                        self.main_loop_task_obj.cancel)
+                    self.main_loop_task_obj.cancel()
+                    try:
+                        self.main_loop_task_obj.result(timeout=2.0)
+                    except (asyncio.CancelledError,
+                            concurrent.futures.CancelledError):
+                        pass  # Expected when cancelling
+                    except Exception as e:
+                        logger.warning(f"Error cancelling main task: {e}")
 
-                # Stop the event loop
-                self.main_loop.call_soon_threadsafe(self.main_loop.stop)
+                # Only stop the event loop if we created it (have a thread)
+                if self.main_loop_thread:
+                    # Stop the event loop
+                    self.main_loop.call_soon_threadsafe(self.main_loop.stop)
 
-                # Wait for the thread to complete with timeout
-                self.main_loop_thread.join(timeout=5.0)
-                if self.main_loop_thread.is_alive():
-                    logger.warning("Main loop thread did not exit cleanly")
+                    # Wait for the thread to complete with timeout
+                    self.main_loop_thread.join(timeout=5.0)
+                    if self.main_loop_thread.is_alive():
+                        logger.warning("Main loop thread did not exit cleanly")
+                else:
+                    logger.debug("Using external event loop, not stopping it")
             except Exception as e:
                 logger.warning(f"Error during main loop shutdown: {e}")
 

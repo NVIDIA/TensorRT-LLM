@@ -36,7 +36,9 @@ class RpcWorker(BaseWorker):
     """
 
     # Number of RPC server workers
-    NUM_WORKERS = 6
+    # Increased to handle concurrent requests and prevent thread pool exhaustion
+    # Need enough workers for: submit requests + fetch_responses + other operations
+    NUM_WORKERS = 32
 
     def __init__(
         self,
@@ -116,6 +118,7 @@ class RpcWorker(BaseWorker):
         return await asyncio.to_thread(self.fetch_kv_cache_events)
 
     # for streaming performance
+    # This will be called by the RpcProxy to fetch responses in a loop.
     async def fetch_responses_loop_async(self) -> AsyncGenerator[list, None]:
         while not self.shutdown_event.is_set():
             responses = await self.fetch_responses_async()

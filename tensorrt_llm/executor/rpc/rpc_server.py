@@ -57,8 +57,11 @@ class RPCServer:
         }
         self._dispatcher_thread: Optional[ManagedThread] = None
         if async_run_task:
+            # Increase thread pool size to avoid exhaustion with concurrent operations
+            # Use 2x num_workers to handle both request processing and response handling
             self._executor = ThreadPoolExecutor(
-                max_workers=num_workers, thread_name_prefix="rpc_server_worker")
+                max_workers=num_workers * 2,
+                thread_name_prefix="rpc_server_worker")
         else:
             self._executor = None
 
