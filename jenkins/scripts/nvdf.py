@@ -11,7 +11,7 @@ PROJECT_ROOT = "swdl-trtllm-infra"
 MODE = "prod"
 VERSION = "v1"
 
-# CI monitor indexes, now only support query online and post offline.
+# CI monitor indexes, now only support read access.
 JOB_PROJECT_NAME = f"{PROJECT_ROOT}-ci-{MODE}-job_info"
 STAGE_PROJECT_NAME = f"{PROJECT_ROOT}-ci-{MODE}-stage_info"
 TEST_PROJECT_NAME = f"{PROJECT_ROOT}-ci-{MODE}-test_info"
@@ -19,8 +19,16 @@ JOB_MACHINE_PROJECT_NAME = f"{PROJECT_ROOT}-ci-{MODE}-job_machine_info"
 FAILED_STEP_PROJECT_NAME = f"{PROJECT_ROOT}-ci-{MODE}-failed_step_info"
 PR_PROJECT_NAME = f"{PROJECT_ROOT}-ci-{MODE}-pr_info"
 
-# post online indexes
-# XXXX
+READ_ACCESS_PROJECT_NAME = [
+    JOB_PROJECT_NAME,
+    STAGE_PROJECT_NAME,
+    TEST_PROJECT_NAME,
+    JOB_MACHINE_PROJECT_NAME,
+    FAILED_STEP_PROJECT_NAME,
+    PR_PROJECT_NAME,
+]
+
+WRITE_ACCESS_PROJECT_NAME = []
 
 DISABLE_NVDF_FOR_LOCAL_TEST = False
 
@@ -28,20 +36,14 @@ NVDF_BASE_URL = os.getenv("NVDF_BASE_URL", "")
 NVDF_USERNAME = os.getenv("NVDF_CREDENTIALS_USR", "")
 NVDF_PASSWORD = os.getenv("NVDF_CREDENTIALS_PSW", "")
 
-if not NVDF_BASE_URL or not NVDF_USERNAME or not NVDF_PASSWORD:
-    print(f"NVDF_USERNAME: {NVDF_USERNAME}")
-    print(f"NVDF_PASSWORD: {NVDF_PASSWORD}")
-    print(f"NVDF_BASE_URL: {NVDF_BASE_URL}")
-    raise Exception(
-        "NVDF_BASE_URL or NVDF_USERNAME or NVDF_PASSWORD is not set")
-
 
 class NVDF:
     logger = logging.getLogger(__name__)
     query_build_id_cache: dict = {}
 
     def __init__(self) -> None:
-        pass
+        if not NVDF_BASE_URL:
+            raise Exception("NVDF_BASE_URL is not set")
 
     @staticmethod
     def typeCheckForNVDataFlow(json_data):
@@ -104,37 +106,20 @@ class NVDF:
         data["_id"] = hashlib.md5(data_str).hexdigest()
 
     @staticmethod
-    def postStageInfoToNVDataFlow(json_data):
-        NVDF.postToNVDataFlow(json_data, STAGE_PROJECT_NAME)
-
-    @staticmethod
-    def postTestInfoToNVDataFlow(json_data):
-        NVDF.postToNVDataFlow(json_data, TEST_PROJECT_NAME)
-
-    @staticmethod
-    def postJobInfoToNVDataFlow(json_data):
-        NVDF.postToNVDataFlow(json_data, JOB_PROJECT_NAME)
-
-    @staticmethod
-    def postJobMachineInfoToNVDataFlow(json_data):
-        NVDF.postToNVDataFlow(json_data, JOB_MACHINE_PROJECT_NAME)
-
-    @staticmethod
-    def postFailedStepInfoToNVDataFlow(json_data):
-        NVDF.postToNVDataFlow(json_data, FAILED_STEP_PROJECT_NAME)
-
-    @staticmethod
-    def postPRInfoToNVDataFlow(json_data):
-        """Post GitHub PR information to NVDF."""
-        NVDF.postToNVDataFlow(json_data, PR_PROJECT_NAME)
-
-    @staticmethod
     def postToNVDataFlow(json_data, project, rtn=True):
+        if not NVDF_USERNAME or not NVDF_PASSWORD:
+            raise Exception("NVDF_USERNAME or NVDF_PASSWORD is not set")
+        if project not in WRITE_ACCESS_PROJECT_NAME:
+            raise Exception(
+                "project {} is not in write access project list: {}".format(
+                    project, json.dumps(WRITE_ACCESS_PROJECT_NAME)))
         NVDF.typeCheckForNVDataFlow(json_data)
-        Utils.add_id_of_json(json_data)
+        NVDF.add_id_of_json(json_data)
         json_data = json.dumps(json_data)
         if DISABLE_NVDF_FOR_LOCAL_TEST:
-            # NVDF.logger.info("NVDF is disabled, skip posting to NVDataFlow: {}".format(json_data))
+            NVDF.logger.info(
+                "NVDF is disabled for local test, skip posting to NVDataFlow: {}"
+                .format(json_data))
             return
         url = "{}/dataflow2/{}/posting".format(NVDF_BASE_URL, project)
         headers = {
@@ -163,6 +148,10 @@ class NVDF:
 
     @staticmethod
     def queryFromNVDataFlow(json_data, project):
+        if project not in READ_ACCESS_PROJECT_NAME:
+            raise Exception(
+                "project {} is not in read access project list: {}".format(
+                    project, json.dumps(READ_ACCESS_PROJECT_NAME)))
         if not isinstance(json_data, str):
             json_data = json.dumps(json_data)
         url = "{}/opensearch/df-{}-*/_search".format(NVDF_BASE_URL, project)
