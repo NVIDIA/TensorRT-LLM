@@ -2329,14 +2329,15 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3.2-Exp-hf"
 
     @pytest.mark.skip_less_mpi_world_size(8)
-    @skip_pre_blackwell
+    @skip_pre_hopper
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
         [
             (8, 1, 8, 0, False, True, True, True, 24, "_DEFAULT"),
             (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT"),
+            (8, 1, 8, 0, True, True, True, True, 24, "_DEFAULT"),
         ],
-        ids=["baseline", "baseline_mtp1"])
+        ids=["baseline", "baseline_mtp1", "baseline_fp8kv"])
     def test_fp8_blockscale(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                             attention_dp, cuda_graph, overlap_scheduler,
                             max_batch_size, moe_backend):
@@ -2378,14 +2379,18 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                  enable_attention_dp=attention_dp,
                  speculative_config=mtp_config) as llm:
 
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
             # GPQA Diamond takes too long to run
-            # task = GPQADiamond(self.MODEL_NAME)
-            # task.evaluate(llm,
-            #               extra_evaluator_kwargs=dict(apply_chat_template=True, chat_template_kwargs=dict(thinking=True)))
+            if fp8kv:
+                task = GPQADiamond(self.MODEL_NAME)
+                task.evaluate(llm,
+                              extra_evaluator_kwargs=dict(
+                                  apply_chat_template=True,
+                                  chat_template_kwargs=dict(thinking=True)))
+            else:
+                task = MMLU(self.MODEL_NAME)
+                task.evaluate(llm)
+                task = GSM8K(self.MODEL_NAME)
+                task.evaluate(llm)
 
     @skip_pre_blackwell
     @pytest.mark.parametrize(
