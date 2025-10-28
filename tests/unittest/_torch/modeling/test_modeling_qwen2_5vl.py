@@ -8,23 +8,12 @@ from test_modeling_multimodal import Scenario, TestModelingMultimodal
 from transformers import Qwen2_5_VLConfig
 from transformers import \
     Qwen2_5_VLForConditionalGeneration as HFQwen2_5_VLForConditionalLM
+from utils.llm_data import llm_models_root
 
-from tensorrt_llm._torch.attention_backend.interface import \
-    AttentionRuntimeFeatures
 from tensorrt_llm._torch.models.checkpoints.hf.qwen2vl_weight_mapper import \
     Qwen2VLHfWeightMapper
 from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2_5_VLModel
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
-
-
-def llm_models_root() -> str:
-    '''return LLM_MODELS_ROOT path if it is set in env, assert when it's set but not a valid path
-    '''
-    DEFAULT_LLM_MODEL_ROOT = os.path.join("/scratch.trt_llm_data", "llm-models")
-    LLM_MODELS_ROOT = os.environ.get("LLM_MODELS_ROOT", DEFAULT_LLM_MODEL_ROOT)
-
-    return LLM_MODELS_ROOT
-
 
 QWEN2_5_VL_7B_CONFIG = {
     "architectures": ["Qwen2_5_VLForConditionalGeneration"],
@@ -105,11 +94,6 @@ class TestQwen2_5_VLScenario(Scenario):
 
 class TestQwen2_5_VL(TestModelingMultimodal):
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # Override the generic config with our specific config
-        self.config = QWEN2_5_VL_7B_CONFIG
-
     def get_model_config(self):
         """Return the model configuration dictionary."""
         return QWEN2_5_VL_7B_CONFIG
@@ -128,9 +112,6 @@ class TestQwen2_5_VL(TestModelingMultimodal):
 
     def get_model_config_class(self):
         return Qwen2_5_VLConfig
-
-    # def get_dtype(self) -> torch.dtype:
-    #     return str_dtype_to_torch(self.config["torch_dtype"])
 
     def get_trtllm_inputs(self,
                           input_ids,
@@ -277,47 +258,10 @@ class TestQwen2_5_VL(TestModelingMultimodal):
         ]
         return scenarios
 
-    def test_all(self) -> None:
-        self.init()
-        scenarios = self.get_scenarios()
-
-        results = {}
-        failed_scenarios = []
-
-        for scenario in scenarios:
-            print(f"Testing comprehensive scenario: {scenario}")
-            try:
-                if scenario.chunked_prefill:
-                    self.runtime_features = AttentionRuntimeFeatures(
-                        chunked_prefill=True, chunk_size=8192)
-                elif scenario.kv_cache_reuse:
-                    self.runtime_features = AttentionRuntimeFeatures(
-                        cache_reuse=True, chunk_size=8192)
-
-                if scenario.disable_fuse_rope:
-                    self.trtllm_model, self.model_config = self.create_trtllm_model(
-                        load_weights=True,
-                        hf_model_state_dict=self.hf_model.state_dict(),
-                        disable_fuse_rope=True)
-                result = self.run_scenario_test(scenario)
-                results[str(scenario)] = result
-                if not result:
-                    failed_scenarios.append(str(scenario))
-            except Exception as e:
-                print(f"Error in scenario {scenario}: {e}")
-                results[str(scenario)] = False
-                failed_scenarios.append(str(scenario))
-
-        # Print detailed summary
-        passed = sum(results.values())
-        total = len(results)
-        print(
-            f"Comprehensive batch test results: {passed}/{total} scenarios passed"
-        )
-
-        if failed_scenarios:
-            print(f"Failed scenarios: {failed_scenarios}")
-
-        # Assert all scenarios pass
-        self.assertEqual(len(failed_scenarios), 0,
-                         f"Some scenarios failed: {failed_scenarios}")
+    def setup_scenario(self, scenario: TestQwen2_5_VLScenario):
+        super().setup_scenario(scenario)
+        if scenario.disable_fuse_rope:
+            self.trtllm_model, self.model_config = self.create_trtllm_model(
+                load_weights=True,
+                hf_model_state_dict=self.hf_model.state_dict(),
+                disable_fuse_rope=True)

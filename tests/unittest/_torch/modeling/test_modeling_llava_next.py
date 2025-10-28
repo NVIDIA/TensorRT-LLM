@@ -73,12 +73,7 @@ class TestLlavaNextScenario(Scenario):
 
 class TestLlavaNext(TestModelingMultimodal):
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.config = LLAVA_NEXT_7B_CONFIG
-
     def get_model_config(self):
-        """Return the model configuration dictionary."""
         return LLAVA_NEXT_7B_CONFIG
 
     def get_trtllm_model_class(self):
@@ -123,6 +118,3 @@ class TestLlavaNext(TestModelingMultimodal):
                                   kv_cache_reuse=True),
         ]
         return scenarios
-
-    def test_all(self) -> None:
-        super().test_all()

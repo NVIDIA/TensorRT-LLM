@@ -37,7 +37,6 @@ Author: TensorRT-LLM Team
 """
 
 import os
-import time
 import unittest
 from abc import ABC, abstractmethod
 from copy import deepcopy
@@ -49,6 +48,7 @@ import torch
 from _torch.helpers import create_mock_engine
 from transformers import (AutoProcessor, AutoTokenizer, PretrainedConfig,
                           PreTrainedModel)
+from utils.llm_data import llm_models_root
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.interface import \
@@ -66,20 +66,6 @@ from tensorrt_llm.inputs import (create_input_processor,
 from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             MultimodalRuntimeData)
 from tensorrt_llm.mapping import Mapping
-
-
-def llm_models_root() -> str:
-    """Get the LLM models root directory path.
-
-    Returns:
-        Path to the LLM models root directory from environment variable or default.
-
-    Note:
-        Set LLM_MODELS_ROOT environment variable to override the default path.
-    """
-    DEFAULT_LLM_MODEL_ROOT = os.path.join("/scratch.trt_llm_data", "llm-models")
-    LLM_MODELS_ROOT = os.environ.get("LLM_MODELS_ROOT", DEFAULT_LLM_MODEL_ROOT)
-    return LLM_MODELS_ROOT
 
 
 @dataclass(repr=False)
@@ -198,81 +184,6 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         attn_metadata: Attention metadata
     """
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._trtllm_model_cache = None
-        self._hf_model_cache = None
-
-        # Model Config
-        self.device = torch.device("cuda:0")
-        self.dtype = self.get_dtype()
-        self.config = self.get_model_config()
-
-        # Initialize state variables
-        self.hf_config = None
-        self.hf_model = None
-        self.trtllm_model = None
-        self.model_config = None
-        self.runtime_features = None
-        self.kv_cache_manager = None
-        self.attn_metadata = None
-
-    def cleanup(self):
-        """Cleanup resources and reset state.
-
-        This method can be called to free GPU memory and reset test state.
-        Useful when running multiple tests or debugging.
-        """
-        if self.kv_cache_manager is not None:
-            try:
-                self.kv_cache_manager.shutdown()
-            except Exception as e:
-                print(f"Warning: Error during KV cache manager shutdown: {e}")
-            self.kv_cache_manager = None
-
-        self.attn_metadata = None
-
-        # Force garbage collection to free GPU memory
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    def print_test_info(self):
-        """Print information about the test configuration.
-
-        Useful for debugging and understanding test setup.
-        """
-        print("\n" + "=" * 70)
-        print("TEST CONFIGURATION")
-        print("=" * 70)
-        print(f"Model Type: {self.get_model_type()}")
-        print(f"Device: {self.device}")
-        print(f"Data Type: {self.dtype}")
-
-        if self.config:
-            print(f"\nModel Config:")
-            print(f"  - Hidden Size: {self.config.get('hidden_size', 'N/A')}")
-            print(
-                f"  - Num Layers: {self.config.get('num_hidden_layers', 'N/A')}"
-            )
-            print(
-                f"  - Num Attention Heads: {self.config.get('num_attention_heads', 'N/A')}"
-            )
-            print(
-                f"  - Num KV Heads: {self.config.get('num_key_value_heads', 'N/A')}"
-            )
-
-        atol, rtol = self.get_tolerance()
-        print(f"\nTolerance Settings:")
-        print(f"  - Absolute Tolerance: {atol}")
-        print(f"  - Relative Tolerance: {rtol}")
-
-        scenarios = self.get_scenarios()
-        print(f"\nTest Scenarios ({len(scenarios)} total):")
-        for i, scenario in enumerate(scenarios, 1):
-            print(f"  {i}. {scenario}")
-
-        print("=" * 70 + "\n")
-
     @abstractmethod
     def get_model_config(self) -> Dict:
         """Return the model configuration dictionary."""
@@ -381,7 +292,7 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         return prompts, media
 
     def create_hf_config(self) -> PretrainedConfig:
-        config_dict = deepcopy(self.config)
+        config_dict = deepcopy(self.get_model_config())
         config_class = self.get_model_config_class()
         hf_config = config_class.from_dict(config_dict)
         return hf_config
@@ -434,7 +345,7 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         """
         hf_model_class = self.get_hf_model_class()
         hf_model = hf_model_class(pretrained_config).to(self.device).to(
-            self.dtype)
+            self.get_dtype())
         hf_model.eval()
 
         return hf_model
@@ -623,7 +534,6 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
             prompt_token_ids, extra_processed_inputs = input_processor_with_hash(
                 input, sampling_params=None)
             input_ids.extend(prompt_token_ids)
-            # context_sequence_lengths.append(len(prompt_token_ids))
             multimodal_params = MultimodalParams(
                 multimodal_data=extra_processed_inputs.get('multimodal_data'),
                 multimodal_input=extra_processed_inputs.get('multimodal_input'))
@@ -760,7 +670,8 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         elif modality == "video":
             images = None
             videos = [
-                input['multi_modal_data'][f'{modality}'] for input in inputs
+                input['multi_modal_data'][f'{modality}'][0].frames
+                for input in inputs
             ]
         elif modality == "text":
             # For text-only modality, no images or videos needed
@@ -1041,48 +952,49 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         ]
         return scenarios
 
-    def init(self):
-        """Initialize models and configurations for testing.
-
-        This method:
-        1. Sets random seed for reproducibility
-        2. Creates HuggingFace config from model config
-        3. Creates HuggingFace model
-        4. Creates TensorRT-LLM model and loads weights from HF model
-        5. Initializes runtime features
-
-        Note:
-            Override this method if you need custom initialization logic.
-        """
+    def setUp(self):
+        """Initialize models and configurations for testing."""
         torch.random.manual_seed(0)
 
-        print("Initializing test environment...")
-        print(f"  Creating HuggingFace config...")
+        # TODO: Add multi-GPU support
+        self.device = torch.device("cuda:0")
+
         self.hf_config = self.create_hf_config()
-
-        print(f"  Creating HuggingFace model...")
         self.hf_model = self.create_hf_model(self.hf_config)
-
-        print(f"  Creating TensorRT-LLM model and loading weights...")
         self.trtllm_model, self.model_config = self.create_trtllm_model(
             load_weights=True, hf_model_state_dict=self.hf_model.state_dict())
-
-        print(f"  Initializing runtime features...")
         self.runtime_features = AttentionRuntimeFeatures()
 
-        print("✓ Initialization complete\n")
+    def tearDown(self):
+        """Cleanup resources and reset state.
+
+        This method can be called to free GPU memory and reset test state.
+        Useful when running multiple tests or debugging.
+        """
+        if self.kv_cache_manager is not None:
+            try:
+                self.kv_cache_manager.shutdown()
+            except Exception as e:
+                print(f"Warning: Error during KV cache manager shutdown: {e}")
+            self.kv_cache_manager = None
+
+        self.attn_metadata = None
+
+        # Force garbage collection to free GPU memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def setup_scenario(self, scenario: Scenario):
+        # Update runtime features based on scenario
+        if scenario.chunked_prefill:
+            self.runtime_features = AttentionRuntimeFeatures(
+                chunked_prefill=True, chunk_size=8192)
+        elif scenario.kv_cache_reuse:
+            self.runtime_features = AttentionRuntimeFeatures(cache_reuse=True,
+                                                             chunk_size=8192)
 
     def test_all(self) -> None:
         """Comprehensive test covering multiple scenario types in one batch.
-
-        This test method:
-        1. Initializes models and configurations
-        2. Gets test scenarios from get_scenarios()
-        3. Runs each scenario with appropriate runtime features
-        4. Collects results and error messages
-        5. Prints detailed summary with timing information
-        6. Asserts all scenarios pass
-
         The test combines regular inference, CUDA graph, chunked prefill,
         KV cache reuse, and different modalities to provide thorough coverage
         while minimizing model loading overhead.
@@ -1090,111 +1002,13 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         Raises:
             AssertionError: If any scenario fails
         """
-        start_time = time.time()
-
-        print("=" * 70)
-        print(f"Starting comprehensive multimodal model test")
-        print(f"Model: {self.get_model_type()}")
-        print("=" * 70 + "\n")
-
-        init_start = time.time()
-        self.init()
-        init_time = time.time() - init_start
-
         scenarios = self.get_scenarios()
-
-        print(f"Running {len(scenarios)} test scenarios...\n")
-
-        results = {}
-        failed_scenarios = []
-        error_messages = {}
-        scenario_times = {}
-
-        for idx, scenario in enumerate(scenarios, 1):
-            scenario_str = str(scenario)
-            print(f"[{idx}/{len(scenarios)}] Testing scenario: {scenario_str}")
-
-            scenario_start = time.time()
-
-            try:
-                # Update runtime features based on scenario
-                if scenario.chunked_prefill:
-                    self.runtime_features = AttentionRuntimeFeatures(
-                        chunked_prefill=True, chunk_size=8192)
-                elif scenario.kv_cache_reuse:
-                    self.runtime_features = AttentionRuntimeFeatures(
-                        cache_reuse=True, chunk_size=8192)
-                else:
-                    self.runtime_features = AttentionRuntimeFeatures()
-
-                # Run the scenario test
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario):
+                self.setup_scenario(scenario)
+                print(f"\n========== Testing scenario: {scenario} ==========")
                 result = self.run_scenario_test(scenario)
-                results[scenario_str] = result
-
-                scenario_time = time.time() - scenario_start
-                scenario_times[scenario_str] = scenario_time
-
-                if result:
-                    print(f"✓ Scenario passed (took {scenario_time:.2f}s)\n")
-                else:
-                    failed_scenarios.append(scenario_str)
-                    error_messages[scenario_str] = "Output comparison failed"
-                    print(f"✗ Scenario failed (took {scenario_time:.2f}s)\n")
-
-            except Exception as e:
-                scenario_time = time.time() - scenario_start
-                scenario_times[scenario_str] = scenario_time
-
-                print(f"✗ Error in scenario {scenario_str}: {e}")
-                print(f"   (took {scenario_time:.2f}s)")
-                import traceback
-                traceback.print_exc()
-                print()  # Empty line for readability
-
-                results[scenario_str] = False
-                failed_scenarios.append(scenario_str)
-                error_messages[scenario_str] = str(e)
-
-        total_time = time.time() - start_time
-        test_time = total_time - init_time
-
-        # Print detailed summary
-        print("=" * 70)
-        print("TEST SUMMARY")
-        print("=" * 70)
-
-        passed = sum(results.values())
-        total = len(results)
-        print(f"\nOverall: {passed}/{total} scenarios passed")
-
-        print(f"\nTiming Information:")
-        print(f"  • Initialization: {init_time:.2f}s")
-        print(f"  • Test Execution: {test_time:.2f}s")
-        print(f"  • Total Time: {total_time:.2f}s")
-        print(f"  • Average per scenario: {test_time/total:.2f}s")
-
-        if failed_scenarios:
-            print(f"\n❌ Failed scenarios ({len(failed_scenarios)}):")
-            for scenario in failed_scenarios:
-                error_msg = error_messages.get(scenario, 'Unknown error')
-                time_taken = scenario_times.get(scenario, 0)
-                print(f"  • {scenario} ({time_taken:.2f}s)")
-                print(f"    └─ {error_msg}")
-        else:
-            print(f"\n✓ All scenarios passed successfully!")
-
-        # Show slowest scenarios for performance insights
-        if scenario_times:
-            print(f"\nSlowest Scenarios:")
-            sorted_times = sorted(scenario_times.items(),
-                                  key=lambda x: x[1],
-                                  reverse=True)
-            for scenario, duration in sorted_times[:3]:  # Top 3 slowest
-                status = "✓" if results.get(scenario, False) else "✗"
-                print(f"  {status} {scenario}: {duration:.2f}s")
-
-        print("\n" + "=" * 70 + "\n")
-
-        # Assert all scenarios pass
-        self.assertEqual(len(failed_scenarios), 0,
-                         f"Some scenarios failed: {failed_scenarios}")
+                self.assertTrue(
+                    result,
+                    f"========== Scenario failed: {scenario} ==========\n")
+                print(f"========== Scenario passed: {scenario} ==========\n")
