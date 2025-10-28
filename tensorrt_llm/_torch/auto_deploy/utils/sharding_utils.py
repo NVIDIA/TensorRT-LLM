@@ -820,9 +820,6 @@ class QuantizationShardingMixin(ABC):
                 self.shard_load_hook,
                 weight_name=weight_key,
                 weight_shape=weight_new_shape,
-                dim=dim,
-                rank=rank,
-                world_size=world_size,
             )
         )
 
