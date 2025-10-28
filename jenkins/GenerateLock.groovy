@@ -38,14 +38,28 @@ def createKubernetesPodConfig()
     return podConfig
 }
 
+def getGitCredentialId (String repoUrl) {
+    if (repoUrl ==~ /https:\/\/github\.com\/[\w\-]+\/[\w\-\.]+(\.git)?/) {
+        return 'github-token-trtllm-ci'
+    }
+    if (repoUrl ==~ /https:\/\/gitlab\-master\.nvidia\.com\/[\w\-]+\/[\w\-\.]+(\.git)?/) {
+        return 'svc_tensorrt_gitlab_api_token'
+    }
+    return null
+}
+
 def generate()
 {
     sh "pwd && ls -alh"
 
     container("alpine") {
-        LLM_REPO = params.repoUrl
+        def LLM_REPO = params.repoUrl
         if (LLM_REPO == "Custom Repo") {
             LLM_REPO = params.customRepoUrl
+        }
+        def CREDENTIAL_ID = getGitCredentialId(LLM_REPO)
+        if (CREDENTIAL_ID == null) {
+            throw new Exception("Failed to get access token for repository")
         }
         sh "apt update"
         sh "apt install -y python3-dev git curl git-lfs"
@@ -66,7 +80,7 @@ def generate()
             sh "git status"
             sh "git add \$(find . -type f \\( -name 'poetry.lock' -o -name 'pyproject.toml' \\))"
             sh "git commit -s -m \"[None][infra] Check in most recent lock file from nightly pipeline\""
-            withCredentials([usernamePassword(credentialsId: 'github-cred-trtllm-ci', usernameVariable: 'GIT_USER', passwordVariable: 'GIT_PASS')]) {
+            withCredentials([usernamePassword(credentialsId: CREDENTIAL_ID, usernameVariable: 'GIT_USER', passwordVariable: 'GIT_PASS')]) {
                 def authedUrl = LLM_REPO.replaceFirst('https://', "https://${GIT_USER}:${GIT_PASS}@")
                 sh "git remote set-url origin ${authedUrl}"
                 sh "git fetch origin ${params.branchName}"
