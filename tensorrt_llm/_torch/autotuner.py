@@ -10,7 +10,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -127,7 +127,7 @@ Dim = Union[DynamicDim, StaticDim]
 class OptimizationProfile:
     '''Ranges of all tensors, all dimension
     '''
-    shapes: List[List[Dim]]
+    shapes: List[List[Dim]] = field(default_factory=lambda: [[]])
 
     def get_hash_key(self):
         return self.get_opt_shapes()
@@ -536,23 +536,90 @@ class AutoTuner:
 
         self.profiling_debug = True
 
-        #
-        # Test mode state for testing all kernels
-        #
-        # Capture mode flag
-        self._capture_mode: bool = False
-        # List of captured contexts
-        self._captured_contexts: List[Dict[str, Any]] = []
-        # List of (runner_idx, tactic) for each context to iterate through
-        self._test_mode_tactics_config: List[Tuple[int, int]] = None
-        # Track which choose_one call we are at during replay of captured contexts
-        self._test_mode_call_idx: int = 0
+        # Current captured choose_one() contexts
+        self._active_capture: Optional['AutoTuner.TacticsCapture'] = None
+        # Last captured choose_one() contexts
+        self._last_capture: Optional['AutoTuner.TacticsCapture'] = None
 
     @classmethod
     def get(cls):
         if cls._instance is None:
             cls._instance = AutoTuner()
         return cls._instance
+
+    class TacticsCapture:
+        """Object returned by capture() that can be iterated to get all tactic combinations.
+
+        This class encapsulates all state related to capturing and replaying tactics:
+        - Captured execution contexts
+        - Generated tactic configurations
+        - Current replay state (which config and call index)
+        """
+
+        def __init__(self, autotuner):
+            self.autotuner = autotuner
+            # State for captured contexts
+            self._captured_contexts: List[Dict[str, Any]] = []
+            self._configurations = None
+            # State for replay mode
+            self._replay_runner_tactic_list: Optional[List[Tuple[int,
+                                                                 int]]] = None
+            self._replay_context_idx: int = 0
+
+        def __iter__(self):
+            """Iterate through all tactic configurations.
+
+            For single context: yields (runner, tactic)
+            For multiple contexts: yields ((runner_ctx0, tactic_ctx0), (runner_ctx1, tactic_ctx1), ...)
+            """
+            if self._configurations is None:
+                self._configurations = self._generate_configurations()
+
+            for config in self._configurations:
+                # config is a tuple of (runner_idx, tactic) for each context
+                # Convert to (runner, tactic) format for user
+                runner_tactic_pairs = []
+                for ctx_idx, (runner_idx, tactic) in enumerate(config):
+                    runners = self._captured_contexts[ctx_idx]['runners']
+                    runner = runners[runner_idx]
+                    runner_tactic_pairs.append((runner, tactic))
+
+                yield tuple(runner_tactic_pairs)
+
+        def _generate_configurations(self):
+            """Generate all valid tactic combinations."""
+            if not self._captured_contexts:
+                raise RuntimeError(
+                    "No context available for testing.\n"
+                    "Use capture() to capture the operation context first:\n"
+                    "  with AutoTuner.get().capture() as tactics_capture:\n"
+                    "      output = operation.forward(...)\n")
+
+            # Collect valid tactics for each context separately
+            context_tactics_lists = []
+
+            for context in self._captured_contexts:
+                runners = context['runners']
+                inputs = context['inputs']
+                kwargs = context.get('kwargs', {})
+
+                # Collect all valid (runner, tactic) combinations for this context
+                tactics_lists = []
+                for runner_idx, runner in enumerate(runners):
+                    valid_tactics = runner.get_valid_tactics(
+                        inputs, OptimizationProfile(), **kwargs)
+                    for tactic in valid_tactics:
+                        tactics_lists.append((runner_idx, tactic))
+                context_tactics_lists.append(tactics_lists)
+
+            # Generate cartesian product from context and tactics where all_configrations[i][ctx] = (runner, tactic)
+            # Such that each element in all_configrations is a replay of multiple contexts of all possible replays
+            all_configurations = list(itertools.product(*context_tactics_lists))
+            return all_configurations
+
+        def is_replaying(self) -> bool:
+            """Check if this TacticsCapture is currently in replay mode."""
+            return self._replay_runner_tactic_list is not None
 
     def choose_one(
         self,
@@ -585,19 +652,22 @@ class AutoTuner:
             Runner authors are suggested to provide a fallback implementation for each runner to avoid potential issues.
         """
 
-        # In test mode, return the forced runner and tactic by cycling through contexts
-        if self._test_mode_tactics_config is not None:
-            # Replay the captured choose_one() context one by one
-            call_idx = self._test_mode_call_idx
+        # Check if we're in replay mode via active TacticsCapture
+        if self._active_capture is not None and self._active_capture.is_replaying(
+        ):
+            tactics_capture = self._active_capture
+            call_idx = tactics_capture._replay_context_idx
+
+            assert call_idx < len(tactics_capture._replay_runner_tactic_list
+                                  ), "call_idx out of range"
             assert call_idx < len(
-                self._test_mode_tactics_config), "call_idx out of range"
-            assert call_idx < len(
-                self._captured_contexts), "call_idx out of range"
-            assert len(self._test_mode_tactics_config) == len(
-                self._captured_contexts)
-            # Check if we have a forced tactic for this call and both custom_op and kwargs match
-            captured_custom_op = self._captured_contexts[call_idx].get(
-                'custom_op')
+                tactics_capture._captured_contexts), "call_idx out of range"
+            assert len(tactics_capture._replay_runner_tactic_list) == len(
+                tactics_capture._captured_contexts)
+
+            # Check if we have a forced tactic for this call and both custom_op match
+            captured_custom_op = tactics_capture._captured_contexts[
+                call_idx].get('custom_op')
             if captured_custom_op != custom_op:
                 raise RuntimeError(
                     f"Custom op mismatch in kernel testing mode.\n"
@@ -606,16 +676,21 @@ class AutoTuner:
                     f"Context index: {call_idx}\n"
                     f"Make sure the forward() call in test mode uses the same operation as captured."
                 )
-            runner_idx, tactic = self._test_mode_tactics_config[call_idx]
-            self._test_mode_call_idx += 1
+
+            runner_idx, tactic = tactics_capture._replay_runner_tactic_list[
+                call_idx]
+            # Increment context counter
+            tactics_capture._replay_context_idx += 1
             # Reset counter after all contexts have been used
-            if self._test_mode_call_idx >= len(self._test_mode_tactics_config):
-                self._test_mode_call_idx = 0
+            if tactics_capture._replay_context_idx >= len(
+                    tactics_capture._replay_runner_tactic_list):
+                tactics_capture._replay_context_idx = 0
             return (runners[runner_idx], tactic)
 
         # Capture context for testing all underlying kernels
-        if self._capture_mode:
-            self._captured_contexts.append({
+        if self._active_capture is not None and not self._active_capture.is_replaying(
+        ):
+            self._active_capture._captured_contexts.append({
                 'custom_op': custom_op,
                 'runners': runners,
                 'tuning_config': tuning_config,
@@ -1009,89 +1084,89 @@ class AutoTuner:
             )
 
     @contextlib.contextmanager
-    def capture_exec_context(self):
-        """Context manager for explicitly capturing execution context.
+    def capture(self):
+        """Context manager for capturing execution contexts for testing.
 
-        See get_tactics_iterator() for more details.
+        Returns a TacticsCapture object that can be iterated to get all valid
+        (runner, tactic) combinations.
+
+        Example:
+            >>> # Single context case
+            >>> with AutoTuner.get().capture() as tactics_capture:
+            ...     y = custom_op.forward(x)
+            >>>
+            >>> for runner, tactic in tactics_capture:
+            ...     with AutoTuner.get().replay(runner, tactic):
+            ...         y = custom_op.forward(x)
+
+            >>> # Multiple contexts case
+            >>> with AutoTuner.get().capture() as tactics_capture:
+            ...     y = custom_op1.forward(x)
+            ...     z = custom_op2.forward(y)
+            >>>
+            >>> for config in tactics_capture:
+            ...     with AutoTuner.get().replay(config):
+            ...         y = custom_op1.forward(x)
+            ...         z = custom_op2.forward(y)
         """
-        self._captured_contexts.clear()
-        self._capture_mode = True
+        tactics_capture = self.TacticsCapture(self)
+        self._active_capture = tactics_capture
+        try:
+            yield tactics_capture
+        finally:
+            self._active_capture = None
+            self._last_capture = tactics_capture
+
+    @contextlib.contextmanager
+    def replay(self, *config: Tuple[Tuple[TunableRunner, int], ...]):
+        """Context manager for replaying with specific runner/tactic configuration.
+
+        Args:
+            config:
+                - A tuple of (runner, tactic) pairs. The tuple size matches the number of captured choose_one() contexts.
+        """
+        # Parse config argument
+        if len(config) == 1:
+            if isinstance(config[0], tuple):
+                # Multiple contexts: replay(((r0,t0), (r1,t1), ...))
+                runner_tactic_pairs = list(config[0])
+            else:
+                # Also handle single context passed as replay((runner, tactic))
+                runner_tactic_pairs = [config[0]]
+        else:
+            raise ValueError(
+                f"Invalid config for replay: {config}\n"
+                "Expected replay(((runner, tactic), (runner, tactic), ...))")
+
+        # Find the TacticsCapture to use
+        tactics_capture = self._active_capture or self._last_capture
+
+        if tactics_capture is None:
+            raise RuntimeError(
+                "No TacticsCapture available for replay. "
+                "Make sure you've called capture() before replay().")
+
+        # Temporarily set as active capture during replay
+        prev_active = self._active_capture
+        self._active_capture = tactics_capture
+
+        runner_tactic_list = []
+        for ctx_idx, (runner, tactic) in enumerate(runner_tactic_pairs):
+            runners = tactics_capture._captured_contexts[ctx_idx]['runners']
+            runner_idx = runners.index(runner)
+            runner_tactic_list.append((runner_idx, tactic))
+
+        logger.debug(
+            f"[Autotuner][replay]: Testing configuration: {runner_tactic_list}")
+
+        # Replay the contexts with given (runner, tactic) pairs
+        tactics_capture._replay_runner_tactic_list = runner_tactic_list
+        tactics_capture._replay_context_idx = 0
+
         try:
             yield
         finally:
-            self._capture_mode = False
-
-    @contextlib.contextmanager
-    def get_tactics_iterator(self):
-        """Context manager for iterating through all valid (runner, tactic) combinations for testing.
-
-        This allows comprehensive kernel testing by iterating through all available
-        implementations and tactics.
-
-        Yields:
-            Iterator of configuration tuples. Each configuration is a tuple of
-            (runner_idx, tactic) pairs, one for each captured context.
-
-        Example:
-            >>> # First, explicitly capture the execution context
-            >>> with AutoTuner.get().capture_exec_context(), torch.inference_mode():
-            ...     output = custom_op.forward(x)  # May call choose_one multiple times
-            >>> # Then test all tactic combinations
-            >>> with AutoTuner.get().get_tactics_iterator() as iterator:
-            ...     for config in iterator:  # config = ((runner_idx_0, tactic_0), (runner_idx_1, tactic_1), ...)
-            ...         output = custom_op.forward(x)
-            ...         # Compare output against reference
-        """
-
-        if not self._captured_contexts:
-            raise RuntimeError(
-                "No context available for testing.\n"
-                "Use capture_exec_context() to capture the operation context first:\n"
-                "  with AutoTuner.get().capture_exec_context():\n"
-                "      output = operation.forward(...)\n")
-
-        # Collect valid tactics for each context separately
-        context_tactics_lists = []
-
-        for context in self._captured_contexts:
-            context['custom_op']
-            runners = context['runners']
-            tuning_config = context['tuning_config']
-            inputs = context['inputs']
-            kwargs = context.get('kwargs', {})
-
-            # Generate optimization profile for current inputs
-            profiles = self._optimization_profiles(tuning_config, inputs)
-
-            # Use the first profile for testing
-            profile = profiles[0] if profiles else None
-
-            # Collect all valid (runner_idx, tactic) combinations for this context
-            context_tactics = []
-            for runner_idx, runner in enumerate(runners):
-                valid_tactics = runner.get_valid_tactics(
-                    inputs, profile, **kwargs)
-                for tactic in valid_tactics:
-                    context_tactics.append((runner_idx, tactic))
-            context_tactics_lists.append(context_tactics)
-
-        # Generate cartesian product of all context tactics
-        # Each configuration is a tuple of (runner_idx, tactic) for each context
-        all_configurations = list(itertools.product(*context_tactics_lists))
-
-        # Generator function to yield each configuration
-        def tactics_iterator():
-            for config in all_configurations:
-                # Set the test mode with the full tactics configuration
-                self._test_mode_tactics_config = list(config)
-                self._test_mode_call_idx = 0
-                logger.debug(
-                    f"[Autotuner][test_all_kernels]: Testing configuration: {config}"
-                )
-                yield config
-
-        try:
-            yield tactics_iterator()
-        finally:
-            self._test_mode_tactics_config = None
-            self._test_mode_call_idx = 0
+            tactics_capture._replay_runner_tactic_list = None
+            tactics_capture._replay_context_idx = 0
+            # Restore previous active capture state
+            self._active_capture = prev_active

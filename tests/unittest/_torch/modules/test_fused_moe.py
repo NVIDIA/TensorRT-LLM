@@ -598,13 +598,12 @@ def test_fused_moe_fp8(moe_backend, dtype, routing_cls, bias):
             fused_moe.forward(x, router_logits)
 
         # Explicitly capture context for kernel testing
-        with AutoTuner.get().capture_exec_context(), torch.inference_mode():
+        with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
             output = fused_moe.forward(x, router_logits)
 
         # Test all kernel tactics
-        with torch.inference_mode(), AutoTuner.get().get_tactics_iterator(
-        ) as iterator:
-            for _ in iterator:
+        for tactic in all_tactics:
+            with AutoTuner.get().replay(tactic), torch.inference_mode():
                 output = fused_moe.forward(x, router_logits)
                 check_accuracy(output,
                                ref_output,
@@ -1455,13 +1454,12 @@ def test_fused_moe_nvfp4(dtype, moe_backend):
             return
 
         # Explicitly capture context for kernel testing
-        with AutoTuner.get().capture_exec_context(), torch.inference_mode():
+        with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
             output = fused_moe.forward(x, router_logits)
 
         # Test all kernel tactics
-        with torch.inference_mode(), AutoTuner.get().get_tactics_iterator(
-        ) as iterator:
-            for _ in iterator:
+        for tactic in all_tactics:
+            with AutoTuner.get().replay(tactic), torch.inference_mode():
                 output = fused_moe.forward(x, router_logits)
                 torch.testing.assert_close(output,
                                            ref_output,
@@ -1593,13 +1591,12 @@ def test_fused_moe_w4a8_nvfp4_fp8(moe_backend):
             fused_moe.forward(x, router_logits)
 
         # Explicitly capture context for kernel testing
-        with AutoTuner.get().capture_exec_context(), torch.inference_mode():
+        with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
             output = fused_moe.forward(x, router_logits)
 
         # Test all kernel tactics
-        with torch.inference_mode(), AutoTuner.get().get_tactics_iterator(
-        ) as iterator:
-            for _ in iterator:
+        for tactic in all_tactics:
+            with AutoTuner.get().replay(tactic), torch.inference_mode():
                 output = fused_moe.forward(x, router_logits)
                 torch.testing.assert_close(output,
                                            ref_output,
@@ -1858,13 +1855,12 @@ def test_fused_moe_w4afp8(dtype, weight_loading_mode):
             fused_moe.forward(x, router_logits)
 
         # Explicitly capture context for kernel testing
-        with AutoTuner.get().capture_exec_context(), torch.inference_mode():
+        with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
             output = fused_moe.forward(x, router_logits)
 
         # Test all kernel tactics
-        with torch.inference_mode(), AutoTuner.get().get_tactics_iterator(
-        ) as iterator:
-            for _ in iterator:
+        for tactic in all_tactics:
+            with AutoTuner.get().replay(tactic), torch.inference_mode():
                 output = fused_moe.forward(x, router_logits)
                 # assert that result does not contain NaN or is all 0s
                 assert not torch.isnan(output).any(), "output contains NaN"
@@ -1980,15 +1976,13 @@ def test_fused_moe_mxfp4_mxfp8(moe_backend, bias):
     with torch.inference_mode(), autotune():
         fused_moe.forward(x, router_logits)
 
-    # Captures fused_moe underlying runners as autotuner context
-    with torch.inference_mode(), AutoTuner.get().capture_exec_context():
+    # Capture fused_moe underlying runners as autotuner context
+    with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
         output = fused_moe.forward(x, router_logits)
 
-    # Test different tactics using last captured context
-    with torch.inference_mode(), AutoTuner.get().get_tactics_iterator(
-    ) as iterator:
-        # Iterate runner/tactic in internal autotuner context
-        for _ in enumerate(iterator):
+    # Test different tactics using captured context
+    for tactic in all_tactics:
+        with AutoTuner.get().replay(tactic), torch.inference_mode():
             output = fused_moe.forward(x, router_logits)
             torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.15)
 
@@ -2129,8 +2123,18 @@ def test_fused_moe_wfp4a16(dtype, hidden_size, moe_backend):
             fused_moe.forward(x, router_logits)
 
         # Explicitly capture context for kernel testing
-        with AutoTuner.get().capture_exec_context(), torch.inference_mode():
+        with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
             output = fused_moe.forward(x, router_logits)
+
+        # Test all kernel tactics
+        for tactic in all_tactics:
+            with AutoTuner.get().replay(tactic), torch.inference_mode():
+                output = fused_moe.forward(x, router_logits)
+                check_accuracy(output,
+                               ref_output,
+                               rtol=1e-2,
+                               atol=0.1,
+                               percent=0.99)
 
         # compare
         torch.cuda.synchronize()
@@ -2394,14 +2398,13 @@ def test_fused_moe_int8_woq_per_channel(dtype, weight_dtype):
             fused_moe.forward(x, router_logits)
 
         # Explicitly capture context for kernel testing
-        with AutoTuner.get().capture_exec_context(), torch.inference_mode():
+        with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
             output = fused_moe.forward(x, router_logits)
 
         # Test all kernel tactics
         atol = calc_woq_tolerence(ref_output, weight_dtype)
-        with torch.inference_mode(), AutoTuner.get().get_tactics_iterator(
-        ) as iterator:
-            for _ in iterator:
+        for tactic in all_tactics:
+            with AutoTuner.get().replay(tactic), torch.inference_mode():
                 output = fused_moe.forward(x, router_logits)
                 torch.testing.assert_close(output,
                                            ref_output,

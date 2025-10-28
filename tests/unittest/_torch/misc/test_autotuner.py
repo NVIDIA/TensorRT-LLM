@@ -413,25 +413,27 @@ def test_kernel_testing_single_context():
                                           tuning_config, [x, w])
 
     # Capture execution context
-    with tuner.capture_exec_context():
+    with tuner.capture() as all_tactics:
         runner, tactic = tuner.choose_one("test_kernel_testing_single", runners,
                                           tuning_config, [x, w])
         reference_output = runner([x, w], tactic=tactic)
 
     # Test all tactics
-    tested_configs = []
-    with tuner.get_tactics_iterator() as iterator:
-        for config in iterator:
-            tested_configs.append(config)
-            runner, tactic = tuner.choose_one("test_kernel_testing_single",
-                                              runners, tuning_config, [x, w])
-            output = runner([x, w], tactic=tactic)
+    tested_tactics = []
+    for (runner, tactic), in all_tactics:
+        tested_tactics.append((runner, tactic))
+        with tuner.replay(((runner, tactic), )):
+            runner_ret, tactic_ret = tuner.choose_one(
+                "test_kernel_testing_single", runners, tuning_config, [x, w])
+            output = runner_ret([x, w], tactic=tactic_ret)
             # Verify output matches reference
             torch.testing.assert_close(output, reference_output)
+            assert runner == runner_ret and tactic == tactic_ret, \
+                f"Runner and tactic mismatch: expected ({runner, tactic}), got ({runner_ret, tactic_ret})"
 
     # Should have tested 3 tactics ([-1, 0, 1])
-    assert len(tested_configs) == len(GemmRunner().get_valid_tactics([x, w], OptimizationProfile([[]]))), \
-        f"Expected 3 tactics to be tested, got {len(tested_configs)}"
+    assert len(tested_tactics) == len(GemmRunner().get_valid_tactics([x, w], OptimizationProfile([[]]))), \
+        f"Expected 3 tactics to be tested, got {len(tested_tactics)}"
 
 
 class MultiContextRunner(TunableRunner):
@@ -486,7 +488,7 @@ def test_kernel_testing_multiple_contexts():
                                      gemm_idx=1)
 
     # Capture execution context (captures both choose_one calls)
-    with tuner.capture_exec_context():
+    with tuner.capture() as all_tactics:
         runner_0, tactic_0 = tuner.choose_one("test_multi_context",
                                               runners,
                                               tuning_config, [x, w],
@@ -499,13 +501,13 @@ def test_kernel_testing_multiple_contexts():
         ref_output_1 = runner_1([x, w], tactic=tactic_1, gemm_idx=1)
 
     # Test all tactic combinations (cartesian product)
-    tested_configs = []
-    with tuner.get_tactics_iterator() as iterator:
-        for config in iterator:
-            tested_configs.append(config)
-            # Each config is ((runner_idx_0, tactic_0), (runner_idx_1, tactic_1))
-            assert len(config) == 2, f"Expected 2 contexts, got {len(config)}"
+    tested_tactics = []
+    for tactic in all_tactics:
+        tested_tactics.append(tactic)
+        # Each tactic is ((runner_0, tactic_0), (runner_1, tactic_1))
+        assert len(tactic) == 2, f"Expected 2 contexts, got {len(tactic)}"
 
+        with tuner.replay(tactic):
             # Make the same calls in the same order
             runner_0, tactic_0 = tuner.choose_one("test_multi_context",
                                                   runners,
@@ -526,10 +528,10 @@ def test_kernel_testing_multiple_contexts():
             assert output_1.shape == ref_output_1.shape
 
     # Should have tested 2*3 = 6 combinations
-    assert len(tested_configs) == \
-          (len(MultiContextRunner().get_valid_tactics([x, w], OptimizationProfile([[]]), gemm_idx=0)) * \
-          len(MultiContextRunner().get_valid_tactics([x, w], OptimizationProfile([[]]), gemm_idx=1))), \
-        f"Expected 6 tactic combinations (2*3), got {len(tested_configs)}"
+    num_tactics_for_gemm_idx = lambda gemm_idx: len(runners[
+        0].get_valid_tactics([x, w], OptimizationProfile(), gemm_idx=gemm_idx))
+    assert len(tested_tactics) == num_tactics_for_gemm_idx(0) * num_tactics_for_gemm_idx(1), \
+        f"Expected 6 tactic combinations (2*3), got {len(tested_tactics)}"
 
 
 def test_kernel_testing_mismatched_ops():
@@ -544,13 +546,13 @@ def test_kernel_testing_mismatched_ops():
     tuner.clear_cache()
 
     # Capture execution context for operation A
-    with tuner.capture_exec_context():
+    with tuner.capture() as all_tactics:
         _ = tuner.choose_one("test_op_A", runners, tuning_config, [x, w])
 
     # Try to test with operation B (should raise RuntimeError)
     try:
-        with tuner.get_tactics_iterator() as iterator:
-            for config in iterator:
+        for (runner, tactic), in all_tactics:
+            with tuner.replay(((runner, tactic), )):
                 # This should raise RuntimeError because custom_op doesn't match
                 _ = tuner.choose_one("test_op_B", runners, tuning_config,
                                      [x, w])
