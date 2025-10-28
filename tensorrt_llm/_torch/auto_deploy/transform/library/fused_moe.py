@@ -1,17 +1,31 @@
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Type
 
 import torch
+from pydantic import Field
 from torch.fx import GraphModule, Node
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
 from ...utils.node_utils import bfs, extract_op_args, identify_regions_between_residuals, is_op
-from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
+from ..interface import (
+    BaseTransform,
+    SharedConfig,
+    TransformConfig,
+    TransformInfo,
+    TransformRegistry,
+)
+
+_BACKEND_OPS = {
+    "agent": torch.ops.auto_deploy.cuda_moe,
+    "trtllm": torch.ops.auto_deploy.trtllm_moe_fused,
+    "triton": torch.ops.auto_deploy.triton_moe_fused,
+    "cutedsl": torch.ops.auto_deploy.cutedsl_moe_fused,
+}
 
 
-def _insert_fused_moe_ops(gm: GraphModule) -> int:
+def _insert_fused_moe_ops(gm: GraphModule, backend: str) -> int:
     fused_key_counter = 0
     graph = gm.graph
 
@@ -32,6 +46,9 @@ def _insert_fused_moe_ops(gm: GraphModule) -> int:
                 "w3_weight",
             )
         )
+
+        replacement_op = _BACKEND_OPS[backend]
+
         if mlp_style_val == "gated_mlp":
             fused_w_up_experts = torch.stack(
                 [
@@ -44,13 +61,15 @@ def _insert_fused_moe_ops(gm: GraphModule) -> int:
             )
             new_key_w_up = f"fused_moe_w3_w1_stacked_{fused_key_counter}"
             # TRTLLM fused MoE op supports gated MLP only.
-            replacement_op = torch.ops.auto_deploy.trtllm_moe_fused
+            assert backend == "trtllm", "TRTLLM fused MoE op supports gated MLP only."
 
         elif mlp_style_val == "mlp":
             fused_w_up_experts = torch.stack([gm.get_parameter(n.target) for n in w1_list], dim=0)
             new_key_w_up = f"fused_moe_w1_stacked_{fused_key_counter}"
             # Triton fused MoE op supports mlp only.
-            replacement_op = torch.ops.auto_deploy.triton_moe_fused
+            assert backend in ["triton", "agent", "cutedsl"], (
+                "Backend must be triton or agent or cutedsl for mlp style."
+            )
 
         else:
             raise ValueError(f"Unknown mlp_style: {mlp_style_val}")
@@ -59,6 +78,15 @@ def _insert_fused_moe_ops(gm: GraphModule) -> int:
 
         new_key_w_down = f"fused_moe_w2_stacked_{fused_key_counter}"
         fused_key_counter += 1
+        if backend == "cutedsl":
+            # CuteDSL expects the weights to be transposed.
+            fused_w_up_experts = fused_w_up_experts.transpose(
+                1, 2
+            ).contiguous()  # [E, H, I] -> [E, I, H]
+            fused_w_down_experts = fused_w_down_experts.transpose(
+                1, 2
+            ).contiguous()  # [E, I, H] -> [E, H, I]
+
         param_w_up = torch.nn.Parameter(fused_w_up_experts)
         param_w_down = torch.nn.Parameter(fused_w_down_experts)
         gm.register_parameter(new_key_w_up, param_w_up)
@@ -736,12 +764,25 @@ def _stack_fp8_moe_weights(gm: GraphModule) -> int:
     return fused_key_counter
 
 
+class FuseMoeConfig(TransformConfig):
+    backend: str = Field(
+        default="trtllm",
+        description="Backend to use for MoE computation ('trtllm' or 'triton' or 'agent').",
+    )
+
+
 @TransformRegistry.register("fuse_moe")
 class FuseMoe(BaseTransform):
     """
     Scan the FX graph and replace all calls to torch.ops.auto_deploy.torch_moe with
     torch.ops.auto_deploy.trtllm_moe_fused.
     """
+
+    config: FuseMoeConfig
+
+    @classmethod
+    def get_config_class(cls) -> Type[TransformConfig]:
+        return FuseMoeConfig
 
     def _apply(
         self,
@@ -751,7 +792,7 @@ class FuseMoe(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         with cuda_memory_tracker():
-            fused_key_counter = _insert_fused_moe_ops(gm)
+            fused_key_counter = _insert_fused_moe_ops(gm, self.config.backend)
 
         info = TransformInfo(
             skipped=False, num_matches=fused_key_counter, is_clean=False, has_valid_shapes=False

@@ -204,6 +204,86 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(scalar_t const* _
     }
 }
 
+// CuTeDSL-optimized kernel: outputs token IDs, sorted weights, and cu_seqlens directly
+template <typename scalar_t, typename weight_t>
+__global__ void moe_align_cutedsl_kernel(scalar_t const* __restrict__ topk_ids,
+    weight_t const* __restrict__ topk_weights, int32_t* __restrict__ sorted_token_ids,
+    weight_t* __restrict__ sorted_weights, int32_t* __restrict__ cu_seqlens,
+    int32_t* __restrict__ total_tokens_post_pad, int32_t num_experts, int32_t top_k, size_t numel,
+    int32_t max_num_tokens_padded)
+{
+    extern __shared__ int32_t shared_mem[];
+    int32_t* shared_counts = shared_mem;
+    int32_t* cumsum = shared_mem + num_experts;
+
+    // Initialize output arrays for padding entries
+    // Padding entries have token_id=0 and weight=0 so they don't affect results
+    for (size_t it = threadIdx.x; it < max_num_tokens_padded; it += blockDim.x)
+    {
+        sorted_token_ids[it] = 0;                      // Valid token ID for safe indexing
+        sorted_weights[it] = static_cast<weight_t>(0); // Zero weight for padding
+    }
+
+    // Initialize shared memory counts
+    if (threadIdx.x < num_experts)
+    {
+        shared_counts[threadIdx.x] = 0;
+    }
+    __syncthreads();
+
+    // Count tokens per expert
+    const size_t tid = threadIdx.x;
+    const size_t stride = blockDim.x;
+    for (size_t i = tid; i < numel; i += stride)
+    {
+        int expert_id = topk_ids[i];
+        atomicAdd(&shared_counts[expert_id], 1);
+    }
+    __syncthreads();
+
+    // Compute cumulative sum (cu_seqlens)
+    using BlockScan = cub::BlockScan<int32_t, 1024>;
+    __shared__ typename BlockScan::TempStorage temp_storage;
+
+    int expert_count = 0;
+    if (threadIdx.x < num_experts)
+    {
+        expert_count = shared_counts[threadIdx.x];
+    }
+
+    int cumsum_val;
+    BlockScan(temp_storage).ExclusiveSum(expert_count, cumsum_val);
+
+    // Write cu_seqlens (this is what CuTeDSL needs!)
+    if (threadIdx.x <= num_experts)
+    {
+        cu_seqlens[threadIdx.x] = cumsum_val;
+        cumsum[threadIdx.x] = cumsum_val;
+    }
+
+    if (threadIdx.x == num_experts)
+    {
+        *total_tokens_post_pad = cumsum_val;
+    }
+    __syncthreads();
+
+    // Sort tokens and weights by expert
+    // Each thread processes tokens and stores token_id (not flattened index) and weight
+    for (size_t i = tid; i < numel; i += stride)
+    {
+        int32_t expert_id = topk_ids[i];
+        int32_t token_id = i / top_k; // Convert flattened index to token ID
+        weight_t weight = topk_weights[i];
+
+        // Atomically get position in sorted array for this expert
+        int32_t rank = atomicAdd(&cumsum[expert_id], 1);
+
+        // Store token ID (not flattened index!) and weight
+        sorted_token_ids[rank] = token_id;
+        sorted_weights[rank] = weight;
+    }
+}
+
 } // namespace moe
 } // namespace auto_deploy
 
@@ -265,7 +345,59 @@ void moe_align_block_size_cuda(torch::Tensor topk_ids, int64_t num_experts, int6
         });
 }
 
+void moe_align_cutedsl_cuda(torch::Tensor topk_ids, torch::Tensor topk_weights, int64_t num_experts, int64_t top_k,
+    torch::Tensor sorted_token_ids, torch::Tensor sorted_weights, torch::Tensor cu_seqlens,
+    torch::Tensor num_tokens_post_pad)
+{
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    // Use 1024 threads for BlockScan (supports up to 1024 experts)
+    int threads = 1024;
+    TORCH_CHECK(num_experts <= 1024, "num_experts must be <= 1024 for CuTeDSL kernel");
+
+    // Shared memory: counts[num_experts] + cumsum[num_experts + 1]
+    size_t shared_mem_size = (num_experts + num_experts + 1) * sizeof(int32_t);
+
+    AT_DISPATCH_INTEGRAL_TYPES(topk_ids.scalar_type(), "moe_align_cutedsl_kernel",
+        [&]
+        {
+            // Dispatch based on weight dtype
+            if (topk_weights.scalar_type() == torch::kFloat32)
+            {
+                auto kernel = auto_deploy::moe::moe_align_cutedsl_kernel<scalar_t, float>;
+                kernel<<<1, threads, shared_mem_size, stream>>>(topk_ids.data_ptr<scalar_t>(),
+                    topk_weights.data_ptr<float>(), sorted_token_ids.data_ptr<int32_t>(),
+                    sorted_weights.data_ptr<float>(), cu_seqlens.data_ptr<int32_t>(),
+                    num_tokens_post_pad.data_ptr<int32_t>(), num_experts, top_k, topk_ids.numel(),
+                    sorted_token_ids.size(0));
+            }
+            else if (topk_weights.scalar_type() == torch::kFloat16)
+            {
+                auto kernel = auto_deploy::moe::moe_align_cutedsl_kernel<scalar_t, at::Half>;
+                kernel<<<1, threads, shared_mem_size, stream>>>(topk_ids.data_ptr<scalar_t>(),
+                    topk_weights.data_ptr<at::Half>(), sorted_token_ids.data_ptr<int32_t>(),
+                    sorted_weights.data_ptr<at::Half>(), cu_seqlens.data_ptr<int32_t>(),
+                    num_tokens_post_pad.data_ptr<int32_t>(), num_experts, top_k, topk_ids.numel(),
+                    sorted_token_ids.size(0));
+            }
+            else if (topk_weights.scalar_type() == torch::kBFloat16)
+            {
+                auto kernel = auto_deploy::moe::moe_align_cutedsl_kernel<scalar_t, at::BFloat16>;
+                kernel<<<1, threads, shared_mem_size, stream>>>(topk_ids.data_ptr<scalar_t>(),
+                    topk_weights.data_ptr<at::BFloat16>(), sorted_token_ids.data_ptr<int32_t>(),
+                    sorted_weights.data_ptr<at::BFloat16>(), cu_seqlens.data_ptr<int32_t>(),
+                    num_tokens_post_pad.data_ptr<int32_t>(), num_experts, top_k, topk_ids.numel(),
+                    sorted_token_ids.size(0));
+            }
+            else
+            {
+                TORCH_CHECK(false, "Unsupported weight dtype for CuTeDSL kernel");
+            }
+        });
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.def("moe_align_block_size", &moe_align_block_size_cuda, "MoE align block size (CUDA)");
+    m.def("moe_align_cutedsl", &moe_align_cutedsl_cuda, "MoE align for CuTeDSL (CUDA)");
 }
