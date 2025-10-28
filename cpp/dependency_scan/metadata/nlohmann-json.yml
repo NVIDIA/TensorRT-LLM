@@ -3,8 +3,7 @@ description: JSON for Modern C++ header-only library
 license: MIT
 copyright: Copyright (c) 2013-2024 Niels Lohmann
 homepage: https://github.com/nlohmann/json
-source: bundled
-aliases: []
+source: submodule
 basename_matches: []
 linker_flags_matches: []
 directory_matches:

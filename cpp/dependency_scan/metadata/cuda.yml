@@ -1,16 +1,22 @@
 dependencies:
 - name: cuda-cudart-dev
   description: CUDA Runtime API development libraries and headers
-  path_components: []
-  aliases: []
+  source: container
   basename_matches: []
   linker_flags_matches:
   - -lcudadevrt
+  directory_matches:
+  - cuda-12.9
+  - cuda-13.0
+  - cuda
+  - cooperative_groups
+  - cub
+  - thrust
 - name: cuda-cudart-static
   description: CUDA Runtime static library for device code linking
-  path_components: []
-  aliases: []
+  source: container
   basename_matches:
   - libcudart_static.a
   linker_flags_matches:
   - -lcudart_static
+  directory_matches: []

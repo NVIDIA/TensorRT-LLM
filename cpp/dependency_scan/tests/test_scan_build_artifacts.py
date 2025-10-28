@@ -235,6 +235,21 @@ class TestArtifactCollector:
         if artifacts:
             assert any("test.h" in a.path for a in artifacts)
 
+    def test_parse_d_file_trailing_colons(self, tmp_path):
+        """Test _parse_d_file strips trailing colons from malformed paths"""
+        # Create test D file with trailing colons (malformed .d file)
+        d_file = tmp_path / "test.d"
+        d_file.write_text(
+            "build/foo.o: /usr/include/stdio.h: /usr/include/stdlib.h:\n")
+
+        collector = ArtifactCollector(tmp_path)
+        artifacts = collector._parse_d_file(d_file)
+
+        # Should strip trailing colons from paths
+        for artifact in artifacts:
+            assert not artifact.path.endswith(':')
+            assert artifact.path  # No empty strings
+
     def test_parse_link_file_basic(self, tmp_path):
         """Test _parse_link_file parses link.txt"""
         # Create test link file
@@ -282,6 +297,30 @@ class TestArtifactCollector:
         assert any("libtest.a" in a.path for a in artifacts)
         if artifacts:
             assert artifacts[0].metadata.get('static') == True
+
+    def test_parse_link_file_cmake_linker_artifacts(self, tmp_path):
+        """Test _parse_link_file handles CMakeFiles artifacts with -Wl,-soname"""
+        # Create link file with CMakeFiles linker artifact
+        link_file = tmp_path / "link.txt"
+        link_file.write_text(
+            "/usr/bin/c++ -o foo /build/CMakeFiles/foo.dir/-Wl,-soname,libtest.so.1\n"
+        )
+
+        collector = ArtifactCollector(tmp_path)
+        artifacts = collector._parse_link_file(link_file)
+
+        # Should extract library name from CMakeFiles artifact
+        linker_artifacts = [
+            a for a in artifacts if a.metadata.get('cmake_linker_artifact')
+        ]
+        assert len(linker_artifacts) == 1
+
+        artifact = linker_artifacts[0]
+        assert artifact.path == "-ltest"  # Extracted from libtest.so.1
+        assert artifact.type == "library"
+        assert artifact.metadata['linker_flag'] == True
+        assert artifact.metadata['cmake_linker_artifact'] == True
+        assert artifact.metadata['library_name'] == "libtest.so.1"
 
     def test_get_needed_libraries(self, tmp_path):
         """Test _get_needed_libraries extracts NEEDED entries"""
@@ -363,8 +402,7 @@ class TestPatternMatcher:
                 "description": "GNU C Library: Shared libraries",
                 "basename_matches": [],
                 "linker_flags_matches": ["-lpthread"],
-                "directory_matches": [],
-                "aliases": []
+                "directory_matches": []
             }]
         }
         with open(deps_dir / "dpkg.yml", 'w') as f:
@@ -377,8 +415,7 @@ class TestPatternMatcher:
             "description": "NVIDIA CUDA Runtime library version 12",
             "basename_matches": ["libcudart.so.12"],
             "linker_flags_matches": [],
-            "directory_matches": ["cuda-12"],
-            "aliases": []
+            "directory_matches": ["cuda-12"]
         }
         with open(deps_dir / "cuda-cudart-12.yml", 'w') as f:
             yaml.dump(cuda_data, f)
@@ -390,8 +427,7 @@ class TestPatternMatcher:
             "description": "PyTorch machine learning framework",
             "basename_matches": [],
             "linker_flags_matches": [],
-            "directory_matches": ["pytorch"],
-            "aliases": []
+            "directory_matches": ["pytorch"]
         }
         with open(deps_dir / "pytorch.yml", 'w') as f:
             yaml.dump(pytorch_data, f)
@@ -403,8 +439,7 @@ class TestPatternMatcher:
             "description": "DeepEP library",
             "basename_matches": ["deep_ep_cpp"],
             "linker_flags_matches": [],
-            "directory_matches": [],
-            "aliases": []
+            "directory_matches": []
         }
         with open(deps_dir / "deepep.yml", 'w') as f:
             yaml.dump(deepep_data, f)
@@ -416,8 +451,7 @@ class TestPatternMatcher:
             "description": "JSON for Modern C++",
             "basename_matches": [],
             "linker_flags_matches": [],
-            "directory_matches": ["json"],
-            "aliases": []
+            "directory_matches": ["json"]
         }
         with open(deps_dir / "nlohmann-json.yml", 'w') as f:
             yaml.dump(json_data, f)
@@ -464,7 +498,163 @@ class TestPatternMatcher:
 
         assert mapping is not None
         assert mapping.dependency == "pytorch"
-        assert mapping.metadata['matched_component'] == "pytorch"
+        assert mapping.metadata['matched_pattern'] == "pytorch"
+        assert mapping.metadata['matched_sequence'] == "pytorch"
+
+    def test_match_path_multi_directory(self, tmp_path):
+        """Test _match_path_alias matches multi-directory patterns"""
+        deps_dir = tmp_path / "dependencies"
+        deps_dir.mkdir()
+
+        # Create YAML with multi-directory pattern
+        dep_data = {
+            "name": "test-lib",
+            "description": "Test library with multi-directory pattern",
+            "basename_matches": [],
+            "linker_flags_matches": [],
+            "directory_matches": ["foo/bar", "3rdparty/test"]
+        }
+        with open(deps_dir / "test-lib.yml", 'w') as f:
+            yaml.dump(dep_data, f)
+
+        matcher = PatternMatcher(deps_dir)
+
+        # Test: /home/foo/bar/file.h matches "foo/bar"
+        artifact1 = Artifact(path="/home/foo/bar/file.h",
+                             type="header",
+                             source="test.d")
+        mapping1 = matcher._match_path_alias(artifact1)
+        assert mapping1 is not None
+        assert mapping1.dependency == "test-lib"
+        assert mapping1.metadata['matched_pattern'] == "foo/bar"
+        assert mapping1.metadata['matched_sequence'] == "foo/bar"
+
+        # Test: /home/foobar/file.h does NOT match "foo/bar" (no substring matching)
+        artifact2 = Artifact(path="/home/foobar/file.h",
+                             type="header",
+                             source="test.d")
+        mapping2 = matcher._match_path_alias(artifact2)
+        assert mapping2 is None
+
+        # Test: /build/3rdparty/test/include/test.h matches "3rdparty/test"
+        artifact3 = Artifact(path="/build/3rdparty/test/include/test.h",
+                             type="header",
+                             source="test.d")
+        mapping3 = matcher._match_path_alias(artifact3)
+        assert mapping3 is not None
+        assert mapping3.dependency == "test-lib"
+        assert mapping3.metadata['matched_pattern'] == "3rdparty/test"
+
+    def test_match_path_multi_directory_rightmost(self, tmp_path):
+        """Test rightmost wins for multi-directory patterns"""
+        deps_dir = tmp_path / "dependencies"
+        deps_dir.mkdir()
+
+        dep_data = {
+            "name": "test-lib",
+            "description": "Test library for rightmost matching",
+            "basename_matches": [],
+            "linker_flags_matches": [],
+            "directory_matches": ["foo/bar"]
+        }
+        with open(deps_dir / "test-lib.yml", 'w') as f:
+            yaml.dump(dep_data, f)
+
+        matcher = PatternMatcher(deps_dir)
+
+        # Pattern: "foo/bar" appears twice in path
+        # Path: /foo/bar/baz/foo/bar/qux.h
+        # Should match at rightmost position (position 3)
+        artifact = Artifact(path="/foo/bar/baz/foo/bar/qux.h",
+                            type="header",
+                            source="test.d")
+        mapping = matcher._match_path_alias(artifact)
+
+        assert mapping is not None
+        assert mapping.dependency == "test-lib"
+        assert mapping.metadata['matched_pattern'] == "foo/bar"
+        # Position should be 3 (rightmost occurrence)
+        assert mapping.metadata['position'] == 3
+
+    def test_match_path_no_substring_matching(self, tmp_path):
+        """Test that substring matching is NOT supported"""
+        deps_dir = tmp_path / "dependencies"
+        deps_dir.mkdir()
+
+        dep_data = {
+            "name": "test-lib",
+            "description": "Test library for substring verification",
+            "basename_matches": [],
+            "linker_flags_matches": [],
+            "directory_matches": ["oo/ba", "o/b"]
+        }
+        with open(deps_dir / "test-lib.yml", 'w') as f:
+            yaml.dump(dep_data, f)
+
+        matcher = PatternMatcher(deps_dir)
+
+        # Pattern: "oo/ba"
+        # Path: /foo/bar/file.h
+        # Should NOT match ("oo" != "foo", "ba" != "bar")
+        artifact1 = Artifact(path="/foo/bar/file.h",
+                             type="header",
+                             source="test.d")
+        mapping1 = matcher._match_path_alias(artifact1)
+        assert mapping1 is None
+
+        # Pattern: "o/b"
+        # Path: /foo/bar/file.h
+        # Should NOT match
+        artifact2 = Artifact(path="/foo/bar/file.h",
+                             type="header",
+                             source="test.d")
+        mapping2 = matcher._match_path_alias(artifact2)
+        assert mapping2 is None
+
+    def test_match_path_mixed_single_and_multi(self, tmp_path):
+        """Test single and multi-directory patterns coexist"""
+        deps_dir = tmp_path / "dependencies"
+        deps_dir.mkdir()
+
+        # Create two dependencies: one with single, one with multi-dir patterns
+        dep1_data = {
+            "name": "pytorch",
+            "description": "PyTorch with single component",
+            "basename_matches": [],
+            "linker_flags_matches": [],
+            "directory_matches": ["pytorch", "torch"]
+        }
+        with open(deps_dir / "pytorch.yml", 'w') as f:
+            yaml.dump(dep1_data, f)
+
+        dep2_data = {
+            "name": "cutlass",
+            "description": "Cutlass with multi-directory",
+            "basename_matches": [],
+            "linker_flags_matches": [],
+            "directory_matches": ["3rdparty/cutlass"]
+        }
+        with open(deps_dir / "cutlass.yml", 'w') as f:
+            yaml.dump(dep2_data, f)
+
+        matcher = PatternMatcher(deps_dir)
+
+        # Test single component pattern still works
+        artifact1 = Artifact(path="/home/pytorch/lib/test.so",
+                             type="library",
+                             source="test")
+        mapping1 = matcher._match_path_alias(artifact1)
+        assert mapping1 is not None
+        assert mapping1.dependency == "pytorch"
+
+        # Test multi-directory pattern works
+        artifact2 = Artifact(path="/build/3rdparty/cutlass/include/cutlass.h",
+                             type="header",
+                             source="test.d")
+        mapping2 = matcher._match_path_alias(artifact2)
+        assert mapping2 is not None
+        assert mapping2.dependency == "cutlass"
+        assert mapping2.metadata['matched_sequence'] == "3rdparty/cutlass"
 
     def test_match_generic_library_fallback(self, dependencies_dir):
         """Test _match_generic_library as fallback"""
@@ -518,8 +708,7 @@ class TestPatternMatcher:
             "description": "Test library for unit tests",
             "basename_matches": ["libtest.so"],
             "linker_flags_matches": ["-ltest"],
-            "directory_matches": ["test-lib"],
-            "aliases": ["testlib"]
+            "directory_matches": ["test-lib"]
         }
         with open(deps_dir / "test-lib.yml", 'w') as f:
             yaml.dump(dep_data, f)
@@ -535,8 +724,6 @@ class TestPatternMatcher:
         # Check path_aliases
         assert "test-lib" in matcher.path_aliases
         assert matcher.path_aliases["test-lib"] == "test-lib"
-        assert "testlib" in matcher.path_aliases
-        assert matcher.path_aliases["testlib"] == "test-lib"
 
     def test_yaml_loading_dpkg_format(self, tmp_path):
         """Test loading dpkg.yml with dependencies list"""
@@ -551,16 +738,14 @@ class TestPatternMatcher:
                 "description": "First dependency",
                 "basename_matches": ["libdep1.so"],
                 "linker_flags_matches": [],
-                "directory_matches": [],
-                "aliases": []
+                "directory_matches": []
             }, {
                 "name": "dep2",
                 "version": "2.0",
                 "description": "Second dependency",
                 "basename_matches": ["libdep2.so"],
                 "linker_flags_matches": [],
-                "directory_matches": [],
-                "aliases": []
+                "directory_matches": []
             }]
         }
         with open(deps_dir / "dpkg.yml", 'w') as f:
@@ -586,8 +771,7 @@ class TestPatternMatcher:
             "description": "First dependency with duplicate pattern",
             "basename_matches": ["duplicate.so"],
             "linker_flags_matches": [],
-            "directory_matches": [],
-            "aliases": []
+            "directory_matches": []
         }
         with open(deps_dir / "dep1.yml", 'w') as f:
             yaml.dump(dep1_data, f)
@@ -599,8 +783,7 @@ class TestPatternMatcher:
             "description": "Second dependency with duplicate pattern",
             "basename_matches": ["duplicate.so"],
             "linker_flags_matches": [],
-            "directory_matches": [],
-            "aliases": []
+            "directory_matches": []
         }
         with open(deps_dir / "dep2.yml", 'w') as f:
             yaml.dump(dep2_data, f)
@@ -648,8 +831,7 @@ class TestPatternMatcher:
             "description": "This file should be skipped",
             "basename_matches": ["should-not-exist.so"],
             "linker_flags_matches": [],
-            "directory_matches": [],
-            "aliases": []
+            "directory_matches": []
         }
         with open(deps_dir / "_schema.yml", 'w') as f:
             yaml.dump(schema_data, f)
@@ -661,8 +843,7 @@ class TestPatternMatcher:
             "description": "Normal dependency file",
             "basename_matches": ["normal.so"],
             "linker_flags_matches": [],
-            "directory_matches": [],
-            "aliases": []
+            "directory_matches": []
         }
         with open(deps_dir / "normal-dep.yml", 'w') as f:
             yaml.dump(normal_data, f)
@@ -689,8 +870,7 @@ class TestPatternMatcher:
                 "description": "System dependency from dpkg",
                 "basename_matches": ["libsystem.so"],
                 "linker_flags_matches": [],
-                "directory_matches": [],
-                "aliases": []
+                "directory_matches": []
             }]
         }
         with open(deps_dir / "dpkg.yml", 'w') as f:
@@ -703,8 +883,7 @@ class TestPatternMatcher:
             "description": "Custom dependency from individual file",
             "basename_matches": ["libcustom.so"],
             "linker_flags_matches": [],
-            "directory_matches": [],
-            "aliases": []
+            "directory_matches": []
         }
         with open(deps_dir / "custom-dep.yml", 'w') as f:
             yaml.dump(custom_data, f)
@@ -729,8 +908,7 @@ class TestPatternMatcher:
             "description": "Minimal dependency with empty arrays",
             "basename_matches": [],
             "linker_flags_matches": [],
-            "directory_matches": ["minimal"],
-            "aliases": []
+            "directory_matches": ["minimal"]
         }
         with open(deps_dir / "minimal-dep.yml", 'w') as f:
             yaml.dump(dep_data, f)
@@ -886,8 +1064,7 @@ class TestIntegration:
                 "description": "GNU C Library: Shared libraries",
                 "basename_matches": [],
                 "linker_flags_matches": ["-lpthread"],
-                "directory_matches": [],
-                "aliases": []
+                "directory_matches": []
             }]
         }
         with open(deps_dir / "dpkg.yml", 'w') as f:

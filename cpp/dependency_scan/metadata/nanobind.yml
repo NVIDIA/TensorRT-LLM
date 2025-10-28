@@ -3,8 +3,7 @@ description: Tiny and efficient C++/Python bindings
 license: BSD-3-Clause
 copyright: Copyright (c) 2022-2024 Wenzel Jakob
 homepage: https://github.com/wjakob/nanobind
-source: bundled
-aliases: []
+source: submodule
 basename_matches: []
 linker_flags_matches: []
 directory_matches:

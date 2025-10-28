@@ -38,6 +38,13 @@ except ImportError:
     JSONSCHEMA_AVAILABLE = False
     ValidationError = Exception  # Fallback for type hints
 
+# Configuration: Submodules directory location
+# This path points to the 3rdparty submodules directory.
+# Change this constant if dependencies move to a different location.
+# Current: TRTLLM_ROOT/3rdparty
+# Future: May change to ${CMAKE_BINARY_DIR}/_deps/
+THIRDPARTY_ROOT = Path(__file__).parent.parent.parent / '3rdparty'
+
 # ============================================================================
 # MODULE 1: Data Models
 # ============================================================================
@@ -91,8 +98,6 @@ class DpkgResolver:
       3. Parse output: "package:arch: /path/to/file"
       4. Cache results to avoid repeated queries
       5. Normalize package names (remove :arch suffix, handle cuda packages)
-
-    Reference: dep-detective/dep_detective/providers/utilities/system_package_resolver_provider.py:19-161
     """
 
     def __init__(self):
@@ -139,8 +144,6 @@ class DpkgResolver:
           -lpthread → /lib/x86_64-linux-gnu/libpthread.so.0
           -lm → /lib/x86_64-linux-gnu/libm.so.6
           -lstdc++ → /usr/lib/x86_64-linux-gnu/libstdc++.so.6
-
-        Reference: dep-detective/dep_detective/providers/utilities/system_package_resolver_provider.py:71-96
         """
         if lib_name.startswith("-l"):
             lib_name = lib_name[2:]  # Remove -l prefix
@@ -180,8 +183,6 @@ class DpkgResolver:
           /usr/include/c++/13/vector → libstdc++-13-dev
           -lpthread → libc6
           /usr/local/cuda-12.9/include/cuda.h → cuda-cudart-dev-12-9 → cuda-cudart-dev
-
-        Reference: dep-detective/dep_detective/providers/utilities/system_package_resolver_provider.py:19-70
         """
         # Check cache first
         if file_path in self._cache:
@@ -236,8 +237,6 @@ class DpkgResolver:
           cuda-cudart-dev-12-9 → cuda-cudart-dev
           libcublas-dev-12-9 → libcublas-dev
           libc6 → libc6 (no change)
-
-        Reference: dep-detective/dep_detective/providers/utilities/system_package_resolver_provider.py:133-148
         """
         # Pattern: package-name-##-# → package-name
         match = re.match(r"^(.+?)-(\d+)-(\d+)$", package)
@@ -262,10 +261,8 @@ class ArtifactCollector:
     """
     Collects artifacts from D files (headers), link.txt files (libraries), and wheels (binaries).
 
-    Reference:
-      - D files: dep-detective/dep_detective/providers/detectors/headers.py:346-553
-      - Link files: dep-detective/dep_detective/providers/detectors/links.py:264-501
-      - Wheels: dep-detective/dep_detective/providers/detectors/wheel.py:80-297
+    Args:
+        build_dir: Path to build directory to scan
     """
 
     def __init__(self, build_dir: Path):
@@ -317,19 +314,27 @@ class ArtifactCollector:
           2. Handle line continuations (backslash at end)
           3. Split by whitespace to get all paths
           4. Skip first token (target: header1 header2 ...)
-          5. Resolve relative paths from depfile's parent directory
-          6. Filter out non-existent paths
-          7. Canonicalize with os.path.realpath()
+          5. Strip trailing colons from paths (handles malformed .d files)
+          6. Resolve relative paths from depfile's parent directory
+          7. Filter out non-existent paths
+          8. Canonicalize with os.path.realpath()
+
+        Malformed .d File Handling:
+          Some CMake-generated .d files contain paths with trailing colons.
+          Example: '/usr/include/stdc-predef.h:' (should be '/usr/include/stdc-predef.h')
+
+          This is caused by incorrect formatting in CMake's dependency tracking.
+          The parser strips trailing colons using rstrip(':') to handle these cases,
+          preventing duplicate artifacts and improving accuracy.
 
         Example D file:
           ```
-          build/foo.o: /usr/include/stdio.h \\
-            ../include/myheader.h \\
+          build/foo.o: /usr/include/stdio.h \
+            ../include/myheader.h \
             /usr/local/cuda/include/cuda.h
           ```
-
-        Reference: dep-detective/dep_detective/providers/detectors/headers.py:346-438
         """
+
         artifacts = []
 
         try:
@@ -351,6 +356,12 @@ class ArtifactCollector:
         context_dir = d_file.parent
 
         for header_path in header_paths:
+            # Strip trailing colons from paths (malformed .d files)
+            # Some .d files have malformed entries like '/usr/include/stdc-predef.h:'
+            header_path = header_path.rstrip(':')
+            if not header_path:
+                continue
+
             # Store original relative path before joining (for 3rdparty resolution)
             original_header_path = header_path
 
@@ -362,19 +373,20 @@ class ArtifactCollector:
             try:
                 canonical_path = os.path.realpath(header_path)
 
-                # If path doesn't exist and contains '3rdparty/', try resolving from tensorrt_llm root
+                # If path doesn't exist and contains submodules dir pattern, try resolving from submodules directory
+                submodules_pattern = f'{THIRDPARTY_ROOT.name}/'
                 if not os.path.exists(
-                        canonical_path) and '3rdparty/' in original_header_path:
-                    # Extract the part starting from FIRST '3rdparty/' in ORIGINAL path (handles nested 3rdparty dirs)
+                        canonical_path
+                ) and submodules_pattern in original_header_path:
+                    # Extract the part starting from FIRST submodules dir pattern in ORIGINAL path (handles nested dirs)
                     # e.g., ../../../../3rdparty/xgrammar/3rdparty/picojson/picojson.h
                     # should extract: xgrammar/3rdparty/picojson/picojson.h
-                    idx = original_header_path.find('3rdparty/')
+                    idx = original_header_path.find(submodules_pattern)
                     if idx != -1:
-                        relative_part = original_header_path[idx +
-                                                             len('3rdparty/'):]
-                        # Find tensorrt_llm root (go up from cpp/build or cpp/dependency_scan)
-                        tensorrt_llm_root = Path(__file__).parent.parent.parent
-                        alternative_path = tensorrt_llm_root / '3rdparty' / relative_part
+                        relative_part = original_header_path[
+                            idx + len(submodules_pattern):]
+                        # Resolve from THIRDPARTY_ROOT constant
+                        alternative_path = THIRDPARTY_ROOT / relative_part
                         alternative_canonical = os.path.realpath(
                             str(alternative_path))
 
@@ -426,14 +438,16 @@ class ArtifactCollector:
                     except Exception:
                         pass
 
-                if os.path.exists(canonical_path):
-                    artifacts.append(
-                        Artifact(
-                            path=canonical_path,
-                            type='header',
-                            source=str(d_file),
-                            context_dir=str(context_dir),
-                            metadata={'original_path': original_header_path}))
+                # Include all headers (even non-existent) for complete coverage
+                artifacts.append(
+                    Artifact(path=canonical_path,
+                             type='header',
+                             source=str(d_file),
+                             context_dir=str(context_dir),
+                             metadata={
+                                 'original_path': original_header_path,
+                                 'path_exists': os.path.exists(canonical_path)
+                             }))
             except Exception:
                 continue
 
@@ -450,15 +464,28 @@ class ArtifactCollector:
              a) -l flags (e.g., -lpthread)
              b) Absolute library paths (*.a, *.so)
              c) @response.rsp files → recursively expand
+             d) CMakeFiles linker artifacts with embedded -Wl flags (special handling)
           4. Deduplicate and return
+
+        CMakeFiles Linker Artifact Extraction:
+          CMake generates special linker artifacts in CMakeFiles directories that
+          encode library dependencies in the path itself.
+
+          Pattern: /path/CMakeFiles/foo.dir/-Wl,-soname,libtest.so.1
+
+          These paths contain embedded linker flags (-Wl,-soname) that specify
+          the library's soname. The parser extracts the library name (libtest.so.1),
+          strips the 'lib' prefix, and converts it to a linker flag (-ltest).
+
+          This enables proper dependency mapping for internal build artifacts that
+          would otherwise be unmapped.
 
         Example link.txt:
           ```
           /usr/bin/c++ ... -lpthread -ldl /path/to/libfoo.a @response.rsp
           ```
-
-        Reference: dep-detective/dep_detective/providers/detectors/links.py:264-399
         """
+
         artifacts = []
 
         try:
@@ -475,6 +502,30 @@ class ArtifactCollector:
                 rsp_file = Path(context_dir) / token[1:]
                 if rsp_file.exists():
                     artifacts.extend(self._parse_link_file(rsp_file))
+                continue
+
+            # Handle CMakeFiles linker artifacts with embedded -Wl flags
+            # Pattern: /path/CMakeFiles/foo.dir/-Wl,-soname,libbar.so
+            # These encode library dependencies in the path itself
+            if '/CMakeFiles/' in token and '/-Wl,' in token:
+                # Extract library name from -Wl,-soname,libfoo.so
+                match = re.search(r'-Wl,-soname,(.+)$', token)
+                if match:
+                    lib_name = match.group(1)
+                    # Add as linker flag artifact for pattern matching
+                    artifacts.append(
+                        Artifact(
+                            path=
+                            f"-l{lib_name.replace('lib', '').split('.')[0]}",
+                            type='library',
+                            source=str(link_file),
+                            context_dir=str(context_dir),
+                            metadata={
+                                'linker_flag': True,
+                                'cmake_linker_artifact': True,
+                                'original_token': token,
+                                'library_name': lib_name
+                            }))
                 continue
 
             # Handle -l flags
@@ -495,13 +546,17 @@ class ArtifactCollector:
 
                 try:
                     canonical_path = os.path.realpath(token)
-                    if os.path.exists(canonical_path):
-                        artifacts.append(
-                            Artifact(path=canonical_path,
-                                     type='library',
-                                     source=str(link_file),
-                                     context_dir=str(context_dir),
-                                     metadata={'static': token.endswith('.a')}))
+                    # Include all library paths (even non-existent) for complete coverage
+                    artifacts.append(
+                        Artifact(path=canonical_path,
+                                 type='library',
+                                 source=str(link_file),
+                                 context_dir=str(context_dir),
+                                 metadata={
+                                     'static': token.endswith('.a'),
+                                     'path_exists':
+                                     os.path.exists(canonical_path)
+                                 }))
                 except Exception:
                     continue
 
@@ -525,8 +580,6 @@ class ArtifactCollector:
           tensorrt_llm-0.1.0-py3-none-any.whl contains:
             - tensorrt_llm/libs/libnvinfer_plugin_tensorrt_llm.so
             - Uses: libcudart.so.12, libnvinfer.so.10, libstdc++.so.6
-
-        Reference: dep-detective/dep_detective/providers/detectors/wheel.py:80-297
         """
         artifacts = []
 
@@ -590,8 +643,6 @@ class ArtifactCollector:
            0x0000000000000001 (NEEDED)             Shared library: [libcudart.so.12]
            0x0000000000000001 (NEEDED)             Shared library: [libstdc++.so.6]
           ```
-
-        Reference: dep-detective/dep_detective/providers/detectors/links.py:400-501
         """
         needed = []
 
@@ -627,15 +678,13 @@ class PatternMatcher:
 
     Provides 3-tier resolution strategy:
       1. Exact pattern matching (basename_matches and linker_flags_matches)
-      2. Path alias matching (directory_matches and aliases - rightmost match wins)
+      2. Path matching (directory_matches - rightmost match wins)
       3. Generic library name inference (fallback)
 
     YAML files are loaded from dependencies/ directory:
       - Individual dependency files (e.g., tensorrt-llm.yml)
-      - dpkg.yml with dependencies: list format
+      - Files with dependencies: list format (e.g., base.yml, cuda.yml)
       - All *.yml files except those starting with '_'
-
-    Reference: dep-detective/dep_detective/providers/utilities/library_mapper.py:29-148
     """
 
     def __init__(self, metadata_dir: Path):
@@ -647,8 +696,7 @@ class PatternMatcher:
         """
         self.pattern_mappings: Dict[str, str] = {}
         self.path_aliases: Dict[str, str] = {}
-        self.known_names: Set[str] = set(
-        )  # Track all known dependency names/aliases
+        self.known_names: Set[str] = set()  # Track all known dependency names
         self._schema = None
         self._duplicate_warnings: Set[str] = set()
 
@@ -676,9 +724,9 @@ class PatternMatcher:
           2. Load each file and validate against schema
           3. Handle two formats:
              - Individual dependency files (with name, basename_matches, etc.)
-             - dpkg.yml with dependencies: list format
+             - Files with dependencies: list format (e.g., base.yml, cuda.yml)
           4. Merge all basename_matches/linker_flags_matches into pattern_mappings
-          5. Merge all directory_matches/aliases into path_aliases
+          5. Merge all directory_matches into path_aliases
           6. Warn about validation errors and duplicates
         """
         yaml_files = sorted([
@@ -767,21 +815,8 @@ class PatternMatcher:
                 self._duplicate_warnings.add(component)
             self.path_aliases[component] = dependency_name
 
-        # Merge aliases into path_aliases
-        aliases = dep_data.get("aliases", [])
-        for alias in aliases:
-            if alias in self.path_aliases and alias not in self._duplicate_warnings:
-                print(
-                    f"Warning: Duplicate alias '{alias}' found in {source_file.name} "
-                    f"(previously mapped to '{self.path_aliases[alias]}', now '{dependency_name}')",
-                    file=sys.stderr)
-                self._duplicate_warnings.add(alias)
-            self.path_aliases[alias] = dependency_name
-
         # Track known dependency names (for nested vendor detection)
         self.known_names.add(dependency_name.lower())
-        for alias in aliases:
-            self.known_names.add(alias.lower())
         for component in directory_matches:
             self.known_names.add(component.lower())
 
@@ -791,7 +826,7 @@ class PatternMatcher:
 
         Algorithm:
           1. Try pattern matching (basename_matches and linker_flags_matches - exact match only - highest confidence)
-          2. Try path alias matching (directory_matches and aliases - rightmost directory wins)
+          2. Try path matching (directory_matches - rightmost directory wins)
           3. Try generic library name inference (lowest confidence)
           4. Return first match or None
         """
@@ -800,7 +835,7 @@ class PatternMatcher:
         if result:
             return result
 
-        # Strategy 2: Path aliases
+        # Strategy 2: Path matching (directory_matches)
         result = self._match_path_alias(artifact)
         if result:
             return result
@@ -830,8 +865,6 @@ class PatternMatcher:
 
         Note: For partial path matching, use directory_matches in YAML files.
               Directory matches work on whole directory names (e.g., "fmt/" in path).
-
-        Reference: dep-detective/dep_detective/providers/utilities/library_mapper.py:37-53
         """
         basename = os.path.basename(artifact.path)
 
@@ -858,37 +891,71 @@ class PatternMatcher:
 
     def _match_path_alias(self, artifact: Artifact) -> Optional[Mapping]:
         """
-        Match using path_aliases (rightmost directory name wins).
+        Match using path_aliases (supports single and multi-directory patterns).
 
         Algorithm:
-          1. Split path by '/' to get directory components
-          2. Iterate from right to left (rightmost has priority)
-          3. Check if each component exists in path_aliases
-          4. Return first match with MEDIUM confidence
+          1. Split path by '/' to get directory components (filter empty strings)
+          2. For each pattern in path_aliases:
+             a. Normalize pattern (strip leading/trailing slashes)
+             b. Split pattern into components
+             c. Search for exact consecutive component sequence in path
+             d. Rightmost match wins
+          3. Return first match with MEDIUM confidence
 
         Examples:
-          /foo/bar/pytorch/include/torch/torch.h → pytorch (matches "pytorch")
-          /build/cuda-12/include/cuda.h → cuda-12 (matches "cuda-12")
-          /build/deep_ep/src/foo.h → deepep (matches "deep_ep" → alias to "deepep")
+          Single component:
+            Pattern: "pytorch"
+            /foo/bar/pytorch/include/torch/torch.h → pytorch (matches "pytorch")
 
-        Reference: dep-detective/dep_detective/providers/utilities/library_mapper.py:54-75
+          Multi-directory:
+            Pattern: "foo/bar"
+            /home/foo/bar/file.h → foo/bar (matches consecutive "foo", "bar")
+            /home/foobar/file.h → NO MATCH ("foobar" != ["foo", "bar"])
+
+          Rightmost wins:
+            Pattern: "foo/bar"
+            /foo/bar/baz/foo/bar/qux.h → matches at rightmost position
         """
-        path_parts = artifact.path.split('/')
+        # Split path into components (filter out empty strings from leading slash)
+        path_components = [c for c in artifact.path.split('/') if c]
 
-        # Check from right to left (rightmost wins)
-        for i in range(len(path_parts) - 1, -1, -1):
-            part = path_parts[i]
-            if part in self.path_aliases:
-                return Mapping(artifact=artifact,
-                               dependency=self.path_aliases[part],
-                               confidence='medium',
-                               strategy='path_alias',
-                               metadata={
-                                   'matched_component': part,
-                                   'position': i
-                               })
+        best_match = None
+        best_position = -1  # Rightmost wins (highest position)
 
-        return None
+        for pattern, dependency in self.path_aliases.items():
+            # Normalize pattern: strip slashes, split into components
+            pattern_normalized = pattern.strip('/')
+
+            # Handle empty pattern after stripping
+            if not pattern_normalized:
+                continue
+
+            pattern_components = pattern_normalized.split('/')
+            pattern_len = len(pattern_components)
+
+            # Search for exact consecutive sequence match using sliding window
+            # Iterate through all possible positions in the path
+            for i in range(len(path_components) - pattern_len + 1):
+                # Check if pattern_components match exactly at position i
+                if path_components[i:i + pattern_len] == pattern_components:
+                    # Found exact match at position i
+                    # Keep rightmost match (highest i value wins)
+                    if i > best_position:
+                        best_position = i
+                        best_match = Mapping(artifact=artifact,
+                                             dependency=dependency,
+                                             confidence='medium',
+                                             strategy='path_alias',
+                                             metadata={
+                                                 'matched_pattern':
+                                                 pattern,
+                                                 'matched_sequence':
+                                                 '/'.join(pattern_components),
+                                                 'position':
+                                                 i
+                                             })
+
+        return best_match
 
     def _match_generic_library(self, artifact: Artifact) -> Optional[Mapping]:
         """
@@ -903,8 +970,6 @@ class PatternMatcher:
         Examples:
           libfoobar.so → foobar (low confidence)
           libtest.so.1 → test (low confidence)
-
-        Reference: patterns.json:444-454 (fallback rule)
         """
         if artifact.type != 'library':
             return None
@@ -1150,8 +1215,9 @@ def validate_yaml_files(metadata_dir: Path) -> bool:
             with open(yaml_file, 'r') as f:
                 data = yaml.safe_load(f)
 
-            # Handle dpkg.yml format
-            if yaml_file.name == "dpkg.yml" and "dependencies" in data:
+            # Handle files with dependencies list format (e.g., base.yml, cuda.yml)
+            if "dependencies" in data and isinstance(data["dependencies"],
+                                                     list):
                 for dep_data in data["dependencies"]:
                     total += 1
                     try:

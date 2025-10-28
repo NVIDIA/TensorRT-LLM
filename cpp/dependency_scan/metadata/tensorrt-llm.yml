@@ -2,9 +2,11 @@ name: tensorrt-llm
 description: TensorRT-LLM core libraries and Python bindings built by this project
 license: Apache-2.0
 homepage: https://github.com/NVIDIA/TensorRT-LLM
-source: built-from-source
-aliases:
-- trtllm
-basename_matches: []
-linker_flags_matches: []
-directory_matches: []
+source: submodule
+basename_matches:
+- deep_ep_cpp_tllm.cpython-312-x86_64-linux-gnu.so
+- deep_gemm_cpp_tllm.cpython-312-x86_64-linux-gnu.so
+linker_flags_matches:
+- -ltensorrt_llm
+directory_matches:
+- tensorrt_llm

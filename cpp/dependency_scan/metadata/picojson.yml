@@ -3,8 +3,7 @@ description: Header-only JSON parser/serializer in C++ (vendored in xgrammar)
 license: BSD-2-Clause
 copyright: Copyright 2009-2010 Cybozu Labs, Inc., Copyright 2011-2014 Kazuho Oku
 homepage: https://github.com/kazuho/picojson
-source: bundled
-aliases: []
+source: submodule
 basename_matches: []
 linker_flags_matches: []
 directory_matches:

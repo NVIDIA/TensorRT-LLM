@@ -1,6 +1,6 @@
 name: pytorch
 description: pytorch libraries and components
-aliases: []
+source: container
 basename_matches:
 - libc10.so
 - libc10_cuda.so

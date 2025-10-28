@@ -4,8 +4,7 @@ description: Common in-memory tensor structure for deep learning frameworks (ven
 license: Apache-2.0
 copyright: Copyright 2017 by Contributors
 homepage: https://github.com/dmlc/dlpack
-source: bundled
-aliases: []
+source: submodule
 basename_matches: []
 linker_flags_matches: []
 directory_matches:

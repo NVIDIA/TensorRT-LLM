@@ -1,8 +1,7 @@
 name: ucxx
 description: C++ bindings for UCX (Unified Communication X)
 homepage: https://github.com/rapidsai/ucxx
-source: bundled
-aliases: []
+source: submodule
 basename_matches: []
 linker_flags_matches: []
 directory_matches:

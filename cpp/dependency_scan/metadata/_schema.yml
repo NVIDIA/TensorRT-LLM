@@ -39,8 +39,12 @@ properties:
 
   source:
     type: string
-    enum: ["apt", "pip", "built-from-source", "bundled", "download", "other"]
-    description: "How this dependency is obtained"
+    enum: ["submodule", "container", "fetched"]
+    description: |
+      How this dependency is obtained:
+        - submodule: Git submodules in 3rdparty/ directory
+        - container: Pre-installed in the container image (e.g., PyTorch)
+        - fetched: Downloaded from URL and built from source
 
   basename_matches:
     type: array
@@ -65,15 +69,21 @@ properties:
       type: string
       minLength: 1
     uniqueItems: true
-    description: "Directory name components that indicate this dependency"
+    description: |
+      Directory path patterns (single or multi-directory).
+      Supports exact consecutive component matching (no substring matching).
 
-  aliases:
-    type: array
-    items:
-      type: string
-      minLength: 1
-    uniqueItems: true
-    description: "Other names that map to this dependency"
+      Examples:
+        - "pytorch" (single component: matches any path containing /pytorch/)
+        - "3rdparty/cutlass" (multi-directory: matches /3rdparty/cutlass/ sequence)
+        - "foo/bar/baz" (multi-directory: matches /foo/bar/baz/ sequence)
+
+      Matching behavior:
+        - Exact component match only (no substrings)
+        - "foo/bar" matches "/home/foo/bar/file.h" ✓
+        - "foo/bar" does NOT match "/home/foobar/file.h" ✗
+        - "oo/ba" does NOT match "/foo/bar/file.h" ✗
+        - Rightmost match wins if pattern appears multiple times in path
 
 # At least one pattern matching section required
 anyOf:

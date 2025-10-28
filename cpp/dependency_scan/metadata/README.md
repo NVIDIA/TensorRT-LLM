@@ -8,17 +8,17 @@ After running the scanner, check `scan_output/unknown.yml` for unmapped artifact
 
 ## Structure
 
-Each `.yml` file represents one dependency:
+Each `.yml` file represents one or more dependencies:
 
 ```
 metadata/
 ├── _template.yml       # Template for new dependencies
 ├── _schema.yml         # JSON schema for validation
-├── dpkg.yml           # System libraries (list format)
+├── base.yml           # Base system packages (list format)
+├── cuda.yml           # CUDA packages (list format)
 ├── tensorrt-llm.yml   # Individual dependency
 ├── pytorch.yml
-├── cuda-cudart-12.yml
-└── ... (62+ dependencies)
+└── ... (23 total files)
 ```
 
 ## File Formats
@@ -28,64 +28,203 @@ metadata/
 Most dependencies use this format:
 
 ```yaml
-# metadata/tensorrt-llm.yml
+# metadata/pytorch.yml
 
-name: tensorrt-llm                    # Required: canonical name
-version: "1.2.0"                      # Required: version
-description: TensorRT-LLM libraries   # Required: description
+name: pytorch                      # Required: canonical name
+description: PyTorch machine learning framework  # Required: min 10 chars
 
-license: Apache-2.0                   # Optional: license
-copyright: "Copyright 2024 NVIDIA"    # Optional: copyright
-homepage: "https://..."               # Optional: URL
-source: "built-from-source"           # Optional: how obtained
+license: BSD-3-Clause              # Optional: SPDX identifier
+copyright: Copyright (c) PyTorch Contributors    # Optional
+homepage: https://pytorch.org/     # Optional: URL
+source: container                  # Optional: how obtained (container, submodule, fetched)
 
-patterns:                             # Artifact patterns (exact or substring)
-  - libth_common.so
-  - libpg_utils.so
+basename_matches:                  # Exact basename matches
+  - libtorch.so
+  - libc10.so
 
-linker_flags:                         # Linker flags (-l flags)
-  - -ltensorrt_llm
+linker_flags_matches:              # Linker flags (-l flags)
+  - -ltorch_python
 
-path_components:                      # Path matching
-  - tensorrt_llm
-
-aliases:                              # Other names
-  - trtllm
+directory_matches:                 # Directory path patterns
+  - ATen
+  - c10
+  - torch
 ```
 
-### dpkg.yml (List Format)
+### List Format (base.yml, cuda.yml)
 
-System libraries use a list format for compactness:
+System packages use a list format for compactness:
 
 ```yaml
-# metadata/dpkg.yml
+# metadata/base.yml or cuda.yml
 
 dependencies:
   - name: libc6
-    version: "2.35"
     description: GNU C Library
-    patterns:
+    source: container
+    basename_matches:
       - libc.so.6
-    linker_flags:
+    linker_flags_matches:
       - -lc
       - -lpthread
       - -ldl
-      - -lm
-      - -lrt
-    path_components: []
-    aliases: []
+    directory_matches: []
 
   - name: libstdc++6
-    version: "13.0"
     description: GNU C++ Library
-    patterns:
+    source: container
+    basename_matches:
       - libstdc++.so.6
-    linker_flags:
+    linker_flags_matches:
       - -lstdc++
-    path_components: []
-    aliases: []
+    directory_matches: []
   # ... more system libraries
 ```
+
+## Field Names Reference
+
+**Current field names** (as of latest schema):
+- `basename_matches` - Exact filename matches (not "patterns")
+- `linker_flags_matches` - Linker flags (not "linker_flags")
+- `directory_matches` - Path component patterns (not "path_components")
+
+## Iterative Pattern Development
+
+This section describes the recommended workflow for achieving high coverage through iterative pattern refinement.
+
+### Workflow Steps
+
+1. **Run the scanner** on your build directory:
+   ```bash
+   python scan_build_artifacts.py --build-dir /path/to/build
+   ```
+
+2. **Examine scan_output/unknown.yml** to identify unmapped artifacts:
+   ```bash
+   cat scan_output/unknown.yml
+   ```
+
+   Example output:
+   ```yaml
+   summary:
+     count: 42
+     action_required: Add patterns to YAML files in metadata/ for these artifacts
+
+   artifacts:
+     - /build/3rdparty/newlib/include/foo.h
+     - /usr/local/cuda-13.0/include/cuda.h
+     - libfoo.so
+     - -lbar
+   ```
+
+3. **Analyze patterns** in unknown artifacts:
+   - Group artifacts by logical dependency
+   - Identify common directory paths
+   - Note exact library names and linker flags
+   - Look for version patterns (e.g., cuda-12.9, cuda-13.0)
+
+4. **Add or update patterns** in metadata YAML files:
+   - For new dependencies: Copy `_template.yml` and create new file
+   - For existing dependencies: Update relevant YAML file
+   - Use the most powerful matching strategy (see below)
+
+5. **Validate your changes**:
+   ```bash
+   python scan_build_artifacts.py --validate
+   ```
+
+6. **Re-run scanner** to verify improvements:
+   ```bash
+   python scan_build_artifacts.py
+   ```
+
+7. **Check results**:
+   ```bash
+   # Check summary in scan_output/known.yml
+   grep "coverage:" scan_output/known.yml
+
+   # Check remaining unknowns
+   grep "count:" scan_output/unknown.yml
+   ```
+
+8. **Repeat** steps 2-7 until `scan_output/unknown.yml` shows `count: 0`
+
+### Achieving 100% Coverage
+
+The goal is to reduce unknown artifacts to zero. Key strategies:
+
+- **Start with directory_matches**: Most powerful pattern type (see below)
+- **Use version-agnostic patterns**: Match across multiple versions (see next section)
+- **Group related artifacts**: Single dependency file can match headers, libs, and linker flags
+- **Test incrementally**: Add patterns for one dependency at a time
+- **Validate frequently**: Catch syntax errors early with `--validate`
+
+## Version-Agnostic Pattern Matching
+
+For dependencies with multiple versions (e.g., CUDA 12.9, 13.0), use patterns that match all versions.
+
+### Problem
+
+Artifacts from different CUDA versions:
+```
+/usr/local/cuda-12.9/include/cuda.h
+/usr/local/cuda-13.0/include/cuda.h
+/usr/local/cuda/include/cuda.h
+```
+
+### Solution: Version-Agnostic Patterns
+
+Use `directory_matches` with version-agnostic patterns:
+
+```yaml
+# metadata/cuda.yml
+name: cuda-cudart
+description: CUDA Runtime Library
+
+directory_matches:
+  - cuda-12.9      # Matches /cuda-12.9/ paths
+  - cuda-13.0      # Matches /cuda-13.0/ paths
+  - cuda           # Matches /cuda/ paths (generic fallback)
+```
+
+### When to Use This Approach
+
+- **Multiple versions installed**: Different CUDA/TensorRT versions in same environment
+- **Version symlinks**: Generic paths like `/usr/local/cuda/` alongside versioned ones
+- **Forward compatibility**: Pattern works for future versions without updates
+- **Container evolution**: Handles version changes between container builds
+
+### Best Practices
+
+1. **List specific versions first**: More specific patterns take priority
+   ```yaml
+   directory_matches:
+     - cuda-12.9    # Specific version
+     - cuda-13.0    # Specific version
+     - cuda         # Generic fallback
+   ```
+
+2. **Use with basename_matches**: Combine with exact filename matching
+   ```yaml
+   basename_matches:
+     - libcudart.so.12
+     - libcudart.so.13
+
+   directory_matches:
+     - cuda-12.9
+     - cuda-13.0
+     - cuda
+   ```
+
+3. **Test across versions**: Verify patterns work with different installations
+
+4. **Document version ranges**: Add comments for clarity
+   ```yaml
+   directory_matches:
+     - cuda-12.9    # CUDA 12.9.x
+     - cuda-13.0    # CUDA 13.0.x
+     - cuda         # Generic (all versions)
+   ```
 
 ## Adding Patterns
 
@@ -96,7 +235,7 @@ After running the scanner, check `scan_output/unknown.yml`:
 ```yaml
 summary:
   count: 2
-  action_required: "Add patterns to YAML files in metadata/ for these artifacts"
+  action_required: Add patterns to YAML files in metadata/ for these artifacts
 
 artifacts:
   - /build/3rdparty/newlib/include/foo.h
@@ -108,15 +247,15 @@ artifacts:
 If `libfoo.so` belongs to an existing dependency (e.g., `pytorch`):
 
 1. Open `metadata/pytorch.yml`
-2. Add to the `patterns` list:
+2. Add to the `basename_matches` list:
    ```yaml
-   patterns:
+   basename_matches:
      - libtorch.so
      - libfoo.so      # ← Add here
    ```
 3. Re-run scanner:
    ```bash
-   python ../scan_build_artifacts.py --build-dir /path --output-dir validation_output/
+   python ../scan_build_artifacts.py
    ```
 
 ### Option B: Create New Dependency
@@ -132,91 +271,156 @@ If this is a new dependency:
 2. Edit the file:
    ```yaml
    name: foo-library
-   version: "1.0"
    description: Foo library for data processing
+   source: submodule
 
-   patterns:
+   basename_matches:
      - libfoo.so
+     - libfoo.a
+
+   linker_flags_matches:
+     - -lfoo
+
+   directory_matches:
+     - foo-library
    ```
 
 3. Validate and re-run:
    ```bash
    python ../scan_build_artifacts.py --validate
-   python ../scan_build_artifacts.py --build-dir /path --output-dir validation_output/
+   python ../scan_build_artifacts.py
    ```
 
 ## Pattern Matching Behavior
 
-The scanner tries matches in this order:
+The scanner uses a **3-tier matching strategy**:
 
-1. **Exact match on basename**: `libfoo.so` == `libfoo.so`
-2. **Exact match on full path**: `/path/to/libfoo.so` == `/path/to/libfoo.so`
-3. **Substring match**: `foo.cpython` in `foo.cpython-312-x86_64.so`
+### 1. Exact Pattern Matching (HIGH confidence)
+Matches exact filenames or linker flags:
 
-**No need to specify match type** - the scanner tries both automatically!
-
-### Examples
-
-**Exact match** (`patterns`):
+**Basename matches:**
 ```yaml
-patterns:
-  - libcudart.so.12      # Matches only "libcudart.so.12"
-  - libcudart.so.12.0    # Matches only "libcudart.so.12.0"
+basename_matches:
+  - libcudart.so.12      # Matches only "libcudart.so.12" exactly
+  - libcudart.so.12.0    # Matches only "libcudart.so.12.0" exactly
 ```
 
-**Substring match** (`patterns`):
+**Linker flags:**
 ```yaml
-patterns:
-  - deep_ep_cpp  # Matches "deep_ep_cpp_tllm.cpython-312-x86_64-linux-gnu.so"
-```
-
-**Linker flags** (`linker_flags`):
-```yaml
-linker_flags:
+linker_flags_matches:
   - -lpthread    # Matches "-lpthread" in link.txt
   - -lcudart     # Matches "-lcudart"
 ```
 
-**Path components** (`path_components`):
+### 2. Path Alias Matching (MEDIUM confidence)
+Matches directory components in paths. **Now supports multi-directory patterns!**
+
+**Single component:**
 ```yaml
-path_components:
-  - pytorch      # Matches "/build/pytorch/include/torch.h"
-  - cuda-12      # Matches "/usr/local/cuda-12/include/cuda.h"
+directory_matches:
+  - pytorch      # Matches any path containing /pytorch/
+                 # Example: /build/pytorch/include/torch.h ✓
 ```
+
+**Multi-directory (NEW):**
+```yaml
+directory_matches:
+  - 3rdparty/cutlass           # Matches /3rdparty/cutlass/ sequence
+  - external/NVIDIA/cutlass    # Matches full /external/NVIDIA/cutlass/ sequence
+```
+
+**Matching rules:**
+- Exact component match only (no substring matching)
+- `"foo/bar"` matches `/home/foo/bar/file.h` ✓
+- `"foo/bar"` does NOT match `/home/foobar/file.h` ✗
+- `"oo/ba"` does NOT match `/foo/bar/file.h` ✗
+- Rightmost match wins if pattern appears multiple times in path
+
+### 3. Generic Inference (LOW confidence)
+Fallback: extracts library name from `-lfoo` → `foo`
+
+### Pattern Matching Power Ranking
+
+**Most Powerful → Least Powerful:**
+
+1. **directory_matches** - Matches entire directories of headers/files
+   - Example: `directory_matches: [pytorch]` matches 4,822+ PyTorch headers
+   - Single pattern can cover hundreds or thousands of artifacts
+
+2. **basename_matches** - Matches specific library files
+   - Example: `basename_matches: [libtorch.so]` matches one library
+   - Good for targeting specific libraries
+
+3. **linker_flags_matches** - Matches linker flags in link.txt files
+   - Example: `linker_flags_matches: [-ltorch]` matches one linker flag
+   - Useful for libraries without headers in build
+
+**Recommendation:** Start with `directory_matches` for maximum coverage with minimal patterns.
 
 ## Required Fields
 
 Every dependency MUST have:
 
 ```yaml
-name: my-dep        # Required: lowercase, hyphenated
-version: "1.0"      # Required: version string
+name: my-dep        # Required: lowercase, hyphenated, + allowed
 description: "..."  # Required: minimum 10 characters
 ```
 
 At least one pattern section is required:
-- `patterns` (artifact filenames)
-- `linker_flags` (-l flags)
-- `path_components` (directory names)
+- `basename_matches` (exact filenames)
+- `linker_flags_matches` (-l flags)
+- `directory_matches` (path components)
 
 ## Optional Fields
 
 Recommended for attribution/licensing:
 
 ```yaml
-license: "Apache-2.0"                    # SPDX identifier
-copyright: "Copyright 2024 NVIDIA"       # Copyright notice
-homepage: "https://example.com"          # Project URL
-source: "apt"                            # How obtained
+version: "1.0"                           # Optional: version string
+license: "Apache-2.0"                    # Optional: SPDX identifier
+copyright: "Copyright 2024 NVIDIA"       # Optional: copyright notice
+homepage: "https://example.com"          # Optional: project URL
+source: "submodule"                      # Optional: how obtained
 ```
 
 Valid `source` values:
-- `apt` - Installed via apt/dpkg
-- `pip` - Installed via pip
-- `built-from-source` - Compiled from source
-- `bundled` - Bundled with project
-- `download` - Downloaded binary
-- `other` - Other method
+- `submodule` - Git submodules in 3rdparty/ directory
+- `container` - Pre-installed in container image (e.g., PyTorch, CUDA)
+- `fetched` - Downloaded from URL and built from source
+
+## Multi-Directory Pattern Examples
+
+### Example 1: Vendor Directory Boundaries
+
+```yaml
+# metadata/cutlass.yml
+name: cutlass
+description: CUDA Templates for Linear Algebra Subroutines
+source: submodule
+
+directory_matches:
+  - cutlass              # Single: matches any /cutlass/ in path
+  - 3rdparty/cutlass     # Multi: matches /3rdparty/cutlass/ sequence
+  - external/NVIDIA/cutlass  # Multi: matches full sequence
+```
+
+**Why multi-directory?** Prevents false positives:
+- `"cutlass"` alone might match `/other-project/cutlass/` (unwanted)
+- `"3rdparty/cutlass"` is more specific and safer
+
+### Example 2: Nested Dependencies
+
+```yaml
+# metadata/dlpack.yml
+name: dlpack
+description: Deep Learning Pack
+source: submodule
+
+directory_matches:
+  - 3rdparty/xgrammar/3rdparty/dlpack  # Nested submodule path
+```
+
+Matches `/build/3rdparty/xgrammar/3rdparty/dlpack/include/dlpack.h`
 
 ## Finding Which File to Edit
 
@@ -241,6 +445,12 @@ List all dependencies:
 grep "^name:" *.yml | sort
 ```
 
+Search in list format files (base.yml, cuda.yml):
+
+```bash
+grep -A 5 "name: libc6" base.yml
+```
+
 ## Validation
 
 ### Manual Validation
@@ -257,18 +467,16 @@ Expected output:
 ================================================================================
 YAML Validation
 ================================================================================
-Dependencies directory: ./dependencies
 
-✓ cuda-cudart-12.yml
+✓ base.yml:libc6
+✓ base.yml:libstdc++6
+✓ cuda.yml:cuda-cudart-dev
 ✓ pytorch.yml
 ✓ tensorrt-llm.yml
 ...
-✓ dpkg.yml:libc6
-✓ dpkg.yml:libstdc++6
-...
 
 ================================================================================
-Results: 73/73 valid, 0/73 invalid
+Results: 25/25 valid, 0/25 invalid
 ================================================================================
 ```
 
@@ -277,15 +485,15 @@ Results: 73/73 valid, 0/73 invalid
 After adding patterns, re-run the scanner:
 
 ```bash
-python ../scan_build_artifacts.py --build-dir /path --output-dir validation_output/
+python ../scan_build_artifacts.py
 ```
 
-Check `validation_output/unknown.yml` - should have fewer (or zero) artifacts:
+Check `scan_output/unknown.yml` - should have fewer (or zero) artifacts:
 
 ```yaml
 summary:
   count: 0  # Improved from previous run!
-  action_required: "Add patterns to YAML files in metadata/ for these artifacts"
+  coverage: 100.0%
 
 artifacts: []
 ```
@@ -293,46 +501,70 @@ artifacts: []
 ### Schema Validation
 
 The `_schema.yml` file defines validation rules:
-- Required fields
+- Required fields: `name`, `description`
 - Field types (string, array, etc.)
 - Field patterns (e.g., linker flags must start with `-l`)
 - Minimum lengths
 - Unique items in arrays
 
-Validation requires `jsonschema`:
-```bash
-pip install jsonschema
-```
-
 ## Common Mistakes
 
-### 1. Missing Required Fields
+### 1. Using Old Field Names
+
+```yaml
+patterns: [...]           # ❌ Wrong (old name)
+basename_matches: [...]   # ✓ Correct
+
+linker_flags: [...]       # ❌ Wrong (old name)
+linker_flags_matches: [...] # ✓ Correct
+
+path_components: [...]    # ❌ Wrong (old name)
+directory_matches: [...]  # ✓ Correct
+```
+
+### 2. Missing Required Fields
 
 ```yaml
 name: my-dep        # ✓ Required
-version: "1.0"      # ✓ Required
 description: "..."  # ✓ Required (min 10 chars)
 ```
 
-### 2. Empty Pattern Sections
+### 3. Empty Pattern Sections
 
 ```yaml
-patterns: []        # ❌ Need at least one pattern section
-linker_flags: []
-path_components: []
+basename_matches: []        # ❌ Need at least one pattern section
+linker_flags_matches: []
+directory_matches: []
 ```
 
-Must have at least one of: `patterns`, `linker_flags`, or `path_components`
+Must have at least one of: `basename_matches`, `linker_flags_matches`, or `directory_matches`
 
-### 3. Wrong Linker Flag Format
+### 4. Wrong Linker Flag Format
 
 ```yaml
-linker_flags:
+linker_flags_matches:
   - pthread         # ❌ Wrong
   - -lpthread       # ✓ Correct (must start with -l)
 ```
 
-### 4. Duplicate Patterns Across Files
+### 5. Substring Matching in directory_matches
+
+```yaml
+directory_matches:
+  - oo/ba           # ❌ Won't match /foo/bar/ (no substring matching)
+  - foo/bar         # ✓ Correct (exact component match)
+```
+
+### 6. Invalid source Field
+
+```yaml
+source: apt           # ❌ Wrong (old enum value)
+source: container     # ✓ Correct (new enum)
+source: pip           # ❌ Wrong (old enum value)
+source: submodule     # ✓ Correct (new enum)
+```
+
+### 7. Duplicate Patterns Across Files
 
 Scanner will warn if same pattern appears in multiple files:
 
@@ -343,7 +575,7 @@ Warning: Duplicate pattern 'libfoo.so' found in bar.yml
 
 Last loaded file wins (alphabetical order). Remove duplicates.
 
-### 5. Invalid Name Format
+### 8. Invalid Name Format
 
 ```yaml
 name: MyDep         # ❌ Wrong (uppercase)
@@ -351,13 +583,6 @@ name: my_dep        # ❌ Wrong (underscore)
 name: my-dep        # ✓ Correct (lowercase, hyphenated)
 name: cuda-12       # ✓ Correct (numbers ok)
 name: libstdc++6    # ✓ Correct (+ allowed)
-```
-
-### 6. Missing Description
-
-```yaml
-description: "Test"              # ❌ Too short (min 10 chars)
-description: "Test library"      # ✓ Correct (10+ chars)
 ```
 
 ## Troubleshooting
@@ -368,8 +593,8 @@ description: "Test library"      # ✓ Correct (10+ chars)
 
 **Solution**:
 1. Check exact artifact path in `scan_output/unknown.yml`
-2. Try substring pattern if exact doesn't work
-3. Use path_components for directory-based matching
+2. Use correct field names: `basename_matches`, not `patterns`
+3. For directories, use `directory_matches`
 4. Check for typos in pattern
 
 Example:
@@ -378,11 +603,43 @@ Example:
 artifacts:
   - /build/pytorch/lib/libtorch.so.2.0
 
-# Try adding:
-patterns:
-  - libtorch.so.2.0      # Exact match
-  # OR
-  - libtorch.so          # Substring match
+# Add exact match:
+basename_matches:
+  - libtorch.so.2.0
+
+# OR use directory matching:
+directory_matches:
+  - pytorch
+```
+
+### Issue: Multi-directory pattern not working
+
+**Cause**: Substring matching expectations.
+
+**Solution**:
+- Multi-directory patterns require **exact component matches**
+- `"oo/ba"` will NOT match `/foo/bar/`
+- Use full component names: `"foo/bar"`
+
+Example:
+```yaml
+directory_matches:
+  - vendor/cutlass      # ✓ Matches /vendor/cutlass/
+  - cutlass             # ✓ Also works (single component)
+  - end/cutlass         # ❌ Won't match /vendor/cutlass/ (no substring matching)
+```
+
+### Issue: dpkg.yml not found
+
+**Cause**: File was renamed to `base.yml`.
+
+**Solution**:
+```bash
+# Old (incorrect)
+grep "pattern" metadata/dpkg.yml
+
+# New (correct)
+grep "pattern" metadata/base.yml
 ```
 
 ### Issue: Validation fails with schema error
@@ -391,9 +648,9 @@ patterns:
 
 **Solution**:
 1. Compare with `_template.yml`
-2. Ensure required fields present
+2. Ensure required fields present (`name`, `description`)
 3. Check linker flags start with `-l`
-4. Verify arrays have unique items
+4. Use correct field names: `basename_matches`, `linker_flags_matches`, `directory_matches`
 
 Example error:
 ```
@@ -403,19 +660,6 @@ Example error:
 Fix:
 ```yaml
 description: "Foo library for data processing"  # At least 10 chars
-```
-
-### Issue: Can't find which file contains pattern
-
-**Cause**: Pattern in dpkg.yml or nested in list.
-
-**Solution**:
-```bash
-# Search all files including dpkg.yml
-grep -r "pattern-name" .
-
-# Search dpkg.yml specifically
-grep -A 5 "pattern-name" dpkg.yml
 ```
 
 ### Issue: Coverage decreased after changes
@@ -432,295 +676,64 @@ git diff metadata/
 python ../scan_build_artifacts.py --validate
 ```
 
-## Advanced Usage
-
-### Wildcards and Regex
-
-Patterns are exact or substring matches - **no wildcards or regex supported**.
-
-Instead of:
-```yaml
-patterns:
-  - libfoo.*.so      # ❌ Not supported
-```
-
-Use multiple entries:
-```yaml
-patterns:
-  - libfoo.so
-  - libfoo.so.1
-  - libfoo.so.2
-```
-
-Or use path_components:
-```yaml
-path_components:
-  - foo-library      # Matches any file in foo-library/ directory
-```
-
-### Bundled Binaries with Version Suffixes
-
-For Python extensions with version suffixes:
-
-```yaml
-patterns:
-  - my_module.cpython   # Matches my_module.cpython-312-x86_64-linux-gnu.so
-```
-
-Substring match handles version variations automatically.
-
-### Aliases for Package Name Variations
-
-If dpkg returns different package names:
-
-```yaml
-name: cuda-cudart-dev
-aliases:
-  - cuda-cudart-12-dev
-  - cuda-cudart-13-dev
-```
-
-### Multiple Versions
-
-Create separate files for major versions:
-
-```
-metadata/
-├── cuda-cudart-11.yml
-├── cuda-cudart-12.yml
-└── cuda-cudart-13.yml
-```
-
-Each with version-specific patterns:
-
-```yaml
-# cuda-cudart-12.yml
-patterns:
-  - libcudart.so.12
-  - libcudart.so.12.0
-path_components:
-  - cuda-12
-```
-
 ## Best Practices
 
-1. **One dependency per file** (except dpkg.yml for system libs)
+1. **One dependency per file** (except base.yml/cuda.yml for system libs)
 2. **Use descriptive names**: `cuda-cudart-12` not `cudart12`
-3. **Include version in name** for versioned dependencies
+3. **Use multi-directory patterns** for vendored dependencies to avoid false positives
 4. **Add metadata** (license, copyright, homepage) for attribution
 5. **Validate after changes**: `python ../scan_build_artifacts.py --validate`
 6. **Test coverage**: Re-run scanner after adding patterns
-7. **Document rationale**: Add comments for non-obvious patterns
-8. **Keep dpkg.yml for system libraries only**
-9. **Use substring patterns sparingly** (prefer exact matches)
-10. **Commit changes atomically** (one dependency per commit)
+7. **Use correct field names**: `basename_matches`, not `patterns`
+8. **Keep base.yml for system libraries only** (resolved via dpkg-query)
+9. **Use `source: container`** for pre-installed packages (PyTorch, CUDA)
+10. **Use `source: submodule`** for 3rdparty/ git submodules
+11. **Start with directory_matches**: Most powerful pattern type for coverage
+12. **Use version-agnostic patterns**: Match multiple versions with single pattern
 
-## Examples
+## Resolution Strategy
 
-### Example 1: Adding CUDA Library Pattern
+The scanner uses a **two-tier resolution strategy**:
 
-Unknown artifact in `scan_output/unknown.yml`:
+### PRIMARY: dpkg-query
+- System-installed packages
+- High confidence
+- Handles all CUDA, system libraries automatically
+
+### FALLBACK: YAML Patterns
+Only used when dpkg-query doesn't know about the artifact:
+1. Exact basename match → High confidence
+2. Exact linker flag match → High confidence
+3. Directory alias match → Medium confidence
+4. Generic library inference → Low confidence
+
+**Key insight**: Most CUDA and system packages are resolved via dpkg-query (PRIMARY), not YAML patterns. This is why `cuda.yml` and `base.yml` are sparse - they only contain fallback patterns for artifacts dpkg doesn't know about.
+
+## Example: Complete Dependency File
+
 ```yaml
-artifacts:
-  - /usr/local/cuda-12.0/lib64/libcublasLt.so.12
+# metadata/cutlass.yml
+
+name: cutlass
+description: CUDA Templates for Linear Algebra Subroutines
+
+version: "3.5.0"
+license: BSD-3-Clause
+copyright: Copyright (c) 2017 - 2025 NVIDIA CORPORATION & AFFILIATES
+homepage: https://github.com/NVIDIA/cutlass
+source: submodule
+
+basename_matches:
+  - libcutlass.a
+
+linker_flags_matches:
+  - -lcutlass
+
+directory_matches:
+  - cutlass
+  - 3rdparty/cutlass           # Multi-directory: prevents false positives
+  - external/NVIDIA/cutlass    # Multi-directory: vendor-specific path
 ```
-
-Add to existing `cuda-cublas-12.yml`:
-```yaml
-name: cuda-cublas-12
-version: "12.0"
-description: NVIDIA CUDA Basic Linear Algebra Subroutines library version 12
-
-patterns:
-  - libcublas.so.12
-  - libcublasLt.so.12      # ← Add here
-
-linker_flags:
-  - -lcublas
-  - -lcublasLt             # ← Add here
-
-path_components:
-  - cuda-12
-
-aliases: []
-```
-
-### Example 2: Creating New Dependency
-
-Unknown artifact in `scan_output/unknown.yml`:
-```yaml
-artifacts:
-  - /build/3rdparty/nlohmann_json/include/json.hpp
-```
-
-Create `nlohmann-json.yml`:
-```yaml
-name: nlohmann-json
-version: "3.11.2"
-description: JSON for Modern C++ header-only library
-
-license: MIT
-copyright: "Copyright (c) 2013-2022 Niels Lohmann"
-homepage: "https://github.com/nlohmann/json"
-source: bundled
-
-patterns: []              # Header-only, no library files
-
-linker_flags: []
-
-path_components:
-  - nlohmann_json         # Matches path component
-  - json                  # Also matches "json" directory
-
-aliases:
-  - nlohmann-json-dev
-```
-
-Re-run scanner:
-```bash
-python ../scan_build_artifacts.py
-cat scan_output/unknown.yml  # Should be empty or reduced
-```
-
-### Example 3: Bundled Python Extension
-
-Unknown artifact in `scan_output/unknown.yml`:
-```yaml
-artifacts:
-  - tensorrt_llm/libs/executor_worker.cpython-312-x86_64-linux-gnu.so
-```
-
-Create `tensorrt-llm.yml`:
-```yaml
-name: tensorrt-llm
-version: "1.2.0"
-description: TensorRT-LLM inference optimization libraries
-
-source: built-from-source
-
-patterns:
-  - executor_worker.cpython    # Substring match for versioned extensions
-  - libth_common.so
-
-linker_flags: []
-
-path_components:
-  - tensorrt_llm
-
-aliases:
-  - trtllm
-```
-
-### Example 4: System Library in dpkg.yml
-
-Unknown artifact in `scan_output/unknown.yml`:
-```yaml
-artifacts:
-  - -lgomp
-```
-
-Add to `dpkg.yml`:
-```yaml
-dependencies:
-  # ... existing entries ...
-
-  - name: libgomp1
-    version: "13.0"
-    description: GCC OpenMP runtime library
-    patterns:
-      - libgomp.so.1
-    linker_flags:
-      - -lgomp          # ← Add here
-    path_components: []
-    aliases: []
-```
-
-## Integration with Scanner
-
-### Scanner Resolution Order
-
-1. **dpkg-query** (PRIMARY)
-   - System-installed packages
-   - High confidence
-
-2. **YAML patterns** (FALLBACK)
-   - Exact pattern match → High confidence
-   - Substring pattern match → High confidence
-   - Path alias match → Medium confidence
-   - Generic library inference → Low confidence
-
-### Output Files
-
-The scanner generates simplified YAML output files:
-
-- **`scan_output/known.yml`**: Successfully mapped artifacts (paths only, no metadata)
-- **`scan_output/unknown.yml`**: Unmapped artifacts needing patterns (simple list)
-
-**Known artifacts example:**
-```yaml
-summary:
-  total_artifacts: 6198
-  mapped: 6198
-  unmapped: 0
-  coverage: "100.0%"
-  unique_dependencies: 45
-
-dependencies:
-  cuda-cudart:
-    - /usr/local/cuda-12.9/include/cuda_runtime.h
-    - /usr/local/cuda-12.9/include/cuda.h
-
-  libc6:
-    - /usr/include/stdio.h
-    - -lpthread
-```
-
-**Unknown artifacts example:**
-```yaml
-summary:
-  count: 2
-  action_required: "Add patterns to YAML files in metadata/ for these artifacts"
-
-artifacts:
-  - /build/unknown/foo.h
-  - libmystery.so
-```
-
-**Key benefits of YAML output:**
-- Human-readable format
-- Smaller file sizes vs JSON
-- Easy to scan and parse
-- Aligned with metadata/*.yml format consistency
-
-### Workflow Integration
-
-1. **Initial scan**:
-   ```bash
-   python ../scan_build_artifacts.py
-   ```
-
-2. **Check unknown artifacts**:
-   ```bash
-   cat scan_output/unknown.yml
-   ```
-
-3. **Add patterns** to metadata/ files
-
-4. **Validate changes**:
-   ```bash
-   python ../scan_build_artifacts.py --validate
-   ```
-
-5. **Re-scan to verify**:
-   ```bash
-   python ../scan_build_artifacts.py
-   cat scan_output/unknown.yml  # Should be reduced/empty
-   ```
-
-6. **Review known artifacts**:
-   ```bash
-   cat scan_output/known.yml  # Check coverage improved
-   ```
 
 ## Schema Reference
 
@@ -728,31 +741,21 @@ See `_schema.yml` for full JSON schema definition.
 
 Key constraints:
 - `name`: Required, string, pattern `^[a-z0-9-+]+$`, min length 1
-- `version`: Required, string, min length 1
 - `description`: Required, string, min length 10
-- `patterns`: Optional, array of strings, unique items
-- `linker_flags`: Optional, array of strings matching `^-l`, unique items
-- `path_components`: Optional, array of strings, unique items
-- `aliases`: Optional, array of strings, unique items
-- `source`: Optional, enum (apt/pip/built-from-source/bundled/download/other)
+- `version`: Optional, string, min length 1
+- `basename_matches`: Optional, array of strings, unique items
+- `linker_flags_matches`: Optional, array of strings matching `^-l`, unique items
+- `directory_matches`: Optional, array of strings, unique items (supports multi-directory)
+- `source`: Optional, enum (submodule/container/fetched)
 
-At least one of `patterns`, `linker_flags`, or `path_components` required.
-
-## Migration from patterns.json
-
-If migrating from old `patterns.json` format, see `MIGRATION_GUIDE.md` for detailed instructions.
-
-Quick migration:
-```bash
-python migrate_to_dependencies.py
-```
+At least one of `basename_matches`, `linker_flags_matches`, or `directory_matches` required.
 
 ## Support
 
 For issues or questions:
 - Review `_schema.yml` for validation rules
 - See `_template.yml` for new dependency template
-- Check `MIGRATION_GUIDE.md` for migration from patterns.json
 - Run `python ../scan_build_artifacts.py --help` for CLI options
-- Check scanner source code: `scan_build_artifacts.py` (PatternMatcher class)
+- Check scanner source code: `scan_build_artifacts.py` (PatternMatcher class, lines 620-926)
 - Review output files: `scan_output/known.yml` and `scan_output/unknown.yml`
+- See main README: `../README.md` for architecture and workflow details

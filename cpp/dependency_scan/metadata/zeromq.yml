@@ -1,0 +1,8 @@
+name: libzmq5
+description: ZeroMQ lightweight messaging kernel library
+source: container
+path_components: []
+aliases: []
+basename_matches: []
+linker_flags_matches:
+- -lzmq

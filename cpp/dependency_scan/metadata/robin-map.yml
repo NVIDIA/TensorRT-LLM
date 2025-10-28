@@ -3,10 +3,7 @@ description: Fast hash map and hash set using robin hood hashing
 license: MIT
 copyright: Copyright (c) 2017 Thibaut Goetghebuer-Planchon
 homepage: https://github.com/Tessil/robin-map
-source: bundled
-aliases:
-- tsl-robin-map
-- tessil-robin-map
+source: submodule
 basename_matches:
 - robin_map.h
 - robin_hash.h
@@ -14,3 +11,4 @@ basename_matches:
 linker_flags_matches: []
 directory_matches:
 - robin_map
+- tsl

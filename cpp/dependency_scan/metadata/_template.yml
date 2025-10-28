@@ -3,13 +3,12 @@ description: Brief description of the dependency (minimum 10 characters)
 license: ''
 copyright: ''
 homepage: ''
-source: ''
-aliases:
-- example-dev
+source: ''  # submodule, container, or fetched
 basename_matches:
 - libexample.so
 - libexample.so.1
 linker_flags_matches:
 - -lexample
 directory_matches:
-- example_dir
+- example_dir          # Single component
+- 3rdparty/example     # Multi-directory (if bundled in vendor dir)

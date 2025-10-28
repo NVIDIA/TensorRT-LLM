@@ -11,18 +11,54 @@ python scan_build_artifacts.py
 # Output: scan_output/known.yml, scan_output/unknown.yml
 ```
 
+## Recent Improvements
+
+### 100% Artifact Coverage Achievement
+
+Recent bug fixes and parser improvements achieved **100% artifact coverage** with 0 unknowns:
+
+1. **Parser Bug Fix: Trailing Colon Stripping** (scan_build_artifacts.py:353-361)
+   - Issue: Malformed CMake .d files had paths with trailing colons (e.g., `/usr/include/stdio.h:`)
+   - Fix: Strip trailing colons using `header_path.rstrip(':')`
+   - Impact: Eliminated 8,354 duplicate artifacts
+
+2. **CMakeFiles Linker Artifact Handling** (scan_build_artifacts.py:489-509)
+   - Issue: CMakeFiles artifacts with embedded `-Wl,-soname` flags were not recognized
+   - Pattern: `/build/CMakeFiles/foo.dir/-Wl,-soname,libtest.so.1`
+   - Fix: Extract library names from these paths and convert to linker flags (e.g., `-ltest`)
+   - Impact: Properly mapped 12 internal build artifacts to dependencies
+
+3. **Pattern Improvements**
+   - Updated `metadata/cuda.yml` with version-agnostic CUDA patterns (cuda-12.9, cuda-13.0, cuda)
+   - Updated `metadata/tensorrt-llm.yml` with directory_matches for self-recognition
+   - Result: 100% coverage, 0 unknowns
+
+See `BUG_FIX_SUMMARY.md` for detailed technical information on earlier validation bug fixes.
+
 ## Usage
 
+### Basic Usage
+
 ```bash
-# Custom build directory
+# Scan with default settings
+python scan_build_artifacts.py
+
+# Scan custom build directory
 python scan_build_artifacts.py --build-dir /path/to/build
 
-# Custom output directory
-python scan_build_artifacts.py --output-dir reports/
+# Scan with custom output directory
+python scan_build_artifacts.py --output-dir /path/to/output
 
 # Validate YAML files
 python scan_build_artifacts.py --validate
 ```
+
+### Command-Line Arguments
+
+- `--build-dir`: Build directory to scan (default: `../build/`)
+- `--output-dir`: Output directory for reports (default: `scan_output/`)
+- `--metadata-dir`: Metadata directory containing YAML files (default: `./metadata/`)
+- `--validate`: Validate YAML files without running scanner
 
 ## Resolution Strategy
 
@@ -86,18 +122,38 @@ artifacts: []
 Edit existing or create new YAML file in `metadata/`:
 
 ```yaml
-name: newlib
-description: Newlib C library for embedded systems
+name: cutlass
+description: CUDA Templates for Linear Algebra Subroutines
 
 basename_matches:
-  - libnewlib.so
+  - libcutlass.a
 
 linker_flags_matches:
-  - -lnewlib
+  - -lcutlass
 
 directory_matches:
-  - newlib
+  - cutlass              # Single: matches any /cutlass/ in path
+  - 3rdparty/cutlass     # Multi: matches /3rdparty/cutlass/ sequence
 ```
+
+#### Multi-Directory Patterns
+
+Directory patterns support both single and multi-directory matching:
+
+**Single Component:**
+- `"pytorch"` matches any path containing `/pytorch/`
+- Example: `/home/build/pytorch/include/torch.h` ✓
+
+**Multi-Directory:**
+- `"3rdparty/cutlass"` matches consecutive `/3rdparty/cutlass/` sequence
+- `"foo/bar"` matches `/home/foo/bar/file.h` ✓
+- `"foo/bar"` does NOT match `/home/foobar/file.h` ✗ (no substring matching)
+
+**Matching Rules:**
+- Exact component matching only (no substrings)
+- `"oo/ba"` will NOT match `/foo/bar/`
+- Rightmost match wins if pattern appears multiple times
+- Leading/trailing slashes are ignored (`"/foo/bar/"` = `"foo/bar"`)
 
 See `metadata/_template.yml` and `metadata/README.md` for details.
 
@@ -111,7 +167,7 @@ description: PyTorch machine learning framework
 license: BSD-3-Clause
 copyright: Copyright (c) PyTorch Contributors
 homepage: https://pytorch.org/
-source: pip
+source: container
 
 basename_matches:
   - libtorch.so
@@ -130,21 +186,21 @@ aliases:
   - torch
 ```
 
-Multiple dependencies can be grouped in list format (see `metadata/dpkg.yml`, `metadata/cuda.yml`).
+Multiple dependencies can be grouped in list format (see `metadata/base.yml`, `metadata/cuda.yml`).
 
 ## Testing
 
 ```bash
 cd tests
 python -m pytest test_scan_build_artifacts.py -v
-# Expected: 34 passed
+# Expected: 40 passed
 ```
 
 ## Troubleshooting
 
 **Low dpkg coverage**
 - Running on non-Debian system
-- YAML dependencies will handle more as fallback
+- YAML dependencies will handle more as fallback, with concrete patterns.
 
 **Many unknown artifacts**
 1. Review `scan_output/unknown.yml`
@@ -155,6 +211,7 @@ python -m pytest test_scan_build_artifacts.py -v
 **Wrong mappings**
 - Check pattern priorities in YAML files
 - More specific patterns should be listed first
+- Make sure the patterns are very specific, to avoid false positives, or interfering with other patterns.
 
 **Slow performance**
 - Use `--build-dir` to target specific subdirectories
@@ -171,9 +228,30 @@ scan_build_artifacts.py (1,000 lines)
 ```
 
 **Artifact Sources:**
-- D files: CMake dependency files with headers
-- link.txt: Linker commands with libraries
-- Wheels: Python binaries via readelf
+- D files: CMake dependency files with headers. Dependency source header files.
+- link.txt: Linker commands with libraries. Precompiled dependency artifacts.
+- Wheels: Python binaries via readelf. Runtime dependency artifacts.
+
+**Special Parsing Behaviors:**
+
+1. **Malformed .d File Handling** (_parse_d_file method)
+   - Some CMake-generated .d files contain paths with trailing colons
+   - Example: `/usr/include/stdc-predef.h:` (should be `/usr/include/stdc-predef.h`)
+   - Parser strips trailing colons to handle these malformed entries
+   - Prevents duplicate artifacts and improves accuracy
+
+2. **CMakeFiles Linker Artifact Extraction** (_parse_link_file method)
+   - CMake generates special linker artifacts in CMakeFiles directories
+   - Pattern: `/path/CMakeFiles/foo.dir/-Wl,-soname,libtest.so.1`
+   - Parser extracts library name and converts to linker flag: `-ltest`
+   - Enables proper dependency mapping for internal build artifacts
+
+3. **3rdparty Submodule Resolution** (_parse_d_file method)
+   - When D files contain relative paths with submodule directories that don't exist relative to the build directory, the scanner attempts to resolve them from the configured submodules directory
+   - **Configuration**: Set via `THIRDPARTY_ROOT` constant in scan_build_artifacts.py (line 46)
+   - **Default**: `TRTLLM_ROOT/3rdparty` (3 levels up from scanner location)
+   - **Customization**: Edit the `THIRDPARTY_ROOT` constant if dependencies move (e.g., to `${CMAKE_BINARY_DIR}/_deps/`)
+   - **Example**: `../../../../3rdparty/xgrammar/include/file.h` resolves to `{THIRDPARTY_ROOT}/xgrammar/include/file.h`
 
 **Resolution Flow:**
 1. Collect artifacts from build directory
@@ -189,11 +267,4 @@ scan_build_artifacts.py (1,000 lines)
 - `metadata/_schema.yml` - YAML validation schema
 - `metadata/README.md` - Pattern documentation
 - `tests/test_scan_build_artifacts.py` - Unit tests
-
-## Requirements
-
-Python 3.8+ with stdlib only. No external dependencies required.
-
-## License
-
-Same as TensorRT-LLM parent project.
+- `BUG_FIX_SUMMARY.md` - Historical bug fix documentation

@@ -3,8 +3,7 @@ description: CUDA Templates for Linear Algebra Subroutines
 license: BSD-3-Clause
 copyright: Copyright (c) 2017-2024 NVIDIA Corporation
 homepage: https://github.com/NVIDIA/cutlass
-source: bundled
-aliases: []
+source: submodule
 basename_matches: []
 linker_flags_matches: []
 directory_matches:

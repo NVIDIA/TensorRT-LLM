@@ -1,8 +1,7 @@
 name: xgrammar
 description: XGrammar library for structured text generation
 homepage: https://github.com/mlc-ai/xgrammar
-source: bundled
-aliases: []
+source: submodule
 basename_matches: []
 linker_flags_matches: []
 directory_matches:
