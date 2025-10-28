@@ -1416,7 +1416,7 @@ def triton_kt_cache_update_and_bmm(
 
 
 ########################################################
-# Triton TopK kernel with optional interleave
+# Triton interleave kernel
 ########################################################
 
 
@@ -1474,6 +1474,55 @@ def interleave_kernel(
         # Store to output kv positions
         output_indices = head_idx * total_kv_tokens + kv_start + block_offsets
         tl.store(output_ptr + output_indices, values, mask=block_mask)
+
+
+def triton_interleave(input_tensor: torch.Tensor, kt_offsets: torch.Tensor,
+                      kv_lens: torch.Tensor, kv_cu_lens: torch.Tensor,
+                      total_kv_tokens: int, kt_page_size: int) -> torch.Tensor:
+    """
+    Interleave kt tokens to kv tokens by repeating each kt token kt_page_size times.
+
+    Args:
+        input_tensor: Input scores [num_kv_heads, sum(kt_lens)]
+        kt_offsets: KT offsets [batch_size + 1]
+        kv_lens: KV lengths [batch_size]
+        kv_cu_lens: KV cumulative lengths [batch_size + 1]
+        total_kv_tokens: Total number of KV tokens
+        kt_page_size: Page size for interleaving
+
+    Returns:
+        interleaved_tensor: Interleaved tensor [num_kv_heads, total_kv_tokens]
+    """
+    num_kv_heads = input_tensor.shape[0]
+    total_kt_tokens = input_tensor.shape[1]
+    batch_size = len(kv_lens)
+    device = input_tensor.device
+
+    # Create interleaved tensor
+    interleaved_tensor = torch.empty((num_kv_heads, total_kv_tokens),
+                                     dtype=input_tensor.dtype,
+                                     device=device)
+
+    # Launch interleave kernel
+    grid = (batch_size, num_kv_heads)
+    interleave_kernel[grid](input_tensor,
+                            interleaved_tensor,
+                            kt_offsets,
+                            kv_lens,
+                            kv_cu_lens,
+                            batch_size,
+                            num_kv_heads,
+                            kt_page_size,
+                            total_kt_tokens,
+                            total_kv_tokens,
+                            BLOCK_SIZE=1024)
+
+    return interleaved_tensor
+
+
+########################################################
+# Triton TopK kernel
+########################################################
 
 
 @triton.jit
@@ -1628,50 +1677,6 @@ def topk_kernel(
     tl.store(output_indices_ptr + output_base + result_offsets,
              selected_indices,
              mask=result_mask)
-
-
-def triton_interleave(input_tensor: torch.Tensor, kt_offsets: torch.Tensor,
-                      kv_lens: torch.Tensor, kv_cu_lens: torch.Tensor,
-                      total_kv_tokens: int, kt_page_size: int) -> torch.Tensor:
-    """
-    Interleave kt tokens to kv tokens by repeating each kt token kt_page_size times.
-
-    Args:
-        input_tensor: Input scores [num_kv_heads, sum(kt_lens)]
-        kt_offsets: KT offsets [batch_size + 1]
-        kv_lens: KV lengths [batch_size]
-        kv_cu_lens: KV cumulative lengths [batch_size + 1]
-        total_kv_tokens: Total number of KV tokens
-        kt_page_size: Page size for interleaving
-
-    Returns:
-        interleaved_tensor: Interleaved tensor [num_kv_heads, total_kv_tokens]
-    """
-    num_kv_heads = input_tensor.shape[0]
-    total_kt_tokens = input_tensor.shape[1]
-    batch_size = len(kv_lens)
-    device = input_tensor.device
-
-    # Create interleaved tensor
-    interleaved_tensor = torch.empty((num_kv_heads, total_kv_tokens),
-                                     dtype=input_tensor.dtype,
-                                     device=device)
-
-    # Launch interleave kernel
-    grid = (batch_size, num_kv_heads)
-    interleave_kernel[grid](input_tensor,
-                            interleaved_tensor,
-                            kt_offsets,
-                            kv_lens,
-                            kv_cu_lens,
-                            batch_size,
-                            num_kv_heads,
-                            kt_page_size,
-                            total_kt_tokens,
-                            total_kv_tokens,
-                            BLOCK_SIZE=1024)
-
-    return interleaved_tensor
 
 
 def triton_topk(input_tensor: torch.Tensor, input_offsets: torch.Tensor,
