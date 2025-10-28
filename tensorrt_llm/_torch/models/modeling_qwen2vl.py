@@ -919,7 +919,8 @@ class Qwen2VLModelBase(PreTrainedModel):
         self.model_config = model_config
         self.config = model_config.pretrained_config
 
-        assert model_config.attn_backend == 'TRTLLM', "Qwen2/2.5-VL only supports TRTLLM backend now"
+        if model_config.attn_backend != 'TRTLLM':
+            raise ValueError("Qwen2/2.5-VL only supports TRTLLM backend now")
         if not disabble_fuse_rope:
             self.init_mrope_embedding(model_config)
 
