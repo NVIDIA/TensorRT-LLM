@@ -33,8 +33,7 @@ from ...utils.node_utils import (
     extract_weight_node,
     filtered_nodes,
     identify_regions_between_residuals,
-    is_fake_quantized_linear_op,
-    is_linear_op,
+    is_any_lin_op,
     is_op,
     subgraph,
 )
@@ -256,7 +255,7 @@ def _process_ssm_sharding(
     """
     # Find next linear node to define subgraph boundary
     try:
-        out_proj_node, _ = bfs(entry_node, is_linear_op, include_root=False)
+        out_proj_node, _ = bfs(entry_node, is_any_lin_op, include_root=False)
     except RuntimeError:
         ad_logger.warning("Could not find next linear node after entry_node for Mamba sharding")
         return 0
@@ -450,7 +449,7 @@ def _process_column_sharding(
         )
 
     # get the subgraph of this module. Subgraph boundary is the next linear node.
-    next_lin_node, depth = bfs(linear_nodes[0], is_linear_op, include_root=False)
+    next_lin_node, _ = bfs(linear_nodes[0], is_any_lin_op, include_root=False)
     subgraph_nodes = subgraph(
         linear_nodes,
         [next_lin_node],
@@ -549,7 +548,7 @@ def detect_sharding_from_factory_config(
     num_simple_shards = 0
     num_row_col_shards = 0
 
-    for lin_node in filtered_nodes(gm.graph.nodes, [is_linear_op, is_fake_quantized_linear_op]):
+    for lin_node in filtered_nodes(gm.graph.nodes, is_any_lin_op):
         # use node's weight name to get the module name
         module_name = extract_weight_node(lin_node).target
 
@@ -735,7 +734,7 @@ def detect_ssm_shard(
         # We assume that one ssm node defines a subgraph corresponding
         # to a single Mamba layer.
         # Find defining previous (in_proj) and next (out_proj) linear nodes.
-        in_proj_node, _ = bfs(ssm_node, is_linear_op, attr_next="args", include_root=False)
+        in_proj_node, _ = bfs(ssm_node, is_any_lin_op, attr_next="args", include_root=False)
 
         num_ssm_shards += int(
             _process_ssm_sharding(gm, in_proj_node, sharding_config, rank, world_size)
@@ -832,7 +831,7 @@ def detect_column_row_shard(
         unaccounted_nodes: Set[Node] = set()
         current_node = n_start
         while current_node != n_end:
-            if is_linear_op(current_node) or is_fake_quantized_linear_op(current_node):
+            if is_any_lin_op(current_node):
                 nodes_linear[current_node.args[0]].append(current_node)
             elif is_op(current_node, shardable_attention_nodes):
                 attention_nodes.add(current_node)
@@ -948,6 +947,7 @@ def detect_column_row_shard(
                 rank=rank,
                 world_size=world_size,
                 dist_op="all_reduce",
+                min_local_shape=min_local_shape,
             )
         )
 
