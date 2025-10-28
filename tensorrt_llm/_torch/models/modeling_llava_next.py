@@ -84,9 +84,9 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
                                                           List[torch.Tensor]]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Define model specific variables here before shared logic
-        mm_tokens = torch.tensor([self.model_config.image_token_index
+        mm_tokens = torch.tensor([self.config.image_token_index
                                   ]).to(input_ids.device)
-        model_hidden_size = self.model_config.text_config.hidden_size
+        model_hidden_size = self.config.text_config.hidden_size
         start_len = end_len = 0  # for llava, need not append start/end token around each image token
         # End model specific variables
 
@@ -191,12 +191,12 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
             raise NotImplementedError(
                 "Only one mm_handle is supported for LlavaNext for now")
         hidden_size = mm_handles[0]['tensor_size'][1]
-        assert hidden_size == self.model_config.text_config.hidden_size, "Multimodal embedding hidden size must match model hidden size"
+        assert hidden_size == self.config.text_config.hidden_size, "Multimodal embedding hidden size must match model hidden size"
         input_ids = self.tokenizer(text_prompt,
                                    return_tensors="pt").input_ids[0]
 
-        vocab_size = self.model_config.text_config.vocab_size
-        image_token_index = self.model_config.image_token_index
+        vocab_size = self.config.text_config.vocab_size
+        image_token_index = self.config.image_token_index
 
         image_mask = input_ids == image_token_index
         image_positions = torch.where(image_mask)[0]

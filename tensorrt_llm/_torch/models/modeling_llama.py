@@ -5,8 +5,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 from PIL.Image import Image
 from torch import nn
-from transformers import (AutoProcessor, Llama4Config, Llama4VisionModel,
-                          LlamaConfig)
+from transformers import (AutoProcessor, AutoTokenizer, Llama4Config,
+                          Llama4VisionModel, LlamaConfig, PretrainedConfig)
 from transformers.modeling_utils import load_sharded_checkpoint
 from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
 
@@ -1150,7 +1150,7 @@ class Llama4InputProcessor(BaseMultimodalInputProcessor,
                 f"Missing required key in multimodal embedding: {e}")
 
         # Validate embedding dimensions
-        model_hidden_size = self.model_config.text_config.hidden_size
+        model_hidden_size = self.config.text_config.hidden_size
         for i, embedding in enumerate(mm_embeddings):
             if embedding.shape[-1] != model_hidden_size:
                 raise ValueError(

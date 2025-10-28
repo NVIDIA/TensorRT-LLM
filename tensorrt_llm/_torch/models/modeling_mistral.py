@@ -261,13 +261,13 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         images = inputs.get("multi_modal_data", {}).get("image")
-        do_rescale = self._processor.image_processor.do_rescale
+        do_rescale = self.processor.image_processor.do_rescale
         if images is not None and isinstance(images[0], torch.Tensor):
             # The default multimodal input loader will normalize images to [0, 1] when the requested
             # format is "pt" (pytorch tensors), but not for "pil" (PIL images).
             do_rescale = False
 
-        processed = self._processor(
+        processed = self.processor(
             text=inputs["prompt"],
             images=images,
             do_rescale=do_rescale,
@@ -310,18 +310,18 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
         return torch.tensor([
             # This is the `[IMG]` token id inserted into the prompt that should be replaced with image
             # embeddings.
-            self._processor.image_token_id,
+            self.processor.image_token_id,
             # This is the `[IMG_BREAK]` token id at the end of every "row".
-            self._processor.image_break_token_id,
+            self.processor.image_break_token_id,
             # This is the `[IMG_END]` token id to signify the end of an image.
-            self._processor.image_end_token_id,
+            self.processor.image_end_token_id,
         ])
 
     def get_mm_special_token_ids(self) -> torch.Tensor:
         """Get the IDs of special multimodal tokens (placeholders not included)."""
         return torch.tensor([
-            self._processor.image_break_token_id,
-            self._processor.image_end_token_id,
+            self.processor.image_break_token_id,
+            self.processor.image_end_token_id,
         ])
 
 

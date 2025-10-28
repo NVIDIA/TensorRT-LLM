@@ -110,7 +110,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
 
         self.tllm_multimodal_token_id = self.get_vocab_size() + 1
         # temporal patch size for video frames
-        self.temporal_patch_size = getattr(self._config.vision_config,
+        self.temporal_patch_size = getattr(self.config.vision_config,
                                            'temporal_patch_size', 1)
 
     @property
@@ -150,7 +150,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         The main difference between the two implementations is how temporal position IDs are calculated.
 
         Args:
-            config: The HF model configuration
+            config: The HF's PretrainedConfig model configuration
             input_ids: Indices of input sequence tokens in the vocabulary
             image_grid_thw: The temporal, height and width of feature shape of each image in LLM
             video_grid_thw: The temporal, height and width of feature shape of each video in LLM

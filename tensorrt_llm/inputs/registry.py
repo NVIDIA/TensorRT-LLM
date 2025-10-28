@@ -566,13 +566,13 @@ def create_input_processor(
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.models import get_model_architecture
 
-    model_config = None
+    config = None
 
     if checkpoint_format == "HF":
         try:
-            config = ModelConfig.from_pretrained(model_path_or_dir,
-                                                 trust_remote_code=True)
-            model_config = config.pretrained_config
+            model_config = ModelConfig.from_pretrained(model_path_or_dir,
+                                                       trust_remote_code=True)
+            config = model_config.pretrained_config
         except (ValueError, EnvironmentError) as e:
             logger.debug(
                 f"Unable to load HF config from {model_path_or_dir}: {e}. Falling back."
@@ -581,9 +581,9 @@ def create_input_processor(
         logger.debug(
             f"checkpoint_format={checkpoint_format}; skipping HF config load.")
 
-    if model_config is not None:
+    if config is not None:
         try:
-            model_cls, _ = get_model_architecture(model_config)
+            model_cls, _ = get_model_architecture(config)
             input_processor_cls = INPUT_PROCESSOR_REGISTRY._input_processors_cls_by_model_type \
                 .get(model_cls)
         except RuntimeError:  # unregistered model
@@ -591,7 +591,7 @@ def create_input_processor(
             input_processor_cls = None
         if input_processor_cls is not None:
             return input_processor_cls(model_path_or_dir,
-                                       model_config,
+                                       config,
                                        tokenizer,
                                        trust_remote_code=True)
 
