@@ -890,10 +890,15 @@ class PyExecutor:
 
                     # Stage 1: Async forward (all ranks) and decoding pass (last rank only)
                     if not self.dist.is_last_pp_rank:
-                        sample_state = self._forward_step_inter_pp(
-                            scheduled_batch)
+                        with torch.cuda.nvtx.range(
+                                f"_forward_step_inter_pp pp_rank {self.dist.pp_rank}"
+                        ):
+                            sample_state = self._forward_step_inter_pp(
+                                scheduled_batch)
                     else:
-                        with torch.cuda.nvtx.range("_forward_step_last_pp"):
+                        with torch.cuda.nvtx.range(
+                                f"_forward_step_last_pp pp_rank {self.dist.pp_rank}"
+                        ):
                             # init_disagg_gen_requests must be before engine forward, where the prev_seq_slot is updated.
                             if self.guided_decoder is not None and self.kv_cache_transceiver:
                                 self.guided_decoder.add_batch(scheduled_batch)
@@ -924,6 +929,7 @@ class PyExecutor:
 
                     self.micro_batches[microbatch_id] = batch_state
 
+                # sync sampler for previous microbatch to start new sample state comm chain.
                 prev_microbatch_id = (microbatch_id -
                                       1) % self.num_micro_batches
                 previous_batch = self.micro_batches[prev_microbatch_id]
@@ -931,10 +937,9 @@ class PyExecutor:
                     with nvtx_range("sync_previous_sampler_event"):
                         previous_batch.sample_state.sampler_event.synchronize()
 
-                # Stage 2: Communicate new tokens for previous batch between ranks
+                # Stage 2: Communicate sample state for previous batch between ranks
                 # send/recv chain: (pp_size - 1) -> 0 -> 1 -> ... -> (pp_size - 2)
-                # last rank: sync sampler for previous microbatch to start new tokens comm chain.
-                # other ranks: send/recv tokens for next microbatch to allow overlap
+                # intermediate ranks: send/recv sample state for next microbatch to allow overlap
                 offset = -1 if self.dist.is_last_pp_rank else 1
                 prev_microbatch_id = (microbatch_id +
                                       offset) % self.num_micro_batches
@@ -966,7 +971,7 @@ class PyExecutor:
                                     tag=prev_microbatch_id)
                     torch.cuda.nvtx.range_pop()
 
-                # Stage 3: Finalize previous batch that finished tokens communication
+                # Stage 3: Finalize previous batch that finished sample state communication
                 # In last pp rank, stage 2 and 3 process different previous batches
                 prev_microbatch_id = (microbatch_id +
                                       1) % self.num_micro_batches
