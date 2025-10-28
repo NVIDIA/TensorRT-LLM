@@ -241,7 +241,8 @@ def get_model_yaml_config(model_label: str,
             'config': {
                 'enable_chunked_prefill': True,
             }
-        }
+        },
+        # Llama-v3.3 models with xgrammar guided decoding
         {
             'patterns': ["llama_v3.3_70b_instruct_fp8-bench-float8-maxbs:512-maxnt:2048-input_output_len:500,2000-reqs:400-con:200-gpus:8"],
             'config': {
