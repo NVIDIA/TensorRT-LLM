@@ -290,7 +290,8 @@ class DeepseekV3WeightLoader:
                 if names[-1] == "kv_b_proj":
                     # TODO: remove weight_dequant after enabling fp8_bmm
                     dequant_kv_b_proj = self.model_config.quant_config.is_module_excluded_from_quantization(
-                        names[-1]) and self.model_config.quant_config.exclude_quantization is None
+                        names[-1]
+                    ) and self.model_config.quant_config.exclude_quantization is None
                     if dequant_kv_b_proj:
                         kv_b_proj, k_b_proj_trans = load_kv_b_proj_and_k_b_proj_trans_dequant(
                             name)

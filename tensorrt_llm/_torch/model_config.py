@@ -325,7 +325,8 @@ class ModelConfig(Generic[TConfig]):
         return quant_config, layer_quant_config
 
     @staticmethod
-    def load_angelslim_quant_config(quant_config_file, checkpoint_dir, moe_backend):
+    def load_angelslim_quant_config(quant_config_file, checkpoint_dir,
+                                    moe_backend):
         quant_config = QuantConfig()
         layer_quant_config = None
 
@@ -621,7 +622,7 @@ class ModelConfig(Generic[TConfig]):
             quant_config, layer_quant_config = cls.load_modelopt_quant_config(
                 quant_config_file, checkpoint_dir, moe_backend)
         elif quant_config_file := cached_file(checkpoint_dir,
-                                            'angelslim_hf_quant_config.json'):
+                                              'angelslim_hf_quant_config.json'):
             quant_config, layer_quant_config = cls.load_angelslim_quant_config(
                 quant_config_file, checkpoint_dir, moe_backend)
         # quantized ckpt in other formats
