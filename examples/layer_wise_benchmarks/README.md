@@ -15,7 +15,22 @@ pip install -e ../..
 **Step 3:** In the container, run benchmarks and generate profiles:
 
 ```bash
-NP=4 ./mpi_launch.sh ./run_single.sh DeepSeek-R1.yaml --test-case GEN
+# Run DeepSeek-R1
+NP=4 ./mpi_launch.sh ./run_single.sh config_ctx.yaml
+NP=4 ./mpi_launch.sh ./run_single.sh config_gen.yaml
+# Run DeepSeek-V3.2-Exp
+NP=4 ./mpi_launch.sh ./run_single.sh config_ctx.yaml --model deepseek-ai/DeepSeek-V3.2-Exp --moe-backend DEEPGEMM
+NP=4 ./mpi_launch.sh ./run_single.sh config_gen.yaml --model deepseek-ai/DeepSeek-V3.2-Exp --moe-backend DEEPGEMM
+# Run DeepSeek-V3.2-Exp with 32k context length
+NP=4 ./mpi_launch.sh ./run_single.sh config_ctx.yaml --model deepseek-ai/DeepSeek-V3.2-Exp --max-seq-len $((32768 + 1024 + 4)) --max-num-tokens $((32768 + 1024 + 4)) --moe-backend DEEPGEMM --batch-size 1 --seq-len-q 32769
+NP=4 ./mpi_launch.sh ./run_single.sh config_gen.yaml --model deepseek-ai/DeepSeek-V3.2-Exp --max-seq-len $((32768 + 1024 + 4)) --moe-backend DEEPGEMM --seq-len-kv-cache 32769
+# Run with attention TP
+NP=4 TRTLLM_ENABLE_PDL=1 ./mpi_launch.sh ./run_single.sh config_gen.yaml --no-enable-attention-dp --moe-backend TRTLLM
+# Run with MTP3
+NP=4 ./mpi_launch.sh ./run_single.sh config_gen.yaml --batch-size 32 --seq-len-q 4
+# Run 4 layers
+NP=4 ./mpi_launch.sh ./run_single.sh config_gen.yaml --layer-indices 5,6,7,8
+# TODO: DeepEP examples, --simulate-num-gpus examples
 ```
 
 ### Run with Slurm
@@ -41,7 +56,10 @@ It uses the image recorded in `../../jenkins/current_image_tags.properties`. The
 **Step 3:** Run benchmarks to generate profiles. Run the following command on the controller node, where `NODES` &le; the number of allocated nodes:
 
 ```bash
-SLURM_JOB_ID=$SLURM_JOB_ID NODES=2 NP=8 ./slurm_launch.sh ./run_single.sh DeepSeek-R1.yaml --test-case GEN
+# Run DeepSeek-R1
+SLURM_JOB_ID=$SLURM_JOB_ID NODES=2 NP=8 ./slurm_launch.sh ./run_single.sh config_gen.yaml
+# Run with attention TP
+SLURM_JOB_ID=$SLURM_JOB_ID NODES=2 NP=8 TRTLLM_ENABLE_PDL=1 ./slurm_launch.sh ./run_single.sh config_gen.yaml --no-enable-attention-dp --moe-backend TRTLLM
 ```
 
 ## Parse profiles

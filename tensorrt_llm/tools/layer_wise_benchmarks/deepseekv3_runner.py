@@ -238,7 +238,7 @@ class DeepSeekV3Runner:
         tensorrt_llm._torch.models.modeling_deepseekv3.DeepseekV3Gate = gate_cls_orig
 
     def create_run_pack(self,
-                        test_case: str,
+                        run_type: str,
                         batch_size: int,
                         seq_len_q: int,
                         seq_len_kv_cache: int,
@@ -259,11 +259,11 @@ class DeepSeekV3Runner:
             num_contexts={
                 "CTX": batch_size,
                 "GEN": 0
-            }[test_case],
+            }[run_type],
             prompt_lens=[{
                 "CTX": seq_len_q,
                 "GEN": seq_len_kv_cache
-            }[test_case]] * batch_size,
+            }[run_type]] * batch_size,
             max_num_tokens=batch_size * seq_len_q,
             kv_cache_manager=kv_cache_manager,
             kv_cache_params=KVCacheParams(

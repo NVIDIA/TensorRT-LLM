@@ -19,18 +19,49 @@ def comma_separated_ints(s):
 # Parse cmdline
 parser = argparse.ArgumentParser()
 parser.add_argument("config_path", type=str)
-parser.add_argument("--test-case",
-                    type=str,
-                    choices=["CTX", "GEN"],
-                    default="GEN")
+parser.add_argument("--model", type=str, help="Pretrained model name or path")
 parser.add_argument(
     "--layer-indices",
     type=comma_separated_ints,
-    default=[5],
-    help="Indices of layers to profile, should be a contiguous range.")
+    help="Comma separated indices of layers, should be a contiguous range")
+parser.add_argument("--run-type", type=str, choices=["CTX", "GEN"])
+parser.add_argument("--simulate-num-gpus", type=int)
+# KV cache related args
+parser.add_argument("--max-batch-size", type=int)
+parser.add_argument("--max-seq-len", type=int)
+group = parser.add_mutually_exclusive_group(required=False)
+group.add_argument("--enable-attention-dp",
+                   action="store_true",
+                   dest="enable_attention_dp")
+group.add_argument("--no-enable-attention-dp",
+                   action="store_false",
+                   dest="enable_attention_dp")
+parser.set_defaults(enable_attention_dp=None)
+# Model init args
+parser.add_argument("--max-num-tokens", type=int)
+parser.add_argument("--moe-backend", type=str)
+group = parser.add_mutually_exclusive_group(required=False)
+group.add_argument("--use-cuda-graph",
+                   action="store_true",
+                   dest="use_cuda_graph")
+group.add_argument("--no-use-cuda-graph",
+                   action="store_false",
+                   dest="use_cuda_graph")
+parser.set_defaults(use_cuda_graph=None)
+# Per iteration args
+parser.add_argument("--batch-size", type=int)
+parser.add_argument("--seq-len-q", type=int)
+parser.add_argument("--seq-len-kv-cache", type=int)
+parser.add_argument("--balance-method", type=str)
+parser.add_argument("--balance-ratio", type=float)
 args = parser.parse_args()
 with open(args.config_path) as f:
-    config = yaml.safe_load(f)[args.test_case]
+    config = yaml.safe_load(f)
+del args.config_path
+for k, v in vars(args).items():
+    if v is None:
+        setattr(args, k, config[k])
+print(args)
 
 # MPI args
 rank = mpi_rank()
@@ -39,17 +70,13 @@ local_rank = local_mpi_rank()
 torch.cuda.set_device(local_rank)
 
 # Create KV cache manager
-pretrained_model_name_or_path = config["pretrained_model_name_or_path"]
-max_batch_size = config["max_batch_size"]
-max_seq_len = config["max_seq_len"]
-enable_attention_dp = config["enable_attention_dp"]
 mapping = DeepSeekV3Runner.create_mapping(
-    enable_attention_dp=enable_attention_dp)
+    enable_attention_dp=args.enable_attention_dp)
 kv_cache_manager = DeepSeekV3Runner.create_kv_cache_manager(
-    pretrained_model_name_or_path,
+    args.model,
     mapping,
-    max_batch_size=max_batch_size,
-    max_seq_len=max_seq_len,
+    max_batch_size=args.max_batch_size,
+    max_seq_len=args.max_seq_len,
     layer_indices=args.layer_indices)
 attn_workspace = torch.empty((0, ), device="cuda", dtype=torch.int8)
 
@@ -58,31 +85,23 @@ AutoTuner.get().clear_cache()
 capture_stream = torch.cuda.Stream()
 
 # Create Runner
-max_num_tokens = config["max_num_tokens"]
-moe_backend = config["moe_backend"]
-use_cuda_graph = config["use_cuda_graph"]
-runner = DeepSeekV3Runner(pretrained_model_name_or_path,
+runner = DeepSeekV3Runner(args.model,
                           mapping,
-                          moe_backend=moe_backend,
+                          moe_backend=args.moe_backend,
                           layer_indices=args.layer_indices,
-                          max_seq_len=max_seq_len,
-                          max_num_tokens=max_num_tokens,
-                          use_cuda_graph=use_cuda_graph)
+                          max_seq_len=args.max_seq_len,
+                          max_num_tokens=args.max_num_tokens,
+                          use_cuda_graph=args.use_cuda_graph)
 
 # Warm up
-batch_size = config["batch_size"]
-seq_len_q = config["seq_len_q"]
-seq_len_kv_cache = config["seq_len_kv_cache"]
-balance_method = BalanceMethod[config["balance_method"]]
-balance_ratio = config["balance_ratio"]
-run_pack = runner.create_run_pack(args.test_case,
-                                  batch_size=batch_size,
-                                  seq_len_q=seq_len_q,
-                                  seq_len_kv_cache=seq_len_kv_cache,
+run_pack = runner.create_run_pack(args.run_type,
+                                  batch_size=args.batch_size,
+                                  seq_len_q=args.seq_len_q,
+                                  seq_len_kv_cache=args.seq_len_kv_cache,
                                   kv_cache_manager=kv_cache_manager,
                                   attn_workspace=attn_workspace)
-runner.replace_routing_method(balance_method=balance_method,
-                              balance_ratio=balance_ratio)
+runner.replace_routing_method(balance_method=BalanceMethod[args.balance_method],
+                              balance_ratio=args.balance_ratio)
 capture_stream.wait_stream(torch.cuda.current_stream())
 with torch.cuda.stream(capture_stream):
     run_pack()
@@ -93,7 +112,7 @@ torch.cuda.synchronize()
 
 # Profile: capture graph and replay it
 torch.cuda.cudart().cudaProfilerStart()
-if use_cuda_graph:
+if args.use_cuda_graph:
     with with_multi_stream(True):
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g,
@@ -109,8 +128,9 @@ events = [
 ]
 for i in range(warmup_times + run_times):
     events[i].record()
-    with nvtx.annotate(f"b={batch_size} s={seq_len_q} EP{world_size}"):
-        if use_cuda_graph:
+    with nvtx.annotate(
+            f"b={args.batch_size} s={args.seq_len_q} EP{world_size}"):
+        if args.use_cuda_graph:
             g.replay()
         else:
             run_pack()

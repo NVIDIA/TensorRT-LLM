@@ -14,16 +14,21 @@ if [ "$RANK" -eq 0 ]; then
 fi
 
 PROFILE=${PROFILE:-1}
+GPU_METRICS=${GPU_METRICS:-0}
 if [ "$PROFILE" -eq 1 ]; then
     PROFILE_FOLDER=profiles/run_single
     mkdir -p ${PROFILE_FOLDER}
-    PROFILE_CMD="nsys profile \
-        -t cuda,nvtx -s none \
-        --cpuctxsw none --cuda-event-trace false \
-        --cuda-graph-trace node \
-        -c cudaProfilerApi --capture-range-end stop \
-        -o ${PROFILE_FOLDER}/run_single_ep${WORLD_SIZE}_rank${RANK}.nsys-rep \
+    PROFILE_CMD="nsys profile
+        -t cuda,nvtx -s none
+        --cpuctxsw none --cuda-event-trace false
+        --cuda-graph-trace node
+        -c cudaProfilerApi --capture-range-end stop
+        -o ${PROFILE_FOLDER}/run_single_ep${WORLD_SIZE}_rank${RANK}.nsys-rep
         --force-overwrite true"
+    if [ "$GPU_METRICS" -eq 1 ]; then
+        PROFILE_CMD+=" --gpu-metrics-devices $LOCAL_RANK
+            --gpu-metrics-frequency 10000"
+    fi
 else
     PROFILE_CMD=
 fi
