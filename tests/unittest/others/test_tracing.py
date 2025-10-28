@@ -1,10 +1,13 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import logging
 import os
 import tempfile
 import threading
 from collections.abc import Iterable
 from concurrent import futures
-from typing import Callable, Generator, Literal
+from typing import Callable, Dict, Generator, Literal
 
 import openai
 import pytest
@@ -40,7 +43,8 @@ class FakeTraceService(TraceServiceServicer):
         return ExportTraceServiceResponse()
 
 
-@pytest.fixture(scope="function")
+# The trace service binds a free port at runtime and exposes its address via the fixture.
+@pytest.fixture(scope="module")
 def trace_service() -> Generator[FakeTraceService, None, None]:
     """Fixture to set up a fake gRPC trace service"""
     executor = futures.ThreadPoolExecutor(max_workers=1)
@@ -48,7 +52,9 @@ def trace_service() -> Generator[FakeTraceService, None, None]:
     server = grpc.server(executor)
     service = FakeTraceService()
     add_TraceServiceServicer_to_server(service, server)
-    server.add_insecure_port(FAKE_TRACE_SERVER_ADDRESS)
+    # Bind to an ephemeral port to avoid conflicts with local collectors.
+    port = server.add_insecure_port("localhost:0")
+    service.address = f"localhost:{port}"
     server.start()
 
     yield service
@@ -97,14 +103,14 @@ def temp_extra_llm_api_options_file(request):
 
 @pytest.fixture(scope="module")
 def server(model_name: str, backend: str, temp_extra_llm_api_options_file: str,
-           num_postprocess_workers: int):
+           num_postprocess_workers: int, trace_service: FakeTraceService):
     model_path = get_model_path(model_name)
     args = ["--backend", f"{backend}"]
     if backend == "trt":
         args.extend(["--max_beam_width", "4"])
     args.extend(["--extra_llm_api_options", temp_extra_llm_api_options_file])
     args.extend(["--num_postprocess_workers", f"{num_postprocess_workers}"])
-    args.extend(["--otlp_traces_endpoint", FAKE_TRACE_SERVER_ADDRESS])
+    args.extend(["--otlp_traces_endpoint", trace_service.address])
 
     os.environ[OTEL_EXPORTER_OTLP_TRACES_INSECURE] = "true"
 
@@ -117,7 +123,7 @@ FieldName = Literal["bool_value", "string_value", "int_value", "double_value",
 
 
 def decode_value(value: AnyValue):
-    field_decoders: dict[FieldName, Callable] = {
+    field_decoders: Dict[FieldName, Callable[[AnyValue], object]] = {
         "bool_value": (lambda v: v.bool_value),
         "string_value": (lambda v: v.string_value),
         "int_value": (lambda v: v.int_value),
