@@ -286,7 +286,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     # Max chunk size for two-level chunking:
     # 1. Request-level: Pack multiple small requests into one chunk (up to indexer_max_chunk_size)
     # 2. Intra-request: Split large requests into Q-blocks when seq_len > max_chunk_size
-    indexer_max_chunk_size = 128000  # Tunable
+    indexer_max_chunk_size: int
 
     def __init__(self, *args, **kwargs):
         self.num_sms = tensorrt_llm.deep_gemm.get_num_sms()
@@ -1332,29 +1332,6 @@ class DSACacheManager(KVCacheManager):
             for layer_idx in range(self.num_local_layers)
         ]
 
-    def add_dummy_requests(
-        self,
-        request_ids: List[int],
-        token_nums: Optional[List[int]] = None,
-        is_gen: bool = False,
-        prepare_resource: bool = True,
-        max_num_draft_tokens: int = 0,
-        use_mrope: bool = False,
-        max_beam_width: int = 1,
-        num_extra_decoding_steps: int = 0,
-    ):
-        requests = super().add_dummy_requests(
-            request_ids=request_ids,
-            token_nums=token_nums,
-            is_gen=is_gen,
-            prepare_resource=prepare_resource,
-            max_num_draft_tokens=max_num_draft_tokens,
-            use_mrope=use_mrope,
-            max_beam_width=max_beam_width,
-            num_extra_decoding_steps=num_extra_decoding_steps,
-        )
-        return requests
-
     def get_indexer_k_cache_buffers(self, layer_idx: int):
         """Get indexer k cache buffer from a specific layer pool."""
         block_size = self.tokens_per_block
@@ -1362,15 +1339,6 @@ class DSACacheManager(KVCacheManager):
         layer_offset = self.layer_offsets[layer_idx]
         return self.indexer_k_cache_pool_per_layer[layer_offset].view(
             self.num_blocks, block_size, 1, per_token_size)
-
-    def prepare_resources(self, scheduled_batch):
-        """
-        Prepare resources for both low rank cache and indexer K cache.
-        """
-        super().prepare_resources(scheduled_batch)
-
-    def free_resources(self, request):
-        super().free_resources(request)
 
     @staticmethod
     def get_cache_size_per_token(model_config: ModelConfig, mapping: Mapping,

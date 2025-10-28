@@ -826,7 +826,7 @@ class KVCacheManager(BaseResourceManager):
 
     def get_indexer_k_cache_pool_data(self, layer_idx: int) -> torch.Tensor:
         result = self.impl.get_indexer_k_cache_pool_data(layer_idx)
-        return result.reshape(result.shape[0], -1)
+        return result.view(result.shape[0], -1)
 
     def get_unique_primary_pool(self) -> torch.Tensor:
         return self.impl.get_unique_primary_pool()
