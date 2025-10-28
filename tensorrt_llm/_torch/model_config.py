@@ -426,8 +426,10 @@ class ModelConfig(Generic[TConfig]):
                     trust_remote_code=trust_remote_code,
                     **kwargs,
                 )
-                if pretrained_config.architectures[0] == "DeepseekV32ForCausalLM":
-                    sparse_attention_config = kwargs.get('sparse_attention_config')
+                if pretrained_config.architectures[
+                        0] == "DeepseekV32ForCausalLM":
+                    sparse_attention_config = kwargs.get(
+                        'sparse_attention_config')
                     if sparse_attention_config:
                         index_n_heads = sparse_attention_config.index_n_heads or pretrained_config.index_n_heads
                         index_head_dim = sparse_attention_config.index_head_dim or pretrained_config.index_head_dim
