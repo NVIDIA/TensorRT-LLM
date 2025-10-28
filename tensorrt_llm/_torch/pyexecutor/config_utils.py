@@ -39,13 +39,13 @@ def load_pretrained_config(model_name_or_path: str,
                            trust_remote_code: bool = False,
                            **kwargs) -> transformers.PretrainedConfig:
     config_dict, _ = transformers.PretrainedConfig.get_config_dict(
-        model_name_or_path, trust_remote_code=trust_remote_code, **kwargs)
+        model_name_or_path, **kwargs)
     model_type = config_dict.get("model_type")
     if model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[model_type]
-        model_config = config_class.from_pretrained(
-            model_name_or_path, trust_remote_code=trust_remote_code, **kwargs)
+        model_config = config_class.from_pretrained(model_name_or_path,
+                                                    **kwargs)
     else:
         model_config = transformers.AutoConfig.from_pretrained(
-            model_name_or_path, trust_remote_code=trust_remote_code, **kwargs)
+            model_name_or_path, trust_remote_code=trust_remote_code)
     return model_config
