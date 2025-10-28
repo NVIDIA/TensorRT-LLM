@@ -190,6 +190,12 @@ def main():
         default=1,
         help="The max batch size to use for the model",
     )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default="torch-opt",
+        help="The backend to use for compilation (default: torch-opt)",
+    )
     args = parser.parse_args()
     DiffusionPipeline._execution_device = property(execution_device_getter, execution_device_setter)
     pipe = DiffusionPipeline.from_pretrained(args.model, torch_dtype=torch.bfloat16)
@@ -217,7 +223,7 @@ def main():
             gm, quant_state_dict, strict_missing=False, strict_unexpected=False, clone=False
         )
 
-    compiler_cls = CompileBackendRegistry.get("torch-opt")
+    compiler_cls = CompileBackendRegistry.get(args.backend)
     gm = compiler_cls(gm, args=(), max_batch_size=args.max_batch_size, kwargs=flux_kwargs).compile()
 
     del model
