@@ -1643,8 +1643,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             benchmark_cmd += [f"--pp={self._config.pp_size}"]
         if self._config.streaming == "streaming":
             benchmark_cmd += [f"--streaming"]
-        #use default yaml config
-        if self._config.backend == "pytorch":
+       
+        #Add extra-llm-api-config.yml for pytorch and tensorrt backend
+        if self._config.backend == "pytorch" or self._config.backend == "":
             import yaml
             pytorch_config_path = os.path.join(engine_dir,
                                                "extra-llm-api-config.yml")
