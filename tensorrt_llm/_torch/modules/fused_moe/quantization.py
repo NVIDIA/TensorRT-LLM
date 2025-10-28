@@ -1390,9 +1390,11 @@ class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
         pad_size_inter = module.intermediate_size_per_partition - w3_weight_shard.shape[
             0]
         if w3_weight_shard.ndim == 2:
+            # [intermediate_size, hidden_size]
             pad_size_hidden = module.hidden_size // 2 - w3_weight_shard.shape[1]
             pad_shape = (0, pad_size_hidden, 0, pad_size_inter)
         elif w3_weight_shard.ndim == 1:
+            # [intermediate_size]
             pad_shape = (0, pad_size_inter)
         else:
             raise NotImplementedError(
@@ -1403,6 +1405,10 @@ class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
         w3_weight_shard = torch.nn.functional.pad(w3_weight_shard, pad_shape)
 
         w31_weight_shard = torch.cat([w3_weight_shard, w1_weight_shard], dim=0)
+
+        if w3_weight_shard.ndim == 2:
+            w31_weight_shard = torch.ops.trtllm.fp4_interleave_for_Hopper_mixed_gemm(
+                w31_weight_shard)
 
         dst_w3_w1_weight.copy_(w31_weight_shard.view(dst_w3_w1_weight.dtype),
                                non_blocking=True)
@@ -1433,6 +1439,11 @@ class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
                 f"Invalid shape of w2_weight_shard {w2_weight_shard.shape}")
 
         w2_weight_shard = torch.nn.functional.pad(w2_weight_shard, pad_shape)
+
+        if w2_weight_shard.ndim == 2:
+            w2_weight_shard = torch.ops.trtllm.fp4_interleave_for_Hopper_mixed_gemm(
+                w2_weight_shard)
+
         dst_w2_weight.copy_(w2_weight_shard.view(dst_w2_weight.dtype),
                             non_blocking=True)
 
