@@ -721,6 +721,7 @@ class SamplingConfig:
     min_length: Union[int, torch.Tensor] = field(default=1)
     presence_penalty: Union[float, torch.Tensor] = field(default=0.0)
     frequency_penalty: Union[float, torch.Tensor] = field(default=0.0)
+    prompt_ignore_length: Union[int, torch.Tensor] = field(default=0)
     use_beam_hyps: bool = field(default=True)
 
     # None here means user didn't set it, and dynamicDecodeOp.cpp take optional value
@@ -1474,6 +1475,16 @@ class GenerationSession(object):
                                                 scfg.frequency_penalty,
                                                 dtype=torch.float32)
 
+        if isinstance(scfg.prompt_ignore_length, torch.Tensor):
+            assert scfg.prompt_ignore_length.dtype == torch.int32, f"scfg.prompt_ignore_length.dtype ({scfg.prompt_ignore_length.dtype}) must be torch.int32"
+            assert scfg.prompt_ignore_length.shape[
+                0] == batch_size, f"scfg.prompt_ignore_length.shape[0] ({scfg.prompt_ignore_length.shape[0]}) must equal to batch_size ({batch_size})"
+            self.prompt_ignore_length = scfg.prompt_ignore_length
+        else:
+            self.prompt_ignore_length = torch.full([batch_size],
+                                                   scfg.prompt_ignore_length,
+                                                   dtype=torch.int32)
+
         if isinstance(scfg.min_length, torch.Tensor):
             assert scfg.min_length.dtype == torch.int32, f"scfg.min_length.dtype ({scfg.min_length.dtype}) must be torch.int32"
             assert scfg.min_length.shape[
@@ -1543,6 +1554,7 @@ class GenerationSession(object):
                 self.repetition_penalty,
                 self.presence_penalty,
                 self.frequency_penalty,
+                self.prompt_ignore_length,
                 self.min_length,
                 self.host_length_penalty,
                 self.host_early_stopping,

@@ -434,6 +434,12 @@ size_t getEnvMemSizeForKVCacheTransferBuffer()
     return memSizeForKVCacheTransferBuffer;
 }
 
+bool getEnvKVCacheTransferAllBlocksForWindow()
+{
+    static bool const allBlocksForWindow = getBoolEnv("TRTLLM_KVCACHE_TRANSFER_ALL_BLOCKS_FOR_WINDOW");
+    return allBlocksForWindow;
+}
+
 uint16_t getEnvNixlPort()
 {
     static uint16_t const nixlPort = getUInt64Env("TRTLLM_NIXL_PORT").value_or(0);
@@ -448,6 +454,45 @@ bool getEnvDisaggBenchmarkGenOnly()
 bool getEnvDisableChunkedAttentionInGenPhase()
 {
     return getBoolEnv("TRTLLM_DISABLE_CHUNKED_ATTENTION_IN_GEN_PHASE");
+}
+
+bool getEnvMoeA2AOneBlockPerToken()
+{
+    // Default true; return false only if env set to "0"
+    static std::optional<int32_t> const val = getIntEnv("TLLM_MOE_A2A_ONE_BLOCK_PER_TOKEN");
+    if (!val.has_value())
+    {
+        return true;
+    }
+    return val.value() != 0;
+}
+
+static int sanitizeBlockSize(std::optional<int32_t> const& val)
+{
+    // Default 256 when not set or invalid
+    int block = val.value_or(256);
+    // Clamp to sane CUDA bounds and warp multiples
+    if (block <= 0)
+        block = 256;
+    if (block > 1024)
+        block = 1024;
+    // Round to nearest multiple of 32 (warp size)
+    block = (block + 31) / 32 * 32;
+    if (block == 0)
+        block = 256;
+    return block;
+}
+
+int getEnvMoeA2ADispatchBlockSize()
+{
+    static int const kBlock = sanitizeBlockSize(getIntEnv("TLLM_MOE_A2A_DISPATCH_BLOCK_SIZE"));
+    return kBlock;
+}
+
+int getEnvMoeA2ACombineBlockSize()
+{
+    static int const kBlock = sanitizeBlockSize(getIntEnv("TLLM_MOE_A2A_COMBINE_BLOCK_SIZE"));
+    return kBlock;
 }
 
 } // namespace tensorrt_llm::common

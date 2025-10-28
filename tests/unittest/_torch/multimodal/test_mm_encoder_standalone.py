@@ -177,7 +177,7 @@ def test_multi_request_batch_chat(model_key, multimodal_model_config):
             f"Skipping test for {model_key} - only testing llava-v1.6-mistral-7b-hf for now"
         )
 
-    encoder_model_dir = multimodal_model_config['hf_model_dir']
+    encoder_model_dir = multimodal_model_config['model_dir']
 
     max_tokens = 64
     free_gpu_memory_fraction = 0.6

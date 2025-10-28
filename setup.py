@@ -50,8 +50,7 @@ def parse_requirements(filename: os.PathLike):
 
 def sanity_check():
     tensorrt_llm_path = Path(__file__).resolve().parent / "tensorrt_llm"
-    if not ((tensorrt_llm_path / "bindings").exists() or
-            (tensorrt_llm_path / "bindings.pyi").exists()):
+    if not (tensorrt_llm_path / "bindings").exists():
         raise ImportError(
             'The `bindings` module does not exist. Please check the package integrity. '
             'If you are attempting to use the pip development mode (editable installation), '
@@ -121,7 +120,8 @@ else:
         'libs/nvshmem/nvshmem_transport_ibgda.so.103', 'bindings.*.so',
         'deep_ep/LICENSE', 'deep_ep_cpp_tllm.*.so', "include/**/*",
         'deep_gemm/LICENSE', 'deep_gemm/include/**/*',
-        'deep_gemm_cpp_tllm.*.so', 'scripts/install_tensorrt.sh'
+        'deep_gemm_cpp_tllm.*.so', 'scripts/install_tensorrt.sh',
+        'flash_mla/LICENSE', 'flash_mla_cpp_tllm.*.so'
     ]
 
 package_data += [
@@ -233,13 +233,19 @@ if use_precompiled:
 
 sanity_check()
 
+with open("README.md", "r", encoding="utf-8") as fh:
+    long_description = fh.read()
+
 # https://setuptools.pypa.io/en/latest/references/keywords.html
 setup(
     name='tensorrt_llm',
     version=get_version(),
-    description='TensorRT-LLM: A TensorRT Toolbox for Large Language Models',
-    long_description=
-    'TensorRT-LLM: A TensorRT Toolbox for Large Language Models',
+    description=
+    ('TensorRT LLM provides users with an easy-to-use Python API to define Large Language Models (LLMs) and supports '
+     'state-of-the-art optimizations to perform inference efficiently on NVIDIA GPUs.'
+     ),
+    long_description=long_description,
+    long_description_content_type="text/markdown",
     author="NVIDIA Corporation",
     url="https://github.com/NVIDIA/TensorRT-LLM",
     download_url="https://github.com/NVIDIA/TensorRT-LLM/tags",
