@@ -478,17 +478,6 @@ protected:
 
     void TearDown() override {}
 
-    int getEnvMpiDebugRank()
-    {
-        // Look-up env variable TLLM_DEBUG_RANK.
-        char const* const env = std::getenv("TLLM_DEBUG_RANK");
-        if (env == nullptr)
-        {
-            return -2;  // -1 means all ranks, -2 means no debug rank.
-        }
-        return std::stoi(env);
-    }
-
     void setUpCommunicator(int contextTp, int contextPp, int contextCp, int genTp, int genPp, int genCp,
         bool isMLA = false, bool contextDP = false, bool generationDP = false)
     {
@@ -968,7 +957,8 @@ protected:
             {
                 if (blockIdInWindow >= startBlockId)
                 {
-                    verifyBlockData(*it, initial, globalBlockIdsForWindow.empty() ? blockIdx : globalBlockIdsForWindow[blockIdx], windowSize);
+                    verifyBlockData(*it, initial,
+                        globalBlockIdsForWindow.empty() ? blockIdx : globalBlockIdsForWindow[blockIdx], windowSize);
                 }
                 blockIdx++;
                 blockIdInWindow++;
@@ -978,11 +968,6 @@ protected:
 
     void fillBlockData(tensorrt_llm::runtime::ITensor& blockData, int blockId, size_t initial, int windowSize = 0)
     {
-        static const int TARGET_RANK = getEnvMpiDebugRank(); // -1 means all ranks.
-        if (TARGET_RANK == -1 || tensorrt_llm::mpi::MpiComm::world().getRank() == TARGET_RANK)
-        {
-            TLLM_LOG_INFO("fillBlockData called for rank %d mRankInInstance %d blockId %d windowSize %d", mRank, mRankInInstance, blockId, windowSize);
-        }
         auto const& blockManager = mManager->getBlockManager();
         auto const onlyWindowSize = windowSize == 0 ? blockManager.getPoolWindowSize(0) : windowSize;
         auto const& bufferManager = blockManager.getBufferManager(onlyWindowSize);
@@ -1032,19 +1017,6 @@ protected:
                                 using ValueType = decltype(generateValue);
                                 auto* dataPtr = static_cast<ValueType*>(hostTensor->data(keyIndex));
                                 *dataPtr = generateValue;
-                                if (TARGET_RANK == -1 || tensorrt_llm::mpi::MpiComm::world().getRank() == TARGET_RANK)
-                                {
-                                    TLLM_LOG_INFO(tensorrt_llm::mpi::MpiComm::world().getRank(),
-                                        "[RANK %d] [fillBlockData::key] blockId=%d, layer=%d->%d, head=%d->%d, token=%d->%d, hidden=%d, "
-                                        "keyIdx=%zu, set_value=%s, dataType=%d",
-                                        tensorrt_llm::mpi::MpiComm::world().getRank(),
-                                        blockId, layerId, layerId + startLayerId,
-                                        headId, headId + startHeadId,
-                                        tokenId, tokenId + startTokenId,
-                                        hiddenId, keyIndex,
-                                        std::to_string(static_cast<double>(*dataPtr)).c_str(),
-                                        static_cast<int>(blockData.getDataType()));
-                                }
                             },
                             generateExpectedValue(initial, windowSize, tokenId + startTokenId, layerId + startLayerId,
                                 headId + startHeadId, hiddenId, true, blockData.getDataType()));
@@ -1069,16 +1041,9 @@ protected:
         bufferManager.getStream().synchronize();
     }
 
-    void verifyBlockData(
-        tensorrt_llm::runtime::ITensor& blockData, size_t initial, int blockId, int windowSize = 0)
+    void verifyBlockData(tensorrt_llm::runtime::ITensor& blockData, size_t initial, int blockId, int windowSize = 0)
     {
         auto const& blockManager = mManager->getBlockManager();
-
-        static const int TARGET_RANK = getEnvMpiDebugRank(); // -1 means all ranks.
-        if (TARGET_RANK == -1 || tensorrt_llm::mpi::MpiComm::world().getRank() == TARGET_RANK)
-        {
-            TLLM_LOG_INFO("verifyBlockData called for rank %d mRankInInstance %d blockId %d", mRank, mRankInInstance, blockId);
-        }
 
         auto const onlyWindowSize = windowSize == 0 ? blockManager.getPoolWindowSize(0) : windowSize;
         auto const& bufferManager = blockManager.getBufferManager(onlyWindowSize);
@@ -1132,24 +1097,6 @@ protected:
                                 using ValueType = decltype(generateValue);
                                 auto* dataPtr = static_cast<ValueType*>(hostTensor->data(keyIndex));
                                 EXPECT_EQ(*dataPtr, generateValue);
-                                if (TARGET_RANK == -1 || tensorrt_llm::mpi::MpiComm::world().getRank() == TARGET_RANK)
-                                {
-                                    std::string result = "";
-                                    if (*dataPtr != generateValue) {
-                                        result = "FAILED!";
-                                    }
-                                    TLLM_LOG_INFO(tensorrt_llm::mpi::MpiComm::world().getRank(),
-                                        "[RANK %d] [verifyBlockData::value] blockId=%d, layer=%d->%d, head=%d->%d, token=%d->%d, hidden=%d, "
-                                        "valueIdx=%zu, actual_value=%s, dataType=%d %s",
-                                        tensorrt_llm::mpi::MpiComm::world().getRank(),
-                                        blockId, layerId, layerId + startLayerId,
-                                        headId, headId + startHeadId,
-                                        tokenId, tokenId + startTokenId,
-                                        hiddenId, valueIndex,
-                                        std::to_string(static_cast<double>(*dataPtr)).c_str(),
-                                        static_cast<int>(blockData.getDataType()),
-                                        result.c_str());
-                                }
                             },
                             generateExpectedValue(initial, windowSize, tokenId + startTokenId, layerId + startLayerId,
                                 headId + startHeadId, hiddenId, true, blockData.getDataType()));
@@ -1175,12 +1122,6 @@ protected:
     std::variant<double, float, int16_t, int8_t> generateExpectedValue(size_t initial, int windowSize, int tokenId,
         int layerId, int headId, int hiddenId, bool key, nvinfer1::DataType dataType)
     {
-        static const int TARGET_RANK = getEnvMpiDebugRank(); // -1 means all ranks.
-        if (TARGET_RANK == -1 || tensorrt_llm::mpi::MpiComm::world().getRank() == TARGET_RANK)
-        {
-            TLLM_LOG_INFO("generateExpectedValue called for rank %d, initial=%zu, windowSize=%d, tokenId=%d, layerId=%d, headId=%d, hiddenId=%d, key=%d, dataType=%d",
-                tensorrt_llm::mpi::MpiComm::world().getRank(), initial, windowSize, tokenId, layerId, headId, hiddenId, key, static_cast<int>(dataType));
-        }
         size_t seed = 0;
         std::size_t hashValue = std::hash<size_t>{}(initial);
         std::hash<int> hasher{};
