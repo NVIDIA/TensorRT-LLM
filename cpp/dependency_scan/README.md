@@ -1,6 +1,7 @@
 # CPP Dependency Scanner
 
 Scans TensorRT-LLM build artifacts (headers, libraries, binaries) and maps them to source dependencies.
+A build artifact is any header file used in the build, and any linked static/dynamic library.
 
 ## Quick Start
 
@@ -11,29 +12,35 @@ python scan_build_artifacts.py
 # Output: scan_output/known.yml, scan_output/unknown.yml
 ```
 
-## Recent Improvements
+## Goals and Non-Goals
 
-### 100% Artifact Coverage Achievement
+### Goals
 
-Recent bug fixes and parser improvements achieved **100% artifact coverage** with 0 unknowns:
+This scanner is designed to:
 
-1. **Parser Bug Fix: Trailing Colon Stripping** (scan_build_artifacts.py:353-361)
-   - Issue: Malformed CMake .d files had paths with trailing colons (e.g., `/usr/include/stdio.h:`)
-   - Fix: Strip trailing colons using `header_path.rstrip(':')`
-   - Impact: Eliminated 8,354 duplicate artifacts
+1. **Map Build Artifacts to Dependencies**
+   - Identify which source dependencies (container-origin, fetched, third-party) are used in the TensorRT-LLM C++ build
+   - Use tools + developer-provided pattern data to map build artifacts to canonical packages.
 
-2. **CMakeFiles Linker Artifact Handling** (scan_build_artifacts.py:489-509)
-   - Issue: CMakeFiles artifacts with embedded `-Wl,-soname` flags were not recognized
-   - Pattern: `/build/CMakeFiles/foo.dir/-Wl,-soname,libtest.so.1`
-   - Fix: Extract library names from these paths and convert to linker flags (e.g., `-ltest`)
-   - Impact: Properly mapped 12 internal build artifacts to dependencies
+2. **Achieve Complete Coverage**
+   - Goal: 100% of build artifacts mapped to known dependencies.
+   - Track unmapped artifacts in `unknown.yml` for iterative pattern refinement
 
-3. **Pattern Improvements**
-   - Updated `metadata/cuda.yml` with version-agnostic CUDA patterns (cuda-12.9, cuda-13.0, cuda)
-   - Updated `metadata/tensorrt-llm.yml` with directory_matches for self-recognition
-   - Result: 100% coverage, 0 unknowns
+4. **Enable Iterative Development**
+   - Provide actionable output (`unknown.yml`) to guide pattern additions
+   - Support YAML-based pattern definitions for easy maintenance
+   - Validate patterns with schema checking
 
-See `BUG_FIX_SUMMARY.md` for detailed technical information on earlier validation bug fixes.
+### Non-Goals
+
+This scanner is **NOT** designed to:
+
+1. Identify any source-integrated dependencies. A source-integrated dependency is any copy-pasted code directly from a third-party repository to the TensorRT-LLM codebase.
+2. Identify pip-installed python runtime dependencies.
+3. Be a one-size-fits-all solution catching all dependencies.
+4. Enrich with license information for each dependency - or generate attributions.
+5. Track transitive dependencies that are invisible to cmake.
+6. provide Windows support.
 
 ## Usage
 
