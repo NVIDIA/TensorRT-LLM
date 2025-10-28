@@ -1421,7 +1421,7 @@ def triton_kt_cache_update_and_bmm(
 
 
 @triton.jit
-def triton_interleave_kernel(
+def interleave_kernel(
     input_ptr,
     output_ptr,
     kt_offsets_ptr,
@@ -1630,89 +1630,84 @@ def topk_kernel(
              mask=result_mask)
 
 
-def triton_topk(
-        input_tensor: torch.Tensor,
-        kt_offsets: torch.Tensor,
-        kv_lens: torch.Tensor,
-        kv_cu_lens: torch.Tensor,
-        sparse_offsets: torch.Tensor,
-        total_sparse_attn_indices: int,
-        total_kv_tokens: int,
-        max_attn_seq_len: int,
-        max_real_kt_tokens: int,
-        max_real_kv_tokens: int,
-        topk: int,
-        kt_page_size: int,
-        use_interleave: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
+def triton_interleave(input_tensor: torch.Tensor, kt_offsets: torch.Tensor,
+                      kv_lens: torch.Tensor, kv_cu_lens: torch.Tensor,
+                      total_kv_tokens: int, kt_page_size: int) -> torch.Tensor:
     """
-    Perform topk operation with optional interleaving.
+    Interleave kt tokens to kv tokens by repeating each kt token kt_page_size times.
 
     Args:
         input_tensor: Input scores [num_kv_heads, sum(kt_lens)]
         kt_offsets: KT offsets [batch_size + 1]
         kv_lens: KV lengths [batch_size]
         kv_cu_lens: KV cumulative lengths [batch_size + 1]
-        sparse_offsets: Sparse offsets [batch_size + 1]
-        total_sparse_attn_indices: Total number of sparse attention indices
         total_kv_tokens: Total number of KV tokens
-        max_attn_seq_len: Maximum sequence length
-        max_real_kt_tokens: Maximum real KT tokens
-        max_real_kv_tokens: Maximum real KV tokens
-        topk: scalar of TopK parameter
         kt_page_size: Page size for interleaving
-        use_interleave: Whether to perform interleaving
 
     Returns:
-        output_indices: Selected indices [num_kv_heads, num_total_sparse_indices]
-        sparse_offsets: Sparse offsets [batch_size + 1]
+        interleaved_tensor: Interleaved tensor [num_kv_heads, total_kv_tokens]
     """
-
     num_kv_heads = input_tensor.shape[0]
+    total_kt_tokens = input_tensor.shape[1]
     batch_size = len(kv_lens)
     device = input_tensor.device
 
-    if use_interleave:
-        total_kt_tokens = input_tensor.shape[1]
+    # Create interleaved tensor
+    interleaved_tensor = torch.empty((num_kv_heads, total_kv_tokens),
+                                     dtype=input_tensor.dtype,
+                                     device=device)
 
-        # Create interleaved tensor
-        interleaved_tensor = torch.empty((num_kv_heads, total_kv_tokens),
-                                         dtype=input_tensor.dtype,
-                                         device=device)
+    # Launch interleave kernel
+    grid = (batch_size, num_kv_heads)
+    interleave_kernel[grid](input_tensor,
+                            interleaved_tensor,
+                            kt_offsets,
+                            kv_lens,
+                            kv_cu_lens,
+                            batch_size,
+                            num_kv_heads,
+                            kt_page_size,
+                            total_kt_tokens,
+                            total_kv_tokens,
+                            BLOCK_SIZE=1024)
 
-        # Launch interleave kernel
-        grid = (batch_size, num_kv_heads)
-        triton_interleave_kernel[grid](input_tensor,
-                                       interleaved_tensor,
-                                       kt_offsets,
-                                       kv_lens,
-                                       kv_cu_lens,
-                                       batch_size,
-                                       num_kv_heads,
-                                       kt_page_size,
-                                       total_kt_tokens,
-                                       total_kv_tokens,
-                                       BLOCK_SIZE=1024)
+    return interleaved_tensor
 
-        # Use interleaved tensor and kv_cu_lens for topk
-        working_tensor = interleaved_tensor
-        working_offsets = kv_cu_lens
-        max_real_tokens = triton.next_power_of_2(max_real_kv_tokens)
-    else:
-        # Use original tensor and kt_offsets for topk
-        working_tensor = input_tensor
-        working_offsets = kt_offsets
-        max_real_tokens = triton.next_power_of_2(max_real_kt_tokens)
 
-    total_working_tokens = working_tensor.shape[1]
+def triton_topk(input_tensor: torch.Tensor, input_offsets: torch.Tensor,
+                sparse_offsets: torch.Tensor, total_sparse_attn_indices: int,
+                max_attn_seq_len: int, max_real_tokens: int,
+                topk: int) -> torch.Tensor:
+    """
+    Perform topk operation on input tensor.
+
+    Args:
+        input_tensor: Input scores [num_kv_heads, total_tokens]
+        input_offsets: Input offsets [batch_size + 1]
+        sparse_offsets: Sparse offsets [batch_size + 1]
+        total_sparse_attn_indices: Total number of sparse attention indices
+        max_attn_seq_len: Maximum sequence length
+        max_real_tokens: Maximum real tokens (power of 2)
+        topk: TopK parameter (must be power of 2)
+
+    Returns:
+        output_indices: Selected indices [num_kv_heads, num_total_sparse_indices]
+    """
+
+    num_kv_heads, total_tokens = input_tensor.shape
+    batch_size = sparse_offsets.shape[0] - 1
+    device = input_tensor.device
 
     # Create output tensor
     output_indices = torch.empty((num_kv_heads, total_sparse_attn_indices),
                                  dtype=torch.int32,
                                  device=device)
 
+    max_real_tokens = triton.next_power_of_2(max_real_tokens)
+
     # Create temporary storage for topk algorithm (double size for dual-buffer design)
     temp_values = torch.empty((batch_size, num_kv_heads, max_attn_seq_len * 2),
-                              dtype=working_tensor.dtype,
+                              dtype=input_tensor.dtype,
                               device=device)
     temp_indices = torch.empty((batch_size, num_kv_heads, max_attn_seq_len * 2),
                                dtype=torch.int32,
@@ -1724,16 +1719,16 @@ def triton_topk(
     BLOCK_SIZE = max(512, 2 * topk)
 
     topk_kernel[grid](
-        working_tensor,
+        input_tensor,
         output_indices,
         temp_values,
         temp_indices,
-        working_offsets,
+        input_offsets,
         sparse_offsets,
         batch_size,
         num_kv_heads,
         topk,
-        total_working_tokens,
+        total_tokens,
         total_sparse_attn_indices,
         max_attn_seq_len,
         max_real_tokens,

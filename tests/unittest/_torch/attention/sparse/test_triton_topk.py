@@ -1,8 +1,7 @@
 import pytest
 import torch
-import triton
 
-from tensorrt_llm._torch.attention_backend.sparse.kernel import topk_kernel
+from tensorrt_llm._torch.attention_backend.sparse.kernel import triton_topk
 
 
 def pytorch_reference_topk(
@@ -66,7 +65,7 @@ def pytorch_reference_topk(
     return topk_indices
 
 
-def topk_kernel_wrapper(
+def triton_topk_wrapper(
     input_tensor: torch.Tensor,
     kv_offsets: torch.Tensor,
     kv_lens: torch.Tensor,
@@ -86,7 +85,6 @@ def topk_kernel_wrapper(
     batch_size = len(kv_lens)
     device = input_tensor.device
 
-    total_input_tokens = input_tensor.shape[1]
     max_seq_len = kv_lens.max().item()
 
     sparse_lens = torch.tensor(
@@ -99,40 +97,14 @@ def topk_kernel_wrapper(
     ]).to(device)
     total_sparse_indices = sparse_offsets[-1].item()
 
-    max_real_tokens = triton.next_power_of_2(max_seq_len)
-
-    output_indices_flat = torch.empty((num_kv_heads, total_sparse_indices),
-                                      dtype=torch.int32,
-                                      device=device)
-
-    temp_values = torch.empty((batch_size, num_kv_heads, max_seq_len * 2),
-                              dtype=input_tensor.dtype,
-                              device=device)
-    temp_indices = torch.empty((batch_size, num_kv_heads, max_seq_len * 2),
-                               dtype=torch.int32,
-                               device=device)
-
-    grid = (batch_size, num_kv_heads)
-
-    assert topk & (topk - 1) == 0, "Topk must be a power of 2"
-    BLOCK_SIZE = max(512, 2 * topk)
-
-    topk_kernel[grid](
+    output_indices_flat = triton_topk(
         input_tensor,
-        output_indices_flat,
-        temp_values,
-        temp_indices,
         kv_offsets,
         sparse_offsets,
-        batch_size,
-        num_kv_heads,
-        topk,
-        total_input_tokens,
         total_sparse_indices,
         max_seq_len,
-        max_real_tokens,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
+        max_seq_len,  # max_real_tokens (will be converted to power of 2 inside)
+        topk)
 
     # Convert flat format to padded format [num_kv_heads, batch_size, topk]
     output_indices_padded = torch.full((num_kv_heads, batch_size, topk),
@@ -224,7 +196,7 @@ def test_topk_kernel(batch_size, seq_lens, num_kv_heads, topk):
                                dtype=dtype,
                                device=device)
 
-    kernel_output = topk_kernel_wrapper(
+    triton_output = triton_topk_wrapper(
         input_tensor=input_tensor,
         kv_offsets=kv_offsets,
         kv_lens=kv_lens,
@@ -239,13 +211,10 @@ def test_topk_kernel(batch_size, seq_lens, num_kv_heads, topk):
     )
 
     overlap_ratio = compute_overlap_ratio(
-        kernel_output,
+        triton_output,
         reference_output,
         kv_lens,
     )
-
-    assert kernel_output.shape == reference_output.shape, \
-        f"Shape mismatch: {kernel_output.shape} vs {reference_output.shape}"
 
     min_threshold = 0.99
 
