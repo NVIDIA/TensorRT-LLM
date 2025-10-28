@@ -3520,9 +3520,30 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
         with llm:
             model_name = "GPT-OSS/120B-MXFP4"
+
+            # GSM8K
             task = GSM8K(model_name)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
+
+            # GPQA Medium Reasoning
+            task = GPQADiamond(model_name)
+
+            chat_template_kwargs = dict(reasoning_effort="medium")
+            extra_evaluator_kwargs = {
+                **self.extra_evaluator_kwargs, "chat_template_kwargs":
+                chat_template_kwargs
+            }
+
+            sampling_params = SamplingParams(
+                temperature=1.0,
+                top_p=1.0,
+                max_tokens=MAX_OUTPUT_LEN,
+                truncate_prompt_tokens=MAX_INPUT_LEN)
+
+            task.evaluate(llm,
+                          sampling_params=sampling_params,
+                          extra_evaluator_kwargs=extra_evaluator_kwargs)
 
     @pytest.mark.skip_less_device(8)
     @pytest.mark.parametrize(
@@ -3561,30 +3582,9 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
         with llm:
             model_name = "GPT-OSS/120B-MXFP4"
-
-            # GSM8K
             task = GSM8K(model_name)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
-
-            # GPQA Medium Reasoning
-            task = GPQADiamond(model_name)
-
-            chat_template_kwargs = dict(reasoning_effort="medium")
-            extra_evaluator_kwargs = {
-                **self.extra_evaluator_kwargs, "chat_template_kwargs":
-                chat_template_kwargs
-            }
-
-            sampling_params = SamplingParams(
-                temperature=1.0,
-                top_p=1.0,
-                max_tokens=MAX_OUTPUT_LEN,
-                truncate_prompt_tokens=MAX_INPUT_LEN)
-
-            task.evaluate(llm,
-                          sampling_params=sampling_params,
-                          extra_evaluator_kwargs=extra_evaluator_kwargs)
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize(
