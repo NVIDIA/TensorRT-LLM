@@ -426,15 +426,18 @@ class ModelConfig(Generic[TConfig]):
                     trust_remote_code=trust_remote_code,
                     **kwargs,
                 )
-                if pretrained_config.model_type == "deepseek_v32":
-                    sparse_attention_config = kwargs.get(
-                        'sparse_attention_config')
-                    index_n_heads, index_head_dim, index_topk, indexer_max_chunk_size = None, None, None, None
+                if pretrained_config.architectures[0] == "DeepseekV32ForCausalLM":
+                    sparse_attention_config = kwargs.get('sparse_attention_config')
                     if sparse_attention_config:
-                        index_n_heads = sparse_attention_config.index_n_heads
-                        index_head_dim = sparse_attention_config.index_head_dim
-                        index_topk = sparse_attention_config.index_topk
+                        index_n_heads = sparse_attention_config.index_n_heads or pretrained_config.index_n_heads
+                        index_head_dim = sparse_attention_config.index_head_dim or pretrained_config.index_head_dim
+                        index_topk = sparse_attention_config.index_topk or pretrained_config.index_topk
                         indexer_max_chunk_size = sparse_attention_config.indexer_max_chunk_size
+                    else:
+                        index_n_heads = pretrained_config.index_n_heads
+                        index_head_dim = pretrained_config.index_head_dim
+                        index_topk = pretrained_config.index_topk
+                        indexer_max_chunk_size = None
                     kwargs[
                         'sparse_attention_config'] = DeepSeekSparseAttentionConfig(
                             index_n_heads=index_n_heads,
