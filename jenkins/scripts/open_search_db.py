@@ -45,7 +45,7 @@ READ_ACCESS_PROJECT_NAME = [
 
 WRITE_ACCESS_PROJECT_NAME = []
 
-DISABLE_NVDF_FOR_LOCAL_TEST = False
+DISABLE_OPEN_SEARCH_DB_FOR_LOCAL_TEST = False
 
 DEFAULT_QUERY_SIZE = 3000
 DEFAULT_RETRY_COUNT = 5
@@ -53,12 +53,12 @@ DEFAULT_LOOKBACK_DAYS = 7
 POST_TIMEOUT_SECONDS = 20
 QUERY_TIMEOUT_SECONDS = 10
 
-NVDF_BASE_URL = os.getenv("NVDF_BASE_URL", "")
-NVDF_USERNAME = os.getenv("NVDF_CREDENTIALS_USR", "")
-NVDF_PASSWORD = os.getenv("NVDF_CREDENTIALS_PSW", "")
+OPEN_SEARCH_DB_BASE_URL = os.getenv("OPEN_SEARCH_DB_BASE_URL", "")
+OPEN_SEARCH_DB_USERNAME = os.getenv("OPEN_SEARCH_DB_CREDENTIALS_USR", "")
+OPEN_SEARCH_DB_PASSWORD = os.getenv("OPEN_SEARCH_DB_CREDENTIALS_PSW", "")
 
 
-class NVDF:
+class OpenSearchDB:
     logger = logging.getLogger(__name__)
     query_build_id_cache: dict = {}
 
@@ -66,64 +66,64 @@ class NVDF:
         pass
 
     @staticmethod
-    def typeCheckForNVDataFlow(json_data):
+    def typeCheckForOpenSearchDB(json_data):
         if isinstance(json_data, list):
             for data in json_data:
-                NVDF.typeCheckForNVDataFlow(data)
+                OpenSearchDB.typeCheckForOpenSearchDB(data)
             return json_data
         if not isinstance(json_data, dict):
             raise TypeError(f"Expected dict, got {type(json_data).__name__}")
         for key, value in json_data.items():
             if key.startswith("l_"):
                 if not isinstance(value, int):
-                    NVDF.logger.fatal(
-                        "NVDF type check failed! key:{}, value:{} value_type:{}"
+                    OpenSearchDB.logger.fatal(
+                        "OpenSearchDB type check failed! key:{}, value:{} value_type:{}"
                         .format(key, value, type(value)))
                     raise Exception(
-                        "typeCheckForNVDataFlow Failed, key:{}, value:{} value_type:{}"
+                        "typeCheckForOpenSearchDB Failed, key:{}, value:{} value_type:{}"
                         .format(key, value, type(value)))
             elif key.startswith("s_"):
                 if not isinstance(value, str):
-                    NVDF.logger.fatal(
-                        "NVDF type check failed! key:{}, value:{} value_type:{}"
+                    OpenSearchDB.logger.fatal(
+                        "OpenSearchDB type check failed! key:{}, value:{} value_type:{}"
                         .format(key, value, type(value)))
                     raise Exception(
-                        "typeCheckForNVDataFlow Failed, key:{}, value:{} value_type:{}"
+                        "typeCheckForOpenSearchDB Failed, key:{}, value:{} value_type:{}"
                         .format(key, value, type(value)))
             elif key.startswith("b_"):
                 if not isinstance(value, bool):
-                    NVDF.logger.fatal(
-                        "NVDF type check failed! key:{}, value:{} value_type:{}"
+                    OpenSearchDB.logger.fatal(
+                        "OpenSearchDB type check failed! key:{}, value:{} value_type:{}"
                         .format(key, value, type(value)))
                     raise Exception(
-                        "typeCheckForNVDataFlow Failed, key:{}, value:{} value_type:{}"
+                        "typeCheckForOpenSearchDB Failed, key:{}, value:{} value_type:{}"
                         .format(key, value, type(value)))
             elif key.startswith("ts_"):
                 if not isinstance(value, int):
-                    NVDF.logger.fatal(
-                        "NVDF type check failed! key:{}, value:{} value_type:{}"
+                    OpenSearchDB.logger.fatal(
+                        "OpenSearchDB type check failed! key:{}, value:{} value_type:{}"
                         .format(key, value, type(value)))
                     raise Exception(
-                        "typeCheckForNVDataFlow Failed, key:{}, value:{} value_type:{}"
+                        "typeCheckForOpenSearchDB Failed, key:{}, value:{} value_type:{}"
                         .format(key, value, type(value)))
             elif key.startswith("flat_"):
                 if not isinstance(value, dict):
-                    NVDF.logger.fatal(
-                        "NVDF type check failed! key:{}, value_type:{}".format(
-                            key, type(value)))
+                    OpenSearchDB.logger.fatal(
+                        "OpenSearchDB type check failed! key:{}, value_type:{}".
+                        format(key, type(value)))
                     raise Exception(
-                        "typeCheckForNVDataFlow Failed, key:{}, value:{} value_type:{}"
+                        "typeCheckForOpenSearchDB Failed, key:{}, value:{} value_type:{}"
                         .format(key, value, type(value)))
             elif key.startswith("ni_"):
                 if not isinstance(value, (str, int, float)):
-                    NVDF.logger.fatal(
-                        "NVDF type check failed! key:{}, value_type:{}".format(
-                            key, type(value)))
+                    OpenSearchDB.logger.fatal(
+                        "OpenSearchDB type check failed! key:{}, value_type:{}".
+                        format(key, type(value)))
                     raise Exception(
-                        "typeCheckForNVDataFlow Failed, key:{}, value:{} value_type:{}"
+                        "typeCheckForOpenSearchDB Failed, key:{}, value:{} value_type:{}"
                         .format(key, value, type(value)))
             else:
-                NVDF.logger.fatal(
+                OpenSearchDB.logger.fatal(
                     "Unknown key type! key:{}, value_type:{}".format(
                         key, type(value)))
         return json_data
@@ -137,7 +137,7 @@ class NVDF:
     def add_id_of_json(data):
         if isinstance(data, list):
             for d in data:
-                NVDF.add_id_of_json(d)
+                OpenSearchDB.add_id_of_json(d)
             return
         if not isinstance(data, dict):
             raise TypeError("data is not a dict, type:{}".format(type(data)))
@@ -145,24 +145,25 @@ class NVDF:
         data["_id"] = hashlib.md5(data_str).hexdigest()
 
     @staticmethod
-    def postToNVDataFlow(json_data, project):
-        if not NVDF_BASE_URL:
-            raise Exception("NVDF_BASE_URL is not set")
-        if not NVDF_USERNAME or not NVDF_PASSWORD:
-            raise Exception("NVDF_USERNAME or NVDF_PASSWORD is not set")
+    def postToOpenSearchDB(json_data, project):
+        if not OPEN_SEARCH_DB_BASE_URL:
+            raise Exception("OPEN_SEARCH_DB_BASE_URL is not set")
+        if not OPEN_SEARCH_DB_USERNAME or not OPEN_SEARCH_DB_PASSWORD:
+            raise Exception(
+                "OPEN_SEARCH_DB_USERNAME or OPEN_SEARCH_DB_PASSWORD is not set")
         if project not in WRITE_ACCESS_PROJECT_NAME:
             raise Exception(
                 "project {} is not in write access project list: {}".format(
                     project, json.dumps(WRITE_ACCESS_PROJECT_NAME)))
-        NVDF.typeCheckForNVDataFlow(json_data)
-        NVDF.add_id_of_json(json_data)
+        OpenSearchDB.typeCheckForOpenSearchDB(json_data)
+        OpenSearchDB.add_id_of_json(json_data)
         json_data = json.dumps(json_data)
-        if DISABLE_NVDF_FOR_LOCAL_TEST:
-            NVDF.logger.info(
-                "NVDF is disabled for local test, skip posting to NVDataFlow: {}"
+        if DISABLE_OPEN_SEARCH_DB_FOR_LOCAL_TEST:
+            OpenSearchDB.logger.info(
+                "OpenSearchDB is disabled for local test, skip posting to OpenSearchDB: {}"
                 .format(json_data))
             return None
-        url = "{}/dataflow2/{}/posting".format(NVDF_BASE_URL, project)
+        url = "{}/dataflow2/{}/posting".format(OPEN_SEARCH_DB_BASE_URL, project)
         headers = {
             "Content-Type": "application/json",
             "Accept-Charset": "UTF-8"
@@ -173,33 +174,37 @@ class NVDF:
                 url,
                 data=json_data,
                 headers=headers,
-                auth=HTTPProxyAuth(NVDF_USERNAME, NVDF_PASSWORD),
+                auth=HTTPProxyAuth(OPEN_SEARCH_DB_USERNAME,
+                                   OPEN_SEARCH_DB_PASSWORD),
                 timeout=POST_TIMEOUT_SECONDS,
             )
             if res.status_code in [200, 201, 202]:
                 if res.status_code != 200 and project == JOB_PROJECT_NAME:
-                    NVDF.logger.info("nvdf post not 200, log:{} {}".format(
-                        res.status_code, res.text))
+                    OpenSearchDB.logger.info(
+                        "OpenSearchDB post not 200, log:{} {}".format(
+                            res.status_code, res.text))
                 return
-            NVDF.logger.info("nvdf post failed, will retry, error:{} {}".format(
-                res.status_code, res.text))
+            OpenSearchDB.logger.info(
+                "OpenSearchDB post failed, will retry, error:{} {}".format(
+                    res.status_code, res.text))
             retry_time -= 1
-        NVDF.logger.error(
-            "Fail to postToNVDataFlow after {} retry: {}, json: {}, error: {}".
-            format(retry_time, url, json_data, res.text))
+        OpenSearchDB.logger.error(
+            "Fail to postToOpenSearchDB after {} retry: {}, json: {}, error: {}"
+            .format(retry_time, url, json_data, res.text))
         return None
 
     @staticmethod
-    def queryFromNVDataFlow(json_data, project):
-        if not NVDF_BASE_URL:
-            raise Exception("NVDF_BASE_URL is not set")
+    def queryFromOpenSearchDB(json_data, project):
+        if not OPEN_SEARCH_DB_BASE_URL:
+            raise Exception("OPEN_SEARCH_DB_BASE_URL is not set")
         if project not in READ_ACCESS_PROJECT_NAME:
             raise Exception(
                 "project {} is not in read access project list: {}".format(
                     project, json.dumps(READ_ACCESS_PROJECT_NAME)))
         if not isinstance(json_data, str):
             json_data = json.dumps(json_data)
-        url = "{}/opensearch/df-{}-*/_search".format(NVDF_BASE_URL, project)
+        url = "{}/opensearch/df-{}-*/_search".format(OPEN_SEARCH_DB_BASE_URL,
+                                                     project)
         headers = {
             "Content-Type": "application/json",
             "Accept-Charset": "UTF-8"
@@ -212,27 +217,27 @@ class NVDF:
                                timeout=QUERY_TIMEOUT_SECONDS)
             if res.status_code in [200, 201, 202]:
                 return res.json()
-            NVDF.logger.info(
+            OpenSearchDB.logger.info(
                 "nvdf query failed, will retry, error:{} {}".format(
                     res.status_code, res.text))
             retry_time -= 1
-        NVDF.logger.error(
-            "Fail to queryFromNVDataFlow after {} retry: {}, json: {}, error: {}"
+        OpenSearchDB.logger.error(
+            "Fail to queryFromOpenSearchDB after {} retry: {}, json: {}, error: {}"
             .format(retry_time, url, json_data, res.text))
         return None
 
     @staticmethod
-    def queryBuildIdFromNVDataFlow(job_name, last_days=DEFAULT_LOOKBACK_DAYS):
-        if DISABLE_NVDF_FOR_LOCAL_TEST:
+    def queryBuildIdFromOpenSearchDB(job_name, last_days=DEFAULT_LOOKBACK_DAYS):
+        if DISABLE_OPEN_SEARCH_DB_FOR_LOCAL_TEST:
             return []
-        if job_name in NVDF.query_build_id_cache:
-            return NVDF.query_build_id_cache[job_name]
+        if job_name in OpenSearchDB.query_build_id_cache:
+            return OpenSearchDB.query_build_id_cache[job_name]
         json_data = {
             "size": DEFAULT_QUERY_SIZE,
             "query": {
                 "range": {
                     "ts_created": {
-                        "gte": NVDF._calculate_timestamp(last_days),
+                        "gte": OpenSearchDB._calculate_timestamp(last_days),
                     }
                 }
             },
@@ -240,29 +245,31 @@ class NVDF:
         }
         build_ids = []
         try:
-            query_res = NVDF.queryFromNVDataFlow(json_data, JOB_PROJECT_NAME)
+            query_res = OpenSearchDB.queryFromOpenSearchDB(
+                json_data, JOB_PROJECT_NAME)
             for job in query_res["hits"]["hits"]:
                 job_info = job.get("_source", {})
                 if job_name == job_info.get("s_job_name"):
                     build_ids.append(job_info.get("s_build_id"))
-            NVDF.query_build_id_cache[job_name] = build_ids
+            OpenSearchDB.query_build_id_cache[job_name] = build_ids
             return build_ids
         except Exception as e:
-            NVDF.logger.warning(f"Failed to query build IDs from NVDF: {e}")
+            OpenSearchDB.logger.warning(
+                f"Failed to query build IDs from OpenSearchDB: {e}")
             return []
 
     @staticmethod
-    def queryPRIdsFromNVDataFlow(repo_name, last_days=DEFAULT_LOOKBACK_DAYS):
+    def queryPRIdsFromOpenSearchDB(repo_name, last_days=DEFAULT_LOOKBACK_DAYS):
         """
-        Query existing PR IDs from NVDF for a specific repository.
-        Mirrors queryBuildIdFromNVDataFlow for PR monitoring.
+        Query existing PR IDs from OpenSearchDB for a specific repository.
+        Mirrors queryBuildIdFromOpenSearchDB for PR monitoring.
         """
-        if DISABLE_NVDF_FOR_LOCAL_TEST:
+        if DISABLE_OPEN_SEARCH_DB_FOR_LOCAL_TEST:
             return []
 
         cache_key = f"pr_{repo_name}"
-        if cache_key in NVDF.query_build_id_cache:
-            return NVDF.query_build_id_cache[cache_key]
+        if cache_key in OpenSearchDB.query_build_id_cache:
+            return OpenSearchDB.query_build_id_cache[cache_key]
 
         json_data = {
             "size": DEFAULT_QUERY_SIZE,
@@ -272,7 +279,9 @@ class NVDF:
                         {
                             "range": {
                                 "ts_created": {
-                                    "gte": NVDF._calculate_timestamp(last_days),
+                                    "gte":
+                                    OpenSearchDB._calculate_timestamp(
+                                        last_days),
                                 }
                             }
                         },
@@ -289,18 +298,20 @@ class NVDF:
 
         pr_numbers = []
         try:
-            query_res = NVDF.queryFromNVDataFlow(json_data, PR_PROJECT_NAME)
+            query_res = OpenSearchDB.queryFromOpenSearchDB(
+                json_data, PR_PROJECT_NAME)
             for pr in query_res["hits"]["hits"]:
                 pr_info = pr.get("_source", {})
                 if repo_name == pr_info.get("s_repo_name"):
                     pr_number = pr_info.get("l_pr_number")
                     if pr_number and pr_number not in pr_numbers:
                         pr_numbers.append(pr_number)
-            NVDF.query_build_id_cache[cache_key] = pr_numbers
+            OpenSearchDB.query_build_id_cache[cache_key] = pr_numbers
             return pr_numbers
         except Exception as e:
-            NVDF.logger.warning(f"Failed to query PR IDs from NVDF: {e}")
+            OpenSearchDB.logger.warning(
+                f"Failed to query PR IDs from OpenSearchDB: {e}")
             return []
 
 
-print(NVDF.queryBuildIdFromNVDataFlow("LLM/main/L0_MergeRequest_PR"))
+print(OpenSearchDB.queryBuildIdFromOpenSearchDB("LLM/main/L0_MergeRequest_PR"))
