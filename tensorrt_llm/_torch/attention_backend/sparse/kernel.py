@@ -1476,30 +1476,6 @@ def triton_interleave_kernel(
         tl.store(output_ptr + output_indices, values, mask=block_mask)
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_SIZE': 256}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_SIZE': 256}, num_warps=8, num_stages=3),
-        triton.Config({'BLOCK_SIZE': 512}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_SIZE': 512}, num_warps=8, num_stages=3),
-        triton.Config({'BLOCK_SIZE': 512}, num_warps=16, num_stages=2),
-        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_SIZE': 1024}, num_warps=16, num_stages=2),
-        triton.Config({'BLOCK_SIZE': 1024}, num_warps=16, num_stages=3),
-        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8, num_stages=3),
-        triton.Config({'BLOCK_SIZE': 2048}, num_warps=16, num_stages=2),
-        triton.Config({'BLOCK_SIZE': 2048}, num_warps=16, num_stages=3),
-    ],
-    key=['max_real_tokens'],
-    prune_configs_by={
-        'early_config_prune':
-        lambda configs, nargs, **kwargs: [
-            config for config in configs
-            if config.kwargs.get('BLOCK_SIZE', 0) > nargs['topk']
-        ]
-    },
-    use_cuda_graph=True,
-)
 @triton.jit
 def topk_kernel(
     input_ptr,
@@ -1567,7 +1543,7 @@ def topk_kernel(
 
     # Multi-round iterative argsort approach
     # This works for both short and long sequences uniformly
-    current_len = input_len
+    current_len = input_len.to(tl.int32)
     current_base = temp_base
     round_num = 0
 
@@ -1609,7 +1585,7 @@ def topk_kernel(
                     chunk_values, chunk_indices, dim=0, descending=True)
 
                 # Extract top-k candidates from this chunk
-                chunk_topk = tl.minimum(actual_topk, chunk_len)
+                chunk_topk = tl.minimum(actual_topk, chunk_len).to(tl.int32)
                 chunk_topk_mask = chunk_offsets < chunk_topk
 
                 # Store top-k candidates to next round's storage
@@ -1634,10 +1610,10 @@ def topk_kernel(
 
     final_values = tl.load(temp_values_ptr + current_base + final_offsets,
                            mask=final_mask,
-                           other=0.0)
+                           other=-1e10)
     final_indices = tl.load(temp_indices_ptr + current_base + final_offsets,
                             mask=final_mask,
-                            other=0.0).to(tl.int32)
+                            other=-1).to(tl.int32)
 
     final_sorted_values, final_sorted_indices = argsort(final_values,
                                                         final_indices,
@@ -1744,6 +1720,9 @@ def triton_topk(
 
     grid = (batch_size, num_kv_heads)
 
+    assert topk & (topk - 1) == 0, "Topk must be a power of 2"
+    BLOCK_SIZE = max(512, 2 * topk)
+
     topk_kernel[grid](
         working_tensor,
         output_indices,
@@ -1758,6 +1737,7 @@ def triton_topk(
         total_sparse_attn_indices,
         max_attn_seq_len,
         max_real_tokens,
+        BLOCK_SIZE=BLOCK_SIZE,
     )
 
     return output_indices
