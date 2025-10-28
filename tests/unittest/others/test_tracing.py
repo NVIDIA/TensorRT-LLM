@@ -28,8 +28,6 @@ from tensorrt_llm.llmapi.tracing import SpanAttributes
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-FAKE_TRACE_SERVER_ADDRESS = "localhost:4317"
-
 
 class FakeTraceService(TraceServiceServicer):
 
