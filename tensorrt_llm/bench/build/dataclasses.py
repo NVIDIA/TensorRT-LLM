@@ -192,9 +192,23 @@ class ModelConfig(BaseModel):
 
     @classmethod
     def from_hf(cls, model_hf_name, hf_model_path):
+        # TODO: remove this once the transformers can support all of those models in _CONFIG_REGISTRY
+        import transformers
+        from tensorrt_llm._torch.model_config import _CONFIG_REGISTRY
         model_name_or_path = hf_model_path or model_hf_name
-        hf_config = AutoConfig.from_pretrained(
-            model_name_or_path, trust_remote_code=True).to_dict()
+        config_dict, _ = transformers.PretrainedConfig.get_config_dict(
+                    model_name_or_path,
+                    trust_remote_code=True)
+        model_type = config_dict.get("model_type")
+        if model_type in _CONFIG_REGISTRY:
+            config_class = _CONFIG_REGISTRY[model_type]
+            model_config = config_class.from_pretrained(
+                model_name_or_path,
+                trust_remote_code=True)
+        else:
+            model_config = AutoConfig.from_pretrained(model_name_or_path,
+                                        trust_remote_code=True)
+        hf_config = model_config.to_dict()
         param_count = cls.get_param_count(model_hf_name, hf_model_path)
 
         return cls(name=model_hf_name, param_count=param_count, **hf_config)
