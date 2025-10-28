@@ -2016,7 +2016,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         sh "df -h"
         sh "ls /scratch.trt_llm_data/"
         sh "ls /scratch.trt_llm_data/llm-models"
-        sh "ls /scratch.trt_llm_data/llm-models/Qwen3"1
+        sh "ls /scratch.trt_llm_data/llm-models/Qwen3"
 
         // setup HF_HOME to cache model and datasets
         // init the huggingface cache from nfs, since the nfs is read-only, and HF_HOME needs to be writable, otherwise it will fail at creating file lock
