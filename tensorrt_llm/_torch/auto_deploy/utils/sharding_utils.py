@@ -220,9 +220,7 @@ def get_all_weights_in_subgraph(
     sinks: list[Node],
 ):
     """Get all weight nodes (get_attr nodes) in the subgraph between sources and sinks."""
-    weight_nodes = subgraph(
-        sources, sinks, include_boundary_nodes=False, include=lambda n: n.op == "get_attr"
-    )
+    weight_nodes = subgraph(sources, sinks, include=lambda n: n.op == "get_attr")
     return weight_nodes
 
 

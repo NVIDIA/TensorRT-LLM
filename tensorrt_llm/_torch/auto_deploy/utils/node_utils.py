@@ -135,9 +135,13 @@ def extract_weight_node(node: Node) -> int:
         weight_node = node.args[1]
     # for other parametrized nodes, we need to find the weight node
     else:
-        weight_nodes = [n for n in node.args if isinstance(n, Node) and n.op == "get_attr"]
+        weight_nodes = [
+            n for n in node.args if isinstance(n, Node) and find_get_attr_node(n) is not None
+        ]
         # can be two weights (if bias weight is present)
-        assert len(weight_nodes) >= 1, "Expected exactly one weight node in the parametrized node"
+        assert len(weight_nodes) >= 1, (
+            "Expected exactly at least one weight node in the parametrized node"
+        )
         weight_node = weight_nodes[0]
     # for modelopt quantized graph, there will be a quantize_op
     _, weight_params, _ = get_quantization_params_from_linear_node(node)
@@ -379,8 +383,28 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
     return boundary_nodes
 
 
-def identify_layer_subgraphs(gm: GraphModule) -> None:
-    pass
+def get_all_layer_subgraphs(gm: GraphModule) -> List[List[Node]]:
+    """Get subgraphs corresponding to all consecutive layers (attention, MLP, SSM, MoE) in the graph."""
+
+    assert gm.graph.nodes, "Graph is empty"
+    layer_subgraphs = []
+    linear_nodes = list(filtered_nodes(gm.graph.nodes, is_linear_op))
+    unprocessed_linear_nodes = set(linear_nodes)
+    assert len(linear_nodes) > 0, "Could not find any linear nodes in the graph"
+
+    terminating_indices = [-1]
+
+    # for each linear node, find its layer subgraph defined as regions between consecutive linear nodes
+    while True:
+        layer_subgraph = get_layer_after_linear_node(linear_nodes, terminating_indices)
+        unprocessed_linear_nodes -= set(layer_subgraph)
+        layer_subgraphs.append(layer_subgraph)
+        last_lin_index = terminating_indices[-1] + 1
+        if last_lin_index >= len(linear_nodes):
+            break
+
+    # unprocessed linear nodes can be "simple sharded".
+    return layer_subgraphs, unprocessed_linear_nodes
 
 
 def bfs(
@@ -532,32 +556,63 @@ def successors(
 
 
 def subgraph(
-    sources: list[Node],
-    sinks: list[Node],
-    include_boundary_nodes: bool = True,
+    sources: Optional[list[Node]] = None,
+    sinks: Optional[list[Node]] = None,
     include: Optional[Callable[[Node], bool]] = None,
     exclude: Optional[Callable[[Node], bool]] = None,
+    boundary_condition: Optional[Callable[[Node], bool]] = None,
 ) -> List[Node]:
     """
-    Returns a list of nodes in a subgraph in computation DAG defined as all nodes
-    succeeding any of the node in sources and preceding any of the nodes in sinks.
-    It is built by a BFS traversal from sinks, where the sources list acts as a
-    boundary. We do it in this order (and not from sources to sinks) to include
-    nodes like weights or other inputs (they are not successors of sinks, so otherwise
-    they wouldn't be included).
+    Returns a list of nodes in a subgraph in computation DAG defined as either:
+    1. all nodes succeeding any of the node in sources and preceding any of the
+      nodes in sinks. In this case, it is built by a BFS traversal from sinks,
+      where the sources list acts as a boundary. We do it in this order (and not
+      from sources to sinks) to include nodes like weights or other inputs (they
+      are not successors of sinks, so otherwise they wouldn't be included).
+    2. all nodes succeeding any of the node in sources, bounded by (BFS search
+      not extending further than) boundary_condition.
+    3. all nodes preceding any of the nodes in sinks, bounded by (BFS search
+      not extending further than) boundary_condition.
 
     Optionally, include or exclude conditions may be specified to include [exclude]
-    only nodes that meet [don't meet] certain condition.
+      only nodes that meet [don't meet] certain condition.
+
     """
     subgraph_nodes = []
     seen = set()
-    queue = list(sinks)
-    sources_set = set(sources)
 
-    # Initialize queue with sinks and mark them as seen
-    for node in sinks:
-        if node not in seen:
-            seen.add(node)
+    # differentiate between cases 1, 2, and 3 by checking if sinks and sources are provided
+    if sinks is not None and sources is not None:
+        # case 1
+        queue = list(sinks)
+        start_nodes = set(sinks)
+        sources_set = set(sources)
+        # Initialize queue with sinks and mark them as seen
+        for node in sinks:
+            if node not in seen:
+                seen.add(node)
+        if boundary_condition is None:
+
+            def boundary_condition(n):
+                return n in sources_set
+
+        attr_next = "args"
+    elif sources is not None:
+        # case 2
+        assert boundary_condition is not None, "boundary_condition must be provided for case 2"
+        # Initialize queue with sinks and mark them as seen
+        queue = list(sources)
+        start_nodes = set(sources)
+        attr_next = "users"
+    elif sinks is not None:
+        # case 3
+        assert boundary_condition is not None, "boundary_condition must be provided for case 3"
+        # Initialize queue with sinks and mark them as seen
+        queue = list(sinks)
+        start_nodes = set(sinks)
+        attr_next = "args"
+    else:
+        raise ValueError("Either sinks or sources must be provided")
 
     # BFS traversal from sinks backwards through predecessors
     while queue:
@@ -569,23 +624,64 @@ def subgraph(
             should_include = False
         if exclude is not None and exclude(node):
             should_include = False
-        if not include_boundary_nodes and (node in sources_set) or (node in sinks):
-            should_include = False
 
-        if should_include:
+        if should_include and node not in start_nodes:
             subgraph_nodes.append(node)
 
-        # Stop traversal at source nodes (boundary) - don't explore their predecessors
-        if node in sources_set:
+        # Stop traversal at boundary - don't explore their predecessors
+        if boundary_condition(node) and node not in start_nodes:
             continue
 
         # Traverse to predecessor nodes (all inputs to this node)
-        for arg in node.args:
+        for arg in getattr(node, attr_next):
             if isinstance(arg, Node) and arg not in seen:
                 seen.add(arg)
                 queue.append(arg)
 
     return subgraph_nodes
+
+
+def get_layer_after_linear_node(
+    linear_nodes: List[Node], terminating_indices: List[int]
+) -> List[Node]:
+    """Get the layer after a linear node."""
+    lin_nodes_in_subgraph = []
+    start_lin_index = terminating_indices[-1] + 1
+    while len(lin_nodes_in_subgraph) != 1:
+        forward_subgraph = subgraph(
+            sources=[linear_nodes[start_lin_index]], boundary_condition=is_linear_op
+        )
+        lin_nodes_in_subgraph = list(
+            filtered_nodes(forward_subgraph, ops=torch.ops.auto_deploy.torch_linear_simple)
+        )
+        start_lin_index += 1
+    terminating_linear_node = lin_nodes_in_subgraph[0]
+    # get all opening linear nodes
+    opening_linear_nodes = subgraph(
+        sinks=[terminating_linear_node], include=is_linear_op, boundary_condition=is_linear_op
+    )
+    # opening nodes must succeed last terminating node
+    last_terminating_index = terminating_indices[-1]
+    opening_linear_nodes = [
+        n for n in opening_linear_nodes if linear_nodes.index(n) > last_terminating_index
+    ]
+    assert linear_nodes[start_lin_index - 1] in opening_linear_nodes, (
+        "Linear node not found in opening linear nodes"
+    )
+    layer_subgraph = opening_linear_nodes + forward_subgraph
+
+    # return the index of the terminating linear node
+    if terminating_linear_node == linear_nodes[-1]:
+        terminating_index = len(linear_nodes)
+    else:
+        terminating_index = start_lin_index + len(opening_linear_nodes) - 1
+    terminating_indices.append(terminating_index)
+    if terminating_index < len(linear_nodes):
+        assert linear_nodes[terminating_index] == terminating_linear_node, (
+            "Terminating linear node not found"
+        )
+    # otherwise, we are done. We processed the last linear node.
+    return layer_subgraph
 
 
 def draw_graph(gm: GraphModule, filename: str):
