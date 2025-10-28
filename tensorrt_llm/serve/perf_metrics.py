@@ -1,0 +1,154 @@
+import asyncio
+from collections import defaultdict, deque
+from typing import Any, Dict, List
+
+from prometheus_client import Counter, Histogram
+
+COUNTER_METRICS = [
+    ("total_requests", "Total number of requests"),
+    ("error_requests", "Total number of error requests"),
+    ("retry_requests", "Total number of retry requests"),
+    ("completed_requests", "Total number of completed requests"),
+]
+# fmt: off
+LONG_TIME_BUCKETS = [
+    0.1, 0.3, 0.5, 0.8, 1.0, 1.5, 2.0, 2.5, 5.0, 10.0, 15.0, 20.0, 30.0, 40.0, 50.0,
+     60.0, 120.0, 240.0, 480.0, 960.0, 1920.0,
+]
+SHORT_TIME_BUCKETS = [
+    0.001, 0.005, 0.01, 0.02, 0.04, 0.06, 0.08, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0,
+    7.5, 10.0, 20.0, 40.0, 80.0, 160.0, 640.0, 2560.0,
+]
+# fmt: on
+HISTOGRAM_METRICS = [
+    (
+        "first_token_latency_seconds",
+        "Histogram of latency from first token to completion in seconds",
+        SHORT_TIME_BUCKETS,
+    ),
+    (
+        "complete_latency_seconds",
+        "Histogram of latency from request arrival to last token in seconds",
+        LONG_TIME_BUCKETS,
+    ),
+    (
+        "per_token_latency_seconds",
+        "Histogram of latency from request arrival to completion in seconds",
+        SHORT_TIME_BUCKETS,
+    ),
+]
+
+
+class ClientMetricsCollector:
+    def __init__(self, client_type: str):
+        assert client_type in ["ctx", "gen"]
+        self._client_type = client_type
+        # TODO: add server address to metric labels
+        self._counter_metrics = {
+            f"{name}": Counter(f"{self._client_type}_{name}", description)
+            for name, description in COUNTER_METRICS
+        }
+        self._histogram_metrics = {
+            f"{name}": Histogram(f"{self._client_type}_{name}", description, buckets=buckets)
+            for name, description, buckets in HISTOGRAM_METRICS
+        }
+
+    def inc(self, metric: str, amount: int = 1):
+        self._counter_metrics[metric].inc(amount)
+
+    def observe(self, metric: str, value: float):
+        self._histogram_metrics[metric].observe(value)
+
+
+class DisaggPerfMetricsCollector:
+    def __init__(self, max_requests: int):
+        self._max_requests = max_requests
+        self._keys = deque(maxlen=max_requests)
+        self._server_metrics = defaultdict(dict)
+        self._lock = asyncio.Lock()
+        self._clients = []
+
+    def add_client(self, client):
+        self._clients.append(client)
+
+    async def add_per_request_metrics(
+        self,
+        ctx_server: str,
+        gen_server: str,
+        ctx_request_id: int,
+        server_arrival_time: float,
+        server_first_token_time: float,
+    ):
+        async with self._lock:
+            self._keys.append(
+                (
+                    ctx_server,
+                    gen_server,
+                    ctx_request_id,
+                    server_arrival_time,
+                    server_first_token_time,
+                )
+            )
+
+    async def get_perf_metrics(self) -> List[Dict[str, Any]]:
+        perf_metrics = {}
+        for client in self._clients:
+            metrics_dict = await client.collect_metrics()
+            perf_metrics.update(metrics_dict)
+
+        return_metrics = []
+        async with self._lock:
+            for server, metrics_data in perf_metrics:
+                server_metrics = self._server_metrics[server]
+                # avoid metrics map inflation by limiting the number of requests to add
+                available_req_num = min(
+                    max(0, self._max_requests - len(server_metrics)), len(metrics_data)
+                )
+                req_metrics_map = {
+                    req_metrics["ctx_request_id"]: req_metrics
+                    for req_metrics in metrics_data[:available_req_num]
+                    if "ctx_request_id" in req_metrics
+                }
+                server_metrics.update(req_metrics_map)
+
+            remain_keys = []
+            for (
+                ctx_server,
+                gen_server,
+                ctx_request_id,
+                server_arrival_time,
+                server_first_token_time,
+            ) in self.perf_metrics_keys:
+                gen_perf_metrics = self._server_metrics[gen_server].pop(ctx_request_id, None)
+                if gen_perf_metrics is None:
+                    # generation not finished
+                    remain_keys.append(
+                        (
+                            ctx_server,
+                            gen_server,
+                            ctx_request_id,
+                            server_arrival_time,
+                            server_first_token_time,
+                        )
+                    )
+                    continue
+                ctx_perf_metrics = self._server_metrics[ctx_server].pop(ctx_request_id, None)
+                # TODO: strip the keys for less repeating and use table style response
+                return_metrics.append(
+                    {
+                        "ctx_server": ctx_server,
+                        "gen_server": gen_server,
+                        "disagg_server_arrival_time": server_arrival_time,
+                        "disagg_server_first_token_time": server_first_token_time,
+                        "ctx_perf_metrics": ctx_perf_metrics,
+                        "gen_perf_metrics": gen_perf_metrics,
+                    }
+                )
+            self.perf_metrics_keys = deque(remain_keys, maxlen=self.perf_metrics_max_requests)
+        return return_metrics
+
+    def inc(self, metric: str, amount: int = 1):
+        self._counter_metrics[metric].inc(amount)
+
+    def observe(self, metric: str, value: float):
+        self._histogram_metrics[metric].observe(value)
