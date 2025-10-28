@@ -19,6 +19,7 @@
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/vector.h>
 #include <tensorrt_llm/thop/attentionOp.h>
+#include <tensorrt_llm/thop/moeAlltoAllMeta.h>
 #include <torch/extension.h>
 
 namespace nb = nanobind;
@@ -28,6 +29,12 @@ namespace tensorrt_llm::nanobind::thop
 
 void initBindings(nb::module_& m)
 {
+    // Export MoE A2A constants
+    for (auto const& kv : torch_ext::getMoeA2AMetaInfoIndexPairs())
+    {
+        m.attr(kv.first) = kv.second;
+    }
+
     m.def("attention", &torch_ext::attention,
         // Parameters with default values using std::nullopt for optional arguments
         nb::arg("q"), nb::arg("k") = std::nullopt, nb::arg("v") = std::nullopt, nb::arg("output"),

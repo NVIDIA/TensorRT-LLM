@@ -55,6 +55,7 @@
         "tensorrt_llm/kernels/causalConv1d/causalConv1d.cu": "dual license",
         "tensorrt_llm/kernels/causalConv1d/causalConv1d.h": "dual license",
         "tensorrt_llm/thop/causalConv1dOp.cpp": "dual license",
+        "tensorrt_llm/common/vec_dtypes.cuh": "dual license",
         "_": "don't remove, for trailing comma"
     }
 }

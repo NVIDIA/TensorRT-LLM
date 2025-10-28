@@ -1,3 +1,14 @@
+# Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#     http://www.apache.org/licenses/LICENSE-2.0
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from collections import defaultdict
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
@@ -6,9 +17,12 @@ import torch
 from strenum import StrEnum
 from torch._prims_common import DeviceLikeType
 
+from tensorrt_llm._torch.pyexecutor.guided_decoder import GuidedDecoder
+from tensorrt_llm._torch.pyexecutor.py_executor_creator import get_guided_decoding_config
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.llmapi.llm_args import ContextChunkingPolicy
+from tensorrt_llm.llmapi.tokenizer import TokenizerBase
 
 from ...._utils import mpi_rank, mpi_world_size
 from ....bindings.internal.batch_manager import CacheType
@@ -26,7 +40,7 @@ from ...pyexecutor.scheduler import (
 )
 from ..custom_ops.attention_interface import SequenceInfo
 from ..distributed import common as dist
-from ..llm_args import AutoDeployConfig, LlmArgs
+from ..llm_args import LlmArgs
 from ..transform.optimizer import InferenceOptimizer
 from ..utils.logger import ad_logger
 from .interface import CachedSequenceInterface, GetInferenceModel
@@ -83,8 +97,8 @@ class ADEngine(ModelEngine):
         return self.cache_seq_interface.device
 
     @classmethod
-    def build_from_config(cls, ad_config: AutoDeployConfig):
-        """Build the ADEngine using the AutoDeployConfig that gets passed through from the LLM."""
+    def build_from_config(cls, ad_config: LlmArgs):
+        """Build the ADEngine using the LlmArgs that gets passed through from the LLM."""
 
         max_batch_size = ad_config.max_batch_size
         max_seq_len = ad_config.max_seq_len
@@ -98,15 +112,16 @@ class ADEngine(ModelEngine):
             device = torch.device(f"cuda:{torch.cuda.current_device()}")
         device = str(device)
 
+        factory = ad_config.create_factory()
+
         # initialize seq info object
         seq_info = SequenceInfo(
             max_seq_len=max_seq_len,
             max_batch_size=max_batch_size,
             page_size=attn_page_size,
             max_num_tokens=max_num_tokens,
+            vocab_size_padded=factory.vocab_size_padded,
         )
-
-        factory = ad_config.create_factory()
 
         # TODO (lucaslie): consider how we move args around InferenceOptimizer.__init__,
         # ADEngine.__init__, and ADEngine.build_from_config. Seems a bit unnatural atm.
@@ -294,8 +309,9 @@ class ADEngine(ModelEngine):
         return {"logits": logits_flat}
 
 
-def create_autodeploy_executor(ad_config: LlmArgs):
-    """Create an AutoDeploy executor from the given configuration and checkpoint directory.
+def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[TokenizerBase] = None):
+    """Create an AutoDeploy executor from the given configuration and tokenizer.
+    The tokenizer is required for guided decoding.
 
     This is the entrypoint API to the _autodeploy backend.
     """
@@ -402,6 +418,25 @@ def create_autodeploy_executor(ad_config: LlmArgs):
     )
     sampler = TorchSampler(sampler_args)
 
+    # Guided (istructured) decoding.
+    guided_decoder = None
+    if (
+        (guided_decoding_backend := ad_config.guided_decoding_backend) is not None
+    ) and dist_mapping.is_last_pp_rank():
+        vocab_size_padded = engine.cache_seq_interface.info.vocab_size_padded
+        if vocab_size_padded is None:
+            raise RuntimeError(
+                "Could not determine the vocabulary size. Required for guided decoding."
+            )
+        guided_decoding_config = get_guided_decoding_config(
+            guided_decoding_backend=guided_decoding_backend, tokenizer=tokenizer
+        )
+        guided_decoder = GuidedDecoder(
+            guided_decoding_config=guided_decoding_config,
+            max_num_sequences=ad_config.max_batch_size,
+            vocab_size_padded=vocab_size_padded,
+        )
+
     # creating the executor object
     py_executor = PyExecutor(
         resource_manager,
@@ -416,5 +451,6 @@ def create_autodeploy_executor(ad_config: LlmArgs):
         max_draft_len=max_draft_len,
         max_total_draft_tokens=max_total_draft_tokens,
         max_beam_width=ad_config.max_beam_width,
+        guided_decoder=guided_decoder,
     )
     return py_executor

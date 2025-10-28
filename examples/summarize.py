@@ -211,6 +211,7 @@ def main(args):
     repetition_penalty = args.repetition_penalty
     presence_penalty = args.presence_penalty
     frequency_penalty = args.frequency_penalty
+    prompt_ignore_length = args.prompt_ignore_length
     random_seed = args.random_seed
     torch.manual_seed(random_seed)
 
@@ -353,6 +354,7 @@ def main(args):
                     repetition_penalty=repetition_penalty,
                     presence_penalty=presence_penalty,
                     frequency_penalty=frequency_penalty,
+                    prompt_ignore_length=prompt_ignore_length,
                     lora_uids=args.lora_task_uids,
                     lookahead_config=args.lookahead_config,
                     output_sequence_lengths=True,

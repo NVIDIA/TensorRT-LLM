@@ -6,12 +6,12 @@ import time
 from concurrent.futures import ProcessPoolExecutor
 
 import pytest
-from test_base_worker import create_fake_executor_config
 
 from tensorrt_llm.executor.request import GenerationRequest
 from tensorrt_llm.executor.rpc import RPCClient
 from tensorrt_llm.executor.rpc.rpc_common import get_unique_ipc_addr
 from tensorrt_llm.executor.rpc_worker import RpcWorker
+from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -28,8 +28,12 @@ assert model_path.exists()
 class TestRpcWorkerTP1:
 
     def setup_method(self):
-        self.llm_args, self.executor_config = create_fake_executor_config(
-            model_path)
+        self.llm_args = TorchLlmArgs(
+            model=model_path,
+            tensor_parallel_size=1,
+            backend='pytorch',
+            enable_iter_perf_stats=True,
+        )
         self.pool, self.addr = self.create_worker_pool()
         self.client = self.create_rpc_client(self.addr)
         self.client.setup_engine().remote()
@@ -50,7 +54,6 @@ class TestRpcWorkerTP1:
             RpcWorker.main_task,
             engine=model_path,
             rpc_addr=addr,
-            executor_config=self.executor_config,
             llm_args=self.llm_args,
             hf_model_dir=model_path,
         )
@@ -200,8 +203,12 @@ class TestRpcWorkerTP1:
 class TestRpcWorkerTP2:
 
     def setup_method(self):
-        self.llm_args, self.executor_config = create_fake_executor_config(
-            model_path, tp_size=2)
+        self.llm_args = TorchLlmArgs(
+            model=model_path,
+            tensor_parallel_size=2,
+            backend='pytorch',
+            enable_iter_perf_stats=True,
+        )
         self.session, self.addr, self.futures = self.create_worker_session()
         self.client = self.create_rpc_client(self.addr)
         self.client.setup_engine().remote()
@@ -218,7 +225,6 @@ class TestRpcWorkerTP2:
         futures = session.submit(RpcWorker.main_task,
                                  engine=model_path,
                                  rpc_addr=addr,
-                                 executor_config=self.executor_config,
                                  llm_args=self.llm_args,
                                  hf_model_dir=model_path,
                                  model_world_size=2)

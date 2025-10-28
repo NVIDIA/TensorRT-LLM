@@ -18,12 +18,18 @@ from tensorrt_llm.llmapi import (EagleDecodingConfig, LookaheadDecodingConfig,
                                  MedusaDecodingConfig)
 from tensorrt_llm.quantization import QuantAlgo
 
-from ..conftest import (llm_models_root, parametrize_with_ids, skip_no_nvls,
-                        skip_post_blackwell, skip_pre_ada, skip_pre_blackwell,
-                        skip_pre_hopper)
+from ..conftest import (get_sm_version, llm_models_root, parametrize_with_ids,
+                        skip_no_nvls, skip_post_blackwell, skip_pre_ada,
+                        skip_pre_blackwell, skip_pre_hopper)
 from .accuracy_core import (MMLU, CliFlowAccuracyTestHarness, CnnDailymail,
                             Humaneval, PassKeyRetrieval64k,
                             PassKeyRetrieval128k, SlimPajama6B, ZeroScrolls)
+
+# skip trt flow cases on post-Blackwell-Ultra
+if get_sm_version() >= 103:
+    pytest.skip(
+        "TRT workflow tests are not supported on post Blackwell-Ultra architecture",
+        allow_module_level=True)
 
 
 class TestGpt2(CliFlowAccuracyTestHarness):

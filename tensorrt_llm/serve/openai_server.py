@@ -28,7 +28,7 @@ from tensorrt_llm.inputs.data import TokensPrompt
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
-from tensorrt_llm.llmapi import MultimodalEncoder
+from tensorrt_llm.llmapi import MultimodalEncoder, tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole)
 from tensorrt_llm.llmapi.llm import RequestOutput
@@ -541,6 +541,8 @@ class OpenAIServer:
                 postproc_args=postproc_args,
             )
 
+            trace_headers = (None if raw_request is None else tracing.extract_trace_headers(raw_request.headers))
+
             promise = self.llm.generate_async(
                 inputs=prompt,
                 sampling_params=sampling_params,
@@ -549,6 +551,7 @@ class OpenAIServer:
                 lora_request=request.lora_request,
                 disaggregated_params=disaggregated_params,
                 cache_salt=request.cache_salt,
+                trace_headers=trace_headers,
             )
             asyncio.create_task(self.await_disconnected(raw_request, promise))
             if not self.postproc_worker_enabled:
@@ -763,6 +766,7 @@ class OpenAIServer:
                     if request.stream else completion_response_post_processor,
                     postproc_args=postproc_args,
                 )
+                trace_headers = (None if raw_request is None else tracing.extract_trace_headers(raw_request.headers))
 
                 prompt = prompt_inputs(prompt)
                 if prompt.get("prompt") is not None:
@@ -777,7 +781,8 @@ class OpenAIServer:
                     _postproc_params=postproc_params,
                     streaming=request.stream,
                     lora_request=request.lora_request,
-                    disaggregated_params=disaggregated_params
+                    disaggregated_params=disaggregated_params,
+                    trace_headers=trace_headers
                 )
                 asyncio.create_task(self.await_disconnected(raw_request, promise))
                 if not self.postproc_worker_enabled:

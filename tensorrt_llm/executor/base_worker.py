@@ -130,6 +130,7 @@ class BaseWorker(GenerationExecutor):
                 create_executor = create_autodeploy_executor
                 assert isinstance(self.llm_args, ADLlmArgs)
                 args["ad_config"] = self.llm_args.get_pytorch_backend_config()
+                args["tokenizer"] = self._tokenizer
             else:
                 raise ValueError(
                     f"Unsupported backend config: {self.llm_args.backend}")
@@ -886,7 +887,15 @@ def _get_metrics_dict(
                 req_perf_metrics.timing_metrics.first_scheduled_time.
                 total_seconds(),
                 RequestEventTiming.LAST_TOKEN_TIME:
-                req_perf_metrics.timing_metrics.last_token_time.total_seconds()
+                req_perf_metrics.timing_metrics.last_token_time.total_seconds(),
+                RequestEventTiming.KV_CACHE_TRANSFER_START:
+                req_perf_metrics.timing_metrics.kv_cache_transfer_start.
+                total_seconds(),
+                RequestEventTiming.KV_CACHE_TRANSFER_END:
+                req_perf_metrics.timing_metrics.kv_cache_transfer_end.
+                total_seconds(),
+                RequestEventTiming.KV_CACHE_SIZE:
+                req_perf_metrics.timing_metrics.kv_cache_size,
             }
     return metrics_dict
 

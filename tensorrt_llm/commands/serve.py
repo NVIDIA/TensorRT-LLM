@@ -91,6 +91,7 @@ def get_llm_args(model: str,
                  trust_remote_code: bool = False,
                  reasoning_parser: Optional[str] = None,
                  fail_fast_on_attention_window_too_large: bool = False,
+                 otlp_traces_endpoint: Optional[str] = None,
                  enable_chunked_prefill: bool = False,
                  **llm_args_extra_dict: Any):
 
@@ -134,6 +135,7 @@ def get_llm_args(model: str,
         "reasoning_parser": reasoning_parser,
         "fail_fast_on_attention_window_too_large":
         fail_fast_on_attention_window_too_large,
+        "otlp_traces_endpoint": otlp_traces_endpoint,
         "enable_chunked_prefill": enable_chunked_prefill,
     }
 
@@ -322,6 +324,10 @@ class ChoiceWithAlias(click.Choice):
     help=
     "Exit with runtime error when attention window is too large to fit even a single sequence in the KV cache."
 )
+@click.option("--otlp_traces_endpoint",
+              type=str,
+              default=None,
+              help="Target URL to which OpenTelemetry traces will be sent.")
 @click.option("--disagg_cluster_uri",
               type=str,
               default=None,
@@ -344,8 +350,8 @@ def serve(
         extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
         metadata_server_config_file: Optional[str], server_role: Optional[str],
         fail_fast_on_attention_window_too_large: bool,
-        enable_chunked_prefill: bool, disagg_cluster_uri: Optional[str],
-        media_io_kwargs: Optional[str]):
+        otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
+        disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -371,6 +377,7 @@ def serve(
         reasoning_parser=reasoning_parser,
         fail_fast_on_attention_window_too_large=
         fail_fast_on_attention_window_too_large,
+        otlp_traces_endpoint=otlp_traces_endpoint,
         enable_chunked_prefill=enable_chunked_prefill)
 
     llm_args_extra_dict = {}

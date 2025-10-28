@@ -343,11 +343,19 @@ class SimpleGroupedStrategySampler(GroupedStrategySampler[Strategy]):
         )
 
 
+class _AcceptSyncCompute:
+    pass
+
+
+ACCEPT_SYNC_COMPUTE = _AcceptSyncCompute()
+
+
 # Inspired by https://github.com/pytorch/pytorch/issues/80577; note also the
 # suggestion to consider torch.nested.
 def torch_multi_arange(
     ends: torch.Tensor,
     *,
+    output_length: int | _AcceptSyncCompute,
     starts: Optional[torch.Tensor] = None,
     steps: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -355,13 +363,23 @@ def torch_multi_arange(
 
     Starts, ends, steps need to share dtype and shape. Invalid ranges like range(1, 2, -1) are
     silently discarded. 'steps' defaults to 1 and 'starts' defaults to 0.
+
+    Provide 'output_length' to avoid synchronization when using device tensors or pass
+    `ACCEPT_SYNC_COMPUTE` to explicitly accept the possibility of a device sync (for device tensors)
+    or when tensors are known to reside on the host.
     """
     if steps is not None:
         assert ends.dtype == steps.dtype
         assert ends.shape == steps.shape
+        assert ends.device == steps.device
     if starts is not None:
         assert ends.dtype == starts.dtype
         assert ends.shape == starts.shape
+        assert ends.device == starts.device
+    output_length_arg = None if isinstance(output_length, _AcceptSyncCompute) else output_length
+
+    if ends.numel() == 0:
+        return ends.clone()
 
     # This algorithm combines torch.repeat_interleaved() and torch.cumsum() to
     # construct the result.
@@ -378,29 +396,37 @@ def torch_multi_arange(
         repeats = repeats.clone()
         repeats -= starts
     if steps is not None:
-        repeats = (repeats + steps - 1).div(steps, rounding_mode="floor")
-    repeats = repeats.clip(0)  # ignore invalid ranges
+        repeats *= steps.sign()
+        steps_abs = steps.abs()
+        repeats = (repeats + steps_abs - 1).div(steps_abs, rounding_mode="floor")
+    repeats = repeats.clip(min=0)  # ignore invalid ranges
     range_ends = repeats - 1  # last element in each range
     if steps is not None:
         range_ends *= steps
     if starts is not None:
         range_ends += starts
     prev_range_ends = range_ends.roll(1)  # last element in preceding range (or 0)
-    prev_range_ends[0] = 0
-    ones = (
-        torch.tensor(1, dtype=ends.dtype, pin_memory=True)
-        .to(device=ends.device, non_blocking=True)
-        .broadcast_to(ends.shape)
-    )
+    prev_range_ends[0].fill_(0)
+    ones = torch.ones((), dtype=ends.dtype, device=ends.device)
+    zeros = torch.zeros((), dtype=ends.dtype, device=ends.device)
     if steps is None:
-        steps = ones
+        steps = ones.broadcast_to(ends.shape)
     jumps = -prev_range_ends  # delta from one range to the next
     if starts is not None:
         jumps += starts
+    #     NB: Apply correction for empty ranges
+    jumps_corrections = torch.where(repeats == 0, jumps, zeros).cumsum(0, dtype=ends.dtype)
+    jumps += jumps_corrections
     seq = torch.cat((jumps.unsqueeze(-1), steps.unsqueeze(-1)), dim=1).view(-1)
     #
     # 2. Construct output via torch.repeat_interleave() and torch.cumsum()
-    seq_repeats = torch.cat((ones.unsqueeze(-1), (repeats - 1).unsqueeze(-1)), dim=1).view(-1)
-    seq = seq.repeat_interleave(seq_repeats)
-    seq = seq.cumsum(0)
+    #     NB: For a resulting empty range, repeats - 1 == -1. In this case, we
+    #         should set repeats for delta and increment both to 0 instead.
+    jump_repeats = torch.where(repeats == 0, zeros, ones)
+    step_repeats = torch.where(repeats == 0, zeros, repeats - 1)
+    seq_repeats = torch.cat((jump_repeats.unsqueeze(-1), step_repeats.unsqueeze(-1)), dim=1).view(
+        -1
+    )
+    seq = seq.repeat_interleave(seq_repeats, output_size=output_length_arg)
+    seq = seq.cumsum(0, dtype=ends.dtype)
     return seq
