@@ -91,7 +91,6 @@ def get_llm_args(model: str,
                  num_postprocess_workers: int = 0,
                  trust_remote_code: bool = False,
                  reasoning_parser: Optional[str] = None,
-                 tool_parser: Optional[str] = None,
                  fail_fast_on_attention_window_too_large: bool = False,
                  otlp_traces_endpoint: Optional[str] = None,
                  enable_chunked_prefill: bool = False,
@@ -135,7 +134,6 @@ def get_llm_args(model: str,
         "num_postprocess_workers": num_postprocess_workers,
         "postprocess_tokenizer_dir": tokenizer or model,
         "reasoning_parser": reasoning_parser,
-        "tool_parser": tool_parser,
         "fail_fast_on_attention_window_too_large":
         fail_fast_on_attention_window_too_large,
         "otlp_traces_endpoint": otlp_traces_endpoint,
@@ -149,6 +147,7 @@ def launch_server(
         host: str,
         port: int,
         llm_args: dict,
+        tool_parser: Optional[str] = None,
         metadata_server_cfg: Optional[MetadataServerConfig] = None,
         server_role: Optional[ServerRole] = None,
         disagg_cluster_config: Optional[DisaggClusterConfig] = None,
@@ -172,6 +171,7 @@ def launch_server(
 
     server = OpenAIServer(llm=llm,
                           model=model,
+                          tool_parser=tool_parser,
                           server_role=server_role,
                           metadata_server_cfg=metadata_server_cfg,
                           disagg_cluster_config=disagg_cluster_config,
@@ -385,7 +385,6 @@ def serve(
         num_postprocess_workers=num_postprocess_workers,
         trust_remote_code=trust_remote_code,
         reasoning_parser=reasoning_parser,
-        tool_parser=tool_parser,
         fail_fast_on_attention_window_too_large=
         fail_fast_on_attention_window_too_large,
         otlp_traces_endpoint=otlp_traces_endpoint,
@@ -430,8 +429,8 @@ def serve(
 
     multimodal_server_config = MultimodalServerConfig(
         media_io_kwargs=parsed_media_io_kwargs)
-    launch_server(host, port, llm_args, metadata_server_cfg, server_role,
-                  disagg_cluster_config, multimodal_server_config)
+    launch_server(host, port, llm_args, tool_parser, metadata_server_cfg,
+                  server_role, disagg_cluster_config, multimodal_server_config)
 
 
 @click.command("mm_embedding_serve")
