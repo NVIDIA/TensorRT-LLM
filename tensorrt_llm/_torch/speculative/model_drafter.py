@@ -548,6 +548,12 @@ class ModelDrafter(Drafter):
             for req in scheduled_batch.all_requests()
         }
 
+        for request in draft_batch.all_requests():
+            target_model_req = req_id_to_old_request[request.py_request_id]
+            if target_model_req.is_context_init_state:
+                continue
+            target_model_req.py_draft_tokens = [0] * self.max_draft_len
+
         self.draft_seq_slot_manager.prepare_resources(draft_batch)
         return draft_batch, req_id_to_old_request
 
