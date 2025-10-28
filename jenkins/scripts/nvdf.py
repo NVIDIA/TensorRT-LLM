@@ -301,3 +301,6 @@ class NVDF:
         except Exception as e:
             NVDF.logger.warning(f"Failed to query PR IDs from NVDF: {e}")
             return []
+
+
+print(NVDF.queryBuildIdFromNVDataFlow("LLM/main/L0_MergeRequest_PR"))
