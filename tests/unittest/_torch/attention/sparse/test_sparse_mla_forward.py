@@ -283,10 +283,13 @@ def calculate_reference_output_mixed(q_ctx, q_gen, kv_c_all, k_pe_all, W_UK,
 @pytest.mark.skipif(get_sm_version() < 90,
                     reason="FlashMLA requires SM90 (Hopper) or later")
 @pytest.mark.parametrize("batch_name", list(BATCH_SPECS.keys()))
-@pytest.mark.parametrize("kv_cache_dtype", ["auto"])  # TODO: Add "fp8" support
-def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype):
+@pytest.mark.parametrize("kv_cache_dtype",
+                         ["auto", "fp8"])  # TODO: Add "fp8" support
+def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str):
     """Test sparse MLA attention for pure prefill, pure decode, and mixed batches."""
-    print(f"\n{'='*80}\nTesting: {batch_name}\n{'='*80}")
+    print(
+        f"\n{'='*80}\nTesting: {batch_name} kv_cache_dtype: {kv_cache_dtype}\n{'='*80}"
+    )
 
     device = torch.device('cuda')
     dtype = torch.bfloat16
@@ -393,8 +396,6 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype):
     if kv_cache_dtype == "auto":
         cache_dtype = dtype
     elif kv_cache_dtype == "fp8":
-        # TODO: Implement FP8 quantization for MLA cache
-        pytest.skip("fp8 cache dtype not yet supported with FlashMLA backend")
         cache_dtype = torch.float8_e4m3fn
     else:
         cache_dtype = dtype
@@ -871,13 +872,19 @@ if __name__ == "__main__":
     # Test pure prefill
     test_forward_sparse_mla_unified(batch_name="small_prefill",
                                     kv_cache_dtype="auto")
+    test_forward_sparse_mla_unified(batch_name="small_prefill",
+                                    kv_cache_dtype="fp8")
 
     # Test pure decode
     test_forward_sparse_mla_unified(batch_name="small_decode",
                                     kv_cache_dtype="auto")
+    test_forward_sparse_mla_unified(batch_name="small_decode",
+                                    kv_cache_dtype="fp8")
 
     # TODO: Mixed batch test - generation reference needs sparse attention masking
     test_forward_sparse_mla_unified(batch_name="small_mixed",
                                     kv_cache_dtype="auto")
+    test_forward_sparse_mla_unified(batch_name="small_mixed",
+                                    kv_cache_dtype="fp8")
 
     print("All tests passed!")
