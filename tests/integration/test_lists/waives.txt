@@ -403,3 +403,6 @@ full:RTX/accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_2gpus[dp2-trtllm-
 examples/test_phi.py::test_llm_phi_lora_1gpu[Phi-3-mini-4k-instruct-ru-lora-Phi-3-mini-4k-instruct-lora_fp16-base_fp16] SKIP (https://nvbugs/5612313)
 accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_auto_dtype[False] SKIP (https://nvbugs/5569696)
 accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_auto_dtype[True] SKIP (https://nvbugs/5569696)
+test_e2e.py::test_trtllm_serve_multimodal_example SKIP (https://nvbugs/5596377)
+test_e2e.py::test_openai_chat_multimodal_example SKIP (https://nvbugs/5596377)
+unittest/llmapi/test_llm_multi_gpu_pytorch.py::test_llm_rpc_streaming_tp2 SKIP (https://nvbugs/5594753)
