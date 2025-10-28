@@ -9,7 +9,6 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers import AutoModelForCausalLM
 
-from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
 from tensorrt_llm._torch.auto_deploy.models.patches.bamba import _bamba_mixer_torch_forward
 
 
@@ -148,13 +147,13 @@ def _set_sharding_config_patched(self, *args, **kwargs):
         "in_proj": "mamba",
         "out_proj": "rowwise",
         "up_proj": "colwise",
-        # "gate_proj": "colwise",
+        "gate_proj": "colwise",
         "down_proj": "rowwise",
-        # "*": "gather",
+        "*": "gather",
     }
 
 
-AutoModelForCausalLMFactory._set_sharding_config = _set_sharding_config_patched
+# AutoModelForCausalLMFactory._set_sharding_config = _set_sharding_config_patched
 
 # TODO: figure out how this can be incorporated into the export patch system
 AutoModelForCausalLM.from_config = get_model_from_config_patched

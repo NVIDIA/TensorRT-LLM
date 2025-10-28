@@ -271,6 +271,10 @@ def filtered_nodes(
                 yield node
 
 
+def is_any_lin_op(node: Node) -> bool:
+    return is_linear_op(node) or is_fake_quantized_linear_op(node)
+
+
 def is_linear_op(node: Node) -> bool:
     """Check if the node is a linear op.
 

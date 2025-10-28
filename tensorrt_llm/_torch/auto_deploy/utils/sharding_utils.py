@@ -18,7 +18,7 @@ from ..utils.logger import ad_logger
 from .node_utils import (
     bfs,
     extract_param_names_from_node,
-    is_linear_op,
+    is_any_lin_op,
     is_op,
     num_users_of_weight_node,
     subgraph,
@@ -80,7 +80,7 @@ def _validate_sharded_shapes(
     """
 
     # get the subgraph of this module. Subgraph boundary is the next linear node.
-    next_lin_node, _ = bfs(node, is_linear_op, include_root=False)
+    next_lin_node, _ = bfs(node, is_any_lin_op, include_root=False)
     nodes_to_validate = subgraph(
         [node],
         [next_lin_node],
@@ -261,7 +261,7 @@ def _insert_sharded_mamba(
     """
     # Find next linear node to define subgraph boundary
     try:
-        next_lin_node, depth = bfs(entry_node, is_linear_op, include_root=False)
+        next_lin_node, depth = bfs(entry_node, is_any_lin_op, include_root=False)
     except RuntimeError:
         ad_logger.warning("Could not find next linear node after entry_node for Mamba sharding")
         return False
@@ -478,7 +478,7 @@ def _shard_parameter_node(
 
     # # # column shard with no gather: the output is sharded
     if not add_dist:
-        if is_linear_op(node):
+        if is_any_lin_op(node):
             _validate_sharded_shapes(
                 node, fused_weight_dims=fused_weight_dims, world_size=world_size
             )
@@ -700,6 +700,9 @@ class QuantizationShardingMixin(ABC):
                 self.shard_load_hook,
                 weight_name=weight_key,
                 weight_shape=weight_new_shape,
+                dim=dim,
+                rank=rank,
+                world_size=world_size,
             )
         )
 
