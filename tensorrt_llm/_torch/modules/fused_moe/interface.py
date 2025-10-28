@@ -181,6 +181,7 @@ class MoE(nn.Module):
 
         # All ranks participate in allreduce regardless of EP/TP combination
         self.mapping = model_config.mapping
+        self.parallel_rank = self.mapping.tp_rank
         self.parallel_size = self.mapping.tp_size
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
 
