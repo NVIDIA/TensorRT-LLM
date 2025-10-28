@@ -133,7 +133,7 @@ class ADEngine(ModelEngine):
         self.llm_args.enable_iter_perf_stats = False
         self.llm_args.enable_iter_req_stats = False
         self.llm_args.stream_interval = 1
-        self.llm_args.attention_dp_enable_balance = False
+        self.llm_args.attention_dp_config = None
         self.llm_args.batch_wait_timeout_ms = 0
         self.llm_args.batch_wait_timeout_iters = 0
         self.llm_args.batch_wait_max_tokens_ratio = 0.0
