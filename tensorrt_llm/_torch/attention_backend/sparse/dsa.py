@@ -305,6 +305,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         capture_graph = torch.cuda.is_current_stream_capturing()
 
         self.indexer_k_cache_block_offsets = self.get_empty(
+            self.cuda_graph_buffers,
             [self.max_num_sequences, self.kv_cache_manager.max_blocks_per_seq],
             cache_name="indexer_k_cache_block_offsets",
             dtype=torch.int32,
@@ -318,7 +319,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # For mla_rope_append_paged_kv_assign_q
         if not self.enable_context_mla_with_cached_kv:
             self.ctx_cached_token_indptr = self.get_empty(
-                (self.max_num_requests + 1, ),
+                self.cuda_graph_buffers, (self.max_num_requests + 1, ),
                 cache_name="ctx_cached_token_indptr",
                 dtype=torch.int64,
                 capture_graph=capture_graph)
@@ -327,7 +328,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 device='cpu',
                 pin_memory=True,
             )
-            self.ctx_kv_indptr = self.get_empty((self.max_num_requests + 1, ),
+            self.ctx_kv_indptr = self.get_empty(self.cuda_graph_buffers,
+                                                (self.max_num_requests + 1, ),
                                                 cache_name="ctx_kv_indptr",
                                                 dtype=torch.int64,
                                                 capture_graph=capture_graph)
@@ -338,7 +340,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             )
         # New generation buffers for dsa
         self.gen_cached_token_indptr = self.get_empty(
-            (self.max_num_requests + 1, ),
+            self.cuda_graph_buffers, (self.max_num_requests + 1, ),
             cache_name="gen_cached_token_indptr",
             dtype=torch.int64,
             capture_graph=capture_graph)
@@ -347,7 +349,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             device='cpu',
             pin_memory=True,
         )
-        self.gen_kv_indptr = self.get_empty((self.max_num_requests + 1, ),
+        self.gen_kv_indptr = self.get_empty(self.cuda_graph_buffers,
+                                            (self.max_num_requests + 1, ),
                                             cache_name="gen_kv_indptr",
                                             dtype=torch.int64,
                                             capture_graph=capture_graph)
@@ -358,7 +361,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         )
         # Indexer metadata
         # Separate slot mappings for non-interleaved layout (flat byte indices)
-        self.slot_mapping_fp8 = self.get_empty((self.max_num_tokens, ),
+        self.slot_mapping_fp8 = self.get_empty(self.cuda_graph_buffers,
+                                               (self.max_num_tokens, ),
                                                cache_name="slot_mapping_fp8",
                                                dtype=torch.int64,
                                                capture_graph=capture_graph)
@@ -368,7 +372,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             pin_memory=True,
         )
         self.slot_mapping_scale = self.get_empty(
-            (self.max_num_tokens, ),
+            self.cuda_graph_buffers, (self.max_num_tokens, ),
             cache_name="slot_mapping_scale",
             dtype=torch.int64,
             capture_graph=capture_graph)
@@ -378,26 +382,30 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             pin_memory=True,
         )
         # Per-token request index buffer for topk_indices conversion
-        self.req_idx_per_token = self.get_empty((self.max_num_tokens, ),
+        self.req_idx_per_token = self.get_empty(self.cuda_graph_buffers,
+                                                (self.max_num_tokens, ),
                                                 cache_name="req_idx_per_token",
                                                 dtype=torch.int32,
                                                 capture_graph=capture_graph)
         # Block table for topk_indices conversion (shared for context and generation)
         self.block_table = self.get_empty(
+            self.cuda_graph_buffers,
             (self.max_num_requests, self.kv_cache_manager.max_blocks_per_seq),
             cache_name="block_table",
             dtype=torch.int32,
             capture_graph=capture_graph)
         self.scheduler_metadata_buffer = self.get_empty(
-            (self.num_sms + 1, 2),
+            self.cuda_graph_buffers, (self.num_sms + 1, 2),
             cache_name="scheduler_metadata_buffer",
             dtype=torch.int32,
             capture_graph=capture_graph)
-        self.cu_seqlen_ks = self.get_empty((self.max_num_tokens, ),
+        self.cu_seqlen_ks = self.get_empty(self.cuda_graph_buffers,
+                                           (self.max_num_tokens, ),
                                            cache_name="cu_seqlen_ks",
                                            dtype=torch.int32,
                                            capture_graph=capture_graph)
-        self.cu_seqlen_ke = self.get_empty((self.max_num_tokens, ),
+        self.cu_seqlen_ke = self.get_empty(self.cuda_graph_buffers,
+                                           (self.max_num_tokens, ),
                                            cache_name="cu_seqlen_ke",
                                            dtype=torch.int32,
                                            capture_graph=capture_graph)
