@@ -262,7 +262,12 @@ def get_expected_outputs(start_token: int,
 
 @pytest.fixture(scope="module")
 def fixed_params():
-    return {"max_tokens": 4, "max_beam_width": 2}
+    return {"max_tokens": 8, "max_beam_width": 2}
+
+
+@pytest.fixture(scope="module", params=["TRTLLMSampler", "TorchSampler"])
+def sampler_type(request):
+    return request.param
 
 
 @pytest.fixture(scope="module")
@@ -289,17 +294,20 @@ def _build_llm(fixed_params, input_prompts, model_kwargs):
         max_beam_width=fixed_params["max_beam_width"],
         disable_overlap_scheduler=True,
         cuda_graph_config=None,
+        sampler_type=sampler_type,
     )
 
 
 @pytest.fixture(scope="module")
 def llm(fixed_params, input_prompts, model_kwargs):
     return _build_llm(fixed_params, input_prompts, model_kwargs)
+    yield llm
+    llm.shutdown()
 
 
 @pytest.fixture(scope="module")
-def llm_cuda_graph(fixed_params, input_prompts, model_kwargs):
-    return LLM(
+def llm_cuda_graph(fixed_params, input_prompts, sampler_type, model_kwargs):
+    llm = LLM(
         **model_kwargs,
         kv_cache_config=KvCacheConfig(max_tokens=10000),
         max_batch_size=fixed_params["max_beam_width"] * len(
@@ -435,7 +443,7 @@ def test_beam_search_output_shapes(gather_context_logits: bool,
                                    return_log_probs: bool,
                                    num_output_beams: int, num_prompts: int, llm,
                                    fixed_params, input_prompts) -> None:
-    if return_log_probs and num_prompts > 1:
+    if return_log_probs and num_prompts > 1 and llm.args.sampler_type == "TRTLLMSampler":
         pytest.skip(
             "Beam search currently does not support return_log_probs with multiple prompts"
         )
@@ -466,7 +474,7 @@ def test_beam_search_output_shapes_cuda_graph_and_overlap(
         gather_context_logits: bool, gather_generation_logits: bool,
         return_log_probs: bool, num_output_beams: int, num_prompts: int,
         llm_cuda_graph, fixed_params, input_prompts) -> None:
-    if return_log_probs and num_prompts > 1:
+    if return_log_probs and num_prompts > 1 and llm_cuda_graph.args.sampler_type == "TRTLLMSampler":
         pytest.skip(
             "Beam search currently does not support return_log_probs with multiple prompts"
         )

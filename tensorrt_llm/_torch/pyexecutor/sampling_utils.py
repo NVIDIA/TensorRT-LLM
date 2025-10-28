@@ -38,11 +38,43 @@ TopK: TypeAlias = tuple[Literal["top_k"], int, float]
 TopP: TypeAlias = tuple[Literal["top_p"], float, float]
 TopKTopP: TypeAlias = tuple[Literal["top_k_top_p"], int, float, float]
 Greedy: TypeAlias = tuple[Literal["greedy"], None]
-BeamSearchForPrefill: TypeAlias = tuple[Literal["beam_search_for_prefill"], int]
-BeamSearch: TypeAlias = tuple[Literal["beam_search"], int]
+BeamSearchForPrefill: TypeAlias = tuple[Literal["beam_search_for_prefill"], int, float]
+BeamSearch: TypeAlias = tuple[Literal["beam_search"], int, float]
 GREEDY: Greedy = ("greedy", None)
 
 Strategy: TypeAlias = TopK | TopP | Greedy | TopKTopP | TemperatureOnly | BeamSearchForPrefill | BeamSearch
+
+
+@dataclass(kw_only=True)
+class StrategyMetadata:
+    pass
+
+
+@dataclass(kw_only=True)
+class BeamSearchMetadata(StrategyMetadata):
+    cache_indirection: torch.Tensor
+    cache_indirection_buffer: torch.Tensor
+    cum_log_probs: torch.Tensor
+    seq_slots: torch.Tensor
+    seq_lens: torch.Tensor
+    finished_beams: torch.Tensor
+    end_ids: torch.Tensor
+
+
+@dataclass(kw_only=True)
+class StrategyMetadata:
+    pass
+
+
+@dataclass(kw_only=True)
+class BeamSearchMetadata(StrategyMetadata):
+    cache_indirection: torch.Tensor
+    cache_indirection_buffer: torch.Tensor
+    cum_log_probs: torch.Tensor
+    seq_slots: torch.Tensor
+    seq_lens: torch.Tensor
+    finished_beams: torch.Tensor
+    end_ids: torch.Tensor
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -64,13 +96,10 @@ def resolve_sampling_strategy(params: UtilsSamplingParams, *, vocab_size: int) -
     top_p = params.top_p
     top_k = params.top_k
 
-    if beam_width is not None and beam_width > 1:
-        if params.is_context_init_state:
-            return ("beam_search_for_prefill", beam_width)
-        else:
-            return ("beam_search", beam_width)
+    # Beam width defaults to 1 if not specified
+    beam_width = beam_width or 1
 
-    if SamplingParams.params_imply_greedy_decoding(
+    if beam_width <= 1 and SamplingParams.params_imply_greedy_decoding(
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
@@ -80,6 +109,13 @@ def resolve_sampling_strategy(params: UtilsSamplingParams, *, vocab_size: int) -
     # --- resolving default values
     # NB: not greedy, hence temperature != 0 if specified
     temperature = temperature or 1.0
+
+    # Beam search does not rely on top_p or top_k, so we can return the strategy here
+    if beam_width > 1:
+        if params.is_context_init_state:
+            return ("beam_search_for_prefill", beam_width, temperature)
+        else:
+            return ("beam_search", beam_width, temperature)
 
     # NB: not greedy, hence top_p != 0 if specified
     top_p = top_p or 1.0
@@ -238,32 +274,24 @@ def greedy_search_sampling_batch(
     return next_tokens, softmax
 
 
-@dataclass(kw_only=True, frozen=True)
-class BeamSearchArgs:
-    cache_indirection: torch.Tensor
-    cache_indirection_buffer: torch.Tensor
-    beam_scores: torch.Tensor
-    seq_slots: torch.Tensor
-    seq_lens: torch.Tensor
-
-
 def update_cache_indirection_buffer(
     cache_indirection_input: torch.Tensor,
     cache_indirection_output: torch.Tensor,
     seq_slots: torch.Tensor,
 ) -> None:
-    for seq_slot in seq_slots:
-        cache_indirection_input[seq_slot].copy_(
-            cache_indirection_output[seq_slot], non_blocking=False
-        )
+    assert cache_indirection_input.device == cache_indirection_output.device, (
+        "cache_indirection_input and cache_indirection_output must be on the same device"
+    )
+    cache_indirection_input[seq_slots] = cache_indirection_output[seq_slots]
 
 
 def beam_search_sampling_batch(
     logits: torch.Tensor,
     beam_width: int,
-    beam_search_args: BeamSearchArgs,
-    temperature: float = 1.0,
+    beam_search_args: BeamSearchMetadata,
+    temperature: float,
     generator: Optional[torch.Generator] = None,
+    return_probs: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Sample <beam_width> tokens for each request in parallel.
@@ -276,7 +304,10 @@ def beam_search_sampling_batch(
     batch_size = batch_size // beam_width
 
     # compute probability distribution
-    softmax = torch.softmax(logits.view(batch_size, beam_width, vocab_size), dim=-1)
+    logits = logits.view(batch_size, beam_width, vocab_size)
+    softmax: Optional[torch.Tensor] = None
+    if return_probs:
+        softmax = torch.softmax(logits, dim=-1)
     if beam_width > 1:
         # update the "input" cache indirection
         update_cache_indirection_buffer(
@@ -289,9 +320,22 @@ def beam_search_sampling_batch(
         )
 
         # get logprobs of each beam
-        logprobs = torch.log(softmax)
-        # adjust logprobs of each beam using the beams current score
-        logprobs += beam_search_args.beam_scores.unsqueeze(-1)[beam_search_args.seq_slots]
+        logprobs = torch.log_softmax(logits, dim=-1)
+
+        # handle finished beams
+        # Guarantee that finished beams will only sample their end_id token, with logprob 0.
+        # This implies that a finished beam will not alter its score
+        for i in range(beam_search_args.seq_slots.size(0)):
+            logprobs[
+                i, beam_search_args.finished_beams[beam_search_args.seq_slots[i]] > 0, :
+            ] = -float("inf")
+            logprobs[
+                i,
+                beam_search_args.finished_beams[beam_search_args.seq_slots[i]] > 0,
+                beam_search_args.end_ids[i],
+            ] = 0
+
+        logprobs += beam_search_args.cum_log_probs.unsqueeze(-1)[beam_search_args.seq_slots]
 
         # get the top <beam_width> logprobs across all beams
         logprobs = logprobs.view(batch_size, beam_width * vocab_size)
@@ -303,35 +347,41 @@ def beam_search_sampling_batch(
         # get the beam idx from which the tokens were sampled (optimal predecessor)
         predecessor_beam = next_tokens // vocab_size
 
-        # update the past cache indirection of each beam
+        # update the past cache indirection and finished states of each beam
         for batch_idx, seq_slot in enumerate(beam_search_args.seq_slots):
             seq_len = beam_search_args.seq_lens[batch_idx]
             # each beams optimal predecessor
             predecessor_beam_indices = predecessor_beam[batch_idx, :]
+            # update the beams finished states accordingly
+            beam_search_args.finished_beams[seq_slot, :] = beam_search_args.finished_beams[
+                seq_slot, predecessor_beam_indices
+            ]
             # update the cache indirection for the current sequence
             beam_search_args.cache_indirection[seq_slot, :, :seq_len] = (
                 beam_search_args.cache_indirection_buffer[
                     seq_slot, predecessor_beam_indices, :seq_len
                 ]
             )
+
         # project the next_tokens values to the vocab_size
         next_tokens = next_tokens % vocab_size
 
         # update the beam scores
-        beam_search_args.beam_scores[beam_search_args.seq_slots] = sorted_logprobs[:, :beam_width]
-
+        beam_search_args.cum_log_probs[beam_search_args.seq_slots] = sorted_logprobs[:, :beam_width]
     return next_tokens, softmax
 
 
 def beam_search_sampling_batch_for_prefill(
     logits: torch.Tensor,
     beam_width: int,
-    beam_search_args: BeamSearchArgs,
-    temperature: float = 1.0,
+    beam_search_args: BeamSearchMetadata,
+    temperature: float,
     generator: Optional[torch.Generator] = None,
+    return_probs: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Sample <beam_width> tokens for prefill requests in parallel.
+
     Replicate the logits <beam_width> times, as context requests do not have multiple beams yet.
     Then call beam_search_sampling_batch to sample each beams' tokens.
     """
@@ -339,12 +389,16 @@ def beam_search_sampling_batch_for_prefill(
     assert logits_dim == 2, "logits should be 2D: [batch_size * beam_width, vocab_size]"
     batch_size, vocab_size = logits.size()
     logits = logits.view(batch_size, 1, vocab_size)
-    logits = logits.tile(1, beam_width, 1)
+    expanded_logits = torch.zeros(
+        (batch_size, beam_width, vocab_size), device=logits.device, dtype=logits.dtype
+    )
     # Initialize the logits of the newly created beams to 0
     # to prevent the same token from being sampled multiple times.
-    logits[:, 1:] = 0
-    logits = logits.view(batch_size * beam_width, vocab_size)
-    return beam_search_sampling_batch(logits, beam_width, beam_search_args, temperature, generator)
+    expanded_logits[:, :1].copy_(logits, non_blocking=True)
+    expanded_logits = expanded_logits.view(batch_size * beam_width, vocab_size)
+    return beam_search_sampling_batch(
+        expanded_logits, beam_width, beam_search_args, temperature, generator, return_probs
+    )
 
 
 def get_rejected_indices(
@@ -394,7 +448,7 @@ def sample(
     logits: torch.Tensor,
     *,
     generator: Optional[torch.Generator] = None,
-    beam_search_args: BeamSearchArgs | None = None,
+    group_metadata: StrategyMetadata | None = None,
     return_probs: bool = True,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     match strategy:
@@ -428,19 +482,29 @@ def sample(
             )
         case ("greedy", None):
             tokens, softmax = greedy_search_sampling_batch(logits, return_probs=return_probs)
-        case ("beam_search_for_prefill", beam_width):
+        case ("beam_search_for_prefill", beam_width, temperature):
+            assert group_metadata is not None and isinstance(group_metadata, BeamSearchMetadata), (
+                "BeamSearchMetadata is required for beam_search_sampling_batch_for_prefill"
+            )
             tokens, softmax = beam_search_sampling_batch_for_prefill(
                 logits,
                 beam_width=beam_width,
-                beam_search_args=beam_search_args,
+                beam_search_args=group_metadata,
+                temperature=temperature,
                 generator=generator,
+                return_probs=return_probs,
             )
-        case ("beam_search", beam_width):
+        case ("beam_search", beam_width, temperature):
+            assert group_metadata is not None and isinstance(group_metadata, BeamSearchMetadata), (
+                "BeamSearchMetadata is required for beam_search_sampling_batch"
+            )
             tokens, softmax = beam_search_sampling_batch(
                 logits,
                 beam_width=beam_width,
-                beam_search_args=beam_search_args,
+                beam_search_args=group_metadata,
+                temperature=temperature,
                 generator=generator,
+                return_probs=return_probs,
             )
     return tokens, softmax
 
@@ -464,6 +528,7 @@ class GroupedStrategySampler(Generic[GenericStrategyKeyType], abc.ABC):
         group_logit_indices: Optional[torch.Tensor] = None,
         generator: Optional[torch.Generator] = None,
         return_probs: bool,
+        group_metadata: StrategyMetadata | None = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         raise NotImplementedError
 
@@ -486,7 +551,7 @@ class SimpleGroupedStrategySampler(GroupedStrategySampler[Strategy]):
         group_logit_indices: Optional[torch.Tensor] = None,
         generator: Optional[torch.Generator] = None,
         return_probs: bool,
-        beam_search_args: BeamSearchArgs | None = None,
+        group_metadata: StrategyMetadata | None = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         if group_logit_indices is None:
             assert logits.size(0) == len(strategies)
@@ -500,7 +565,7 @@ class SimpleGroupedStrategySampler(GroupedStrategySampler[Strategy]):
             logits,
             generator=generator,
             return_probs=return_probs,
-            beam_search_args=beam_search_args,
+            group_metadata=group_metadata,
         )
 
 
