@@ -4,7 +4,6 @@ run_type: GEN
 simulate_num_gpus: null
 
 # KV cache related args
-max_batch_size: 1024
 max_seq_len: 9220  # 8192 + 1024 + 4
 enable_attention_dp: true
 

@@ -27,7 +27,6 @@ parser.add_argument(
 parser.add_argument("--run-type", type=str, choices=["CTX", "GEN"])
 parser.add_argument("--simulate-num-gpus", type=int)
 # KV cache related args
-parser.add_argument("--max-batch-size", type=int)
 parser.add_argument("--max-seq-len", type=int)
 group = parser.add_mutually_exclusive_group(required=False)
 group.add_argument("--enable-attention-dp",
@@ -72,10 +71,11 @@ torch.cuda.set_device(local_rank)
 # Create KV cache manager
 mapping = DeepSeekV3Runner.create_mapping(
     enable_attention_dp=args.enable_attention_dp)
+max_batch_size = 2048
 kv_cache_manager = DeepSeekV3Runner.create_kv_cache_manager(
     args.model,
     mapping,
-    max_batch_size=args.max_batch_size,
+    max_batch_size=max_batch_size,
     max_seq_len=args.max_seq_len,
     layer_indices=args.layer_indices)
 attn_workspace = torch.empty((0, ), device="cuda", dtype=torch.int8)
@@ -94,6 +94,8 @@ runner = DeepSeekV3Runner(args.model,
                           use_cuda_graph=args.use_cuda_graph)
 
 # Warm up
+assert args.batch_size <= max_batch_size
+assert args.seq_len_q + args.seq_len_kv_cache <= args.max_seq_len
 run_pack = runner.create_run_pack(args.run_type,
                                   batch_size=args.batch_size,
                                   seq_len_q=args.seq_len_q,
