@@ -9,6 +9,28 @@ import torch
 from tensorrt_llm.logger import logger
 
 
+def get_smallest_key_greater_than(ordered_dict, target_value):
+    """
+    Return (k, ordered_dict[k]) where k is the smallest key with k >= target_value,
+    or (None, None) if not found.
+    """
+    min_key = min((k for k in ordered_dict.keys() if k >= target_value),
+                  default=None)
+    return (min_key, ordered_dict[min_key]) if min_key is not None else (None,
+                                                                         None)
+
+
+def get_biggest_key_smaller_than(ordered_dict, target_value):
+    """
+    Return (k, ordered_dict[k]) where k is the largest key with k < target_value,
+    or (None, None) if not found.
+    """
+    max_key = max((k for k in ordered_dict.keys() if k < target_value),
+                  default=None)
+    return (max_key, ordered_dict[max_key]) if max_key is not None else (None,
+                                                                         None)
+
+
 def get_size_in_byte(target_shape: list[int], target_dtype: torch.dtype):
     return math.prod(target_shape) * target_dtype.itemsize
 
