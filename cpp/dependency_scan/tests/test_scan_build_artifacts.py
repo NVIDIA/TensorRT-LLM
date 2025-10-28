@@ -361,9 +361,9 @@ class TestPatternMatcher:
                 "name": "libc6",
                 "version": "2.35",
                 "description": "GNU C Library: Shared libraries",
-                "patterns": [],
-                "linker_flags": ["-lpthread"],
-                "path_components": [],
+                "basename_matches": [],
+                "linker_flags_matches": ["-lpthread"],
+                "directory_matches": [],
                 "aliases": []
             }]
         }
@@ -375,9 +375,9 @@ class TestPatternMatcher:
             "name": "cuda-cudart-12",
             "version": "12.0",
             "description": "NVIDIA CUDA Runtime library version 12",
-            "patterns": ["libcudart.so.12"],
-            "linker_flags": [],
-            "path_components": ["cuda-12"],
+            "basename_matches": ["libcudart.so.12"],
+            "linker_flags_matches": [],
+            "directory_matches": ["cuda-12"],
             "aliases": []
         }
         with open(deps_dir / "cuda-cudart-12.yml", 'w') as f:
@@ -388,9 +388,9 @@ class TestPatternMatcher:
             "name": "pytorch",
             "version": "2.0",
             "description": "PyTorch machine learning framework",
-            "patterns": [],
-            "linker_flags": [],
-            "path_components": ["pytorch"],
+            "basename_matches": [],
+            "linker_flags_matches": [],
+            "directory_matches": ["pytorch"],
             "aliases": []
         }
         with open(deps_dir / "pytorch.yml", 'w') as f:
@@ -401,9 +401,9 @@ class TestPatternMatcher:
             "name": "deepep",
             "version": "1.0",
             "description": "DeepEP library",
-            "patterns": ["deep_ep_cpp"],
-            "linker_flags": [],
-            "path_components": [],
+            "basename_matches": ["deep_ep_cpp"],
+            "linker_flags_matches": [],
+            "directory_matches": [],
             "aliases": []
         }
         with open(deps_dir / "deepep.yml", 'w') as f:
@@ -414,9 +414,9 @@ class TestPatternMatcher:
             "name": "nlohmann-json",
             "version": "3.11",
             "description": "JSON for Modern C++",
-            "patterns": [],
-            "linker_flags": [],
-            "path_components": ["json"],
+            "basename_matches": [],
+            "linker_flags_matches": [],
+            "directory_matches": ["json"],
             "aliases": []
         }
         with open(deps_dir / "nlohmann-json.yml", 'w') as f:
@@ -425,12 +425,12 @@ class TestPatternMatcher:
         return deps_dir
 
     def test_match_exact_library(self, dependencies_dir):
-        """Test _match_exact_library finds exact matches"""
+        """Test _match_patterns finds exact matches"""
         matcher = PatternMatcher(dependencies_dir)
 
         artifact = Artifact(path="-lpthread", type="library", source="link.txt")
 
-        mapping = matcher._match_exact_library(artifact)
+        mapping = matcher._match_patterns(artifact)
 
         assert mapping is not None
         assert mapping.dependency == "libc6"
@@ -438,20 +438,19 @@ class TestPatternMatcher:
         assert mapping.strategy == "exact_pattern_match"
 
     def test_match_substring_pattern(self, dependencies_dir):
-        """Test _match_exact_library finds substring matches (bundled binaries)"""
+        """Test that substring matching is no longer supported (removed for safety)"""
         matcher = PatternMatcher(dependencies_dir)
 
         artifact = Artifact(path="tensorrt_llm/libs/deep_ep_cpp_tllm.so",
                             type="binary",
                             source="wheel")
 
-        # This now goes through _match_exact_library which tries substring match
-        mapping = matcher._match_exact_library(artifact)
+        # Substring matching was removed from _match_patterns to prevent false positives
+        # This test verifies it returns None for non-exact matches
+        mapping = matcher._match_patterns(artifact)
 
-        assert mapping is not None
-        assert mapping.dependency == "deepep"
-        assert mapping.confidence == "high"
-        assert mapping.strategy == "substring_pattern_match"
+        # Should return None since "deep_ep_cpp_tllm.so" doesn't exactly match "deep_ep_cpp"
+        assert mapping is None
 
     def test_match_path_alias_rightmost(self, dependencies_dir):
         """Test _match_path_alias uses rightmost directory match"""
@@ -517,9 +516,9 @@ class TestPatternMatcher:
             "name": "test-lib",
             "version": "1.0",
             "description": "Test library for unit tests",
-            "patterns": ["libtest.so"],
-            "linker_flags": ["-ltest"],
-            "path_components": ["test-lib"],
+            "basename_matches": ["libtest.so"],
+            "linker_flags_matches": ["-ltest"],
+            "directory_matches": ["test-lib"],
             "aliases": ["testlib"]
         }
         with open(deps_dir / "test-lib.yml", 'w') as f:
@@ -550,17 +549,17 @@ class TestPatternMatcher:
                 "name": "dep1",
                 "version": "1.0",
                 "description": "First dependency",
-                "patterns": ["libdep1.so"],
-                "linker_flags": [],
-                "path_components": [],
+                "basename_matches": ["libdep1.so"],
+                "linker_flags_matches": [],
+                "directory_matches": [],
                 "aliases": []
             }, {
                 "name": "dep2",
                 "version": "2.0",
                 "description": "Second dependency",
-                "patterns": ["libdep2.so"],
-                "linker_flags": [],
-                "path_components": [],
+                "basename_matches": ["libdep2.so"],
+                "linker_flags_matches": [],
+                "directory_matches": [],
                 "aliases": []
             }]
         }
@@ -585,9 +584,9 @@ class TestPatternMatcher:
             "name": "dep1",
             "version": "1.0",
             "description": "First dependency with duplicate pattern",
-            "patterns": ["duplicate.so"],
-            "linker_flags": [],
-            "path_components": [],
+            "basename_matches": ["duplicate.so"],
+            "linker_flags_matches": [],
+            "directory_matches": [],
             "aliases": []
         }
         with open(deps_dir / "dep1.yml", 'w') as f:
@@ -598,9 +597,9 @@ class TestPatternMatcher:
             "name": "dep2",
             "version": "2.0",
             "description": "Second dependency with duplicate pattern",
-            "patterns": ["duplicate.so"],
-            "linker_flags": [],
-            "path_components": [],
+            "basename_matches": ["duplicate.so"],
+            "linker_flags_matches": [],
+            "directory_matches": [],
             "aliases": []
         }
         with open(deps_dir / "dep2.yml", 'w') as f:
@@ -611,7 +610,7 @@ class TestPatternMatcher:
 
         # Check warning was emitted
         captured = capsys.readouterr()
-        assert "Warning: Duplicate pattern 'duplicate.so'" in captured.err
+        assert "Warning: Duplicate basename match 'duplicate.so'" in captured.err
 
         # Last one wins
         assert matcher.pattern_mappings["duplicate.so"] == "dep2"
@@ -647,9 +646,9 @@ class TestPatternMatcher:
             "name": "should-not-load",
             "version": "1.0",
             "description": "This file should be skipped",
-            "patterns": ["should-not-exist.so"],
-            "linker_flags": [],
-            "path_components": [],
+            "basename_matches": ["should-not-exist.so"],
+            "linker_flags_matches": [],
+            "directory_matches": [],
             "aliases": []
         }
         with open(deps_dir / "_schema.yml", 'w') as f:
@@ -660,9 +659,9 @@ class TestPatternMatcher:
             "name": "normal-dep",
             "version": "1.0",
             "description": "Normal dependency file",
-            "patterns": ["normal.so"],
-            "linker_flags": [],
-            "path_components": [],
+            "basename_matches": ["normal.so"],
+            "linker_flags_matches": [],
+            "directory_matches": [],
             "aliases": []
         }
         with open(deps_dir / "normal-dep.yml", 'w') as f:
@@ -688,9 +687,9 @@ class TestPatternMatcher:
                 "name": "system-dep",
                 "version": "1.0",
                 "description": "System dependency from dpkg",
-                "patterns": ["libsystem.so"],
-                "linker_flags": [],
-                "path_components": [],
+                "basename_matches": ["libsystem.so"],
+                "linker_flags_matches": [],
+                "directory_matches": [],
                 "aliases": []
             }]
         }
@@ -702,9 +701,9 @@ class TestPatternMatcher:
             "name": "custom-dep",
             "version": "2.0",
             "description": "Custom dependency from individual file",
-            "patterns": ["libcustom.so"],
-            "linker_flags": [],
-            "path_components": [],
+            "basename_matches": ["libcustom.so"],
+            "linker_flags_matches": [],
+            "directory_matches": [],
             "aliases": []
         }
         with open(deps_dir / "custom-dep.yml", 'w') as f:
@@ -728,9 +727,9 @@ class TestPatternMatcher:
             "name": "minimal-dep",
             "version": "1.0",
             "description": "Minimal dependency with empty arrays",
-            "patterns": [],
-            "linker_flags": [],
-            "path_components": ["minimal"],
+            "basename_matches": [],
+            "linker_flags_matches": [],
+            "directory_matches": ["minimal"],
             "aliases": []
         }
         with open(deps_dir / "minimal-dep.yml", 'w') as f:
@@ -885,9 +884,9 @@ class TestIntegration:
                 "name": "libc6",
                 "version": "2.35",
                 "description": "GNU C Library: Shared libraries",
-                "patterns": [],
-                "linker_flags": ["-lpthread"],
-                "path_components": [],
+                "basename_matches": [],
+                "linker_flags_matches": ["-lpthread"],
+                "directory_matches": [],
                 "aliases": []
             }]
         }

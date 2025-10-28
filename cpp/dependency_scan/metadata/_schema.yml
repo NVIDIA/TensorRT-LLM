@@ -5,7 +5,6 @@ type: object
 
 required:
   - name
-  - version
   - description
 
 properties:
@@ -43,15 +42,15 @@ properties:
     enum: ["apt", "pip", "built-from-source", "bundled", "download", "other"]
     description: "How this dependency is obtained"
 
-  patterns:
+  basename_matches:
     type: array
     items:
       type: string
       minLength: 1
     uniqueItems: true
-    description: "Artifact patterns (exact or substring match)"
+    description: "Exact basename matches (filename or library name)"
 
-  linker_flags:
+  linker_flags_matches:
     type: array
     items:
       type: string
@@ -60,13 +59,13 @@ properties:
     uniqueItems: true
     description: "Linker flags (-l flags)"
 
-  path_components:
+  directory_matches:
     type: array
     items:
       type: string
       minLength: 1
     uniqueItems: true
-    description: "Path components that indicate this dependency (exact match of subdirectory)"
+    description: "Directory name components that indicate this dependency"
 
   aliases:
     type: array
@@ -78,6 +77,6 @@ properties:
 
 # At least one pattern matching section required
 anyOf:
-  - required: ["patterns"]
-  - required: ["linker_flags"]
-  - required: ["path_components"]
+  - required: ["basename_matches"]
+  - required: ["linker_flags_matches"]
+  - required: ["directory_matches"]
