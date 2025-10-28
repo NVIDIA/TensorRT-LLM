@@ -56,7 +56,6 @@ MODEL_PATH_DICT = {
     "modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8",
     "llama_v3.3_70b_instruct_fp4":
     "modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp4",
-    "llama_v3.3_70b_instruct": "llama-3.3-models/Llama-3.3-70B-Instruct",
     "llama_v3.1_405b_instruct_fp8":
     "llama-3.1-model/Llama-3.1-405B-Instruct-FP8",
     "llama_v3.1_405b_instruct_fp4":
@@ -1653,7 +1652,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 os.makedirs(os.path.dirname(pytorch_config_path), exist_ok=True)
             config = get_model_yaml_config(self._config.to_string(),
                                            lora_dirs=self.lora_dirs)
-            print_info(f"pytorch model config: {config}")
+            print_info(f"pytorch/TRT model config: {config}")
             with open(pytorch_config_path, 'w') as f:
                 yaml.dump(config, f, default_flow_style=False)
             benchmark_cmd += [f"--extra_llm_api_options={pytorch_config_path}"]

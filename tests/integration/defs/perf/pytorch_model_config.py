@@ -14,7 +14,7 @@
 # limitations under the License.
 # -*- coding: utf-8 -*-
 """
-Model pytorch yaml config for trtllm-bench perf tests
+Model pytorch/TRT yaml config for trtllm-bench perf tests
 """
 
 
@@ -36,12 +36,23 @@ def get_model_yaml_config(model_label: str,
         Returns:
             dict: yaml config
         """
-    base_config = {
-        'print_iter_log': True,
-        'cuda_graph_config': {
-            'enable_padding': True,
-        },
-    }
+    if 'pytorch' in model_label:
+        # Pytorch backend config
+        base_config = {
+            'print_iter_log': True,
+            'cuda_graph_config': {
+                'enable_padding': True,
+            },
+        }
+    else:
+        # TRT backend config
+        base_config = {
+            'extended_runtime_perf_knob_config': {
+                'cuda_graph_cache_size': 1.0,
+                'cuda_graph_mode': True,
+            },        
+        }
+    
     if 'kv_cache_dtype' in model_label:
         base_config.update({
             'kv_cache_dtype':
