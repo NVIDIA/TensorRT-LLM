@@ -449,11 +449,17 @@ class FP8QDQLinearMethod(LinearMethodBase):
         v_weight = v_weight.to(module.dtype) * weight_scale[2]
 
         fused_weight = torch.cat((q_weight, k_weight, v_weight))
+        original_device = module.weight_scale.device
+        # module.weight_scale and fused_weight must be on the same device for division operation
+        # Reset the device of module.weight_scale to the original device if changed
         if module.weight_scale.device != fused_weight.device:
             module.weight_scale = Parameter(
                 module.weight_scale.data.to(fused_weight.device))
         fused_weight = (fused_weight / module.weight_scale).to(
             torch.float8_e4m3fn)
+        if original_device != module.weight_scale.device:
+            module.weight_scale = Parameter(
+                module.weight_scale.data.to(original_device))
         copy_weight(module.weight, fused_weight)
 
         # Load k and v scales, used for NVFP4 KV cache
@@ -489,11 +495,17 @@ class FP8QDQLinearMethod(LinearMethodBase):
         gate_weight = gate_weight.to(module.dtype) * weight_scale[0]
         up_weight = up_weight.to(module.dtype) * weight_scale[1]
         fused_weight = torch.cat((gate_weight, up_weight))
+        original_device = module.weight_scale.device
+        # module.weight_scale and fused_weight must be on the same device for division operation
+        # Reset the device of module.weight_scale to the original device if changed
         if module.weight_scale.device != fused_weight.device:
             module.weight_scale = Parameter(
                 module.weight_scale.data.to(fused_weight.device))
         fused_weight = (fused_weight / module.weight_scale).to(
             torch.float8_e4m3fn)
+        if original_device != module.weight_scale.device:
+            module.weight_scale = Parameter(
+                module.weight_scale.data.to(original_device))
         copy_weight(module.weight, fused_weight)
 
 
