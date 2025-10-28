@@ -6,11 +6,12 @@ import json
 import os
 import time
 import uuid
+# yapf: disable
+from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator
 from copy import copy
 from typing import Literal, Optional, OrderedDict, Union
 
-# yapf: disable
 from openai.types.responses import (ResponseCompletedEvent,
                                     ResponseContentPartAddedEvent,
                                     ResponseContentPartDoneEvent,
@@ -25,7 +26,6 @@ from openai.types.responses import (ResponseCompletedEvent,
                                     ResponseReasoningTextDoneEvent,
                                     ResponseTextDeltaEvent,
                                     ResponseTextDoneEvent)
-# yapf: enable
 from openai.types.responses.response_function_web_search import (
     ActionFind, ActionOpenPage, ActionSearch, ResponseFunctionWebSearch)
 from openai.types.responses.response_reasoning_item import Content
@@ -42,9 +42,13 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_protocol import (OpenAIBaseModel,
                                                 ResponseInputOutputItem,
                                                 ResponsesRequest,
-                                                ResponsesResponse)
+                                                ResponsesResponse,
+                                                UCompletionRequest,
+                                                UCompletionResponse)
 
 from .harmony_adapter import HarmonyAdapter
+
+# yapf: enable
 
 REASONING_EFFORT = {
     "high": ReasoningEffort.HIGH,
@@ -878,8 +882,45 @@ class ServerArrivalTimeMiddleware:
         if scope["type"] == "http":
             # Add arrival time to scope
             scope["state"] = {}
+            scope["ctx_server"] = ""
+            scope["gen_server"] = ""
             scope["state"][
                 "server_arrival_time"] = get_steady_clock_now_in_seconds()
 
         # Pass through the original receive/send - no wrapping!
         await self.app(scope, receive, send)
+
+
+class ResponseHooks(ABC):
+    """
+    Hooks for response processing and (disagg) service perf observability.
+    """
+
+    @abstractmethod
+    def on_req_begin(self, request: UCompletionRequest):
+        pass
+
+    @abstractmethod
+    def on_ctx_resp(self, ctx_server: str, response: UCompletionResponse):
+        pass
+
+    @abstractmethod
+    def on_first_token(self,
+                       gen_server: str,
+                       request: UCompletionRequest,
+                       response: UCompletionResponse = None):
+        pass
+
+    @abstractmethod
+    def on_resp_done(self,
+                     gen_server: str,
+                     request: UCompletionRequest,
+                     response: UCompletionResponse = None):
+        pass
+
+
+async def done_generator() -> AsyncGenerator[bytes, None]:
+    yield "data: [DONE]\n\n".encode('utf-8')
+
+
+CompletionResponseGenerator = AsyncGenerator[bytes, None]

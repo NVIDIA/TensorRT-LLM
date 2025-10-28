@@ -4,7 +4,7 @@ import os
 import random
 import time
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from tensorrt_llm.llmapi.disagg_utils import DisaggClusterConfig, ServerRole
 from tensorrt_llm.logger import logger
@@ -44,6 +44,7 @@ class DisaggClusterManager:
         self._current_ctx_workers = {}  # worker_id -> WorkerInfo
         self._current_gen_workers = {}  # worker_id -> WorkerInfo
         self._watch_handle = None
+        self._watch_task = None
 
     def __del__(self):
         try:
@@ -92,7 +93,14 @@ class DisaggClusterManager:
     def worker_key_prefix(self) -> str:
         return get_worker_key_prefix(self._config.cluster_name)
 
-    async def watch_workers(self, get_existing_first: bool = True):
+    async def watch_workers(
+        self,
+        get_existing_first: bool = True,
+        on_event: Optional[Callable[[WorkerInfo, WatchEventType],
+                                    None]] = None):
+        if self._watch_handle:
+            logger.error("Watch handle is already initialized")
+            return []
         workers = []
         self._watch_handle = await self._cluster_storage.watch(
             self.worker_key_prefix)
@@ -109,12 +117,38 @@ class DisaggClusterManager:
                 workers.append(self._parse_worker_info(event))
                 events.append(event)
             await self._watch_handle.add_events(events)
+
+        self._watch_handle = await self._cluster_storage.watch(
+            self.worker_key_prefix)
+
+        async def on_event_wrapper():
+            logger.warning(
+                f"Initializing watch task with {len(workers)} existing workers")
+            for worker_info in workers:
+                await on_event(worker_info, WatchEventType.SET)
+            logger.warning("Start watching worker events")
+            while True:
+                try:
+                    worker_events = await self._watch_handle.drain()
+                    for event in worker_events:
+                        worker_info = self._parse_worker_info(event)
+                        await on_event(worker_info, event.event_type)
+                except Exception as e:
+                    logger.error(
+                        f"Error updating routers by worker events: {e}")
+                    await asyncio.sleep(1)
+
+        if on_event:
+            self._watch_task = asyncio.create_task(on_event_wrapper())
         return workers
 
     async def unwatch_workers(self) -> None:
         if self._watch_handle:
             await self._cluster_storage.unwatch(self.worker_key_prefix)
             self._watch_handle = None
+        if self._watch_task:
+            self._watch_task.cancel()
+            self._watch_task = None
 
     async def get_worker_events(
             self) -> List[Tuple[WorkerInfo, WatchEventType]]:
