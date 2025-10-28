@@ -196,7 +196,18 @@ def main():
         default="torch-opt",
         help="The backend to use for compilation (default: torch-opt)",
     )
+    parser.add_argument(
+        "--image_path",
+        type=str,
+        default="output.png",
+        help="Path to save the generated image (default: output.png)",
+    )
     args = parser.parse_args()
+
+    # Validate max_batch_size
+    if args.max_batch_size <= 0:
+        raise ValueError(f"max_batch_size must be positive, got {args.max_batch_size}")
+
     DiffusionPipeline._execution_device = property(execution_device_getter, execution_device_setter)
     pipe = DiffusionPipeline.from_pretrained(args.model, torch_dtype=torch.bfloat16)
     pipe.to("cuda")
@@ -204,7 +215,8 @@ def main():
     if args.hf_inference:
         if not args.skip_image_generation:
             ad_logger.info("Generating image with the torch pipeline")
-            generate_image(pipe, args.prompt, "hf_mars_horse.png")
+            hf_image_path = f"hf_{args.image_path}"
+            generate_image(pipe, args.prompt, hf_image_path)
         if args.benchmark:
             ad_logger.info("Benchmarking HuggingFace model")
             latency = benchmark_model(pipe, args.prompt)
@@ -217,11 +229,20 @@ def main():
 
     if args.restore_from:
         ad_logger.info(f"Restoring model from {args.restore_from}")
-        mto.restore(model, args.restore_from)
-        quant_state_dict = model.state_dict()
-        load_buffers_and_params(
-            gm, quant_state_dict, strict_missing=False, strict_unexpected=False, clone=False
-        )
+        try:
+            mto.restore(model, args.restore_from)
+            quant_state_dict = model.state_dict()
+            load_buffers_and_params(
+                gm, quant_state_dict, strict_missing=False, strict_unexpected=False, clone=False
+            )
+        except Exception as e:
+            ad_logger.error(f"Failed to restore model from {args.restore_from}: {e}")
+            raise
+
+    # Validate backend availability
+    if not CompileBackendRegistry.has(args.backend):
+        available = CompileBackendRegistry.list()
+        raise ValueError(f"Backend '{args.backend}' not found. Available backends: {available}")
 
     compiler_cls = CompileBackendRegistry.get(args.backend)
     gm = compiler_cls(gm, args=(), max_batch_size=args.max_batch_size, kwargs=flux_kwargs).compile()
@@ -231,7 +252,7 @@ def main():
     pipe.transformer = fx_model
     if not args.skip_image_generation:
         ad_logger.info("Generating image with the exported auto-deploy model")
-        generate_image(pipe, args.prompt, "autodeploy_mars_horse_gm.png")
+        generate_image(pipe, args.prompt, args.image_path)
 
     if args.benchmark:
         ad_logger.info("Benchmarking AutoDeploy model")
