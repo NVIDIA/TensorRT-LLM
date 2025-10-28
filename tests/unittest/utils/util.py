@@ -517,6 +517,7 @@ def assert_no_cuda_sync(
     sleep_ctl.cancel()
     scope_finished_event.synchronize()
 
+
 _pynvmlInited = False
 
 

@@ -36,7 +36,8 @@ class RequestQueueItem:
 
     @property
     def is_normal_request(self):
-        return self.id > 0 and not self.is_canceled_request
+        return not (self.is_shutdown_request or self.is_canceled_request
+                    or self.is_control_request)
 
     @property
     def is_control_request(self):
@@ -279,7 +280,8 @@ class ExecutorRequestQueue:
         all_ranks_num_active_requests: Optional[List[int]] = None
     ) -> List[RequestQueueItem]:
         """Common logic for fetching and processing requests from the queue."""
-        # until control request is processed, no new requests should be processed
+        # Block new request processing while control requests are pending.
+        # Control requests must be handled exclusively to ensure proper synchronization.
         if len(self.control_requests) != 0:
             return []
         # Calculate timeout
@@ -295,7 +297,7 @@ class ExecutorRequestQueue:
         # Fetch requests from rank 0
         new_requests = []
         if self.dist.rank == 0:
-            # After control request is processed, process the accumulated requests
+            # Process accumulated requests that were queued during control request handling.
             if len(self.request_accumulated) != 0:
                 new_requests.extend(self.request_accumulated)
                 self.request_accumulated.clear()

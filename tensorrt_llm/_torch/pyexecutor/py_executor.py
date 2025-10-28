@@ -1303,13 +1303,14 @@ class PyExecutor:
             self._handle_errors(error_msg)
 
     def _handle_control_request(self):
-        if len(self.active_requests) != 0 or \
-            self.executor_request_queue.get_waiting_queue_size() != 0:
-            return
-        if len(self.executor_request_queue.control_requests) > 0:
-            assert len(
-                self.executor_request_queue.control_requests
-            ) == 1, f"control request should be the only request in the list, but got {len(self.executor_request_queue.control_requests)}"
+        if len(self.active_requests) == 0 and \
+            self.executor_request_queue.get_waiting_queue_size() == 0 and \
+            len(self.executor_request_queue.control_requests) > 0:
+            assert len(self.executor_request_queue.control_requests) == 1, (
+                f"Expected exactly one control request to be processed at a time, "
+                f"but found {len(self.executor_request_queue.control_requests)} control requests. "
+                f"This may indicate a race condition or improper control request handling."
+            )
             self.executor_request_queue.control_requests.pop(0)
             self.control_request_barrier.set()
             self.control_action_done.wait()
