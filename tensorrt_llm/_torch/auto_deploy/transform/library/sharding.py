@@ -30,6 +30,7 @@ from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
 from ...utils.node_utils import (
     bfs,
+    extract_weight_node,
     filtered_nodes,
     identify_regions_between_residuals,
     is_fake_quantized_linear_op,
@@ -550,7 +551,7 @@ def detect_sharding_from_factory_config(
 
     for lin_node in filtered_nodes(gm.graph.nodes, [is_linear_op, is_fake_quantized_linear_op]):
         # use node's weight name to get the module name
-        module_name = lin_node.args[1].target
+        module_name = extract_weight_node(lin_node).target
 
         if any(attn_name in module_name for attn_name in attn_names):
             min_local_shape = head_dim
