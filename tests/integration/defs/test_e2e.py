@@ -2183,6 +2183,7 @@ def test_ptp_quickstart_advanced_deepseek_r1_8gpus(llm_root, llm_venv,
                          stdout=running_log)
         _check_mem_usage(running_log, [106.3, 0, 0, 0], 8)
 
+
 @pytest.mark.skip_less_device_memory(110000)
 @pytest.mark.skip_less_device(8)
 @pytest.mark.parametrize("model_name,model_path", [
@@ -2220,7 +2221,8 @@ def test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus(
             "--relaxed_delta=0.5",
             "--enable_attention_dp",
             "--use_one_model",
-            f"--moe_backend={"DEEPGEMM" if is_blackwell else "CUTLASS"}",
+            "--moe_backend",
+            "DEEPGEMM" if is_blackwell else "CUTLASS",
         ],
                          stdout=running_log)
         _check_mem_usage(running_log, [85.6, 0, 0, 0], 8)
