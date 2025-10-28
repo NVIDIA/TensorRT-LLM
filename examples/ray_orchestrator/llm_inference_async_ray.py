@@ -1,4 +1,5 @@
 # Generate text asynchronously with Ray orchestrator.
+import argparse
 import asyncio
 
 from tensorrt_llm import LLM, SamplingParams
@@ -6,6 +7,16 @@ from tensorrt_llm.llmapi import KvCacheConfig
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Generate text asynchronously with Ray orchestrator.")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        help=
+        "HuggingFace model name or path to local HF model (default: TinyLlama/TinyLlama-1.1B-Chat-v1.0)"
+    )
+    args = parser.parse_args()
     # Configure KV cache memory usage fraction.
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
                                     max_tokens=4096,
@@ -13,7 +24,7 @@ def main():
 
     # model could accept HF model name or a path to local HF model.
     llm = LLM(
-        model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        model=args.model,
         kv_cache_config=kv_cache_config,
         max_seq_len=1024,
         max_batch_size=1,
