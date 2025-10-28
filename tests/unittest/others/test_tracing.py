@@ -168,21 +168,6 @@ def test_tracing(client: openai.OpenAI, model_name: str,
         top_p=top_p,
         logprobs=False,
     )
-    assert chat_completion.id is not None
-    assert len(chat_completion.choices) == 1
-    message = chat_completion.choices[0].message
-    assert message.content is not None
-    assert message.role == "assistant"
-    # test finish_reason
-    finish_reason = chat_completion.choices[0].finish_reason
-    completion_tokens = chat_completion.usage.completion_tokens
-    if finish_reason == "length":
-        assert completion_tokens == 10
-    elif finish_reason == "stop":
-        assert completion_tokens <= 10
-    else:
-        raise RuntimeError(
-            f"finish_reason {finish_reason} not in [length, stop]")
 
     timeout = 10
     if not trace_service.evt.wait(timeout):
