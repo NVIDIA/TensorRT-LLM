@@ -10,9 +10,8 @@ from tensorrt_llm.logger import logger
 
 from ...distributed import allgather
 from ...model_config import ModelConfig
-from ...utils import (AlltoallMethodType, AuxStreamType, EventType,
-                      Fp4QuantizedTensor, ceil_div)
-from .interface import MoE
+from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor, ceil_div
+from .interface import AlltoallMethodType, MoE
 
 # isort: off
 from .quantization import (

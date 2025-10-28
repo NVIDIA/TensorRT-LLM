@@ -1,7 +1,7 @@
 import contextlib
 import threading
 from dataclasses import dataclass
-from enum import Enum, IntEnum
+from enum import Enum
 from typing import Dict, List
 
 import torch
@@ -314,15 +314,3 @@ def get_device_uuid(device_idx: int) -> str:
     property = torch.cuda.get_device_properties(device_idx)
     uuid = "GPU-" + str(property.uuid)
     return uuid
-
-
-# The type of alltoall method
-class AlltoallMethodType(IntEnum):
-    # Not available
-    NotEnabled = 0
-    # MNNVL
-    MNNVL = 1
-    # DeepEP intranode or internode: CUDA Graphs are supported, IBGDA is required by internode
-    DeepEP = 2
-    # DeepEP low latency: CUDA Graphs are supported, IBGDA is required
-    DeepEPLowLatency = 3

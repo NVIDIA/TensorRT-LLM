@@ -12,10 +12,9 @@ from tensorrt_llm.mapping import Mapping
 from ...distributed import AllReduce, allgather, reducescatter
 from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
-from ...utils import (AlltoallMethodType, AuxStreamType, EventType,
-                      Fp4QuantizedTensor)
+from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from .deep_ep_utils import buffer_pool, deep_ep_installed
-from .interface import MoE
+from .interface import AlltoallMethodType, MoE
 from .moe_load_balancer import get_moe_load_balancer
 from .ops import MoEOp, MoEOpSelector
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,

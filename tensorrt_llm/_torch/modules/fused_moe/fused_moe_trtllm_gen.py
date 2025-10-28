@@ -13,8 +13,8 @@ from ...custom_ops.trtllm_gen_custom_ops import \
     fp4_block_scale_fake_output_without_finalize
 from ...distributed import allgather
 from ...model_config import ModelConfig
-from ...utils import AlltoallMethodType, Fp4QuantizedTensor, ceil_div
-from .interface import MoE, MoEWeightLoadingMode
+from ...utils import Fp4QuantizedTensor, ceil_div
+from .interface import AlltoallMethodType, MoE, MoEWeightLoadingMode
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
                            NVFP4TRTLLMGenFusedMoEMethod,
                            W4A8MXFP4FP8TRTLLMGenFusedMoEMethod,
