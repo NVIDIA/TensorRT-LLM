@@ -6,3 +6,7 @@ nvidia/Nano-v2-VLM:
   - accuracy: 43.78
 llava-hf/llava-v1.6-mistral-7b:
   - accuracy: 35.33
+Efficient-Large-Model/NVILA-8B:
+  - accuracy: 47.77
+Efficient-Large-Model/VILA1.5-3b:
+  - accuracy: 32.33

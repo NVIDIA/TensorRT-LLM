@@ -2414,8 +2414,6 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
 @pytest.mark.parametrize("use_cuda_graph", [False, True])
 @pytest.mark.parametrize("modality", ["image", "video", "mixture_text_image"])
 @pytest.mark.parametrize("model_name,model_path", [
-    ("NVILA-8B-FP16", "vila/NVILA-8B"),
-    ("NVILA-15B-FP16", "NVILA-15B"),
     pytest.param("mistral-small-3.1-24b-instruct",
                  "Mistral-Small-3.1-24B-Instruct-2503",
                  marks=pytest.mark.skip_less_device_memory(80000)),
@@ -2490,20 +2488,6 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
             [["invented", "internet", "person", "people", "computers"],
              ["large", "rock", "mountain", "center", "sky", "clear", "trees"]]
         },
-        "NVILA-8B-FP16": {
-            "image": [
-                ["stormy", "ocean", "waves", "cloudy", "sunlight", "sky"],
-                ["rock", "formation", "sunny", "sky", "clouds"],
-                ["road", "busy", "car", "black", "blue"],
-            ],
-            "video": [
-                ["woman", "street", "night", "walking", "camera"],
-                [
-                    "stunning", "earth", "space", "planet", "curvature", "dark",
-                    "bright", "contrast", "illuminate"
-                ],
-            ],
-        },
         "mistral-small-3.1-24b-instruct": {
             "image": [
                 ["dramatic", "seascape", "ocean", "turbulent", "waves", "dark"],
@@ -2572,32 +2556,24 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
 
     print("All answers are correct!")
 
-    if not any(name in model_name for name in ["NVILA"]):
-        print(f"Skipping functionality test for {model_name}.")
-        return
-
     print(f"Functionality test {model_name} {modality} mode.")
     functionality_inputs = {
         "image": {
             "prompt":
             "Describe the two images in detail.",
             "media": [
-                "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/inpaint.png",
-                "https://huggingface.co/datasets/Sayali9141/traffic_signal_images/resolve/main/61.jpg",
+                str(test_data_root / "inpaint.png"),
+                str(test_data_root / "61.jpg"),
             ],
         },
         "video": {
             "prompt":
             "Tell me what you see in the video briefly.",
             "media": [
-                "https://huggingface.co/datasets/Efficient-Large-Model/VILA-inference-demos/resolve/main/OAI-sora-tokyo-walk.mp4",
-                "https://huggingface.co/datasets/Efficient-Large-Model/VILA-inference-demos/resolve/main/world.mp4",
+                str(test_data_root / "OAI-sora-tokyo-walk.mp4"),
+                str(test_data_root / "world.mp4"),
             ],
         },
-    }
-
-    mapping = {
-        "NVILA-8B-FP16": [72.3, 0.6],
     }
 
     with tempfile.NamedTemporaryFile(mode='w+t',
@@ -2618,10 +2594,6 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
             "--disable_kv_cache_reuse",
         ],
                          stdout=running_log)
-
-        if model_name in mapping:
-            peak, fraction = mapping[model_name]
-            _check_mem_usage(running_log, [peak, 0, 0, 0])
 
 
 @pytest.mark.parametrize("modality", ["image", "video"])
@@ -2786,8 +2758,8 @@ def test_ptp_quickstart_multimodal_chunked_prefill(llm_root, llm_venv,
         os.path.join(llm_models_root(), "multimodals", "test_data"))
     print(f"Accuracy test {model_name} {modality} mode with example inputs.")
     if modality == "video" and model_name in {
-            "mistral-small-3.1-24b-instruct", "phi4-multimodal-instruct", "phi4-multimodal-instruct-fp4",
-            "phi4-multimodal-instruct-fp8"
+            "mistral-small-3.1-24b-instruct", "phi4-multimodal-instruct",
+            "phi4-multimodal-instruct-fp4", "phi4-multimodal-instruct-fp8"
     }:
         pytest.skip(f"Skipping video modality test for {model_name}")
     accuracy_inputs = {

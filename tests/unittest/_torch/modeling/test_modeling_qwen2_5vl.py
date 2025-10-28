@@ -4,7 +4,7 @@ from typing import List
 
 import torch
 from _torch.helpers import create_mock_engine
-from test_modeling_multimodal import Scenario, TestModelingMultimodal
+from test_modeling_multimodal import MultimodalScenario, TestModelingMultimodal
 from transformers import Qwen2_5_VLConfig
 from transformers import \
     Qwen2_5_VLForConditionalGeneration as HFQwen2_5_VLForConditionalLM
@@ -73,7 +73,7 @@ QWEN2_5_VL_7B_CONFIG = {
 
 
 @dataclass(repr=False)
-class TestQwen2_5_VLScenario(Scenario):
+class TestQwen2_5_VLScenario(MultimodalScenario):
 
     disable_fuse_rope: bool = False
 
@@ -158,7 +158,7 @@ class TestQwen2_5_VL(TestModelingMultimodal):
 
         return trtllm_inputs
 
-    def init_kv_cache_manager(self, scenario: Scenario):
+    def init_kv_cache_manager(self, scenario: TestQwen2_5_VLScenario):
         """NOTE: Exactly the same as the parent class method, but with the mrope flag set to True for Qwen2.5-VL model."""
         cache_config = self.get_kv_cache_config(scenario)
         tokens_per_block = cache_config['tokens_per_block']

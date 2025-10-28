@@ -2,8 +2,8 @@ import os
 from dataclasses import dataclass
 from typing import List
 
-from test_modeling_multimodal import (Scenario, TestModelingMultimodal,
-                                      llm_models_root)
+from test_modeling_multimodal import (MultimodalScenario,
+                                      TestModelingMultimodal, llm_models_root)
 from transformers import LlavaNextConfig
 from transformers import \
     LlavaNextForConditionalGeneration as HFLlavaNextForConditionalGeneration
@@ -67,7 +67,7 @@ LLAVA_NEXT_7B_CONFIG = {
 
 
 @dataclass(repr=False)
-class TestLlavaNextScenario(Scenario):
+class TestLlavaNextScenario(MultimodalScenario):
     pass
 
 
