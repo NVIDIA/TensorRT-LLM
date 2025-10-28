@@ -27,7 +27,7 @@ from utils import add_common_args
 import tensorrt_llm
 import tensorrt_llm.profiler as profiler
 from tensorrt_llm import logger
-from tensorrt_llm.bindings import KVCacheType
+from tensorrt_llm.llmapi.kv_cache_type import KVCacheType
 from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime import (PYTHON_BINDINGS, ModelConfig, ModelRunner,
                                   SamplingConfig, Session, TensorInfo)
@@ -122,8 +122,7 @@ class QWenInfer(object):
         num_kv_heads = config["pretrained_config"].get("num_key_value_heads",
                                                        num_heads)
         if "kv_cache_type" in config["build_config"]:
-            kv_cache_type = KVCacheType.from_string(
-                config["build_config"]["kv_cache_type"])
+            kv_cache_type = KVCacheType(config["build_config"]["kv_cache_type"])
         else:
             kv_cache_type = KVCacheType.CONTINUOUS
 
