@@ -29,6 +29,7 @@ from defs.trt_test_alternative import (is_linux, is_windows, print_info,
 
 from ..conftest import get_llm_root, llm_models_root, trt_environment
 from .pytorch_model_config import get_model_yaml_config
+from .sample_options_config import get_sample_options_config
 from .utils import (AbstractPerfScriptTestClass, PerfBenchScriptTestCmds,
                     PerfDisaggScriptTestCmds, PerfMetricType,
                     PerfServerClientBenchmarkCmds, generate_test_nodes)
@@ -139,6 +140,9 @@ MODEL_PATH_DICT = {
     "bielik_11b_v2.2_instruct_fp8": "Bielik-11B-v2.2-Instruct-FP8",
     "mistral_small_v3.1_24b": "Mistral-Small-3.1-24B-Instruct-2503",
     "gpt_oss_120b_fp4": "gpt_oss/gpt-oss-120b",
+    "gpt_oss_20b_fp4": "gpt_oss/gpt-oss-20b",
+    "nemotron_nano_9b_v2": "NVIDIA-Nemotron-Nano-12B-v2",
+    "starcoder2_7b": "starcoder2-7b",
 }
 # Model PATH of HuggingFace
 HF_MODEL_PATH = {
@@ -1642,7 +1646,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             benchmark_cmd += [f"--streaming"]
         #use default yaml config
         if self._config.backend == "pytorch":
-            import yaml
             pytorch_config_path = os.path.join(engine_dir,
                                                "extra-llm-api-config.yml")
             if not os.path.exists(pytorch_config_path):
@@ -1654,7 +1657,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 yaml.dump(config, f, default_flow_style=False)
             benchmark_cmd += [f"--extra_llm_api_options={pytorch_config_path}"]
         elif self._config.backend == "_autodeploy":
-            import yaml
             autodeploy_config_path = os.path.join(engine_dir,
                                                   "extra_llm_api_options.yaml")
             if not os.path.exists(autodeploy_config_path):
@@ -1681,6 +1683,15 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             benchmark_cmd += [
                 f"--extra_llm_api_options={autodeploy_config_path}"
             ]
+        # for sample options
+        sample_options_path = os.path.join(engine_dir, "sample_options.yml")
+        if not os.path.exists(sample_options_path):
+            os.makedirs(os.path.dirname(sample_options_path), exist_ok=True)
+        sample_config = get_sample_options_config(self._config.to_string())
+        print_info(f"sample options config: {sample_config}")
+        with open(sample_options_path, 'w') as f:
+            yaml.dump(sample_config, f, default_flow_style=False)
+        benchmark_cmd += [f"--sample_options={sample_options_path}"]
         return benchmark_cmd
 
     def get_commands(self):

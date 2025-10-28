@@ -200,7 +200,7 @@ add_cuda_architectures(fpA_intB_gemm_src 89)
 add_instantiations(fpA_intB_gemm_src ${INSTANTIATION_GENERATION_DIR}/gemm)
 
 add_library(fb_gemm_src STATIC ${FBGEMM_SRC_CU} ${FBGEMM_CU_INSTANTIATIONS})
-set_cuda_architectures(fb_gemm_src 89 90 120f)
+set_cuda_architectures(fb_gemm_src 89 90 100f 120f)
 # add_instantiations(fb_gemm_src
 # ${INSTANTIATION_GENERATION_DIR}/fp8_rowwise_gemm)
 

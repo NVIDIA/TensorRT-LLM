@@ -6,7 +6,6 @@ import pytest
 import torch
 
 from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
-from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
 
 # isort: off
@@ -15,7 +14,6 @@ from utils.llm_data import llm_models_root
 from utils.util import skip_single_gpu
 # isort: on
 
-from tensorrt_llm._torch.pyexecutor.config import update_executor_config
 from tensorrt_llm.executor.base_worker import BaseWorker
 from tensorrt_llm.executor.request import GenerationRequest
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
@@ -28,12 +26,16 @@ model_path = llm_models_root() / default_model_name
 class FakeWorker(BaseWorker):
 
     def __init__(self, engine: str, tp_size: int = 1):
-        llm_args, executor_config = create_fake_executor_config(engine, tp_size)
+        llm_args = TorchLlmArgs(
+            model=model_path,
+            tensor_parallel_size=tp_size,
+            backend='pytorch',
+            enable_iter_perf_stats=True,
+        )
         super().__init__(
             engine=engine,
             llm_args=llm_args,
             hf_model_dir=engine,
-            executor_config=executor_config,
         )
         # Note: BaseWorker doesn't call setup_engine() automatically,
         # unlike GenerationExecutorWorker, so we need to call it manually
@@ -114,34 +116,6 @@ class TestWorkerBase:
             elapsed = time.time() - start_time
             print(f"await_responses latency: {elapsed:.3f} seconds")
             assert timeout / 2 <= elapsed <= timeout * 2, f"Latency out of expected range: {elapsed}"
-
-
-def create_fake_executor_config(model_path, tp_size=1):
-    # Use TorchLlmArgs for PyTorch backend tests
-    llm_args = TorchLlmArgs(
-        model=model_path,
-        tensor_parallel_size=tp_size,
-        backend='pytorch',
-        enable_iter_perf_stats=True,
-    )
-
-    executor_config = tllm.ExecutorConfig(1)
-    executor_config.max_batch_size = 1
-    executor_config.model_world_size = tp_size
-
-    update_executor_config(
-        executor_config,
-        pytorch_backend_config=llm_args.get_pytorch_backend_config(),
-        mapping=llm_args.parallel_config.to_mapping(),
-        speculative_config=llm_args.speculative_config,
-        hf_model_dir=model_path,
-        max_input_len=20,
-        max_seq_len=40,
-        checkpoint_format=llm_args.checkpoint_format,
-        checkpoint_loader=llm_args.checkpoint_loader,
-    )
-
-    return llm_args, executor_config
 
 
 class TestRpcWorkerBaseTP2:
