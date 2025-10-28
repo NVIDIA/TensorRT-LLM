@@ -519,7 +519,7 @@ class ModelDrafter(Drafter):
             new_tokens_lens = torch.ones(batch_size, device=device)
             new_tokens_lens += num_accepted_tokens_device
             next_draft_tokens = torch.zeros(batch_size,
-                                            self.max_draft_tokens,
+                                            self.max_draft_len,
                                             device=device)
         target_inputs.new_tokens_lens = new_tokens_lens
         target_inputs.next_draft_tokens = next_draft_tokens

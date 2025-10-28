@@ -193,6 +193,7 @@ def prepare_for_generation_with_tree_decoding(
         attn_metadata.kv_lens_cuda[:batch_size] += next_layer_gen_len_per_req
 
     # FIXME, update without D2H
+    # Not updating kv_lens here has no effect on the calculation results, but only affects the calculation performance.
     # attn_metadata.kv_lens[:batch_size] = attn_metadata.kv_lens_cuda[:batch_size].cpu()
 
     ## 3.2) _seq_lens, _seq_lens_cuda
@@ -209,6 +210,11 @@ def prepare_for_generation_with_tree_decoding(
         ## 3.5) use_spec_decoding
         attn_metadata.use_spec_decoding = True
 
+    # NOTE: For the spec_decoding_position_offsets, spec_decoding_packed_mask, spec_decoding_generation_lengths,
+    # They are stored contiguously without padding. This is why we need to reshape them here.
+    # They're initially allocated a size of [batch_size, max_total_draft_tokens + 1].
+    # However, within the drafter, the number of draft tokens input to each drafter layer is less than max_total_draft_tokens,
+    # so we only need to use part of the buffer. We need to store them contiguously.
     ## 3.6) spec_decoding_position_offsets
     attn_metadata.spec_decoding_position_offsets.reshape(
         -1

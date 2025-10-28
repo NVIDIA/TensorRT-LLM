@@ -2601,8 +2601,9 @@ class PyTorchModelEngine(ModelEngine):
                 is_spec_decoding_enabled=is_spec_dec_mode,
                 is_spec_dec_tree=spec_metadata.is_spec_dec_tree,
                 is_spec_dec_dynamic_tree=spec_metadata.is_spec_dec_dynamic_tree,
-                max_draft_len=spec_metadata.max_draft_len,
-                max_total_draft_tokens=spec_metadata.max_total_draft_tokens,
+                max_draft_len=self.original_max_draft_len,
+                max_total_draft_tokens=self.original_max_total_draft_tokens,
+                model_is_wrapped=self.model_is_wrapped,
                 spec_metadata=spec_metadata,
                 spec_tree_manager=spec_tree_manager,
                 spec_decoding_tensor=spec_decoding_tensor)
