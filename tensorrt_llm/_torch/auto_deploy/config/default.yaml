@@ -77,7 +77,7 @@ transforms:
   detect_sharding:
     stage: sharding
     simple_shard_only: false
-    sharding_source: ['factory']
+    sharding_source: ['factory', 'heuristic']
     support_partial_config: true
     sharding_dims: ['tp', 'ep', 'bmm']
     requires_shape_prop: true

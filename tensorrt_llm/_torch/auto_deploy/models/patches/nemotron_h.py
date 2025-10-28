@@ -148,9 +148,9 @@ def _set_sharding_config_patched(self, *args, **kwargs):
         "in_proj": "mamba",
         "out_proj": "rowwise",
         "up_proj": "colwise",
-        "gate_proj": "colwise",
+        # "gate_proj": "colwise",
         "down_proj": "rowwise",
-        "*": "gather",
+        # "*": "gather",
     }
 
 
