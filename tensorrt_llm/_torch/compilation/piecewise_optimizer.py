@@ -172,7 +172,10 @@ class PiecewiseRunner(object):
             return self.default_callable(*args)
 
         if self.is_first_runner or self.is_last_runner:
-            set_piecewise_running(self.is_first_runner)
+            if self.is_first_runner == self.is_last_runner:
+                set_piecewise_running(False)
+            else:
+                set_piecewise_running(self.is_first_runner)
 
         entry = self.entries[runtime_num_of_token]
 

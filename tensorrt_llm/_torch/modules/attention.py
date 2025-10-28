@@ -77,10 +77,14 @@ def extract_extra_attrs(layer_idx: str, attn_type: str):
 
 
 def maybe_compile(func):
-    if is_piecewise_running():
-        # When piecewise running, we don't need to compile the function to avoid host overhead in attention op.
-        return func
-    return torch.compile(func)
+
+    def wrapper(*args, **kwargs):
+        if is_piecewise_running():
+            # When piecewise running, we don't need to compile the function to avoid host overhead in attention op.
+            return func(*args, **kwargs)
+        return torch.compile(func)(*args, **kwargs)
+
+    return wrapper
 
 
 @maybe_compile
