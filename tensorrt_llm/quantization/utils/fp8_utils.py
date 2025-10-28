@@ -521,8 +521,9 @@ def per_token_quant_and_transform(
 
 
 def fp8_quantize_1x128_sf_transpose(
-        x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    x_fp8, x_scale = torch.ops.trtllm.fp8_quantize_1x128(x)
+        x: torch.Tensor,
+        use_ue8m0: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+    x_fp8, x_scale = torch.ops.trtllm.fp8_quantize_1x128(x, use_ue8m0=use_ue8m0)
     if x_scale.ndim == 1:  # Handle SM version differences (SM90: 1D padded, SM100+: 2D)
         x_padded = (x.shape[0] + 3) // 4 * 4
         num_blocks = (x.shape[1] + 127) // 128

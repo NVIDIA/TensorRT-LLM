@@ -27,11 +27,11 @@ from tensorrt_llm.bindings.internal.batch_manager import \
     CacheType as CacheTypeCpp
 from tensorrt_llm.deep_gemm import (fp8_mqa_logits, fp8_paged_mqa_logits,
                                     get_paged_mqa_logits_metadata)
-from tensorrt_llm.quantization.utils import fp8_utils
 from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.utils import fp8_utils
 
 from .kernel import triton_convert_req_index_to_global_index
 
@@ -584,6 +584,8 @@ class Indexer(nn.Module):
         )
 
         self.softmax_scale = self.head_dim**-0.5
+        # TODO: make it configurable from hf config
+        self.scale_fmt = "ue8m0"
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
@@ -1094,8 +1096,10 @@ class Indexer(nn.Module):
         q = q.view(-1, self.head_dim)
 
         q, k = maybe_execute_in_parallel(
-            lambda: fp8_utils.fp8_quantize_1x128_sf_transpose(q),
-            lambda: fp8_utils.fp8_quantize_1x128_sf_transpose(k),
+            lambda: fp8_utils.fp8_quantize_1x128_sf_transpose(
+                q, use_ue8m0=self.scale_fmt == "ue8m0"),
+            lambda: fp8_utils.fp8_quantize_1x128_sf_transpose(
+                k, use_ue8m0=self.scale_fmt == "ue8m0"),
             self.ln_events[0],
             self.ln_events[1],
             self.aux_stream,
