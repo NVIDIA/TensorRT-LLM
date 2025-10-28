@@ -612,15 +612,16 @@ accuracy/test_llm_api_pytorch.py::TestPhi4MiniInstruct::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestPhi4::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestPhi4::test_fp8
 accuracy/test_llm_api_pytorch.py::TestEXAONE4::test_auto_dtype
-accuracy/test_llm_api_pytorch.py::TestQwen2_VL_7B::test_auto_dtype
-accuracy/test_llm_api_pytorch.py::TestQwen2_5_VL_7B::test_auto_dtype
-accuracy/test_llm_api_pytorch.py::TestNano_V2_VLM::test_auto_dtype
 accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_nixl_backend
 accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_nixl_backend
 accuracy/test_llm_api_pytorch.py::TestMistralNemo12B::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestMistralNemo12B::test_auto_dtype_tp2
 accuracy/test_llm_api_pytorch.py::TestSeedOss_36B::test_auto_dtype
-accuracy/test_llm_api_pytorch.py::TestLlava_V1_6_Mistral_7B::test_auto_dtype
+
+accuracy/test_llm_api_pytorch_multimodal.py::TestQwen2_VL_7B::test_auto_dtype
+accuracy/test_llm_api_pytorch_multimodal.py::TestQwen2_5_VL_7B::test_auto_dtype
+accuracy/test_llm_api_pytorch_multimodal.py::TestNano_V2_VLM::test_auto_dtype
+accuracy/test_llm_api_pytorch_multimodal.py::TestLlava_V1_6_Mistral_7B::test_auto_dtype
 
 test_e2e.py::test_llama_e2e[use_cpp_session-remove_input_padding-]
 test_e2e.py::test_llama_e2e[use_py_session-remove_input_padding-]
