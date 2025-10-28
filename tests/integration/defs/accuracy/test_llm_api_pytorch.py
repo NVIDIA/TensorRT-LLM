@@ -2404,9 +2404,12 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
         moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
         kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                         free_gpu_memory_fraction=0.7)
+        cuda_graph_config = CudaGraphConfig(
+            enable_padding=True,
+            max_batch_size=max_batch_size) if cuda_graph else None
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
-            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            cuda_graph_config=cuda_graph_config,
             moe_config=moe_config,
         )
 
