@@ -1242,11 +1242,20 @@ class ShardingConfig(BaseModel):
         return self
 
     def add(self, transform: ShardingTransformInfo) -> bool:
-        """Append a TP transform only if that node was
+        """Append a transform only if that node was
         not sharded before. Do not overwrite existing transforms.
         """
-        # try to add to appropriate transformation list
-        transform_list = self._transform_list_dict[type(transform)]
+        # Find the appropriate list by checking inheritance
+        transform_list = None
+        for base_class, transform_list_candidate in self._transform_list_dict.items():
+            if isinstance(transform, base_class):
+                transform_list = transform_list_candidate
+                break
+
+        if transform_list is None:
+            raise ValueError(f"Unknown transform type: {type(transform)}")
+
+        # Check if node already has a transform
         for existing_transform in transform_list:
             if existing_transform.target_node == transform.target_node:
                 return False

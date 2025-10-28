@@ -77,7 +77,7 @@ transforms:
   detect_sharding:
     stage: sharding
     simple_shard_only: false
-    sharding_source: ['factory','heuristic']
+    sharding_source: ['factory']
     support_partial_config: true
     sharding_dims: ['tp', 'ep', 'bmm']
     requires_shape_prop: true
@@ -119,18 +119,18 @@ transforms:
   fuse_fp8_moe:
     stage: post_load_fusion
     enabled: true
-  fuse_allreduce_residual_rmsnorm:
-    stage: post_load_fusion
+  # fuse_allreduce_residual_rmsnorm:
+  #   stage: post_load_fusion
   # TODO (lucaslie): add backend selection as part of configurable inference optimizers
   # check if we can fuse rmsnorm
-  fuse_rmsnorm:
-    # TODO (lucaslie): add backend selection as part of configurable inference optimizers
-    # check if we can fuse rmsnorm
-    stage: post_load_fusion
-    backend: triton
-    requires_shape_prop: true
-  fuse_gated_rmsnorm:
-    stage: post_load_fusion
+  # fuse_rmsnorm:
+  #   # TODO (lucaslie): add backend selection as part of configurable inference optimizers
+  #   # check if we can fuse rmsnorm
+  #   stage: post_load_fusion
+  #   backend: triton
+  #   requires_shape_prop: true
+  # fuse_gated_rmsnorm:
+  #   stage: post_load_fusion
 
   ############################################################################################
   # VISUALIZE GRAPH
