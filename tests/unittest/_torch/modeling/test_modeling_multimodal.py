@@ -161,30 +161,33 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         test_data_root = Path(
             os.path.join(llm_models_root(), "multimodals", "test_data"))
 
-        # Define test cases for each modality
-        test_cases = {
-            "image": (["Describe the natural environment in the image."],
-                      [str(test_data_root / "seashore.png")]),
-            "multiple_image":
-            (["Describe the difference between the two images."], [
+        # Return test cases based on modality
+        if modality == "image":
+            prompts = ["Describe the natural environment in the image."]
+            media = [str(test_data_root / "seashore.png")]
+        elif modality == "multiple_image":
+            prompts = ["Describe the difference between the two images."]
+            media = [
                 str(test_data_root / "inpaint.png"),
                 str(test_data_root / "61.jpg")
-            ]),
-            "video": (["Tell me what you see in the video briefly."],
-                      [str(test_data_root / "OAI-sora-tokyo-walk.mp4")]),
-            "mixture_text_image": ([
+            ]
+        elif modality == "video":
+            prompts = ["Tell me what you see in the video briefly."]
+            media = [str(test_data_root / "OAI-sora-tokyo-walk.mp4")]
+        elif modality == "mixture_text_image":
+            prompts = [
                 "Describe the scene in the image briefly.",
                 "Who invented the internet?"
-            ], [[str(test_data_root / "inpaint.png")], []]),
-            "text": (["Who invented the internet?"], []),
-        }
-
-        if modality not in test_cases:
+            ]
+            media = [[str(test_data_root / "inpaint.png")], []]
+        elif modality == "text":
+            prompts = ["Who invented the internet?"]
+            media = []
+        else:
             raise ValueError(
                 f"Invalid modality: {modality}. "
-                f"Supported modalities: {', '.join(test_cases.keys())}")
-
-        prompts, media = test_cases[modality]
+                f"Supported modalities: image, multiple_image, video, mixture_text_image, text"
+            )
 
         return prompts, media
 
