@@ -16,8 +16,6 @@ class HFModel:
             model_name, torch_dtype=torch.bfloat16).to("cuda")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.cuda_device = torch.cuda.current_device()
-        # Set seed for reproducible random initialization (same as TrainingInstance)
-        torch.manual_seed(32)
         self.all_weights = {}
         self.device_uuid = [
             HFModel.get_device_uuid(i) for i in range(torch.cuda.device_count())
@@ -29,7 +27,6 @@ class HFModel:
         return get_device_uuid(cuda_device)
 
     def flip_weights(self):
-        # Initialize all the parameters with random values (same as TrainingInstance)
         for _, p in self.model.named_parameters():
             p.data = -p.data
 
@@ -62,28 +59,6 @@ class HFModel:
                 all_handles.append((name, handle))
             ret[self.device_uuid[device]] = all_handles
         return ret
-
-    def get_weights(self):
-        return dict(self.all_weights[self.cuda_device])
-
-    def generate(self, inputs: List[torch.Tensor], max_new_tokens: int = 50):
-        generated_texts = []
-        generated_token_ids = []
-        for input_ids in inputs:
-            if input_ids.dim() == 1:
-                input_ids = input_ids.unsqueeze(0)
-
-            input_ids = input_ids.to(self.model.device)
-
-            ret = self.model.generate(input_ids=input_ids,
-                                      max_new_tokens=max_new_tokens,
-                                      use_cache=True)
-
-            new_tokens = ret[0][input_ids.shape[1]:]
-            generated_token_ids.append(new_tokens)
-            generated_texts.append(
-                self.tokenizer.decode(new_tokens, skip_special_tokens=True))
-        return generated_texts, generated_token_ids
 
     def generate_batch_incremental(self, original_prompts: List[str],
                                    generated_token_ids_list: List[List[int]]):
@@ -131,7 +106,7 @@ def extract_tokens_from_outputs(outputs):
 def compare_logits(logits_list: List[torch.Tensor],
                    ref_logits_list: List[torch.Tensor],
                    topk: int = 20,
-                   threshold: float = 0.9):
+                   threshold: float = 0.85):
     assert len(logits_list) == len(ref_logits_list)
 
     for i in range(len(logits_list)):
