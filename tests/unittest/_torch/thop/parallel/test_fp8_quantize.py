@@ -228,10 +228,8 @@ def test_fp8_quantize_ue8m0_vs_triton(dtype, m, k):
         input_tensor.clone(), quant_group_size=128, scale_ue8m0=True)
 
     # Convert CUDA float32 scale to int32 packed format for comparison
-    from tensorrt_llm.deep_gemm import transform_sf_into_required_layout
-
-    # CUDA output is [num_blocks, m], need to transpose to [m, num_blocks]
-    cuda_scale_int32 = transform_sf_into_required_layout(
+    from tensorrt_llm.quantization.utils import fp8_utils
+    cuda_scale_int32 = fp8_utils.transform_sf_into_required_layout(
         sf=cuda_scale_float.t().contiguous(),
         mn=m,
         k=k,
