@@ -3560,7 +3560,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                   moe_config=MoeConfig(backend=moe_backend))
 
         with llm:
-            model_name = "GPT-OSS/MXFP4"
+            model_name = "GPT-OSS/120B-MXFP4"
 
             # GSM8K
             task = GSM8K(model_name)
@@ -3789,7 +3789,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                   moe_config=MoeConfig(backend=moe_backend))
 
         with llm:
-            model_name = "GPT-OSS/MXFP4"
+            model_name = "GPT-OSS/120B-MXFP4"
 
             # GSM8K
             task = GSM8K(model_name)
