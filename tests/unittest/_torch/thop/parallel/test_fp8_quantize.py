@@ -202,7 +202,7 @@ def test_mxfp8_quantize_alignment_torch_device(m, k, dtype,
 
 
 @pytest.mark.skipif(
-    getSMVersion() != 100 and getSMVersion() != 90,
+    getSMVersion() != 103 and getSMVersion() != 90,
     reason="Only test on Blackwell and Hopper",
 )
 @pytest.mark.parametrize("k", [128, 256, 512])
@@ -220,7 +220,8 @@ def test_fp8_quantize_ue8m0_vs_triton(dtype, m, k):
     input_tensor = torch.randn((m, k), device='cuda', dtype=dtype)
 
     # CUDA version with UE8M0
-    cuda_fp8, cuda_scale_float = torch.ops.trtllm.fp8_quantize_1x128(
+    from tensorrt_llm.quantization.utils import fp8_utils
+    cuda_fp8, cuda_scale_float = fp8_utils.fp8_quantize_1x128_sf_transpose(
         input_tensor, use_ue8m0=True)
 
     # Triton reference with UE8M0
@@ -228,9 +229,8 @@ def test_fp8_quantize_ue8m0_vs_triton(dtype, m, k):
         input_tensor.clone(), quant_group_size=128, scale_ue8m0=True)
 
     # Convert CUDA float32 scale to int32 packed format for comparison
-    from tensorrt_llm.quantization.utils import fp8_utils
     cuda_scale_int32 = fp8_utils.transform_sf_into_required_layout(
-        sf=cuda_scale_float.t().contiguous(),
+        sf=cuda_scale_float,
         mn=m,
         k=k,
         recipe=(1, 1, 128),
