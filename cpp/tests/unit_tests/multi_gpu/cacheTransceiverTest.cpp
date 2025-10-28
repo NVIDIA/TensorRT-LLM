@@ -1268,7 +1268,7 @@ TEST_P(AsymmetricalCacheTest, TestCase)
     {
         GTEST_SKIP() << "Temporarily skipping cache transceiver tests with NIXL backend for CP.";
     }
-    std::vector<int> lenList = {8};
+    std::vector<int> lenList = {30, 10, 60, 80};
     if (genCp > 1)
     {
         std::vector<int> updatedLenList;
@@ -1296,7 +1296,7 @@ TEST_P(AsymmetricalCacheTest, TestCase)
         std::vector<std::shared_ptr<WrappedLlmRequest>> requests;
 
         // the second loop is for cache reuse
-        for (int i = 0; i < 1; i++)
+        for (int i = 0; i < 2; i++)
         {
             for (auto len : lenList)
             {
@@ -1473,22 +1473,10 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
 }
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0, AsymmetricalCacheTest,
-    testing::Combine(testing::Values(1),
-                     testing::Values(1),
-                     testing::Values(1),
-                     testing::Values(1),
-                     testing::Values(1),
-                     testing::Values(1),
-                     testing::Values(2),
-                     testing::Values(1),
-                     testing::Values(4),
-                     testing::Values(8),
-                     testing::Values(nvinfer1::DataType::kINT8),
-                     testing::Values(1),
-                     testing::Values(false),
-                     testing::Values(false),
-                     testing::Values(false),
-                     testing::Values(true)));
+    testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(1), testing::Values(1, 2),
+        testing::Values(1, 2), testing::Values(1), testing::Values(4), testing::Values(4), testing::Values(4),
+        testing::Values(16), testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
+        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(true, false)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithWindow, AsymmetricalCacheTest,
     testing::Combine(testing::Values(1), testing::Values(1), testing::Values(1), testing::Values(1), testing::Values(1),
