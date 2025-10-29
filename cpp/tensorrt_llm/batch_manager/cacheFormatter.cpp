@@ -578,7 +578,7 @@ void convertKVCachePrecisionVector( //TODO: Instead of iterating and calling ker
         
         if (srcDataType == nvinfer1::DataType::kHALF && destDataType == nvinfer1::DataType::kFP8)
         {
-            kernels::invokeConversion<__nv_fp8_e4m3, half>(
+            kernels::invokeConversion<__nv_fp8_e4m3, half>( // Dest, Src
                 reinterpret_cast<__nv_fp8_e4m3*>(tempBuffer->data()),
                 reinterpret_cast<half const*>(block->data()),
                 blockVolume,
@@ -586,33 +586,11 @@ void convertKVCachePrecisionVector( //TODO: Instead of iterating and calling ker
                 stream
             );
         }
-        else if (srcDataType == nvinfer1::DataType::kBF16 && destDataType == nvinfer1::DataType::kFP8)
-        {
-            kernels::invokeConversion<__nv_fp8_e4m3, __nv_bfloat16>(
-                reinterpret_cast<__nv_fp8_e4m3*>(tempBuffer->data()),
-                reinterpret_cast<__nv_bfloat16 const*>(block->data()),
-                blockVolume,
-                nullptr,
-                stream
-            );
-        }
         else if (srcDataType == nvinfer1::DataType::kFP8 && destDataType == nvinfer1::DataType::kHALF)
         {
-            // FP8 -> FP16 conversion for transmission buffer (Overriding for now)
             kernels::invokeConversion<half, __nv_fp8_e4m3>(
                 reinterpret_cast<half*>(tempBuffer->data()),
                 reinterpret_cast<__nv_fp8_e4m3 const*>(block->data()),
-                blockVolume,
-                nullptr,
-                stream
-            );
-        }
-        else if (srcDataType == nvinfer1::DataType::kBF16 && destDataType == nvinfer1::DataType::kHALF)
-        {
-            // BF16 -> FP16 conversion for transmission buffer (Overriding for now)
-            kernels::invokeConversion<half, __nv_bfloat16>(
-                reinterpret_cast<half*>(tempBuffer->data()),
-                reinterpret_cast<__nv_bfloat16 const*>(block->data()),
                 blockVolume,
                 nullptr,
                 stream

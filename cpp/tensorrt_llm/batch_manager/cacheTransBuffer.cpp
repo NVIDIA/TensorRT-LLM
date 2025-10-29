@@ -203,62 +203,30 @@ CacheTransBufferManager::CacheTransBufferManager(
     if (maxNumTokens.has_value())
     {
         TLLM_CHECK(maxNumTokens.value() % tokensPerBlock == 0);
-
-        // Transmission always uses FP16 for mixed precision support
-        size_t transmissionDataSize = common::getDTypeSize(nvinfer1::DataType::kHALF);
-        size_t storageDataSize = common::getDTypeSize(mDataType);
-
-        TLLM_LOG_INFO("=== Buffer Size Calculation Debug ===");
-        TLLM_LOG_INFO("maxNumTokens: %ld", maxNumTokens.value());
-        TLLM_LOG_INFO("tokensPerBlock: %ld", tokensPerBlock);
-        
-        // getBlockSize() returns volume of [numKvHeads, tokensPerBlock, sizePerHead] for ONE cache (K or V)
-        // We need to multiply by KV factor (2 for SELF, 1 for SELFKONLY) to get both K and V
-        size_t blockSizeInElements = mCacheManager->getBlockManager().getBlockSize(0);
-        size_t kvFactor = (mCacheManager->getCacheType() == CacheType::kSELFKONLY ? 1 : 2);
-        
-        TLLM_LOG_INFO("getBlockSize(0): %ld elements (for ONE cache)", blockSizeInElements);
-        TLLM_LOG_INFO("kvFactor: %ld (1=K only, 2=K+V)", kvFactor);
-        TLLM_LOG_INFO("storageDataSize (mDataType): %ld bytes", storageDataSize);
-        TLLM_LOG_INFO("transmissionDataSize (FP16): %ld bytes", transmissionDataSize);
-        
-        // Calculate bytes per token for both K and V in transmission format (FP16)
-        size_t bytesPerTokenInStorage = (blockSizeInElements * kvFactor * storageDataSize) / tokensPerBlock;
-        size_t bytesPerTokenInTransmission = (blockSizeInElements * kvFactor * transmissionDataSize) / tokensPerBlock;
-        auto kvCacheByteSizePerTokenPerLayer = bytesPerTokenInTransmission;
-        
-        TLLM_LOG_INFO("bytesPerTokenInStorage: %ld", bytesPerTokenInStorage);
-        TLLM_LOG_INFO("bytesPerTokenInTransmission: %ld", bytesPerTokenInTransmission);
-        TLLM_LOG_INFO("kvCacheByteSizePerTokenPerLayer: %ld", kvCacheByteSizePerTokenPerLayer);
-            
+        auto dataSize = common::getDTypeSize(mDataType);
+        auto kvCacheByteSizePerTokenPerLayer = mCacheManager->getBlockManager().getBlockSize(0) / tokensPerBlock
+            * (mCacheManager->getCacheType() == CacheType::kSELFKONLY ? 1 : 2) * dataSize;
         for (auto layerId = 0; layerId < mCacheManager->getBlockManager().getNumLayers(); layerId++)
         {
             auto poolIdx = mCacheManager->getBlockManager().getLayerPoolIdx(layerId);
             auto windowSize = static_cast<size_t>(mCacheManager->getBlockManager().getPoolWindowSize(poolIdx));
-            auto validTokenNum = (windowSize < maxNumTokens.value() ? windowSize : maxNumTokens.value());
-            
-            TLLM_LOG_INFO("Layer %d: poolIdx=%d, windowSize=%ld, validTokenNum=%ld", 
-                layerId, poolIdx, windowSize, validTokenNum);
-            TLLM_LOG_INFO("Layer %d: adding %ld bytes (validTokenNum=%ld * kvCacheBytesPerToken=%ld)", 
-                layerId, validTokenNum * kvCacheByteSizePerTokenPerLayer, validTokenNum, kvCacheByteSizePerTokenPerLayer);
-            
+            auto alignedWindowSize = (windowSize + tokensPerBlock - 1) / tokensPerBlock * tokensPerBlock;
+            auto validTokenNum = (alignedWindowSize < maxNumTokens.value() ? alignedWindowSize : maxNumTokens.value());
+            if (common::getEnvKVCacheTransferAllBlocksForWindow())
+            {
+                validTokenNum = maxNumTokens.value();
+            }
+            validTokenNum += tokensPerBlock; // add one more block
+
             bufferSizeFromMaxNumToken += validTokenNum * kvCacheByteSizePerTokenPerLayer;
         }
-
-        TLLM_LOG_INFO("Total bufferSizeFromMaxNumToken: %ld bytes", bufferSizeFromMaxNumToken);
-        
     }
 
     mTransferBufferSize
         = maxNumTokens.has_value() ? bufferSizeFromMaxNumToken : common::getEnvMemSizeForKVCacheTransferBuffer();
-
-    TLLM_LOG_INFO("HERE HERE HERE HERE HERE --------- ");
-    TLLM_LOG_INFO("mTransferBufferSize:%ld", mTransferBufferSize);
-    TLLM_LOG_INFO("HERE HERE HERE HERE HERE --------- ");
-
     mOnlyUseDynamicBuffer = mTransferBufferSize == 0;
     mRecvBufferCount = common::getEnvRequestKVCacheConcurrent() ? common::getEnvKVCacheRecvBufferCount() : 1;
-    mSendBufferCount = common::getEnvParallelCacheSend() ? common::getEnvKVCacheSendMaxConcurrenceNum() : 1;
+    mSendBufferCount = common::getEnvKVCacheSendMaxConcurrenceNum();
     mUseFabricMemory = !(common::getEnvKVCacheTransferUseSyncBuffer() || common::getEnvKVCacheTransferUseAsyncBuffer())
         && FabricMemory::supportFbaricMemory();
     if (mUseFabricMemory)

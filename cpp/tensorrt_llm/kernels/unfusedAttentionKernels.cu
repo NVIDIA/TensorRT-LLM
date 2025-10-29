@@ -2338,6 +2338,8 @@ void invokeConversion(Dst* dst, Src const* src, int64_t size, float const* __res
         Dst * dst, Src const* src, int64_t size, float const* __restrict__ scale, cudaStream_t stream)
 INSTANTIATE_invokeConversion(__nv_fp8_e4m3, half);
 INSTANTIATE_invokeConversion(__nv_fp8_e4m3, __nv_bfloat16);
+INSTANTIATE_invokeConversion(half, __nv_fp8_e4m3);
+INSTANTIATE_invokeConversion(__nv_bfloat16, __nv_fp8_e4m3);
 #undef INSTANTIATE_invokeConversion
 
 template <typename T>

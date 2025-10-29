@@ -1,19 +1,19 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+* SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+* SPDX-License-Identifier: Apache-2.0
+*
+* Licensed under the Apache License, Version 2.0 (the "License");
+* you may not use this file except in compliance with the License.
+* You may obtain a copy of the License at
+*
+* http://www.apache.org/licenses/LICENSE-2.0
+*
+* Unless required by applicable law or agreed to in writing, software
+* distributed under the License is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+* See the License for the specific language governing permissions and
+* limitations under the License.
+*/
 
 #pragma once
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -96,7 +96,7 @@ bool getEnvDisableKVCacheTransferOverlap();
 
 bool getEnvEnableReceiveKVCacheParallel();
 
-std::string const& getEnvKVCacheTransferOutputPath();
+std::string const& getEnvKVCacheTimeOutputPath();
 
 bool getEnvTryZCopyForKVCacheTransfer();
 
@@ -127,6 +127,8 @@ bool getEnvKVCacheTransferUseSyncBuffer();
 
 size_t getEnvKVCacheSendMaxConcurrenceNum();
 
+bool getEnvKVCacheEnablePrecisionConversion();
+
 size_t getEnvMemSizeForKVCacheTransferBuffer();
 
 uint16_t getEnvNixlPort();
@@ -136,7 +138,17 @@ bool getEnvDisaggBenchmarkGenOnly();
 // Whether to disable the chunked-attention in the generation phase.
 bool getEnvDisableChunkedAttentionInGenPhase();
 
-// Whether to enable KV cache precision conversion during transfers.
-bool getEnvEnableKVCachePrecisionConversion();
+// Whether to use one block per token for MoE A2A kernels (default true).
+bool getEnvMoeA2AOneBlockPerToken();
+
+// TODO: For DEV purpose temporarily.
+// Block size (threads per block) for MoE A2A Dispatch kernels (default 256 if unset or invalid)
+int getEnvMoeA2ADispatchBlockSize();
+// Block size (threads per block) for MoE A2A Combine kernels (default 256 if unset or invalid)
+int getEnvMoeA2ACombineBlockSize();
+
+bool getEnvKVCacheTransferAllBlocksForWindow();
+
+bool getEnvEplbForceGdrcopy();
 
 } // namespace tensorrt_llm::common
