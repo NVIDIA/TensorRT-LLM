@@ -227,7 +227,8 @@ class ReportUtility:
             try:
                 props = torch.cuda.get_device_properties(idx)
                 gpu_info["name"] = getattr(props, "name", "Unknown")
-                gpu_info["memory.total"] = float(getattr(props, "total_memory", 0.0)) / (1024.0**3)  # GB
+                gpu_info["memory.total"] = float(
+                    getattr(props, "total_memory", 0.0)) / (1024.0**3)  # GB
                 if pynvml:
                     # For memory clock, we must use pynvml
                     handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
@@ -588,8 +589,10 @@ class ReportUtility:
             for gpu in gpus:
                 name = gpu.get("name", "Unknown")
                 idx = gpu.get("index", 0)
-                mem_total_str = f"{gpu["memory.total"]:.2f} GB" if gpu.get("memory.total") is not None else "N/A"
-                mem_clock_str = f"{gpu.get("clocks.mem"):.2f} GHz" if gpu.get("clocks.mem") is not None else "N/A"
+                mem_total_str = f"{gpu['memory.total']:.2f} GB" if gpu.get(
+                    "memory.total") is not None else "N/A"
+                mem_clock_str = f"{gpu['clocks.mem']:.2f} GHz" if gpu.get(
+                    'clocks.mem') is not None else "N/A"
 
                 machine_info += (
                     f"GPU {idx}: {name}, memory {mem_total_str}, {mem_clock_str}\n"
