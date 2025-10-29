@@ -66,75 +66,72 @@ class OpenSearchDB:
         pass
 
     @staticmethod
-    def typeCheckForOpenSearchDB(json_data):
+    def typeCheckForOpenSearchDB(json_data) -> bool:
+        """
+        Check if the data is valid for OpenSearchDB.
+
+        :param json_data: Data to check, type dict or list.
+        :return: bool, True if data is valid, False otherwise.
+        """
         if isinstance(json_data, list):
-            for data in json_data:
-                OpenSearchDB.typeCheckForOpenSearchDB(data)
-            return json_data
+            return all(
+                OpenSearchDB.typeCheckForOpenSearchDB(item)
+                for item in json_data)
         if not isinstance(json_data, dict):
-            raise TypeError(f"Expected dict, got {type(json_data).__name__}")
+            OpenSearchDB.logger.error(
+                f"OpenSearchDB type check failed! Expected dict, got {type(json_data).__name__}"
+            )
+            return False
+
+        allowed_keys = {"_id", "_project", "_shard", "_version"}
+        type_map = {
+            "l_": int,
+            "d_": float,
+            "s_": str,
+            "b_": bool,
+            "ts_": int,
+            "flat_": dict,
+            "ni_": (str, int, float),
+        }
+
         for key, value in json_data.items():
-            if key.startswith("l_"):
-                if not isinstance(value, int):
-                    OpenSearchDB.logger.fatal(
-                        "OpenSearchDB type check failed! key:{}, value:{} value_type:{}"
-                        .format(key, value, type(value)))
-                    raise Exception(
-                        "typeCheckForOpenSearchDB Failed, key:{}, value:{} value_type:{}"
-                        .format(key, value, type(value)))
-            elif key.startswith("s_"):
-                if not isinstance(value, str):
-                    OpenSearchDB.logger.fatal(
-                        "OpenSearchDB type check failed! key:{}, value:{} value_type:{}"
-                        .format(key, value, type(value)))
-                    raise Exception(
-                        "typeCheckForOpenSearchDB Failed, key:{}, value:{} value_type:{}"
-                        .format(key, value, type(value)))
-            elif key.startswith("b_"):
-                if not isinstance(value, bool):
-                    OpenSearchDB.logger.fatal(
-                        "OpenSearchDB type check failed! key:{}, value:{} value_type:{}"
-                        .format(key, value, type(value)))
-                    raise Exception(
-                        "typeCheckForOpenSearchDB Failed, key:{}, value:{} value_type:{}"
-                        .format(key, value, type(value)))
-            elif key.startswith("ts_"):
-                if not isinstance(value, int):
-                    OpenSearchDB.logger.fatal(
-                        "OpenSearchDB type check failed! key:{}, value:{} value_type:{}"
-                        .format(key, value, type(value)))
-                    raise Exception(
-                        "typeCheckForOpenSearchDB Failed, key:{}, value:{} value_type:{}"
-                        .format(key, value, type(value)))
-            elif key.startswith("flat_"):
-                if not isinstance(value, dict):
-                    OpenSearchDB.logger.fatal(
-                        "OpenSearchDB type check failed! key:{}, value_type:{}".
-                        format(key, type(value)))
-                    raise Exception(
-                        "typeCheckForOpenSearchDB Failed, key:{}, value:{} value_type:{}"
-                        .format(key, value, type(value)))
-            elif key.startswith("ni_"):
-                if not isinstance(value, (str, int, float)):
-                    OpenSearchDB.logger.fatal(
-                        "OpenSearchDB type check failed! key:{}, value_type:{}".
-                        format(key, type(value)))
-                    raise Exception(
-                        "typeCheckForOpenSearchDB Failed, key:{}, value:{} value_type:{}"
-                        .format(key, value, type(value)))
-            else:
-                OpenSearchDB.logger.fatal(
-                    "Unknown key type! key:{}, value_type:{}".format(
-                        key, type(value)))
-        return json_data
+            matched = False
+            for prefix, expected_type in type_map.items():
+                if key.startswith(prefix):
+                    if not isinstance(value, expected_type):
+                        OpenSearchDB.logger.error(
+                            f"OpenSearchDB type check failed! key:{key}, value:{value} value_type:{type(value)}"
+                        )
+                        return False
+                    matched = True
+                    break
+            if not matched:
+                if key not in allowed_keys:
+                    OpenSearchDB.logger.error(
+                        f"Unknown key type! key:{key}, value_type:{type(value)}"
+                    )
+                    return False
+        return True
 
     @staticmethod
-    def _calculate_timestamp(days_ago):
+    def _calculate_timestamp(days_ago) -> int:
+        """
+        Calculate timestamp in milliseconds.
+
+        :param days_ago: Number of days ago.
+        :return: Timestamp in milliseconds.
+        """
         return int(time.time() -
                    24 * 3600 * days_ago) // (24 * 3600) * 24 * 3600 * 1000
 
     @staticmethod
-    def add_id_of_json(data):
+    def add_id_of_json(data) -> None:
+        """
+        Add _id field to the data.
+
+        :param data: Data to add _id field, type dict or list.
+        :return: None.
+        """
         if isinstance(data, list):
             for d in data:
                 OpenSearchDB.add_id_of_json(d)
@@ -145,66 +142,97 @@ class OpenSearchDB:
         data["_id"] = hashlib.md5(data_str).hexdigest()
 
     @staticmethod
-    def postToOpenSearchDB(json_data, project):
+    def postToOpenSearchDB(json_data, project) -> bool:
+        """
+        Post data to OpenSearchDB.
+
+        :param json_data: Data to post, type dict or list.
+        :param project: Name of the project.
+        :return: bool, True if post successful, False otherwise.
+        """
         if not OPEN_SEARCH_DB_BASE_URL:
-            raise Exception("OPEN_SEARCH_DB_BASE_URL is not set")
+            OpenSearchDB.logger.error("OPEN_SEARCH_DB_BASE_URL is not set")
+            return False
         if not OPEN_SEARCH_DB_USERNAME or not OPEN_SEARCH_DB_PASSWORD:
-            raise Exception(
+            OpenSearchDB.logger.error(
                 "OPEN_SEARCH_DB_USERNAME or OPEN_SEARCH_DB_PASSWORD is not set")
+            return False
         if project not in WRITE_ACCESS_PROJECT_NAME:
-            raise Exception(
-                "project {} is not in write access project list: {}".format(
-                    project, json.dumps(WRITE_ACCESS_PROJECT_NAME)))
-        OpenSearchDB.typeCheckForOpenSearchDB(json_data)
+            OpenSearchDB.logger.error(
+                f"project {project} is not in write access project list: {json.dumps(WRITE_ACCESS_PROJECT_NAME)}"
+            )
+            return False
+        if not OpenSearchDB.typeCheckForOpenSearchDB(json_data):
+            OpenSearchDB.logger.error(
+                f"OpenSearchDB type check failed! json_data:{json_data}")
+            return False
+
         OpenSearchDB.add_id_of_json(json_data)
-        json_data = json.dumps(json_data)
+        json_data_dump = json.dumps(json_data)
+
         if DISABLE_OPEN_SEARCH_DB_FOR_LOCAL_TEST:
             OpenSearchDB.logger.info(
-                "OpenSearchDB is disabled for local test, skip posting to OpenSearchDB: {}"
-                .format(json_data))
-            return None
-        url = "{}/dataflow2/{}/posting".format(OPEN_SEARCH_DB_BASE_URL, project)
+                f"OpenSearchDB is disabled for local test, skip posting to OpenSearchDB: {json_data_dump}"
+            )
+            return True
+
+        url = f"{OPEN_SEARCH_DB_BASE_URL}/dataflow2/{project}/posting"
         headers = {
             "Content-Type": "application/json",
             "Accept-Charset": "UTF-8"
         }
-        retry_time = DEFAULT_RETRY_COUNT
-        while retry_time:
-            res = requests.post(
-                url,
-                data=json_data,
-                headers=headers,
-                auth=HTTPProxyAuth(OPEN_SEARCH_DB_USERNAME,
-                                   OPEN_SEARCH_DB_PASSWORD),
-                timeout=POST_TIMEOUT_SECONDS,
-            )
-            if res.status_code in [200, 201, 202]:
-                if res.status_code != 200 and project == JOB_PROJECT_NAME:
+
+        for attempt in range(DEFAULT_RETRY_COUNT):
+            try:
+                res = requests.post(
+                    url,
+                    data=json_data_dump,
+                    headers=headers,
+                    auth=HTTPProxyAuth(OPEN_SEARCH_DB_USERNAME,
+                                       OPEN_SEARCH_DB_PASSWORD),
+                    timeout=POST_TIMEOUT_SECONDS,
+                )
+                if res.status_code in (200, 201, 202):
+                    if res.status_code != 200 and project == JOB_PROJECT_NAME:
+                        OpenSearchDB.logger.info(
+                            f"OpenSearchDB post not 200, log:{res.status_code} {res.text}"
+                        )
+                    return True
+                else:
                     OpenSearchDB.logger.info(
-                        "OpenSearchDB post not 200, log:{} {}".format(
-                            res.status_code, res.text))
-                return
-            OpenSearchDB.logger.info(
-                "OpenSearchDB post failed, will retry, error:{} {}".format(
-                    res.status_code, res.text))
-            retry_time -= 1
+                        f"OpenSearchDB post failed, will retry, error:{res.status_code} {res.text}"
+                    )
+            except Exception as e:
+                OpenSearchDB.logger.info(
+                    f"OpenSearchDB post exception, attempt {attempt + 1} error: {e}"
+                )
         OpenSearchDB.logger.error(
-            "Fail to postToOpenSearchDB after {} retry: {}, json: {}, error: {}"
-            .format(retry_time, url, json_data, res.text))
-        return None
+            f"Fail to postToOpenSearchDB after {DEFAULT_RETRY_COUNT} tries: {url}, json: {json_data_dump}, last error: {getattr(res, 'text', 'N/A') if 'res' in locals() else ''}"
+        )
+        return False
 
     @staticmethod
-    def queryFromOpenSearchDB(json_data, project):
+    def queryFromOpenSearchDB(json_data, project) -> dict:
+        """
+        Query data from OpenSearchDB.
+
+        :param json_data: Data to query, type dict or list.
+        :param project: Name of the project.
+        :return: dict, query result.
+        """
         if not OPEN_SEARCH_DB_BASE_URL:
-            raise Exception("OPEN_SEARCH_DB_BASE_URL is not set")
+            OpenSearchDB.logger.error("OPEN_SEARCH_DB_BASE_URL is not set")
+            return {}
         if project not in READ_ACCESS_PROJECT_NAME:
-            raise Exception(
-                "project {} is not in read access project list: {}".format(
-                    project, json.dumps(READ_ACCESS_PROJECT_NAME)))
+            OpenSearchDB.logger.error(
+                f"project {project} is not in read access project list: {json.dumps(READ_ACCESS_PROJECT_NAME)}"
+            )
+            return {}
         if not isinstance(json_data, str):
-            json_data = json.dumps(json_data)
-        url = "{}/opensearch/df-{}-*/_search".format(OPEN_SEARCH_DB_BASE_URL,
-                                                     project)
+            json_data_dump = json.dumps(json_data)
+        else:
+            json_data_dump = json_data
+        url = f"{OPEN_SEARCH_DB_BASE_URL}/opensearch/df-{project}-*/_search"
         headers = {
             "Content-Type": "application/json",
             "Accept-Charset": "UTF-8"
@@ -212,19 +240,19 @@ class OpenSearchDB:
         retry_time = DEFAULT_RETRY_COUNT
         while retry_time:
             res = requests.get(url,
-                               data=json_data,
+                               data=json_data_dump,
                                headers=headers,
                                timeout=QUERY_TIMEOUT_SECONDS)
             if res.status_code in [200, 201, 202]:
                 return res.json()
             OpenSearchDB.logger.info(
-                "nvdf query failed, will retry, error:{} {}".format(
-                    res.status_code, res.text))
+                f"nvdf query failed, will retry, error:{res.status_code} {res.text}"
+            )
             retry_time -= 1
         OpenSearchDB.logger.error(
-            "Fail to queryFromOpenSearchDB after {} retry: {}, json: {}, error: {}"
-            .format(retry_time, url, json_data, res.text))
-        return None
+            f"Fail to queryFromOpenSearchDB after {retry_time} retry: {url}, json: {json_data_dump}, error: {res.text}"
+        )
+        return {}
 
     @staticmethod
     def queryBuildIdFromOpenSearchDB(job_name, last_days=DEFAULT_LOOKBACK_DAYS):
