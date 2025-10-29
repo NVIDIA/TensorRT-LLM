@@ -138,7 +138,9 @@ class ShardedWeightLoader(HfWeightLoader):
 
 @register_mapper("DUMMY_FORMAT")
 class ShardedWeightMapper(HfWeightMapper):
-    already_sharded: bool = True
+    def __init__(self):
+        super().__init__()
+        self.already_sharded = True
 
 
 def test_sharded_safetensors_checkpoint_loader():
