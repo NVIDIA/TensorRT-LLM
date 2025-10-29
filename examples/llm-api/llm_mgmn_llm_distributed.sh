@@ -8,7 +8,9 @@
 #SBATCH -e logs/llmapi-distributed.err
 #SBATCH -J llmapi-distributed-task
 
-### Run LLM-API with pytorch backend on Slurm
+### :section Slurm
+### :title Run LLM-API with pytorch backend on Slurm
+### :order 0
 
 # NOTE, this feature is experimental and may not work on all systems.
 # The trtllm-llmapi-launch is a script that launches the LLM-API code on
@@ -27,14 +29,14 @@
 #   MOUNT_DIR: the directory to mount in the container
 #   MOUNT_DEST: the destination directory in the container
 #   WORKDIR: the working directory in the container
-#   SOURCE_ROOT: the path to the TensorRT-LLM source
+#   SOURCE_ROOT: the path to the TensorRT LLM source
 #   PROLOGUE: the prologue to run before the script
 #   LOCAL_MODEL: the local model directory to use, NOTE: downloading from HF is
 #      not supported in Slurm mode, you need to download the model and put it in
 #      the LOCAL_MODEL directory.
 
 # Adjust the paths to run
-export script=$SOURCE_ROOT/examples/pytorch/quickstart_advanced.py
+export script=$SOURCE_ROOT/examples/llm-api/quickstart_advanced.py
 
 # Just launch the PyTorch example with trtllm-llmapi-launch command.
 srun -l \

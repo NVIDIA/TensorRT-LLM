@@ -132,9 +132,12 @@ std::optional<std::shared_ptr<KVCacheEventManager>> Executor::getKVCacheEventMan
     return mImpl->getKVCacheEventManager();
 }
 
-KVCacheEvent::KVCacheEvent(size_t eventId, KVCacheEventData data)
+KVCacheEvent::KVCacheEvent(
+    size_t eventId, KVCacheEventData data, SizeType32 windowSize, std::optional<SizeType32> attentionDpRank)
     : eventId{eventId}
     , data{std::move(data)}
+    , windowSize{windowSize}
+    , attentionDpRank{attentionDpRank}
 {
 }
 

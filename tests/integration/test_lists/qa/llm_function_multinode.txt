@@ -1,0 +1,13 @@
+test_e2e.py::test_ptp_quickstart_advanced_deepseek_multi_nodes[DeepSeek-V3]
+test_e2e.py::test_ptp_quickstart_advanced_deepseek_multi_nodes[DeepSeek-V3-0324]
+test_e2e.py::test_openai_multinodes_chat_tp16pp1
+test_e2e.py::test_multi_nodes_eval[llama-3.3-models/Llama-3.3-70B-Instruct-tp16-mmlu]
+test_e2e.py::test_multi_nodes_eval[llama4-models/Llama-4-Maverick-17B-128E-Instruct-tp8pp2-mmlu]
+test_e2e.py::test_multi_nodes_eval[llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8-tp8pp2-mmlu]
+test_e2e.py::test_multi_nodes_eval[Qwen3/Qwen3-235B-A22B-tp16-mmlu]
+test_e2e.py::test_multi_nodes_eval[Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf-tp16-mmlu]
+test_e2e.py::test_multi_nodes_eval[DeepSeek-R1/DeepSeek-R1-0528-FP4-tp16-mmlu]
+test_e2e.py::test_multi_nodes_eval[Kimi-K2-Instruct-tp16-mmlu]
+test_e2e.py::test_multi_nodes_eval[nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1-tp16-mmlu]
+test_e2e.py::test_openai_disagg_multi_nodes_completion[ctx_tp2pp1-gen_tp2pp1]
+test_e2e.py::test_openai_disagg_multi_nodes_completion[ctx_tp1pp2-gen_tp1pp2]

@@ -130,10 +130,14 @@ std::vector<th::Tensor> lora_grouped_gemm(th::Tensor const& input, th::Tensor co
         }
     }
 
-    auto cublasHandle = getCublasHandle();
-    auto cublasLtHandle = getCublasLtHandle();
-    auto cublasWraper
-        = std::make_shared<tensorrt_llm::common::CublasMMWrapper>(cublasHandle, cublasLtHandle, nullptr, nullptr);
+    thread_local std::shared_ptr<tensorrt_llm::common::CublasMMWrapper> cublasWrapper;
+    if (cublasWrapper == nullptr)
+    {
+        auto cublasHandle = getCublasHandle();
+        auto cublasLtHandle = getCublasLtHandle();
+        cublasWrapper
+            = std::make_shared<tensorrt_llm::common::CublasMMWrapper>(cublasHandle, cublasLtHandle, nullptr, nullptr);
+    }
 
     int const inHiddenSize = input.sizes()[input.sizes().size() - 1];
 
@@ -151,7 +155,7 @@ std::vector<th::Tensor> lora_grouped_gemm(th::Tensor const& input, th::Tensor co
     }
 
     auto mLoraImpl = std::make_shared<tensorrt_llm::kernels::LoraImpl>(
-        inHiddenSize, outHiddenSizes, transA, transB, numLoraModules, loraRuntimeDataType, max_low_rank, cublasWraper);
+        inHiddenSize, outHiddenSizes, transA, transB, numLoraModules, loraRuntimeDataType, max_low_rank, cublasWrapper);
 
     // TODO (dafrimi): use Profiler to find the best tactic as used in lora_plugin
     mLoraImpl->setBestTactic(std::nullopt);

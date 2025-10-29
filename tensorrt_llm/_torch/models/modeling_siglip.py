@@ -23,7 +23,9 @@ class SiglipVisionTransformer(nn.Module):
     For example, it is different from the regular SiglipVisionTransformer in the sense that it does not return a pooled output.
     """
 
-    def __init__(self, model_config: ModelConfig[SiglipVisionConfig]):
+    def __init__(self,
+                 model_config: ModelConfig[SiglipVisionConfig],
+                 use_post_layernorm: bool = False):
         super().__init__()
         config = model_config.pretrained_config
         self.config = config
@@ -32,6 +34,9 @@ class SiglipVisionTransformer(nn.Module):
         self.encoder = SiglipEncoder(model_config)
         if hasattr(config, "vision_use_head"):
             assert not config.vision_use_head, "Currently, we only support vision_use_head = False"
+        self.post_layernorm = nn.LayerNorm(
+            config.hidden_size,
+            eps=config.layer_norm_eps) if use_post_layernorm else nn.Identity()
 
     def forward(
         self,
@@ -52,40 +57,57 @@ class SiglipVisionTransformer(nn.Module):
             attn_metadata=attn_metadata,
         )
 
+        encoder_outputs_list = list(encoder_outputs)
+        encoder_outputs_list[-1] = self.post_layernorm(encoder_outputs_list[-1])
+        encoder_outputs = tuple(encoder_outputs_list)
+
         return encoder_outputs
 
 
 @register_auto_model("SiglipVisionModel")
 class SiglipVisionModel(nn.Module):
 
-    def __init__(self, model_config: ModelConfig[SiglipVisionConfig]):
+    def __init__(self,
+                 model_config: ModelConfig[SiglipVisionConfig],
+                 use_post_layernorm: bool = False):
         super().__init__()
         self.config = model_config.pretrained_config
-        self.vision_model = SiglipVisionTransformer(model_config)
+        self.vision_model = SiglipVisionTransformer(
+            model_config, use_post_layernorm=use_post_layernorm)
         self.model_config = model_config
+
+        # Needed for prepare_attn_metadata
+        self.image_size = self.config.image_size
+        self.patch_size = self.config.patch_size
+
         self.metadata_cls = get_attention_backend(
             model_config.attn_backend).Metadata
+        self.attn_metadata = self.metadata_cls(
+            max_num_requests=
+            8192,  #TODO(yechank-nvidia): Make this along with the LLM's max_num_requests
+            max_num_tokens=model_config.max_num_tokens,
+            kv_cache_manager=None,
+        )
 
     def prepare_attn_metadata(self, batch_size):
         """
         To simplify the usage of the model, this function aims to fill the metadata for Attention
         Call this function before forward pass
         """
-        seq_len = (self.config.image_size // self.config.patch_size)**2
+        seq_len = (self.image_size // self.patch_size)**2
         request_ids = list(range(1, batch_size + 1))
         prompt_lens = [seq_len] * batch_size
-        attn_metadata = self.metadata_cls(
-            seq_lens=torch.tensor([seq_len] * batch_size, dtype=torch.int),
-            num_contexts=batch_size,
-            max_num_requests=batch_size,
-            max_num_tokens=seq_len * batch_size,
-            kv_cache_manager=None,
-            request_ids=request_ids,
-            prompt_lens=prompt_lens,
-        )
-        attn_metadata.max_seq_len = seq_len * batch_size
-        attn_metadata.prepare()
-        return attn_metadata
+        seq_lens = torch.tensor([seq_len] * batch_size,
+                                dtype=torch.int,
+                                pin_memory=True)
+
+        self.attn_metadata.num_contexts = batch_size
+        self.attn_metadata.request_ids = request_ids
+        self.attn_metadata.prompt_lens = prompt_lens
+        self.attn_metadata.seq_lens = seq_lens
+        self.attn_metadata.max_seq_len = seq_len
+        self.attn_metadata.prepare()
+        return self.attn_metadata
 
     @property
     def dtype(self):

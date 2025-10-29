@@ -34,6 +34,9 @@ namespace cutlass_kernels = ::tensorrt_llm::kernels::opened_cutlass_kernels;
 #else
 namespace cutlass_kernels = ::tensorrt_llm::kernels::cutlass_kernels;
 #endif
+
+using LaunchConfig = typename cutlass_kernels::GemmAllReduceImplInterface::LaunchConfig;
+
 namespace tensorrt_llm::plugins
 {
 struct GemmAllReducePluginOptions
@@ -125,6 +128,8 @@ private:
 
     void allocatePersistentWorkspace();
 
+    LaunchConfig getStaticHeuristicLaunchConfig(int M) const;
+
     // Params that are initialized during constructor
     using KeyType = std::tuple<DataType, DataType, DataType>;
     using ValueType = std::function<cutlass_kernels::GemmAllReduceImplInterface*()>;
@@ -149,7 +154,7 @@ private:
     int mNbOutputs = 0;
 
     std::map<KeyType, ValueType> mTypedInstantiators;
-    char const* mWorkspaceKey = "gemm_allreduce_workspace";
+    std::string mWorkspaceKey;
     std::shared_ptr<cutlass_kernels::GemmAllReduceImplInterface> mGemm;
     // Params that are initialized during configurePlugin()
     GemmAllReducePersistentWorkspace* mWorkspace = nullptr;

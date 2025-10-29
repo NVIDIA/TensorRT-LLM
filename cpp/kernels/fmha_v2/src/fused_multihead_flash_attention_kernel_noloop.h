@@ -175,10 +175,10 @@ inline __device__ void device_flash_attention_nl(Params const& params)
 
     int const kv_loop_end = ((valid_seqlen + Cta_tile_p::N - 1) / Cta_tile_p::N) * Cta_tile_p::N;
     int const kv_loop_start = mask_sliding_window
-        ? (max(0, q_sequence_start - params.sliding_window_size) / Cta_tile_p::N) * Cta_tile_p::N
+        ? (max(0, q_sequence_start + 1 - params.sliding_window_size) / Cta_tile_p::N) * Cta_tile_p::N
         : 0;
     int const sliding_window_mask_end = mask_sliding_window
-        ? (max(0, q_sequence_start + Cta_tile_p::M - 1 - params.sliding_window_size) / Cta_tile_p::N) * Cta_tile_p::N
+        ? (max(0, q_sequence_start + Cta_tile_p::M - params.sliding_window_size) / Cta_tile_p::N) * Cta_tile_p::N
         : 0;
 
     static_assert(Cta_tile_p::M >= Cta_tile_p::N, "");
@@ -344,7 +344,7 @@ inline __device__ void device_flash_attention_nl(Params const& params)
     fmha::Clear_accumulator<Acc_type_o, Cta_tile_o::WARPS_K>::apply(acc_o);
 
     // Flash attention updater
-    fmha::Tile_o_normalizer<Traits_o, Cta_tile_o, Kernel_traits::SAGE_ATTENTION> acc_o_normalizer;
+    fmha::Tile_o_normalizer<Traits_o, Cta_tile_o, Kernel_traits::SAGE_ATTENTION> acc_o_normalizer(params, binfo);
     if constexpr (Kernel_traits::SAGE_ATTENTION)
     {
         acc_o_normalizer.move_to_first_block(params, bidb, bidh);
@@ -709,6 +709,8 @@ inline __device__ void device_flash_attention_nl(Params const& params)
         }
     } // Inner loop over the key/value sequence length.
 
+    // Update the sum if attention sinks are used.
+    acc_o_normalizer.update_sum(global_max, global_sum);
     // Update acc_o of flash attention
     acc_o_normalizer.final_update(acc_o, global_sum);
 

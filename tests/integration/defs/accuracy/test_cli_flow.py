@@ -18,12 +18,18 @@ from tensorrt_llm.llmapi import (EagleDecodingConfig, LookaheadDecodingConfig,
                                  MedusaDecodingConfig)
 from tensorrt_llm.quantization import QuantAlgo
 
-from ..conftest import (llm_models_root, parametrize_with_ids, skip_no_nvls,
-                        skip_post_blackwell, skip_pre_ada, skip_pre_blackwell,
-                        skip_pre_hopper)
+from ..conftest import (get_sm_version, llm_models_root, parametrize_with_ids,
+                        skip_no_nvls, skip_post_blackwell, skip_pre_ada,
+                        skip_pre_blackwell, skip_pre_hopper)
 from .accuracy_core import (MMLU, CliFlowAccuracyTestHarness, CnnDailymail,
                             Humaneval, PassKeyRetrieval64k,
                             PassKeyRetrieval128k, SlimPajama6B, ZeroScrolls)
+
+# skip trt flow cases on post-Blackwell-Ultra
+if get_sm_version() >= 103:
+    pytest.skip(
+        "TRT workflow tests are not supported on post Blackwell-Ultra architecture",
+        allow_module_level=True)
 
 
 class TestGpt2(CliFlowAccuracyTestHarness):
@@ -50,11 +56,13 @@ class TestGpt2(CliFlowAccuracyTestHarness):
     def test_context_fmha_fp32_acc(self):
         self.run(extra_summarize_args=["--enable_context_fmha_fp32_acc"])
 
+    @skip_post_blackwell
     @pytest.mark.parametrize("precision", ["int8", "int4"])
     def test_weight_only(self, precision: str):
         quant_algo = QuantAlgo.W8A16 if precision == "int8" else QuantAlgo.W4A16
         self.run(quant_algo=quant_algo)
 
+    @skip_post_blackwell
     def test_int8_kv_cache(self):
         self.run(kv_cache_quant_algo=QuantAlgo.INT8)
 
@@ -208,9 +216,11 @@ class TestLlama3_3NemotronSuper49Bv1(CliFlowAccuracyTestHarness):
     EXAMPLE_FOLDER = "models/core/nemotron_nas"
 
     @pytest.mark.skip_less_device(2)
+    @pytest.mark.skip_less_device_memory(80000)
     def test_auto_dtype_tp2(self):
         self.run(tasks=[MMLU(self.MODEL_NAME)], tp_size=2, dtype='auto')
 
+    @skip_pre_hopper
     @pytest.mark.skip(
         reason="nemotron-nas scripts have to accommodate fp8 flags")
     @pytest.mark.skip_less_device(2)
@@ -245,6 +255,7 @@ class TestLlama3_1NemotronNano8Bv1(CliFlowAccuracyTestHarness):
                  kv_cache_quant_algo=QuantAlgo.FP8)
 
 
+@pytest.mark.timeout(10800)
 class TestNemotronUltra(CliFlowAccuracyTestHarness):
     MODEL_NAME = "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1"
     MODEL_PATH = f"{llm_models_root()}/nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1"
@@ -366,6 +377,13 @@ class TestPhi4MiniInstruct(CliFlowAccuracyTestHarness):
     def test_auto_dtype(self):
         self.run(tasks=[MMLU(self.MODEL_NAME)], dtype='auto')
 
+    @pytest.mark.skip_less_device(2)
+    def test_tp2(self):
+        # Created a dummy accuracy to track tp_size=2 for phi4-mini model.
+        # TODO: update once https://nvbugs/5393849 is fixed.
+        MODEL_NAME = "microsoft/Phi-4-mini-instruct-tp2"
+        self.run(tasks=[MMLU(MODEL_NAME)], tp_size=2)
+
 
 # Long sequence length test:
 # Model FP16 7B + 32K tokens in KV cache = 14 * 1024 MB + 32K * 0.5 MB = 30720 MB + scratch memory
@@ -406,6 +424,7 @@ class TestVicuna7B(CliFlowAccuracyTestHarness):
     EAGLE_MODEL_NAME = "yuhuili/EAGLE-Vicuna-7B-v1.3"
     EAGLE_MODEL_PATH = f"{llm_models_root()}/EAGLE-Vicuna-7B-v1.3"
 
+    @skip_post_blackwell
     def test_lookahead(self, mocker):
         mocker.patch.object(CnnDailymail, "MAX_BATCH_SIZE", 8)
 
@@ -416,6 +435,7 @@ class TestVicuna7B(CliFlowAccuracyTestHarness):
                  ],
                  extra_summarize_args=["--lookahead_config=[7,7,7]"])
 
+    @skip_post_blackwell
     @parametrize_with_ids("cuda_graph", [False, True])
     def test_medusa(self, cuda_graph, mocker):
         mocker.patch.object(self.__class__, "EXAMPLE_FOLDER", "medusa")
@@ -516,6 +536,10 @@ class TestLlama7B(CliFlowAccuracyTestHarness):
                 f"--quant_ckpt_path={llm_models_root()}/int4-quantized-gptq-awq/llama-7b-4bit-gs128.safetensors"
             ])
 
+    @pytest.mark.skip(
+        reason=
+        "Waived for now because attention sink cannot work with the non-cyclic kv cache kernel & runtime changes."
+    )
     def test_streamingllm(self):
         self.run(extra_acc_spec="streamingllm",
                  extra_build_args=["--streamingllm=enable"],
@@ -764,7 +788,7 @@ class TestLlama3_1_8B(CliFlowAccuracyTestHarness):
             tp_size=4,
             extra_build_args=extra_build_args)
 
-    @skip_pre_ada
+    @skip_pre_hopper
     @skip_post_blackwell
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize(
@@ -804,14 +828,14 @@ class TestLlama3_1_8BInstruct(CliFlowAccuracyTestHarness):
     def test_auto_dtype(self):
         self.run(dtype='auto')
 
-    @skip_pre_ada
+    @skip_pre_hopper
     def test_fp8_prequantized(self, mocker):
         mocker.patch.object(
             self.__class__, "MODEL_PATH",
             f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8")
         self.run(quant_algo=QuantAlgo.FP8, kv_cache_quant_algo=QuantAlgo.FP8)
 
-    @skip_pre_ada
+    @skip_pre_hopper
     @skip_post_blackwell
     def test_medusa_fp8_prequantized(self, mocker):
         # nvidia/Llama-3.1-8B-Medusa-FP8
@@ -942,6 +966,7 @@ class TestLlama3_2_1B(CliFlowAccuracyTestHarness):
 
 
 # TODO: Remove the CLI tests once NIMs use PyTorch backend
+@pytest.mark.skip_less_device_memory(80000)
 class TestLlama3_3_70BInstruct(CliFlowAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.3-70B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct"
@@ -951,6 +976,7 @@ class TestLlama3_3_70BInstruct(CliFlowAccuracyTestHarness):
     def test_auto_dtype_tp8(self):
         self.run(tasks=[MMLU(self.MODEL_NAME)], tp_size=8, dtype='auto')
 
+    @skip_pre_hopper
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_device_not_contain(["H100", "H200", "B200"])
     def test_fp8_prequantized_tp4(self, mocker):
@@ -1095,6 +1121,7 @@ class TestMixtral8x7B(CliFlowAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(80000)
+    @skip_post_blackwell
     def test_weight_only_int4_tp2(self):
         self.run(quant_algo=QuantAlgo.W4A16,
                  tp_size=2,
@@ -1102,6 +1129,7 @@ class TestMixtral8x7B(CliFlowAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(80000)
+    @skip_post_blackwell
     def test_weight_only_int8_tp2(self):
         self.run(quant_algo=QuantAlgo.W8A16,
                  tp_size=2,
@@ -1148,14 +1176,15 @@ class TestMixtral8x22B(CliFlowAccuracyTestHarness):
     @skip_pre_ada
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(80000)
-    def test_fp8_tp2pp2(self):
+    def test_fp8_tp2pp2(self, timeout_manager):
         self.run(tasks=[CnnDailymail(self.MODEL_NAME),
                         MMLU(self.MODEL_NAME)],
                  quant_algo=QuantAlgo.FP8,
                  tp_size=2,
                  pp_size=2,
                  extra_convert_args=["--calib_size=32"],
-                 extra_build_args=["--gemm_plugin=auto"])
+                 extra_build_args=["--gemm_plugin=auto"],
+                 timeout_manager=timeout_manager)
 
     @skip_post_blackwell
     @pytest.mark.skip_less_device(8)
@@ -1165,7 +1194,8 @@ class TestMixtral8x22B(CliFlowAccuracyTestHarness):
         ids=['expert_parallel', 'mixed_parallel', 'tensor_parallel'])
     @pytest.mark.parametrize("moe_renorm_mode", [0, 1],
                              ids=['no_renormalize', 'renormalize'])
-    def test_int8_plugin_tp8(self, moe_tp_size, moe_renorm_mode):
+    def test_int8_plugin_tp8(self, moe_tp_size, moe_renorm_mode,
+                             timeout_manager):
         self.run(quant_algo=QuantAlgo.W8A16,
                  tp_size=8,
                  extra_convert_args=[
@@ -1176,7 +1206,8 @@ class TestMixtral8x22B(CliFlowAccuracyTestHarness):
                  extra_build_args=[
                      "--max_beam_width=4", "--gemm_plugin=auto",
                      "--moe_plugin=auto", f"--max_seq_len={8192}"
-                 ])
+                 ],
+                 timeout_manager=timeout_manager)
 
 
 class TestGemma2B(CliFlowAccuracyTestHarness):

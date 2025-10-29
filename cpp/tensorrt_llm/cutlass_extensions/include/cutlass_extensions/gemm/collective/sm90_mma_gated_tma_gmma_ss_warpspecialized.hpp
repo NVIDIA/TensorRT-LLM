@@ -24,7 +24,6 @@
 #include "cute/algorithm/gemm.hpp"
 #include "cute/atom/mma_atom.hpp"
 #include "cute/numeric/arithmetic_tuple.hpp"
-#include "cute/tensor_predicate.hpp"
 #include "cutlass/pipeline/pipeline.hpp"
 #include "cutlass/trace.h"
 

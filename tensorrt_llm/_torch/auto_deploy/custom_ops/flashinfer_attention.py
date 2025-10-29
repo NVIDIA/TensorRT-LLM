@@ -153,14 +153,14 @@ class _FlashInferPlanner:
 _GlobalFlashInferPlanner = _FlashInferPlanner()
 
 
-@torch.library.custom_op("attention::prepare_flashinfer_metadata", mutates_args=())
+@torch.library.custom_op("auto_deploy::flashinfer_attention_prepare_metadata", mutates_args=())
 def prepare_flashinfer_metadata(
-    input_ids: torch.Tensor,
     position_ids: torch.Tensor,
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
     cache_loc: torch.Tensor,
     pages_per_seq: torch.Tensor,
+    slot_idx: torch.Tensor,
     page_size: int,
 ) -> List[torch.Tensor]:
     """Prepare metadata for flashinfer attention.
@@ -173,7 +173,7 @@ def prepare_flashinfer_metadata(
     _GlobalFlashInferPlanner.reset()
 
     # retrieve sanitzed metadata
-    seq_len = SequenceInfo._get_sanitized_seq_len(input_ids, seq_len)
+    seq_len = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
     num_seq = len(seq_len)
 
     # prepare flashinfer-style metadata
@@ -198,7 +198,6 @@ def prepare_flashinfer_metadata(
         flashinfer.get_seq_lens(paged_kv_indptr, paged_kv_last_page_len, page_size),
         position_ids.numel(),
     )
-
     # return metadata
     return (
         qo_indptr,
@@ -214,9 +213,9 @@ def prepare_flashinfer_metadata(
 # As SequenceInfo._get_sanitized_num_sequences could break in fake mode
 @prepare_flashinfer_metadata.register_fake
 def prepare_flashinfer_metadata_fake(
-    input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, page_size
+    position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size
 ):
-    seq_len = SequenceInfo._get_sanitized_seq_len(input_ids, seq_len)
+    seq_len = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
     qo_indptr = torch.empty(len(seq_len) + 1, dtype=seq_len.dtype, device=seq_len.device)
     return (
         qo_indptr,  # qo_indptr
@@ -228,7 +227,7 @@ def prepare_flashinfer_metadata_fake(
     )
 
 
-@torch.library.custom_op("attention::flashinfer_mha_with_cache", mutates_args=())
+@torch.library.custom_op("auto_deploy::flashinfer_attention_mha_with_cache", mutates_args=())
 def flashinfer_mha_with_cache(
     # Q, K, V
     q: torch.Tensor,
@@ -331,7 +330,7 @@ def flashinfer_mha_with_cache_fake(
     return torch.empty_like(q.contiguous())
 
 
-@AttentionRegistry.register("FlashInfer")
+@AttentionRegistry.register("flashinfer")
 class FlashInferAttention(AttentionDescriptor):
     @classmethod
     def _get_planner(cls) -> _FlashInferPlanner:
@@ -355,15 +354,15 @@ class FlashInferAttention(AttentionDescriptor):
     @classmethod
     def get_source_attention_op(cls) -> OpOverloadPacket:
         """Get the source attention op that we target for replacement."""
-        return torch.ops.attention.bsnd_grouped_sdpa
+        return torch.ops.auto_deploy.torch_attention
 
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
-        return torch.ops.attention.flashinfer_mha_with_cache
+        return torch.ops.auto_deploy.flashinfer_attention_mha_with_cache
 
     @classmethod
     def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
-        return torch.ops.attention.prepare_flashinfer_metadata, 6
+        return torch.ops.auto_deploy.flashinfer_attention_prepare_metadata, 6
 
     @classmethod
     def get_cache_initializers(
@@ -399,6 +398,21 @@ class FlashInferAttention(AttentionDescriptor):
 
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
+        # Sanity check: layout == "bsnd"
+        # Prefer kwargs; fall back to the final positional arg if it's a string.
+        layout = source_attn_node.kwargs.get("layout", None)
+        if (
+            layout is None
+            and len(source_attn_node.args) > 0
+            and isinstance(source_attn_node.args[-1], str)
+        ):
+            layout = source_attn_node.args[-1]
+        if layout != "bsnd":
+            raise RuntimeError(
+                f"Expected torch_attention layout='bsnd' but got {layout!r} "
+                f"for node: {source_attn_node.format_node()}"
+            )
+
         # Double check other arguments
         attn_mask, dropout_p, is_causal = extract_op_args(
             source_attn_node, "attn_mask", "dropout_p", "is_causal"
@@ -415,8 +429,8 @@ class FlashInferAttention(AttentionDescriptor):
         else:
             scale = source_attn_node.kwargs.get("scale", None)
 
-        if not isinstance(scale, float):
-            ad_logger.warning("Provided scale is not a float. Using default scale instead.")
+        if not (isinstance(scale, float) or scale is None):
+            ad_logger.warning(f"Provided {scale=}, is not a float. Using default scale instead.")
             scale = None
 
         return [

@@ -159,6 +159,18 @@ input [
     optional: true
   },
   {
+    name: "return_num_input_tokens"
+    data_type: TYPE_BOOL
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "return_num_output_tokens"
+    data_type: TYPE_BOOL
+    dims: [ 1 ]
+    optional: true
+  },
+  {
     name: "beam_width"
     data_type: TYPE_INT32
     dims: [ 1 ]
@@ -346,6 +358,16 @@ output [
     name: "total_draft_tokens"
     data_type: TYPE_INT32
     dims: [ 1 ]
+  },
+  {
+    name: "num_input_tokens"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+  },
+  {
+    name: "num_output_tokens"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
   }
 ]
 ensemble_scheduling {
@@ -530,6 +552,14 @@ ensemble_scheduling {
           value: "return_perf_metrics"
       }
       input_map {
+          key: "return_num_input_tokens"
+          value: "return_num_input_tokens"
+      }
+      input_map {
+          key: "return_num_output_tokens"
+          value: "return_num_output_tokens"
+      }
+      input_map {
           key: "num_return_sequences"
           value: "num_return_sequences"
       }
@@ -652,6 +682,14 @@ ensemble_scheduling {
       output_map {
         key: "total_draft_tokens"
         value: "total_draft_tokens"
+      },
+      output_map {
+        key: "num_input_tokens"
+        value: "num_input_tokens"
+      },
+      output_map {
+        key: "num_output_tokens"
+        value: "num_output_tokens"
       }
     },
     {

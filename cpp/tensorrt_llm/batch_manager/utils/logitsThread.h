@@ -21,10 +21,8 @@
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
-#include "tensorrt_llm/runtime/modelConfig.h"
 
 #include <memory>
-#include <optional>
 
 namespace tensorrt_llm::batch_manager
 {
@@ -52,7 +50,7 @@ void draftModelSendLogitsThread(int device, std::atomic<bool>* draftModelThreadS
     std::shared_ptr<kv_cache_manager::BaseKVCacheManager> const& crossKvCacheManager,
     std::shared_ptr<BasePeftCacheManager> const& peftCacheManager);
 
-std::optional<runtime::ITensor::SharedPtr> targetModelReceiveLogits(
-    executor::SpeculativeDecodingFastLogitsInfo const& fastLogitsInfo, runtime::ModelConfig const& modelConfig);
+void targetModelReceiveLogits(runtime::ITensor::SharedPtr& draftLogitsHost,
+    executor::SpeculativeDecodingFastLogitsInfo const& fastLogitsInfo, nvinfer1::DataType logitsDtype);
 
 } // namespace tensorrt_llm::batch_manager::utils

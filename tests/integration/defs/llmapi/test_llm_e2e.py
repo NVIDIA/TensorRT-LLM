@@ -23,7 +23,7 @@ from defs.common import convert_weights, venv_check_call
 from defs.conftest import llm_models_root, unittest_path
 from defs.trt_test_alternative import check_call
 
-from tensorrt_llm.llmapi import LLM
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.llmapi.llm_utils import BuildConfig
 
 
@@ -90,6 +90,7 @@ def test_llmapi_load_engine_from_build_command_with_lora(
     ])
 
 
+@pytest.mark.skip(reason="https://nvbugs/5574355")
 @pytest.mark.parametrize("model_name,model_path", [
     ("llama", "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"),
 ])
@@ -141,14 +142,14 @@ def test_llmapi_build_command_parameters_align(llm_root, llm_venv, engine_dir,
     with open(os.path.join(engine_dir, "config.json"), "r") as f:
         engine_config = json.load(f)
 
-        build_cmd_cfg = BuildConfig.from_dict(
-            engine_config["build_config"]).to_dict()
+        build_cmd_cfg = BuildConfig(
+            **engine_config["build_config"]).model_dump()
 
     with open(os.path.join(tmpdir.name, "config.json"), "r") as f:
         llm_api_engine_cfg = json.load(f)
 
-        build_llmapi_cfg = BuildConfig.from_dict(
-            llm_api_engine_cfg["build_config"]).to_dict()
+        build_llmapi_cfg = BuildConfig(
+            **llm_api_engine_cfg["build_config"]).model_dump()
 
     assert build_cmd_cfg == build_llmapi_cfg
 

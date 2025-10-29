@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include <cfloat>
 #include <fmha/traits.h>
 #include <fmha/utils.h>
 
@@ -1250,6 +1251,23 @@ struct Tile_o_normalizer
         BYTES_PER_ELEMENT = sizeof(float)
     };
 
+    // Initialize the attention sinks.
+    template <typename Params, typename Block_info>
+    inline __device__ Tile_o_normalizer(Params const& params, Block_info const& binfo)
+        : attention_sink_value_(params.attention_sinks != nullptr ? params.attention_sinks[binfo.bidh] : -FLT_MAX)
+    {
+    }
+
+    // Update the sum when attention sinks are used.
+    inline __device__ void update_sum(float const (&max)[ROWS_PER_THREAD], float (&sum)[ROWS_PER_THREAD])
+    {
+#pragma unroll
+        for (int i = 0; i < ROWS_PER_THREAD; ++i)
+        {
+            sum[i] += expf(attention_sink_value_ - max[i]);
+        }
+    }
+
     // Update o.
     inline __device__ void update(Fragment_accu (&acc_o)[MMAS_M][MMAS_N], float (&curr_max)[ROWS_PER_THREAD],
         float const (&prev_max)[ROWS_PER_THREAD], float (&sum)[ROWS_PER_THREAD])
@@ -1331,8 +1349,9 @@ struct Tile_o_normalizer
     }
 
     // Update o.
-    inline __device__ void final_update(Fragment_accu (&acc_o)[MMAS_M][MMAS_N], float const (&sum)[ROWS_PER_THREAD])
+    inline __device__ void final_update(Fragment_accu (&acc_o)[MMAS_M][MMAS_N], float (&sum)[ROWS_PER_THREAD])
     {
+
 #ifdef HALF_ACCUMULATION_FOR_FLASH_ATTENTION // Half accumulation
 #pragma unroll
         for (int mi = 0; mi < MMAS_M; ++mi)
@@ -1403,6 +1422,9 @@ struct Tile_o_normalizer
         }
 #endif // defined HALF_ACCUMULATION_FOR_FLASH_ATTENTION
     }
+
+    // Attention sink value.
+    float attention_sink_value_;
 };
 
 template <typename Traits, typename Cta_tile>
@@ -1461,6 +1483,23 @@ struct Tile_o_normalizer_fp32
         BYTES_PER_ELEMENT = sizeof(float)
     };
 
+    // Initialize the attention sinks.
+    template <typename Params, typename Block_info>
+    inline __device__ Tile_o_normalizer_fp32(Params const& params, Block_info const& binfo)
+        : attention_sink_value_(params.attention_sinks != nullptr ? params.attention_sinks[binfo.bidh] : -FLT_MAX)
+    {
+    }
+
+    // Update the sum when attention sinks are used.
+    inline __device__ void update_sum(float const (&max)[ROWS_PER_THREAD], float (&sum)[ROWS_PER_THREAD])
+    {
+#pragma unroll
+        for (int i = 0; i < ROWS_PER_THREAD; ++i)
+        {
+            sum[i] += expf(attention_sink_value_ - max[i]);
+        }
+    }
+
     // Update o.
     inline __device__ void update(Fragment_accu (&acc_o)[MMAS_M][MMAS_N], float (&curr_max)[ROWS_PER_THREAD],
         float const (&prev_max)[ROWS_PER_THREAD], float (&sum)[ROWS_PER_THREAD])
@@ -1501,7 +1540,7 @@ struct Tile_o_normalizer_fp32
     }
 
     // Update o after P * V
-    inline __device__ void final_update(Fragment_accu (&acc_o)[MMAS_M][MMAS_N], float const (&sum)[ROWS_PER_THREAD])
+    inline __device__ void final_update(Fragment_accu (&acc_o)[MMAS_M][MMAS_N], float (&sum)[ROWS_PER_THREAD])
     {
 
 #pragma unroll
@@ -1517,9 +1556,7 @@ struct Tile_o_normalizer_fp32
                 int jj = 2 * mi + ii;
 
                 // The diviser.
-                // printf("curr_sum_[ii] %lf %lf \n", curr_sum_[ii], curr_sum_[ii]);
                 beta[ii] = (sum[jj] == 0.f || sum[jj] != sum[jj]) ? 1.f : 1.f / sum[jj];
-                // printf("beta %lf \n", beta[ii]);
             }
 
 #pragma unroll
@@ -1538,6 +1575,9 @@ struct Tile_o_normalizer_fp32
             }
         }
     }
+
+    // Attention sink value.
+    float attention_sink_value_;
 };
 
 template <typename Cta_tile>
@@ -1550,8 +1590,12 @@ struct Tile_o_normalizer<Ampere_hmma_fp32_traits, Cta_tile>
     // The base class.
     using Base = Tile_o_normalizer_fp32<Traits, Cta_tile>;
 
-    // Default ctor
-    Tile_o_normalizer() = default;
+    // The ctor.
+    template <typename Params, typename Block_info>
+    inline __device__ Tile_o_normalizer(Params const& params, Block_info const& binfo)
+        : Base(params, binfo)
+    {
+    }
 };
 
 template <typename Cta_tile>
@@ -1564,10 +1608,15 @@ struct Tile_o_normalizer<Ampere_hmma_bf16_traits, Cta_tile>
     // The base class.
     using Base = Tile_o_normalizer_fp32<Traits, Cta_tile>;
 
-    // Default ctor
-    Tile_o_normalizer() = default;
+    // The ctor.
+    template <typename Params, typename Block_info>
+    inline __device__ Tile_o_normalizer(Params const& params, Block_info const& binfo)
+        : Base(params, binfo)
+    {
+    }
 };
 
+// The attention sinks are not enabled for Volta.
 template <typename Cta_tile>
 struct Tile_o_normalizer<Volta_hmma_fp16_16x16x16_traits, Cta_tile>
 {
@@ -1747,8 +1796,23 @@ struct Tile_o_normalizer<Ada_qmma_e4m3_fp32_traits, Cta_tile>
     // The base class.
     using Base = Tile_o_normalizer_fp32<Traits, Cta_tile>;
 
-    // Default ctor
-    Tile_o_normalizer() = default;
+    // The ctor.
+    template <typename Params, typename Block_info>
+    inline __device__ Tile_o_normalizer(Params const& params, Block_info const& binfo)
+        : Base(params, binfo)
+    {
+    }
+
+    // Update the sum.
+    inline __device__ void update_sum(float const (&max)[Base::ROWS_PER_THREAD], float (&sum)[Base::ROWS_PER_THREAD])
+    {
+// Take the log2f(Traits::SOFTMAX_FP_QUANT_SCALE) into account as the same scale has been applied to sum.
+#pragma unroll
+        for (int i = 0; i < Base::ROWS_PER_THREAD; ++i)
+        {
+            sum[i] += expf(this->attention_sink_value_ - max[i]) * Traits::SOFTMAX_FP_QUANT_SCALE;
+        }
+    }
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1786,8 +1850,12 @@ struct Tile_o_normalizer<Ada_qmma_e4m3_fp32_traits, Cta_tile, true>
         REGS_PER_THREAD = 8
     };
 
-    // Default ctor
-    Tile_o_normalizer() = default;
+    // The ctor.
+    template <typename Params, typename Block_info>
+    inline __device__ Tile_o_normalizer(Params const& params, Block_info const& binfo)
+        : Base(params, binfo)
+    {
+    }
 
     inline __device__ void merge(Fragment_accu (&acc_dst)[MMAS_M][MMAS_N], Fragment_accu (&acc_src)[MMAS_M][MMAS_N])
     {
@@ -1904,8 +1972,7 @@ struct Softmax_saver
         , softmax_sum_ptr_(reinterpret_cast<char*>(params.softmax_stats_ptr))
         , softmax_stats_stride_in_bytes_(params.softmax_stats_stride_in_bytes)
     {
-        size_t softmax_max_off = sizeof(float) * params.b * params.s * params.h;
-        softmax_max_ptr_ = reinterpret_cast<char*>(params.softmax_stats_ptr) + softmax_max_off;
+        softmax_max_ptr_ = reinterpret_cast<char*>(params.softmax_stats_ptr);
 
         int warp = threadIdx.x / Cta_tile::THREADS_PER_WARP;
         int lane = threadIdx.x % Cta_tile::THREADS_PER_WARP;
@@ -1917,9 +1984,9 @@ struct Softmax_saver
         store_softmax_ = (lane % 4 == 0 && int(warp / WARPS_M) == 0);
 
         // assume fixed seq length for the batch
-        size_t const bh_offset = (binfo.sum_s * params.h + binfo.bidh) * sizeof(float);
-        softmax_sum_ptr_ += bh_offset + row0_ * params.softmax_stats_stride_in_bytes;
+        size_t const bh_offset = (binfo.sum_s * params.h + binfo.bidh) * sizeof(float) * 2;
         softmax_max_ptr_ += bh_offset + row0_ * params.softmax_stats_stride_in_bytes;
+        softmax_sum_ptr_ += bh_offset + row0_ * params.softmax_stats_stride_in_bytes + sizeof(float);
     };
 
     inline __device__ void store(int q_loop, float* p_sum, float* p_max)
@@ -1938,19 +2005,19 @@ struct Softmax_saver
                 int row_offset = q_loop * Cta_tile::M + mi * Mma_tile::M_PER_MMA_PER_CTA;
                 if (row0_ + row_offset < actual_q_len_)
                 {
-                    fmha::stg(softmax_sum_ptr_ + row_offset * softmax_stats_stride_in_bytes_, sum0);
                     fmha::stg(softmax_max_ptr_ + row_offset * softmax_stats_stride_in_bytes_, max0);
+                    fmha::stg(softmax_sum_ptr_ + row_offset * softmax_stats_stride_in_bytes_, sum0);
                 }
                 if (row0_ + row_offset + 8 < actual_q_len_)
                 {
-                    fmha::stg(softmax_sum_ptr_ + (row_offset + 8) * softmax_stats_stride_in_bytes_, sum1);
                     fmha::stg(softmax_max_ptr_ + (row_offset + 8) * softmax_stats_stride_in_bytes_, max1);
+                    fmha::stg(softmax_sum_ptr_ + (row_offset + 8) * softmax_stats_stride_in_bytes_, sum1);
                 }
             }
         }
     }
 
-    // ptr
+    // ptr (total_token_q, h, 2) float
     char* softmax_sum_ptr_ = nullptr;
     char* softmax_max_ptr_ = nullptr;
 

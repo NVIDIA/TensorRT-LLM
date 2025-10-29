@@ -17,6 +17,7 @@
 #pragma once
 
 #include <numeric>
+#include <optional>
 
 #include "BatchedGemmOptions.h"
 #include "KernelParams.h"
@@ -233,21 +234,80 @@ struct BatchedGemmData
         // The dtype is float32.
         void const* mPtrBias{nullptr};
 
-        // The output tensor scaling factor for MxFp{4,8}, Fp8 and NvFp4 quantization.
+        // The output tensor scaling factor for Fp8 (not DeepSeek FP8) and NvFp4 quantization.
         // TensorRT-LLM API requires a scaling factor on the device.
+        // scaleC = dequantA * dequantB * quantC,
+        // where dequantA is global dequantization scaling factor of A
+        //    if dtypeA is FP8, it transforms the range from [-448, 448] to [-amaxA, amaxA]
+        //    if dtypeA is NvFp4, it transforms the range from [-448 * 6, 448 * 6] to [-amaxA, amaxA],
+        //    otherwise it is 1.
+        // dequantB is defined similarly to dequantA.
+        // quantC is the quantization scaling factor of C.
+        //    if dtypeC is FP8, it transforms the range from [-amaxC, amaxC] to [-448, 448]
+        //    if dtypeC is NvFp4, it transforms the range from [-amaxC, amaxC] to [-448 * 6, 448 * 6],
+        //    otherwise it is 1.
         // Shape is [B].
         float const* mPtrScaleC{nullptr};
 
-        // The output gate scale for MxFp{4,8} and NvFp4 quantization.
+        // The output gate scale for Fp8 (not DeepSeek FP8) and NvFp4 quantization.
         // TensorRT-LLM API requires a scaling factor on the device.
+        // scaleGate = dequantA * dequantB,
+        // where dequantA is global dequantization scaling factor of A
+        //    if dtypeA is FP8, it transforms the range from [-448, 448] to [-amaxA, amaxA]
+        //    if dtypeA is NvFp4, it transforms the range from [-448 * 6, 448 * 6] to [-amaxA, amaxA],
+        //    otherwise it is 1.
+        // dequantB is defined similarly to dequantA.
         // Shape is [B].
         float const* mPtrScaleGate{nullptr};
 
-        // The alpha and beta for SwiGlu.
-        // gatedActivation <- (x0 + beta) * sigmoid(alpha * x1)
-        // Shape is [B]
-        float const* mPtrSwiGluAlpha{nullptr};
-        float const* mPtrSwiGluBeta{nullptr};
+        // The clamp limit for the accumulator before applying the activation.
+        // Shape is [B].
+        // Clamp is INF if nullptr.
+        // When the input is FP8 or NVFP4, the clamp has to be scaled by limit' = limit / dequantAb.
+        // If applied on SwiGlu, it will be:
+        //
+        //   x_glu    = x_glu.clamp(min=None, max=limit)
+        //   x_linear = x_linear.clamp(min=-limit, max=limit)
+        //
+        // The given clamp limit applies to the dequantized values, so the order of operations would
+        // look something like this:
+        //
+        // x0 = x0 * dqAb
+        // x0 = clamp(x0, none, limit)
+        // x0 = x0 * sigmoid(alpha * x0)
+        // x1 = dqAb * x1
+        // x1 = clamp(x1, -limit, limit)
+        // out = qC * (x1 + beta) * x0
+        //
+        // Given that the dqAb and qC are combined into scaleC, we can bring the dqAb into the clamp
+        // limit and apply the clamping prior to dequantization:
+        //
+        // x0 = clamp(x0, none, limit / dqAb)
+        // x0 = x0 * dqAb
+        // x0 = x0 * sigmoid(alpha * x0)
+        // x1 = clamp(x1, -limit / dqAb, limit / dqAb)
+        // scaleC = dqAb * qC
+        // beta' = beta / dqAb
+        // out = scaleC * (x1 + beta') * x0
+        //
+        // Note this assumes that dequantScaleAb == scaleGate which is true in TRT-LLM MoE use-case
+        //
+        float const* mPtrClampLimit{nullptr};
+
+        // The alpha and beta for SwiGlu or GeGlu.
+        // gatedActivation <- (x0 + beta) * activation(x1, alpha)
+        // Shape is [B].
+        // Alpha is 1.f if nullptr.
+        // Beta is 0.f if nullptr.
+        // The formula for SwiGlu (for GeGlu, replace sigmoid with phi):
+        //
+        //   out_glu  = x_glu * torch.sigmoid(alpha * x_glu) * (x_linear + beta)
+        //
+        // The beta is added before applying the global scaling factor. I.e.
+        // x_linear = (x_linear + beta') * scaleC
+        // Thus, the beta' = beta / (dequantA * dequantB), where the beta is the original beta.
+        float const* mPtrGatedActAlpha{nullptr};
+        float const* mPtrGatedActBeta{nullptr};
 
         // Param is used when the kernel is configured with -routeAct true.
         // The inputs are not padded, but the outputs are padded to divUpMul(M[bi], tileM) for batchM or
@@ -392,12 +452,15 @@ struct BatchedGemmData
 class BatchedGemmInterface
 {
 public:
+    using ModuleCache = std::unordered_map<std::string, std::tuple<CUmodule, CUfunction>>;
+
     BatchedGemmInterface() {}
 
     // Launch the cubin from the provided config. It calls all necessary memsets for internal buffers.
     // Provided config must be validated with isValidConfig before the call.
     int32_t run(BatchedGemmConfig const& config, void* workspace, BatchedGemmData const& options, void* cudaStream,
-        int32_t multiProcessorCount);
+        int32_t multiProcessorCount, bool usePdl = true,
+        std::optional<std::reference_wrapper<ModuleCache>> moduleCache = std::nullopt);
 
     // Initializes the buffers before the world sync. Must be called before run.
     int32_t runInitBeforeWorldSync(
@@ -414,10 +477,68 @@ public:
     // Returns the number of available cubin configurations
     size_t getNumBatchedGemmConfigs() const;
 
-    // Returns the number of CTAs of the last launched kernel.
-    int32_t getNumCtas() const
+    // Returns the grid dimensions of the current kernel.
+    std::tuple<int32_t, int32_t, int32_t> getGridDim(
+        BatchedGemmOptions const& options, std::optional<int32_t> maxNumCtasInBatchDim = std::nullopt) const
     {
-        return mNumCtas;
+        bool const batchM = options.mBatchMode == BatchedGemmOptions::BatchMode::BatchM;
+
+        int32_t numCtasBatch{0};
+        // For normal BMM, mNumTokens == 0 and the number of CTAs is known to host.
+        if (options.mIsStaticBatch)
+        {
+            for (int32_t bi = 0; bi < options.mNumBatches; ++bi)
+            {
+                numCtasBatch += batchM ? gemm::divUp(options.mBatchedM[bi], options.mTileM)
+                                       : gemm::divUp(options.mBatchedN[bi], options.mTileN);
+            }
+        }
+        // For MoE, mNumTokens != 0 and the number of CTAs is known only at runtime.
+        // We launch maximally possible number of CTAs and use ptrNumNonExitingCtas to determine the
+        // actual number of CTAs to run.
+        else if ((options.mEnablesEarlyExit || options.mEnablesDelayedEarlyExit) && options.mNumTokens != 0)
+        {
+            assert(maxNumCtasInBatchDim.has_value()
+                && "maxNumCtasInBatchDim must be provided when options.mNumTokens != 0");
+            numCtasBatch = maxNumCtasInBatchDim.value();
+        }
+        else
+        {
+            throw std::invalid_argument("Invalid combination of options");
+        }
+
+        if (batchM)
+        {
+            numCtasBatch = gemm::divUpMul(numCtasBatch, options.mClusterDimX);
+        }
+        else
+        {
+            numCtasBatch = gemm::divUpMul(numCtasBatch, options.mClusterDimY);
+        }
+
+        int32_t numCtasTile
+            = batchM ? gemm::divUp(options.mN, options.mTileN) : gemm::divUp(options.mM, options.mTileM);
+        if (batchM)
+        {
+            numCtasTile = gemm::divUpMul(numCtasTile, options.mClusterDimY);
+        }
+        else
+        {
+            numCtasTile = gemm::divUpMul(numCtasTile, options.mClusterDimX);
+        }
+        int32_t const numCtasInner = options.mNumSlicesForSplitK;
+        return std::make_tuple(numCtasBatch, numCtasTile, numCtasInner);
+    }
+
+    // Creates GemmOptions from kernel and data.
+    BatchedGemmOptions getOptionsFromConfigAndData(BatchedGemmConfig const& config, BatchedGemmData const& data) const;
+
+    // Returns the number of CTAs of the current kernel.
+    int32_t getNumCtas(
+        BatchedGemmOptions const& options, std::optional<int32_t> maxNumCtasInBatchDim = std::nullopt) const
+    {
+        auto [numCtasBatch, numCtasTile, numCtasInner] = getGridDim(options, maxNumCtasInBatchDim);
+        return numCtasBatch * numCtasTile * numCtasInner;
     }
 
     // Returns true if the configuration of the cubin can be executed for the given params.
@@ -427,18 +548,12 @@ private:
     // Aligns the pointer to the alignment
     template <typename Dtype>
     inline Dtype* alignPtr(Dtype* ptr, int64_t alignment) const;
-    // Creates GemmOptions from kernel and data.
-    BatchedGemmOptions getOptionsFromConfigAndData(BatchedGemmConfig const& config, BatchedGemmData const& data) const;
 
     // Returns the size of the workspace buffers in bytes
     std::vector<size_t> getWorkspaceSizesInBytes(BatchedGemmConfig const& config, BatchedGemmData const& data) const;
 
     // Returns the size padded to the alignment
     size_t getSizePaddedToAlignment(size_t size, size_t alignment) const;
-
-private:
-    // Number of the CTAs of the last launched kernel.
-    int32_t mNumCtas{0};
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -500,7 +615,7 @@ bool BatchedGemmInterface::isValidConfig(BatchedGemmConfig const& config, Batche
     auto options = getOptionsFromConfigAndData(config, data);
 
     // Is Blackwell?
-    bool isBlackwell = config.mSm == gemm::SmVersion::Sm100a;
+    bool isBlackwell = gemm::isSmVersionBlackwell(config.mSm);
 
     // Check options without modifications.
     return checkAndUpdateBatchedGemmOptions(options, isBlackwell,
@@ -579,10 +694,13 @@ std::vector<size_t> BatchedGemmInterface::getWorkspaceSizesInBytes(
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-
 int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspace,
-    BatchedGemmData const& batchedGemmData, void* cudaStream, int32_t /* multiProcessorCount */)
+    BatchedGemmData const& batchedGemmData, void* cudaStream, int32_t /* multiProcessorCount */, bool usePdl,
+    std::optional<std::reference_wrapper<ModuleCache>> moduleCache)
 {
+    // Might be used.
+    (void) usePdl;
+    (void) moduleCache;
     // Get options from config and data.
     auto options = getOptionsFromConfigAndData(config, batchedGemmData);
 
@@ -608,52 +726,63 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
         }
     }
 
-    int32_t numCtaXy{0};
-    if (options.mIsStaticBatch)
-    {
-        for (int32_t bi = 0; bi < options.mNumBatches; ++bi)
-        {
-            numCtaXy += batchM ? gemm::divUp(options.mBatchedM[bi], options.mTileM)
-                               : gemm::divUp(options.mBatchedN[bi], options.mTileN);
-        }
-    }
-
-    int32_t maxNumCtasInBatchDim{numCtaXy};
-    // For normal BMM, mNumTokens == 0 and the number of CTAs is known to host.
-    // For MoE, mNumTokens != 0 and the number of CTAs is known only at runtime.
-    // We launch maximally possible number of CTAs and use ptrNumNonExitingCtas to determine
-    // the actual number of CTAs to run.
-    if ((options.mEnablesEarlyExit || options.mEnablesDelayedEarlyExit) && options.mNumTokens != 0)
-    {
-        // Get maximum number of CTAs in batch dim.
-        maxNumCtasInBatchDim = batchedGemmData.mProblemDimensions.mMaxNumCtasInTokenDim;
-    }
-
-    auto const numCtaX = batchM ? maxNumCtasInBatchDim : gemm::divUp(options.mM, options.mTileM);
-    auto const numCtaY = batchM ? gemm::divUp(options.mN, options.mTileN) : maxNumCtasInBatchDim;
-    auto const numCtaZ = options.mNumSlicesForSplitK;
-    mNumCtas = numCtaX * numCtaY * numCtaZ;
-
-    auto kernelParams = KernelParams::setKernelParams(options, batchM, batchedGemmData.mInputBuffers.mPtrA,
+    auto [numCtaBatch, numCtaTile, numCtaInner]
+        = getGridDim(options, batchedGemmData.mProblemDimensions.mMaxNumCtasInTokenDim);
+    auto kernelParams = KernelParamsSetup::setKernelParams(options, batchM, batchedGemmData.mInputBuffers.mPtrA,
         batchedGemmData.mInputBuffers.mPtrB, batchedGemmData.mOutputBuffers.mPtrC,
         batchedGemmData.mInputBuffers.mPtrSfA, batchedGemmData.mInputBuffers.mPtrSfB,
         batchedGemmData.mInputBuffers.mPtrPerTokenSfA, batchedGemmData.mInputBuffers.mPtrPerTokenSfB,
         batchedGemmData.mInputBuffers.mPtrBias, batchedGemmData.mOutputBuffers.mPtrSfC,
         batchedGemmData.mInputBuffers.mPtrScaleC, batchedGemmData.mInputBuffers.mPtrScaleGate,
-        batchedGemmData.mInputBuffers.mPtrSwiGluAlpha, batchedGemmData.mInputBuffers.mPtrSwiGluBeta,
-        batchedGemmData.mInputBuffers.mPtrRouteMap, dPtrRowMax, dPtrRowMaxBars,
-        batchedGemmData.mInputBuffers.mPtrNumNonExitingCtas, batchedGemmData.mInputBuffers.mPtrTotalNumPaddedTokens,
-        batchedGemmData.mInputBuffers.mPtrCtaIdxXyToBatchIdx, batchedGemmData.mInputBuffers.mPtrCtaIdxXyToMnLimit,
-        maxNumCtasInBatchDim);
+        batchedGemmData.mInputBuffers.mPtrClampLimit, batchedGemmData.mInputBuffers.mPtrGatedActAlpha,
+        batchedGemmData.mInputBuffers.mPtrGatedActBeta, batchedGemmData.mInputBuffers.mPtrRouteMap, dPtrRowMax,
+        dPtrRowMaxBars, batchedGemmData.mInputBuffers.mPtrNumNonExitingCtas,
+        batchedGemmData.mInputBuffers.mPtrTotalNumPaddedTokens, batchedGemmData.mInputBuffers.mPtrCtaIdxXyToBatchIdx,
+        batchedGemmData.mInputBuffers.mPtrCtaIdxXyToMnLimit, numCtaBatch);
 
     // The size of the grid.
-    std::vector<int32_t> grid{numCtaX, numCtaY, numCtaZ};
+    std::vector<int32_t> grid = batchM ? std::vector<int32_t>{numCtaBatch, numCtaTile, numCtaInner}
+                                       : std::vector<int32_t>{numCtaTile, numCtaBatch, numCtaInner};
 
 #ifdef TLLM_GEN_EXPORT_INTERFACE
     CUmodule cuModule;
     CUfunction cuFunction;
-    cuModuleLoadData(&cuModule, config.mData);
-    cuModuleGetFunction(&cuFunction, cuModule, config.mFunctionName);
+
+    if (moduleCache.has_value())
+    {
+        ModuleCache& moduleCacheRef = moduleCache.value().get();
+
+        // Modules are associated with a specific context, so the context is included in the key
+        CUcontext ctx;
+        unsigned long long ctxId;
+        cuCtxGetCurrent(&ctx);
+        cuCtxGetId(ctx, &ctxId);
+
+        // Reinterpret the ctxId as a string to avoid needing a custom hash or converting it to a
+        // string in decimal representation.
+        std::string const ctxName
+            = std::string(reinterpret_cast<char*>(&ctxId), sizeof(unsigned long long) / sizeof(char));
+        std::string const funcName = std::string(config.mFunctionName);
+        auto const moduleKey = ctxName + funcName;
+        auto module = moduleCacheRef.find(moduleKey);
+
+        // Use cache if module is found, otherwise load and insert into cache
+        if (module != moduleCacheRef.end())
+        {
+            cuFunction = std::get<1>(module->second);
+        }
+        else
+        {
+            cuModuleLoadData(&cuModule, config.mData);
+            cuModuleGetFunction(&cuFunction, cuModule, config.mFunctionName);
+            moduleCacheRef.insert(std::make_pair(moduleKey, std::make_tuple(cuModule, cuFunction)));
+        }
+    }
+    else
+    {
+        cuModuleLoadData(&cuModule, config.mData);
+        cuModuleGetFunction(&cuFunction, cuModule, config.mFunctionName);
+    }
 
     // Prepare the grid/block.
     dim3 block3{static_cast<uint32_t>(config.mNumThreadsPerCTA), static_cast<uint32_t>(1), static_cast<uint32_t>(1)};
@@ -667,14 +796,22 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
     // Run the kernel.
     auto result = trtllm::gen::launchKernel((void*) &kernelParams, cudaStream, config.mSharedMemSize, cuFunction,
         block3, grid3, cluster3,
-        config.mOptions.mGridWaitForPrimaryEarlyExit | config.mOptions.mGridWaitForPrimaryA
-            | config.mOptions.mGridWaitForPrimaryB);
+        usePdl
+            && (config.mOptions.mGridWaitForPrimaryEarlyExit | config.mOptions.mGridWaitForPrimaryA
+                | config.mOptions.mGridWaitForPrimaryB));
     if (result != CUDA_SUCCESS)
     {
         return -1;
     }
+    // If a module cache has not been given, unload the module to avoid leaking
+    if (!moduleCache.has_value())
+    {
+        cuModuleUnload(cuModule);
+    }
 #else
-    config.mCudaRunner->run((void*) &kernelParams, (void*) cudaStream, grid);
+    config.mCudaRunner->run((void*) &kernelParams, (void*) cudaStream, grid,
+        /* cluster */ {},
+        /* instanceId */ config.mInstanceIdx);
 #endif
 
     return 0;

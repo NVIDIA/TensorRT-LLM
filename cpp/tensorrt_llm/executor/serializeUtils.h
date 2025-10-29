@@ -21,12 +21,14 @@
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/serialization.h"
 #include "tensorrt_llm/executor/types.h"
+#include <array>
 #include <iostream>
 #include <istream>
 #include <list>
 #include <optional>
 #include <ostream>
 #include <type_traits>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -73,6 +75,44 @@ struct is_variant<std::variant<Ts...>> : std::true_type
 
 template <typename T>
 constexpr bool is_variant_v = is_variant<T>::value;
+
+// Detect std::array
+template <typename T>
+struct is_std_array : std::false_type
+{
+};
+
+template <typename U, std::size_t N>
+struct is_std_array<std::array<U, N>> : std::true_type
+{
+    using value_type = U;
+    static constexpr std::size_t size = N;
+};
+
+template <typename T>
+constexpr bool is_std_array_v = is_std_array<T>::value;
+
+template <typename T>
+using array_value_type_t = typename is_std_array<T>::value_type;
+
+template <typename T>
+constexpr std::size_t array_size_v = is_std_array<T>::size;
+
+// Detect std::pair
+template <typename T>
+struct is_std_pair : std::false_type
+{
+};
+
+template <typename A, typename B>
+struct is_std_pair<std::pair<A, B>> : std::true_type
+{
+    using first_type = A;
+    using second_type = B;
+};
+
+template <typename T>
+constexpr bool is_std_pair_v = is_std_pair<T>::value;
 
 // SerializedSize
 template <typename T>
@@ -122,6 +162,14 @@ static_assert(hasSerializedSize<GuidedDecodingParams>(size_t()));
 static_assert(!hasSerializedSize<std::string>(size_t()));
 static_assert(!hasSerializedSize<std::optional<float>>(size_t()));
 static_assert(hasSerializedSize<CacheTransceiverConfig>(size_t()));
+static_assert(hasSerializedSize<KVCacheEvent>(size_t()));
+static_assert(hasSerializedSize<KVCacheCreatedData>(size_t()));
+static_assert(hasSerializedSize<KVCacheStoredData>(size_t()));
+static_assert(hasSerializedSize<KVCacheStoredBlockData>(size_t()));
+static_assert(hasSerializedSize<KVCacheRemovedData>(size_t()));
+static_assert(hasSerializedSize<KVCacheEventDiff<SizeType32>>(size_t()));
+static_assert(hasSerializedSize<KVCacheUpdatedData>(size_t()));
+static_assert(hasSerializedSize<tensorrt_llm::runtime::UniqueToken>(size_t()));
 
 template <typename T>
 size_t serializedSize(T const& data)
@@ -152,6 +200,21 @@ size_t serializedSize(T const& data)
             size += serializedSize(elem);
         }
         return size;
+    }
+    // std::array
+    else if constexpr (is_std_array_v<T>)
+    {
+        size_t size = 0;
+        for (auto const& elem : data)
+        {
+            size += serializedSize(elem);
+        }
+        return size;
+    }
+    // std::pair
+    else if constexpr (is_std_pair_v<T>)
+    {
+        return serializedSize(data.first) + serializedSize(data.second);
     }
     // Optional
     else if constexpr (std::is_same_v<T, std::optional<typename ValueType<T>::type>>)
@@ -219,6 +282,14 @@ static_assert(hasSerialize<ContextPhaseParams>(nullptr));
 static_assert(!hasSerialize<std::string>(nullptr));
 static_assert(!hasSerialize<std::optional<float>>(nullptr));
 static_assert(hasSerialize<CacheTransceiverConfig>(nullptr));
+static_assert(hasSerialize<KVCacheEvent>(nullptr));
+static_assert(hasSerialize<KVCacheCreatedData>(nullptr));
+static_assert(hasSerialize<KVCacheStoredData>(nullptr));
+static_assert(hasSerialize<KVCacheStoredBlockData>(nullptr));
+static_assert(hasSerialize<KVCacheRemovedData>(nullptr));
+static_assert(hasSerialize<KVCacheEventDiff<SizeType32>>(nullptr));
+static_assert(hasSerialize<KVCacheUpdatedData>(nullptr));
+static_assert(hasSerialize<tensorrt_llm::runtime::UniqueToken>(nullptr));
 
 template <typename T>
 void serialize(T const& data, std::ostream& os)
@@ -249,6 +320,20 @@ void serialize(T const& data, std::ostream& os)
         {
             serialize(element, os);
         }
+    }
+    // std::array
+    else if constexpr (is_std_array_v<T>)
+    {
+        for (auto const& element : data)
+        {
+            serialize(element, os);
+        }
+    }
+    // std::pair
+    else if constexpr (is_std_pair_v<T>)
+    {
+        serialize(data.first, os);
+        serialize(data.second, os);
     }
     // Optional
     else if constexpr (std::is_same_v<T, std::optional<typename ValueType<T>::type>>)
@@ -290,6 +375,22 @@ struct get_variant_alternative_type
         return std::get<T::index()>(variant);
     }
 };
+
+template <typename T>
+T deserialize(std::istream& is);
+
+// Helper function to deserialize variant by index using template recursion
+template <typename T, std::size_t... Is>
+T deserializeVariantByIndex(std::istream& is, std::size_t index, std::index_sequence<Is...> /*indices*/)
+{
+    T result;
+    bool found = ((Is == index ? (result = deserialize<std::variant_alternative_t<Is, T>>(is), true) : false) || ...);
+    if (!found)
+    {
+        TLLM_THROW("Invalid variant index during deserialization: " + std::to_string(index));
+    }
+    return result;
+}
 
 // Deserialize
 template <typename T>
@@ -511,6 +612,42 @@ T deserialize(std::istream& is)
     {
         return Serialization::deserializeCacheTransceiverConfig(is);
     }
+    else if constexpr (std::is_same_v<T, tensorrt_llm::executor::KVCacheEvent>)
+    {
+        return Serialization::deserializeKVCacheEvent(is);
+    }
+    else if constexpr (std::is_same_v<T, tensorrt_llm::executor::KVCacheCreatedData>)
+    {
+        return Serialization::deserializeKVCacheCreatedData(is);
+    }
+    else if constexpr (std::is_same_v<T, tensorrt_llm::executor::KVCacheStoredData>)
+    {
+        return Serialization::deserializeKVCacheStoredData(is);
+    }
+    else if constexpr (std::is_same_v<T, tensorrt_llm::executor::KVCacheStoredBlockData>)
+    {
+        return Serialization::deserializeKVCacheStoredBlockData(is);
+    }
+    else if constexpr (std::is_same_v<T, tensorrt_llm::executor::KVCacheRemovedData>)
+    {
+        return Serialization::deserializeKVCacheRemovedData(is);
+    }
+    else if constexpr (std::is_same_v<T, tensorrt_llm::executor::KVCacheEventDiff<SizeType32>>)
+    {
+        return Serialization::deserializeKVCacheEventDiff<SizeType32>(is);
+    }
+    else if constexpr (std::is_same_v<T, tensorrt_llm::executor::KVCacheUpdatedData>)
+    {
+        return Serialization::deserializeKVCacheUpdatedData(is);
+    }
+    else if constexpr (std::is_same_v<T, tensorrt_llm::runtime::UniqueToken>)
+    {
+        return Serialization::deserializeUniqueToken(is);
+    }
+    else if constexpr (std::is_same_v<T, tensorrt_llm::batch_manager::kv_cache_manager::BlockKey>)
+    {
+        return Serialization::deserializeBlockKey(is);
+    }
     // Optional
     else if constexpr (std::is_same_v<T, std::optional<typename ValueType<T>::type>>)
     {
@@ -540,6 +677,23 @@ T deserialize(std::istream& is)
         }
         return container;
     }
+    // std::array
+    else if constexpr (is_std_array_v<T>)
+    {
+        T container{};
+        for (std::size_t i = 0; i < array_size_v<T>; ++i)
+        {
+            container[i] = deserialize<array_value_type_t<T>>(is);
+        }
+        return container;
+    }
+    // std::pair
+    else if constexpr (is_std_pair_v<T>)
+    {
+        auto first = deserialize<typename is_std_pair<T>::first_type>(is);
+        auto second = deserialize<typename is_std_pair<T>::second_type>(is);
+        return T{std::move(first), std::move(second)};
+    }
     // std::variant
     else if constexpr (is_variant_v<T>)
     {
@@ -547,23 +701,7 @@ T deserialize(std::istream& is)
         std::size_t index = 0;
         is.read(reinterpret_cast<char*>(&index), sizeof(index));
 
-        // TODO: Is there a better way to implement this?
-        T data;
-        if (index == 0)
-        {
-            using U = std::variant_alternative_t<0, T>;
-            data = deserialize<U>(is);
-        }
-        else if (index == 1)
-        {
-            using U = std::variant_alternative_t<1, T>;
-            data = deserialize<U>(is);
-        }
-        else
-        {
-            TLLM_THROW("Serialization of variant of size > 2 is not supported.");
-        }
-        return data;
+        return deserializeVariantByIndex<T>(is, index, std::make_index_sequence<std::variant_size_v<T>>{});
     }
     else
     {

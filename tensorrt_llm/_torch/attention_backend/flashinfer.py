@@ -1,3 +1,4 @@
+import math
 import os
 import weakref
 from dataclasses import dataclass, field
@@ -13,7 +14,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..utils import get_global_attrs, get_model_extra_attrs
 from .interface import (AttentionBackend, AttentionMask, AttentionMetadata,
-                        PredefinedAttentionMask)
+                        CustomAttentionMask, PredefinedAttentionMask)
 
 try:
     check_cuda_arch()
@@ -39,6 +40,8 @@ class PlanParams:
 
     attention_mask_type: AttentionMaskType
     attention_mask_data: Optional[torch.Tensor] = None
+    sm_scale: Optional[float] = None
+    window_left: Optional[int] = None
 
 
 @dataclass(kw_only=True)
@@ -167,7 +170,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     def create_cuda_graph_metadata(self,
                                    max_batch_size: int,
                                    sub_cross_metadata: bool = False,
-                                   max_draft_tokens: int = 0) -> Self:
+                                   max_draft_tokens: int = 0,
+                                   buffers=None) -> Self:
         metadata = super().create_cuda_graph_metadata(max_batch_size,
                                                       sub_cross_metadata,
                                                       max_draft_tokens)
@@ -294,10 +298,16 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self._positions[:positions.size(0)].copy_(positions,
                                                       non_blocking=True)
 
-        for plan_params in self._plan_params_to_wrappers:
-            # Re-plan the cached wrappers for a new set of requests.
-            self._plan_params_to_wrappers[plan_params].is_planned = False
-            self._plan_with_params(plan_params)
+        # Generally, plan_params with non-trivial attention_mask_data are relevant only the
+        # corresponding forward pass. So, flush them out here as they won't be relevant for
+        # subsequent forward calls.
+        for plan_params in list(self._plan_params_to_wrappers.keys()):
+            if plan_params.attention_mask_data is None:
+                # Re-plan the cached wrappers for a new set of requests.
+                self._plan_params_to_wrappers[plan_params].is_planned = False
+                self._plan_with_params(plan_params)
+            else:
+                del self._plan_params_to_wrappers[plan_params]
 
         if self.cross is not None and self.cross is not self:
             self.cross.prepare()
@@ -309,13 +319,23 @@ class FlashInferAttentionMetadata(AttentionMetadata):
              q_dtype: torch.dtype,
              kv_dtype: torch.dtype,
              attention_mask_type: int,
+             q_scaling: Optional[float] = None,
+             attention_window_size: Optional[int] = None,
              attention_mask_data: Optional[torch.Tensor] = None) -> PlanParams:
+
+        sm_scale = None
+        if q_scaling is not None:
+            sm_scale = 1 / (math.sqrt(head_dim) * q_scaling)
+
         plan_params = PlanParams(
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             q_dtype=q_dtype,
             kv_dtype=kv_dtype,
+            sm_scale=sm_scale,
+            window_left=attention_window_size
+            if attention_window_size is not None else -1,
             attention_mask_type=AttentionMaskType(attention_mask_type),
             attention_mask_data=attention_mask_data)
         return self._plan_with_params(plan_params)
@@ -353,6 +373,12 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         is_causal = plan_params.attention_mask_type == AttentionMaskType.causal
 
         def prefill_plan():
+            # Setting `window_left` to -1 for custom attention mask is important.
+            # Else, FlashInfer proceeds to use SWA regardless of attention_mask_data.
+            if plan_params.attention_mask_data is not None:
+                window_left = -1
+            else:
+                window_left = plan_params.window_left
             prefill_wrapper.plan(
                 self.qo_indptr[:self.num_contexts + 1],
                 self.paged_kv_indptr_prefill[:self.num_contexts + 1],
@@ -363,8 +389,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 plan_params.head_dim,
                 self.page_size,
                 causal=is_causal,
+                sm_scale=plan_params.sm_scale,
+                window_left=window_left,
                 q_data_type=plan_params.q_dtype,
                 kv_data_type=plan_params.kv_dtype,
+                custom_mask=plan_params.attention_mask_data,
             )
 
         if plan_params in self._plan_params_to_wrappers:
@@ -398,11 +427,13 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 plan_params.num_kv_heads,
                 plan_params.head_dim,
                 self.page_size,
+                sm_scale=plan_params.sm_scale,
+                window_left=plan_params.window_left,
                 q_data_type=plan_params.q_dtype,
                 kv_data_type=plan_params.kv_dtype,
             )
 
-        # Must sync after append_paged_kv_cache and before plan
+        # Must sync after append_paged_kv_cache and before plan.
         torch.cuda.current_stream().synchronize()
 
         if self.num_contexts > 0:
@@ -431,6 +462,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         head_dim: int,
         num_kv_heads: Optional[int] = None,
         quant_config: Optional[QuantConfig] = None,
+        q_scaling: Optional[float] = None,
         skip_create_weights_in_init: bool = False,
         **kwargs,
     ):
@@ -438,6 +470,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                          quant_config, **kwargs)
         if not skip_create_weights_in_init:
             self.update_quant_config(self.quant_config)
+        self.q_scaling = q_scaling
 
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         self.quant_config = new_quant_config
@@ -446,15 +479,99 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             self.has_fp8_kv_cache = self.quant_config.layer_quant_mode.has_fp8_kv_cache(
             )
 
+    def forward_impl(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        metadata: FlashInferAttentionMetadata,
+        attention_mask_type: int,
+        output: torch.Tensor,
+        attention_mask_data: Optional[torch.Tensor] = None,
+        attention_window_size: Optional[int] = None,
+    ) -> None:
+        # Query
+        q = q.view(-1, self.num_heads, self.head_dim)
+
+        # Key and Value
+        kv_cache = metadata.kv_cache_manager.get_buffers(self.layer_idx)
+
+        if k is not None and v is not None:
+            k = k.view(-1, self.num_kv_heads, self.head_dim)
+            v = v.view(-1, self.num_kv_heads, self.head_dim)
+
+            if self.has_fp8_kv_cache:
+                assert kv_cache.dtype == torch.float8_e4m3fn, (
+                    f"KV cache should have fp8 dtype, but get {kv_cache.dtype}")
+                k = k.to(torch.float8_e4m3fn)
+                v = v.to(torch.float8_e4m3fn)
+            assert k.dtype == v.dtype == kv_cache.dtype, (
+                f"KV cache dtype {kv_cache.dtype} does not match k/v dtype {k.dtype}/{v.dtype}"
+            )
+
+            flashinfer.page.append_paged_kv_cache(
+                append_key=k,
+                append_value=v,
+                batch_indices=metadata.batch_indices,
+                positions=metadata.positions,
+                paged_kv_cache=kv_cache,
+                kv_indices=metadata.paged_kv_indices,
+                kv_indptr=metadata.paged_kv_indptr,
+                kv_last_page_len=metadata.paged_kv_last_page_len,
+                kv_layout=metadata.kv_layout)
+
+        num_contexts = metadata.num_contexts
+        num_generations = metadata.num_generations
+        num_ctx_tokens = metadata.num_ctx_tokens
+
+        def prefill_forward(plan_params: PlanParams, out: torch.Tensor):
+            wrapper = metadata.get_prefill_wrapper(plan_params)
+            wrapper.run(q[:num_ctx_tokens],
+                        kv_cache,
+                        out=out.view(-1, self.num_heads, self.head_dim))
+
+        def decode_forward(plan_params: PlanParams, out: torch.Tensor):
+            wrapper = metadata.get_decode_wrapper(plan_params)
+            wrapper.run(q[num_ctx_tokens:],
+                        kv_cache,
+                        out=out.view(-1, self.num_heads, self.head_dim))
+
+        # this will do nothing if the last forward pass had the same parameters
+        plan_params = metadata.plan(self.num_heads,
+                                    self.num_kv_heads,
+                                    self.head_dim,
+                                    q_dtype=q.dtype,
+                                    kv_dtype=kv_cache.dtype,
+                                    q_scaling=self.q_scaling,
+                                    attention_window_size=attention_window_size,
+                                    attention_mask_type=attention_mask_type,
+                                    attention_mask_data=attention_mask_data)
+
+        if num_contexts == 0:
+            decode_forward(plan_params, output)
+        elif num_generations == 0:
+            prefill_forward(plan_params, output)
+        else:
+            prefill_forward(plan_params, output[:num_ctx_tokens, :])
+            decode_forward(plan_params, output[num_ctx_tokens:, :])
+
     def forward(self,
                 q: torch.Tensor,
                 k: Optional[torch.Tensor],
                 v: Optional[torch.Tensor],
                 metadata: FlashInferAttentionMetadata,
                 *,
+                attention_window_size: Optional[int] = None,
                 attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
+                attention_mask_data: Optional[torch.Tensor] = None,
+                output: Optional[torch.Tensor] = None,
                 **kwargs) -> torch.Tensor:
-        if attention_mask == PredefinedAttentionMask.CAUSAL:
+        if attention_mask == CustomAttentionMask.CUSTOM:
+            assert attention_mask_data is not None, "attention_mask_data is required for custom attention mask."
+            attention_mask_type = int(AttentionMaskType.custom_mask)
+            attention_mask_data = attention_mask_data if attention_mask_data.ndim == 1 else attention_mask_data.flatten(
+            )
+        elif attention_mask == PredefinedAttentionMask.CAUSAL:
             attention_mask_type = int(AttentionMaskType.causal)
             attention_mask_data = None
         elif attention_mask == PredefinedAttentionMask.FULL:
@@ -463,121 +580,20 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         else:
             raise ValueError("Unexpected attention mask type")
 
-        return forward_pattern(q, k, v, self.num_heads, self.head_dim,
-                               self.num_kv_heads, self.layer_idx,
-                               self.has_fp8_kv_cache, attention_mask_type,
-                               attention_mask_data)
+        if output is None:
+            output = torch.empty_like(q)
 
+        # FlashInfer's sliding window attention is inclusive, while the attention window size defined in TRTLLM is exclusive.
+        # So we need to subtract 1 from the attention window size for a consistent behavior.
+        if attention_window_size is not None:
+            attention_window_size = attention_window_size - 1
 
-@torch.library.custom_op("trtllm::flashinfer_forward", mutates_args=())
-def forward_pattern(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    num_heads: int,
-    head_dim: int,
-    num_kv_heads: int,
-    layer_idx: int,
-    has_fp8_kv_cache: bool,
-    attention_mask_type: int,
-    attention_mask_data: Optional[torch.Tensor],
-) -> torch.Tensor:
-    '''
-    Wrapping the flashinfer forward as a custom op is required to fix `torch.compile` graph breaks,
-    otherwise it will graph break when calling `metadata.num_contexts` since it convert tensor's sum directly to int.
-    '''
-    # torch.compile does not support custom object as arguments, so we have to use global function to get the metadata.
-    extra_attrs = get_model_extra_attrs()
-    if extra_attrs is not None:
-        metadata_ref = extra_attrs.get("attention_metadata", None)
-        metadata = metadata_ref() if metadata_ref is not None else None
-    else:
-        metadata = get_global_attrs().attention_metadata()
-
-    assert isinstance(
-        metadata,
-        FlashInferAttentionMetadata,
-    )
-
-    # Query
-    q = q.view(-1, num_heads, head_dim)
-
-    # Key and Value
-    kv_cache = metadata.kv_cache_manager.get_buffers(layer_idx)
-
-    if k is not None and v is not None:
-        k = k.view(-1, num_kv_heads, head_dim)
-        v = v.view(-1, num_kv_heads, head_dim)
-
-        if has_fp8_kv_cache:
-            assert kv_cache.dtype == torch.float8_e4m3fn, f"KV cache should have fp8 dtype, but get {kv_cache.dtype}"
-            k = k.to(torch.float8_e4m3fn)
-            v = v.to(torch.float8_e4m3fn)
-        assert k.dtype == v.dtype == kv_cache.dtype, f"KV cache dtype {kv_cache.dtype} does not match k/v dtype {k.dtype}/{v.dtype}"
-
-        flashinfer.page.append_paged_kv_cache(
-            append_key=k,
-            append_value=v,
-            batch_indices=metadata.batch_indices,
-            positions=metadata.positions,
-            paged_kv_cache=kv_cache,
-            kv_indices=metadata.paged_kv_indices,
-            kv_indptr=metadata.paged_kv_indptr,
-            kv_last_page_len=metadata.paged_kv_last_page_len,
-            kv_layout=metadata.kv_layout)
-
-    num_contexts = metadata.num_contexts
-    num_generations = metadata.num_generations
-    num_ctx_tokens = metadata.num_ctx_tokens
-
-    def prefill_forward(plan_params: PlanParams):
-        wrapper = metadata.get_prefill_wrapper(plan_params)
-        output = wrapper.run(q[:num_ctx_tokens], kv_cache)
-        output = output.view(num_ctx_tokens, -1)
+        self.forward_impl(q=q,
+                          k=k,
+                          v=v,
+                          metadata=metadata,
+                          attention_mask_type=attention_mask_type,
+                          attention_mask_data=attention_mask_data,
+                          attention_window_size=attention_window_size,
+                          output=output)
         return output
-
-    def decode_forward(plan_params: PlanParams):
-        wrapper = metadata.get_decode_wrapper(plan_params)
-        output = wrapper.run(q[num_ctx_tokens:], kv_cache)
-        output = output.view(num_generations, -1)
-        return output
-
-    # this will do nothing if the last forward pass had the same parameters
-    plan_params = metadata.plan(num_heads,
-                                num_kv_heads,
-                                head_dim,
-                                q_dtype=q.dtype,
-                                kv_dtype=kv_cache.dtype,
-                                attention_mask_type=attention_mask_type,
-                                attention_mask_data=attention_mask_data)
-
-    if num_contexts > 0:
-        ctx_output = prefill_forward(plan_params)
-
-    if num_generations > 0:
-        gen_output = decode_forward(plan_params)
-
-    if num_contexts > 0 and num_generations > 0:
-        output = torch.cat([ctx_output, gen_output], dim=0)
-    elif num_contexts > 0:
-        output = ctx_output
-    elif num_generations > 0:
-        output = gen_output
-
-    return output
-
-
-@forward_pattern.register_fake
-def _(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    num_heads: int,
-    head_dim: int,
-    num_kv_heads: int,
-    layer_idx: int,
-    has_fp8_kv_cache: bool,
-    attention_mask_type: int,
-    attention_mask_data: Optional[torch.Tensor],
-):
-    return torch.empty_like(q)

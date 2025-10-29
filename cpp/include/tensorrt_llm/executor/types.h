@@ -58,6 +58,7 @@ using RandomSeedType = std::uint64_t;
 using VecLogProbs = std::vector<FloatType>;
 using StreamPtr = std::shared_ptr<tensorrt_llm::runtime::CudaStream>;
 using MillisecondsType = std::chrono::milliseconds;
+using CacheSaltIDType = std::uint64_t;
 using LogitsPostProcessor
     = std::function<void(IdType, Tensor&, BeamTokens const&, StreamPtr const&, std::optional<IdType>)>;
 using LogitsPostProcessorMap = std::unordered_map<std::string, LogitsPostProcessor>;
@@ -361,7 +362,7 @@ struct IterationStats
     /// @brief Stats specific to inflight batching
     std::optional<InflightBatchingStats> inflightBatchingStats;
     /// @brief Stats specific to speculative decoding
-    std::optional<SpecDecodingStats> specDecStats;
+    std::optional<SpecDecodingStats> specDecodingStats;
 };
 
 /// @brief Enum class that represents the state of a request
@@ -450,7 +451,7 @@ struct RequestPerfMetrics
         /// @brief End time of the KV cache transfer for disaggregated serving
         TimePoint kvCacheTransferEnd;
         /// @brief KV Cache size transfer for disaggregated serving
-        mutable size_t kvCacheSize = 0;
+        size_t kvCacheSize = 0;
     };
 
     struct KvCacheMetrics

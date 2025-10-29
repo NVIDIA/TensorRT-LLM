@@ -304,6 +304,7 @@ def add_common_args(parser):
     parser.add_argument('--repetition_penalty', type=float, default=1.0)
     parser.add_argument('--presence_penalty', type=float, default=0.0)
     parser.add_argument('--frequency_penalty', type=float, default=0.0)
+    parser.add_argument('--prompt_ignore_length', type=int, default=0)
     parser.add_argument('--min_p', type=float, default=0.0)
     parser.add_argument('--beam_search_diversity_rate', type=float, default=0.0)
     parser.add_argument('--random_seed', type=int, default=0)
@@ -358,7 +359,7 @@ def add_common_args(parser):
         default=None,
         nargs="+",
         help=
-        'The attention window size that controls the sliding window attention / cyclic kv cache behavior'
+        'The attention window size that controls the sliding window attention kv cache behavior'
     )
     parser.add_argument(
         '--multi_block_mode',
@@ -439,12 +440,12 @@ def add_common_args(parser):
         "   E.g.: [4, [0], [1], False] for [draft_len, draft_model_device_list, target_model_device_list, use_logits]."
     )
     parser.add_argument(
-        '--prompt_lookup_config',
+        '--ngram_config',
         type=str,
         default=None,
         help=
-        "Configuration of Prompt-Lookup decoding, see `examples/prompt_lookup/README.md` for more information."
-        "   E.g.: [10,2,[0]] for [prompt_lookup_num_tokens, max_matching_ngram_size, device_list].",
+        "Configuration of NGram decoding, see `examples/ngram/README.md` for more information."
+        "   E.g.: [10,2,[0]] for [max_draft_len, max_matching_ngram_size, device_list].",
     )
     parser.add_argument(
         '--medusa_choices',

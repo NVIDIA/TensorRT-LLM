@@ -20,6 +20,10 @@
 #include "tensorrt_llm/common/assert.h"
 #include "trtllmGen_bmm_export/BatchedGemmInterface.h"
 #include "trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
+// DO NOT include cudaUtils.h and logger.h before BatchedGemmInterface.h as it #undef TLLM_LOG_INFO and co.
+#include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/common/logger.h"
 
 namespace tensorrt_llm
 {
@@ -29,6 +33,27 @@ namespace kernels
 using namespace batchedGemm::batchedGemm;
 using namespace batchedGemm::gemm;
 using namespace batchedGemm::trtllm::gen;
+
+static BatchedGemmInterface::ModuleCache globalTrtllmGenBatchedGemmModuleCache;
+
+constexpr bool isSMCompatible(int gpuSM, SmVersion kernelSM)
+{
+    if (gpuSM == 103)
+    {
+        return kernelSM == SmVersion::Sm100f || kernelSM == SmVersion::Sm103a;
+    }
+    else if (gpuSM == 100)
+    {
+        return kernelSM == SmVersion::Sm100f || kernelSM == SmVersion::Sm100a;
+    }
+    else if (gpuSM == 90)
+    {
+        return kernelSM == SmVersion::Sm90a;
+    }
+
+    TLLM_THROW("Unexpected gpuSM %d", gpuSM);
+    return false;
+}
 
 std::vector<int64_t> prioritizePredefinedConfigs(int m, int n, int k, std::vector<int64_t> const& sortedIndices,
     batchedGemm::batchedGemm::BatchedGemmConfig const* configs)
@@ -58,88 +83,11 @@ std::vector<int64_t> prioritizePredefinedConfigs(int m, int n, int k, std::vecto
     std::vector<int64_t> prioritizedIndices;
 
     //
-    // Qwen3
+    // Dummy
     //
 
-    // Qwen3_235B_TP1_EP8_MoE_FC1 m=3072 k=4096
-    if (n /* out_dim */ == 3072 && k /* in_dim */ == 4096)
-    {
-        auto pred = [](BatchedGemmConfig const& config)
-        {
-            BatchedGemmOptions const& options = config.mOptions;
-            return options.mNumStages == 4 && options.mNumStagesMma == 1 && options.mTileK == 512
-                && options.mTileScheduler == TileScheduler::Static;
-        };
-        prioritizedIndices = bubbleUpConfig(sortedIndices, pred);
-    }
-    // Qwen3_235B_TP1_EP8_MoE_FC2 m=4096 k=1536
-    else if (n /* out_dim */ == 4096 && k /* in_dim */ == 1536)
-    {
-        auto pred = [](BatchedGemmConfig const& config)
-        {
-            BatchedGemmOptions const& options = config.mOptions;
-            return options.mNumStages == 4 && options.mNumStagesMma == 1 && options.mTileK == 512
-                && options.mTileScheduler == TileScheduler::Static;
-        };
-        prioritizedIndices = bubbleUpConfig(sortedIndices, pred);
-    }
-    // Qwen3_235B_TP2_EP4_MoE_FC1 m=1536 k=4096
-    else if (n /* out_dim */ == 1536 && k /* in_dim */ == 4096)
-    {
-        auto pred = [](BatchedGemmConfig const& config)
-        {
-            BatchedGemmOptions const& options = config.mOptions;
-            return options.mNumStages == 4 && options.mNumStagesMma == 1 && options.mTileK == 512
-                && options.mTileScheduler == TileScheduler::Static;
-        };
-        prioritizedIndices = bubbleUpConfig(sortedIndices, pred);
-    }
-    // Qwen3_235B_TP2_EP4_MoE_FC2 m=4096 k=768
-    else if (n /* out_dim */ == 4096 && k /* in_dim */ == 768)
-    {
-        auto pred = [](BatchedGemmConfig const& config)
-        {
-            BatchedGemmOptions const& options = config.mOptions;
-            return options.mNumStages == 4 && options.mNumStagesMma == 2 && options.mTileK == 512
-                && options.mTileScheduler == TileScheduler::Persistent;
-        };
-        prioritizedIndices = bubbleUpConfig(sortedIndices, pred);
-    }
-    // Qwen3_235B_TP4_EP2_MoE_FC1 m=768 k=4096
-    else if (n /* out_dim */ == 768 && k /* in_dim */ == 4096)
-    {
-        auto pred = [](BatchedGemmConfig const& config)
-        {
-            BatchedGemmOptions const& options = config.mOptions;
-            return options.mNumStages == 4 && options.mNumStagesMma == 1 && options.mTileK == 512
-                && options.mTileScheduler == TileScheduler::Static;
-        };
-        prioritizedIndices = bubbleUpConfig(sortedIndices, pred);
-    }
-    // Qwen3_235B_TP4_EP2_MoE_FC2 m=4096 k=384
-    else if (n /* out_dim */ == 4096 && k /* in_dim */ == 384)
-    {
-        auto pred = [](BatchedGemmConfig const& config)
-        {
-            BatchedGemmOptions const& options = config.mOptions;
-            return options.mNumStages == 4 && options.mNumStagesMma == 2 && options.mTileK == 512
-                && options.mTileScheduler == TileScheduler::Persistent;
-        };
-        prioritizedIndices = bubbleUpConfig(sortedIndices, pred);
-    }
-    // Qwen3_235B_TP8_EP1_MoE_FC1 m=384 k=4096
-    else if (n /* out_dim */ == 384 && k /* in_dim */ == 4096)
-    {
-        auto pred = [](BatchedGemmConfig const& config)
-        {
-            BatchedGemmOptions const& options = config.mOptions;
-            return options.mNumStages == 4 && options.mNumStagesMma == 1 && options.mTileK == 512
-                && options.mTileScheduler == TileScheduler::Static;
-        };
-        prioritizedIndices = bubbleUpConfig(sortedIndices, pred);
-    }
     // Qwen3_235B_TP8_EP1_MoE_FC2 m=4096 k=192
-    else if (n /* out_dim */ == 4096 && k /* in_dim */ == 192)
+    if (n /* out_dim */ == 0 && k /* in_dim */ == 0)
     {
         auto pred = [](BatchedGemmConfig const& config)
         {
@@ -169,18 +117,51 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
 
     mPassingConfigIndices.clear();
 
+    int gpuSM = tensorrt_llm::common::getSMVersion();
     for (size_t i = 0; i < bmm.getNumBatchedGemmConfigs(); ++i)
     {
         auto const options = configs[i].mOptions;
         auto const tileSize = mOptions.transposeMmaOutput ? options.mTileN : options.mTileM;
         // When we include low-latency kernels we can set transposeMmaOutput via constructor
-        if (options.mDtypeA == mOptions.eltType && options.mDtypeC == mOptions.outputType
-            && options.mUseDeepSeekFp8 == mOptions.deepSeekFp8
+        if (options.mDtypeA == mOptions.dtypeA && options.mDtypeB == mOptions.dtypeB
+            && options.mDtypeC == mOptions.dtypeC && options.mUseDeepSeekFp8 == mOptions.deepSeekFp8
             && options.mTransposeMmaOutput == mOptions.transposeMmaOutput
             && (!doesRouteImplUseNoRoute(options.mRouteImpl)) == mOptions.routeAct
             && options.mFusedAct == mOptions.fusedAct && options.mIsStaticBatch == mOptions.staticBatch
-            && tileSize == mOptions.tileSize)
+            && tileSize == mOptions.tileSize && isSMCompatible(gpuSM, configs[i].mSm))
         {
+            auto sm = configs[i].mSm;
+            if (sm != SmVersion::Sm100f)
+            {
+                int smVersion = tensorrt_llm::common::getSMVersion();
+                if (smVersion == 100 && sm != SmVersion::Sm100a)
+                {
+                    continue;
+                }
+                else if (smVersion == 103 && sm != SmVersion::Sm103a)
+                {
+                    continue;
+                }
+            }
+
+            if (options.mFusedAct)
+            {
+                if (options.mActType != static_cast<batchedGemm::gemmGatedAct::ActType>(mOptions.actType))
+                {
+                    continue;
+                }
+            }
+
+            // FIXME: Disables a few static scheduler kernels (schedS) that appears to have issues;
+            // found after commit e257cb3533; still under investigation. Offending kernels:
+            // bmm_E2m1_E2m1E2m1_Fp32_t128x64x256_s6_et128x64_m128x64x64_cga1x1x1_16dp256b_TN_transOut_schedS_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a
+            // bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256_s3_et128x64_m128x64x32_cga1x1x1_16dp256b_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f
+            if (options.mTileScheduler == TileScheduler::Static && options.mUseTmaOobOpt == true
+                && options.mTileN == 64)
+            {
+                continue;
+            }
+
             if (mOptions.transposeMmaOutput && options.mEpilogueTileM == mOptions.epilogueTileM)
             {
                 mPassingConfigIndices.push_back(i);
@@ -188,7 +169,12 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
         }
     }
 
-    TLLM_CHECK_WITH_INFO(!mPassingConfigIndices.empty(), "No kernel found for the given options");
+    TLLM_CHECK_WITH_INFO(!mPassingConfigIndices.empty(),
+        "No kernel found for the given options: mDtypeA: %s, mDtypeB: %s, mDtypeC: %s, mUseDeepSeekFp8: %d, "
+        "mTransposeMmaOutput: %d, mRouteAct: %d, mFusedAct: %d, mIsStaticBatch: %d, mTileSize: %d",
+        tg::dtypeToString(mOptions.dtypeA).c_str(), tg::dtypeToString(mOptions.dtypeB).c_str(),
+        tg::dtypeToString(mOptions.dtypeC).c_str(), mOptions.deepSeekFp8, mOptions.transposeMmaOutput,
+        mOptions.routeAct, mOptions.fusedAct, mOptions.staticBatch, mOptions.tileSize);
 }
 
 size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(int32_t m, int32_t n, int32_t k,
@@ -220,9 +206,10 @@ size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(int32_t m, int32_t n,
 void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens,
     int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim, void const* a, void const* sfA, void const* b,
     void const* sfB, void const* perTokensSfA, void const* perTokensSfB, float const* scaleC, float const* scaleGateC,
-    void* c, void* outSfC, int32_t const* routeMap, int32_t const* totalNumPaddedTokens,
-    int32_t const* ctaIdxXyToBatchIdx, int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas,
-    void* workspace, CUstream stream, int device, int32_t configIndex)
+    float const* ptrBias, float const* ptrAlpha, float const* ptrBeta, float const* ptrClampLimit, void* c,
+    void* outSfC, int32_t const* routeMap, int32_t const* totalNumPaddedTokens, int32_t const* ctaIdxXyToBatchIdx,
+    int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas, void* workspace, CUstream stream, int device,
+    int32_t configIndex)
 {
     auto bmm = BatchedGemmInterface();
 
@@ -274,6 +261,10 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vecto
     gemmData.mInputBuffers.mPtrScaleGate = scaleGateC;
     gemmData.mInputBuffers.mPtrPerTokenSfA = mOptions.transposeMmaOutput ? perTokensSfB : perTokensSfA;
     gemmData.mInputBuffers.mPtrPerTokenSfB = mOptions.transposeMmaOutput ? perTokensSfA : perTokensSfB;
+    gemmData.mInputBuffers.mPtrBias = ptrBias;
+    gemmData.mInputBuffers.mPtrGatedActAlpha = ptrAlpha;
+    gemmData.mInputBuffers.mPtrGatedActBeta = ptrBeta;
+    gemmData.mInputBuffers.mPtrClampLimit = ptrClampLimit;
 
     gemmData.mInputBuffers.mPtrRouteMap = routeMap;
 
@@ -292,12 +283,22 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vecto
     int32_t multiProcessorCount;
     cudaDeviceGetAttribute(&multiProcessorCount, cudaDevAttrMultiProcessorCount, device);
 
+    auto envVarVal = std::getenv("TLLM_BATCHED_GEMM_PRINT_NAME");
+    if (envVarVal && std::atoi(envVarVal) == 1)
+    {
+        TLLM_LOG_INFO("NumBatches %d, MaxNumCtasInBatchDim %d, ShapeMNK %d %d %d, Kernel %s", numBatches,
+            maxNumCtasInBatchDim, m, n, k, config.mFunctionName);
+    }
     // FIXME once we start using all-reduce in the epilogue of the bmm this can be moved elsewhere
     bmm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));
 
-    auto const err = bmm.run(config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount);
+    auto const err = bmm.run(config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount,
+        tensorrt_llm::common::getEnvEnablePDL(), globalTrtllmGenBatchedGemmModuleCache);
 
-    TLLM_CHECK_WITH_INFO(err == 0, "Error occurred when running GEMM!");
+    TLLM_CHECK_WITH_INFO(err == 0,
+        "Error occurred when running GEMM!"
+        " (numBatches: %d, GemmMNK: %d %d %d, Kernel: %s)",
+        numBatches, m, n, k, config.mFunctionName);
 }
 
 void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens,
@@ -307,7 +308,22 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vecto
     // Dispatch with block scaling factors and with static batching.
     run(m, n, k, batchedTokens, /* numTokens */ 0, batchedTokens.size(), /* maxNumCtasInBatchDim */ 0, a, sfA, b, sfB,
         /* perTokensSfA */ nullptr, /* perTokensSfB */ nullptr,
-        /* scaleC */ nullptr, /* scaleGateC */ nullptr, c, outSfC,
+        /* scaleC */ nullptr, /* scaleGateC */ nullptr, /* ptrBias */ nullptr, /* ptrAlpha */ nullptr,
+        /* ptrBeta */ nullptr, /* ptrClampLimit */ nullptr, c, outSfC,
+        /* routeMap */ nullptr, /* totalNumPaddedTokens */ nullptr,
+        /* ctaIdxXyToBatchIdx */ nullptr, /* ctaIdxXyToMnLimit */ nullptr,
+        /* numNonExitingCtas */ nullptr, workspace, stream, device, configIndex);
+}
+
+void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens,
+    void const* a, void const* sfA, void const* b, void const* sfB, float const* ptrBias, float const* ptrAlpha,
+    float const* ptrBeta, float const* ptrClampLimit, void* c, void* outSfC, void* workspace, CUstream stream,
+    int device, int32_t configIndex)
+{
+    // Dispatch with block scaling factors and with static batching.
+    run(m, n, k, batchedTokens, /* numTokens */ 0, batchedTokens.size(), /* maxNumCtasInBatchDim */ 0, a, sfA, b, sfB,
+        /* perTokensSfA */ nullptr, /* perTokensSfB */ nullptr,
+        /* scaleC */ nullptr, /* scaleGateC */ nullptr, ptrBias, ptrAlpha, ptrBeta, ptrClampLimit, c, outSfC,
         /* routeMap */ nullptr, /* totalNumPaddedTokens */ nullptr,
         /* ctaIdxXyToBatchIdx */ nullptr, /* ctaIdxXyToMnLimit */ nullptr,
         /* numNonExitingCtas */ nullptr, workspace, stream, device, configIndex);
@@ -320,7 +336,9 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vecto
     // Dispatch with block scaling factors and with static batching.
     run(m, n, k, batchedTokens, /* numTokens */ 0, batchedTokens.size(), /* maxNumCtasInBatchDim */ 0, a,
         /* sfA */ nullptr, b, /* sfB */ nullptr, /* perTokensSfA */ nullptr, /* perTokensSfB */ nullptr, scaleC,
-        scaleGateC, c, /* outSfC */ nullptr,
+        scaleGateC, /* ptrBias */ nullptr, /* ptrAlpha */ nullptr, /* ptrBeta */ nullptr, /* ptrClampLimit */ nullptr,
+        c,
+        /* outSfC */ nullptr,
         /* routeMap */ nullptr, /* totalNumPaddedTokens */ nullptr,
         /* ctaIdxXyToBatchIdx */ nullptr, /* ctaIdxXyToMnLimit */ nullptr,
         /* numNonExitingCtas */ nullptr, workspace, stream, device, configIndex);
@@ -332,6 +350,8 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(int32_t m
 {
     auto const bmm = BatchedGemmInterface();
     auto const configs = bmm.getBatchedGemmConfigs();
+
+    int32_t multiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
 
     BatchedGemmData gemmData;
     // Dims
@@ -346,36 +366,73 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(int32_t m
     gemmData.mProblemDimensions.mRank = 0;
     gemmData.mProblemDimensions.mWorldSize = 1;
     gemmData.mProblemDimensions.mMaxNumCtasInTokenDim = maxNumCtasInBatchDim;
-    // Sort configs by options
-    std::vector<int64_t> sortedIndices = mPassingConfigIndices;
-    std::sort(sortedIndices.begin(), sortedIndices.end(),
-        [&configs](int64_t idx0, int64_t idx1)
-        {
-            auto const& optionsA = configs[idx0].mOptions;
-            auto const& optionsB = configs[idx1].mOptions;
+    auto cmpFunc = [&configs, &gemmData, &bmm, &multiProcessorCount](int64_t idx0, int64_t idx1)
+    {
+        auto const& optionsA = configs[idx0].mOptions;
+        auto const& optionsB = configs[idx1].mOptions;
+        int32_t sizeK = gemmData.mProblemDimensions.mK;
 
-            // Sort by tileK sizes first
-            if (optionsA.mTileK != optionsB.mTileK)
+        // Tier 0: K < tileK, prefer higher efficiency.
+        if (optionsA.mTileK != optionsB.mTileK)
+        {
+            // Both waste computation, prefer higher efficiency.
+            if (sizeK <= optionsA.mTileK && sizeK <= optionsB.mTileK)
+            {
+                double eff_a = (double) sizeK / optionsA.mTileK;
+                double eff_b = (double) sizeK / optionsB.mTileK;
+                return eff_a > eff_b;
+            }
+            // If either can be utilized, sort by tileK.
+            else
             {
                 return optionsA.mTileK > optionsB.mTileK;
             }
+        }
 
-            // Then by unroll loop 2x for mma
-            if (optionsA.mUseUnrollLoop2xForMma != optionsB.mUseUnrollLoop2xForMma)
-            {
-                return optionsA.mUseUnrollLoop2xForMma;
-            }
+        // Tier 1: When tileK is the same, prefer unroll loop 2x for mma.
+        if (optionsA.mUseUnrollLoop2xForMma != optionsB.mUseUnrollLoop2xForMma)
+        {
+            return optionsA.mUseUnrollLoop2xForMma;
+        }
 
-            // Then by tile scheduler (persistent scheduler is better for FC2 in MoE)
-            if (doesRouteImplUseNoRoute(optionsA.mRouteImpl))
+        // Tier 2+: When previous comparators are the same, prefer higher tileM.
+        if (optionsA.mTileM != optionsB.mTileM)
+        {
+            return optionsA.mTileM > optionsB.mTileM;
+        }
+
+        // Tier 2+: When previous comparators are the same, prefer higher tileN.
+        if (optionsA.mTileN != optionsB.mTileN)
+        {
+            return optionsA.mTileN > optionsB.mTileN;
+        }
+
+        // Tier 2+: When previous comparators are the same, and when the number of estimated CTAs is on the larger side,
+        // prefer persistent tile scheduler.
+        if (optionsA.mTileScheduler != optionsB.mTileScheduler)
+        {
+            auto options = bmm.getOptionsFromConfigAndData(configs[idx0], gemmData);
+            auto numCtas = bmm.getNumCtas(options, gemmData.mProblemDimensions.mMaxNumCtasInTokenDim);
+            if (numCtas > multiProcessorCount)
             {
                 return optionsA.mTileScheduler == batchedGemm::gemm::TileScheduler::Persistent;
             }
+            else
+            {
+                return optionsB.mTileScheduler == batchedGemm::gemm::TileScheduler::Persistent;
+            }
+        }
 
-            return optionsA.mTileM > optionsB.mTileM;
-        });
+        return false;
+    };
+    // Sort configs by options.
+    std::vector<int64_t> sortedIndices = mPassingConfigIndices;
+    std::sort(sortedIndices.begin(), sortedIndices.end(), cmpFunc);
 
+    // Special rules for corner cases, if applicable.
     std::vector<int64_t> prioritizedIndices = prioritizePredefinedConfigs(m, n, k, sortedIndices, configs);
+
+    // Filter out invalid configs.
     std::vector<int64_t> validConfigIndices;
     for (auto const& configIndex : prioritizedIndices)
     {

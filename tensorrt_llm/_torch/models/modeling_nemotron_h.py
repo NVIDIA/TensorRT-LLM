@@ -13,13 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, Optional
+import re
+from typing import Optional
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 from transformers import AutoConfig, PretrainedConfig
 
+from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
+    BaseWeightMapper
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 
 from ..attention_backend import AttentionMetadata
@@ -61,8 +64,16 @@ class MLPLayer(MLP):
         layer_idx: int,
     ):
         config = model_config.pretrained_config
+        if isinstance(config.intermediate_size, list):
+            if len(config.intermediate_size) == 1:
+                intermediate_size = config.intermediate_size[0]
+            else:
+                intermediate_size = config.intermediate_size[layer_idx]
+        else:
+            intermediate_size = config.intermediate_size
+
         super().__init__(hidden_size=config.hidden_size,
-                         intermediate_size=config.intermediate_size,
+                         intermediate_size=intermediate_size,
                          bias=False,
                          activation=relu2,
                          dtype=config.torch_dtype,
@@ -137,7 +148,7 @@ class NemotronHLayer(DecoderLayer):
             self.mixer = Mamba2Mixer(d_model=config.hidden_size,
                                      d_state=config.ssm_state_size,
                                      d_conv=config.conv_kernel,
-                                     expand=config.expand,
+                                     nheads=config.mamba_num_heads,
                                      n_groups=config.n_groups,
                                      head_dim=config.mamba_head_dim,
                                      chunk_size=config.chunk_size,
@@ -150,7 +161,7 @@ class NemotronHLayer(DecoderLayer):
         elif layer_type == "*":
             self.mixer = TransformerLayer(model_config, layer_idx)
         else:
-            ValueError(f"{layer_type} is not supported")
+            raise ValueError(f"{layer_type} is not supported")
 
     def forward(
         self,
@@ -211,7 +222,9 @@ class NemotronHModel(DecoderModel):
             )
 
         if self.mamba_metadata is None or self.mamba_metadata.max_batch_size != attn_metadata.max_num_requests:
-            self.mamba_metadata = Mamba2Metadata(attn_metadata.max_num_requests)
+            self.mamba_metadata = Mamba2Metadata(
+                attn_metadata.max_num_requests,
+                chunk_size=self.model_config.pretrained_config.chunk_size)
         self.mamba_metadata.prepare(attn_metadata)
 
         if inputs_embeds is None:
@@ -243,7 +256,7 @@ class NemotronHForCausalLM(DecoderModelForCausalLM[NemotronHModel,
 
         if model_config.quant_config.exclude_modules is not None:
             model_config.quant_config.exclude_modules = [
-                k.replace('model.layers.backbone', 'model')
+                re.sub(r'(model\.layers\.)?backbone', 'model', k)
                 for k in model_config.quant_config.exclude_modules
             ]
 
@@ -254,94 +267,9 @@ class NemotronHForCausalLM(DecoderModelForCausalLM[NemotronHModel,
             vocab_size=model_config.pretrained_config.vocab_size,
         )
 
-    def load_weights(self, weights: Dict):
-        config = self.model_config.pretrained_config
-        tp_size = self.model_config.mapping.tp_size
-        tp_rank = self.model_config.mapping.tp_rank
-        d_inner = config.hidden_size * config.expand
-        n_groups = config.n_groups
-        d_state = config.ssm_state_size
-        nheads = d_inner // config.mamba_head_dim
-
-        new_weights = {}
-        for name, params in weights.items():
-            key = name
-
-            # change backbone root name to model
-            if "backbone" in key:
-                key = key.replace("backbone", "model")
-
-            # change embedding layer to embed_token
-            if "embeddings" in key:
-                key = key.replace("embeddings", "embed_tokens")
-
-            if "A_log" in key:
-                key = key.replace("A_log", "A")
-
-            if "_scale" in key and weights[name].dim() == 0:
-                new_weights[key] = weights[name]
-            elif "A" in key:
-                w = split(weights[name], tp_size, tp_rank)
-                w = w.to(torch.float32)
-                w = -torch.exp(w)
-                new_weights[key] = w
-            elif "D" in key:
-                w = split(weights[name], tp_size, tp_rank)
-                w = w.to(torch.float32)
-                new_weights[key] = w
-            elif "dt_bias" in key:
-                w = split(weights[name], tp_size, tp_rank)
-                w = w.to(torch.float32)
-                new_weights[key] = w
-            elif "mixer.in_proj" in key:
-                w = weights[name]
-                in_proj_z, in_proj_x, in_proj_b, in_proj_c, in_proj_dt = torch.split(
-                    w, [
-                        d_inner, d_inner, n_groups * d_state,
-                        n_groups * d_state, nheads
-                    ],
-                    dim=0)
-
-                w = []
-                for rank in range(tp_size):
-                    in_proj_z_rank = split(in_proj_z, tp_size, rank)
-                    in_proj_x_rank = split(in_proj_x, tp_size, rank)
-                    in_proj_b_rank = split(in_proj_b, tp_size, rank)
-                    in_proj_c_rank = split(in_proj_c, tp_size, rank)
-                    in_proj_dt_rank = split(in_proj_dt, tp_size, rank)
-                    y = torch.concat([
-                        in_proj_z_rank, in_proj_x_rank, in_proj_b_rank,
-                        in_proj_c_rank, in_proj_dt_rank
-                    ])
-                    w.append(y)
-
-                w = torch.concat(w).contiguous()
-                new_weights[key] = w
-            elif "conv1d" in key:
-                w = weights[name]
-                # removing dim(1) because we are using Linear to store conv1d weights
-                if "weight" in key:
-                    w = w.squeeze(1)
-
-                conv_x, conv_b, conv_c = torch.split(
-                    w, [d_inner, n_groups * d_state, n_groups * d_state], dim=0)
-
-                w = []
-                for rank in range(tp_size):
-                    conv_x_rank = split(conv_x, tp_size, rank)
-                    conv_b_rank = split(conv_b, tp_size, rank)
-                    conv_c_rank = split(conv_c, tp_size, rank)
-                    y = torch.concat([conv_x_rank, conv_b_rank, conv_c_rank])
-                    w.append(y)
-                w = torch.concat(w).contiguous()
-                new_weights[key] = w
-            elif "mixer.norm.weight" in key:
-                w = split(weights[name], tp_size, tp_rank)
-                new_weights[key] = w
-            else:
-                new_weights[key] = weights[name]
-
-        super().load_weights(new_weights)
+    def load_weights(self, weights: dict, weight_mapper: BaseWeightMapper):
+        new_weights = weight_mapper.preprocess_weights(weights)
+        super().load_weights(new_weights, weight_mapper)
 
 
 AutoConfig.register(NemotronHConfig.model_type, NemotronHConfig)

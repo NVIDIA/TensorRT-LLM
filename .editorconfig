@@ -1,0 +1,24 @@
+# Auto basic formatting when saving file with EditorConfig https://editorconfig.org/
+
+# top-most EditorConfig file
+root = true
+
+[*]
+end_of_line = lf
+trim_trailing_whitespace = true
+insert_final_newline = true
+
+# make
+[Makefile*]
+indent_style = tab
+indent_size = 4
+
+# c++
+[*.{cpp,cu,h}]
+indent_style = space
+indent_size = 4
+
+# python
+[*.py]
+indent_style = space
+indent_size = 4

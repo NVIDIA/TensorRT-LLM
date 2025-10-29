@@ -86,7 +86,7 @@ std::string getMacroFlag(std::string const& name, std::string const& value)
 std::string getSMFlag(int SM)
 {
     std::string smStr = std::to_string(SM);
-    if (SM == 90 || SM == 120)
+    if (SM == 90 || SM == 120 || SM == 121)
     {
         smStr += "a";
     }
@@ -205,10 +205,11 @@ tllmXqaJitStatus getMacroFlags(tllmXqaJitContext const* context, std::vector<std
     macros["M_TILESIZE"] = std::to_string(m_tilesize);
     macros["USE_CUSTOM_BARRIER"] = "1";
     // Sliding window is not supported when spec dec is enabled.
-    macros["SLIDING_WINDOW"] = context->multi_query_tokens ? "0" : "1";
+    macros["SLIDING_WINDOW"] = context->multi_query_tokens && context->is_spec_dec_tree ? "0" : "1";
     macros["LOW_PREC_OUTPUT"] = context->fp8_output ? "1" : "0";
     macros["USE_INPUT_KV"] = context->use_input_kv ? "1" : "0";
     macros["ROPE_STYLE"] = std::to_string(int(context->rope_style));
+    macros["IS_SPEC_DEC_TREE"] = context->is_spec_dec_tree ? "1" : "0";
 
     // Without these macros, NVRTC uses precompiled headers for cuda_fp16.h etc.
     // Linking might fail due to ABI incompatibility.
@@ -347,7 +348,7 @@ tllmXqaJitStatus compileProgram(tllmXqaJitProgram prog)
         nvPTXCompilerHandle ptx_compiler;
         CHECK_NVPTX_ERROR(nvPTXCompilerCreate(&ptx_compiler, ptx_size, ptx_data.data()));
 
-        std::vector<char const*> ptx_compile_options = {"--gpu-name=sm_120"};
+        std::vector<char const*> ptx_compile_options = {"--gpu-name=sm_120f"};
         CHECK_NVPTX_ERROR(nvPTXCompilerCompile(ptx_compiler, ptx_compile_options.size(), ptx_compile_options.data()));
 
         size_t cubin_size;

@@ -26,6 +26,7 @@
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tensorrt_llm/runtime/utils/debugUtils.h"
 
+namespace tr = tensorrt_llm::runtime;
 namespace tru = tensorrt_llm::runtime::utils;
 
 namespace tensorrt_llm::batch_manager
@@ -69,11 +70,18 @@ void setupMedusaLogits(std::vector<TensorPtr>& medusaLogitsHeads, TensorPtr cons
 
 SizeType32 HandleContextLogits::operator()(DecoderInputBuffers& inputBuffers, RequestVector const& contextRequests,
     tr::ITensor::SharedPtr const& logits, std::vector<tr::SizeType32> const& numContextLogitsVec,
-    tr::ModelConfig const& modelConfig, tr::BufferManager const& manager, OptionalRef<DraftBuffers> draftBuffers,
+    tr::ModelConfig const& modelConfig, tr::BufferManager const& manager,
     OptionalRef<MedusaBuffers> medusaBuffers) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(HandleContextLogits);
+
+    auto& decoderRequests = inputBuffers.decoderRequests;
+    decoderRequests.clear();
+    decoderRequests.reserve(contextRequests.size());
+    auto& allDecoderLogits = inputBuffers.logits;
+    allDecoderLogits.clear();
+    allDecoderLogits.reserve(contextRequests.size());
 
     SizeType32 batchIndex{0};
     SizeType32 logitsIndex{0};
@@ -114,13 +122,11 @@ SizeType32 HandleContextLogits::operator()(DecoderInputBuffers& inputBuffers, Re
         // Get the logits from the last context token and draft tokens
         auto const numDecoderLogits = 1 + draftLength;
         auto const seqSlot = llmReq->mSeqSlot.value();
-        auto& decoderLogits = inputBuffers.logits.at(seqSlot);
         TensorPtr logitsView = ITensor::slice(logits, logitsIndex - numDecoderLogits, numDecoderLogits);
 
         if (modelConfig.getSpeculativeDecodingMode().hasDraftLogits())
         {
-            TLLM_CHECK(draftBuffers);
-            auto& medusaLogitsHeads = draftBuffers->predictedDraftLogits.at(seqSlot);
+            auto& medusaLogitsHeads = inputBuffers.predictedDraftLogits.at(seqSlot);
             TLLM_CHECK(medusaBuffers);
             setupMedusaLogits(medusaLogitsHeads, medusaBuffers->medusaLogitsDevice,
                 modelConfig.getSpeculativeDecodingModule().getMaxDraftPathLen(), logitsIndex - numDecoderLogits,
@@ -136,22 +142,28 @@ SizeType32 HandleContextLogits::operator()(DecoderInputBuffers& inputBuffers, Re
 
         TLLM_CHECK_DEBUG_WITH_INFO(tru::tensorHasInvalid<float>(*logitsView, manager, "logits") == false,
             "Found invalid number (NaN or Inf) in logits");
-        // Scatter the output logits to the decoderLogits
-        auto const reqBeamWidth = llmReq->getBeamWidthByIter();
-        if (reqBeamWidth > 1)
+
+        if (llmReq->isLastContextChunk())
         {
-            // Tile logits of context requests
-            auto const logitsShape = logitsView->getShape();
-            auto const logitsType = logitsView->getDataType();
-            decoderLogits = manager.gpu(ITensor::makeShape({reqBeamWidth, logitsShape.d[1]}), logitsType);
-            tensorrt_llm::runtime::kernels::tileTensor(*decoderLogits, *logitsView, reqBeamWidth, manager.getStream());
-            decoderLogits->unsqueeze(0);
-        }
-        else
-        {
-            auto const logitsViewShape = logitsView->getShape();
-            decoderLogits
-                = ITensor::view(logitsView, ITensor::makeShape({logitsViewShape.d[0], 1, logitsViewShape.d[1]}));
+            TensorPtr decoderLogits;
+            auto const reqBeamWidth = llmReq->getBeamWidthByIter();
+            if (reqBeamWidth > 1)
+            {
+                // Tile logits of context requests
+                auto const& logitsShape = logitsView->getShape();
+                auto const logitsType = logitsView->getDataType();
+                decoderLogits = manager.gpu(ITensor::makeShape({reqBeamWidth, logitsShape.d[1]}), logitsType);
+                tensorrt_llm::runtime::kernels::tileTensor(
+                    *decoderLogits, *logitsView, reqBeamWidth, manager.getStream());
+                decoderLogits->unsqueeze(0);
+            }
+            else
+            {
+                decoderLogits = logitsView;
+                decoderLogits->unsqueeze(1);
+            }
+            decoderRequests.push_back(llmReq);
+            allDecoderLogits.emplace_back(std::move(decoderLogits));
         }
 
         ++batchIndex;

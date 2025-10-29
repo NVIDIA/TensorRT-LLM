@@ -17,17 +17,22 @@ import struct
 import sys
 from typing import List, Tuple
 
-from cuda import cuda, cudart
-from cuda.cudart import cudaError_t
+from tensorrt_llm._utils import mpi_disabled
+
+try:
+    from cuda.bindings import driver as cuda
+    from cuda.bindings import runtime as cudart
+except ImportError:
+    from cuda import cuda, cudart
 
 from ._utils import mpi_comm
 from .logger import logger
 from .mapping import Mapping
 
 
-def _raise_if_error(error: cudaError_t | cuda.CUresult):
-    if isinstance(error, cudaError_t):
-        if error != cudaError_t.cudaSuccess:
+def _raise_if_error(error: cudart.cudaError_t | cuda.CUresult):
+    if isinstance(error, cudart.cudaError_t):
+        if error != cudart.cudaError_t.cudaSuccess:
             raise RuntimeError(f"CUDA Runtime API error: {repr(error)}")
     if isinstance(error, cuda.CUresult):
         if error != cuda.CUresult.CUDA_SUCCESS:
@@ -69,11 +74,11 @@ class IpcMemory:
     def __init__(self, mapping: Mapping, size: int, open_ipc: bool = True):
         self.mapping = mapping
         self.open_ipc = open_ipc and mapping.tp_size <= mapping.gpus_per_node
+        self.peer_ptrs = [0] * mapping.tp_size
+        self.local_ptr = 0
+
         if self.open_ipc:
             self.peer_ptrs, self.local_ptr = IpcMemory.open_ipc_memory(self.mapping, size, True)
-        else:
-            self.peer_ptrs = [0] * mapping.tp_size
-            self.local_ptr = 0
 
     def __del__(self):
         if not sys.is_finalizing() and self.open_ipc:
@@ -100,9 +105,15 @@ class IpcMemory:
                 size += alignment - (size % alignment)
             return size
 
-        comm = mpi_comm().Split(
-            mapping.pp_rank * mapping.cp_size + mapping.cp_rank, mapping.tp_rank
-        )
+        if mpi_disabled():
+            from tensorrt_llm._utils import torch_comm
+
+            allgather = torch_comm().tp_allgather
+        else:
+            comm = mpi_comm().Split(
+                mapping.pp_rank * mapping.cp_size + mapping.cp_rank, mapping.tp_rank
+            )
+            allgather = comm.allgather
 
         # see allocateIpcMemory in cpp/tensorrt_llm/runtime/ipcUtils.cpp for alignment reason
         # 1 << 21 is 2MB
@@ -113,8 +124,8 @@ class IpcMemory:
             _raise_if_error(cudart.cudaMemset(local_ptr, 0, aligned_size)[0])
         error, local_handle = cudart.cudaIpcGetMemHandle(local_ptr)
         _raise_if_error(error)
+        handles_reserved = allgather(local_handle.reserved)
 
-        handles_reserved = comm.allgather(local_handle.reserved)
         handles = []
         for reserved in handles_reserved:
             handle = cudart.cudaIpcMemHandle_t()
@@ -138,6 +149,8 @@ class IpcMemory:
     def close_ipc_memory(mapping: Mapping, peer_ptrs: List[int]):
         for node, ptr in enumerate(peer_ptrs):
             if node == mapping.tp_rank:
-                _raise_if_error(cudart.cudaFree(ptr)[0])
+                if ptr != 0:
+                    _raise_if_error(cudart.cudaFree(ptr)[0])
             else:
-                _raise_if_error(cudart.cudaIpcCloseMemHandle(ptr)[0])
+                if ptr != 0:
+                    _raise_if_error(cudart.cudaIpcCloseMemHandle(ptr)[0])

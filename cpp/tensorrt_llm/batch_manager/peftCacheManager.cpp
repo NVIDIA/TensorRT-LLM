@@ -601,10 +601,7 @@ SizeType32 PeftCacheManager::determineNumPages(std::shared_ptr<LlmRequest> llmRe
             {
                 return mHostLoraCache->determineNumPages(llmRequest->getLoraConfig().value());
             }
-            else
-            {
-                throw;
-            }
+            throw;
         }
     }
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);

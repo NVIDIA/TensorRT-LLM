@@ -268,7 +268,7 @@ struct Sm90AuxAllReduce
             tma_store_wait<0>();
 
             int tile_idx = params_ptr->tile_layout(m, n);
-            SystemBarrier::arrive_inc(
+            SystemBarrier::arrive_inc<cuda::thread_scope::thread_scope_device>(
                 params_ptr->barrier_params, thread_idx, tile_idx, params_ptr->rank, params_ptr->world_size);
         }
     };

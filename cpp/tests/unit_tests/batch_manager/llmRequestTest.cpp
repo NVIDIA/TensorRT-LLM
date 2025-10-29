@@ -56,7 +56,7 @@ TEST_F(LlmRequestTest, fromExecutorRequest)
         EXPECT_EQ(llmReq.getState(), tb::LlmRequestState::kCONTEXT_INIT);
         EXPECT_FALSE(llmReq.mSeqSlot);
         // No speculative decoding config, draft tokens should be empty
-        EXPECT_EQ(llmReq.getDraftTokens()->size(), 0);
+        EXPECT_EQ(llmReq.getNumDraftTokens(), 0);
         EXPECT_FALSE(llmReq.getEmbeddingBias().has_value());
         EXPECT_FALSE(llmReq.getBadWordsList().has_value());
         EXPECT_FALSE(llmReq.getStopWordsList().has_value());
@@ -748,13 +748,13 @@ TEST_P(ParamTest, createResponse)
 
 INSTANTIATE_TEST_SUITE_P(LlmRequestTest, ParamTest,
     testing::Combine(
-        // streaming
-        testing::Values(false, true),
+        // TODO: Support and add coverage for streamLLM
+        testing::Values(false),
         // excludeInputFromOutput
         testing::Values(false, true),
         // returnAllGeneratedTokens
         testing::Values(false, true),
-        // beamWdith
+        // beamWidth
         testing::Values(1, 2),
         // tokensPerIteration
         testing::Values(1, 3),

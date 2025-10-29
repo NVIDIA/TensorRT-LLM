@@ -1,31 +1,37 @@
 import copy
 import math
 import os
+from functools import partial
 from itertools import chain
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import numpy as np
 import torch
 import torch.nn as nn
-import transformers
+from einops import rearrange
 from PIL import Image
 from transformers import (AutoProcessor, AutoTokenizer, PretrainedConfig,
                           PreTrainedModel)
+from transformers.models.auto import CONFIG_MAPPING
 
-from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
+from tensorrt_llm.inputs.multimodal import MultimodalParams
+
+from ...inputs import (BaseMultimodalInputProcessor, ExtraProcessedInputs,
+                       InputProcessor, MultimodalPlaceholderMetadata,
+                       MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_utils import fuse_input_embeds
+from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
+                                        get_multimodal_embeddings)
+from .modeling_siglip import SiglipVisionModel
 from .modeling_utils import register_auto_model
 
 DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
 
 
-# Copied from HyperCLOVAX-SEED-Vision-Instruct-3B/modeling_hyperclovax.py
 def select_best_resolution(original_size: tuple,
                            possible_resolutions: list) -> tuple:
     original_height, original_width = original_size
@@ -51,7 +57,6 @@ def select_best_resolution(original_size: tuple,
     return best_fit
 
 
-# Copied from HyperCLOVAX-SEED-Vision-Instruct-3B/modeling_hyperclovax.py
 def unpad_image(tensor: torch.Tensor,
                 original_size: Tuple[int, int]) -> torch.Tensor:
     original_width, original_height = original_size
@@ -74,7 +79,6 @@ def unpad_image(tensor: torch.Tensor,
     return unpadded_tensor
 
 
-# Copied from HyperCLOVAX-SEED-Vision-Instruct-3B/modeling_hyperclovax.py
 def get_anyres_image_grid_shape(
     image_size: Tuple[int, int],
     grid_pinpoints: Union[str, List[Tuple[int, int]]],
@@ -90,7 +94,6 @@ def get_anyres_image_grid_shape(
     return width // patch_size, height // patch_size
 
 
-# Copied from HyperCLOVAX-SEED-Vision-Instruct-3B/modeling_hyperclovax.py
 def reshape_and_unpad_image_features(
     image_feature: torch.Tensor,
     height: int,
@@ -134,7 +137,6 @@ def reshape_and_unpad_image_features(
     return image_feature
 
 
-# Copied from HyperCLOVAX-SEED-Vision-Instruct-3B/modeling_hyperclovax.py
 def anyres_postprocessing(
     image_forward_outs: torch.FloatTensor,
     split_sizes: List[int],
@@ -185,7 +187,6 @@ def anyres_postprocessing(
     return image_features
 
 
-# Copied from HyperCLOVAX-SEED-Vision-Instruct-3B/modeling_hyperclovax.py
 def adaptive_anyres_postprocessing(
     image_forward_outs: torch.FloatTensor,
     image_sizes: List[List[int]],
@@ -235,7 +236,6 @@ def adaptive_anyres_postprocessing(
     return image_features
 
 
-# Copied from HyperCLOVAX-SEED-Vision-Instruct-3B/modeling_hyperclovax.py
 def compute_adaptive_params(
     pixel_values: Optional[List[List[torch.FloatTensor]]] = None,
     num_queries_vis_abstractors: Optional[List[List[int]]] = None,
@@ -382,7 +382,6 @@ def compute_adaptive_params(
     return num_queries_vis_abstractors, num_grids, image_sizes, is_videos, group_ids
 
 
-# Copied from HyperCLOVAX-SEED-Vision-Instruct-3B/modeling_hyperclovax.py
 def determine_non_vision_query_lengths(input_ids: torch.LongTensor, pad_id: int,
                                        img_start_id: int) -> List[int]:
     non_vision_query_lengths = []
@@ -403,7 +402,169 @@ def determine_non_vision_query_lengths(input_ids: torch.LongTensor, pad_id: int,
     return non_vision_query_lengths
 
 
-class HCXVisionInputProcessor(InputProcessor):
+class HCXVisionCAbstractor(nn.Module):
+    """
+    This module is based on C-Abstractor, whose license is under apache-2.0.
+    You can check the original code at https://github.com/khanrc/honeybee/blob/main/honeybee/projectors/projectors.py
+    and we made necessary modifications.
+    """
+
+    def __init__(
+        self,
+        num_queries: int,
+        num_input_tokens: int,
+        encoder_hidden_size: int,
+        hidden_size: int,
+        output_hidden_size: int,
+        pos_emb: bool = True,
+        prenorm: bool = False,
+    ):
+        super().__init__()
+        self.num_input_tokens = num_input_tokens
+        self.output_hidden_size = output_hidden_size
+
+        # Positional embedding
+        if pos_emb:
+            self.pos_emb = torch.nn.Parameter(
+                torch.zeros(1, num_input_tokens, encoder_hidden_size))
+            self.pos_emb.data.normal_(mean=0.0, std=0.02)
+        else:
+            self.pos_emb = None
+
+        # (Optional) Pre-normalization layer
+        from timm.layers import LayerNorm
+        if prenorm:
+            self.prenorm = LayerNorm(encoder_hidden_size)
+        else:
+            self.prenorm = None
+
+        self.build_net(num_queries, encoder_hidden_size, hidden_size,
+                       output_hidden_size)
+        self.dtype = next(self.parameters()).dtype
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        num_queries_vis_abstractors: Optional[List[List[int]]] = None,
+        num_grids: Optional[List[int]] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: (B, L, encoder_hidden_size) tensor from the visual backbone (e.g. CLIP visual encoder), including cls token.
+        """
+        if self.prenorm is not None:
+            x = self.prenorm(x)
+
+        if self.pos_emb is not None:
+            x = x + self.pos_emb
+
+        x = self._forward(
+            x,
+            num_queries_vis_abstractors=num_queries_vis_abstractors,
+            num_grids=num_grids,
+        )  # (B, L, output_hidden_size)
+
+        return x
+
+    def _forward(
+        self,
+        x: torch.Tensor,
+        num_queries_vis_abstractors: Optional[List[List[int]]] = None,
+        num_grids: Optional[List[int]] = None,
+    ) -> torch.Tensor:
+
+        # x: [B, L, dim]
+        B, L, dim = x.shape
+        hw = int(L**0.5)
+        x = rearrange(x, "b (h w) d -> b d h w", h=hw, w=hw)
+
+        if num_queries_vis_abstractors is not None:
+            assert num_grids is not None
+            return self._forward_adaptive_num_query(
+                x, num_queries_vis_abstractors, num_grids)
+
+        x = self.net(x)
+        x = rearrange(x, "b d h w -> b (h w) d")
+        x = self.readout(x)
+        return x
+
+    def _forward_adaptive_num_query(
+        self,
+        x: torch.Tensor,
+        num_queries_vis_abstractors: Optional[List[List[int]]] = None,
+        num_grids: Optional[List[int]] = None,
+    ) -> List[torch.Tensor]:
+        # self.net is consisted by 3 layers (s1, sampler, s2)
+        assert len(self.net) == 3
+
+        x = self.net[0](x)  # s1
+        new_x = []
+        for i, num_queries in enumerate(num_queries_vis_abstractors):
+            hw = int(num_queries**0.5)
+            sampler = nn.AdaptiveAvgPool2d((hw, hw))
+            out = sampler(x[num_grids[i]:num_grids[i + 1], :])
+            out = self.net[2](out)  # s2
+
+            out = rearrange(out, "b d h w -> b (h w) d")
+            out = self.readout(out)
+
+            new_x.append(out)
+        return new_x
+
+    def build_net(
+        self,
+        n_queries: int,
+        encoder_hidden_size: int,
+        hidden_size: int,
+        output_hidden_size: int,
+        depth: int = 3,
+        mlp_depth: int = 2,
+    ):
+        assert (n_queries**0.5).is_integer(
+        ), f"n_queries must be square number. n_queries: {n_queries}"
+        hw = int(n_queries**0.5)
+        from timm.layers import LayerNorm2d
+        from timm.models.regnet import RegStage
+
+        # RegBlock = ResBlock + SE
+        RegBlock = partial(
+            RegStage,
+            stride=1,
+            dilation=1,
+            act_layer=nn.SiLU,
+            norm_layer=LayerNorm2d,
+        )
+
+        s1 = RegBlock(
+            depth,
+            encoder_hidden_size,
+            hidden_size,
+        )
+        sampler = nn.AdaptiveAvgPool2d((hw, hw))
+        s2 = RegBlock(
+            depth,
+            hidden_size,
+            hidden_size,
+        )
+
+        self.net = nn.Sequential(s1, sampler, s2)
+        self.readout = self.build_mlp(mlp_depth, hidden_size,
+                                      output_hidden_size)
+
+    def build_mlp(
+        self,
+        depth: int,
+        hidden_size: int,
+        output_hidden_size: int,
+    ):
+        layers = [nn.Linear(hidden_size, output_hidden_size)]
+        for _ in range(1, depth):
+            layers.append(nn.SiLU())
+            layers.append(nn.Linear(output_hidden_size, output_hidden_size))
+        return nn.Sequential(*layers)
+
+
+class HCXVisionInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
 
     def __init__(self,
                  model_path: str,
@@ -423,17 +584,74 @@ class HCXVisionInputProcessor(InputProcessor):
             model_path,
             trust_remote_code=trust_remote_code,
             use_fast=self.use_fast)
-        self.tllm_image_token_id = self.pretrained_config.language_config[
+        self.tllm_multimodal_token_id = self.pretrained_config.language_config[
             "vocab_size"] + 1
-        if DISAGG:
-            self.mm_encoder = HCXVisionModel(self.pretrained_config,
-                                             skip_processor=True)
+        self.vision_query_lengths = None
+        self._vision_query_generator = None
+
+    def get_vocab_size(self):
+        return self.pretrained_config.language_config["vocab_size"]
+
+    def get_num_tokens_per_image(
+        self,
+        image: Image.Image,
+        **kwargs,
+    ):
+        """
+        Get the number of tokens per image.
+
+        This method must be called after __call__ is executed.
+        Uses a generator pattern to safely iterate through vision_query_lengths.
+
+        Args:
+            image: PIL Image to get token count for
+            **kwargs: Additional arguments for processor (unused)
+
+        Returns:
+            int: Number of tokens for the image
+
+        Raises:
+            RuntimeError: If called before __call__ is executed
+            IndexError: If called more times than there are images
+        """
+        if self.vision_query_lengths is None:
+            raise RuntimeError(
+                "get_num_tokens_per_image() must be called after __call__() is executed. "
+                "vision_query_lengths is not available.")
+
+        # Initialize generator if not already done
+        if self._vision_query_generator is None:
+            self._vision_query_generator = self._create_vision_query_generator()
+
+        try:
+            return next(self._vision_query_generator)
+        except StopIteration:
+            raise IndexError(
+                "get_num_tokens_per_image() called more times than the number of images processed. "
+                "No more vision query lengths available.")
+
+    def get_mm_token_ids(self):
+        return torch.tensor([self.tllm_multimodal_token_id])
+
+    def _create_vision_query_generator(self):
+        """Create a generator that yields vision query lengths for each image."""
+        if self.vision_query_lengths is None:
+            return
+
+        # Flatten all vision query lengths from all batches
+        for batch_vision_queries in self.vision_query_lengths:
+            for query_length in batch_vision_queries:
+                yield query_length
+
+    def _reset_vision_query_generator(self):
+        """Reset the vision query generator."""
+        self._vision_query_generator = None
 
     def _post_process(self,
                       input_ids: torch.Tensor,
                       preprocessed_image: dict[str, any] = None):
         if not preprocessed_image:
-            return input_ids
+            return input_ids[0]
 
         vision_query_lengths = preprocessed_image.get("vision_query_lengths",
                                                       None)
@@ -476,7 +694,7 @@ class HCXVisionInputProcessor(InputProcessor):
                     batch_idx,
                     input_start + token_len:input_start + token_len +
                     vision_query_lengths[batch_idx][multi_img_idx],
-                ] = self.tllm_image_token_id
+                ] = self.tllm_multimodal_token_id
 
                 input_start += token_len + vision_query_lengths[batch_idx][
                     multi_img_idx]
@@ -495,7 +713,6 @@ class HCXVisionInputProcessor(InputProcessor):
                     mm_processor_kwargs: Dict[str, Any]):
 
         preprocessed_image = None
-        is_video_list = [False] * len(images)
         if images is not None:
             is_video_list = [False] * len(images)
             preprocessed_image = self.processor(
@@ -503,6 +720,10 @@ class HCXVisionInputProcessor(InputProcessor):
                 is_video_list=is_video_list,
                 **mm_processor_kwargs,
             )
+            self.vision_query_lengths = preprocessed_image.get(
+                "vision_query_lengths", None)
+            # Reset generator when new vision_query_lengths are available
+            self._reset_vision_query_generator()
 
         input_ids = self.tokenizer.encode(text_prompt,
                                           add_special_tokens=False,
@@ -531,136 +752,128 @@ class HCXVisionInputProcessor(InputProcessor):
         if not preprocessed_image:
             return fused_input_ids.to(torch.int32).tolist(), {}
 
-        if DISAGG:
-            mm_embeds = self.mm_encoder.forward(preprocessed_image)
-            mm_embeds = torch.cat(mm_embeds, dim=0)
-        else:
-            # NOTE: For now, I am using "mm_embeding" in tensor format to send the image data to the model.
-            # CASE 1: Sending raw image data
-            if isinstance(images[0], Image.Image):
-                images = [torch.from_numpy(np.array(image)) for image in images]
-            mm_embeds = torch.stack(images, dim=0)
-
-            # NOTE: After refactoring the llmRequest, we can use preprocessed_image['pixel_values'] to send the image data to the model.
-            # CASE 2: Sending preprocessed image data
-            # mm_embeds = torch.cat(preprocessed_image['pixel_values'][0],
-            #                                dim=0)
-
+        multimodal_data = {}
+        multimodal_data["image"] = {
+            "pixel_values":
+            torch.stack(preprocessed_image['pixel_values'][0],
+                        dim=0).to(torch.bfloat16),
+            "image_sizes":
+            preprocessed_image.get('image_sizes', None),
+            "is_videos":
+            preprocessed_image.get('is_videos', None),
+            "num_queries_vis_abstractors":
+            preprocessed_image.get('num_queries_vis_abstractors', None),
+            "num_queries_vis_abstractors_slow":
+            preprocessed_image.get('num_queries_vis_abstractors_slow', None),
+            "first_last_frames_slows":
+            preprocessed_image.get('first_last_frames_slows', None),
+        }
         return fused_input_ids.to(torch.int32).tolist(), {
-            "mm_embedding": mm_embeds,
+            "multimodal_data": multimodal_data
         }
 
 
-class HCXVisionModel:
+@register_auto_model("HCXVisionModel")
+class HCXVisionModel(nn.Module):
 
-    def __init__(self,
-                 pretrained_config: PretrainedConfig,
-                 skip_processor: bool = False):
-
-        self.pretrained_config = pretrained_config
-        self.vision_config = self.pretrained_config.vision_config
-
-        model_path = self.pretrained_config._name_or_path
-
-        # TODO: Remove this when we refactor LlmRequest
-        # NOTE: trust_remote_code can be removed once we refactor LlmRequest
-        self.skip_processor = skip_processor
-        if not self.skip_processor:
-            self.processor = AutoProcessor.from_pretrained(
-                model_path, trust_remote_code=True, use_fast=True)
-
-        # NOTE: There is no way of importing mm_projector, HCXVisionCAbstractor from HF. So, can not do the sharded_loading.
-        # NOTE: trust_rmemote_code can be removed once we change the model into TRT-LLM's format
-        model = transformers.AutoModelForCausalLM.from_pretrained(
-            model_path, trust_remote_code=True)
-        model.eval()
-        self.device = 'cuda'
-
-        # TODO: Convert to TRT-LLM's SIGLIP
-        self.vision_model = model.vision_model.to(self.device)
-        self.mm_projector = model.mm_projector.to(self.device)
-        self.image_newline = model.image_newline.to(self.device)
+    def __init__(self, model_config: ModelConfig[PretrainedConfig]):
+        super().__init__()
+        self.model_config = model_config
+        self.pretrained_config = model_config.pretrained_config
+        siglip_model_config = copy.deepcopy(self.model_config)
+        siglip_model_config.pretrained_config = self.model_config.pretrained_config.vision_config
+        self.visual_token_idx = 0 if "siglip" in self.model_config.pretrained_config.vision_config.model_type else 1
+        self.dtype = self.model_config.pretrained_config.vision_config.torch_dtype
+        self.vision_model = SiglipVisionModel(siglip_model_config).to(
+            self.dtype)
+        self.mm_projector = HCXVisionCAbstractor(
+            num_queries=self.pretrained_config.num_queries_vis_abstractor,
+            num_input_tokens=(
+                self.pretrained_config.vision_config.image_size //
+                self.pretrained_config.vision_config.patch_size)**2,
+            encoder_hidden_size=self.pretrained_config.vision_config.
+            hidden_size,
+            hidden_size=self.pretrained_config.vision_config.hidden_size,
+            output_hidden_size=self.pretrained_config.hidden_size,
+            pos_emb=self.pretrained_config.proj_pos_emb,
+            prenorm=self.pretrained_config.proj_prenorm,
+        ).to(self.dtype)
+        self.image_newline = nn.Parameter(torch.empty(
+            self.pretrained_config.hidden_size, ),
+                                          requires_grad=False).to(self.dtype)
 
         self.unpad = self.pretrained_config.unpad
         self.use_nth_layer = self.pretrained_config.use_nth_layer
         self.anyres = self.pretrained_config.anyres
-        self.possible_resolutions = self._init_possible_resolutions(
-            self.pretrained_config)
+        self.possible_resolutions = self._init_possible_resolutions()
+        self.post_config()
 
-    def _init_possible_resolutions(self, config: PretrainedConfig):
+    def post_config(self):
+        self.config = self.vision_model.config
+        self.model_config.pretrained_config = self.vision_model.config
+
+    def _init_possible_resolutions(self):
         possible_resolutions = []
-        if config.anyres:
-            assert config.max_num_grids > 0
-            for i in range(1, config.max_num_grids + 1):
-                for j in range(1, config.max_num_grids + 1):
-                    if i == 1 and j == 1 and not config.use_1x1_grid:
+        if self.pretrained_config.anyres:
+            assert self.pretrained_config.max_num_grids > 0
+            for i in range(1, self.pretrained_config.max_num_grids + 1):
+                for j in range(1, self.pretrained_config.max_num_grids + 1):
+                    if i == 1 and j == 1 and not self.pretrained_config.use_1x1_grid:
                         continue
-                    if i * j <= config.max_num_grids:
+                    if i * j <= self.pretrained_config.max_num_grids:
                         possible_resolutions.append([i, j])
 
             possible_resolutions = [[
-                ys * config.vision_config["image_size"],
-                xs * config.vision_config["image_size"]
+                ys * self.pretrained_config.vision_config.image_size,
+                xs * self.pretrained_config.vision_config.image_size
             ] for ys, xs in possible_resolutions]
         return possible_resolutions
 
-    def _to_device(
-            self, input_tensor: Union[torch.Tensor,
-                                      List]) -> Union[torch.Tensor, List]:
-        if isinstance(input_tensor, list):
-            return [self._to_device(item) for item in input_tensor]
-        elif isinstance(input_tensor, torch.Tensor):
-            return input_tensor.to(self.device)
+    def load_weights(self, weights):
+        vision_weights = _filter_weights(weights, "vision_model.")
+        self.vision_model.load_weights(vision_weights)
 
-    # TODO: Remove this when we refactor LlmRequuest
-    def _preprocess(self, mm_data: List[Any]) -> Dict[str, List[Any]]:
-        preprocessed_image_list = []
+        mm_projector_weights = _filter_weights(weights, "mm_projector.")
+        self.mm_projector.load_state_dict(mm_projector_weights, strict=True)
 
-        for images in mm_data:
-            images = torch.unbind(images, dim=0)
-            preprocessed_image = self.processor(
-                images=images,
-                is_video_list=[False] * len(images),
-            )
+        self.image_newline.data.copy_(weights["image_newline"])
 
-            # NOTE: The HCXVisionInputProcessor makes pixel_vlues to CPU values even though use_fast = True.
-            # So, we need to transfer them to GPU.
-            preprocessed_image["pixel_values"] = self._to_device(
-                preprocessed_image["pixel_values"])
-
-            preprocessed_image_list.append(preprocessed_image)
-
-        return {
-            key: [d[key][0] for d in preprocessed_image_list]
-            for key in preprocessed_image_list[0].keys()
+    def _parse_and_batch_multimodal_data(
+        self, multimodal_params: List[MultimodalParams]
+    ) -> Tuple[List[torch.Tensor], Dict[str, List[Any]]]:
+        """Parse and batch multimodal data from MultimodalParams objects."""
+        pixel_values = [
+            list(
+                torch.unbind(
+                    multimodal_param.multimodal_data["image"]["pixel_values"],
+                    dim=0)) for multimodal_param in multimodal_params
+        ]
+        mm_extra_data = {
+            key: [
+                multimodal_param.multimodal_data["image"][key][0]
+                for multimodal_param in multimodal_params
+            ]
+            for key in multimodal_params[0].multimodal_data["image"].keys()
         }
+        return pixel_values, mm_extra_data
 
-    def forward(self, mm_data: Union[List[Any], Dict[str, Any]]):
-        if not self.skip_processor:
-            # NOTE: This should be done in the input processor and got the preprocessed_image metadata from request level.
-            # But before refactoring the llmRequest, we are re-doing inputprocessor here.
-            preprocessed_image = self._preprocess(mm_data)
-        else:
-            # NOTE: When we refactor the llmRequest, we will get the extra_mm_data from mm_data, and need to make it as preprocessed_image.
-            preprocessed_image = mm_data
-            preprocessed_image["pixel_values"] = self._to_device(
-                preprocessed_image["pixel_values"])
+    @torch.inference_mode()
+    def forward(self, multimodal_params: List[MultimodalParams]):
 
-        pixel_values = preprocessed_image.get("pixel_values", None)
-        image_sizes = preprocessed_image.get("image_sizes", None)
-        is_videos = preprocessed_image.get("is_videos", None)
-        num_queries_vis_abstractors = preprocessed_image.get(
+        pixel_values, mm_extra_data = self._parse_and_batch_multimodal_data(
+            multimodal_params)
+        image_sizes = mm_extra_data.get("image_sizes", None)
+        is_videos = mm_extra_data.get("is_videos", None)
+        num_queries_vis_abstractors = mm_extra_data.get(
             "num_queries_vis_abstractors", None)
-        num_queries_vis_abstractors_slow = preprocessed_image.get(
+        num_queries_vis_abstractors_slow = mm_extra_data.get(
             "num_queries_vis_abstractors_slow", None)
-        first_last_frames_slows = preprocessed_image.get(
-            "first_last_frames_slows", None)
+        first_last_frames_slows = mm_extra_data.get("first_last_frames_slows",
+                                                    None)
 
         len_pixel_values = [len(pixel_value) for pixel_value in pixel_values]
         concat_pixel_values = torch.cat(list(chain(*pixel_values)),
                                         dim=0)  # list of list of 4D Tensor
-        visual_token_idx = 0 if "siglip" in self.vision_config[
-            "model_type"] else 1
 
         n_chunks = 1
         total_len = concat_pixel_values.size(0)
@@ -670,7 +883,7 @@ class HCXVisionModel:
         for i in range(n_chunks):
             start = i * chunk_size
             end = (i + 1) * chunk_size
-            chunk = concat_pixel_values[start:end].to(self.vision_model.dtype)
+            chunk = concat_pixel_values[start:end]
             if chunk.size(0) < chunk_size:
                 pad_size = chunk_size - chunk.size(0)
                 dummy_shape = (pad_size, ) + tuple(
@@ -681,15 +894,15 @@ class HCXVisionModel:
                     device=concat_pixel_values.device,
                 )
                 chunk = torch.cat([chunk, dummy], dim=0)
-
+            attn_metadata = self.vision_model.prepare_attn_metadata(
+                chunk.shape[0])
             if self.use_nth_layer == -1:
                 self.vision_model.vision_model.post_layernorm = nn.Identity()
-                outs = self.vision_model(chunk)
-                outs = outs.last_hidden_state[:, visual_token_idx:]
+                outs = self.vision_model(chunk, attn_metadata=attn_metadata)
+                outs = outs[:, self.visual_token_idx:]
             else:
-                outs = self.vision_model(chunk, output_hidden_states=True)
-                outs = outs.hidden_states[self.use_nth_layer][:,
-                                                              visual_token_idx:]
+                outs = self.vision_model(chunk, attn_metadata=attn_metadata)
+                outs = outs[self.use_nth_layer][:, self.visual_token_idx:]
             image_forward_outs_chunks.append(outs)
 
         image_forward_outs = torch.cat(image_forward_outs_chunks, dim=0).to(
@@ -701,8 +914,6 @@ class HCXVisionModel:
             if is_videos is not None:
                 is_videos = list(chain(*is_videos))
             group_ids = None
-            image_forward_outs = image_forward_outs.to(
-                dtype=self.mm_projector.dtype)
             image_forward_outs = self.mm_projector(image_forward_outs)
         else:
             (
@@ -719,9 +930,6 @@ class HCXVisionModel:
                 is_videos,
                 first_last_frames_slows,
             )
-
-            image_forward_outs = image_forward_outs.to(
-                dtype=self.mm_projector.dtype)
             image_forward_outs = self.mm_projector(
                 image_forward_outs,
                 num_queries_vis_abstractors=num_queries_vis_abstractors,
@@ -780,7 +988,23 @@ class HCXVisionModel:
 
 
 @register_auto_model("HCXVisionForCausalLM")
-@register_input_processor(HCXVisionInputProcessor, model_type="hyperclovax_vlm")
+@register_input_processor(
+    HCXVisionInputProcessor,
+    model_type="hyperclovax_vlm",
+    placeholder_metadata=MultimodalPlaceholderMetadata(
+        placeholder_map={
+            "image":
+            '<im_end>\n<|im_start|>user (mime) \n'
+            '{{"type": "image/jpeg", "filename": ""}}<|im_end|>\n'
+            '<|im_start|>user (vector)\n<|dummy3|><|im_end|>\n'
+            '<|im_start|>image/aux\n'
+            '다음 중 ocr은 사진에서 검출된 글자이고, lens_keyword는 사진에서 추출된 '
+            'keyword와 bbox 위치입니다.bbox는 0~1 사이로 정규화된 [x1, y1, x2, y2]의 '
+            '형태입니다. 참고하여 답변하세요. '
+            '{{"ocr": "", "lens_keywords": "", "lens_local_keywords": ""}}'
+        },
+        placeholder_placement=MultimodalPlaceholderPlacement.AFTER_TEXT,
+    ))
 class HCXVisionForCausalLM(PreTrainedModel):
 
     def __init__(self, model_config: ModelConfig):
@@ -790,33 +1014,34 @@ class HCXVisionForCausalLM(PreTrainedModel):
         self.model_config = model_config
         if hasattr(self, "llm"):
             return
-
         if not DISAGG:
-            self.mm_encoder = HCXVisionModel(model_config.pretrained_config)
+            vision_model_config = copy.deepcopy(model_config)
+            vision_model_type = self.model_config.pretrained_config.vision_config[
+                "model_type"]
+            vision_config_obj = CONFIG_MAPPING[vision_model_type](
+                **self.model_config.pretrained_config.vision_config)
+            vision_model_config.pretrained_config.vision_config = vision_config_obj
+            vision_model_config.pretrained_config.architectures = [
+                "HCXVisionModel"
+            ]
+            self.mm_encoder = AutoModelForCausalLM.from_config(
+                vision_model_config)
 
         llm_model_config = copy.deepcopy(model_config)
         llm_model_config.pretrained_config = PretrainedConfig.from_dict(
             llm_model_config.pretrained_config.language_config)
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
-
-        self.model_dtype = getattr(config, "torch_dtype", torch.float16)
-        logger.info(f"{self.dtype=} {self.model_dtype=}")
+        self.model_dtype = getattr(config.language_config, "torch_dtype",
+                                   torch.bfloat16)
         self.post_config()
         self.is_loaded = True
 
     def load_weights(self, weights):
+        language_weights = _filter_weights(weights, "language_model.")
+        self.llm.load_weights(language_weights)
 
-        def filter_weights(prefix, weights: Dict):
-            result = {}
-            for k, v in weights.items():
-                if k.startswith(prefix):
-                    new_k = k[len(prefix) + 1:]
-                    result[new_k] = v.to(self.dtype)
-                    assert result[new_k] is not None
-            return result
-
-        weights = filter_weights("language_model", weights)
-        self.llm.load_weights(weights)
+        if not DISAGG:
+            self.mm_encoder.load_weights(weights)
 
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
@@ -843,20 +1068,24 @@ class HCXVisionForCausalLM(PreTrainedModel):
             f"num_context_requests: {num_context_requests}, num_generation_requests: {num_generation_requests}"
         )
 
-        mm_data = kwargs.get("multi_modal_data", [])
+        multimodal_params = kwargs.get("multimodal_params", [])
         mm_embeds = []
-        if len(mm_data) > 0:
-            assert len(
-                mm_data
-            ) == num_context_requests, f"Number of multimodal tensors ({len(mm_data)}) should be equal to number of context requests ({num_context_requests}) in the batch."
-            if DISAGG:
-                # NOTE: In the DISAGG, we are assuming we get the mm_embeds from the llmRequest.
-                mm_embeds = mm_data
+        if len(multimodal_params) > 0:
+            if not DISAGG:
+                mm_embeds = get_multimodal_embeddings(
+                    encoder_forward_fn=self.mm_encoder.forward,
+                    multimodal_params=multimodal_params[:num_context_requests])
             else:
-                mm_embeds = self.mm_encoder.forward(mm_data)
+                raise NotImplementedError(
+                    "HCXVisionForCausalLM does not support disaggregated inference yet. Please unset "
+                    f"the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."
+                )
+            mm_embeds = find_input_mm_embeds(
+                mm_embeds, multimodal_params[:num_context_requests])
 
         input_ids, input_embeds = fuse_input_embeds(self.llm.model.embed_tokens,
-                                                    input_ids, mm_embeds)
+                                                    input_ids, mm_embeds,
+                                                    **kwargs)
         output_prob = self.llm.forward(
             attn_metadata=attn_metadata,
             input_ids=input_ids,
@@ -866,3 +1095,11 @@ class HCXVisionForCausalLM(PreTrainedModel):
 
         logger.debug(f'output shape: {output_prob.shape}')
         return output_prob
+
+
+def _filter_weights(weights: Dict[str, torch.Tensor],
+                    prefix: str) -> Dict[str, torch.Tensor]:
+    return {
+        name[len(prefix):]: weight
+        for name, weight in weights.items() if name.startswith(prefix)
+    }

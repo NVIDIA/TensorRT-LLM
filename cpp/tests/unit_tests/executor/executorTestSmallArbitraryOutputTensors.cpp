@@ -1,6 +1,5 @@
 #include "include/tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/batch_manager/trtGptModelInflightBatching.h"
-#include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
@@ -128,9 +127,8 @@ std::unique_ptr<DecoderTestShared<TLogits>> SetupDecoderTest(
             std::vector<executor::AdditionalModelOutput>{
                 executor::AdditionalModelOutput{DecoderTestShared<TLogits>::kTopKTensorName, params.gatherContext}});
 
-    auto optionalParams = batch_manager::TrtGptModelOptionalParams{executorConfig, false};
     auto model = std::make_shared<batch_manager::TrtGptModelInflightBatching>(
-        logger, modelConfig, worldConfig, engine, false, optionalParams);
+        logger, modelConfig, worldConfig, engine, false, executorConfig, false);
 
     return std::make_unique<DecoderTestShared<TLogits>>(
         logger, rng, std::make_shared<executor::Executor>(model, executorConfig), randomLogits);

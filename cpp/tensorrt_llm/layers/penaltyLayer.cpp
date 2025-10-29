@@ -83,7 +83,7 @@ void PenaltyLayer<T>::allocateWorkspace()
     {
 
         auto const workspaceSize = mDecoderDomain.getBatchSize() * mDecoderDomain.getMaxDecodingTokens()
-            * mConfiguredBeamWidth * mDecoderDomain.getVocabSize();
+            * mConfiguredBeamWidth * mDecoderDomain.getVocabSize() * 2;
         mPenaltyWorkspaceDevice = mBufferManager->gpu(workspaceSize, nvinfer1::DataType::kINT32);
 
         if (mDecodingMode.isBeamSearch())
@@ -107,6 +107,7 @@ void PenaltyLayer<T>::allocateBuffer()
     mPresencePenalty = mBufferManager->pinnedPool(batchSizeShape, TRTDataType<float>::value);
     mFrequencyPenalty = mBufferManager->pinnedPool(batchSizeShape, TRTDataType<float>::value);
     mMinLength = mBufferManager->pinnedPool(batchSizeShape, TRTDataType<SizeType32>::value);
+    mPromptIgnoreLength = mBufferManager->pinnedPool(batchSizeShape, TRTDataType<SizeType32>::value);
 
     if (mDecodingMode.isUseTemperature())
     {
@@ -128,6 +129,10 @@ void PenaltyLayer<T>::allocateBuffer()
     {
         mMinLengthDevice = mBufferManager->gpu(batchSizeShape, nvinfer1::DataType::kINT32);
     }
+    if (mDecodingMode.isUseOccurrencePenalty())
+    {
+        mPromptIgnoreLengthDevice = mBufferManager->gpu(batchSizeShape, nvinfer1::DataType::kINT32);
+    }
 
     auto const logitsPtrDeviceDesc = std::make_pair(batchSizeShape, TRTDataType<T*>::value);
     mWorkspaceSize = DecodingLayerWorkspace::calculateRequiredWorkspaceSize(logitsPtrDeviceDesc);
@@ -141,6 +146,7 @@ void PenaltyLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, TensorCo
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(PenaltyLayer_setup);
 
     auto setupParams = std::dynamic_pointer_cast<DynamicDecodeSetupParams>(baseSetupParams);
 
@@ -168,6 +174,8 @@ void PenaltyLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, TensorCo
     bool const useFrequencyPenalty
         = mDecodingMode.isUseFrequencyPenalty() && penaltyParams->frequencyPenalty.has_value();
     bool const useMinLength = mDecodingMode.isUseMinLength() && penaltyParams->minLength.has_value();
+    bool const usePromptIgnoreLength
+        = mDecodingMode.isUseOccurrencePenalty() && penaltyParams->promptIgnoreLength.has_value();
     // FIXME: once one of the requests has some penalty, we will always have to compute it.
     // To avoid that we need to scan through all active requests at each iteration.
     mUseTemperature |= useTemperature;
@@ -175,6 +183,7 @@ void PenaltyLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, TensorCo
     mUsePresencePenalty |= usePresencePenalty;
     mUseFrequencyPenalty |= useFrequencyPenalty;
     mUseMinLength |= useMinLength;
+    mUsePromptIgnoreLength |= usePromptIgnoreLength;
 
     if (mUseTemperature)
     {
@@ -202,10 +211,16 @@ void PenaltyLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, TensorCo
         fillBuffers(penaltyParams->minLength, DefaultDecodingParams::getMinLength(), mMinLength, mMinLengthDevice,
             batchSlots, getLimitsPenalty(DecodingPenaltyType::MinLength), "min length");
     }
+    if (mUsePromptIgnoreLength)
+    {
+        fillBuffers(penaltyParams->promptIgnoreLength, DefaultDecodingParams::getPromptIgnoreLength(),
+            mPromptIgnoreLength, mPromptIgnoreLengthDevice, batchSlots,
+            getLimitsPenalty(DecodingPenaltyType::PromptIgnoreLength), "prompt ignore length");
+    }
 
     // Reset penalty workspace
     auto const workspaceSizePerBatch
-        = mDecoderDomain.getMaxDecodingTokens() * mConfiguredBeamWidth * mDecoderDomain.getVocabSize();
+        = mDecoderDomain.getMaxDecodingTokens() * mConfiguredBeamWidth * mDecoderDomain.getVocabSize() * 2;
     for (SizeType32 bi = 0; bi < batchSize; ++bi)
     {
         auto batchSlot = runtime::bufferCast<runtime::SizeType32>(*batchSlots)[bi];
@@ -286,6 +301,7 @@ void PenaltyLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& b
     auto presencePenalties = GET_PENALTIES(PresencePenalty, float);
     auto frequencyPenalties = GET_PENALTIES(FrequencyPenalty, float);
     auto minLengths = GET_PENALTIES(MinLength, SizeType32);
+    auto promptIgnoreLengths = GET_PENALTIES(PromptIgnoreLength, SizeType32);
 
 #undef GET_PENALTIES
 
@@ -315,6 +331,7 @@ void PenaltyLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& b
     penaltyParams.inputLengths = inputLengths;
     penaltyParams.sequenceLengths = bufferCast<SizeType32>(*outputs->sequenceLength.value());
     penaltyParams.minLengths = bufferCastOrNull<SizeType32>(minLengths);
+    penaltyParams.promptIgnoreLengths = bufferCastOrNull<SizeType32>(promptIgnoreLengths);
     penaltyParams.endIds = bufferCast<TokenIdType>(*params->endIds);
     penaltyParams.batchSlots = workspace->getDeviceBatchSlotsPtr();
     penaltyParams.maxTokensPerStep = mDecoderDomain.getMaxDecodingTokens();

@@ -72,12 +72,12 @@ void initRequestBindings(pybind11::module_& m)
         return py::make_tuple(self.getBeamWidth(), self.getTopK(), self.getTopP(), self.getTopPMin(),
             self.getTopPResetIds(), self.getTopPDecay(), self.getSeed(), self.getTemperature(), self.getMinTokens(),
             self.getBeamSearchDiversityRate(), self.getRepetitionPenalty(), self.getPresencePenalty(),
-            self.getFrequencyPenalty(), self.getLengthPenalty(), self.getEarlyStopping(), self.getNoRepeatNgramSize(),
-            self.getNumReturnSequences(), self.getMinP(), self.getBeamWidthArray());
+            self.getFrequencyPenalty(), self.getPromptIgnoreLength(), self.getLengthPenalty(), self.getEarlyStopping(),
+            self.getNoRepeatNgramSize(), self.getNumReturnSequences(), self.getMinP(), self.getBeamWidthArray());
     };
     auto samplingConfigSetstate = [](py::tuple const& state)
     {
-        if (state.size() != 19)
+        if (state.size() != 20)
         {
             throw std::runtime_error("Invalid SamplingConfig state!");
         }
@@ -94,12 +94,13 @@ void initRequestBindings(pybind11::module_& m)
             state[10].cast<std::optional<FloatType>>(),              // RepetitionPenalty
             state[11].cast<std::optional<FloatType>>(),              // PresencePenalty
             state[12].cast<std::optional<FloatType>>(),              // FrequencyPenalty
-            state[13].cast<std::optional<FloatType>>(),              // LengthPenalty
-            state[14].cast<std::optional<SizeType32>>(),             // EarlyStopping
-            state[15].cast<std::optional<SizeType32>>(),             // NoRepeatNgramSize
-            state[16].cast<std::optional<SizeType32>>(),             // NumReturnSequences
-            state[17].cast<std::optional<FloatType>>(),              // MinP
-            state[18].cast<std::optional<std::vector<SizeType32>>>() // BeamWidthArray
+            state[13].cast<std::optional<SizeType32>>(),             // PromptIgnoreLength
+            state[14].cast<std::optional<FloatType>>(),              // LengthPenalty
+            state[15].cast<std::optional<SizeType32>>(),             // EarlyStopping
+            state[16].cast<std::optional<SizeType32>>(),             // NoRepeatNgramSize
+            state[17].cast<std::optional<SizeType32>>(),             // NumReturnSequences
+            state[18].cast<std::optional<FloatType>>(),              // MinP
+            state[19].cast<std::optional<std::vector<SizeType32>>>() // BeamWidthArray
         );
     };
     py::class_<tle::SamplingConfig>(m, "SamplingConfig")
@@ -116,6 +117,7 @@ void initRequestBindings(pybind11::module_& m)
                  std::optional<tle::FloatType> const&,              // repetitionPenalty
                  std::optional<tle::FloatType> const&,              // presencePenalty
                  std::optional<tle::FloatType> const&,              // frequencyPenalty
+                 std::optional<tle::SizeType32> const&,             // promptIgnoreLength
                  std::optional<tle::FloatType> const&,              // lengthPenalty
                  std::optional<tle::SizeType32> const&,             // earlyStopping
                  std::optional<tle::SizeType32> const&,             // noRepeatNgramSize
@@ -138,6 +140,7 @@ void initRequestBindings(pybind11::module_& m)
             py::arg("repetition_penalty") = py::none(),
             py::arg("presence_penalty") = py::none(),
             py::arg("frequency_penalty") = py::none(),
+            py::arg("prompt_ignore_length") = py::none(),
             py::arg("length_penalty") = py::none(),
             py::arg("early_stopping") = py::none(),
             py::arg("no_repeat_ngram_size") = py::none(),
@@ -161,6 +164,8 @@ void initRequestBindings(pybind11::module_& m)
             [](tle::SamplingConfig& self, std::optional<FloatType> v) { self.setPresencePenalty(v); })
         .def_property(
             "frequency_penalty", &tle::SamplingConfig::getFrequencyPenalty, &tle::SamplingConfig::setFrequencyPenalty)
+        .def_property("prompt_ignore_length", &tle::SamplingConfig::getPromptIgnoreLength,
+            &tle::SamplingConfig::setPromptIgnoreLength)
         .def_property("length_penalty", &tle::SamplingConfig::getLengthPenalty, &tle::SamplingConfig::setLengthPenalty)
         .def_property("early_stopping", &tle::SamplingConfig::getEarlyStopping, &tle::SamplingConfig::setEarlyStopping)
         .def_property("no_repeat_ngram_size", &tle::SamplingConfig::getNoRepeatNgramSize,
@@ -364,7 +369,7 @@ void initRequestBindings(pybind11::module_& m)
         return tle::KvCacheRetentionConfig(
             state[0].cast<std::vector<tle::KvCacheRetentionConfig::TokenRangeRetentionConfig>>(),
             state[1].cast<tle::RetentionPriority>(), state[2].cast<std::optional<std::chrono::milliseconds>>(),
-            state[3].cast<tle::KvCacheTransferMode>(), state[4].cast<std::optional<std::string>>());
+            state[3].cast<tle::KvCacheTransferMode>(), state[4].cast<std::string>());
     };
 
     auto kvCacheRetentionConfig = py::class_<tle::KvCacheRetentionConfig>(m, "KvCacheRetentionConfig");
@@ -386,7 +391,7 @@ void initRequestBindings(pybind11::module_& m)
     // TokenRangeRetentionPriority bindings have been defined.
     kvCacheRetentionConfig
         .def(py::init<std::vector<tle::KvCacheRetentionConfig::TokenRangeRetentionConfig>, tle::RetentionPriority,
-                 std::optional<std::chrono::milliseconds>, tle::KvCacheTransferMode, std::optional<std::string>>(),
+                 std::optional<std::chrono::milliseconds>, tle::KvCacheTransferMode, std::string>(),
             py::arg("token_range_retention_configs"),
             py::arg("decode_retention_priority") = tle::KvCacheRetentionConfig::kDefaultRetentionPriority,
             py::arg("decode_duration_ms") = py::none(),
@@ -526,11 +531,11 @@ void initRequestBindings(pybind11::module_& m)
             self.getClientId(), self.getReturnAllGeneratedTokens(), self.getPriority(), self.getRequestType(),
             self.getContextPhaseParams(), self.getEncoderInputFeatures(), self.getEncoderOutputLength(),
             self.getCrossAttentionMask(), self.getEagleConfig(), self.getSkipCrossAttnBlocks(),
-            self.getGuidedDecodingParams());
+            self.getGuidedDecodingParams(), self.getCacheSaltID());
     };
     auto requestSetstate = [](py::tuple const& state)
     {
-        if (state.size() != 33)
+        if (state.size() != 34)
         {
             throw std::runtime_error("Invalid Request state!");
         }
@@ -550,7 +555,8 @@ void initRequestBindings(pybind11::module_& m)
             state[25].cast<tle::RequestType>(), state[26].cast<std::optional<tle::ContextPhaseParams>>(),
             state[27].cast<std::optional<tle::Tensor>>(), state[28].cast<std::optional<SizeType32>>(),
             state[29].cast<std::optional<tle::Tensor>>(), 1, state[30].cast<std::optional<tle::EagleConfig>>(),
-            state[31].cast<std::optional<tle::Tensor>>(), state[32].cast<std::optional<tle::GuidedDecodingParams>>());
+            state[31].cast<std::optional<tle::Tensor>>(), state[32].cast<std::optional<tle::GuidedDecodingParams>>(),
+            state[33].cast<std::optional<tle::CacheSaltIDType>>());
     };
 
     py::class_<tle::Request> request(m, "Request", pybind11::dynamic_attr());
@@ -590,7 +596,8 @@ void initRequestBindings(pybind11::module_& m)
                  std::optional<tle::Tensor>,                    // skipCrossAttnBlocks
                  std::optional<tle::GuidedDecodingParams>,      // guidedDecodingParams
                  std::optional<tle::SizeType32>,                // languageAdapterUid
-                 std::optional<tle::MillisecondsType>           // allottedTimeMs
+                 std::optional<tle::MillisecondsType>,          // allottedTimeMs
+                 std::optional<tle::CacheSaltIDType>            // cacheSaltID
                  >(),
             // clang-format off
         py::arg("input_token_ids"),
@@ -630,8 +637,9 @@ void initRequestBindings(pybind11::module_& m)
         py::arg("skip_cross_attn_blocks") = py::none(),
         py::arg("guided_decoding_params") = py::none(),
         py::arg("language_adapter_uid") = py::none(),
-        py::arg("allotted_time_ms") = py::none()
-    )          // clang-format on
+        py::arg("allotted_time_ms") = py::none(),
+        py::arg("cache_salt_id") = py::none()
+    )             // clang-format on
         .def_property_readonly("input_token_ids", &tle::Request::getInputTokenIds)
         .def_property_readonly("max_tokens", &tle::Request::getMaxTokens)
         .def_property("streaming", &tle::Request::getStreaming, &tle::Request::setStreaming)
@@ -675,6 +683,7 @@ void initRequestBindings(pybind11::module_& m)
         .def_property(
             "guided_decoding_params", &tle::Request::getGuidedDecodingParams, &tle::Request::setGuidedDecodingParams)
         .def_property("allotted_time_ms", &tle::Request::getAllottedTimeMs, &tle::Request::setAllottedTimeMs)
+        .def_property("cache_salt_id", &tle::Request::getCacheSaltID, &tle::Request::setCacheSaltID)
         .def_property(
             "context_phase_params", &tle::Request::getContextPhaseParams, &tle::Request::setContextPhaseParams)
         .def(py::pickle(requestGetstate, requestSetstate));
@@ -688,6 +697,22 @@ void initRequestBindings(pybind11::module_& m)
 
     auto requestPerfMetrics = py::class_<tle::RequestPerfMetrics>(m, "RequestPerfMetrics");
 
+    auto timingMetricsGetstate = [](tle::RequestPerfMetrics::TimingMetrics const& self)
+    {
+        return py::make_tuple(self.arrivalTime, self.firstScheduledTime, self.firstTokenTime, self.lastTokenTime,
+            self.kvCacheTransferStart, self.kvCacheTransferEnd, self.kvCacheSize);
+    };
+    auto timingMetricsSetstate = [](py::tuple const& state)
+    {
+        if (state.size() != 7)
+        {
+            throw std::runtime_error("Invalid TimingMetrics state!");
+        }
+        return tle::RequestPerfMetrics::TimingMetrics{state[0].cast<tle::RequestPerfMetrics::TimePoint>(),
+            state[1].cast<tle::RequestPerfMetrics::TimePoint>(), state[2].cast<tle::RequestPerfMetrics::TimePoint>(),
+            state[3].cast<tle::RequestPerfMetrics::TimePoint>(), state[4].cast<tle::RequestPerfMetrics::TimePoint>(),
+            state[5].cast<tle::RequestPerfMetrics::TimePoint>(), state[6].cast<size_t>()};
+    };
     py::class_<tle::RequestPerfMetrics::TimingMetrics>(m, "TimingMetrics")
         .def(py::init<>())
         .def_readwrite("arrival_time", &tle::RequestPerfMetrics::TimingMetrics::arrivalTime)
@@ -695,22 +720,70 @@ void initRequestBindings(pybind11::module_& m)
         .def_readwrite("first_token_time", &tle::RequestPerfMetrics::TimingMetrics::firstTokenTime)
         .def_readwrite("last_token_time", &tle::RequestPerfMetrics::TimingMetrics::lastTokenTime)
         .def_readwrite("kv_cache_transfer_start", &tle::RequestPerfMetrics::TimingMetrics::kvCacheTransferStart)
-        .def_readwrite("kv_cache_transfer_end", &tle::RequestPerfMetrics::TimingMetrics::kvCacheTransferEnd);
+        .def_readwrite("kv_cache_transfer_end", &tle::RequestPerfMetrics::TimingMetrics::kvCacheTransferEnd)
+        .def_readwrite("kv_cache_size", &tle::RequestPerfMetrics::TimingMetrics::kvCacheSize)
+        .def(py::pickle(timingMetricsGetstate, timingMetricsSetstate));
 
+    auto kvCacheMetricsGetstate = [](tle::RequestPerfMetrics::KvCacheMetrics const& self)
+    {
+        return py::make_tuple(self.numTotalAllocatedBlocks, self.numNewAllocatedBlocks, self.numReusedBlocks,
+            self.numMissedBlocks, self.kvCacheHitRate);
+    };
+    auto kvCacheMetricsSetstate = [](py::tuple const& state)
+    {
+        if (state.size() != 5)
+        {
+            throw std::runtime_error("Invalid KvCacheMetrics state!");
+        }
+        return tle::RequestPerfMetrics::KvCacheMetrics{state[0].cast<SizeType32>(), state[1].cast<SizeType32>(),
+            state[2].cast<SizeType32>(), state[3].cast<SizeType32>(), state[4].cast<float>()};
+    };
     py::class_<tle::RequestPerfMetrics::KvCacheMetrics>(m, "KvCacheMetrics")
         .def(py::init<>())
         .def_readwrite("num_total_allocated_blocks", &tle::RequestPerfMetrics::KvCacheMetrics::numTotalAllocatedBlocks)
         .def_readwrite("num_new_allocated_blocks", &tle::RequestPerfMetrics::KvCacheMetrics::numNewAllocatedBlocks)
         .def_readwrite("num_reused_blocks", &tle::RequestPerfMetrics::KvCacheMetrics::numReusedBlocks)
         .def_readwrite("num_missed_blocks", &tle::RequestPerfMetrics::KvCacheMetrics::numMissedBlocks)
-        .def_readwrite("kv_cache_hit_rate", &tle::RequestPerfMetrics::KvCacheMetrics::kvCacheHitRate);
+        .def_readwrite("kv_cache_hit_rate", &tle::RequestPerfMetrics::KvCacheMetrics::kvCacheHitRate)
+        .def(py::pickle(kvCacheMetricsGetstate, kvCacheMetricsSetstate));
+
+    auto speculativeDecodingMetricsGetstate = [](tle::RequestPerfMetrics::SpeculativeDecodingMetrics const& self)
+    { return py::make_tuple(self.acceptanceRate, self.totalAcceptedDraftTokens, self.totalDraftTokens); };
+    auto speculativeDecodingMetricsSetstate = [](py::tuple const& state)
+    {
+        if (state.size() != 3)
+        {
+            throw std::runtime_error("Invalid SpeculativeDecodingMetrics state!");
+        }
+        return tle::RequestPerfMetrics::SpeculativeDecodingMetrics{
+            state[0].cast<float>(), state[1].cast<SizeType32>(), state[2].cast<SizeType32>()};
+    };
 
     py::class_<tle::RequestPerfMetrics::SpeculativeDecodingMetrics>(m, "SpeculativeDecodingMetrics")
         .def(py::init<>())
         .def_readwrite("acceptance_rate", &tle::RequestPerfMetrics::SpeculativeDecodingMetrics::acceptanceRate)
         .def_readwrite("total_accepted_draft_tokens",
             &tle::RequestPerfMetrics::SpeculativeDecodingMetrics::totalAcceptedDraftTokens)
-        .def_readwrite("total_draft_tokens", &tle::RequestPerfMetrics::SpeculativeDecodingMetrics::totalDraftTokens);
+        .def_readwrite("total_draft_tokens", &tle::RequestPerfMetrics::SpeculativeDecodingMetrics::totalDraftTokens)
+        .def(py::pickle(speculativeDecodingMetricsGetstate, speculativeDecodingMetricsSetstate));
+
+    auto requestPerfMetricsGetstate = [](tle::RequestPerfMetrics const& self)
+    {
+        return py::make_tuple(self.timingMetrics, self.kvCacheMetrics, self.speculativeDecoding, self.firstIter,
+            self.lastIter, self.iter);
+    };
+    auto requestPerfMetricsSetstate = [](py::tuple const& state)
+    {
+        if (state.size() != 6)
+        {
+            throw std::runtime_error("Invalid RequestPerfMetrics state!");
+        }
+        return tle::RequestPerfMetrics{state[0].cast<tle::RequestPerfMetrics::TimingMetrics>(),
+            state[1].cast<tle::RequestPerfMetrics::KvCacheMetrics>(),
+            state[2].cast<tle::RequestPerfMetrics::SpeculativeDecodingMetrics>(),
+            state[3].cast<std::optional<tle::IterationType>>(), state[4].cast<std::optional<tle::IterationType>>(),
+            state[5].cast<std::optional<tle::IterationType>>()};
+    };
 
     // There's a circular dependency between the declaration of the TimingMetrics and RequestPerfMetrics bindings.
     // Defer definition of the RequestPerfMetrics bindings until the TimingMetrics have been defined.
@@ -720,7 +793,8 @@ void initRequestBindings(pybind11::module_& m)
         .def_readwrite("speculative_decoding", &tle::RequestPerfMetrics::speculativeDecoding)
         .def_readwrite("first_iter", &tle::RequestPerfMetrics::firstIter)
         .def_readwrite("last_iter", &tle::RequestPerfMetrics::lastIter)
-        .def_readwrite("iter", &tle::RequestPerfMetrics::iter);
+        .def_readwrite("iter", &tle::RequestPerfMetrics::iter)
+        .def(py::pickle(requestPerfMetricsGetstate, requestPerfMetricsSetstate));
 
     py::class_<tle::AdditionalOutput>(m, "AdditionalOutput")
         .def(py::init([](std::string const& name, tle::Tensor const& output)
@@ -730,7 +804,7 @@ void initRequestBindings(pybind11::module_& m)
 
     auto resultSetstate = [](py::tuple const& state)
     {
-        if (state.size() != 12)
+        if (state.size() != 14)
         {
             throw std::runtime_error("Invalid Request state!");
         }
@@ -746,7 +820,9 @@ void initRequestBindings(pybind11::module_& m)
         result.sequenceIndex = state[8].cast<SizeType32>();
         result.isSequenceFinal = state[9].cast<bool>();
         result.decodingIter = state[10].cast<SizeType32>();
-        result.contextPhaseParams = state[11].cast<std::optional<tle::ContextPhaseParams>>();
+        result.avgDecodedTokensPerIter = state[11].cast<float>();
+        result.contextPhaseParams = state[12].cast<std::optional<tle::ContextPhaseParams>>();
+        result.requestPerfMetrics = state[13].cast<std::optional<tle::RequestPerfMetrics>>();
         return std::make_unique<tle::Result>(result);
     };
 
@@ -754,7 +830,7 @@ void initRequestBindings(pybind11::module_& m)
     {
         return py::make_tuple(self.isFinal, self.outputTokenIds, self.cumLogProbs, self.logProbs, self.contextLogits,
             self.generationLogits, self.encoderOutput, self.finishReasons, self.sequenceIndex, self.isSequenceFinal,
-            self.decodingIter, self.contextPhaseParams);
+            self.decodingIter, self.avgDecodedTokensPerIter, self.contextPhaseParams, self.requestPerfMetrics);
     };
 
     py::class_<tle::Result>(m, "Result")
@@ -771,10 +847,10 @@ void initRequestBindings(pybind11::module_& m)
         .def_readwrite("sequence_index", &tle::Result::sequenceIndex)
         .def_readwrite("is_sequence_final", &tle::Result::isSequenceFinal)
         .def_readwrite("decoding_iter", &tle::Result::decodingIter)
+        .def_readwrite("avg_decoded_tokens_per_iter", &tle::Result::avgDecodedTokensPerIter)
         .def_readwrite("context_phase_params", &tle::Result::contextPhaseParams)
         .def_readwrite("request_perf_metrics", &tle::Result::requestPerfMetrics)
         .def_readwrite("additional_outputs", &tle::Result::additionalOutputs)
-        .def_readwrite("context_phase_params", &tle::Result::contextPhaseParams)
         .def(py::pickle(resultGetstate, resultSetstate));
 
     m.def("deserialize_result",

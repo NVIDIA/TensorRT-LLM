@@ -64,6 +64,12 @@ class MockTritonTensor:
         else:
             return False
 
+    def to_dlpack(self):
+        if self.is_cpu():
+            return self._tensor.__dlpack__()
+        else:
+            return self._tensor.to_dlpack()
+
 
 @dataclass
 class MockTritonError:
@@ -143,6 +149,7 @@ def inputs(streaming=False):
         "sampling_param_seed": [2],
         "return_finish_reason": [True],
         "return_stop_reason": [True],
+        "sampling_param_return_perf_metrics": [True]
     }
 
 
@@ -164,6 +171,7 @@ def test_get_sampling_params_from_request():
     assert config["frequency_penalty"] == 0.0
     assert config["presence_penalty"] == 0.0
     assert config["seed"] == 2
+    assert config["return_perf_metrics"] == True
     assert np.array_equal(config["stop"], np.array(['\n', 'stop']))
 
 

@@ -19,92 +19,307 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/serializeUtils.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include "tensorrt_llm/runtime/utils/pgUtils.h"
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
+#include <functional>
 #include <iostream>
 #include <mutex>
+#include <numeric>
+#include <regex>
+#include <string>
 #include <sys/socket.h>
+#include <thread>
+#include <ucxx/address.h>
 #include <ucxx/typedefs.h>
 #include <unistd.h>
+#include <vector>
+
+#include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
+#include <torch/csrc/distributed/c10d/Store.hpp>
+#include <torch/csrc/distributed/c10d/TCPStore.hpp>
+
+using tensorrt_llm::pg_utils::get_world_pg;
+using tensorrt_llm::pg_utils::PgHelper;
 
 namespace tensorrt_llm::executor::kv_cache
 {
 
-static void listenerCallback(ucp_conn_request_h connRequest, void* arg)
+class UcxCmMessage
 {
-    TLLM_LOG_DEBUG("listenerCallback");
-    char ipStr[INET6_ADDRSTRLEN];
-    char portStr[INET6_ADDRSTRLEN];
-    ucp_conn_request_attr_t attr{};
-    UcxConnectionManager* connectionManager = reinterpret_cast<UcxConnectionManager*>(arg);
+public:
+    enum class MessageType
+    {
+        GET_WORKER_ADDRESS = 1,
+        SERVER_WORKER_ADDRESS = 2,
+        STOP = 3,
+    };
 
-    attr.field_mask = UCP_CONN_REQUEST_ATTR_FIELD_CLIENT_ADDR;
-    ucxx::utils::ucsErrorThrow(ucp_conn_request_query(connRequest, &attr));
-    ucxx::utils::sockaddr_get_ip_port_str(&attr.client_address, ipStr, portStr, INET6_ADDRSTRLEN);
-    TLLM_LOG_DEBUG("Server received a connection request from client at address %s:%s", ipStr, portStr);
-    connectionManager->addConnection(connRequest);
-}
+    MessageType mType;
+    std::optional<std::string> mWorkerAddress;
 
-static std::string getLocalIp()
+    UcxCmMessage(MessageType type, std::optional<std::string> workerAddress)
+        : mType(type)
+        , mWorkerAddress(std::move(workerAddress))
+    {
+    }
+
+    static size_t serializedSize(UcxCmMessage const& message)
+    {
+        namespace su = tensorrt_llm::executor::serialize_utils;
+
+        return su::serializedSize(message.mType) + su::serializedSize(message.mWorkerAddress);
+    }
+
+    static void serialize(UcxCmMessage const& message, std::ostream& os)
+    {
+        namespace su = tensorrt_llm::executor::serialize_utils;
+        su::serialize(message.mType, os);
+        su::serialize(message.mWorkerAddress, os);
+    }
+
+    static UcxCmMessage deserialize(std::istream& is)
+    {
+        namespace su = tensorrt_llm::executor::serialize_utils;
+        auto type = su::deserialize<MessageType>(is);
+        auto workerAddress = su::deserialize<std::optional<std::string>>(is);
+        return UcxCmMessage(type, workerAddress);
+    }
+};
+
+std::string getLocalIpByNic(std::string const& interface, int rank)
 {
-    struct ifaddrs *ifaddr, *ifa;
-    void* addr_ptr;
-    std::string ip("UNKNOWN IP");
-
-    // Get the list of network interfaces
+    struct ifaddrs* ifaddr = nullptr;
     if (getifaddrs(&ifaddr) == -1)
     {
-        perror("getifaddrs");
-        return ip;
+        TLLM_LOG_ERROR(rank,
+            "getLocalIpByNic: Can't get local ip from NIC Interface. Please check whether TRTLLM_UCX_INTERFACE is set "
+            "correctly.");
+        return std::string{};
     }
 
-    // Loop through the linked list of interfaces
-    for (ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next)
+    for (struct ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next)
     {
-        // Check if the interface is an IP interface
         if (ifa->ifa_addr == nullptr)
-            continue;
-
-        std::string ucxInterface = common::getEnvUCXInterface();
-        if (!ucxInterface.empty() && strcmp(ifa->ifa_name, ucxInterface.c_str()) != 0)
         {
             continue;
         }
 
-        // Skip the loopback interface
-        if (ucxInterface.empty() && (strncmp(ifa->ifa_name, "docker", 6) == 0 || strcmp(ifa->ifa_name, "lo") == 0))
+        if (ifa->ifa_name == interface)
         {
-            continue;
+            if (ifa->ifa_addr->sa_family == AF_INET)
+            {
+                char ip[INET_ADDRSTRLEN]{};
+                void* addr = &((reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr))->sin_addr);
+                if ((inet_ntop(AF_INET, addr, ip, sizeof(ip)) != nullptr) && std::strcmp(ip, "0.0.0.0") != 0)
+                {
+                    freeifaddrs(ifaddr);
+                    return std::string(ip);
+                }
+            }
+            else if (ifa->ifa_addr->sa_family == AF_INET6)
+            {
+                char ip[INET6_ADDRSTRLEN]{};
+                void* addr = &((reinterpret_cast<struct sockaddr_in6*>(ifa->ifa_addr))->sin6_addr);
+                if ((inet_ntop(AF_INET6, addr, ip, sizeof(ip)) != nullptr) && std::strncmp(ip, "fe80::", 6) != 0
+                    && std::strcmp(ip, "::1") != 0)
+                {
+                    freeifaddrs(ifaddr);
+                    return std::string(ip);
+                }
+            }
         }
-
-        // Check if the address family is AF_INET (IPv4)
-        // TODO: USER CAN SPECIFY THE IP ADDRESS
-        if (ifa->ifa_addr->sa_family == AF_INET)
-        {
-            addr_ptr = &((struct sockaddr_in*) ifa->ifa_addr)->sin_addr;
-            char address_buffer[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, addr_ptr, address_buffer, sizeof(address_buffer));
-
-            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " ***** UCX    Interface: %s IP Address: %s", ifa->ifa_name,
-                address_buffer);
-            ip = address_buffer;
-            break;
-        }
-    }
-    if (ifa == nullptr)
-    {
-        TLLM_LOG_ERROR(mpi::MpiComm::world().getRank(),
-            "UCX   No valid IP address found please set correct UCX interface with env variable TRTLLM_UCX_INTERFACE");
     }
 
     freeifaddrs(ifaddr);
-    return ip;
+    TLLM_LOG_ERROR(
+        rank, "Can't get local ip from NIC Interface. Please check whether TRTLLM_UCX_INTERFACE is set correctly.");
+    return std::string{};
+}
+
+std::string getLocalIpByHostname(int rank)
+{
+    char hostname[256]{};
+    if (gethostname(hostname, sizeof(hostname)) == -1)
+    {
+        TLLM_LOG_ERROR(rank, "getLocalIpByHostname: Can't get hostname");
+        return std::string{};
+    }
+
+    struct addrinfo hints = {};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_CANONNAME;
+
+    struct addrinfo* res = nullptr;
+    if (getaddrinfo(hostname, nullptr, &hints, &res) != 0)
+    {
+        TLLM_LOG_WARNING(rank, "getLocalIpByHostname: Can't get address info for hostname");
+        return std::string{};
+    }
+
+    for (struct addrinfo* p = res; p != nullptr; p = p->ai_next)
+    {
+
+        if (p->ai_family == AF_INET)
+        { // IPv4
+            char ip[INET_ADDRSTRLEN]{};
+            struct sockaddr_in* ipv4 = reinterpret_cast<struct sockaddr_in*>(p->ai_addr);
+            void* addr = &(ipv4->sin_addr);
+            if ((inet_ntop(AF_INET, addr, ip, sizeof(ip)) != nullptr) && std::strcmp(ip, "127.0.0.1") != 0
+                && std::strcmp(ip, "0.0.0.0") != 0)
+            {
+                freeaddrinfo(res);
+                return std::string(ip);
+            }
+        }
+        else if (p->ai_family == AF_INET6)
+        { // IPv6
+            char ip[INET6_ADDRSTRLEN]{};
+            struct sockaddr_in6* ipv6 = reinterpret_cast<struct sockaddr_in6*>(p->ai_addr);
+            void* addr = &(ipv6->sin6_addr);
+            if ((inet_ntop(AF_INET6, addr, ip, sizeof(ip)) != nullptr) && std::strncmp(ip, "fe80::", 6) != 0
+                && std::strcmp(ip, "::1") != 0)
+            {
+                freeaddrinfo(res);
+                return std::string(ip);
+            }
+        }
+    }
+
+    freeaddrinfo(res);
+    TLLM_LOG_WARNING(rank, "getLocalIpByHostname: Can't get local ip from hostname");
+    return std::string{};
+}
+
+std::string getLocalIpByRemoteOrHostName(int rank)
+{
+
+    // Try IPv4
+    struct sockaddr_in addr
+    {
+    };
+
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(80);
+    // using google's public dns server to get the local ip which can be accessed from remote
+    char const* dns_ip_v4 = "8.8.8.8";
+    inet_pton(AF_INET, dns_ip_v4, &addr.sin_addr);
+
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock != -1)
+    {
+        if (connect(sock, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != -1)
+        {
+            socklen_t addr_len = sizeof(addr);
+            if (getsockname(sock, reinterpret_cast<struct sockaddr*>(&addr), &addr_len) != -1)
+            {
+                char ip[INET_ADDRSTRLEN]{};
+                inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof(ip));
+                close(sock);
+                return std::string(ip);
+            }
+        }
+        close(sock);
+    }
+
+    // Try IPv6
+    struct sockaddr_in6 addr6
+    {
+    };
+
+    addr6.sin6_family = AF_INET6;
+    addr6.sin6_port = htons(80);
+    // using google's public dns server
+    char const* dns_ipv6 = "2001:4860:4860::8888";
+    inet_pton(AF_INET6, dns_ipv6, &addr6.sin6_addr);
+
+    sock = socket(AF_INET6, SOCK_DGRAM, 0);
+    if (sock != -1)
+    {
+        if (connect(sock, reinterpret_cast<struct sockaddr*>(&addr6), sizeof(addr6)) != -1)
+        {
+            socklen_t addr_len = sizeof(addr6);
+            if (getsockname(sock, reinterpret_cast<struct sockaddr*>(&addr6), &addr_len) != -1)
+            {
+                char ip[INET6_ADDRSTRLEN]{};
+                inet_ntop(AF_INET6, &addr6.sin6_addr, ip, sizeof(ip));
+                close(sock);
+                return std::string(ip);
+            }
+        }
+        close(sock);
+    }
+
+    // Try hostname
+    return getLocalIpByHostname(rank);
+}
+
+static std::string getLocalIp(int rank)
+{
+    std::string ucxInterface = common::getEnvUCXInterface();
+    std::string localIP = {};
+    if (!ucxInterface.empty())
+    {
+        localIP = getLocalIpByNic(ucxInterface, rank);
+    }
+    if (localIP.empty())
+    {
+        localIP = getLocalIpByRemoteOrHostName(rank);
+    }
+    // check whether the localIP is valid
+    if (localIP.empty())
+    {
+        TLLM_THROW("getLocalIp: Can't get local ip");
+    }
+    return localIP;
+}
+
+std::optional<std::pair<std::string, int>> parse_zmq_endpoint(std::string const& endpoint)
+{
+    std::regex ipv4_regex(R"(tcp://([\d\.]+):(\d+))");
+    std::regex ipv6_regex(R"(tcp://\[([0-9a-fA-F:%\w]+)\]:(\d+))");
+    std::smatch match;
+    if (std::regex_match(endpoint, match, ipv4_regex))
+    {
+        return std::make_pair(match[1].str(), std::stoi(match[2].str()));
+    }
+    else if (std::regex_match(endpoint, match, ipv6_regex))
+    {
+        return std::make_pair(match[1].str(), std::stoi(match[2].str()));
+    }
+    return std::nullopt;
 }
 
 UcxConnectionManager::UcxConnectionManager()
-
 {
     try
     {
+        if (useMPI())
+        {
+            mRank = mpi::MpiComm::session().getRank();
+            mWorldSize = mpi::MpiComm::session().getSize();
+        }
+        else
+        {
+            auto const worldPg = get_world_pg();
+            if (worldPg)
+            {
+                mRank = worldPg->getRank();
+                mWorldSize = worldPg->getSize();
+                TLLM_LOG_DEBUG(mRank, "UCX using Torch process group - rank: %d, world size: %d", mRank, mWorldSize);
+            }
+            else
+            {
+                TLLM_LOG_DEBUG(mRank, "WARNING: Process group is null, defaulting to single process");
+                mRank = 0;
+                mWorldSize = 1;
+            }
+        }
+
         TLLM_CUDA_CHECK(cudaGetDevice(&mDevice));
         mUcxCtx = ucxx::createContext({{"RNDV_PIPELINE_ERROR_HANDLING", "y"}}, UCP_FEATURE_TAG);
         int device = mDevice;
@@ -120,65 +335,139 @@ UcxConnectionManager::UcxConnectionManager()
             std::string error = "Error creating worker and starting progress thread for rank " + std::string(e.what());
             TLLM_THROW(error);
         }
+        auto workerAddressPtr = mWorkersPool.front()->getAddress();
+        mWorkerAddress = workerAddressPtr->getString();
 
-        try
+        mZmqRepSocket = zmq::socket_t(mZmqContext, zmq::socket_type::rep);
+        mZmqRepSocket.set(zmq::sockopt::sndhwm, 1000);
+        std::string localIp = getLocalIp(mRank);
+        if (localIp.find(':') != std::string::npos)
         {
+            // ipv6
+            mZmqRepSocket.set(zmq::sockopt::ipv6, 1);
 
-            mListener = mWorkersPool.front()->createListener(0, listenerCallback, this);
+            localIp = "[" + localIp + "]";
         }
-        catch (std::exception const& e)
-        {
-            std::string error = "Error creating listener for rank " + std::string(e.what());
-            TLLM_THROW(error);
-        }
+        TLLM_LOG_INFO(mRank, "UcxConnectionManager::UcxConnectionManager localIp: %s", localIp.c_str());
+        mZmqRepSocket.bind("tcp://" + localIp + ":*");
+        mZmqRepEndpoint = mZmqRepSocket.get(zmq::sockopt::last_endpoint);
+        TLLM_LOG_INFO(mRank, "UcxConnectionManager::UcxConnectionManager mZmqRepEndpoint: %s", mZmqRepEndpoint.c_str());
+        auto parse_result = parse_zmq_endpoint(mZmqRepEndpoint);
+        TLLM_CHECK_WITH_INFO(parse_result.has_value(), "Failed to parse ZMQ endpoint");
+        auto [ip, port] = parse_result.value();
+        TLLM_LOG_INFO(mRank, "UcxConnectionManager::UcxConnectionManager ip: %s, port: %d", ip.c_str(), port);
 
-        // Get local IP address
-        std::string localIp = getLocalIp();
-        auto port = mListener->getPort();
-        SocketState socketState{port, localIp};
-        std::vector<executor::kv_cache::SocketState> socketStates(mpi::MpiComm::session().getSize());
+        SocketState socketState{static_cast<uint16_t>(port), ip};
+        std::vector<executor::kv_cache::SocketState> socketStates(mWorldSize);
 
-        if (mpi::MpiComm::session().getSize() > 1)
-        {
-
-            mpi::MpiComm::session().barrier();
-            namespace su = executor::serialize_utils;
-
-            std::ostringstream oStream;
-            su::serialize(socketState, oStream);
-            auto str = oStream.str();
-            std::vector<char> buffer(str.begin(), str.end());
-            std::vector<SizeType32> sizeofBuffer(mpi::MpiComm::session().getSize());
-            SizeType32 bufferSize = buffer.size();
-            mpi::MpiComm::session().allgather(&bufferSize, sizeofBuffer.data(), 1, mpi::MpiType::kINT32);
-            SizeType32 recvBufferSize = std::accumulate(sizeofBuffer.begin(), sizeofBuffer.end(), 0);
-            std::vector<char> recvBuffer(recvBufferSize);
-            std::vector<int> displs(mpi::MpiComm::session().getSize());
-            for (int r = 0; r < mpi::MpiComm::session().getSize(); r++)
-            {
-                displs[r] = (r == 0) ? 0 : (displs[r - 1] + sizeofBuffer[r - 1]);
-            }
-            mpi::MpiComm::session().allgatherv(buffer.data(), bufferSize, mpi::MpiType::kCHAR, recvBuffer.data(),
-                sizeofBuffer, displs, mpi::MpiType::kCHAR);
-
-            // deserialize
-            for (int i = 0; i < mpi::MpiComm::session().getSize(); i++)
-            {
-                std::vector<char> serBuffer(
-                    recvBuffer.begin() + displs[i], recvBuffer.begin() + (displs[i] + sizeofBuffer[i]));
-                su::VectorWrapBuf<char> strbuf(serBuffer);
-                std::istream is(&strbuf);
-                socketStates[i] = su::deserialize<executor::kv_cache::SocketState>(is);
-                TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " recv  socketStates[%d]: %s", i,
-                    socketStates[i].toString().c_str());
-            }
-        }
-        else
+        if (mWorldSize == 1)
         {
             socketStates[0] = socketState;
         }
-        mCommState = CommState(socketStates, mpi::MpiComm::session().getRank());
-        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " ***** UCX    mCommState: %s", mCommState.toString().c_str());
+        else
+        {
+            namespace su = executor::serialize_utils;
+            std::ostringstream oStream;
+            su::serialize(socketState, oStream);
+            auto serializedData = oStream.str();
+            std::vector<char> buffer(serializedData.begin(), serializedData.end());
+            std::vector<SizeType32> sizeofBuffer(mWorldSize);
+            SizeType32 bufferSize = buffer.size();
+
+            if (useMPI())
+            {
+                mpi::MpiComm::session().barrier();
+
+                mpi::MpiComm::session().allgather(&bufferSize, sizeofBuffer.data(), 1, mpi::MpiType::kINT32);
+                SizeType32 recvBufferSize = std::accumulate(sizeofBuffer.begin(), sizeofBuffer.end(), 0);
+                std::vector<char> recvBuffer(recvBufferSize);
+                std::vector<int> displs(mpi::MpiComm::session().getSize());
+                for (int r = 0; r < mpi::MpiComm::session().getSize(); r++)
+                {
+                    displs[r] = (r == 0) ? 0 : (displs[r - 1] + sizeofBuffer[r - 1]);
+                }
+                mpi::MpiComm::session().allgatherv(buffer.data(), bufferSize, mpi::MpiType::kCHAR, recvBuffer.data(),
+                    sizeofBuffer, displs, mpi::MpiType::kCHAR);
+
+                // deserialize
+                for (int i = 0; i < mpi::MpiComm::session().getSize(); i++)
+                {
+                    std::vector<char> serBuffer(
+                        recvBuffer.begin() + displs[i], recvBuffer.begin() + (displs[i] + sizeofBuffer[i]));
+                    su::VectorWrapBuf<char> strbuf(serBuffer);
+                    std::istream is(&strbuf);
+                    socketStates[i] = su::deserialize<executor::kv_cache::SocketState>(is);
+                    TLLM_LOG_DEBUG(mRank, " recv  socketStates[%d]: %s", i, socketStates[i].toString().c_str());
+                }
+            }
+            else
+            {
+                auto const worldPg = get_world_pg();
+                PgHelper pgh{worldPg};
+                PGCHECK_THROW(worldPg->barrier());
+
+                PGCHECK_THROW(pgh.allgather(&bufferSize, std::ref(sizeofBuffer), {}));
+                SizeType32 recvBufferSize = std::accumulate(sizeofBuffer.begin(), sizeofBuffer.end(), 0);
+                std::vector<char> recvBuffer(recvBufferSize);
+
+                PGCHECK_THROW(pgh.allgatherv(std::ref(buffer), std::ref(recvBuffer), std::cref(sizeofBuffer), {}));
+
+                // deserialize
+                char* begin = reinterpret_cast<char*>(recvBuffer.data());
+                for (int r = 0; r < mWorldSize; ++r)
+                {
+                    std::vector<char> serBuffer(begin, begin + sizeofBuffer[r]);
+                    begin += sizeofBuffer[r];
+                    su::VectorWrapBuf<char> strbuf(serBuffer);
+                    std::istream is(&strbuf);
+                    socketStates[r] = su::deserialize<executor::kv_cache::SocketState>(is);
+                    TLLM_LOG_DEBUG(mRank, " recv socketStates[%d]: %s", r, socketStates[r].toString().c_str());
+                }
+            }
+        }
+        mCommState = CommState(socketStates, mRank);
+        TLLM_LOG_DEBUG(mRank, " ***** UCX    mCommState: %s", mCommState.toString().c_str());
+
+        mZmqRepThread = std::thread(
+            [this]()
+            {
+                while (true)
+                {
+                    zmq::message_t message;
+                    auto ret = mZmqRepSocket.recv(message);
+                    TLLM_CHECK_WITH_INFO(ret, "mZmqRepSocket.recv failed");
+                    std::string recvMessage(static_cast<char*>(message.data()), message.size());
+                    std::istringstream is(recvMessage);
+                    UcxCmMessage ucxCmessage = UcxCmMessage::deserialize(is);
+
+                    if (ucxCmessage.mType == UcxCmMessage::MessageType::GET_WORKER_ADDRESS)
+                    {
+                        // add Connection
+                        TLLM_CHECK_WITH_INFO(ucxCmessage.mWorkerAddress.has_value(), "workerAddress is null");
+                        std::string workerAddress = ucxCmessage.mWorkerAddress.value();
+                        std::string selfWorkerAddress = mWorkerAddress;
+                        UcxCmMessage serverMessage(UcxCmMessage::MessageType::SERVER_WORKER_ADDRESS, selfWorkerAddress);
+                        std::ostringstream oStream;
+                        UcxCmMessage::serialize(serverMessage, oStream);
+                        std::string serverMessageStr = oStream.str();
+                        mZmqRepSocket.send(zmq::buffer(serverMessageStr), zmq::send_flags::none);
+                        addConnection(workerAddress);
+                    }
+                    else if (ucxCmessage.mType == UcxCmMessage::MessageType::STOP)
+                    {
+                        UcxCmMessage stopMessage(UcxCmMessage::MessageType::STOP, std::nullopt);
+                        std::ostringstream oStream;
+                        UcxCmMessage::serialize(stopMessage, oStream);
+                        std::string stopMessageStr = oStream.str();
+                        mZmqRepSocket.send(zmq::buffer(stopMessageStr), zmq::send_flags::none);
+                        break;
+                    }
+                    else
+                    {
+                        TLLM_THROW("Zmq recv unknown message: %s", recvMessage.c_str());
+                    }
+                }
+            });
     }
     catch (std::exception const& e)
     {
@@ -189,20 +478,45 @@ UcxConnectionManager::UcxConnectionManager()
 
 UcxConnectionManager::~UcxConnectionManager()
 {
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "UcxConnectionManager::~UcxConnectionManager");
+    TLLM_LOG_DEBUG(mRank, "UcxConnectionManager::~UcxConnectionManager");
 
     for (auto& worker : mWorkersPool)
     {
         worker->stopProgressThread();
     }
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "END UcxConnectionManager::~UcxConnectionManager");
+    if (mZmqRepThread.joinable())
+    {
+        zmq::socket_t socket(mZmqContext, zmq::socket_type::req);
+        socket.set(zmq::sockopt::ipv6, 1);
+        socket.connect(mZmqRepEndpoint);
+        UcxCmMessage stopMessage(UcxCmMessage::MessageType::STOP, std::nullopt);
+        std::ostringstream oStream;
+        UcxCmMessage::serialize(stopMessage, oStream);
+        std::string stopMessageStr = oStream.str();
+        socket.send(zmq::buffer(stopMessageStr), zmq::send_flags::none);
+        zmq::message_t reply;
+        auto ret = socket.recv(reply);
+        TLLM_CHECK_WITH_INFO(ret, "zmq socket.recv failed");
+        std::string replyStr(static_cast<char*>(reply.data()), reply.size());
+        std::istringstream is(replyStr);
+        UcxCmMessage serverMessage = UcxCmMessage::deserialize(is);
+        TLLM_CHECK_WITH_INFO(serverMessage.mType == UcxCmMessage::MessageType::STOP, "serverMessage.mType is not STOP");
+        socket.close();
+        mZmqRepThread.join();
+    }
+
+    mZmqRepSocket.close();
+
+    mZmqContext.close();
+    TLLM_LOG_DEBUG(mRank, "END UcxConnectionManager::~UcxConnectionManager");
 }
 
-void UcxConnectionManager::addConnection(ucp_conn_request_h connRequest)
+void UcxConnectionManager::addConnection(std::string const& workerAddress)
 {
     try
     {
-        std::shared_ptr<ucxx::Endpoint> newEp = mListener->createEndpointFromConnRequest(connRequest, true);
+        auto workerAddressPtr = ucxx::createAddressFromString(workerAddress);
+        auto newEp = mWorkersPool.front()->createEndpointFromWorkerAddress(workerAddressPtr, true);
 
         UcxConnection::ConnectionIdType connectionId = getNewConnectionId(newEp);
         std::scoped_lock lock(mConnectionFuturesMutex);
@@ -219,10 +533,26 @@ void UcxConnectionManager::addConnection(ucp_conn_request_h connRequest)
     }
     catch (std::exception const& e)
     {
-        std::string error = "Error in addConnection(connRequest) for rank "
-            + std::to_string(mpi::MpiComm::world().getRank()) + ": " + e.what();
+        std::string error = "Error in addConnection(connRequest) for rank " + std::to_string(mRank) + ": " + e.what();
         TLLM_THROW(error);
     }
+}
+
+std::string build_zmq_endpoint(std::string const& ip, uint16_t port)
+{
+    std::ostringstream oss;
+
+    std::regex ipv6_regex(R"([0-9a-fA-F]*:[0-9a-fA-F]*:[0-9a-fA-F]*.*)");
+    if (std::regex_match(ip, ipv6_regex) && ip.find(':') != std::string::npos)
+    {
+        oss << "tcp://[" << ip << "]:" << port;
+    }
+    else
+    {
+        oss << "tcp://" << ip << ":" << port;
+    }
+
+    return oss.str();
 }
 
 UcxConnection::ConnectionIdType UcxConnectionManager::addConnection(std::string const& ip, uint16_t port)
@@ -237,7 +567,25 @@ UcxConnection::ConnectionIdType UcxConnectionManager::addConnection(std::string 
             // This lock ensures that only one thread can create an endpoint from hostname and establish a UCX
             // connection at a time, guaranteeing that the only one listener will send connectionId to requester in the
             // same time.
-            std::shared_ptr<ucxx::Endpoint> newEp = mWorkersPool.front()->createEndpointFromHostname(ip, port, true);
+            auto reqSocket = zmq::socket_t(mZmqContext, zmq::socket_type::req);
+            reqSocket.set(zmq::sockopt::ipv6, 1);
+            reqSocket.connect(build_zmq_endpoint(ip, port));
+            UcxCmMessage getWorkerAddressMessage(UcxCmMessage::MessageType::GET_WORKER_ADDRESS, mWorkerAddress);
+            std::ostringstream oStream;
+            UcxCmMessage::serialize(getWorkerAddressMessage, oStream);
+            std::string getWorkerAddressMessageStr = oStream.str();
+            reqSocket.send(zmq::buffer(getWorkerAddressMessageStr), zmq::send_flags::none);
+            zmq::message_t reply;
+            auto ret = reqSocket.recv(reply);
+            TLLM_CHECK_WITH_INFO(ret, "zmq socket.recv failed");
+            std::string replyStr(static_cast<char*>(reply.data()), reply.size());
+            std::istringstream is(replyStr);
+            UcxCmMessage serverMessage = UcxCmMessage::deserialize(is);
+            TLLM_CHECK_WITH_INFO(serverMessage.mType == UcxCmMessage::MessageType::SERVER_WORKER_ADDRESS,
+                "serverMessage.mType is not SERVER_WORKER_ADDRESS");
+            std::string serverWorkerAddress = serverMessage.mWorkerAddress.value();
+            auto serverWorkerAddressPtr = ucxx::createAddressFromString(serverWorkerAddress);
+            auto newEp = mWorkersPool.front()->createEndpointFromWorkerAddress(serverWorkerAddressPtr, true);
             connectionId = getNewConnectionId(newEp);
             connection = std::make_shared<UcxConnection>(connectionId, newEp, this, true);
         }
@@ -250,8 +598,8 @@ UcxConnection::ConnectionIdType UcxConnectionManager::addConnection(std::string 
     }
     catch (std::exception const& e)
     {
-        std::string error = "Error in addConnection(ip) for rank " + std::to_string(mpi::MpiComm::world().getRank())
-            + " ip: " + ip + " port: " + std::to_string(port) + ": " + e.what();
+        std::string error = "Error in addConnection(ip) for rank " + std::to_string(mRank) + " ip: " + ip
+            + " port: " + std::to_string(port) + ": " + e.what();
         TLLM_THROW(error);
     }
 }
@@ -282,20 +630,18 @@ Connection const* UcxConnectionManager::recvConnect(DataContext const& ctx, void
         = *reinterpret_cast<UcxConnection::ConnectionIdType*>(buffer.data() + size);
     std::scoped_lock lock(mConnectionsMutex, mConnectionFuturesMutex);
     TLLM_CHECK_WITH_INFO(mConnectionFutures.find(connectionId) != mConnectionFutures.end(),
-        "connectionFuture not found In recvConnect connectionId : %lu , worldRank: %d", connectionId,
-        mpi::MpiComm::world().getRank());
+        "connectionFuture not found In recvConnect connectionId : %lu , worldRank: %d", connectionId, mRank);
     if (mConnectionFutures.at(connectionId).valid())
     {
         // wait for the connection to be created
         mConnectionFutures.at(connectionId).get();
     }
     TLLM_CHECK_WITH_INFO(mConnections.find(connectionId) != mConnections.end(),
-        "Connection not found In recvConnect connectionId: %lu , worldRank: %d", connectionId,
-        mpi::MpiComm::world().getRank());
+        "Connection not found In recvConnect connectionId: %lu , worldRank: %d", connectionId, mRank);
 
     TLLM_CHECK(!mConnections[connectionId]->isFromRequester());
 
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "recvConnect connectionId: %lu , sendIDData:%lu", connectionId,
+    TLLM_LOG_DEBUG(mRank, "recvConnect connectionId: %lu , sendIDData:%lu", connectionId,
         *reinterpret_cast<uint64_t*>(buffer.data()));
 
     return mConnections[connectionId].get();

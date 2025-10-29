@@ -9,8 +9,8 @@ import pytest
 from utils.util import (skip_gpu_memory_less_than_40gb, skip_num_gpus_less_than,
                         skip_nvlink_inactive)
 
+from tensorrt_llm import LLM
 from tensorrt_llm.llmapi import BuildConfig
-from tensorrt_llm.llmapi.llm import LLM
 
 from ..test_llm import get_model_path
 from .openai_server import RemoteOpenAIServer
@@ -53,7 +53,6 @@ def build_engine(model_name, request):
 
     llm = LLM(model_path,
               tensor_parallel_size=tp_size,
-              auto_parallel_world_size=tp_size,
               build_config=build_config)
 
     engine_dir = TemporaryDirectory(suffix="-engine_dir")

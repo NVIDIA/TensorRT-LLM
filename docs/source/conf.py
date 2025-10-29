@@ -12,13 +12,13 @@ import subprocess
 import sys
 
 import pygit2
+from docutils import nodes
 
 sys.path.insert(0, os.path.abspath('.'))
 
-project = 'TensorRT-LLM'
+project = 'TensorRT LLM'
 copyright = '2025, NVidia'
 author = 'NVidia'
-branch_name = pygit2.Repository('.').head.shorthand
 html_show_sphinx = False
 
 # Get the git commit hash
@@ -49,6 +49,7 @@ extensions = [
     'sphinx.ext.autosummary',
     'sphinx.ext.viewcode',
     'sphinx.ext.napoleon',
+    'sphinx.ext.mathjax',
     'myst_parser',  # for markdown support
     "breathe",
     'sphinx.ext.todo',
@@ -56,13 +57,20 @@ extensions = [
     'sphinxarg.ext',
     'sphinx_click',
     'sphinx_copybutton',
-    'sphinxcontrib.autodoc_pydantic'
+    'sphinxcontrib.autodoc_pydantic',
+    'sphinx_togglebutton',
 ]
 
+autodoc_member_order = 'bysource'
 autodoc_pydantic_model_show_json = True
 autodoc_pydantic_model_show_config_summary = True
 autodoc_pydantic_field_doc_policy = "description"
 autodoc_pydantic_model_show_field_list = True  # Display field list with descriptions
+autodoc_pydantic_model_member_order = "groupwise"
+autodoc_pydantic_model_hide_pydantic_methods = True
+autodoc_pydantic_field_list_validators = False
+autodoc_pydantic_settings_signature_prefix = ""  # remove any prefix
+autodoc_pydantic_settings_hide_reused_validator = True  # hide all the validator should be better
 
 myst_url_schemes = {
     "http":
@@ -70,14 +78,38 @@ myst_url_schemes = {
     "https":
     None,
     "source":
-    "https://github.com/NVIDIA/TensorRT-LLM/tree/" + branch_name + "/{{path}}",
+    "https://github.com/NVIDIA/TensorRT-LLM/tree/" + commit_hash + "/{{path}}",
 }
 
 myst_heading_anchors = 4
 
 myst_enable_extensions = [
     "deflist",
+    "substitution",
+    "dollarmath",
+    "amsmath",
 ]
+
+myst_substitutions = {
+    "version":
+    version,
+    "version_quote":
+    f"`{version}`",
+    "container_tag_admonition":
+    r"""
+```{admonition} Container image tags
+:class: dropdown note
+In the example shell commands, `x.y.z` corresponds to the TensorRT-LLM container
+version to use. If omitted, `IMAGE_TAG` will default to `tensorrt_llm.__version__`
+(e.g., this documentation was generated from the {{version_quote}} source tree).
+If this does not work, e.g., because a container for the version you are
+currently working with has not been released yet, you can try using a
+container published for a previous
+[GitHub pre-release or release](https://github.com/NVIDIA/TensorRT-LLM/releases)
+(see also [NGC Catalog](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags)).
+```
+    """
+}
 
 autosummary_generate = True
 copybutton_exclude = '.linenos, .gp, .go'
@@ -120,12 +152,34 @@ CPP_GEN_DIR = os.path.join(SCRIPT_DIR, '_cpp_gen')
 print('CPP_INCLUDE_DIR', CPP_INCLUDE_DIR)
 print('CPP_GEN_DIR', CPP_GEN_DIR)
 
+html_css_files = [
+    'custom.css',
+]
+
+
+def tag_role(name, rawtext, text, lineno, inliner, options=None, content=None):
+    """A custom role for displaying tags."""
+    options = options or {}
+    content = content or []
+    tag_name = text.lower()
+    node = nodes.literal(text, text, classes=['tag', tag_name])
+    return [node], []
+
 
 def setup(app):
-    from helper import generate_examples, generate_llmapi
+    from helper import generate_examples, generate_llmapi, update_version
+
+    try:
+        from tensorrt_llm.llmapi.utils import tag_llm_params
+        tag_llm_params()
+    except ImportError:
+        print("Warning: tensorrt_llm not available, skipping tag_llm_params")
+
+    app.add_role('tag', tag_role)
 
     generate_examples()
     generate_llmapi()
+    update_version()
 
 
 def gen_cpp_doc(ofile_name: str, header_dir: str, summary: str):

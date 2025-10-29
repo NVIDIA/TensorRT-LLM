@@ -72,6 +72,12 @@ if(ENABLE_MULTI_DEVICE)
   include_directories(${MPI_C_INCLUDE_DIRS})
 endif()
 
+if(ENABLE_NVSHMEM)
+  # Add hints for aarch64
+  find_package(NVSHMEM REQUIRED HINTS /usr/lib/sbsa-linux-gnu/cmake/nvshmem/)
+  include_directories(/usr/include/nvshmem/)
+endif()
+
 if(NOT WIN32)
   set(DECODER_SHARED_TARGET_0 decoder_attention_0)
   set(DECODER_SHARED_TARGET_1 decoder_attention_1)
@@ -140,24 +146,6 @@ add_subdirectory(layers)
 add_subdirectory(runtime)
 add_subdirectory(testing)
 add_subdirectory(executor_worker)
-
-if(ENABLE_CUFILE)
-  find_library(
-    CUFILE_LIBRARY cufile HINTS ${CUDAToolkit_LIBRARY_DIR}
-                                /usr/lib/${TARGET_ARCH} /usr/local/lib)
-  if(NOT CUFILE_LIBRARY)
-    # FATAL_ERROR if user explicitly requests with GDS if CUDA's libcufile.so is
-    # not found.
-    message(
-      FATAL_ERROR
-        "cuFile library not found. Set -DENABLE_CUFILE=OFF if cufile isn't required."
-    )
-  else()
-    message(STATUS "Linking with cufile: ${CUFILE_LIBRARY}")
-  endif()
-else()
-  message(STATUS "ENABLE_CUFILE=OFF, skipping GDS linkage.")
-endif()
 
 set(BATCH_MANAGER_TARGET tensorrt_llm_batch_manager_static)
 set(BATCH_MANAGER_TARGET_ARCH ${TARGET_ARCH})
@@ -231,7 +219,10 @@ if(ENABLE_MULTI_DEVICE)
   set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} ${MPI_C_LIBRARIES} ${NCCL_LIB})
 endif()
 
-message("TRTLLM_LINK_LIBS: ${TRTLLM_LINK_LIBS}")
+if(ENABLE_NVSHMEM)
+  set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} nvshmem::nvshmem_host
+                       nvshmem::nvshmem_device)
+endif()
 
 if(NOT WIN32) # Unix-like compilers
   set(UNDEFINED_FLAG "-Wl,--no-undefined")
@@ -253,10 +244,6 @@ set_target_properties(
              LINK_FLAGS "${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}")
 
 target_link_libraries(${SHARED_TARGET} PUBLIC ${TRTLLM_LINK_LIBS})
-
-if(ENABLE_CUFILE)
-  target_link_libraries(${SHARED_TARGET} PUBLIC ${CUFILE_LIBRARY})
-endif()
 
 target_link_libraries(
   ${SHARED_TARGET}
@@ -285,16 +272,34 @@ if(TARGET ${NIXL_WRAPPER_TARGET})
 endif()
 
 if(NOT WIN32)
-  set_target_properties(${SHARED_TARGET} PROPERTIES LINK_FLAGS
-                                                    "-Wl,-rpath='$ORIGIN'")
+  # Load libraries at $PREFIX/lib from
+  # $PREFIX/lib/python3.12/site-packages/tensorrt_llm/libs
+  set_target_properties(${SHARED_TARGET}
+                        PROPERTIES BUILD_RPATH "$ORIGIN;$ORIGIN/../../../..")
 endif()
 
 if(BUILD_PYT)
   add_subdirectory(thop)
 endif()
 
-if(BUILD_PYBIND)
+if(BINDING_TYPE STREQUAL "pybind")
   add_subdirectory(pybind)
+endif()
+
+if(BINDING_TYPE STREQUAL "nanobind")
+  add_subdirectory(nanobind)
+endif()
+
+if(BUILD_DEEP_EP)
+  add_subdirectory(deep_ep)
+endif()
+
+if(BUILD_DEEP_GEMM)
+  add_subdirectory(deep_gemm)
+endif()
+
+if(BUILD_FLASH_MLA)
+  add_subdirectory(flash_mla)
 endif()
 
 add_subdirectory(plugins)

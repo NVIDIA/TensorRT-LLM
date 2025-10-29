@@ -5,15 +5,16 @@ import pytest
 import torch
 from utils.llm_data import llm_models_root
 
-from tensorrt_llm import SamplingParams
-from tensorrt_llm._torch import LLM
+from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
+from tensorrt_llm.mapping import CpType
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 MAX_SEQ_LEN = 4096 + 1024
 
 
+@pytest.mark.post_merge
 @pytest.mark.parametrize("backend", ["pytorch"])
 @pytest.mark.parametrize("model_name",
                          ["llama-models-v3/Llama-3-8B-Instruct-Gradient-1048k"],
@@ -26,6 +27,7 @@ MAX_SEQ_LEN = 4096 + 1024
                          ids=["anchor1024", "anchor4096"])
 def test_model(backend, model_name, quant, sp_size, sa_block_size,
                sa_anchor_size):
+    pytest.skip("https://nvbugs/5391679")
     quant_configs = {
         "bf16":
         QuantConfig(),
@@ -53,7 +55,7 @@ def test_model(backend, model_name, quant, sp_size, sa_block_size,
 
     model_dir = str(llm_models_root() / model_name)
     cp_config = {
-        "cp_type": "star_attention",
+        "cp_type": CpType.STAR,
         "cp_anchor_size": sa_anchor_size,
         "block_size": sa_block_size
     }

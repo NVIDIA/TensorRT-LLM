@@ -19,27 +19,30 @@ import json
 import linecache
 import math
 import os
+import socket
 import struct
+import tempfile
 import trace
 import weakref
 from contextlib import contextmanager
-from dataclasses import asdict
 from enum import EnumMeta
 from functools import lru_cache, partial, wraps
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 
 import numpy as np
 import nvtx
 from mpi4py import MPI
+from mpi4py.util import pkl5
 from packaging import version
+from typing_extensions import ParamSpec
 
 # isort: off
 import torch
 import tensorrt as trt
 # isort: on
 
-from tensorrt_llm.bindings import DataType, GptJsonConfig
+from tensorrt_llm.bindings import DataType, GptJsonConfig, LayerType
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.logger import logger
 
@@ -179,6 +182,40 @@ _str_to_binding_dtype_dict = dict(
     bool=DataType.BOOL,
     fp8=DataType.FP8,
 )
+_binding_to_str_dtype = {v: k for k, v in _str_to_binding_dtype_dict.items()}
+
+_binding_dtype_bits = {
+    DataType.INT64: 64,
+    DataType.FLOAT: 32,
+    DataType.INT32: 32,
+    DataType.BF16: 16,
+    DataType.HALF: 16,
+    DataType.BOOL: 8,
+    DataType.FP8: 8,
+    DataType.INT8: 8,
+    DataType.UINT8: 8,
+    DataType.NVFP4: 4,
+}
+
+
+def binding_layer_type_to_str(layer_type: LayerType) -> str:
+    return layer_type.name.lower()
+
+
+def binding_to_str_dtype(binding_dtype) -> str:
+    ret = _binding_to_str_dtype.get(binding_dtype)
+    assert ret is not None, f'Unsupported binding dtype: {binding_dtype}'
+    return ret
+
+
+def binding_dtype_size(dtype: DataType):
+    return _binding_dtype_size[dtype]
+
+
+def get_size_in_bytes(num_elements: int, dtype: DataType):
+    total_num_bits = _binding_dtype_bits[dtype] * num_elements
+    assert total_num_bits % 8 == 0, f"Total number of bits {total_num_bits} must be divisible by 8"
+    return total_num_bits // 8
 
 
 def str_dtype_to_binding(dtype):
@@ -436,10 +473,16 @@ def dim_resolve_negative(dim, ndim):
     return tuple(pos)
 
 
+def get_free_port():
+    with socket.socket() as sock:
+        sock.bind(("", 0))
+        return sock.getsockname()[1]
+
+
 # mpi4py only exports MPI_COMM_TYPE_SHARED, so we define OMPI_COMM_TYPE_HOST here
 OMPI_COMM_TYPE_HOST = 9
 
-comm = MPI.COMM_WORLD
+comm = pkl5.Intracomm(MPI.COMM_WORLD)
 
 
 def set_mpi_comm(new_comm):
@@ -454,11 +497,48 @@ def mpi_comm():
 local_comm = mpi_comm().Split_type(split_type=OMPI_COMM_TYPE_HOST)
 
 
+def local_mpi_comm():
+    return local_comm
+
+
+# Global TorchDist instance for Ray orchestrator
+_torch_comm = None
+
+
+def set_torch_comm(torch_comm_instance):
+    """Set global TorchDist instance"""
+    global _torch_comm
+    _torch_comm = torch_comm_instance
+
+
+def torch_comm():
+    """Get global TorchDist instance"""
+    if _torch_comm is None:
+        raise RuntimeError(
+            "TorchDist not initialized. Call set_torch_comm() first.")
+    return _torch_comm
+
+
+def mpi_disabled() -> bool:
+    """True if TLLM_DISABLE_MPI is set to "1", False otherwise."""
+    return os.environ.get("TLLM_DISABLE_MPI") == "1"
+
+
 def mpi_rank():
+    if mpi_disabled():
+        try:
+            return torch.distributed.get_rank()
+        except ValueError:
+            # Fallback: return 0 when MPI is absent (Ray / Slurm PMIx)
+            return 0
     return mpi_comm().Get_rank() if ENABLE_MULTI_DEVICE else 0
 
 
 def global_mpi_rank():
+    if mpi_disabled():
+        # Fallback: return 0 when MPI is absent (Ray / Slurm PMIx)
+        return 0
+
     return MPI.COMM_WORLD.Get_rank() if ENABLE_MULTI_DEVICE else 0
 
 
@@ -492,8 +572,13 @@ def mpi_barrier():
         mpi_comm().Barrier()
 
 
+def local_mpi_barrier():
+    if ENABLE_MULTI_DEVICE:
+        local_comm.Barrier()
+
+
 def mpi_broadcast(obj, root=0):
-    return mpi_comm().bcast(obj, root) if ENABLE_MULTI_DEVICE else obj
+    return mpi_comm().bcast(obj, root) if global_mpi_size() > 1 else obj
 
 
 def mpi_allgather(obj):
@@ -650,10 +735,20 @@ def get_sm_version():
     return prop.major * 10 + prop.minor
 
 
+@lru_cache(maxsize=1)
+def is_sm_100f(sm_version=None):
+    if sm_version is None:
+        sm_version = get_sm_version()
+    return sm_version == 100 or sm_version == 103
+
+
 def is_trace_enabled(env_var: str):
     value = os.environ.get(env_var, "-1")
     if value == "ALL":
         return True
+    if value == "-1":
+        # early return w/o calling global_mpi_rank() for Ray path
+        return False
     try:
         return int(value) == global_mpi_rank()
     except ValueError:
@@ -702,38 +797,6 @@ def trace_func(func):
         return result
 
     return wrapper
-
-
-class DictConversion:
-
-    @classmethod
-    def from_dict(cls, config: Dict[str, Any]):
-        obj = cls()
-        fields = obj.__dataclass_fields__
-        for key, value in config.items():
-            assert hasattr(obj, key), f"cannot find {key} in {obj}"
-            field_cls = fields[key].type
-            if (isinstance(field_cls, type)
-                    and issubclass(field_cls, DictConversion)
-                    and isinstance(value, dict)):
-                value = field_cls.from_dict(value)
-            setattr(obj, key, value)
-        return obj
-
-    def to_dict(self):
-        return asdict(self)
-
-    @classmethod
-    def from_json_file(cls, file):
-        with open(file) as f:
-            return cls.from_dict(json.load(f))
-
-    def set_defaults(self, **kwargs):
-        for key, default in kwargs.items():
-            value = getattr(self, key)
-            if (value is None
-                    or (isinstance(value, (list, dict)) and len(value) == 0)):
-                setattr(self, key, default)
 
 
 class BaseEnumMeta(EnumMeta):
@@ -888,11 +951,13 @@ class TensorWrapper:
         data_ptr: int,
         dtype: Union[torch.dtype, str, np.dtype, trt.DataType],
         shape: Sequence[int],
+        strides: Optional[Sequence[int]] = None,
     ):
         assert isinstance(data_ptr, int)
         self._data_ptr = data_ptr
         self.dtype = dtype
         self.shape = shape
+        self.strides = strides
 
     def data_ptr(self):
         return self._data_ptr
@@ -928,10 +993,17 @@ class TensorWrapper:
     @property
     def __cuda_array_interface__(self):
         return {
-            "shape": self.shape,
-            "typestr": torch_dtype_to_np_typestr(self.dtype),
+            "shape":
+            self.shape,
+            "typestr":
+            torch_dtype_to_np_typestr(self.dtype),
             "data": (self.data_ptr() if self.numel() > 0 else 0, False),
-            "version": 3,
+            "strides": [
+                i * torch.tensor([], dtype=self.dtype).element_size()
+                for i in self.strides
+            ] if self.strides is not None else None,
+            "version":
+            3,
         }
 
     @staticmethod
@@ -988,10 +1060,15 @@ class KVCacheEventSerializer:
         if event_serialize_func is None:
             raise ValueError(f"Unknown KVCache event data type: {event_type}")
 
-        return {
+        json_str = {
             "event_id": event.event_id,
             "data": event_serialize_func(event.data),
+            "window_size": event.window_size,
         }
+        if event.attention_dp_rank is not None:
+            json_str["attention_dp_rank"] = event.attention_dp_rank
+
+        return json_str
 
     @staticmethod
     def _created_to_json(data):
@@ -1063,3 +1140,58 @@ class KVCacheEventSerializer:
             "token_id": data.token_id,
             "token_extra_id": data.token_extra_id
         }
+
+
+def set_prometheus_multiproc_dir() -> object:
+    # Adapted from: https://github.com/sgl-project/sglang/blob/v0.4.10/python/sglang/srt/utils.py#L1266
+    global prometheus_multiproc_dir
+    if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
+        logger.info("User set PROMETHEUS_MULTIPROC_DIR detected.")
+        prometheus_multiproc_dir = tempfile.TemporaryDirectory(
+            dir=os.environ["PROMETHEUS_MULTIPROC_DIR"])
+    else:
+        prometheus_multiproc_dir = tempfile.TemporaryDirectory()
+        os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
+    logger.info(
+        f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")
+
+
+P = ParamSpec("P")
+
+
+# From: https://stackoverflow.com/a/4104188/2749989
+def run_once(f: Callable[P, None]) -> Callable[P, None]:
+
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> None:
+        if not wrapper.has_run:  # type: ignore[attr-defined]
+            wrapper.has_run = True  # type: ignore[attr-defined]
+            return f(*args, **kwargs)
+
+    wrapper.has_run = False  # type: ignore[attr-defined]
+    return wrapper
+
+
+TORCH_PYBIND11_ABI = None
+
+
+def torch_pybind11_abi() -> str:
+    global TORCH_PYBIND11_ABI
+    if TORCH_PYBIND11_ABI is None:
+        TORCH_PYBIND11_ABI = f"{torch._C._PYBIND11_COMPILER_TYPE}{torch._C._PYBIND11_STDLIB}{torch._C._PYBIND11_BUILD_ABI}"
+    return TORCH_PYBIND11_ABI
+
+
+@lru_cache(maxsize=1)
+def is_device_integrated() -> bool:
+    """Check if the current GPU device is integrated (shares physical memory with CPU).
+
+    Integrated GPU systems include DGX Spark and other unified memory architectures.
+    This function caches the result to avoid repeated CUDA device property queries.
+
+    Returns:
+        bool: True if the GPU is integrated, False otherwise. Returns False if CUDA
+              is not available.
+    """
+    if not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_properties().is_integrated

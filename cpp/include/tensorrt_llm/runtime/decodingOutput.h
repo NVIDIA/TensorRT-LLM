@@ -66,12 +66,7 @@ public:
 
     static float constexpr kNegativeInfinity = -1e20f;
 
-    explicit DecodingOutput(TensorPtr ids, TensorPtr gatheredIds)
-        : ids{std::move(ids)}
-        , gatheredIds{std::move(gatheredIds)}
-    {
-        TLLM_CHECK_WITH_INFO(static_cast<bool>(this->ids), "Invalid ids tensor");
-    }
+    DecodingOutput() = default;
 
     //! Mandatory parameters
     //! Previously generated token ids for all steps before DecodingInput.step, [BS, BM, MSL]

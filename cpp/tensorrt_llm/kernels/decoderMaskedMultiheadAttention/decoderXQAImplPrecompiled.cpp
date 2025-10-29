@@ -97,7 +97,7 @@ public:
             }
             XQAKernelRuntimeHashKey hash_key{kernelMeta.mKVDataType, kernelMeta.mHeadDim, kernelMeta.mBeamWidth,
                 kernelMeta.mNumQHeadsOverKV, kernelMeta.mMTileSize, kernelMeta.mTokensPerPage, kernelMeta.mPagedKVCache,
-                kernelMeta.mMultiQueryTokens};
+                kernelMeta.mMultiQueryTokens, false, std::nullopt};
 
             mFunctions.insert(std::make_pair(hash_key, funcInfo));
         }
@@ -124,10 +124,12 @@ public:
             m_tilesize = num_q_heads_over_kv;
         }
 
+        // precompiled XQA does not support param is_fp8_output in hash key
         XQAKernelRuntimeHashKey hash_key
             = {xqaParams.kv_cache_data_type, head_size, beam_width, kernel_num_q_heads_over_kv, m_tilesize,
                 xqaParams.paged_kv_cache ? static_cast<unsigned int>(xqaParams.tokens_per_block) : 0,
-                xqaParams.paged_kv_cache, xqaParams.multi_query_tokens};
+                xqaParams.paged_kv_cache, xqaParams.multi_query_tokens, 0, /* xqa jit param is_fp8_output */
+                std::nullopt};
         auto const findIter = mFunctions.find(hash_key);
         return findIter != mFunctions.end();
     }
@@ -222,8 +224,7 @@ public:
         preprocessingParams.cu_seq_lens = xqaParams.multi_query_tokens ? launchParams.cu_seq_lens : nullptr;
         preprocessingParams.rotary_embedding_inv_freq = rotary_inv_freq_buf;
         preprocessingParams.rotary_coef_cache_buffer = xqaParams.rotary_cos_sin;
-        preprocessingParams.kvScaleOrigQuant = xqaParams.kv_scale_orig_quant;
-        preprocessingParams.kv_cache_scale_factors = nullptr;
+        preprocessingParams.qkv_scale_orig_quant = xqaParams.kv_scale_orig_quant;
         preprocessingParams.spec_decoding_position_offsets = xqaParams.spec_decoding_position_offsets;
         preprocessingParams.mrope_position_deltas = xqaParams.mrope_position_deltas;
         // Scalar parameters.
@@ -257,7 +258,7 @@ public:
         invokeQKVPreprocessing<T, KVCacheBuffer>(preprocessingParams, stream);
         sync_check_cuda_error(stream);
 
-        XQAKernelRuntimeHashKey hash_key = getRuntimeHashKeyFromXQAParams(xqaParams, false);
+        XQAKernelRuntimeHashKey hash_key = getRuntimeHashKeyFromXQAParams(xqaParams, false, mSM);
         auto const findIter = mFunctions.find(hash_key);
 
         TLLM_CHECK_WITH_INFO(findIter != mFunctions.end(), "XQAKernelFunc not found.");
@@ -285,14 +286,8 @@ public:
             void* kernelParams[] = {&maxQSeqLen, &launchParams.num_k_heads, &headGrpSize, &cuQSeqLens,
                 &launchParams.output, &xqa_q_input_ptr, &maskPtr, &launchParams.kvCacheParams, &launchParams.batch_size,
                 &launchParams.kv_scale_quant_orig, &launchParams.scratch};
+            // precompiled XQA Spec-dec kernel does not support multi-block mode
             int multi_block = 1;
-            if (xqaParams.multi_block_mode)
-            {
-                multi_block = computeMultiBlockCount(xqaParams, xqaParams.batch_size, multiprocessor_count);
-                check_cuda_error(cudaMemsetAsync(xqaParams.workspaces, 0,
-                    sizeof(int) * xqaParams.batch_size * qSeqLen * xqaParams.num_kv_heads, stream));
-                sync_check_cuda_error(stream);
-            }
             TLLM_CU_CHECK(mDriver->cuLaunchKernel(func, multi_block, xqaParams.num_kv_heads * nbTokenBlocksPerGrp,
                 xqaParams.batch_size, 128, 1, 2, shared_mem_bytes, stream, kernelParams, nullptr));
         }
@@ -415,6 +410,10 @@ private:
 
 inline XQAKernelList const* getXQAKernels(Data_type type, unsigned int sm)
 {
+    if (sm == kSM_121)
+    {
+        sm = kSM_120;
+    }
     return XQAKernelLoader::Get().getXQAKernels(type, sm);
 }
 

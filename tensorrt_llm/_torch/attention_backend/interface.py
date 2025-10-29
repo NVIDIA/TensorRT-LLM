@@ -3,11 +3,14 @@ import weakref
 from collections import namedtuple
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
-from typing import (Generic, List, Optional, Protocol, Tuple, Type, TypeVar,
-                    Union)
+from typing import (TYPE_CHECKING, Dict, Generic, List, Optional, Protocol,
+                    Tuple, Type, TypeVar, Union)
 
 import torch
 from typing_extensions import Self
+
+if TYPE_CHECKING:
+    from ..speculative.utils import SpecDecodingTensor
 
 from tensorrt_llm.functional import (PositionEmbeddingType, RopeEmbeddingUtils,
                                      RotaryScalingType)
@@ -24,6 +27,8 @@ class AttentionRuntimeFeatures:
     chunked_prefill: bool = False
     cache_reuse: bool = False
     has_speculative_draft_tokens: bool = False
+    chunk_size: int = 0  # this is the chunk size for MLA chunked prefill, it will split kv cache into chunks to save global memory.
+    chunked_prefill_buffer_batch_size: int = 4  # real chunk size for MLA chunked prefill is chunked_prefill_buffer_batch_size * chunk_size.
 
 
 # The type of requests in qkv passed to attention
@@ -44,12 +49,14 @@ class AttentionMetadata:
     max_num_requests: int
     # The max number of tokens in all requests in a single batch.
     max_num_tokens: int
+    # The max number of sequences in a single batch.
+    max_num_sequences: Optional[int] = None
     # The KV cache manager.
     kv_cache_manager: KVCacheManager
     mapping: Optional[Mapping] = None
 
     enable_flash_mla: bool = False
-    enable_paged_context_mla: bool = False
+    enable_context_mla_with_cached_kv: bool = False
     # Whether CUDA graph is enabled.
     is_cuda_graph: bool = field(default=False, repr=False)
 
@@ -117,6 +124,7 @@ class AttentionMetadata:
     runtime_features: AttentionRuntimeFeatures = field(
         default_factory=AttentionRuntimeFeatures)
 
+    # The number of tokens in each rank.
     all_rank_num_tokens: Optional[List[int]] = None
 
     # These fields are set when changing seq_lens and _num_contexts to avoid computation
@@ -125,6 +133,17 @@ class AttentionMetadata:
     _num_generations: int = field(init=False, default=0, repr=False)
     _num_ctx_tokens: int = field(init=False, default=0, repr=False)
     _num_tokens: int = field(init=False, default=0, repr=False)
+
+    # The number of tokens in the padded sequence.
+    padded_num_tokens: Optional[int] = None
+
+    # This buffer is currently only used for TrtllmAttentionMetadata.
+    cache_indirection: Optional[torch.Tensor] = None
+    cuda_graph_buffers: dict[str, list[torch.Tensor]] = None
+
+    _saved_tensors: Dict[str, torch.Tensor] = field(init=False,
+                                                    default_factory=dict)
+    sparse_attention_config: Optional["SparseAttentionConfig"] = None
 
     def __post_init__(self) -> None:
         if self.is_cross:
@@ -260,7 +279,8 @@ class AttentionMetadata:
     def create_cuda_graph_metadata(self,
                                    max_batch_size: int,
                                    sub_cross_metadata: bool = False,
-                                   max_draft_tokens: int = 0) -> Self:
+                                   max_draft_tokens: int = 0,
+                                   buffers=None) -> Self:
         """
         Creates metadata for CUDA graph execution.
         CUDA graphs require to use pre-allocated buffers for all tensors in fields.
@@ -272,6 +292,7 @@ class AttentionMetadata:
 
         cuda_graph_metadata = copy.copy(self)
         cuda_graph_metadata.is_cuda_graph = True
+        cuda_graph_metadata.cuda_graph_buffers = buffers
         if self.has_cross_sub_metadata:
             cuda_graph_metadata.cross = cuda_graph_metadata.cross.create_cuda_graph_metadata(
                 max_batch_size, True)
@@ -299,6 +320,35 @@ class AttentionMetadata:
         cuda_graph_metadata.__post_init__()
         return cuda_graph_metadata
 
+    def prepare_for_spec_dec(self, *fields) -> None:
+        assert len(self._saved_tensors) == 0
+        for f in fields:
+            v = getattr(self, f)
+            assert isinstance(v, torch.Tensor)
+            self._saved_tensors[f] = v
+            setattr(self, f, v.clone())
+
+    def restore_from_spec_dec(self) -> None:
+        for f, v in self._saved_tensors.items():
+            setattr(self, f, v)
+        self._saved_tensors.clear()
+
+    def update_spec_dec_param(
+            self,
+            is_spec_decoding_enabled,
+            is_spec_dec_tree,
+            is_spec_dec_dynamic_tree,
+            max_draft_tokens,
+            spec_decoding_tensor: Optional['SpecDecodingTensor'] = None):
+        """
+        Hook to be called when using TRTLLM attention backend in spec-dec mode.
+        """
+
+    def update_for_spec_dec(self) -> None:
+        """
+        Hook to be called during forward when using spec-dec one-model mode.
+        """
+
 
 class PositionalEmbedder(Protocol):
     """
@@ -314,6 +364,7 @@ class PositionalEmbedder(Protocol):
 class RopeParams:
     dim: int = 0
     theta: float = 10000.0
+    alpha: float = 1.0
     scale_type: RotaryScalingType = RotaryScalingType.none
     scale: float = 1.0
     low_freq_factor: float = 1.0
@@ -326,6 +377,10 @@ class RopeParams:
     beta_slow: int = 1
     mscale: float = 1.0
     mscale_all_dim: float = 0.0
+    short_factor: Optional[Tuple[float]] = None
+    long_factor: Optional[Tuple[float]] = None
+    max_seq_len: Optional[int] = None
+    duplicate_data: bool = True
 
     @staticmethod
     def from_config(config) -> "RopeParams":
@@ -334,8 +389,9 @@ class RopeParams:
         # get rotary parameters.
         hidden_size = config.hidden_size
         num_attention_heads = config.num_attention_heads
-        head_dim = getattr(config, 'head_dim',
-                           hidden_size // num_attention_heads)
+        head_dim = getattr(config, 'head_dim', None)
+        if not isinstance(head_dim, int):
+            head_dim = hidden_size // num_attention_heads
         rope_scaling = getattr(config, 'rope_scaling', None)
         rope_params.max_positions = config.max_position_embeddings
         rope_params.theta = getattr(config, 'rope_theta', 10000.0)
@@ -351,6 +407,7 @@ class RopeParams:
         rope_params.scale_type = RotaryScalingType.none
         rope_params.scale = 1.0
         if rope_scaling is not None:
+            rope_params.alpha = rope_scaling.get("alpha", 1.0)
             rotary_scaling_type = rope_scaling.get(
                 "type", None) or rope_scaling.get("rope_type")
             rope_params.scale_type = RotaryScalingType.from_string(
@@ -360,15 +417,23 @@ class RopeParams:
                 "low_freq_factor", 1.0)
             rope_params.high_freq_factor = rope_scaling.get(
                 "high_freq_factor", 4.0)
-            rope_params.original_max_positions = rope_scaling.get(
-                "original_max_position_embeddings", 1024)
+            rope_params.original_max_positions = getattr(
+                config,
+                "original_max_position_embeddings", None) or rope_scaling.get(
+                    "original_max_position_embeddings", None) or 1024
             rope_params.beta_fast = rope_scaling.get("beta_fast", 32)
             rope_params.beta_slow = rope_scaling.get("beta_slow", 1)
             rope_params.mscale = rope_scaling.get("mscale", 1.0)
             rope_params.mscale_all_dim = rope_scaling.get("mscale_all_dim", 0.0)
+            if "short_factor" in rope_scaling:
+                rope_params.short_factor = tuple(rope_scaling["short_factor"])
+            if "long_factor" in rope_scaling:
+                rope_params.long_factor = tuple(rope_scaling["long_factor"])
         # Workaround for DeepSeek V3 Lite since its rope_scaling is null in config.json.
         elif config.model_type == "deepseek_v3":
             rope_params.scale_type = RotaryScalingType.yarn
+        # Other metdadata for RoPE.
+        rope_params.max_seq_len = getattr(config, 'max_seq_len', None)
 
         return rope_params
 
@@ -390,8 +455,7 @@ class RopeParams:
                 )
 
         if self.scale_type == RotaryScalingType.yarn:
-            rope_inv_freq = None
-            _, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
+            rope_inv_freq, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
                 self.max_positions,
                 self.dim,
                 self.theta,
@@ -401,9 +465,18 @@ class RopeParams:
                 self.beta_slow,
                 self.mscale,
                 self.mscale_all_dim,
+                self.duplicate_data,
             )
         elif self.scale_type == RotaryScalingType.longrope:
-            raise NotImplementedError("Long RoPE is not supported.")
+            rope_inv_freq, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_long_rope(
+                num_pos=self.max_positions,
+                dim=self.dim,
+                theta=self.theta,
+                original_max_pos=self.original_max_positions,
+                short_factor=self.short_factor,
+                long_factor=self.long_factor,
+                max_seq_len=self.max_seq_len,
+            )
         else:
             rope_inv_freq, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
                 self.max_positions,
@@ -413,6 +486,7 @@ class RopeParams:
                 self.scale_type,
                 rope_scaling_config={
                     "factor": self.scale,
+                    "alpha": self.alpha,
                     "low_freq_factor": self.low_freq_factor,
                     "high_freq_factor": self.high_freq_factor,
                     "original_max_position_embeddings":
@@ -451,6 +525,9 @@ class PositionalEmbeddingParams:
     rope: Optional[RopeParams] = None
     is_neox: bool = True
 
+    # mRoPE params (currently, Qwen2/2.5-VL uses it)
+    mrope_section: Optional[List[int]] = None
+
     def __post_init__(self) -> None:
         if self.type.is_deferred():
             assert self.embedder is not None, f"{self.type} requires a not-none external embedder"
@@ -476,8 +553,14 @@ class PredefinedAttentionMask(str, Enum):
     FULL = "full"
 
 
-# May extend to custom attention mask type
-AttentionMask = Union[PredefinedAttentionMask]
+class CustomAttentionMask(str, Enum):
+    """
+    Custom attention mask types
+    """
+    CUSTOM = "custom"
+
+
+AttentionMask = Union[PredefinedAttentionMask, CustomAttentionMask]
 
 
 class AttentionBackend(Generic[TMetadata]):
@@ -494,6 +577,7 @@ class AttentionBackend(Generic[TMetadata]):
         num_kv_heads: Optional[int] = None,
         quant_config: Optional[QuantConfig] = None,
         skip_create_weights_in_init: bool = False,
+        sparse_attention_config: Optional["SparseAttentionConfig"] = None,
         **kwargs,
     ):
         """
@@ -504,12 +588,14 @@ class AttentionBackend(Generic[TMetadata]):
             head_dim (int): The size of each attention head (hidden_size // num_heads).
             num_kv_heads (int): The number of kv heads. Defaults to num_heads if None.
             quant_config (QuantConfig): Optional quantization configuration. If None, no quantization is applied.
+            sparse_attention_config (SparseAttentionConfig): Optional sparse attention configuration. If None, no sparse attention is applied.
         """
         self.layer_idx = layer_idx
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.num_kv_heads = num_kv_heads or self.num_heads
         self.quant_config = quant_config
+        self.sparse_attention_config = sparse_attention_config
 
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         """
@@ -569,3 +655,5 @@ class MLAParams:
     qk_nope_head_dim: int = 0
     v_head_dim: int = 0
     predicted_tokens_per_seq: int = 1
+    chunked_prefill_buffer_batch_size: int = 1
+    hidden_size: int = 0

@@ -552,6 +552,10 @@ uint64_t FusedMultiHeadAttentionXMMAKernelV2::hashFromParams(
 
 FusedMultiHeadAttentionXMMAKernelV2 const* getXMMAKernelsV2(Data_type inputType, Data_type outputType, unsigned int sm)
 {
+    if (sm == kSM_121)
+    {
+        sm = kSM_120;
+    }
     return FusedMHAKernelFactoryV2::Get().getXMMAKernels(sMhaKernelMetaInfosV2,
         sizeof(sMhaKernelMetaInfosV2) / sizeof(sMhaKernelMetaInfosV2[0]), inputType, outputType, sm);
 }

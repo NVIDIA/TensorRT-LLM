@@ -356,7 +356,7 @@ class TestLoraAttentionPytorchFlowVsTRT(unittest.TestCase):
                                    rms_norm_eps=1e-5,
                                    vocab_size=32000,
                                    num_key_value_heads=self.head_num,
-                                   torch_dtype=self.torch_dtype)
+                                   dtype=self.torch_dtype)
 
         mapping = Mapping(world_size=1, tp_size=1, rank=0)
         kv_cache_config = KvCacheConfig(max_tokens=max_seq_len)
@@ -419,31 +419,23 @@ class TestLoraAttentionPytorchFlowVsTRT(unittest.TestCase):
                     lora_params['lora_ranks'],
                     'weight_pointers':
                     lora_params['lora_weights_pointers'],
-                    'is_dora':
-                    False,
                 },
                 LoraModuleType.ATTENTION_K: {
                     'adapter_size':
                     lora_params['lora_ranks'],
                     'weight_pointers': lora_params['lora_weights_pointers'],
-                    'is_dora':
-                    False,
                 },
                 LoraModuleType.ATTENTION_V: {
                     'adapter_size':
                     lora_params['lora_ranks'],
                     'weight_pointers':
                      lora_params['lora_weights_pointers'],
-                    'is_dora':
-                    False,
                 },
                 LoraModuleType.ATTENTION_DENSE: {
                     'adapter_size':
                     lora_params['lora_ranks'],
                     'weight_pointers':
                     lora_params['lora_weights_pointers'],
-                    'is_dora':
-                    False,
                 }
             }
         }

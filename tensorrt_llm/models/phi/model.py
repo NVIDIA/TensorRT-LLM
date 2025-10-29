@@ -20,7 +20,7 @@ from ..._utils import pad_vocab_size
 from ...functional import Tensor
 from ...layers import (MLP, Attention, AttentionMaskType, ColumnLinear,
                        Embedding, LayerNorm)
-from ...lora_manager import LoraConfig, use_lora
+from ...lora_helper import LoraConfig, use_lora
 from ...mapping import Mapping
 from ...module import Module
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
@@ -203,9 +203,7 @@ class PhiForCausalLM(DecoderModelForCausalLM):
             trust_remote_code = kwargs.pop('trust_remote_code', True)
 
             hf_model = AutoModelForCausalLM.from_pretrained(
-                hf_model_dir,
-                torch_dtype="auto",
-                trust_remote_code=trust_remote_code)
+                hf_model_dir, dtype="auto", trust_remote_code=trust_remote_code)
 
         assert isinstance(hf_model, transformers.PreTrainedModel)
 

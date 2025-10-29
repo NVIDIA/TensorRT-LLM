@@ -1,0 +1,74 @@
+# Adapted from https://github.com/vllm-project/vllm/tree/main/.github/ISSUE_TEMPLATE/700-performance-discussion.yml
+name: ⚡ Discussion on the performance of TensorRT-LLM
+description: Submit a proposal/discussion about the performance of TensorRT-LLM
+title: "[Performance]: "
+labels: ["Performance"]
+assignees: ["byshiue", "kaiyux"]
+
+body:
+- type: markdown
+  attributes:
+    value: >
+      #### Before submitting an issue, please make sure the issue hasn't been already addressed by searching through [the existing and past issues](https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue+sort%3Acreated-desc+).
+- type: textarea
+  attributes:
+    label: Proposal to improve performance
+    description: >
+      How do you plan to improve TensorRT-LLM's performance?
+  validations:
+    required: false
+- type: textarea
+  attributes:
+    label: Report of performance regression
+    description: >
+      Please provide detailed description of performance comparison to confirm the regression. You may want to run the benchmark script at https://github.com/NVIDIA/TensorRT-LLM/tree/main/benchmarks .
+  validations:
+    required: false
+- type: textarea
+  attributes:
+    label: Misc discussion on performance
+    description: >
+      Anything about the performance.
+  validations:
+    required: false
+- type: textarea
+  attributes:
+    label: Your current environment (if you think it is necessary)
+    description: |
+      Please provide the following system information to help with performance analysis:
+
+      ```bash
+      # System information
+      nvidia-smi
+      nvcc --version
+      python --version
+      pip show tensorrt_llm tensorrt torch
+      ```
+    value: |
+      **System Information:**
+      - OS:
+      - Python version:
+      - CUDA version:
+      - GPU model(s):
+      - Driver version:
+      - TensorRT version:
+      - PyTorch version:
+      - TensorRT-LLM version:
+
+      **Detailed output:**
+      ```text
+      Paste the output of the above commands here
+      ```
+  validations:
+    required: false
+- type: markdown
+  attributes:
+    value: >
+      Thanks for contributing 🎉!
+- type: checkboxes
+  id: askllm
+  attributes:
+    label: Before submitting a new issue...
+    options:
+      - label: Make sure you already searched for relevant issues, and checked the [documentation](https://nvidia.github.io/TensorRT-LLM/) and [examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples) for answers to frequently asked questions.
+        required: true

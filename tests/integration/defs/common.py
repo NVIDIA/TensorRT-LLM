@@ -16,10 +16,17 @@ import copy
 import os
 import platform
 import re
+import socket
+import time
 from difflib import SequenceMatcher
 from pathlib import Path
 
 from packaging import version
+
+from tensorrt_llm import LLM as LLM_torch
+from tensorrt_llm.executor.request import LoRARequest
+from tensorrt_llm.lora_manager import LoraConfig
+from tensorrt_llm.sampling_params import SamplingParams
 
 from .trt_test_alternative import check_call, check_output, exists, is_windows
 
@@ -43,7 +50,7 @@ def venv_check_output(venv, cmd, env=None, **kwargs):
     return venv.run_cmd(cmd, caller=_war_check_output, env=env, **kwargs)
 
 
-def venv_mpi_check_call(venv, mpi_cmd, python_cmd):
+def venv_mpi_check_call(venv, mpi_cmd, python_cmd, **kwargs):
     """
     This function WAR check_call() to run python_cmd with mpi.
     If mpi_cmd = ["mpirun", "-n", "2"] and python_cmd = ["run.py"], the command will be:
@@ -60,10 +67,10 @@ def venv_mpi_check_call(venv, mpi_cmd, python_cmd):
         kwargs["cwd"] = venv.get_working_directory()
         return check_call(merged_cmd, **kwargs)
 
-    venv.run_cmd(python_cmd, caller=_war_check_call)
+    venv.run_cmd(python_cmd, caller=_war_check_call, **kwargs)
 
 
-def venv_mpi_check_output(venv, mpi_cmd, python_cmd, env=None):
+def venv_mpi_check_output(venv, mpi_cmd, python_cmd, env=None, **kwargs):
     """
     This function WAR check_output() to run python_cmd with mpi.
     If mpi_cmd = ["mpirun", "-n", "2"] and python_cmd = ["run.py"], the command will be:
@@ -80,7 +87,7 @@ def venv_mpi_check_output(venv, mpi_cmd, python_cmd, env=None):
         kwargs["cwd"] = venv.get_working_directory()
         return check_output(merged_cmd, **kwargs)
 
-    return venv.run_cmd(python_cmd, caller=_war_check_output, env=env)
+    return venv.run_cmd(python_cmd, caller=_war_check_output, env=env, **kwargs)
 
 
 def parse_mpi_cmd(cmd):
@@ -308,7 +315,7 @@ def convert_weights(llm_venv,
             f"--dtype={data_type}",
         ]
 
-    elif "prompt_lookup" in model:
+    elif "ngram" in model:
         if "gpt" in model_path:
             example_name = "gpt"
         elif "llama" in model_path:
@@ -335,9 +342,9 @@ def convert_weights(llm_venv,
         redrafter_draft_len_per_beam = kwargs.pop(
             "redrafter_draft_len_per_beam")
         convert_cmd = [
-            f"{example_root}/{script}", "--model_dir", model_path[0],
-            "--drafter_model_dir", model_path[1], "--output_dir", model_dir,
-            f"--dtype={data_type}", f"--tp_size={tp_size}",
+            f"{example_root}/{script}", "--base_model_checkpoint_dir",
+            model_path[0], "--drafter_model_dir", model_path[1], "--output_dir",
+            model_dir, f"--dtype={data_type}", f"--tp_size={tp_size}",
             f"--redrafter_num_beams={redrafter_num_beams}",
             f"--redrafter_draft_len_per_beam={redrafter_draft_len_per_beam}"
         ]
@@ -505,6 +512,7 @@ def convert_weights(llm_venv,
         convert_cmd.append(f"--quant_ckpt_path={quant_ckpt_path}")
     if per_group:
         convert_cmd.append("--per_group")
+    timeout = kwargs.pop('timeout', None)
 
     for key, value in kwargs.items():
         if isinstance(value, bool):
@@ -514,7 +522,7 @@ def convert_weights(llm_venv,
             convert_cmd.extend([f"--{key}={value}"])
 
     if llm_venv:
-        venv_check_call(llm_venv, convert_cmd)
+        venv_check_call(llm_venv, convert_cmd, timeout=timeout)
         return model_dir
     else:
         return convert_cmd, model_dir
@@ -606,6 +614,7 @@ def quantize_data(llm_venv,
 
     if kv_cache_dtype:
         quantize_cmd.append(f"--kv_cache_dtype={kv_cache_dtype}")
+    timeout = kwargs.pop('timeout', None)
 
     for key, value in kwargs.items():
         if isinstance(value, bool):
@@ -616,7 +625,7 @@ def quantize_data(llm_venv,
 
     if llm_venv:
         if not exists(output_dir):
-            venv_check_call(llm_venv, quantize_cmd)
+            venv_check_call(llm_venv, quantize_cmd, timeout=timeout)
         return output_dir
     else:
         return quantize_cmd, output_dir
@@ -644,7 +653,7 @@ def get_trt_llm_lib_dir(venv):
         "import tensorrt_llm; print(f'{tensorrt_llm.__path__[0]}/libs')",
         caller=check_output).strip()
 
-    if "TensorRT-LLM version: " in output:
+    if "TensorRT LLM version: " in output:
         output = output.split('\n')[-1]
 
     return output.strip()
@@ -736,12 +745,28 @@ def generate_dummy_loras(
     from transformers import AutoModelForCausalLM
 
     print("Creating pseudo LoRAs...")
-    model = AutoModelForCausalLM.from_pretrained(
-        hf_model_dir,
-        torch_dtype=torch.float16,
-        device_map="auto",
-        trust_remote_code=True,
-    )
+
+    # Avoid meta tensors by loading model to CPU first (ensures all parameters are materialized)
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            hf_model_dir,
+            dtype=torch.float16,
+            device_map=None,  # Load everything to CPU first
+            trust_remote_code=True,
+            low_cpu_mem_usage=False,
+        )
+    except Exception:
+        # Fallback to auto device mapping if CPU loading fails
+        print(
+            "Warning: Loading model to CPU failed, falling back to auto device mapping"
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            hf_model_dir,
+            dtype=torch.float16,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+
     lora_config = LoraConfig(r=lora_rank,
                              target_modules=target_modules,
                              bias="none",
@@ -752,10 +777,55 @@ def generate_dummy_loras(
         if zero_weights:
             for param in lora_model.parameters():
                 param.data.zero_()
+
         pseudo_lora_dir = f"{lora_output_dir}/pseudo_lora_{lora_idx}"
         lora_model.save_pretrained(pseudo_lora_dir)
         lora_output_paths.append(pseudo_lora_dir)
     return lora_output_paths
+
+
+def get_test_prompts(use_code_prompts: bool = False) -> list[str]:
+    """Get test prompts for LoRA testing.
+
+    Args:
+        use_code_prompts: If True, return code-related prompts. If False, return general prompts.
+
+    Returns:
+        List of test prompts.
+    """
+    if use_code_prompts:
+        return [
+            "Write a function that outputs the fibonacci sequence.",
+            "Convert the following C++ code to Python:  x = 0;x++;",
+            "Find the largest prime factor of 42.",
+            "write a unit test for this function: $(cat fib.py)",
+            "# A simple python function to remove whitespace from a string:",
+            "How to load CodeLlama from HuggingFace?",
+        ]
+    else:
+        return [
+            "Hey how are you doing today?",
+            "How is the weather in Seattle, WA?",
+            "Is it ok to fill diesel in a petrol car?",
+            "Can you check the top 5 trending songs on spotify?",
+            "What is the capital of France?",
+            "How to load CodeLlama from HuggingFace?",
+        ]
+
+
+def get_test_prompts_for_torch() -> list[str]:
+    """Get test prompts for LoRA Torch testing.
+
+    Returns:
+        List of test prompts.
+    """
+    return [
+        "Hey how are you doing today?",
+        "How is the weather in Seattle, WA?",
+        "Is it ok to fill diesel in a petrol car?",
+        "Can you check the top 5 trending songs on spotify?",
+        "What is the capital of France?",
+    ]
 
 
 def test_multi_lora_support(
@@ -771,7 +841,9 @@ def test_multi_lora_support(
     zero_lora_weights=True,
     use_code_prompts=False,
 ):
+    start_time = time.time()
     print("Creating dummy LoRAs...")
+    lora_start = time.time()
     lora_paths = generate_dummy_loras(
         hf_model_dir=hf_model_dir,
         lora_output_dir=llm_venv.get_working_directory(),
@@ -779,8 +851,13 @@ def test_multi_lora_support(
         lora_rank=lora_rank,
         target_modules=target_hf_modules,
         zero_weights=zero_lora_weights)
+    lora_end = time.time()
+    print(
+        f"Creating dummy LoRAs completed in {(lora_end - lora_start):.2f} seconds."
+    )
 
     print("Build engines...")
+    build_start = time.time()
     build_cmd = [
         "trtllm-build",
         f"--checkpoint_dir={tllm_ckpt_dir}",
@@ -801,27 +878,14 @@ def test_multi_lora_support(
         "--max_beam_width=1",
     ]
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
+    build_end = time.time()
+    print(
+        f"Build engines completed in {(build_end - build_start):.2f} seconds.")
 
-    if use_code_prompts:
-        input_prompts = [
-            "Write a function that outputs the fibonacci sequence.",
-            "Convert the following C++ code to Python:  x = 0;x++;",
-            "Find the largest prime factor of 42.",
-            "write a unit test for this function: $(cat fib.py)",
-            "# A simple python function to remove whitespace from a string:",
-            "How to load CodeLlama from HuggingFace?",
-        ]
-    else:
-        input_prompts = [
-            "Hey how are you doing today?",
-            "How is the weather in Seattle, WA?",
-            "Is it ok to fill diesel in a petrol car?",
-            "Can you check the top 5 trending songs on spotify?",
-            "What is the capital of France?",
-            "How to load CodeLlama from HuggingFace?",
-        ]
+    input_prompts = get_test_prompts(use_code_prompts)
 
     print("Run inference with C++ runtime with pybind...")
+    inference_start = time.time()
     run_script = f"{example_root}/../../../run.py" if "core" in example_root else f"{example_root}/../run.py"
     run_cmd = [
         run_script,
@@ -842,6 +906,125 @@ def test_multi_lora_support(
         "--max_output_len=30",
     ]
     venv_check_call(llm_venv, run_cmd)
+    inference_end = time.time()
+    print(
+        f"Inference completed in {(inference_end - inference_start):.2f} seconds."
+    )
+
+    total_time = time.time() - start_time
+    print(
+        f"Total test_multi_lora_support execution time: {total_time:.2f} seconds"
+    )
+
+
+def test_llm_torch_multi_lora_support(
+        hf_model_dir,
+        llm_venv,
+        num_loras=2,
+        lora_rank=8,
+        target_hf_modules=["q_proj", "k_proj", "v_proj"],
+        target_trtllm_modules=["attn_q", "attn_k", "attn_v"],
+        zero_lora_weights=True,
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+        expected_outputs=None):
+    """Test multi-LoRA support with LLM-API Torch backend."""
+
+    # if expected_outputs is None:
+    #     raise ValueError("expected_outputs must be provided for exact validation")
+
+    start_time = time.time()
+    print("Creating dummy LoRAs...")
+    lora_start = time.time()
+
+    lora_paths = generate_dummy_loras(
+        hf_model_dir=hf_model_dir,
+        lora_output_dir=llm_venv.get_working_directory(),
+        num_loras=num_loras,
+        lora_rank=lora_rank,
+        target_modules=target_hf_modules,
+        zero_weights=zero_lora_weights)
+    lora_end = time.time()
+    print(
+        f"Creating dummy LoRAs completed in {(lora_end - lora_start):.2f} seconds."
+    )
+
+    print("Initializing LLM_torch with LoRA support...")
+    init_start = time.time()
+
+    lora_config = LoraConfig(lora_dir=lora_paths,
+                             max_lora_rank=lora_rank,
+                             max_loras=num_loras,
+                             max_cpu_loras=num_loras,
+                             lora_target_modules=target_trtllm_modules)
+
+    input_prompts = get_test_prompts_for_torch()
+
+    with LLM_torch(
+            model=hf_model_dir,
+            lora_config=lora_config,
+            tensor_parallel_size=tensor_parallel_size,
+            pipeline_parallel_size=pipeline_parallel_size,
+            dtype="bfloat16",
+            max_batch_size=8,  # From original test
+            max_input_len=512,  # From original test
+            max_seq_len=562,  # From original test
+            max_beam_width=1  # From original test
+    ) as llm:
+
+        init_end = time.time()
+        print(
+            f"LLM_torch initialization completed in {(init_end - init_start):.2f} seconds."
+        )
+
+        print("Running inference with LLM-API Torch backend...")
+        inference_start = time.time()
+
+        # Create LoRA requests for different adapters
+        lora_requests = []
+        for i in range(len(input_prompts)):
+            if i % 2 == 1:  # Add some requests without LoRA
+                lora_requests.append(None)
+            else:  # With LoRA
+                lora_requests.append(
+                    LoRARequest(f"lora-{i}", i,
+                                lora_paths[i % len(lora_paths)]))
+
+        sampling_params = SamplingParams(max_tokens=30,
+                                         top_p=0.5,
+                                         top_k=0,
+                                         temperature=0.0)
+
+        outputs = llm.generate(input_prompts,
+                               sampling_params=sampling_params,
+                               lora_request=lora_requests)
+
+        inference_end = time.time()
+        print(
+            f"Inference completed in {(inference_end - inference_start):.2f} seconds."
+        )
+
+        # Validate exact outputs
+        print("Validating exact outputs...")
+        assert len(outputs) == len(expected_outputs), \
+            f"Expected {len(expected_outputs)} outputs, got {len(outputs)}"
+
+        for i, (output, expected) in enumerate(zip(outputs, expected_outputs)):
+            actual_text = output.outputs[0].text
+            print(f"Prompt {i+1}: {input_prompts[i]}")
+            print(
+                f"LoRA: {lora_requests[i].lora_int_id if lora_requests[i] else 'None'}"
+            )
+            print(f"Expected: {expected}")
+            print(f"Actual: {actual_text}")
+            print("-" * 50)
+
+            # Exact string comparison
+            assert actual_text == expected, \
+                f"Output {i+1} mismatch:\nExpected: {expected!r}\nActual: {actual_text!r}"
+
+    total_time = time.time() - start_time
+    print(f"Total test execution time: {total_time:.2f} seconds")
 
 
 def get_dummy_spec_decoding_heads(hf_model_dir,
@@ -933,3 +1116,34 @@ def get_dummy_spec_decoding_heads(hf_model_dir,
     export_hf_checkpoint(model,
                          dtype=model.config.torch_dtype,
                          export_dir=os.path.join(save_dir, 'fp8'))
+
+
+def get_mmlu_accuracy(output):
+    mmlu_line = None
+    for line in output.split('\n'):
+        if "MMLU weighted average accuracy:" in line:
+            mmlu_line = line
+            break
+
+    if mmlu_line is None:
+        raise Exception(
+            f"Could not find 'MMLU weighted average accuracy:' in output. Full output:\n{output}"
+        )
+
+    mmlu_accuracy = float(
+        mmlu_line.split("MMLU weighted average accuracy: ")[1].split(" (")[0])
+
+    print(f"MMLU weighted average accuracy is: {mmlu_accuracy}")
+
+    return mmlu_accuracy
+
+
+def wait_for_server(host, port, timeout_seconds=180):
+    start_time = time.time()
+    while time.time() - start_time < timeout_seconds:
+        try:
+            with socket.create_connection((host, port), timeout=5):
+                return True
+        except (socket.error, ConnectionRefusedError, OSError):
+            time.sleep(2)
+    return False

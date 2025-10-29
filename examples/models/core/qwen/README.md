@@ -1,6 +1,6 @@
 # Qwen
 
-This document shows how to build and run a [Qwen](https://huggingface.co/Qwen) model in TensorRT-LLM on both single GPU, single node multi-GPU.
+This document shows how to build and run a [Qwen](https://huggingface.co/Qwen) model in TensorRT LLM on both single GPU, single node multi-GPU.
 
 - [Qwen](#qwen)
   - [Overview](#overview)
@@ -21,54 +21,58 @@ This document shows how to build and run a [Qwen](https://huggingface.co/Qwen) m
     - [Quick start](#quick-start)
       - [Run a single inference](#run-a-single-inference)
     - [Evaluation](#evaluation)
-    - [Model Quantization to FP4](#model-quantization-to-fp4)
+    - [Model Quantization](#model-quantization)
     - [Benchmark](#benchmark)
     - [Serving](#serving)
       - [trtllm-serve](#trtllm-serve)
       - [Disaggregated Serving](#disaggregated-serving)
-  - [Dynamo](#dynamo)
+    - [Eagle3](#eagle3)
+    - [Dynamo](#dynamo)
+  - [Qwen3-Next](#qwen3-next)
   - [Notes and Troubleshooting](#notes-and-troubleshooting)
   - [Credits](#credits)
 
 ## Overview
 
-The TensorRT-LLM Qwen implementation can be found in [models/qwen](../../../../tensorrt_llm/models/qwen/). The TensorRT-LLM Qwen example code is located in [`examples/models/core/qwen`](./). There is one main file:
+The TensorRT LLM Qwen implementation can be found in [models/qwen](../../../../tensorrt_llm/models/qwen/). The TensorRT LLM Qwen example code is located in [`examples/models/core/qwen`](./). There is one main file:
 
 * [`convert_checkpoint.py`](./convert_checkpoint.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the Qwen model.
 
 In addition, there are two shared files in the parent folder [`examples`](../../../) for inference and evaluation:
 
 * [`run.py`](../../../run.py) to run the inference on an input text;
-* [`summarize.py`](../../../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset.
+* [`summarize.py`](../../../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/abisee/cnn_dailymail) dataset.
 
 ## Support Matrix
-|   Model Name       | FP16/BF16  |  FP8  |  WO   |  AWQ  | GPTQ  |  SQ   |  TP   |  PP   |  Arch   |
-| :-------------:    |   :---:    | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :-----: |
-| Qwen-1_8B(-Chat)   |     Y      |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen-7B(-Chat)     |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen-14B(-Chat)    |     Y      |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen-72B(-Chat)    |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-0.5B(-Chat)|     Y      |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-1.8B(-Chat)|     Y      |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-4B(-Chat)  |     Y      |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-7B(-Chat)  |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-14B(-Chat) |     Y      |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-32B(-Chat) |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-72B(-Chat) |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-110B(-Chat)|     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-MoE-A2.7B(-Chat)|   Y   |   -   |   Y   |   -   |   -   |   -   |   Y   |   Y   | Ampere+ |
-| Qwen2-0.5B(-Instruct)|     Y    |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen2-1.5B(-Instruct)|     Y    |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen2-7B(-Instruct)|     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen2-57B-A14B(-Instruct)|  Y   |   -   |   Y   |   -   |   -   |   -   |   Y   |   Y   | Ampere+ |
-| Qwen2-72B(-Instruct)|     Y     |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen2.5-0.5B(-Instruct)|     Y  |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen2.5-3B(-Instruct)|     Y    |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen2.5-1.5B(-Instruct)|     Y  |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen2.5-7B(-Instruct)|     Y    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen2.5-32B(-Instruct)|     Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen2.5-72B(-Instruct)|     Y   |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| QwQ-32B            |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+|   Model Name       | FP16/BF16  |  FP8  |  nvfp4  |  WO   |  AWQ  | GPTQ  |  SQ   |  TP   |  PP   |  EP   |  Arch   |
+| :-------------:    |   :---:    | :---: | :-----: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :-----: |
+| Qwen-1_8B(-Chat)   |     Y      |   Y   |    -    |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen-7B(-Chat)     |     Y      |   Y   |    -    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen-14B(-Chat)    |     Y      |   Y   |    -    |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen-72B(-Chat)    |     Y      |   Y   |    -    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen1.5-0.5B(-Chat)|     Y      |   Y   |    -    |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen1.5-1.8B(-Chat)|     Y      |   Y   |    -    |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen1.5-4B(-Chat)  |     Y      |   Y   |    -    |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen1.5-7B(-Chat)  |     Y      |   Y   |    -    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen1.5-14B(-Chat) |     Y      |   Y   |    -    |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen1.5-32B(-Chat) |     Y      |   Y   |    -    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen1.5-72B(-Chat) |     Y      |   Y   |    -    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen1.5-110B(-Chat)|     Y      |   Y   |    -    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen1.5-MoE-A2.7B(-Chat)|   Y   |   -   |    -    |   Y   |   -   |   -   |   -   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen2-0.5B(-Instruct)|     Y    |   Y   |    -    |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen2-1.5B(-Instruct)|     Y    |   Y   |    -    |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen2-7B(-Instruct)|     Y      |   Y   |    -    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen2-57B-A14B(-Instruct)|  Y   |   -   |    -    |   Y   |   -   |   -   |   -   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen2-72B(-Instruct)|     Y     |   Y   |    -    |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen2.5-0.5B(-Instruct)|     Y  |   Y   |    -    |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen2.5-3B(-Instruct)|     Y    |   Y   |    -    |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen2.5-1.5B(-Instruct)|     Y  |   Y   |    -    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen2.5-7B(-Instruct)|     Y    |   Y   |    -    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen2.5-32B(-Instruct)|     Y   |   Y   |    -    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen2.5-72B(-Instruct)|     Y   |   Y   |    -    |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| QwQ-32B            |     Y      |   Y   |    -    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
+| Qwen3-32B          |     Y      |   Y   |    Y    |   -   |   -   |   -   |   -   |   Y   |   -   |   Y   | Hopper+ |
+| Qwen3-235B-A22B    |     Y      |   Y   |    Y    |   -   |   -   |   -   |   -   |   Y   |   -   |   Y   | Hopper+ |
 
 Please note that Y* sign means that the model does not support all the AWQ + TP combination.
 
@@ -82,9 +86,11 @@ Please note that Y* sign means that the model does not support all the AWQ + TP 
 
 Currently Qwen1 models does not support dynamic NTK and logn attention. Therefore, accuracy on long sequence input for the Qwen-7B and Qwen-14B model is not promised.
 
+For Qwen3 models, we only list the largest models for dense and MoE architectures, but models of other sizes follow similar patterns.
+
 ## Usage
 
-The TensorRT-LLM Qwen example code locates at [examples/models/core/qwen](./). It takes HF weights as input, and builds the corresponding TensorRT engines. The number of TensorRT engines depends on the number of GPUs used to run inference.
+The TensorRT LLM Qwen example code locates at [examples/models/core/qwen](./). It takes HF weights as input, and builds the corresponding TensorRT engines. The number of TensorRT engines depends on the number of GPUs used to run inference.
 
 ### Download model weights
 
@@ -98,7 +104,7 @@ pip install -r requirements.txt
 git lfs install
 ```
 
-Download one or more Qwen models that you would like to build to TensorRT-LLM engines. You may download from the [HuggingFace](https://huggingface.co) hub:
+Download one or more Qwen models that you would like to build to TensorRT LLM engines. You may download from the [HuggingFace](https://huggingface.co) hub:
 
 ```bash
 git clone https://huggingface.co/Qwen/Qwen-7B-Chat   ./tmp/Qwen/7B
@@ -108,9 +114,9 @@ git clone https://huggingface.co/Qwen/Qwen-72B-Chat  ./tmp/Qwen/72B
 
 ### Build TensorRT engine(s)
 
-The [`convert_checkpoint.py`](./convert_checkpoint.py) script converts HF weights to TensorRT-LLM checkpoints.
+The [`convert_checkpoint.py`](./convert_checkpoint.py) script converts HF weights to TensorRT LLM checkpoints.
 
-The `trtllm-build` command builds TensorRT-LLM engines from TensorRT-LLM checkpoints. The number of engine files is also same to the number of GPUs used to run inference.
+The `trtllm-build` command builds TensorRT LLM engines from TensorRT LLM checkpoints. The number of engine files is also same to the number of GPUs used to run inference.
 
 Normally `trtllm-build` only requires single GPU, but if you've already got all the GPUs needed while inferencing, you could enable parallelly building to make the engine building process faster by adding `--workers` argument. Please note that currently `workers` feature only supports single node.
 
@@ -227,7 +233,7 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_sq \
 
 #### SmoothQuant
 
-The smoothquant supports Qwen models. Unlike the FP16 build where the HF weights are processed and loaded into the TensorRT-LLM directly, the SmoothQuant needs to load INT8 weights which should be pre-processed before building an engine.
+The smoothquant supports Qwen models. Unlike the FP16 build where the HF weights are processed and loaded into the TensorRT LLM directly, the SmoothQuant needs to load INT8 weights which should be pre-processed before building an engine.
 
 Example:
 ```bash
@@ -333,7 +339,7 @@ To run the AWQ Qwen example, the following steps are required:
 
 ### Run
 
-To run a TensorRT-LLM Qwen model using the engines generated by `trtllm-build`
+To run a TensorRT LLM Qwen model using the engines generated by `trtllm-build`
 
 ```bash
 # With fp16 inference
@@ -581,8 +587,8 @@ Downloading and preparing dataset cnn_dailymail/3.0.0 to /root/.cache/huggingfac
 load rouge ...
 Downloading builder script: 5.60kB [00:00, 18.9MB/s]
 load rouge done
-[11/09/2023-02:24:06] [TRT-LLM] [I] TensorRT-LLM (total latency: 30.13867211341858 sec)
-[11/09/2023-02:24:06] [TRT-LLM] [I] TensorRT-LLM beam 0 result
+[11/09/2023-02:24:06] [TRT-LLM] [I] TensorRT LLM (total latency: 30.13867211341858 sec)
+[11/09/2023-02:24:06] [TRT-LLM] [I] TensorRT LLM beam 0 result
 [11/09/2023-02:24:06] [TRT-LLM] [I]   rouge1 : 26.35215119137573
 [11/09/2023-02:24:06] [TRT-LLM] [I]   rouge2 : 9.507814774384485
 [11/09/2023-02:24:06] [TRT-LLM] [I]   rougeL : 18.171982659482865
@@ -591,7 +597,7 @@ load rouge done
 
 ## Qwen3
 
-TensorRT-LLM now supports Qwen3, the latest version of the Qwen model series. This guide walks you through the examples to run the Qwen3 models using NVIDIA's TensorRT-LLM framework with the PyTorch backend. According to the support matrix, TensorRT-LLM provides comprehensive support for various Qwen3 model variants including:
+TensorRT LLM now supports Qwen3, the latest version of the Qwen model series. This guide walks you through the examples to run the Qwen3 models using NVIDIA's TensorRT LLM framework with the PyTorch backend. According to the support matrix, TensorRT LLM provides comprehensive support for various Qwen3 model variants including:
 
 - Qwen3-0.6B
 - Qwen3-1.7B
@@ -602,7 +608,7 @@ TensorRT-LLM now supports Qwen3, the latest version of the Qwen model series. Th
 - Qwen3-30B-A3B
 - Qwen3-235B-A22B
 
-Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html) for how to build TensorRT-LLM from source and start a TRT-LLM docker container if needed.
+Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html) for how to build TensorRT LLM from source and start a TRT-LLM docker container if needed.
 
 > [!NOTE]
 > This guide assumes that you replace placeholder values (e.g. `<YOUR_MODEL_DIR>`) with the appropriate paths.
@@ -620,10 +626,10 @@ git clone https://huggingface.co/Qwen/Qwen3-30B-A3B <YOUR_MODEL_DIR>
 
 #### Run a single inference
 
-To quickly run Qwen3, [examples/pytorch/quickstart_advanced.py](../../../pytorch/quickstart_advanced.py):
+To quickly run Qwen3, [examples/llm-api/quickstart_advanced.py](../../../llm-api/quickstart_advanced.py):
 
 ```bash
-python3 examples/pytorch/quickstart_advanced.py --model_dir Qwen3-30B-A3B/ --kv_cache_fraction 0.6
+python3 examples/llm-api/quickstart_advanced.py --model_dir Qwen3-30B-A3B/ --kv_cache_fraction 0.6
 ```
 
 ### Evaluation
@@ -652,7 +658,7 @@ trtllm-eval --model=Qwen3-30B-A3B/ --tokenizer=Qwen3-30B-A3B/ --backend=pytorch 
 
 ```
 
-### Model Quantization to FP4
+### Model Quantization
 
 To quantize the Qwen3 model for use with the PyTorch backend, we'll use NVIDIA's Model Optimizer (ModelOpt) tool. Follow these steps:
 
@@ -665,11 +671,14 @@ pushd TensorRT-Model-Optimizer
 pip install -e .
 
 # Quantize the Qwen3-235B-A22B model by nvfp4
+# By default, the checkpoint would be stored in `TensorRT-Model-Optimizer/examples/llm_ptq/saved_models_Qwen3-235B-A22B_nvfp4_hf/`.
 ./examples/llm_ptq/scripts/huggingface_example.sh --model Qwen3-235B-A22B/ --quant nvfp4 --export_fmt hf
+
+# Quantize the Qwen3-32B model by fp8_pc_pt
+# By default, the checkpoint would be stored in `TensorRT-Model-Optimizer/examples/llm_ptq/saved_models_Qwen3-32B_fp8_pc_pt_hf/`.
+./examples/llm_ptq/scripts/huggingface_example.sh --model Qwen3-32B/ --quant fp8_pc_pt --export_fmt hf
 popd
 ```
-
-By default, the checkpoint would be stored in `TensorRT-Model-Optimizer/examples/llm_ptq/saved_models_Qwen3-235B-A22B_nvfp4_hf/`.
 
 ### Benchmark
 
@@ -692,7 +701,11 @@ concurrency=128
 path_data=./aa_prompt_isl_1k_osl_2k_qwen3_10000samples.txt
 
 # Setup the extra configuration for llm-api
-echo -e "disable_overlap_scheduler: false\nuse_cuda_graph: true\nprint_iter_log: true\ncuda_graph_batch_sizes: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,32,64,128]\nenable_attention_dp: true " > ${path_config}
+echo -e "disable_overlap_scheduler: false
+print_iter_log: true
+cuda_graph_config:
+  batch_sizes: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,32,64,128]
+enable_attention_dp: true " > ${path_config}
 
 # Run trtllm-bench with pytorch backend
 mpirun --allow-run-as-root --oversubscribe -n 1 \
@@ -733,19 +746,19 @@ To serve the model using `trtllm-serve`:
 
 ```bash
 cat >./extra-llm-api-config.yml <<EOF
-use_cuda_graph: true
-cuda_graph_padding_enabled: true
-cuda_graph_batch_sizes:
-- 1
-- 2
-- 4
-- 8
-- 16
-- 32
-- 64
-- 128
-- 256
-- 384
+cuda_graph_config:
+  enable_padding: true
+  batch_sizes:
+  - 1
+  - 2
+  - 4
+  - 8
+  - 16
+  - 32
+  - 64
+  - 128
+  - 256
+  - 384
 print_iter_log: true
 enable_attention_dp: true
 EOF
@@ -754,7 +767,6 @@ trtllm-serve \
   Qwen3-30B-A3B/ \
   --host localhost \
   --port 8000 \
-  --backend pytorch \
   --max_batch_size 161 \
   --max_num_tokens 1160 \
   --tp_size 1 \
@@ -793,7 +805,6 @@ trtllm-serve \
   Qwen3-30B-A3B/ \
   --host localhost \
   --port 8001 \
-  --backend pytorch \
   --max_batch_size 161 \
   --max_num_tokens 1160 \
   --tp_size 1 \
@@ -809,19 +820,19 @@ And you can launch two generation servers on port 8002 and 8003 with:
 export TRTLLM_USE_UCX_KVCACHE=1
 
 cat >./gen-extra-llm-api-config.yml <<EOF
-use_cuda_graph: true
-cuda_graph_padding_enabled: true
-cuda_graph_batch_sizes:
-  - 1
-  - 2
-  - 4
-  - 8
-  - 16
-  - 32
-  - 64
-  - 128
-  - 256
-  - 384
+cuda_graph_config:
+  enable_padding: true
+  batch_sizes:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    - 64
+    - 128
+    - 256
+    - 384
 print_iter_log: true
 enable_attention_dp: true
 EOF
@@ -831,7 +842,6 @@ trtllm-serve \
   Qwen3-30B-A3B/ \
   --host localhost \
   --port ${port} \
-  --backend pytorch \
   --max_batch_size 161 \
   --max_num_tokens 1160 \
   --tp_size 1 \
@@ -880,10 +890,51 @@ Note that the optimal disaggregated serving configuration (i.e. tp/pp/ep mapping
 on the request parameters, the number of concurrent requests and the GPU type. It is recommended to experiment to identify optimal
 settings for your specific use case.
 
+#### Eagle3
+
+Qwen3 now supports Eagle3 (Speculative Decoding with Eagle3). To enable Eagle3 on Qwen3, you need to set the following arguments when running `trtllm-bench` or `trtllm-serve`:
+
+- `speculative_config.decoding_type: Eagle`
+  Set the decoding type to "Eagle" to enable Eagle3 speculative decoding.
+- `speculative_config.max_draft_len: 3`
+  Set the maximum number of draft tokens generated per step (this value can be adjusted as needed).
+- `speculative_config.speculative_model_dir: <EAGLE3_DRAFT_MODEL_PATH>`
+  Specify the path to the Eagle3 draft model (ensure the corresponding draft model weights are prepared).
+
+Currently, there are some limitations when enabling Eagle3:
+
+1. `attention_dp` is not supported. Please disable it or do not set the related flag (it is disabled by default).
+2. If you want to use `enable_block_reuse`, the kv cache type of the target model and the draft model must be the same. Since the draft model only supports fp16/bf16, you need to disable `enable_block_reuse` when using fp8 kv cache.
+
+Example `extra-llm-api-config.yml` snippet for Eagle3:
+
+```bash
+echo "
+enable_attention_dp: false
+speculative_config:
+    decoding_type: Eagle
+    max_draft_len: 3
+    speculative_model_dir: <EAGLE3_DRAFT_MODEL_PATH>
+kv_cache_config:
+    enable_block_reuse: false
+" >> ${path_config}
+```
+
+For further details, please refer to [speculative-decoding.md](../../../../docs/source/advanced/speculative-decoding.md)
+
 ### Dynamo
 
 NVIDIA Dynamo is a high-throughput low-latency inference framework designed for serving generative AI and reasoning models in multi-node distributed environments.
-Dynamo supports TensorRT-LLM as one of its inference engine. For details on how to use TensorRT-LLM with Dynamo please refer to [LLM Deployment Examples using TensorRT-LLM](https://github.com/ai-dynamo/dynamo/blob/main/examples/tensorrt_llm/README.md)
+Dynamo supports TensorRT LLM as one of its inference engine. For details on how to use TensorRT LLM with Dynamo please refer to [LLM Deployment Examples using TensorRT-LLM](https://github.com/ai-dynamo/dynamo/blob/main/examples/tensorrt_llm/README.md)
+
+## Qwen3-Next
+
+Below is the command to run the Qwen3-Next model.
+
+```bash
+mpirun -n 1 --allow-run-as-root --oversubscribe python3 examples/llm-api/quickstart_advanced.py --model_dir /Qwen3-Next-80B-A3B-Thinking --kv_cache_fraction 0.6 --disable_kv_cache_reuse --max_batch_size 1 --tp_size 4
+
+```
 
 ## Notes and Troubleshooting
 

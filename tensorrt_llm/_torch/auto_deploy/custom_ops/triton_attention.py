@@ -41,6 +41,8 @@ def _generate_mha(
     input_pos: torch.Tensor,
     scale: float,
     out: torch.Tensor,
+    sinks: Optional[torch.Tensor] = None,
+    sliding_window: Optional[int] = None,
 ):
     b, (n_heads, q_d_head) = q.shape[0], q.shape[-2:]
     max_seq_len, n_kv_heads = k_cache.shape[1:3]
@@ -97,7 +99,10 @@ def _generate_mha(
         v_d_head,
         SEQ_BLOCK_SIZE,
         HEAD_BLOCK_SIZE,
+        sliding_window if sliding_window is not None else -1,
     )
+    has_sinks = sinks is not None
+
     attention_kv_stage2[(b, n_heads, 1)](
         stage1_output_values,
         stage1_output_logsumexp,
@@ -107,6 +112,8 @@ def _generate_mha(
         n_heads,
         v_d_head,
         SEQ_BLOCK_SIZE,
+        has_sinks,
+        sinks,
     )
 
 
@@ -122,6 +129,8 @@ def _flattened_context_mha(
     seq_start: torch.Tensor,
     scale: float,
     out: torch.Tensor,
+    sinks: Optional[torch.Tensor] = None,
+    sliding_window: Optional[int] = None,
 ) -> None:
     # NOTE: s_total == sum(seq_len)
     s_total, n_heads, q_d_head = q.shape
@@ -149,6 +158,8 @@ def _flattened_context_mha(
 
     # TODO: use input_pos to get the correct cache locations
     grid = (BATCH_SIZE, n_heads, (max(seq_len) + SEQ_BLOCK - 1) // SEQ_BLOCK)
+    has_sinks = sinks is not None
+
     context_attention_kv_flattened[grid](
         q,
         seq_len,
@@ -165,11 +176,13 @@ def _flattened_context_mha(
         v_d_head,
         SEQ_BLOCK,
         max_cache_seq_len,
-        num_stages=2,
+        sliding_window if sliding_window is not None else -1,
+        has_sinks,
+        sinks,
     )
 
 
-@torch.library.custom_op("attention::flattened_mha_with_cache", mutates_args=())
+@torch.library.custom_op("auto_deploy::triton_attention_flattened_mha_with_cache", mutates_args=())
 def flattened_mha_with_cache(
     # Q, K, V
     q: torch.Tensor,
@@ -187,6 +200,8 @@ def flattened_mha_with_cache(
     # <none>
     # CONSTANTS
     scale: Optional[float],
+    sinks: Optional[torch.Tensor] = None,
+    sliding_window: Optional[int] = None,
 ) -> torch.Tensor:
     """Flattened MHA with cache that takes q, k, v in BSND layout.
 
@@ -223,7 +238,9 @@ def flattened_mha_with_cache(
     y = q.new_empty(*bs_view, num_heads, v_head_dim).contiguous()
     if s == 1:
         # generate-only phase
-        _generate_mha(q, k, v, k_cache, v_cache, cache_loc, input_pos, scale, y)
+        _generate_mha(
+            q, k, v, k_cache, v_cache, cache_loc, input_pos, scale, y, sinks, sliding_window
+        )
     else:
         # mixed context + generate phase
         _flattened_context_mha(
@@ -238,6 +255,8 @@ def flattened_mha_with_cache(
             seq_start,
             scale,
             y,
+            sinks,
+            sliding_window,
         )
 
     return y.view(*output_shape)
@@ -255,21 +274,26 @@ def flattened_mha_fake(
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     scale: Optional[float],
+    sinks: Optional[torch.Tensor] = None,
+    sliding_window: Optional[int] = None,
 ):
     return q.new_empty(*q.shape[:-1], v.shape[-1]).contiguous()
 
 
-@torch.library.custom_op("attention::prepare_fused_mha_metadata", mutates_args=())
+@torch.library.custom_op(
+    "auto_deploy::triton_attention_prepare_fused_mha_metadata", mutates_args=()
+)
 def prepare_fused_mha_metadata(
-    input_ids: torch.Tensor,
     position_ids: torch.Tensor,
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
     cache_loc: torch.Tensor,
     pages_per_seq: torch.Tensor,
+    slot_idx: torch.Tensor,
     page_size: int,
 ) -> List[torch.Tensor]:
-    num_seq = SequenceInfo._get_sanitized_num_sequences(input_ids, seq_len)
+    # TODO: maybe use slot_idx instead of pages_per_seq??
+    num_seq = SequenceInfo._get_sanitized_num_sequences(position_ids, seq_len)
     seq_start = torch.zeros_like(seq_len[:num_seq])
     seq_start[1:] = torch.cumsum(seq_len[: num_seq - 1], 0)
     return (
@@ -284,9 +308,9 @@ def prepare_fused_mha_metadata(
 # SequenceInfo._get_sanitized_num_sequences could break in fake mode
 @prepare_fused_mha_metadata.register_fake
 def prepare_fused_mha_metadata_fake(
-    input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, page_size
+    position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size
 ):
-    num_seq = SequenceInfo._get_sanitized_num_sequences(input_ids, seq_len)
+    num_seq = SequenceInfo._get_sanitized_num_sequences(position_ids, seq_len)
     return (
         torch.empty_like(seq_len[:num_seq]),
         torch.empty_like(input_pos[:num_seq]),
@@ -295,8 +319,8 @@ def prepare_fused_mha_metadata_fake(
     )
 
 
-@AttentionRegistry.register("TritonWithFlattenedInputs")
-class TritonWithFlattenedInputs(AttentionDescriptor):
+@AttentionRegistry.register("triton")
+class TritonAttention(AttentionDescriptor):
     @classmethod
     def is_paged(cls) -> bool:
         """Return if the attention op is paged or not."""
@@ -314,15 +338,15 @@ class TritonWithFlattenedInputs(AttentionDescriptor):
 
     @classmethod
     def get_source_attention_op(cls) -> OpOverloadPacket:
-        return torch.ops.attention.bsnd_grouped_sdpa
+        return torch.ops.auto_deploy.torch_attention
 
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
-        return torch.ops.attention.flattened_mha_with_cache
+        return torch.ops.auto_deploy.triton_attention_flattened_mha_with_cache
 
     @classmethod
     def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
-        return torch.ops.attention.prepare_fused_mha_metadata, 4
+        return torch.ops.auto_deploy.triton_attention_prepare_fused_mha_metadata, 4
 
     @classmethod
     def get_cache_initializers(
@@ -336,7 +360,7 @@ class TritonWithFlattenedInputs(AttentionDescriptor):
         v_head_dim = v_fake.shape[3]
 
         def _get_k_cache(si: SequenceInfo):
-            assert not si.is_paged, "Paged cache not supported for TritonWithFlattenedInputs"
+            assert not si.is_paged, "Paged cache not supported for triton"
             return torch.empty(
                 si.num_pages,
                 si.page_size,
@@ -347,7 +371,7 @@ class TritonWithFlattenedInputs(AttentionDescriptor):
             )
 
         def _get_v_cache(si: SequenceInfo):
-            assert not si.is_paged, "Paged cache not supported for TritonWithFlattenedInputs"
+            assert not si.is_paged, "Paged cache not supported for triton"
             return torch.empty(
                 si.num_pages,
                 si.page_size,
@@ -365,6 +389,21 @@ class TritonWithFlattenedInputs(AttentionDescriptor):
 
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
+        # Sanity check: layout == "bsnd"
+        # Prefer kwargs; fall back to the final positional arg if it's a string.
+        layout = source_attn_node.kwargs.get("layout", None)
+        if (
+            layout is None
+            and len(source_attn_node.args) > 0
+            and isinstance(source_attn_node.args[-1], str)
+        ):
+            layout = source_attn_node.args[-1]
+        if layout != "bsnd":
+            raise RuntimeError(
+                f"Expected torch_attention layout='bsnd' but got {layout!r} "
+                f"for node: {source_attn_node.format_node()}"
+            )
+
         # retrieve head_dim from k_fake
         attn_mask, dropout_p, is_causal = extract_op_args(
             source_attn_node, "attn_mask", "dropout_p", "is_causal"
@@ -383,10 +422,14 @@ class TritonWithFlattenedInputs(AttentionDescriptor):
 
         # do a sanity check on the scale if it is not None, we only support the default scale
         # of 1/sqrt(head_dim) and so we should do an approximate check for that one
-        if not isinstance(scale, float):
-            ad_logger.warning("Provided scale is not a float, Using default scale instead.")
+        if not (isinstance(scale, float) or scale is None):
+            ad_logger.warning(f"Provided {scale=} is not a float. Using default scale instead.")
             scale = None
-
+        # Get sinks and sliding_window from args or kwargs
+        sinks = extract_op_args(source_attn_node, "sinks")[0]
+        sliding_window = extract_op_args(source_attn_node, "sliding_window")[0]
         return [
             scale,  # softmax scale
+            sinks,
+            sliding_window,
         ]

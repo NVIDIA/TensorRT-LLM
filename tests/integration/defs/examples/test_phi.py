@@ -15,13 +15,21 @@
 import csv
 import os
 
+import defs.ci_profiler
 import pytest
 from defs.common import (convert_weights, quantize_data,
+                         test_llm_torch_multi_lora_support,
                          test_multi_lora_support, venv_check_call,
                          venv_mpi_check_call)
 from defs.conftest import (get_device_memory, get_sm_version, skip_fp8_pre_ada,
                            skip_post_blackwell, skip_pre_ada)
 from defs.trt_test_alternative import check_call
+
+# skip trt flow cases on post-Blackwell-Ultra
+if get_sm_version() >= 103:
+    pytest.skip(
+        "TRT workflow tests are not supported on post Blackwell-Ultra architecture",
+        allow_module_level=True)
 
 
 @pytest.fixture(scope="module")
@@ -36,6 +44,7 @@ def phi_example_root(llm_root, llm_venv):
     return example_root
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_device_memory(40000)
 @pytest.mark.parametrize("num_beams", [1, 2, 4],
                          ids=lambda num_beams: f'nb:{num_beams}')
@@ -439,3 +448,35 @@ def test_phi_fp8_with_bf16_lora(llm_phi_model_root,
         target_trtllm_modules=trtllm_target_modules[model_name],
         zero_lora_weights=True,
     )
+
+
+@pytest.mark.skip(
+    reason="TODO: Resolve an import issue with transformers's LossKwargs")
+@skip_pre_ada
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize("llm_phi_model_root", ['Phi-4-mini-instruct'],
+                         indirect=True)
+def test_phi_4_mini_instruct_with_bf16_lora_torch(
+        phi_example_root, llm_datasets_root, qcache_dir_without_install_package,
+        llm_venv, engine_dir, llm_phi_model_root):
+    """Run Phi-4-mini-instruct with multiple dummy LoRAs using LLM-API Torch backend."""
+
+    expected_outputs = {
+        'Phi-4-mini-instruct': ["...", "...", "...", "...", "..."],
+    }
+
+    print("Testing with LLM-API Torch backend...")
+
+    defs.ci_profiler.start("test_llm_torch_multi_lora_support")
+    model_name = os.path.basename(llm_phi_model_root).lower()
+    test_llm_torch_multi_lora_support(
+        hf_model_dir=llm_phi_model_root,
+        llm_venv=llm_venv,
+        num_loras=2,
+        lora_rank=8,
+        target_hf_modules=["qkv_proj"],
+        target_trtllm_modules=["attn_qkv"],
+        zero_lora_weights=True,
+        tensor_parallel_size=1,
+        expected_outputs=expected_outputs[model_name])
+    defs.ci_profiler.stop("test_llm_torch_multi_lora_support")

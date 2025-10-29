@@ -104,6 +104,7 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, tg::MmaKind mmaKind, st
         else if ((fastestDimTileSizeBytes % 32) == 0)
         {
             swizzleType = CU_TENSOR_MAP_SWIZZLE_32B;
+            // This path is only for the scaling factors.
         }
         else if ((fastestDimTileSizeBytes % 16) == 0 && (dtype == tg::Dtype::UE8m0 || dtype == tg::Dtype::E4m3))
         {
@@ -180,8 +181,10 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, tg::MmaKind mmaKind, st
 
     if (result != CUDA_SUCCESS)
     {
+        char const* errorString;
+        cuGetErrorString(result, &errorString);
         std::stringstream ss;
-        ss << "Error: Failed to initialize the TMA descriptor " << result << std::endl;
+        ss << "Error: Failed to initialize the TMA descriptor. " << errorString << std::endl;
 
         ss << "tmaFormat: " << static_cast<int>(tmaDataFormat) << " dim: " << dim << " gmem: " << gmemAddr << std::endl;
 
@@ -282,8 +285,10 @@ inline CUtensorMap buildSfTmaDescriptor(tg::Dtype dtype, std::vector<uint64_t> c
 
     if (result != CUDA_SUCCESS)
     {
+        char const* errorString;
+        cuGetErrorString(result, &errorString);
         std::stringstream ss;
-        ss << "Error: Failed to initialize the TMA descriptor for SF " << result << std::endl;
+        ss << "Error: Failed to initialize the TMA descriptor for SF. " << errorString << std::endl;
 
         ss << "tmaFormat: " << static_cast<int>(tmaDataFormat) << " dim: " << dim << " gmem: " << gmemAddr << std::endl;
 

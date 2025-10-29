@@ -53,13 +53,12 @@ TEST(LoraConfigTest, invalidInputs)
 
     // This should work
     auto loraConfig = LoraConfig(1, weights, config);
+    // Having config only without weights is allowed
+    loraConfig = LoraConfig(1, std::nullopt, config);
 
     {
-        // Only one specified
-        testInvalid(1, std::nullopt, config, "must have both");
-
-        // Only one specified
-        testInvalid(1, weights, std::nullopt, "must have both");
+        // Only weights specified without config - not allowed
+        testInvalid(1, weights, std::nullopt, "lora weights must also have lora config");
     }
 
     {

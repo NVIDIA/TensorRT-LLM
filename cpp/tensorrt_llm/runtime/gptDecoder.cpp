@@ -36,11 +36,11 @@ using TensorConstPtr = ITensor::SharedConstPtr;
 using TensorPtr = ITensor::SharedPtr;
 
 template <typename T>
-GptDecoder<T>::GptDecoder(executor::DecodingMode const& mode, size_t maxBatchSize, size_t maxBeamWidth,
+GptDecoder<T>::GptDecoder(executor::DecodingMode const& mode, size_t maxNumSequences, size_t maxBeamWidth,
     size_t vocabSize, size_t vocabSizePadded, CudaStreamPtr const& stream,
     std::shared_ptr<SpeculativeDecodingModule const> speculativeDecodingModule)
     : mManager{std::make_shared<BufferManager>(stream)}
-    , mMaxBatchSize(maxBatchSize)
+    , mMaxNumSequences(maxNumSequences)
     , mVocabSize(vocabSize)
     , mVocabSizePadded(vocabSizePadded)
     , mDecodingMode{mode}
@@ -48,7 +48,7 @@ GptDecoder<T>::GptDecoder(executor::DecodingMode const& mode, size_t maxBatchSiz
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto const decodingDomain = tensorrt_llm::layers::DecoderDomain(
-        maxBatchSize, maxBeamWidth, vocabSize, vocabSizePadded, speculativeDecodingModule);
+        maxNumSequences, maxBeamWidth, vocabSize, vocabSizePadded, speculativeDecodingModule);
     mDynamicDecodeLayer = std::make_shared<tensorrt_llm::layers::DynamicDecodeLayer<T>>(mode, decodingDomain, mManager);
 
     mDecodingLayerWorkspace = std::make_unique<tensorrt_llm::runtime::DecodingLayerWorkspace>(
@@ -65,7 +65,7 @@ void GptDecoder<T>::disableLookahead(
 
     mDecodingMode = executor::DecodingMode::TopKTopP();
     auto const decodingDomain
-        = tensorrt_llm::layers::DecoderDomain(mMaxBatchSize, 1, mVocabSize, mVocabSizePadded, nullptr);
+        = tensorrt_llm::layers::DecoderDomain(mMaxNumSequences, 1, mVocabSize, mVocabSizePadded, nullptr);
 
     auto setupParams = std::make_shared<layers::DynamicDecodeSetupParams>();
 
@@ -84,6 +84,7 @@ void GptDecoder<T>::disableLookahead(
     penaltyParams->repetitionPenalty = mSamplingConfig.repetitionPenalty;
     penaltyParams->presencePenalty = mSamplingConfig.presencePenalty;
     penaltyParams->frequencyPenalty = mSamplingConfig.frequencyPenalty;
+    penaltyParams->promptIgnoreLength = mSamplingConfig.promptIgnoreLength;
     penaltyParams->temperature = mSamplingConfig.temperature;
     penaltyParams->minLength = mSamplingConfig.minLength;
 
@@ -136,6 +137,7 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
     penaltyParams->repetitionPenalty = mSamplingConfig.repetitionPenalty;
     penaltyParams->presencePenalty = mSamplingConfig.presencePenalty;
     penaltyParams->frequencyPenalty = mSamplingConfig.frequencyPenalty;
+    penaltyParams->promptIgnoreLength = mSamplingConfig.promptIgnoreLength;
     penaltyParams->temperature = mSamplingConfig.temperature;
     penaltyParams->minLength = mSamplingConfig.minLength;
 
@@ -286,7 +288,7 @@ std::shared_ptr<tl::StopCriteriaDecodingInputs> prepareStopCriteriaInputs(Decodi
 }
 
 void prepareMedusaInputs(
-    DecodingInput const& inputs, size_t maxBatchSize, std::shared_ptr<tl::DecodingInputs>& baseInputs)
+    DecodingInput const& inputs, size_t maxNumSequences, std::shared_ptr<tl::DecodingInputs>& baseInputs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -303,7 +305,7 @@ void prepareMedusaInputs(
     {
         std::vector<std::vector<TensorPtr>> medusaLogits;
         auto const batchSize = medusaInputs.medusaLogits.size();
-        medusaLogits.resize(maxBatchSize);
+        medusaLogits.resize(maxNumSequences);
         for (size_t bi = 0; bi < batchSize; ++bi)
         {
             auto const slot = batchSlots[bi];
@@ -412,7 +414,7 @@ void prepareEagleInput(DecodingInput const& inputs, std::shared_ptr<tl::Decoding
 
 template <typename T>
 std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
-    DecodingInput const& input, size_t maxBatchSize, tle::DecodingMode const& decodingMode)
+    DecodingInput const& input, size_t maxNumSequences, tle::DecodingMode const& decodingMode)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -470,21 +472,11 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
     // No logits for explicit draft tokens and eagle
     if (!decodingMode.isExplicitDraftTokens() && !decodingMode.isEagle())
     {
-        if (input.logitsVec)
+        for (auto const& logits : input.logitsVec)
         {
-            std::vector<TensorConstPtr> logitsVec;
-            for (auto const& logits : input.logitsVec.value())
-            {
-                TLLM_CHECK(logits->getDataType() == TRTDataType<T>::value);
-                logitsVec.push_back(logits);
-            }
-            forwardParams->logitsVec = logitsVec;
+            TLLM_CHECK(logits->getDataType() == TRTDataType<T>::value);
         }
-        else if (input.logits)
-        {
-            TLLM_CHECK(input.logits->getDataType() == TRTDataType<T>::value);
-            forwardParams->logits = input.logits;
-        }
+        forwardParams->logitsVec = input.logitsVec;
     }
 
     if (input.embeddingBias)
@@ -509,7 +501,7 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
     // Speculative decoding
     if (decodingMode.isMedusa())
     {
-        prepareMedusaInputs(input, maxBatchSize, forwardParams);
+        prepareMedusaInputs(input, maxNumSequences, forwardParams);
     }
     else if (decodingMode.isExplicitDraftTokens())
     {
@@ -749,7 +741,7 @@ void GptDecoder<T>::forwardAsync(DecodingOutput& output, DecodingInput const& in
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto forwardParams = prepareInputs<T>(input, mMaxBatchSize, mDecodingMode);
+    auto forwardParams = prepareInputs<T>(input, mMaxNumSequences, mDecodingMode);
     auto outputParams = prepareOutputs(output, mDecodingMode);
     mDynamicDecodeLayer->forwardAsync(outputParams, forwardParams, mDecodingLayerWorkspace);
 
@@ -760,7 +752,7 @@ template <typename T>
 void GptDecoder<T>::forwardSync(DecodingOutput& output, DecodingInput const& input)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto forwardParams = prepareInputs<T>(input, mMaxBatchSize, mDecodingMode);
+    auto forwardParams = prepareInputs<T>(input, mMaxNumSequences, mDecodingMode);
     auto outputParams = prepareOutputs(output, mDecodingMode);
 
     mDynamicDecodeLayer->forwardSync(outputParams, forwardParams, mDecodingLayerWorkspace);

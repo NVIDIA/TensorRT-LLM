@@ -17,12 +17,14 @@
 
 #pragma once
 
+#include "tensorrt_llm/batch_manager/trtGptModel.h"
+#include "tensorrt_llm/batch_manager/trtGptModelInflightBatching.h"
+#include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/rawEngine.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
-#include "trtGptModelInflightBatching.h"
 
 #include <NvInferPlugin.h>
 
@@ -38,28 +40,31 @@ public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
     static std::shared_ptr<TrtGptModel> create(std::filesystem::path const& trtEnginePath, TrtGptModelType modelType,
-        TrtGptModelOptionalParams const& optionalParams = TrtGptModelOptionalParams())
+        executor::ExecutorConfig const& executorConfig, bool isLeaderInOrchMode)
     {
         auto const jsonConfig = runtime::GptJsonConfig::parse(trtEnginePath / "config.json");
-        auto worldConfig = getWorldConfig(jsonConfig, optionalParams.deviceIds);
+        auto const& deviceIds = executorConfig.getParallelConfig().value_or(executor::ParallelConfig()).getDeviceIds();
+        auto const worldConfig = getWorldConfig(jsonConfig, deviceIds);
         auto const enginePath = trtEnginePath / jsonConfig.engineFilename(worldConfig);
 
         auto const& modelConfig = jsonConfig.getModelConfig();
-        return create(runtime::RawEngine(enginePath), modelConfig, worldConfig, modelType, optionalParams);
+        return create(
+            runtime::RawEngine(enginePath), modelConfig, worldConfig, modelType, executorConfig, isLeaderInOrchMode);
     }
 
     static std::shared_ptr<TrtGptModel> create(std::filesystem::path const& trtEnginePath, TrtGptModelType modelType,
         runtime::GptJsonConfig const& jsonConfig, runtime::WorldConfig const& worldConfig,
-        TrtGptModelOptionalParams const& optionalParams = TrtGptModelOptionalParams())
+        executor::ExecutorConfig const& executorConfig, bool isLeaderInOrchMode)
     {
         auto const enginePath = trtEnginePath / jsonConfig.engineFilename(worldConfig);
         auto const& modelConfig = jsonConfig.getModelConfig();
-        return create(runtime::RawEngine(enginePath), modelConfig, worldConfig, modelType, optionalParams);
+        return create(
+            runtime::RawEngine(enginePath), modelConfig, worldConfig, modelType, executorConfig, isLeaderInOrchMode);
     }
 
     static std::shared_ptr<TrtGptModel> create(runtime::RawEngine const& rawEngine,
         runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig, TrtGptModelType modelType,
-        TrtGptModelOptionalParams const& optionalParams = TrtGptModelOptionalParams())
+        executor::ExecutorConfig const& executorConfig, bool isLeaderInOrchMode)
     {
         auto logger = std::make_shared<runtime::TllmLogger>();
         auto const device = worldConfig.getDevice();
@@ -69,12 +74,13 @@ public:
 
         if ((modelType == TrtGptModelType::InflightBatching) || (modelType == TrtGptModelType::InflightFusedBatching))
         {
-            TrtGptModelOptionalParams const& fixedOptionalParams
-                = TrtGptModelInflightBatching::optionalParamsAreValid(modelConfig, optionalParams)
-                ? optionalParams
-                : TrtGptModelInflightBatching::fixOptionalParams(modelConfig, optionalParams);
-            return std::make_shared<TrtGptModelInflightBatching>(logger, modelConfig, worldConfig, rawEngine,
-                (modelType == TrtGptModelType::InflightFusedBatching), fixedOptionalParams);
+            executor::ExecutorConfig const& fixedExecutorConfig
+                = TrtGptModelInflightBatching::executorConfigIsValid(modelConfig, executorConfig)
+                ? executorConfig
+                : TrtGptModelInflightBatching::fixExecutorConfig(modelConfig, executorConfig);
+            bool const ctxGenFusion = modelType == TrtGptModelType::InflightFusedBatching;
+            return std::make_shared<TrtGptModelInflightBatching>(
+                logger, modelConfig, worldConfig, rawEngine, ctxGenFusion, fixedExecutorConfig, isLeaderInOrchMode);
         }
 
         throw std::runtime_error("Invalid modelType in trtGptModelFactory");

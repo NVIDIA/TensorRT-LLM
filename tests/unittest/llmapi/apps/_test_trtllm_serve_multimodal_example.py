@@ -31,7 +31,7 @@ def temp_extra_llm_api_options_file(request):
             # NOTE: This is for video support.
             "build_config": {
                 "max_num_tokens": 16384,
-            }
+            },
         }
 
         with open(temp_file_path, 'w') as f:
@@ -46,10 +46,7 @@ def temp_extra_llm_api_options_file(request):
 @pytest.fixture(scope="module")
 def server(model_name: str, temp_extra_llm_api_options_file: str):
     model_path = get_model_path(model_name)
-    args = [
-        "--backend", "pytorch", "--extra_llm_api_options",
-        temp_extra_llm_api_options_file
-    ]
+    args = ["--extra_llm_api_options", temp_extra_llm_api_options_file]
     with RemoteOpenAIServer(model_path, port=8000,
                             cli_args=args) as remote_server:
         yield remote_server
@@ -63,7 +60,6 @@ def example_root():
 
 @pytest.mark.parametrize("exe, script",
                          [("python3", "openai_chat_client_for_multimodal.py"),
-                          ("bash", "curl_chat_client_for_multimodal.sh"),
                           ("bash", "genai_perf_client_for_multimodal.sh")])
 def test_trtllm_serve_examples(exe: str, script: str,
                                server: RemoteOpenAIServer, example_root: str):

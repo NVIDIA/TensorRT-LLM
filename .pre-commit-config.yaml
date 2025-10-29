@@ -27,6 +27,7 @@ repos:
         args: [--allow-multiple-documents]
         exclude: ".*/gitlab/.*.yml"
     -   id: trailing-whitespace
+        exclude: '\.(patch|md)$'
     -   id: check-toml
     -   id: mixed-line-ending
         args: [--fix=lf]
@@ -65,7 +66,7 @@ repos:
         additional_dependencies:
         - tomli
         # add ignore words list
-        args: ["-L", "Mor,ans,thirdparty"]
+        args: ["-L", "Mor,ans,thirdparty", "--skip", "ATTRIBUTIONS-*.md"]
 -   repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.9.4
     hooks:
@@ -83,6 +84,11 @@ repos:
         files: ".*/auto_deploy/.*"
 -   repo: local
     hooks:
+    -   id: test lists format
+        name: Check for tabs and multiple spaces in test_lists txt files
+        entry: ./scripts/format_test_list.py
+        language: script
+        files: tests/integration/test_lists/.*\.txt$
     -   id: DCO check
         name: Checks the commit message for a developer certificate of origin signature
         entry: ./scripts/dco_check.py

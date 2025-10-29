@@ -57,16 +57,16 @@ std::tuple<at::Tensor, at::Tensor> fp4_batched_quantize(
     outputShape[rank - 1] = k / 2;
 
     at::Tensor valueE2M1 = at::detail::empty_cuda(outputShape, FLOAT4_E2M1X2, self.device(), /* stride */ std::nullopt);
-    at::Tensor scaleFP8SF = at::detail::empty_cuda({b, tensorrt_llm::computeFP4SwizzledLayoutSFSize(m, k / sfVecSize)},
+    at::Tensor scaleFP8SF = at::detail::empty_cuda({b, tensorrt_llm::computeSwizzledLayoutSFSize(m, k / sfVecSize)},
         SF_DTYPE, self.device(), /* stride */ std::nullopt); // 2D tensor
 
     const thread_local int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
 
 #define LAUNCH_FP4_QUANTIZE_KERNEL(T)                                                                                  \
-    tensorrt_llm::kernels::invokeBatchedFP4Quantization(b, m, k, reinterpret_cast<T*>(self.data_ptr()),                \
+    tensorrt_llm::kernels::invokeFP4Quantization(b, m, k, reinterpret_cast<T*>(self.data_ptr()),                       \
         globalScale.data_ptr<float>(), reinterpret_cast<int64_t*>(valueE2M1.data_ptr()),                               \
-        reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), sfUseUE8M0, mMultiProcessorCount,                           \
-        at::cuda::getCurrentCUDAStream(self.get_device()));
+        reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), sfUseUE8M0, tensorrt_llm::QuantizationSFLayout::SWIZZLED,   \
+        mMultiProcessorCount, at::cuda::getCurrentCUDAStream(self.get_device()));
 
     if (self.scalar_type() == at::ScalarType::Half)
     {

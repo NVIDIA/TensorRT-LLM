@@ -52,6 +52,13 @@ enum class RoutingMethodType : int64_t
     Unspecified = 5,
 };
 
+inline int32_t maybeGetMinTokenCount(int32_t numPaddedTokens, int32_t hiddenSize, int32_t dtypeSizeBits)
+{
+    // Pad so total size exceeds 128KiB for performance reasons
+    int32_t minNumTokensRequired = common::divUp(128 * 1024 * 8, hiddenSize * dtypeSizeBits);
+    return std::max(numPaddedTokens, minNumTokensRequired);
+}
+
 inline std::string serializeMoeRoutingMethodType(RoutingMethodType routingMethodType)
 {
     switch (routingMethodType)
@@ -65,34 +72,41 @@ inline std::string serializeMoeRoutingMethodType(RoutingMethodType routingMethod
     };
 }
 
+inline int32_t getMaxNumCtasInBatchDim(int32_t numTokens, int32_t topK, int32_t numExperts, int32_t tileTokensDim)
+{
+    // For MoE, mNumTokens != 0 and the number of CTAs is known only at runtime.
+    // We launch maximally possible number of CTAs and use ptrNumNonExitingCtas to determine
+    // the actual number of CTAs to run.
+
+    // Initialize number of tokens with the number of expanded tokens after routing.
+    int32_t numRemainingTokens = numTokens * topK;
+    int32_t maxNumCtasInBatchDim = 0;
+    // First, distribute one token each expert until token depletion to maximize CTA tile count.
+    int32_t numExpertsFilled = std::min(numExperts, numRemainingTokens);
+    maxNumCtasInBatchDim += numExpertsFilled;
+    numRemainingTokens -= numExpertsFilled;
+    // Next, greedily pour all remaining tokens to one expert to maximize CTA tile count.
+    // E.g., at this point tokens over 4 experts are [1, 1, 1, 1], and we have 4 tokens left.
+    // If each CTA handles 4 tokens/expert, the greedy strategy is to pour all remaining tokens
+    // to any one expert to get to the 5th CTA tile. Otherwise, we can only get 4 tiles in total.
+    //
+    // Another way to reason about this is to pour the remaining tokens into buckets of some fixed
+    // capacity. These buckets, if full, can then be attributed to any expert; it does not have to
+    // belong to the same expert every time.
+    if (numRemainingTokens > 0)
+    {
+        // For every tileTokenDim tokens, we add an extra CTA tile in the token dimension.
+        // The number of CTA tiles is given by divDown(numRemainingTokens, tokenTileDim).
+        maxNumCtasInBatchDim += (numRemainingTokens / tileTokensDim);
+    }
+    return maxNumCtasInBatchDim;
+}
+
 inline int32_t getMaxPermutedPaddedCount(
     int32_t numTokens, int32_t expertsPerToken, int32_t numExperts, int32_t padding)
 {
-    auto const expandedRowCount = numTokens * expertsPerToken;
-    auto const maxPaddingRequired = (padding - 1) * numExperts;
-    return common::roundUp(expandedRowCount + maxPaddingRequired, padding);
-}
-
-inline int32_t getMaxNumCtasInBatchDim(int32_t numTokens, int32_t topK, int32_t numExperts, int32_t tileTokensDim)
-{
-    // Get maximum number of CTAs in batch dim per expert.
-    auto const maxCtasInBatchDimPerExpert = common::ceilDiv(numTokens, tileTokensDim);
-    // Get maximum enabled experts.
-    auto const maxEnabledExperts = std::min(numTokens * topK, numExperts);
-    // Get maximum number of CTAs in batch dim.
-    auto maxNumCtasInBatchDim = maxEnabledExperts * maxCtasInBatchDimPerExpert;
-
-    // For large token counts, the above bound can be pessimistic since not all the tokens can
-    // be routed to all the enabled experts. Instead we can essentially bound the number of CTAs
-    // by permuted buffer size. However, this method will be overly pessimistic for low-token
-    // counts
-    auto const tilesForPermutedBuffer
-        = common::ceilDiv(getMaxPermutedPaddedCount(numTokens, topK, numExperts, tileTokensDim), tileTokensDim);
-
-    // Set maxNumCtasInBatchDim to be the minimum of the two methods
-    maxNumCtasInBatchDim = std::min(maxNumCtasInBatchDim, tilesForPermutedBuffer);
-
-    return maxNumCtasInBatchDim;
+    int32_t maxCtas = getMaxNumCtasInBatchDim(numTokens, expertsPerToken, numExperts, padding);
+    return maxCtas * padding;
 }
 
 class Runner
@@ -106,12 +120,13 @@ public:
         int32_t nGroups, int32_t topkGroups, int32_t localExpertOffset, int32_t localNumExperts,
         float routedScalingFactor, int32_t* routingExpertIndexes, int32_t* expertCountHistogram,
         int32_t* permutedIdxSize, int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToExpandedIdx,
-        int32_t* permutedIdxToTokenIdx, void* expertWeights, int32_t* numTokensPerExpert, int32_t* ctaIdxXyToBatchIdx,
-        int32_t* ctaIdxXyToMnLimit, int32_t* numNonExitingCtas, batchedGemm::trtllm::gen::Dtype dtypeElt,
-        bool useRoutingScalesOnInput, bool useDeepSeekFp8, RoutingMethodType routingMethodType, cudaStream_t stream);
+        int32_t* permutedIdxToTokenIdx, void* expertWeights, int32_t* expertIds, int32_t* numTokensPerExpert,
+        int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit, int32_t* numNonExitingCtas,
+        batchedGemm::trtllm::gen::Dtype dtypeElt, bool useRoutingScalesOnInput, bool useDeepSeekFp8,
+        RoutingMethodType routingMethodType, cudaStream_t stream);
 
 private:
-    int32_t mTileTokensDim{8};
+    int32_t mTileTokensDim;
 };
 } // namespace Routing
 
@@ -120,7 +135,8 @@ namespace PermuteGemm1
 class Runner
 {
 public:
-    explicit Runner(batchedGemm::trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8, int tileTokensDim);
+    explicit Runner(batchedGemm::trtllm::gen::Dtype dtypeAct, batchedGemm::trtllm::gen::Dtype dtypeWeights,
+        bool useDeepSeekFp8, int tileTokensDim, ActType actType);
 
     size_t getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts,
         int32_t numTokens, int32_t configIndex) const;
@@ -134,14 +150,16 @@ public:
     [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const;
 
     void run(void* hiddenState, void* hiddenStateScale, void* weight, void* weightScale, void* expertWeights,
-        float* outputScalesScalar, float* outputScalesGateScalar, void* output, void* outputScale, int32_t topK,
-        int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts, int32_t numTokens,
-        int32_t* permutedIdxToTokenIdx, int32_t* ptrNumNonExitingCtas, int32_t* ptrTotalNumPaddedTokens,
-        int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit, void* bmm1Workspace,
-        bool useRoutingScalesOnInput, int device, cudaStream_t stream, int32_t configIndex);
+        float* outputScalesScalar, float* outputScalesGateScalar, float* ptrBias, float* ptrSwiGluAlpha,
+        float* ptrSwiGluBeta, float* ptrClampLimit, void* output, void* outputScale, int32_t topK, int32_t hiddenSize,
+        int32_t intermediateSize, int32_t numExperts, int32_t numTokens, int32_t* permutedIdxToTokenIdx,
+        int32_t* ptrNumNonExitingCtas, int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
+        int32_t* ptrCtaIdxXyToMnLimit, void* bmm1Workspace, bool useRoutingScalesOnInput, int device,
+        cudaStream_t stream, int32_t configIndex);
 
 private:
-    batchedGemm::trtllm::gen::Dtype mDtypeElt;
+    batchedGemm::trtllm::gen::Dtype mDtypeAct;
+    batchedGemm::trtllm::gen::Dtype mDtypeWeights;
     int32_t mTileTokensDim;
     tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner mRunner;
 };
@@ -152,8 +170,8 @@ namespace Gemm2
 class Runner
 {
 public:
-    explicit Runner(batchedGemm::trtllm::gen::Dtype dtypeElt, batchedGemm::trtllm::gen::Dtype outputDtype,
-        bool useDeepSeekFp8, int tileTokensDim);
+    explicit Runner(batchedGemm::trtllm::gen::Dtype dtypeAct, batchedGemm::trtllm::gen::Dtype dtypeWeights,
+        batchedGemm::trtllm::gen::Dtype outputDtype, bool useDeepSeekFp8, int tileTokensDim);
 
     size_t getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts,
         int32_t numTokens, int32_t configIndex) const;
@@ -167,14 +185,15 @@ public:
     [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const;
 
     void run(void* permutedHiddenState, void* permutedHiddenStateScale, void* weight, void* weightScale,
-        float* outputScalesScalar, void* output, void* outputScale, int32_t topK, int32_t hiddenSize,
+        float* outputScalesScalar, float* ptrBias, void* output, void* outputScale, int32_t topK, int32_t hiddenSize,
         int32_t intermediateSize, int32_t numExperts, int32_t numTokens, int32_t* ptrNumNonExitingCtas,
         int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit,
         void* bmm2Workspace, int device, cudaStream_t stream, int32_t configIndex);
 
 private:
-    batchedGemm::trtllm::gen::Dtype mDtypeElt;
-    batchedGemm::trtllm::gen::Dtype mOutputDtype;
+    batchedGemm::trtllm::gen::Dtype mDtypeAct;
+    batchedGemm::trtllm::gen::Dtype mDtypeWeights;
+    batchedGemm::trtllm::gen::Dtype mDtypeOut;
     int32_t mTileTokensDim;
     tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner mRunner;
 };
@@ -194,15 +213,29 @@ struct MoERunnerArgs
     // and [num_tokens, hidden_size/16] in float for e2m1
     void* hidden_states_scale = nullptr;
 
+    // Optional inputs:
+    void* topk_weights = nullptr; // [num_tokens, top_k]  with quantized weights
+    int32_t* topk_ids = nullptr;  // [num_tokens, top_k] with expert ids in int32_t
+
     // Gemm input:
     void* gemm1_weights = nullptr;
     void* gemm1_weights_scale = nullptr;
     void* gemm2_weights = nullptr;
     void* gemm2_weights_scale = nullptr;
 
+    float* gemm1_bias = nullptr;
+    float* gemm1_alpha = nullptr;
+    float* gemm1_beta = nullptr;
+    float* gemm1_clamp_limit = nullptr;
+    float* gemm2_bias = nullptr;
+
     int32_t num_tokens{0};
     int32_t num_experts{0};
+    // Hidden dimension input of MoE block. It might be padded.
     int32_t hidden_size{0};
+    // Hidden dimension output of MoE block. It is not padded.
+    // If not provided it is the same as hidden_size.
+    std::optional<int32_t> hidden_size_output;
     // TODO: only compiled routing kernel supports top_k = 8
     int32_t top_k{0};
     int32_t n_group{0};
@@ -290,6 +323,8 @@ class Runner
 {
 public:
     // FIXME: tileTokensDim is hardcoded for now
+    Runner(batchedGemm::trtllm::gen::Dtype dtypeAct, batchedGemm::trtllm::gen::Dtype dtypeWeights, bool useDeepSeekFp8,
+        int tileTokensDim = 8, ActType actType = ActType::SwiGlu);
     Runner(batchedGemm::trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8, int tileTokensDim = 8);
 
     void run(

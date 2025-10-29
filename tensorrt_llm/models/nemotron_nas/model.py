@@ -15,7 +15,6 @@
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Type, Union
 
-from tensorrt_llm.bindings import KVCacheType
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AttentionMaskType, PositionEmbeddingType,
                                      Tensor, gather_last_token_logits, recv,
@@ -28,6 +27,7 @@ from tensorrt_llm.layers.linear import ColumnLinear
 from tensorrt_llm.layers.lora import LoraParams
 from tensorrt_llm.layers.mlp import GatedMLP
 from tensorrt_llm.layers.normalization import RmsNorm
+from tensorrt_llm.llmapi.kv_cache_type import KVCacheType
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.convert_utils import has_safetensors
 from tensorrt_llm.models.modeling_utils import DecoderModelForCausalLM
@@ -674,7 +674,7 @@ class DeciLMForCausalLM(DecoderModelForCausalLM):
             hf_model = transformers.AutoModelForCausalLM.from_pretrained(
                 hf_model_or_dir,
                 device_map='auto' if not load_model_on_cpu else 'cpu',
-                torch_dtype=dtype,
+                dtype=dtype,
                 trust_remote_code=trust_remote_code,
             )
             weights = load_weights_from_hf_model(hf_model, config)

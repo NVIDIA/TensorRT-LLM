@@ -13,9 +13,14 @@ import math
 from typing import Optional, Tuple
 
 import torch.nn.functional as F
-from cuda import cudart
+
+try:
+    from cuda.bindings import runtime as cudart
+except ImportError:
+    from cuda import cudart
+
 from huggingface_hub import hf_hub_download
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from safetensors import safe_open
 from torch import nn
 from transformers import (AutoConfig, AutoModelForCausalLM, AutoProcessor,
@@ -687,11 +692,10 @@ class MultimodalModelRunner:
 
         # Phi-4-multimodal uses pytorch engine due to issues with creating TRT engine.
         if self.model_type == "phi-4-multimodal":
-            model = AutoModelForCausalLM.from_pretrained(
-                self.args.hf_model_dir,
-                torch_dtype=torch.float16,
-                trust_remote_code=True,
-                device_map='cpu')
+            model = AutoModelForCausalLM.from_pretrained(self.args.hf_model_dir,
+                                                         dtype=torch.float16,
+                                                         trust_remote_code=True,
+                                                         device_map='cpu')
             self.vision_model = model.model.embed_tokens_extend.image_embed.to(
                 self.device).eval()
             self.image_newlines = {}
@@ -702,11 +706,10 @@ class MultimodalModelRunner:
             return
 
         if self.model_type == "phi-3-vision":
-            model = AutoModelForCausalLM.from_pretrained(
-                self.args.hf_model_dir,
-                torch_dtype=torch.float16,
-                trust_remote_code=True,
-                device_map='cpu')
+            model = AutoModelForCausalLM.from_pretrained(self.args.hf_model_dir,
+                                                         dtype=torch.float16,
+                                                         trust_remote_code=True,
+                                                         device_map='cpu')
             self.vision_model = model.model.vision_embed_tokens.to(
                 self.device).eval()
 
@@ -760,7 +763,7 @@ class MultimodalModelRunner:
     def init_audio_encoder(self):
         assert self.model_type == "phi-4-multimodal"
         model = AutoModelForCausalLM.from_pretrained(self.args.hf_model_dir,
-                                                     torch_dtype=torch.float16,
+                                                     dtype=torch.float16,
                                                      trust_remote_code=True,
                                                      device_map='cpu')
         self.audio_model = model.model.embed_tokens_extend.audio_embed.to(
@@ -854,7 +857,7 @@ class MultimodalModelRunner:
 
         from transformers import CLIPImageProcessor
         processor = CLIPImageProcessor.from_pretrained(
-            "openai/clip-vit-large-patch14", torch_dtype=torch.bfloat16)
+            "openai/clip-vit-large-patch14", dtype=torch.bfloat16)
         frames = processor.preprocess(frames,
                                       return_tensors="pt")['pixel_values']
         # make dtype consistent with vision encoder
@@ -2173,8 +2176,23 @@ class MultimodalModelRunner:
                 if image_path.startswith("http") or image_path.startswith(
                         "https"):
                     logger.info(f"downloading image from url {image_path}")
-                    response = requests.get(image_path, timeout=5)
-                    image = Image.open(BytesIO(response.content)).convert("RGB")
+                    try:
+                        response = requests.get(image_path, timeout=5)
+                        response.raise_for_status()
+                        if 'image' not in response.headers.get(
+                                'Content-Type', ''):
+                            raise Exception(
+                                f"URL does not point to an image: {image_path}."
+                            )
+                        image = Image.open(BytesIO(
+                            response.content)).convert("RGB")
+                    except (UnidentifiedImageError, IOError):
+                        raise Exception(
+                            f"Cannot identify image file at URL: {image_path}.")
+                    except Exception as e:
+                        raise Exception(
+                            f"Failed to download image from url {image_path}: {e}"
+                        )
                 else:
                     image = Image.open(image_path).convert("RGB")
                 images.append(image)
@@ -2216,6 +2234,7 @@ class MultimodalModelRunner:
             filepath = hf_hub_download(
                 repo_id="hf-internal-testing/fixtures_docvqa",
                 filename="nougat_paper.png",
+                revision="ec57bf8c8b1653a209c13f6e9ee66b12df0fc2db",
                 repo_type="dataset")
             images = Image.open(filepath)
         elif "fuyu" in self.model_type:
@@ -2631,7 +2650,7 @@ class MultimodalModelRunner:
                 )
                 image = None
         elif self.model_type in ['llava_onevision']:
-            pre_prompt = "<|im_start|>user "
+            pre_prompt = "<|im_start|>user " + "<video>" if self.args.video_path is not None else "<image>"
             if input_text is None:
                 input_text = "Question: which city is this? Answer:" if self.args.video_path is None else "Why is this video funny?"
             post_prompt = f"\n{input_text}<|im_end|><|im_start|>assistant\n"
@@ -2642,7 +2661,7 @@ class MultimodalModelRunner:
                                        text=prompt,
                                        return_tensors="pt")
             else:
-                image = self.processor(videos=raw_image,
+                image = self.processor(videos=list(raw_image),
                                        text=prompt,
                                        return_tensors="pt")
 

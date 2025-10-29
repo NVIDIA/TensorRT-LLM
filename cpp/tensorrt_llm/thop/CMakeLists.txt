@@ -34,16 +34,21 @@ set_property(TARGET th_utils PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 target_link_libraries(th_utils PUBLIC ${TORCH_LIBRARIES} ${CUBLAS_LIB}
                                       ${CURAND_LIB})
 
+# TODO This does not compile with internal cutlass MOE gemm
 add_library(
   th_common SHARED
   mlaPreprocessOp.cpp
   allgatherOp.cpp
   allreduceOp.cpp
+  alltoallOp.cpp
   attentionOp.cpp
   causalConv1dOp.cpp
   convertSpecDecodingMaskToPackedMaskOp.cpp
   cutlassScaledMM.cpp
   cublasScaledMM.cpp
+  cublasFp4ScaledMM.cpp
+  cudaNvfp4MM.cpp
+  cudaScaledMM.cpp
   dynamicDecodeOp.cpp
   fmhaPackMaskOp.cpp
   fp8Op.cpp
@@ -54,7 +59,9 @@ add_library(
   fp8BatchedGemmTrtllmGen.cpp
   fp4Quantize.cpp
   fp4BatchedQuantize.cpp
+  fp4xFp8GemmTrtllmGen.cpp
   fp8BlockScalingGemm.cpp
+  fp8RowwiseGemm.cpp
   fp8Quantize.cpp
   dsv3FusedAGemmOp.cpp
   fusedQKNormRopeOp.cpp
@@ -65,8 +72,12 @@ add_library(
   logitsBitmaskOp.cpp
   mambaConv1dOp.cpp
   moeOp.cpp
+  moeUtilOp.cpp
   moeCommOp.cpp
+  moeAlltoAllOp.cpp
   moeLoadBalanceOp.cpp
+  mxFp4BlockScaleMoe.cpp
+  mxFp8Quantize.cpp
   fp8BlockScaleMoe.cpp
   fp8PerTensorScaleMoe.cpp
   fp4BlockScaleMoe.cpp
@@ -77,16 +88,21 @@ add_library(
   reducescatterOp.cpp
   relativeAttentionBiasOp.cpp
   dsv3RouterGemmOp.cpp
-  renormMoeRoutingOp.cpp
+  customMoeRoutingOp.cpp
   selectiveScanOp.cpp
   userbuffersFinalizeOp.cpp
   userbuffersTensor.cpp
+  virtualMemoryAllocator.cpp
+  weightOnlyQuantGemm.cpp
   weightOnlyQuantOp.cpp
   mtpOp.cpp
-  loraOp.cpp)
+  loraOp.cpp
+  finegrained_mixed_dtype_gemm_thop.cpp
+  tinygemm2.cpp)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
-target_link_libraries(th_common PRIVATE ${TORCH_LIBRARIES} th_utils
-                                        ${Python3_LIBRARIES} ${SHARED_TARGET})
+target_link_libraries(
+  th_common PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}
+                    ${SHARED_TARGET} pg_utils)
 
 if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
   target_compile_definitions(th_common
@@ -102,6 +118,11 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
   target_compile_definitions(th_common PUBLIC USING_OSS_CUTLASS_MOE_GEMM)
 endif()
 
+if(ENABLE_CUBLASLT_FP4_GEMM)
+  target_compile_definitions(th_common PUBLIC ENABLE_CUBLASLT_FP4_GEMM)
+  target_link_libraries(th_common PRIVATE ${CUBLASLT_LIB})
+endif()
+
 if(ENABLE_MULTI_DEVICE)
   target_include_directories(th_common PUBLIC ${MPI_C_INCLUDE_DIRS})
   target_link_libraries(th_common PRIVATE ${MPI_C_LIBRARIES} ${NCCL_LIB}
@@ -110,9 +131,9 @@ endif()
 
 if(NOT WIN32)
   set_target_properties(
-    th_common
-    PROPERTIES LINK_FLAGS
-               "-Wl,-rpath='$ORIGIN' ${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}")
+    th_common PROPERTIES BUILD_RPATH "$ORIGIN;$ORIGIN/../../nvidia/nccl/lib")
+  set_target_properties(
+    th_common PROPERTIES LINK_FLAGS "${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}")
 else()
   target_link_libraries(th_common PRIVATE context_attention_src)
 endif()

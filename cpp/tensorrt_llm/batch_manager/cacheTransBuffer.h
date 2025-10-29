@@ -18,6 +18,7 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include <atomic>
@@ -59,7 +60,9 @@ public:
     CacheTransBufferManager(
         KVCacheManager::BaseKVCacheManager* cacheManager, std::optional<size_t> maxNumTokens = std::nullopt);
 
-    static size_t preAllocBufferSize(std::optional<size_t> maxNumTokens = std::nullopt);
+    static size_t preAllocBufferSize(std::map<SizeType32, SizeType32> const& cacheSizeBytesPerTokenPerWindow,
+        SizeType32 tokensPerBlock,
+        std::optional<executor::CacheTransceiverConfig> const& cacheTransceiverConfig = std::nullopt);
 
     std::optional<int> assignBufferIndexForSend();
     void freeBufferIndexForSend(std::optional<int> bufferId);
@@ -67,11 +70,11 @@ public:
     void freeBufferIndexForRecv(std::optional<int> bufferId);
 
     std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> getOrAllocateSendBuffers(
-        std::optional<int> bufferId, int targetNum, size_t targetBufferSize,
+        std::optional<int> bufferId, int targetNum, std::vector<size_t> const& targetBufferEleSizes,
         runtime::BufferManager const& bufferManagerToUse);
 
     std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> getOrAllocateRecvBuffers(
-        std::optional<int> bufferId, int targetNum, size_t targetBufferSize,
+        std::optional<int> bufferId, int targetNum, std::vector<size_t> const& targetBufferEleSizes,
         runtime::BufferManager const& bufferManagerToUse);
 
     runtime::ITensor::SharedPtr getSendBuffer(std::optional<int> bufferId);
@@ -90,8 +93,8 @@ private:
     };
 
     std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> getOrAllocateBuffers(std::optional<int> bufferId,
-        int targetNum, size_t targetBufferEleSize, runtime::BufferManager const& bufferManagerToUse,
-        ConcurrenceResource& concurrenceResource);
+        int targetNum, std::vector<size_t> const& targetBufferEleSizes,
+        runtime::BufferManager const& bufferManagerToUse, ConcurrenceResource& concurrenceResource);
 
     void allocateBuffer();
     std::optional<int> assignBufferIndex(ConcurrenceResource& resource, size_t bufferCount, bool onlyUseDynamicBuffer);

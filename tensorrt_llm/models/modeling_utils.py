@@ -19,7 +19,6 @@ from .._common import default_net
 from .._utils import (QuantModeWrapper, get_init_params, numpy_to_torch,
                       release_gc, str_dtype_to_torch, str_dtype_to_trt,
                       trt_dtype_to_torch)
-from ..bindings import KVCacheType
 from ..bindings.executor import RuntimeDefaults
 from ..functional import (PositionEmbeddingType, Tensor, allgather, constant,
                           cp_split_plugin, gather_last_token_logits,
@@ -31,6 +30,7 @@ from ..layers.attention import Attention, BertAttention
 from ..layers.linear import ColumnLinear, Linear, RowLinear
 from ..layers.lora import Dora, Lora
 from ..layers.moe import MOE, MoeOOTB
+from ..llmapi.kv_cache_type import KVCacheType
 from ..logger import logger
 from ..mapping import Mapping
 from ..module import Module, ModuleList
@@ -67,7 +67,7 @@ class Gemma2ConfigGroup:
 class Gemma3ConfigGroup:
     query_pre_attn_scalar: float
     final_logit_softcapping: Optional[float]
-    sliding_window_pattern: int
+    _sliding_window_pattern: int
     rope_local_base_freq: int
     sliding_window: int
 
@@ -97,6 +97,9 @@ class SpeculativeDecodingMode(IntFlag):
     EXPLICIT_DRAFT_TOKENS = auto()
     EAGLE = auto()
     NGRAM = auto()
+    USER_PROVIDED = auto()
+    SAVE_HIDDEN_STATES = auto()
+    AUTO = auto()
 
     @staticmethod
     def from_arguments(args: argparse.Namespace):
@@ -114,6 +117,12 @@ class SpeculativeDecodingMode(IntFlag):
             return SpeculativeDecodingMode.EAGLE
         elif args.speculative_decoding_mode == "ngram":
             return SpeculativeDecodingMode.NGRAM
+        elif args.speculative_decoding_mode == "user_provided":
+            return SpeculativeDecodingMode.USER_PROVIDED
+        elif args.speculative_decoding_mode == "auto":
+            return SpeculativeDecodingMode.AUTO
+        elif args.speculative_decoding_mode == "save_hidden_states":
+            return SpeculativeDecodingMode.SAVE_HIDDEN_STATES
         else:
             assert False, "Unknown speculative_decoding_mode " + args.speculative_decoding_mode
 
@@ -133,6 +142,7 @@ class QuantConfig:
         has_zero_point (bool): Whether to use zero point for quantization. Defaults to False.
         pre_quant_scale (bool): Whether to use pre-quant scale for quantization. Defaults to False.
         exclude_modules (List[str], optional): The module name patterns that are skipped in quantization. Defaults to None.
+        mamba_ssm_cache_dtype (str, optional): The data type for mamba SSM cache. Defaults to None.
     """
     quant_algo: Optional[QuantAlgo] = None
     kv_cache_quant_algo: Optional[QuantAlgo] = None
@@ -143,6 +153,7 @@ class QuantConfig:
     has_zero_point: bool = False
     pre_quant_scale: bool = False
     exclude_modules: Optional[List[str]] = None
+    mamba_ssm_cache_dtype: Optional[str] = None
 
     @cached_property
     def quant_mode(self) -> QuantModeWrapper:
@@ -728,9 +739,7 @@ class PretrainedModel(Module,
             config.set_rank(rank)
 
         rank = config.mapping.rank
-        if config.mapping.auto_parallel:
-            rank = 0
-        elif config.mapping.cp_size > 1:
+        if config.mapping.cp_size > 1:
             # tp_cp_pp rank -> tp_pp rank: because different cp ranks share the same ckpt
             tp_size = config.mapping.tp_size
             cp_size = config.mapping.cp_size
@@ -1225,6 +1234,11 @@ def fuse_gate_mlp(
                     mlp.gate.activation_scaling_factor.raw_value,
                     mlp.fc.activation_scaling_factor.raw_value,
                 )
+
+                if mlp.bias:
+                    fused_layer.fused_fc.bias.value = np.concatenate(
+                        [mlp.gate.bias.raw_value, mlp.fc.bias.raw_value],
+                        axis=0)
             elif layer_quant_algo is None:
                 fused_layer.fused_fc.weight.value = np.concatenate(
                     [
@@ -1291,7 +1305,7 @@ def unfuse_qkv_gemm(model: PretrainedModel) -> PretrainedModel:
 
     for name, layer in model.named_modules():
         if isinstance(layer, Attention) and not layer.cross_attention:
-            assert layer.tp_size == 1, "please disable manual tp when enable auto parallel"
+            assert layer.tp_size == 1, "unfuse_qkv_gemm requires tp_size == 1"
             if layer.qkv is None:
                 continue
             qkv_params = get_init_params(layer.qkv, ColumnLinear)
@@ -1811,7 +1825,7 @@ def preprocess_perlayer_weights(weights,
                 weights[new_name] = weights[name]
                 weights[
                     new_name +
-                    "_interleaved"] = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
+                    "_interleaved"] = torch.ops.trtllm.block_scale_interleave(
                         weights[name].view(fp4_utils.float4_sf_dtype).cpu(
                         ).contiguous()).reshape(nrows, ncols).view(
                             fp4_utils.float4_sf_dtype)
@@ -1950,7 +1964,7 @@ def save_config(config: PretrainedConfig, *, output_dir: str,
                 log: bool) -> None:
     config_path = Path(output_dir) / "config.json"
     if log:
-        logger.debug(f"Saving TensorRT-LLM configuration to {config_path}")
+        logger.debug(f"Saving TensorRT LLM configuration to {config_path}")
     config_path.parent.mkdir(exist_ok=True, parents=True)
     config_path.write_text(json.dumps(config.to_dict(), indent=4))
 

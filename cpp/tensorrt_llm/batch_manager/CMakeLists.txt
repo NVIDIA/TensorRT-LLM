@@ -24,7 +24,6 @@ set(SRCS
     createNewDecoderRequests.cpp
     contextProgress.cpp
     dataTransceiver.cpp
-    dataTransceiverImpl.cpp
     decoderBuffers.cpp
     encoderBuffers.cpp
     guidedDecoder.cpp
@@ -59,7 +58,7 @@ set(SRCS
 
 file(GLOB_RECURSE XGRAMMAR_SRCS "${3RDPARTY_DIR}/xgrammar/cpp/*.cc")
 list(FILTER XGRAMMAR_SRCS EXCLUDE REGEX
-     "${3RDPARTY_DIR}/xgrammar/cpp/pybind/.*\\.cc")
+     "${3RDPARTY_DIR}/xgrammar/cpp/nanobind/.*\\.cc")
 list(APPEND SRCS ${XGRAMMAR_SRCS})
 
 if(NOT WIN32)
@@ -95,10 +94,6 @@ set(TOP_LEVEL_DIR "${PROJECT_SOURCE_DIR}/..")
 target_compile_definitions(${BATCH_MANAGER_STATIC_TARGET}
                            PUBLIC TOP_LEVEL_DIR="${TOP_LEVEL_DIR}")
 
-if(ENABLE_CUFILE)
-  target_link_libraries(${BATCH_MANAGER_STATIC_TARGET} PUBLIC ${CUFILE_LIBRARY})
-endif()
-
 if(ENABLE_UCX)
   find_package(ucx REQUIRED)
   find_package(ucxx REQUIRED)
@@ -108,3 +103,8 @@ if(ENABLE_UCX)
   target_link_libraries(${BATCH_MANAGER_STATIC_TARGET} PUBLIC)
 
 endif()
+
+find_library(TORCH_PYTHON_LIB torch_python REQUIRED
+             HINTS ${TORCH_INSTALL_PREFIX}/lib)
+target_link_libraries(${BATCH_MANAGER_STATIC_TARGET}
+                      PUBLIC ${TORCH_PYTHON_LIB} Python3::Python pg_utils)

@@ -68,7 +68,7 @@ public:
     template <Scope scope = defaultScope, ArriveOrder order = ArriveOrder::RELEASE>
     __device__ inline mha::conditional_t<scope == Scope::CTA, ArrivalToken, void> arrive(uint32_t update = 1)
     {
-        ArrivalToken token;
+        ArrivalToken token{};
 #if __CUDA_ARCH__ >= 900
         if constexpr (scope == Scope::CTA)
         {
@@ -128,9 +128,9 @@ public:
 
     __device__ inline bool isLocal() const
     {
-        uint32_t addrCtaRank;
+        uint32_t addrCtaRank{};
         asm("getctarank.u64 %0, %1;\n" : "=r"(addrCtaRank) : "l"(addr()));
-        uint32_t ctaRank;
+        uint32_t ctaRank{};
         asm("mov.u32 %0, %%cluster_ctarank;\n" : "=r"(ctaRank));
         return addrCtaRank == ctaRank;
     }
@@ -154,7 +154,7 @@ public:
 #if __CUDA_ARCH__ >= 900
         if constexpr (scope == Scope::CTA)
         {
-            ArrivalToken token;
+            ArrivalToken token{};
             asm volatile("mbarrier.arrive.expect_tx.relaxed.cta.b64 %0, [%1], %2;\n"
                          : "=l"(token)
                          : "l"(addr()), "r"(txCount)
@@ -181,7 +181,7 @@ public:
         {
             if constexpr (scope == Scope::CTA)
             {
-                ArrivalToken token;
+                ArrivalToken token{};
                 switch (order)
                 {
                 case ArriveOrder::RELEASE:
@@ -239,7 +239,7 @@ public:
     template <Scope scope = defaultScope>
     __device__ inline bool test_wait(ArrivalToken&& token)
     {
-        uint32_t ready;
+        uint32_t ready{};
         if constexpr (scope == Scope::CGA)
         {
             asm volatile(
@@ -271,7 +271,7 @@ public:
     template <Scope scope = defaultScope>
     __device__ inline bool test_wait_parity(bool parity)
     {
-        uint32_t ready;
+        uint32_t ready{};
         if constexpr (scope == Scope::CGA)
         {
             asm volatile(
@@ -303,7 +303,7 @@ public:
     template <Scope scope = defaultScope>
     __device__ inline bool try_wait(ArrivalToken&& token)
     {
-        uint32_t ready;
+        uint32_t ready{};
         if constexpr (scope == Scope::CGA)
         {
             asm volatile(
@@ -334,7 +334,7 @@ public:
     template <Scope scope = defaultScope>
     __device__ inline bool try_wait_parity(bool parity)
     {
-        uint32_t ready;
+        uint32_t ready{};
         if constexpr (scope == Scope::CGA)
         {
             asm volatile(

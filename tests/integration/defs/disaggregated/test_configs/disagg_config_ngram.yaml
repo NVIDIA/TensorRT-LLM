@@ -1,0 +1,29 @@
+hostname: localhost
+port: 8000
+model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+free_gpu_memory_fraction: 0.1
+backend: pytorch
+disable_overlap_scheduler: True
+context_servers:
+  num_instances: 1
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  cache_transceiver_config:
+    backend: "DEFAULT"
+  urls:
+    - "localhost:8001"
+generation_servers:
+  num_instances: 1
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  cache_transceiver_config:
+    backend: "DEFAULT"
+  urls:
+    - "localhost:8002"
+  speculative_config:
+    decoding_type: NGram
+    max_draft_len: 4
+    max_matching_ngram_size: 4
+    is_keep_all: True
+    is_use_oldest: True
+    is_public_pool: True

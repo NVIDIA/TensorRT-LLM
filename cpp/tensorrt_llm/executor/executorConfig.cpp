@@ -34,7 +34,7 @@ ExecutorConfig::ExecutorConfig(SizeType32 maxBeamWidth, SchedulerConfig schedule
     std::optional<SpeculativeDecodingConfig> specDecConfig, std::optional<GuidedDecodingConfig> guidedDecodingConfig,
     std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs,
     std::optional<CacheTransceiverConfig> cacheTransceiverConfig, bool gatherGenerationLogits,
-    bool promptTableOffloading, bool enableTrtOverlap)
+    bool promptTableOffloading, bool enableTrtOverlap, bool failFastOnAttentionWindowTooLarge)
     : mMaxBeamWidth(maxBeamWidth)
     , mSchedulerConfig(std::move(schedulerConfig))
     , mKvCacheConfig(std::move(kvCacheConfig))
@@ -63,6 +63,7 @@ ExecutorConfig::ExecutorConfig(SizeType32 maxBeamWidth, SchedulerConfig schedule
     , mGatherGenerationLogits(gatherGenerationLogits)
     , mPromptTableOffloading(promptTableOffloading)
     , mEnableTrtOverlap(enableTrtOverlap)
+    , mFailFastOnAttentionWindowTooLarge(failFastOnAttentionWindowTooLarge)
 {
     TLLM_CHECK(iterStatsMaxIterations >= 0);
     TLLM_CHECK(requestStatsMaxIterations >= 0);
@@ -222,6 +223,11 @@ bool ExecutorConfig::getEnableTrtOverlap() const
     return mEnableTrtOverlap;
 }
 
+bool ExecutorConfig::getFailFastOnAttentionWindowTooLarge() const
+{
+    return mFailFastOnAttentionWindowTooLarge;
+}
+
 // setters
 
 void ExecutorConfig::setMaxBeamWidth(SizeType32 maxBeamWidth)
@@ -369,6 +375,11 @@ void ExecutorConfig::setPromptTableOffloading(bool promptTableOffloading)
 void ExecutorConfig::setEnableTrtOverlap(bool enableTrtOverlap)
 {
     mEnableTrtOverlap = enableTrtOverlap;
+}
+
+void ExecutorConfig::setFailFastOnAttentionWindowTooLarge(bool failFastOnAttentionWindowTooLarge)
+{
+    mFailFastOnAttentionWindowTooLarge = failFastOnAttentionWindowTooLarge;
 }
 
 } // namespace tensorrt_llm::executor

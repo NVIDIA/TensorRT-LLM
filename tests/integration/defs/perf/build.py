@@ -44,7 +44,7 @@ WEIGHT_STREAMING_DISABLED_VAL = "1.0"
 
 
 def parse_arguments():
-    parser = argparse.ArgumentParser(description='Build TensorRT-LLM models.')
+    parser = argparse.ArgumentParser(description='Build TensorRT LLM models.')
     parser.add_argument('-m',
                         '--model',
                         type=str,
@@ -255,7 +255,7 @@ def get_quant_config(quantization: str):
 
 def build_gpt(args):
     build_config = get_build_config(args.model)
-    build_config = BuildConfig.from_dict(build_config)
+    build_config = BuildConfig(**build_config)
     model_config = get_model_config(args.model)
     if args.force_num_layer_1:
         model_config['num_layers'] = 1
@@ -1448,7 +1448,7 @@ def enc_dec_build_helper(component, build_config, model_config, args):
 
 def build_enc_dec(args):
     build_config = get_build_config(args.model)
-    build_config = BuildConfig.from_dict(build_config)
+    build_config = BuildConfig(**build_config)
     model_config = get_model_config(args.model)
     if args.force_num_layer_1:
         model_config['num_layers'] = 1

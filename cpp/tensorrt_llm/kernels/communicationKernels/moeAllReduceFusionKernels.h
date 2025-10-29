@@ -55,7 +55,7 @@ struct AllReduceFusionParams
     void* rms_gamma;
     float rms_eps;
     float* scale_factor;
-    FP4QuantizationSFLayout layout = FP4QuantizationSFLayout::SWIZZLED;
+    QuantizationSFLayout layout = QuantizationSFLayout::SWIZZLED;
     cudaStream_t stream;
 };
 

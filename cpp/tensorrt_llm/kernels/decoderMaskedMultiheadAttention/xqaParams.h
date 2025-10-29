@@ -17,6 +17,7 @@
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
+#include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 
 namespace tensorrt_llm
 {
@@ -34,6 +35,7 @@ struct XQAParams
     void* output_sf = nullptr;
     void const* qkv = nullptr;
     int32_t const* cache_indir = nullptr;
+    float const* attention_sinks = nullptr;
     float const* kv_scale_orig_quant = nullptr;
     float const* kv_scale_quant_orig = nullptr;
     int32_t const* host_past_key_value_lengths = nullptr;
@@ -91,6 +93,8 @@ struct XQAParams
     int max_distance = 0;
     bool multi_block_mode;
     bool multi_query_tokens = false;
+    bool is_spec_dec_tree
+        = true; // by default, XQA spec-dec expect tree-based draft token, only affective when multi_query_tokens = true
 
     float const* logn_scaling_ptr = nullptr; // for logn scaling in XQA
 
@@ -102,6 +106,13 @@ struct XQAParams
     int32_t start_token_idx_sf = 0;          // The start token index in SF tensor.
 
     void* quant_q_buffer_ptr = nullptr;
+
+    // for cross attention
+    int32_t const* encoder_input_lengths = nullptr;
+
+    // sparse attention parameters
+    SparseAttentionParams sparse_params;
+    bool use_sparse_attention = false;
 
     cudaStream_t stream = 0;
 
@@ -172,6 +183,9 @@ struct XQAParams
            << "total_num_input_tokens :" << total_num_input_tokens << std ::endl
            << "is_fp8_output :" << (is_fp8_output ? "true" : "false") << std ::endl
            << "fp8_out_scale :" << fp8_out_scale << std ::endl
+           << "encoder_input_lengths: " << encoder_input_lengths << std::endl
+           << "sparse_params: " << sparse_params.toString() << std::endl
+           << "use_sparse_attention :" << (use_sparse_attention ? "true" : "false") << std ::endl
            << "stream :" << stream;
 
         return ss.str();

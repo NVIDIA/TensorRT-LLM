@@ -16,7 +16,7 @@ from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.logger import logger
 
 from .._utils import global_mpi_rank, mpi_barrier, mpi_rank
-from .utils import print_colored, print_colored_debug
+from .utils import logger_debug, print_colored
 
 if ENABLE_MULTI_DEVICE:
     import mpi4py
@@ -270,8 +270,8 @@ class RemoteMpiCommSessionClient(MpiSession):
         # FIXME: this is a hack to avoid circular import, resolve later
         from tensorrt_llm.executor.ipc import ZeroMqQueue
         self.addr = addr
-        print_colored_debug(
-            f"RemoteMpiCommSessionClient connecting to {addr}\n", "yellow")
+        logger_debug(f"RemoteMpiCommSessionClient connecting to {addr}\n",
+                     "yellow")
         self.queue = ZeroMqQueue((addr, hmac_key),
                                  is_server=False,
                                  socket_type=zmq.PAIR,
@@ -285,10 +285,10 @@ class RemoteMpiCommSessionClient(MpiSession):
                **kwargs) -> list:
         ''' Submit a task to the remote MPI pool. '''
         if self._is_shutdown:
-            print_colored_debug(
-                "RemoteMpiCommSessionClient is already shut down\n", "yellow")
+            logger_debug("RemoteMpiCommSessionClient is already shut down\n",
+                         "yellow")
             return []
-        print_colored_debug(
+        logger_debug(
             f"RemoteMpiCommSessionClient [rank{global_mpi_rank()}] sending task {task} to {self.addr}\n",
             "yellow")
         self.queue.put(RemoteTask(task, args, kwargs, sync=sync))
@@ -301,11 +301,10 @@ class RemoteMpiCommSessionClient(MpiSession):
         self.submit(task, *args, sync=True, **kwargs)
 
         while not ((res := self.poll()) or self._is_shutdown):
-            print_colored_debug(f"Waiting for task completion... {res}\n",
-                                "grey")
+            logger_debug(f"Waiting for task completion... {res}\n", "grey")
             time.sleep(self.SYNC_IDLE_INTERVAL)
 
-        print_colored_debug(
+        logger_debug(
             f"rank{global_mpi_rank()} RemoteMpiCommSessionClient.send_sync received results: {res}\n",
             "green")
 
@@ -367,10 +366,10 @@ class RemoteMpiCommSessionServer():
 
     @staticmethod
     def task_wrapper(task: Callable[..., T], *args, **kwargs) -> T:
-        print_colored_debug(
+        logger_debug(
             f"MpiCommSession rank{mpi_rank()} with world_size {mpi_world_size()}\n",
             "green")
-        print_colored_debug(
+        logger_debug(
             f"MpiCommSession rank{mpi_rank()} start task [{task}] with args: {args} and kwargs: {kwargs}\n",
             "green")
 
@@ -386,24 +385,24 @@ class RemoteMpiCommSessionServer():
             traceback.print_exc()
             raise e
         finally:
-            print_colored_debug(
+            logger_debug(
                 f"MpiCommSession rank{mpi_rank()} task [{task}] finished\n",
                 "green")
             mpi_barrier()
 
     def serve(self):
-        print_colored_debug(
-            f"RemoteMpiCommSessionServer listening on {self.addr}\n", "yellow")
+        logger_debug(f"RemoteMpiCommSessionServer listening on {self.addr}\n",
+                     "yellow")
         while True:
             message: Optional[RemoteTask] = self.queue.get()
             if message is None:
-                print_colored_debug(
+                logger_debug(
                     f"RemoteMpiCommSessionServer [rank{global_mpi_rank()}] received shutdown signal\n",
                     "green")
                 self.session.shutdown_abort()
                 break
             else:
-                print_colored_debug(
+                logger_debug(
                     f"RemoteMpiCommSessionServer [rank{global_mpi_rank()}] received task [{message.task}] from {self.addr}\n",
                     "green")
                 futures = self.session.submit(
@@ -416,10 +415,9 @@ class RemoteMpiCommSessionServer():
                         future.add_done_callback(self.mpi_future_callback)
 
     def mpi_future_callback(self, future):
-        print_colored_debug(f"rank{global_mpi_rank()} got future: {future}\n",
-                            "red")
+        logger_debug(f"rank{global_mpi_rank()} got future: {future}\n", "red")
         if future.exception() is not None:
-            print_colored_debug(
+            logger_debug(
                 f"mpi_future got exception: {future.exception()}, quitting\n",
                 "red")
             self.queue.put(future.exception())
@@ -427,15 +425,15 @@ class RemoteMpiCommSessionServer():
 
         result = future.result()
         self.results.append(result)
-        print_colored_debug(
+        logger_debug(
             f"RemoteMpiCommSessionServer working status: {len(self.results)}/{self.num_results}\n",
             "grey")
         if len(self.results) == self.num_results:
-            print_colored_debug(
+            logger_debug(
                 f"RemoteMpiCommSessionServer received all results, sending to client\n",
                 "green")
             try:
-                self.queue.put_noblock(self.results)
+                self.queue.put_noblock(self.results, retry=2)
             except zmq.ZMQError as e:
                 # The client could be shutdown first.
                 if e.errno == zmq.EAGAIN:
@@ -443,8 +441,8 @@ class RemoteMpiCommSessionServer():
                 else:
                     raise e
 
-            print_colored_debug(
-                f"RemoteMpiCommSessionServer sent results to client\n", "green")
+            logger_debug(f"RemoteMpiCommSessionServer sent results to client\n",
+                         "green")
             self.results.clear()
 
 

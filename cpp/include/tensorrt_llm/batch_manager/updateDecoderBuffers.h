@@ -34,7 +34,6 @@ class DecoderState;
 namespace tensorrt_llm::batch_manager
 {
 
-class DecoderBuffers;
 class DecoderOutputBuffers;
 
 class UpdateDecoderBuffers : Algorithm
@@ -44,10 +43,9 @@ public:
 
     UpdateDecoderBuffers() = default;
 
-    runtime::CudaEvent operator()(runtime::ModelConfig const& modelConfig, DecoderBuffers& decoderBuffers,
-        DecoderOutputBuffers& decoderOutputBuffers, runtime::BufferManager const& copyBufferManager,
-        runtime::decoder::DecoderState const& decoderState, bool returnLogProbs,
-        runtime::CudaEvent const& decoderFinishEvent) const;
+    runtime::CudaEvent operator()(runtime::ModelConfig const& modelConfig, DecoderOutputBuffers& decoderOutputBuffers,
+        runtime::BufferManager const& copyBufferManager, runtime::decoder::DecoderState const& decoderState,
+        bool returnLogProbs, runtime::CudaEvent const& decoderFinishEvent) const;
 };
 
 } // namespace tensorrt_llm::batch_manager

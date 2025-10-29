@@ -6,6 +6,8 @@ import io
 import os
 import sys
 from datetime import datetime
+from pathlib import Path
+from typing import List, Tuple
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
@@ -19,8 +21,32 @@ from transformers import AutoProcessor, Blip2Processor
 from utils import utils
 
 
+def pixtral_pad_images(
+        image_list: List[Image.Image]) -> Tuple[np.ndarray, np.ndarray]:
+    if not image_list:
+        return np.empty((0, 0, 0, 0), dtype=np.uint8), np.empty((0, 2),
+                                                                dtype=np.int64)
+    image_list_np = [np.array(img) for img in image_list]
+    shapes = [img.shape for img in image_list_np]
+    assert all(len(s) == 3
+               for s in shapes), "All input images must have three dimensions"
+    assert all(s[-1] == shapes[0][-1] for s in
+               shapes), "All input images must have the same number of channels"
+    max_h, max_w = max(s[0] for s in shapes), max(s[1] for s in shapes)
+    for i in range(len(image_list_np)):
+        image_list_np[i] = np.pad(image_list_np[i],
+                                  ((0, max_h - image_list_np[i].shape[0]),
+                                   (0, max_w - image_list_np[i].shape[1]),
+                                   (0, 0)),
+                                  mode='constant')
+    raw_image = np.stack(image_list_np, axis=0)
+    image_sizes = np.array([s[:2] for s in shapes], dtype=np.int64)
+    return raw_image, image_sizes
+
+
 def prepare_inputs(text_data,
                    image_data,
+                   image_sizes,
                    request_output_len_data,
                    beam_width_data,
                    temperature_data,
@@ -35,7 +61,6 @@ def prepare_inputs(text_data,
                    image_input_name="image_input"):
     inputs = [
         utils.prepare_tensor("text_input", text_data, grpcclient),
-        utils.prepare_tensor(image_input_name, image_data, grpcclient),
         utils.prepare_tensor("max_tokens", request_output_len_data, grpcclient),
         utils.prepare_tensor("beam_width", beam_width_data, grpcclient),
         utils.prepare_tensor("temperature", temperature_data, grpcclient),
@@ -45,6 +70,14 @@ def prepare_inputs(text_data,
         utils.prepare_tensor("top_p", top_p_data, grpcclient),
         utils.prepare_tensor("stream", streaming_data, grpcclient),
     ]
+    if image_data is not None:
+        inputs += [
+            utils.prepare_tensor(image_input_name, image_data, grpcclient),
+        ]
+    if image_sizes is not None:
+        inputs += [
+            utils.prepare_tensor("image_sizes_input", image_sizes, grpcclient),
+        ]
     if repetition_penalty_data is not None:
         inputs += [
             utils.prepare_tensor("repetition_penalty", repetition_penalty_data,
@@ -63,20 +96,16 @@ def prepare_inputs(text_data,
     return inputs
 
 
-def load_image(image_path):
+def load_image(image_path) -> Image.Image:
     if image_path.startswith("http") or image_path.startswith("https"):
-        image = Image.open(requests.get(image_path,
-                                        stream=True).raw).convert("RGB")
+        image_bytes = requests.get(image_path, stream=True).content
     elif image_path.startswith("data:image/jpeg;base64,"):
         image_base64 = image_path.split(",")[1]
-        # Decode the base64 string
-        image_data = base64.b64decode(image_base64)
-        # Create a BytesIO object from the decoded data
-        image_buffer = io.BytesIO(image_data)
-        image = Image.open(image_buffer).convert("RGB")
+        image_bytes = base64.b64decode(image_base64)
     else:
-        image = Image.open(image_path).convert("RGB")
-    return image
+        image_bytes = Path(image_path).read_bytes()
+
+    return Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
 
 def load_video(video_path, num_of_frames):
@@ -239,7 +268,7 @@ if __name__ == "__main__":
                         required=True,
                         choices=[
                             'blip2', 'llava', 'vila', 'mllama',
-                            'llava_onevision', 'qwen2_vl'
+                            'llava_onevision', 'qwen2_vl', 'pixtral'
                         ],
                         help="Model type")
     parser.add_argument("--hf_model_dir",
@@ -249,11 +278,18 @@ if __name__ == "__main__":
                         help="path to the model directory")
     FLAGS = parser.parse_args()
     # load and process images or video
+    image_sizes = np.empty((0, 2), dtype=np.int64)
     if 'vila' in FLAGS.model_type:
         image_paths = FLAGS.image.split(",")
         raw_image = []
         for image_path in image_paths:
             raw_image.append(load_image(image_path))
+    elif 'pixtral' in FLAGS.model_type:
+        image_paths = FLAGS.image.split(",") if FLAGS.image else []
+        raw_image = []
+        for image_path in image_paths:
+            raw_image.append(load_image(image_path))
+        raw_image, image_sizes = pixtral_pad_images(raw_image)
     elif FLAGS.video is not None:
         assert FLAGS.video_num_frames is not None, "Number of frames should be provided for video input."
         raw_video = load_video(FLAGS.video, FLAGS.video_num_frames)
@@ -303,6 +339,9 @@ if __name__ == "__main__":
             FLAGS.text = image_tag + FLAGS.text
         image_data = np.array([[raw_image]])
         image_input_name = "image_bytes_input"
+    elif 'pixtral' in FLAGS.model_type:
+        image_data = np.array([raw_image])
+        image_input_name = "image_bytes_input"
     elif 'llava_onevision' in FLAGS.model_type:
         if FLAGS.video is not None:
             image_data = np.array([raw_video])
@@ -334,6 +373,9 @@ if __name__ == "__main__":
     temperature_data = np.array(temperature, dtype=np.float32)
     streaming = [[FLAGS.streaming]]
     streaming_data = np.array(streaming, dtype=bool)
+    image_data = None if image_data.size == 0 else image_data
+    image_sizes_data = None if image_sizes.size == 0 else np.array(
+        [image_sizes], dtype=np.int64)
 
     model_name = "ensemble"
     if FLAGS.use_bls:
@@ -356,6 +398,7 @@ if __name__ == "__main__":
 
     inputs = prepare_inputs(text_data,
                             image_data,
+                            image_sizes_data,
                             request_output_len_data,
                             beam_width_data,
                             temperature_data,

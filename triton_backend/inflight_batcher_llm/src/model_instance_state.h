@@ -30,7 +30,7 @@
 #include "triton/core/tritonbackend.h"
 #include "triton/core/tritonserver.h"
 
-#include "tensorrt_llm/batch_manager/kvCacheConfig.h"
+#include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
 
 #include "model_state.h"
@@ -99,6 +99,8 @@ struct RequestData
     std::shared_ptr<std::set<executor::IdType>> pendingBatchedRequestIds;
     executor::RequestType requestType;
     bool returnPerfMetrics;
+    bool returnNumInputTokens;
+    bool returnNumOutputTokens;
 };
 
 //

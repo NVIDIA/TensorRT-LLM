@@ -7,7 +7,11 @@ import time
 import traceback
 
 import tensorrt as trt
-from cuda import cudart
+
+try:
+    from cuda.bindings import runtime as cudart
+except ImportError:
+    from cuda import cudart
 
 import tensorrt_llm
 from tensorrt_llm import (AutoConfig, AutoModelForCausalLM, BuildConfig,
@@ -221,8 +225,11 @@ def build_from_hf(args,
         quant_output_dir.cleanup()
 
     else:  # fake weights
-        trtllm_config = AutoConfig.from_hugging_face(hf_model_dir, dtype,
-                                                     mapping, quant_config)
+        trtllm_config = AutoConfig.from_hugging_face(hf_model_dir,
+                                                     dtype,
+                                                     mapping,
+                                                     quant_config,
+                                                     trust_remote_code=True)
         trtllm_model = AutoModelForCausalLM.get_trtllm_model_class(
             hf_model_dir)(trtllm_config)
 

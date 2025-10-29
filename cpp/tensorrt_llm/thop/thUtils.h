@@ -62,6 +62,7 @@ constexpr auto FLOAT4_E2M1X2 = torch::ScalarType::Byte; // uint8_t
 constexpr auto SF_DTYPE = torch::ScalarType::Byte;      // uint8_t
 
 constexpr auto FP8_BLOCK_SCALING_SF_DTYPE = torch::ScalarType::Float;
+constexpr auto FP8_ROWWISE_SF_DTYPE = torch::ScalarType::Float;
 
 template <typename T>
 inline T* get_ptr(torch::Tensor& t)

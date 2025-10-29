@@ -72,7 +72,8 @@ class TritonDecoder(Decoder):
             "kv_cache_reused_blocks", "kv_cache_alloc_total_blocks",
             "arrival_time_ns", "first_scheduled_time_ns", "first_token_time_ns",
             "last_token_time_ns", "acceptance_rate",
-            "total_accepted_draft_tokens", "total_draft_tokens"
+            "total_accepted_draft_tokens", "total_draft_tokens",
+            "num_input_tokens", "num_output_tokens"
         ]
 
         self._postproc_outputs = [
@@ -92,7 +93,8 @@ class TritonDecoder(Decoder):
             "embedding_bias_weights", "num_draft_tokens", "use_draft_logits",
             "lora_task_id", "lora_weights", "lora_config",
             "exclude_input_in_output", "return_perf_metrics",
-            "guided_decoding_guide_type", "guided_decoding_guide"
+            "guided_decoding_guide_type", "guided_decoding_guide",
+            "return_num_input_tokens", "return_num_output_tokens"
         ]
 
         self.__undo_reshape_whitelist = {
@@ -102,7 +104,9 @@ class TritonDecoder(Decoder):
             "return_context_logits", "return_generation_logits", "beam_width",
             "stream", "prompt_vocab_size", "num_draft_tokens",
             "use_draft_logits", "exclude_input_in_output",
-            "return_perf_metrics", "lora_weights", "lora_config", "lora_task_id"
+            "return_perf_metrics", "lora_weights", "lora_config",
+            "lora_task_id", "return_num_input_tokens",
+            "return_num_output_tokens"
         }
 
     def _exec_triton_request(self, request):
@@ -136,7 +140,9 @@ class TritonDecoder(Decoder):
             "last_token_time_ns": "last_token_time_ns",
             "acceptance_rate": "acceptance_rate",
             "total_accepted_draft_tokens": "total_accepted_draft_tokens",
-            "total_draft_tokens": "total_draft_tokens"
+            "total_draft_tokens": "total_draft_tokens",
+            "num_input_tokens": "num_input_tokens",
+            "num_output_tokens": "num_output_tokens"
         }
         tensors = self.create_triton_tensors(response, name_map)
         return pb_utils.InferenceResponse(output_tensors=tensors)
@@ -165,7 +171,12 @@ class TritonDecoder(Decoder):
                 continue
             triton_name = tensor.name()
             if tensor.is_cpu():
-                value = tensor.as_numpy()
+                try:
+                    value = tensor.as_numpy()
+                except pb_utils.TritonModelException as e:
+                    # Use to_dlpack()/from_dlpack() if as_numpy() fails,
+                    # e.g. in case of BF16 tensors
+                    value = from_dlpack(tensor.to_dlpack())
             else:
                 # If the tensor is in GPU memory make it torch.Tensor type
                 value = from_dlpack(tensor.to_dlpack())
@@ -247,6 +258,7 @@ class TritonDecoder(Decoder):
             "text_input": "QUERY",
             "image_bytes_input": "IMAGE_BYTES",
             "image_url_input": "IMAGE_URL",
+            "image_sizes_input": "IMAGE_SIZES",
             "video_bytes_input": "VIDEO_BYTES",
             "decoder_text_input": "DECODER_QUERY",
             "max_tokens": "REQUEST_OUTPUT_LEN",
@@ -453,7 +465,9 @@ class TritonDecoder(Decoder):
             "exclude_input_in_output": "exclude_input_in_output",
             "return_perf_metrics": "return_perf_metrics",
             "guided_decoding_guide_type": "guided_decoding_guide_type",
-            "guided_decoding_guide": "guided_decoding_guide"
+            "guided_decoding_guide": "guided_decoding_guide",
+            "return_num_input_tokens": "return_num_input_tokens",
+            "return_num_output_tokens": "return_num_output_tokens"
         }
         batch_size = request.text_input.shape[0]
         tensors = self.create_triton_tensors(request, name_map)
@@ -540,7 +554,9 @@ class TritonDecoder(Decoder):
             "last_token_time_ns": "last_token_time_ns",
             "acceptance_rate": "acceptance_rate",
             "total_accepted_draft_tokens": "total_accepted_draft_tokens",
-            "total_draft_tokens": "total_draft_tokens"
+            "total_draft_tokens": "total_draft_tokens",
+            "num_input_tokens": "num_input_tokens",
+            "num_output_tokens": "num_output_tokens"
         }
         return self.convert_triton_response(triton_output, GenerationResponse,
                                             name_map)
@@ -593,5 +609,7 @@ class TritonDecoder(Decoder):
             last_token_time_ns=gen_res.last_token_time_ns,
             acceptance_rate=gen_res.acceptance_rate,
             total_accepted_draft_tokens=gen_res.total_accepted_draft_tokens,
-            total_draft_tokens=gen_res.total_draft_tokens)
+            total_draft_tokens=gen_res.total_draft_tokens,
+            num_input_tokens=gen_res.num_input_tokens,
+            num_output_tokens=gen_res.num_output_tokens)
         return response

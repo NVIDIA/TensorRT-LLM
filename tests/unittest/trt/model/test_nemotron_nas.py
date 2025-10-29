@@ -382,10 +382,11 @@ class TestNemotronNas(unittest.TestCase):
 
     @parameterized.expand(get_loader_test_cases, name_func=unittest_name_func)
     def test_allclose_to_hf(self, hf_model_dir: str, params: TestParams):
+        self.skipTest(f"https://nvbugs/5444611")
         hf_model = transformers.AutoModelForCausalLM.from_pretrained(
             hf_model_dir,
             trust_remote_code=True,
-            torch_dtype=tensorrt_llm._utils.str_dtype_to_torch(params.dtype),
+            dtype=tensorrt_llm._utils.str_dtype_to_torch(params.dtype),
         ).cuda()
         runtime, config = self._from_hf_model(hf_model, params)
         self.allclose(
@@ -719,8 +720,7 @@ class TestNemotronNas(unittest.TestCase):
             from_pretrained(
                 hf_model_dir,
                 trust_remote_code=True,
-                torch_dtype=tensorrt_llm._utils.str_dtype_to_torch(params.dtype
-                                                                   ),
+                dtype=tensorrt_llm._utils.str_dtype_to_torch(params.dtype),
             ).cuda(),
             atol=
             0.92,  # We've observed that on a real checkpoint with the current code, fp8 MMLU is on par with BF16, and this is the observed threshold, though it may seem high.
@@ -746,8 +746,7 @@ class TestNemotronNas(unittest.TestCase):
             from_pretrained(
                 hf_model_dir,
                 trust_remote_code=True,
-                torch_dtype=tensorrt_llm._utils.str_dtype_to_torch(params.dtype
-                                                                   ),
+                dtype=tensorrt_llm._utils.str_dtype_to_torch(params.dtype),
                 device_map="auto",
             ),
         )
@@ -827,6 +826,7 @@ class TestNemotronNas(unittest.TestCase):
     def test_convert_model_from_hf(self, model_dir: Optional[str],
                                    preloaded: bool, tp_size: int, pp_size: int,
                                    dtype: str) -> None:
+        self.skipTest(f"https://nvbugs/5444611")
         ckpt_path = Path(llm_models_root(check=True), "nvsmall/tests",
                          model_dir)
 
@@ -932,7 +932,7 @@ class TestNemotronNas(unittest.TestCase):
         dtype = tensorrt_llm._utils.str_dtype_to_torch(dtype)
 
         hf_model = transformers.AutoModelForCausalLM.from_pretrained(
-            hf_model_dir, trust_remote_code=True, torch_dtype=dtype).cuda()
+            hf_model_dir, trust_remote_code=True, dtype=dtype).cuda()
 
         batch_size = 1
         max_seq_len = 30

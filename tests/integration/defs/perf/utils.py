@@ -19,14 +19,17 @@ import io
 import os
 import re
 import subprocess
+import time
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional
 
+import requests
 from _pytest.nodes import Item
 from _pytest.python import Function
-from defs.trt_test_alternative import check_output, print_error, print_info
+from defs.trt_test_alternative import (check_output, popen, print_error,
+                                       print_info)
 
 from ..common import get_trt_llm_lib_dir, venv_mpi_check_output
 from ..local_venv import PythonVenvRunnerImpl
@@ -87,9 +90,20 @@ class PerfMetricType(str, Enum):
     set up special threshold criteria for each type of metrics (like >50MB for engine size increase, etc.).
     """
     INFERENCE_TIME = "INFERENCE_TIME"
+    MEDIAN_INFERENCE_TIME = "MEDIAN_INFERENCE_TIME"
+    P99_INFERENCE_TIME = "P99_INFERENCE_TIME"
+    INTER_TOKEN_TIME = "INTER_TOKEN_TIME"
+    MEDIAN_INTER_TOKEN_TIME = "MEDIAN_INTER_TOKEN_TIME"
+    P99_INTER_TOKEN_TIME = "P99_INTER_TOKEN_TIME"
     FIRST_TOKEN_TIME = "FIRST_TOKEN_TIME"
+    MEDIAN_FIRST_TOKEN_TIME = "MEDIAN_FIRST_TOKEN_TIME"
+    P99_FIRST_TOKEN_TIME = "P99_FIRST_TOKEN_TIME"
     OUTPUT_TOKEN_TIME = "OUTPUT_TOKEN_TIME"
+    MEDIAN_OUTPUT_TOKEN_TIME = "MEDIAN_OUTPUT_TOKEN_TIME"
+    P99_OUTPUT_TOKEN_TIME = "P99_OUTPUT_TOKEN_TIME"
     TOKEN_THROUGHPUT = "TOKEN_THROUGHPUT"
+    TOTAL_TOKEN_THROUGHPUT = "TOTAL_TOKEN_THROUGHPUT"
+    USER_THROUGHPUT = "USER_THROUGHPUT"
     BUILD_TIME = "BUILD_TIME"
     BUILD_PEAK_CPU_MEMORY = "BUILD_PEAK_CPU_MEMORY"
     BUILD_PEAK_GPU_MEMORY = "BUILD_PEAK_GPU_MEMORY"
@@ -99,93 +113,8 @@ class PerfMetricType(str, Enum):
     SEQ_THROUGHPUT = "SEQ_THROUGHPUT"
     SEQ_LATENCY = "SEQ_LATENCY"
     KV_CACHE_SIZE = "KV_CACHE_SIZE"
-
-
-class PerfScriptTestCmds(NamedTuple):
-    convert_cmd: List[str]
-    build_cmd: List[str]
-    data_cmds: List[List[str]]
-    benchmark_cmds: List[List[str]]
-    mpi_cmd: List[str]
-    is_python: bool
-
-    def run_cmd(self, cmd_idx: int, venv) -> str:
-        output = ""
-        mpi_cmd = self.mpi_cmd
-        build_cmd_str = self.get_cmd_str(0)
-        current_cmd_str = self.get_cmd_str(cmd_idx)
-        if cmd_idx == 0:
-            if self.build_cmd[0].endswith('.py'):
-                print_info(
-                    f'Running engine building command: "{build_cmd_str}"')
-                if len(mpi_cmd) > 0:
-                    output += venv_mpi_check_output(venv, mpi_cmd,
-                                                    self.build_cmd)
-                else:
-                    output += venv.run_cmd(self.build_cmd, caller=check_output)
-            else:
-                envs = copy.deepcopy(os.environ)
-                if len(self.convert_cmd) > 0:
-                    convert_cmd_str = " ".join(self.convert_cmd)
-                    convert_cmds = convert_cmd_str.split(';')
-                    for convert_cmd in convert_cmds:
-                        print_info(
-                            f'Running convert weights command: "{convert_cmd}"')
-                        output += subprocess.check_output(convert_cmd.split(),
-                                                          env=envs).decode()
-                print_info(
-                    f'Running engine building command: "{build_cmd_str}"')
-                command = self.build_cmd
-                output += subprocess.check_output(command, env=envs).decode()
-        else:
-            print_info(f'Engine building command was: "{build_cmd_str}"')
-
-            if len(self.data_cmds) >= cmd_idx:
-                prepare_cmd = self.data_cmds[cmd_idx - 1]
-                prepare_cmd_str = " ".join(prepare_cmd)
-                envs = copy.deepcopy(os.environ)
-                prepare_cmds = prepare_cmd_str.split(';')
-                for cmd in prepare_cmds:
-                    print(f'Now running prepare data command: "{cmd}"')
-                    output += subprocess.check_output(cmd.split(),
-                                                      env=envs).decode()
-
-            print(f'Now running benchmarking command: "{current_cmd_str}"')
-            command = self.benchmark_cmds[cmd_idx - 1]
-            if self.is_python:
-                if len(mpi_cmd) > 0:
-                    output += venv_mpi_check_output(venv, mpi_cmd, command)
-                else:
-                    output += venv.run_cmd(command, caller=check_output)
-            else:
-                envs = copy.deepcopy(os.environ)
-                # Set LD_LIBRARY_PATH to the directory where the binary is located to find libtensorrt_llm.so and
-                # libnvinfer_plugin_tensorrt_llm.so.x.
-                envs[
-                    "LD_LIBRARY_PATH"] = f'{get_trt_llm_lib_dir(venv)}:{os.path.dirname(command[0])}:{envs.get("LD_LIBRARY_PATH", "")}'
-                print(
-                    f'Augmented cpp runtime LD_LIBRARY_PATH={envs["LD_LIBRARY_PATH"]}'
-                )
-                benchmark_cmd = mpi_cmd + command
-                output += subprocess.check_output(benchmark_cmd,
-                                                  env=envs).decode()
-        return output
-
-    def get_cmd_str(self, cmd_idx) -> List[str]:
-        mpi_cmd_str = (" ".join(self.mpi_cmd) +
-                       " ") if len(self.mpi_cmd) > 0 else ""
-
-        if cmd_idx == 0:
-            if self.build_cmd[0].endswith('.py'):
-                cmd_str = mpi_cmd_str + "python3 " + " ".join(self.build_cmd)
-            else:
-                cmd_str = mpi_cmd_str + "  " + " ".join(self.build_cmd)
-        else:
-            python_str = "python3 " if self.is_python else ""
-            cmd_str = mpi_cmd_str + python_str + " ".join(
-                self.benchmark_cmds[cmd_idx - 1])
-
-        return cmd_str
+    DISAGG_SERVER_E2EL = "DISAGG_SERVER_E2EL"
+    DISAGG_SERVER_TTFT = "DISAGG_SERVER_TTFT"
 
 
 @contextlib.contextmanager
@@ -306,6 +235,115 @@ class PerfBenchScriptTestCmds(NamedTuple):
         return cmd_str
 
 
+class PerfServerClientBenchmarkCmds(NamedTuple):
+    server_cmds: List[str]
+    client_cmds: List[List[str]]
+    names: List[str]
+    working_dir: str
+
+    def wait_for_endpoint_ready(self, url: str, timeout: int = 5400):
+        start = time.monotonic()
+        while time.monotonic() - start < timeout:
+            try:
+                time.sleep(10)
+                if requests.get(url).status_code == 200:
+                    print(f"endpoint {url} is ready")
+                    return
+            except Exception as err:
+                print(f"endpoint {url} is not ready, with exception: {err}")
+        print_error(
+            f"Endpoint {url} did not become ready within {timeout} seconds")
+
+    def run_cmd(self, cmd_idx: int, venv) -> str:
+        output = ""
+        server_file_path = os.path.join(
+            self.working_dir, f"trtllm-serve.{self.names[cmd_idx]}.log")
+        client_file_path = os.path.join(
+            self.working_dir, f"trtllm-benchmark.{self.names[cmd_idx]}.log")
+        try:
+            with (  # Start server process
+                    open(server_file_path, 'w') as server_ctx,
+                    popen(self.server_cmds[cmd_idx],
+                          stdout=server_ctx,
+                          stderr=subprocess.STDOUT,
+                          env=venv._new_env,
+                          shell=True) as server_proc):
+                self.wait_for_endpoint_ready(
+                    "http://localhost:8000/v1/models",
+                    timeout=5400)  # 90 minutes for large models
+                output += subprocess.check_output(self.client_cmds[cmd_idx],
+                                                  env=venv._new_env).decode()
+        finally:
+            server_proc.terminate()
+            server_proc.wait()
+        return output
+
+    def get_cmd_str(self, cmd_idx) -> List[str]:
+        return ["server-benchmark tests, please check config files"]
+
+
+class PerfDisaggScriptTestCmds(NamedTuple):
+    ctx_cmd: str
+    gen_cmd: str
+    server_cmd: str
+    client_cmd: List[str]
+    benchmark_cmd: List[str]
+
+    def wait_for_endpoint_ready(self, url: str, timeout: int = 600):
+        start = time.monotonic()
+        while time.monotonic() - start < timeout:
+            try:
+                time.sleep(1)
+                if requests.get(url).status_code == 200:
+                    print(f"endpoint {url} is ready")
+                    return
+            except Exception as err:
+                print(f"endpoint {url} is not ready, with exception: {err}")
+        print_error(
+            f"Endpoint {url} did not become ready within {timeout} seconds")
+
+    def run_cmd(self, cmd_idx: int, venv) -> str:
+        output = ""
+        try:
+            with (  # Start ctx workers
+                    open('output_ctx.log', 'w') as output_ctx,
+                    popen(self.ctx_cmd,
+                          stdout=output_ctx,
+                          stderr=subprocess.STDOUT,
+                          env=venv._new_env,
+                          shell=True) as ctx_workers_proc,
+                    # Start gen workers
+                    open('output_gen.log', 'w') as output_gen,
+                    popen(self.gen_cmd,
+                          stdout=output_gen,
+                          stderr=subprocess.STDOUT,
+                          env=venv._new_env,
+                          shell=True) as gen_workers_proc,
+                    # Start server
+                    open('output_server.log', 'w') as output_server,
+                    popen(self.server_cmd,
+                          stdout=output_server,
+                          stderr=subprocess.STDOUT,
+                          env=venv._new_env,
+                          shell=True) as server_proc):
+                self.wait_for_endpoint_ready(
+                    f"http://localhost:8000/health",
+                    timeout=1800)  # 30 minutes for large models
+                check_output(self.client_cmd, env=venv._new_env)
+                output += check_output(self.benchmark_cmd, env=venv._new_env)
+        finally:
+            server_proc.terminate()
+            ctx_workers_proc.terminate()
+            gen_workers_proc.terminate()
+            server_proc.wait()
+            ctx_workers_proc.wait()
+            gen_workers_proc.wait()
+        return output
+
+    def get_cmd_str(self, cmd_idx) -> List[str]:
+        return ["disaggregated server tests, please check config files"]
+
+
 class AbstractPerfScriptTestClass(abc.ABC):
     """
     Abstract class for all script-based perf tests.
@@ -328,7 +366,7 @@ class AbstractPerfScriptTestClass(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def get_commands(self) -> PerfScriptTestCmds:
+    def get_commands(self) -> PerfBenchScriptTestCmds:
         """
         Get the commands to run the test. Should return an PerfScriptTestCmds instance.
         """
@@ -424,7 +462,6 @@ class AbstractPerfScriptTestClass(abc.ABC):
                                 buf), self._gpu_clock_lock, tmpDir:
                             output = commands.run_cmd(cmd_idx, venv)
                             # Print the output log to buf.
-                            # if not is_prepare_dataset_cmd:
                             print(collect_and_clean_myelin_time(output))
                     else:
                         with contextlib.redirect_stdout(buf), tmpDir:
@@ -434,7 +471,12 @@ class AbstractPerfScriptTestClass(abc.ABC):
                             print(collect_and_clean_myelin_time(output))
 
                     # Print the output log to stdout and cache it.
-                    if not is_prepare_dataset_cmd:
+                    if is_prepare_dataset_cmd:
+                        # For prepare_dataset commands, only print the prepare command info
+                        for line in buf.getvalue().split('\n'):
+                            if 'Now running prepare data command' in line:
+                                print(line)
+                    else:
                         print(buf.getvalue())
                     outputs[cmd_idx] = buf.getvalue()
             else:
@@ -508,18 +550,23 @@ class AbstractPerfScriptTestClass(abc.ABC):
             gpu_idx = gpu_prop.get("index", self._gpu_clock_lock.get_gpu_id())
         # Remove the prefix, which includes the platform info, for network_hash.
         short_test_name = full_test_name.split("::")[-1]
+        # Get device subtype for autodeploy tests
+        device_subtype = None
+        if self._gpu_clock_lock:
+            device_subtype = self._gpu_clock_lock.get_device_subtype()
+
         test_description_dict = {
             "network_name": self.get_test_name(),
             "network_hash":
             short_test_name,  # This is used by the PerfDB to identify a test.
             "sm_clk": gpu_clocks.get("gpu_clock__MHz", None),
             "mem_clk": gpu_clocks.get("memory_clock__MHz", None),
-            "gpu_idx": gpu_idx
+            "gpu_idx": gpu_idx,
+            "device_subtype": device_subtype
         }
 
         # Serialize the commands.
         serialized_cmd = self.get_commands().get_cmd_str(cmd_idx)
-
         # Save engine building log + benchmarking log in the csv file.
         raw_result = ""
         if 0 in outputs:

@@ -1,24 +1,29 @@
 from ..disaggregated_params import DisaggregatedParams
-from ..executor import CompletionOutput, RequestError
+from ..executor import CompletionOutput, LoRARequest, RequestError
 from ..sampling_params import GuidedDecodingParams, SamplingParams
 from .build_cache import BuildCacheConfig
-from .llm import LLM, RequestOutput, _TorchLLM, _TrtLLM
+from .llm import LLM, RequestOutput
 # yapf: disable
-from .llm_args import (BatchingType, CacheTransceiverConfig, CalibConfig,
+from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
+                       CacheTransceiverConfig, CalibConfig,
                        CapacitySchedulerPolicy, ContextChunkingPolicy,
+                       CudaGraphConfig, DeepSeekSparseAttentionConfig,
                        DraftTargetDecodingConfig, DynamicBatchConfig,
                        EagleDecodingConfig, ExtendedRuntimePerfKnobConfig,
                        KvCacheConfig, LlmArgs, LookaheadDecodingConfig,
-                       MedusaDecodingConfig, MTPDecodingConfig,
-                       NGramDecodingConfig, SchedulerConfig, TorchCompileConfig,
-                       TorchLlmArgs, TrtLlmArgs)
-# yapf: enable
+                       MedusaDecodingConfig, MoeConfig, MTPDecodingConfig,
+                       NGramDecodingConfig, RocketSparseAttentionConfig,
+                       SaveHiddenStatesDecodingConfig, SchedulerConfig,
+                       TorchCompileConfig, TorchLlmArgs, TrtLlmArgs,
+                       UserProvidedDecodingConfig)
 from .llm_utils import (BuildConfig, KvCacheRetentionConfig, QuantAlgo,
                         QuantConfig)
+from .mm_encoder import MultimodalEncoder
 from .mpi_session import MpiCommSession
 
 __all__ = [
     'LLM',
+    'MultimodalEncoder',
     'CompletionOutput',
     'RequestOutput',
     'GuidedDecodingParams',
@@ -26,6 +31,8 @@ __all__ = [
     'DisaggregatedParams',
     'KvCacheConfig',
     'KvCacheRetentionConfig',
+    'CudaGraphConfig',
+    'MoeConfig',
     'LookaheadDecodingConfig',
     'MedusaDecodingConfig',
     'EagleDecodingConfig',
@@ -45,11 +52,16 @@ __all__ = [
     'DynamicBatchConfig',
     'CacheTransceiverConfig',
     'NGramDecodingConfig',
+    'UserProvidedDecodingConfig',
     'TorchCompileConfig',
     'DraftTargetDecodingConfig',
     'LlmArgs',
     'TorchLlmArgs',
     'TrtLlmArgs',
-    '_TrtLLM',
-    '_TorchLLM',
+    'AutoDecodingConfig',
+    'AttentionDpConfig',
+    'LoRARequest',
+    'SaveHiddenStatesDecodingConfig',
+    'RocketSparseAttentionConfig',
+    'DeepSeekSparseAttentionConfig',
 ]

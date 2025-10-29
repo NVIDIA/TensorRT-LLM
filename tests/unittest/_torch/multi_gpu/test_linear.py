@@ -6,7 +6,6 @@ import cloudpickle
 import pytest
 import torch
 from mpi4py import MPI
-from mpi4py.futures import MPIPoolExecutor
 from torch import nn
 
 import tensorrt_llm
@@ -20,6 +19,9 @@ MPI.pickle.__init__(
     cloudpickle.loads,
     pickle.HIGHEST_PROTOCOL,
 )
+
+# needed since we reuse the mpi executor pool, first test running will leak a thread
+pytestmark = pytest.mark.threadleak(enabled=False)
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor = None, eps: float = 1e-6):
@@ -246,100 +248,88 @@ def row_linear_norm_fusion_forward(x, hidden_size, dtype, tensor_parallel_size,
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason='needs 2 GPUs to run this test')
-def test_mlp():
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_mlp(mpi_pool_executor):
     torch.manual_seed(42)
     seq_len = 2
     hidden_size = 16
     dtype = torch.bfloat16
-    tensor_parallel_size = 2
+    tensor_parallel_size = mpi_pool_executor.num_workers
     x = torch.randn((seq_len, hidden_size), dtype=dtype)
     l0_weight = torch.randn((4 * hidden_size, hidden_size), dtype=dtype)
     l1_weight = torch.randn((hidden_size, 4 * hidden_size), dtype=dtype)
-    with MPIPoolExecutor(max_workers=tensor_parallel_size) as executor:
-        results = executor.map(
-            run_single_rank,
-            *zip(*[(tensor_parallel_size, mlp_forward, x,
-                    [l0_weight, l1_weight], hidden_size, dtype)] * 2))
-        for r in results:
-            assert r is True
+    results = mpi_pool_executor.map(
+        run_single_rank,
+        *zip(*[(tensor_parallel_size, mlp_forward, x, [l0_weight, l1_weight],
+                hidden_size, dtype)] * 2))
+    for r in results:
+        assert r is True
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason='needs 2 GPUs to run this test')
 @pytest.mark.parametrize("hidden_size", [128, 127],
                          ids=["balanced", "unbalanced"])
-def test_column_linear(hidden_size):
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_column_linear(hidden_size, mpi_pool_executor):
     torch.manual_seed(42)
     seq_len = 10
     dtype = torch.bfloat16
-    tensor_parallel_size = 2
+    tensor_parallel_size = mpi_pool_executor.num_workers
     x = torch.randn((seq_len, hidden_size), dtype=dtype)
     l0_weight = torch.randn((hidden_size, hidden_size), dtype=dtype)
-    with MPIPoolExecutor(max_workers=tensor_parallel_size) as executor:
-        results = executor.map(
-            run_single_rank,
-            *zip(*[(tensor_parallel_size, column_linear_forward, x, [l0_weight],
-                    hidden_size, dtype)] * 2))
-        if hidden_size % 2 != 0:
-            with pytest.raises(AssertionError):
-                for r in results:
-                    assert r is True
-        else:
+    results = mpi_pool_executor.map(
+        run_single_rank,
+        *zip(*[(tensor_parallel_size, column_linear_forward, x, [l0_weight],
+                hidden_size, dtype)] * 2))
+    if hidden_size % 2 != 0:
+        with pytest.raises(AssertionError):
             for r in results:
                 assert r is True
+    else:
+        for r in results:
+            assert r is True
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason='needs 2 GPUs to run this test')
 @pytest.mark.parametrize("hidden_size", [16, 15],
                          ids=["balanced", "unbalanced"])
-def test_row_linear(hidden_size):
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_row_linear(hidden_size, mpi_pool_executor):
     torch.manual_seed(42)
     seq_len = 2
     dtype = torch.bfloat16
-    tensor_parallel_size = 2
+    tensor_parallel_size = mpi_pool_executor.num_workers
     x = torch.randn((seq_len, hidden_size), dtype=dtype)
     l0_weight = torch.randn((hidden_size, hidden_size), dtype=dtype)
-    with MPIPoolExecutor(max_workers=tensor_parallel_size) as executor:
-        results = executor.map(
-            run_single_rank,
-            *zip(*[(tensor_parallel_size, row_linear_forward, x, [l0_weight],
-                    hidden_size, dtype)] * 2))
-        if hidden_size % 2 != 0:
-            with pytest.raises(AssertionError):
-                for r in results:
-                    assert r is True
-        else:
+    results = mpi_pool_executor.map(
+        run_single_rank,
+        *zip(*[(tensor_parallel_size, row_linear_forward, x, [l0_weight],
+                hidden_size, dtype)] * 2))
+    if hidden_size % 2 != 0:
+        with pytest.raises(AssertionError):
             for r in results:
                 assert r is True
+    else:
+        for r in results:
+            assert r is True
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason='needs 2 GPUs to run this test')
 @pytest.mark.parametrize("seq_len", [2, 32], ids=lambda x: f"seqlen:{x}")
 @pytest.mark.parametrize("hidden_size", [16, 256], ids=lambda x: f"hidden:{x}")
-def test_row_linear_norm_fusion(seq_len, hidden_size):
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_row_linear_norm_fusion(seq_len, hidden_size, mpi_pool_executor):
     torch.manual_seed(42)
     dtype = torch.bfloat16
-    tensor_parallel_size = 2
+    tensor_parallel_size = mpi_pool_executor.num_workers
     x = torch.randn((seq_len, hidden_size), dtype=dtype)
     l0_weight = torch.randn((hidden_size, hidden_size), dtype=dtype)
-    with MPIPoolExecutor(max_workers=tensor_parallel_size) as executor:
-        results = executor.map(
-            run_single_rank,
-            *zip(*[(tensor_parallel_size, row_linear_norm_fusion_forward, x,
-                    [l0_weight], hidden_size, dtype)] * 2))
-        for r in results:
-            assert r is True
-
-
-if __name__ == '__main__':
-    test_column_linear(128)
-    test_column_linear(127)
-    test_row_linear(16)
-    test_row_linear(15)
-    test_mlp()
-    test_row_linear_norm_fusion(32, 256)
-    test_row_linear_norm_fusion(32, 16)
-    test_row_linear_norm_fusion(2, 16)
-    test_row_linear_norm_fusion(2, 256)
+    results = mpi_pool_executor.map(
+        run_single_rank,
+        *zip(*[(tensor_parallel_size, row_linear_norm_fusion_forward, x,
+                [l0_weight], hidden_size, dtype)] * 2))
+    for r in results:
+        assert r is True

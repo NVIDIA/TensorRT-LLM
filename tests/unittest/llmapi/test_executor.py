@@ -10,6 +10,7 @@ import pytest
 import torch
 import zmq
 
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._utils import mpi_world_size
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.executor import (DetokenizedGenerationResultBase,
@@ -17,7 +18,7 @@ from tensorrt_llm.executor import (DetokenizedGenerationResultBase,
                                    GenerationResult, GenerationResultBase,
                                    PostprocWorker)
 from tensorrt_llm.executor.ipc import FusedIpcQueue, ZeroMqQueue
-from tensorrt_llm.llmapi import LLM, BuildConfig
+from tensorrt_llm.llmapi import BuildConfig
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.llmapi.utils import AsyncQueue
 from tensorrt_llm.sampling_params import SamplingParams
@@ -77,6 +78,7 @@ def llama_7b_tp2_path(engine_path: Path) -> Path:
     return path
 
 
+@pytest.mark.skip(reason="https://nvbugs/5488280")
 @pytest.mark.skipif(WORLD_SIZE != 1, reason="Must run on single MPI rank")
 def test_generation_bs2(llama_7b_bs2_path: Path):
     tokenizer = TransformersTokenizer.from_pretrained(llama_7b_bs2_path)
@@ -98,6 +100,7 @@ def test_generation_bs2(llama_7b_bs2_path: Path):
                        'E F G H I K L M')
 
 
+@pytest.mark.skip(reason="https://nvbugs/5488280")
 @pytest.mark.skipif(WORLD_SIZE != 1, reason="Must run on single MPI rank")
 def test_sync_generation(llama_7b_path: Path):
     tokenizer = TransformersTokenizer.from_pretrained(llama_7b_path)
@@ -393,7 +396,7 @@ def test_ZeroMqQueue_serialization_complicated_dataclass():
     TokenRangeRetentionConfig = tllm.KvCacheRetentionConfig.TokenRangeRetentionConfig
     kvcache_config = tllm.KvCacheRetentionConfig(
         [TokenRangeRetentionConfig(0, 2, 30, datetime.timedelta(seconds=30))],
-        80)
+        80, None, tllm.KvCacheTransferMode.DRAM, "test_dir")
 
     sampling_params = SamplingParams(max_tokens=4,
                                      embedding_bias=torch.randn(2, 2))

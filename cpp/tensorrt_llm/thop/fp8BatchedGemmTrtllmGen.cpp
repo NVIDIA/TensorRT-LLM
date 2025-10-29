@@ -40,7 +40,6 @@ void runBatchedGemm(at::Tensor& out, at::Tensor& outSfC, at::Tensor const& mat1,
     std::vector<int32_t> const& batchedTokens, bool useDeepSeekFp8, bool lowLatencyKernel,
     tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner& runner, int32_t const configIndex)
 {
-
     // numTokens and maxNumCtasInBatchDim are not used for static batching
     int32_t const numTokens = 0;
     int32_t const maxNumCtasInBatchDim = 0;
@@ -115,7 +114,8 @@ std::tuple<at::Tensor, at::Tensor> fp8_batched_gemm_sm100(at::Tensor const& mat1
         TORCH_CHECK(dDqSfsB.value().scalar_type() == at::ScalarType::Float, "Scale dtype must be FP32.");
         TORCH_CHECK(dDqSfsA.value().dim() == 2, "batching M: dDqSfsA must be a 2D matrix");
         TORCH_CHECK(dDqSfsA.value().sizes()[0] == k / dsFp8QuantBlockSize,
-            "batching M: dDqSfsA must have size B x K/dsFp8QuantBlockSize x divUp(m, dsFp8QuantBlockSize) * 128 * b");
+            "batching M: dDqSfsA must have size B x K/dsFp8QuantBlockSize x divUp(m, dsFp8QuantBlockSize) * tileSize * "
+            "b");
         TORCH_CHECK(
             dDqSfsA.value().sizes()[1] == static_cast<int64_t>(tensorrt_llm::common::divUp(m, tileSize) * tileSize * b),
             "batching M: dDqSfsA must have size B x K/dsFp8QuantBlockSize x divUp(m, tileSize) * tileSize * b");
@@ -207,8 +207,9 @@ public:
         default: C10_THROW_ERROR(NotImplementedError, "outDtype must be one of fp16/bf16/e4m3.");
         }
 
-        RunnerOptionsType const options = {.eltType = mEltType,
-            .outputType = outDtype,
+        RunnerOptionsType const options = {.dtypeA = mEltType,
+            .dtypeB = mEltType,
+            .dtypeC = outDtype,
             .deepSeekFp8 = mUseDeepSeekFp8,
             .fusedAct = false,
             .routeAct = false,

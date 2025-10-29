@@ -28,7 +28,7 @@ from ...functional import (AllReduceFusionOp, AllReduceParams, LayerNormType,
 from ...layers import (Attention, AttentionMaskType, AttentionParams,
                        ColumnLinear, Embedding, GatedMLP, KeyValueCacheParams,
                        LoraParams, PositionEmbeddingType, RmsNorm)
-from ...lora_manager import LoraConfig, use_lora
+from ...lora_helper import LoraConfig, use_lora
 from ...mapping import Mapping
 from ...module import Module
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
@@ -74,7 +74,7 @@ class GemmaDecoderLayer(Module):
                 gemma3_config.query_pre_attn_scalar) / math.sqrt(
                     config.head_size)
             is_sliding = bool(
-                (layer_idx + 1) % gemma3_config.sliding_window_pattern)
+                (layer_idx + 1) % gemma3_config._sliding_window_pattern)
             rotary_base_local = config.rope_local_base_freq
 
         self.attention = Attention(
@@ -157,10 +157,13 @@ class GemmaDecoderLayer(Module):
                 if default_net().plugin_config.reduce_fusion else
                 AllReduceFusionOp.NONE,
                 residual=residual,
-                norm_weight=self.post_layernorm.weight.value,
-                norm_pre_residual_weight=self.pre_feedforward_layernorm.weight.
-                value if self.config.inter_layernorms else None,
-                eps=self.post_layernorm.eps))
+                norm_weight=self.pre_feedforward_layernorm.weight.value
+                if self.config.inter_layernorms else None,
+                norm_pre_residual_weight=self.post_layernorm.weight.value,
+                eps=self.pre_feedforward_layernorm.eps
+                if self.config.inter_layernorms else 1e-06,
+            ),
+        )
 
         if use_cache:
             attention_output, presents = attention_output
@@ -299,7 +302,7 @@ class GemmaForCausalLM(DecoderModelForCausalLM):
         hf_gemma = transformers.AutoModelForCausalLM.from_pretrained(
             hf_model_dir,
             device_map="cpu" if load_model_on_cpu else "auto",
-            torch_dtype='auto',
+            dtype='auto',
         )
         weights = load_gemma_weights_from_hf_model(hf_gemma, trt_llm_config)
         del hf_gemma

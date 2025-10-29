@@ -57,15 +57,20 @@ def run_client(server_addr, values_to_process):
 @pytest.mark.parametrize("task_type", ["submit", "submit_sync"])
 def test_remote_mpi_session(task_type: Literal["submit", "submit_sync"]):
     """Test RemoteMpiPoolSessionClient and RemoteMpiPoolSessionServer interaction"""
-    command = ["bash", "_test_remote_mpi_session.sh", task_type]
+    cur_dir = os.path.dirname(os.path.abspath(__file__))
+    test_file = os.path.join(cur_dir, "_test_remote_mpi_session.sh")
+    assert os.path.exists(test_file), f"Test file {test_file} does not exist"
+    command = ["bash", test_file, task_type]
     print(' '.join(command))
+
     with Popen(command,
                env=os.environ,
                stdout=PIPE,
                stderr=PIPE,
                bufsize=1,
                start_new_session=True,
-               universal_newlines=True) as process:
+               universal_newlines=True,
+               cwd=os.path.dirname(os.path.abspath(__file__))) as process:
 
         # Function to read from a stream and write to output
         def read_stream(stream, output_stream):

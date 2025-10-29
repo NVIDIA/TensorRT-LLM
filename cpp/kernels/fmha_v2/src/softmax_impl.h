@@ -10,6 +10,7 @@
  * its affiliates is strictly prohibited.
  */
 
+#include <cfloat>
 #include <cstdio>
 #include <fmha/numeric_types.h>
 #include <fmha/utils.h>
@@ -33,6 +34,8 @@ struct Softmax_params
     Src_type const* src;
     // Masks.
     int8_t const* mask;
+    // Attention sinks (per head).
+    float const* attention_sinks;
     // Softmax sum pointer.
     float* softmax_sum;
     // ALiBi
@@ -148,7 +151,8 @@ static inline __device__ float apply_exp_(float x, float max)
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <int N>
-static inline __device__ void reduce(float (&data_fp32)[N][1], int8_t const (&mask)[N][1], int warps_n, float& sum_fp32)
+static inline __device__ void reduce(float (&data_fp32)[N][1], int8_t const (&mask)[N][1], int warps_n, float& sum_fp32,
+    float& max_fp32, float const attention_sink)
 {
 
 // Apply the masks.
@@ -159,7 +163,6 @@ static inline __device__ void reduce(float (&data_fp32)[N][1], int8_t const (&ma
     }
 
     // Compute the max inside the thread.
-    float max_fp32 = -HUGE_VALF;
 #pragma unroll
     for (int ii = 0; ii < N; ++ii)
     {
@@ -233,7 +236,7 @@ static inline __device__ void reduce(float (&data_fp32)[N][1], int8_t const (&ma
     }
 
     // Normalize.
-    float inv_sum_fp32 = 1.f / sum_fp32;
+    float inv_sum_fp32 = 1.f / (sum_fp32 + expf(attention_sink - max_fp32));
 #pragma unroll
     for (int ii = 0; ii < N; ++ii)
     {
@@ -244,7 +247,8 @@ static inline __device__ void reduce(float (&data_fp32)[N][1], int8_t const (&ma
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <int N>
-static inline __device__ void reduce(float (&data_fp32)[N][2], int8_t const (&mask)[N][2], int warps_n, float& sum_fp32)
+static inline __device__ void reduce(float (&data_fp32)[N][2], int8_t const (&mask)[N][2], int warps_n, float& sum_fp32,
+    float& max_fp32, float const attention_sink)
 {
 // Apply the masks.
 #pragma unroll
@@ -255,7 +259,6 @@ static inline __device__ void reduce(float (&data_fp32)[N][2], int8_t const (&ma
     }
 
     // Compute the max inside the thread.
-    float max_fp32 = -HUGE_VALF;
 #pragma unroll
     for (int ii = 0; ii < N; ++ii)
     {
@@ -401,7 +404,7 @@ static inline __device__ void reduce(float (&data_fp32)[N][2], int8_t const (&ma
     }
 
     // Normalize.
-    float inv_sum_fp32 = 1.f / sum_fp32;
+    float inv_sum_fp32 = 1.f / (sum_fp32 + expf(attention_sink - max_fp32));
 #pragma unroll
     for (int ii = 0; ii < N; ++ii)
     {
@@ -413,7 +416,8 @@ static inline __device__ void reduce(float (&data_fp32)[N][2], int8_t const (&ma
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <int N>
-static inline __device__ void reduce(float (&data_fp32)[N][4], int8_t const (&mask)[N][4], int warps_n, float& sum_fp32)
+static inline __device__ void reduce(float (&data_fp32)[N][4], int8_t const (&mask)[N][4], int warps_n, float& sum_fp32,
+    float& max_fp32, float const attention_sink)
 {
 
 // Apply the masks.
@@ -427,7 +431,6 @@ static inline __device__ void reduce(float (&data_fp32)[N][4], int8_t const (&ma
     }
 
     // Compute the max inside the thread.
-    float max_fp32 = -HUGE_VALF;
 #pragma unroll
     for (int ii = 0; ii < N; ++ii)
     {
@@ -824,7 +827,7 @@ static inline __device__ void reduce(float (&data_fp32)[N][4], int8_t const (&ma
     }
 
     // Normalize.
-    float inv_sum_fp32 = 1.f / sum_fp32;
+    float inv_sum_fp32 = 1.f / (sum_fp32 + expf(attention_sink - max_fp32));
 #pragma unroll
     for (int ii = 0; ii < N; ++ii)
     {
@@ -994,13 +997,26 @@ static __global__ void softmax_kernel(Softmax_params<Dst_type, Src_type> params)
         }
     }
 
+    // The attention sink value.
+    float attention_sink = -FLT_MAX;
+    if (params.attention_sinks != nullptr)
+    {
+        attention_sink = params.attention_sinks[hi];
+    }
+
     // Do the reduction.
     float sum_fp32 = 0.f;
-    reduce(data_fp32, mask_, params.warps_n, sum_fp32);
+    float max_fp32 = -HUGE_VALF;
+    reduce(data_fp32, mask_, params.warps_n, sum_fp32, max_fp32, attention_sink);
     if (threadIdx.x == 0)
     {
         int sum_s = params.cu_q_seqlens[bi];
-        params.softmax_sum[sum_s * params.h + si * params.h + hi] = sum_fp32;
+        // [B, S, H, 2] {max, sum} float
+        if (hi < params.h)
+        {
+            params.softmax_sum[(sum_s + si) * params.h * 2 + hi * 2] = max_fp32;
+            params.softmax_sum[(sum_s + si) * params.h * 2 + hi * 2 + 1] = sum_fp32;
+        }
     }
     // Reconvert to half.
     DstX_type data_dst[VECs_PER_THREAD];
@@ -1025,9 +1041,9 @@ static __global__ void softmax_kernel(Softmax_params<Dst_type, Src_type> params)
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename Dst_type, typename Src_type>
-void run_softmax(void* dst, void const* src, void const* mask, void* softmax_sum, void* cu_q_seqlens, int s_inner,
-    int s_outer, int b, int h, float scale_bmm1, float scale_softmax, float softcapping_scale_bmm1, int warps_n,
-    bool has_alibi)
+void run_softmax(void* dst, void const* src, void const* mask, void const* attention_sinks, void* softmax_sum,
+    void* cu_q_seqlens, int s_inner, int s_outer, int b, int h, float scale_bmm1, float scale_softmax,
+    float softcapping_scale_bmm1, int warps_n, bool has_alibi)
 {
 
     Softmax_params<Dst_type, Src_type> params;
@@ -1039,6 +1055,7 @@ void run_softmax(void* dst, void const* src, void const* mask, void* softmax_sum
     params.softmax_sum = reinterpret_cast<float*>(softmax_sum);
     params.cu_q_seqlens = reinterpret_cast<int*>(cu_q_seqlens);
     params.mask = reinterpret_cast<int8_t const*>(mask);
+    params.attention_sinks = reinterpret_cast<float const*>(attention_sinks);
     params.has_alibi = has_alibi;
 
     // The dimensions and precomputed values.

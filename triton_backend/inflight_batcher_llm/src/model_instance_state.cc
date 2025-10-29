@@ -698,6 +698,7 @@ executor::ExecutorConfig ModelInstanceState::getExecutorConfigFromParams()
         maxQueueSize, extendedRuntimePerfKnobConfig,
         /*DebugConfig*/ std::nullopt, recvPollPeriodMs};
     execConfig.setSpecDecConfig(specDecConfig);
+    execConfig.setCacheTransceiverConfig(tle::CacheTransceiverConfig(tle::CacheTransceiverConfig::BackendType::MPI));
     if (guidedConfig.has_value())
     {
         execConfig.setGuidedDecodingConfig(guidedConfig.value());
@@ -966,6 +967,10 @@ void ModelInstanceState::enqueue(TRITONBACKEND_Request** requests, uint32_t cons
             }
 
             bool returnPerfMetrics = utils::getRequestBooleanInputTensor(request, InputFieldsNames::returnPerfMetrics);
+            bool returnNumInputTokens
+                = utils::getRequestBooleanInputTensor(request, InputFieldsNames::returnNumInputTokens);
+            bool returnNumOutputTokens
+                = utils::getRequestBooleanInputTensor(request, InputFieldsNames::returnNumOutputTokens);
 
             // Note:
             // A single TRITONBACKEND_Request will produce multiple executor requests when bs > 1.
@@ -993,7 +998,8 @@ void ModelInstanceState::enqueue(TRITONBACKEND_Request** requests, uint32_t cons
                     RequestData{factory, request, tritonRequestId, inputTokensSize, 0, streaming,
                         excludeInputFromOutput, beamWidthCopy, std::move(requestOutputNames),
                         {exec_start_ns, compute_start_ns, 0, 0}, batchIndex, static_cast<int32_t>(requestIds.size()),
-                        numReturnSequences, requestIdsSet, executorRequest.getRequestType(), returnPerfMetrics});
+                        numReturnSequences, requestIdsSet, executorRequest.getRequestType(), returnPerfMetrics,
+                        returnNumInputTokens, returnNumOutputTokens});
             }
             if (tritonRequestId != "")
             {
@@ -1252,6 +1258,29 @@ std::tuple<TRITONBACKEND_Response*, bool, TRITONSERVER_Error*, int64_t> ModelIns
                 }
             }
 
+            // Add token count outputs if requested
+            if (requestData.returnNumInputTokens
+                && requestData.outputNames.count(OutputFieldsNames::numInputTokens) > 0)
+            {
+                std::vector<int64_t> inputTokenCountShape{1, 1};
+                auto inputTokenCountType = TRITONSERVER_TYPE_INT32;
+                auto inputTokenCountBuffer = utils::getResponseBuffer<int32_t>(
+                    tritonResponse, inputTokenCountShape, inputTokenCountType, OutputFieldsNames::numInputTokens);
+                std::vector<int32_t> inputTokenCountVec = {static_cast<int32_t>(requestData.inputTokensSize)};
+                utils::flatten<int32_t>(inputTokenCountVec, inputTokenCountBuffer, inputTokenCountShape);
+            }
+
+            if (requestData.returnNumOutputTokens
+                && requestData.outputNames.count(OutputFieldsNames::numOutputTokens) > 0)
+            {
+                std::vector<int64_t> outputTokenCountShape{1, 1};
+                auto outputTokenCountType = TRITONSERVER_TYPE_INT32;
+                auto outputTokenCountBuffer = utils::getResponseBuffer<int32_t>(
+                    tritonResponse, outputTokenCountShape, outputTokenCountType, OutputFieldsNames::numOutputTokens);
+                std::vector<int32_t> outputTokenCountVec = {static_cast<int32_t>(outputTokensSize)};
+                utils::flatten<int32_t>(outputTokenCountVec, outputTokenCountBuffer, outputTokenCountShape);
+            }
+
             if (requestData.returnPerfMetrics)
             {
                 auto processStats = [&](std::string const& fieldName, auto const& value)
@@ -1299,10 +1328,11 @@ std::tuple<TRITONBACKEND_Response*, bool, TRITONSERVER_Error*, int64_t> ModelIns
                     processStats(OutputFieldsNames::firstTokenTime, timingStats.firstTokenTime);
                     processStats(OutputFieldsNames::lastTokenTime, timingStats.lastTokenTime);
 
-                    auto const& specDecStats = result.requestPerfMetrics.value().speculativeDecoding;
-                    processStats(OutputFieldsNames::acceptanceRate, specDecStats.acceptanceRate);
-                    processStats(OutputFieldsNames::totalAcceptedDraftTokens, specDecStats.totalAcceptedDraftTokens);
-                    processStats(OutputFieldsNames::totalDraftTokens, specDecStats.totalDraftTokens);
+                    auto const& specDecodingStats = result.requestPerfMetrics.value().speculativeDecoding;
+                    processStats(OutputFieldsNames::acceptanceRate, specDecodingStats.acceptanceRate);
+                    processStats(
+                        OutputFieldsNames::totalAcceptedDraftTokens, specDecodingStats.totalAcceptedDraftTokens);
+                    processStats(OutputFieldsNames::totalDraftTokens, specDecodingStats.totalDraftTokens);
                 }
             }
         }

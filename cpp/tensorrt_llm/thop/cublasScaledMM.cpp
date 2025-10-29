@@ -48,29 +48,60 @@ struct hash_tuple
 
 // got from cublasTest matmultFind
 // {mp2, k, n}: {algo, m_tile, m_stages, m_numsK, m_reduction, m_swizzle, m_custom, m_cga}
-using AlgoListType = std::unordered_map<std::tuple<int32_t, int32_t, int32_t>, std::array<int, 7>, hash_tuple>;
+using AlgoListType = std::unordered_map<std::tuple<int32_t, int32_t, int32_t>, std::array<int, 8>, hash_tuple>;
+
+// bf16*bf16->fp32->bf16
+AlgoListType spark_bf16_algo_list = {
+    // GPT-OSS-20b
+    //-m201088 -n1 -algo21 -m_tile11 -m_stages20 -m_workmem0 -k2880
+    {{8, 2880, 201088}, {21, 11, 20, 1, 0, 0, 0, 0}},
+    //-m32 -n1 -algo14 -m_reduction2 -m_numsK10 -m_workmem1024 -k2880
+    {{8, 2880, 32}, {14, 0, 0, 10, 2, 0, 0, 0}},
+    //-m32 -n2048 -algo21 -m_tile11 -m_stages13 -m_reduction1 -m_numsK9 -m_workmem1024
+    //-k2880
+    {{2048, 2880, 32}, {21, 11, 13, 9, 1, 0, 0, 0}},
+    //-m32 -n2175 -algo21 -m_tile11 -m_stages19 -m_reduction1 -m_numsK11
+    //-m_workmem1024 -k2880
+    {{4096, 2880, 32}, {21, 11, 19, 11, 1, 0, 0, 0}},
+    //-m5120 -n1 -algo23 -m_tile11 -m_stages8 -m_reduction1 -m_numsK2
+    //-m_workmem1024 -k2880
+    {{8, 2880, 5120}, {23, 11, 8, 2, 1, 0, 0, 0}},
+    //-m5120 -n2048 -algo21 -m_tile20 -m_stages15 -m_workmem1024 -k2880
+    {{2048, 2880, 5120}, {21, 20, 15, 1, 0, 0, 0, 0}},
+    //-m5120 -n2175 -algo21 -m_tile20 -m_stages15 -m_workmem1024 -k2880
+    {{4096, 2880, 5120}, {21, 20, 15, 1, 0, 0, 0, 0}},
+    //-m2880 -n1 -algo23 -m_tile11 -m_stages14 -m_reduction1 -m_numsK24 -m_workmem1024 -k4096
+    {{8, 4096, 2880}, {23, 11, 14, 24, 1, 0, 0, 0}},
+    //-m2880 -n2048 -ldc2880 -Poutt -ldd2880 -Ps -Pscales -algo21 -m_tile20 -m_stages15 -m_workmem1024 -k4096
+    {{2048, 4096, 2880}, {21, 20, 15, 1, 0, 0, 0, 0}},
+    //-m2880 -n2175 -ldc2880 -Poutt -ldd2880 -Ps -Pscales -algo21 -m_tile20 -m_stages15 -m_workmem1024 -k4096
+    {{4096, 4096, 2880}, {21, 20, 15, 1, 0, 0, 0, 0}},
+};
 
 // bf16*bf16->fp32->bf16
 AlgoListType bf16_algo_list = {
     // Deepseek v3/R1 router gemm
     // [-algo66 -m_tile10 -m_stages35 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom3 -m_mma0 -m_cga2 -m_scheduling1]
-    {{8, 7168, 256}, {10, 35, 1, 0, 0, 3, 2}},
-    {{512, 7168, 256}, {48, 35, 1, 0, 0, 0, 2}},
-    {{1024, 7168, 256}, {13, 35, 1, 0, 0, 1, 3}},
+    {{8, 7168, 256}, {66, 10, 35, 1, 0, 0, 3, 2}},
+    {{512, 7168, 256}, {66, 48, 35, 1, 0, 0, 0, 2}},
+    {{1024, 7168, 256}, {66, 13, 35, 1, 0, 0, 1, 3}},
 };
 
 // fp8*fp8->fp32->fp16
 AlgoListType fp8_algo_list = {
     // Llama-3.1-70B
     // [-algo66 -m_tile393 -m_stages36 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom5 -m_mma0 -m_cga2 -m_scheduling1]
-    {{8, 8192, 8192}, {393, 36, 1, 0, 0, 5, 2}},
+    {{8, 8192, 8192}, {66, 393, 36, 1, 0, 0, 5, 2}},
     // [-algo66 -m_tile10 -m_stages36 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom1 -m_mma0 -m_cga2 -m_scheduling1]
-    {{8, 8192, 57344}, {10, 36, 1, 0, 0, 1, 2}},
+    {{8, 8192, 57344}, {66, 10, 36, 1, 0, 0, 1, 2}},
+    // Llama-3.3-70B TP4 (this is the default algo on B200. Here we aim to use the same algo on GB200.)
+    // [-algo66 -m_tile393 -m_stages36 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom1 -m_mma0 -m_cga4 -m_scheduling1]
+    {{8, 8192, 14336}, {66, 393, 36, 1, 0, 1, 1, 4}},
 };
 
-void set_algo_attr(cublasLtMatmulAlgo_t& algo, std::array<int, 7> const& attr_list)
+void set_algo_attr(cublasLtMatmulAlgo_t& algo, std::array<int, 8> const& attr_list)
 {
-    auto const& [tileID, stagesID, numsK, reduction, swizzle, customOption_, cga_] = attr_list;
+    auto const& [algoId, tileID, stagesID, numsK, reduction, swizzle, customOption_, cga_] = attr_list;
     uint32_t customOption = customOption_;
     uint16_t cga = cga_;
     check_cuda_error(
@@ -98,7 +129,9 @@ bool find_special_algo(cublasLtMatmulAlgo_t& algo, std::shared_ptr<CublasMMWrapp
     if ((aType == CUDA_R_16BF || aType == CUDA_R_16F) && (outType == aType || outType == CUDA_R_32F)
         && compType == CUBLAS_COMPUTE_32F)
     {
-        algo_list = bf16_algo_list;
+        // TODO: remove this after cublas fix the heuristic for Spark
+        algo_list = tensorrt_llm::common::getSMVersion(/*queryRealSmArch=*/true) == 121 ? spark_bf16_algo_list
+                                                                                        : bf16_algo_list;
     }
     else if (aType == CUDA_R_8F_E4M3 && compType == CUBLAS_COMPUTE_32F)
     {
@@ -110,15 +143,18 @@ bool find_special_algo(cublasLtMatmulAlgo_t& algo, std::shared_ptr<CublasMMWrapp
             "No special cublasLt algo found for aType=%d, outType=%d, compType=%d\n", aType, outType, compType);
         return false;
     }
-    int const algoID = 66; // CUBLASLT_MATMUL_ALGO_NVJET
-    check_cuda_error(cublasLtMatmulAlgoInit(
-        cublasWrapper->getCublasLtHandle(), compType, scaleType, aType, bType, outType, outType, algoID, &algo));
     if (auto algo_iter = algo_list.find({mp2, k, n}); algo_iter != algo_list.end())
     {
+        int const algoID = algo_iter->second[0];
+        check_cuda_error(cublasLtMatmulAlgoInit(
+            cublasWrapper->getCublasLtHandle(), compType, scaleType, aType, bType, outType, outType, algoID, &algo));
         set_algo_attr(algo, algo_iter->second);
     }
     else
     {
+        int const algoID = 66; // CUBLASLT_MATMUL_ALGO_NVJET
+        check_cuda_error(cublasLtMatmulAlgoInit(
+            cublasWrapper->getCublasLtHandle(), compType, scaleType, aType, bType, outType, outType, algoID, &algo));
         TLLM_LOG_DEBUG("No special cublasLt algo found for m=%d, k=%d, n=%d\n", m, k, n);
         return false;
     }
@@ -178,7 +214,8 @@ bool find_special_algo_deprecated(cublasLtMatmulAlgo_t& algo, std::shared_ptr<Cu
 }
 
 void cublas_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tensor const& b,
-    std::optional<at::Tensor> const& scale_a, std::optional<at::Tensor> const& scale_b, bool fast_acc = false)
+    std::optional<at::Tensor> const& scale_a, std::optional<at::Tensor> const& scale_b,
+    std::optional<at::Tensor> const& bias, bool fast_acc = false)
 {
     bool use_scale = false;
     if (scale_a.has_value() && scale_b.has_value())
@@ -224,6 +261,13 @@ void cublas_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tenso
         b_scale = static_cast<void*>(scale_b.value().data_ptr());
     }
 
+    bool use_bias = bias.has_value();
+    void* bias_ptr = nullptr;
+    if (use_bias)
+    {
+        bias_ptr = static_cast<void*>(bias.value().data_ptr());
+    }
+
     cublasWrapper->setStream(stream);
     cublasWrapper->setWorkspace(ws_ptr);
 
@@ -242,6 +286,8 @@ void cublas_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tenso
         CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, /*lda=*/k, /*ldb=*/k, /*ldc=*/n, /*fastAcc=*/fast_acc);
     if (use_scale)
         cublasWrapper->setScaleDescriptors(a_scale, b_scale);
+    if (use_bias)
+        cublasWrapper->setBiasDescriptor(bias_ptr);
     cublasWrapper->Gemm(CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, /*A=*/b_ptr, /*lda=*/k, /*B=*/a_ptr, /*ldb=*/k, out_ptr,
         /*ldc=*/n, 1.0F, 0.0F, algo, has_algo, true);
     cublasWrapper->destroyDescriptors();
@@ -271,12 +317,10 @@ Tensor& cublas_scaled_mm_out(Tensor const& mat_a, Tensor const& mat_b, Tensor co
     TORCH_CHECK(out.strides()[0] % 16 == 0 && mat_b.strides()[1] % 16 == 0); // 16 Byte Alignment
     TORCH_CHECK(scale_a.is_contiguous() && scale_b.is_contiguous());
 
-    TORCH_CHECK(!bias.has_value(), "bias is not support yet");
-
     TORCH_CHECK(mat_a.dtype() == torch::kFloat8_e4m3fn);
     TORCH_CHECK(mat_b.dtype() == torch::kFloat8_e4m3fn);
 
-    cublas_gemm_caller(out, mat_a, mat_b, scale_a, scale_b, true);
+    cublas_gemm_caller(out, mat_a, mat_b, scale_a, scale_b, bias, true);
     return out;
 }
 
@@ -317,9 +361,7 @@ Tensor& cublas_mm_out(Tensor const& mat_a, Tensor const& mat_b, std::optional<at
     TORCH_CHECK(mat_a.strides()[1] == 1 && out.strides()[1] == 1); // Row-major
     TORCH_CHECK(mat_b.strides()[0] == 1);                          // Column-major
 
-    TORCH_CHECK(!bias.has_value(), "bias is not support yet");
-
-    cublas_gemm_caller(out, mat_a, mat_b, at::nullopt, at::nullopt, false);
+    cublas_gemm_caller(out, mat_a, mat_b, at::nullopt, at::nullopt, bias, false);
     return out;
 }
 
@@ -340,11 +382,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "cublas_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scale_a, Tensor scale_b, Tensor? bias,"
         " ScalarType? out_dtype, bool to_userbuffers=False) -> (Tensor out)");
-    m.def(
-        "cublas_scaled_mm_out(Tensor mat_a, Tensor mat_b, Tensor scale_a, Tensor scale_b, Tensor? bias,"
-        " int userbuffers_id, Tensor! out) -> (Tensor out)");
     m.def("cublas_mm(Tensor mat_a, Tensor mat_b, Tensor? bias, ScalarType? out_dtype) -> (Tensor out)");
-    m.def("cublas_mm_out(Tensor mat_a, Tensor mat_b, Tensor? bias, Tensor! out) -> (Tensor out)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

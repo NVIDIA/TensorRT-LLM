@@ -8,7 +8,9 @@
 #SBATCH -e logs/trtllm-serve.err
 #SBATCH -J trtllm-serve
 
-### Run trtllm-serve with pytorch backend on Slurm
+### :title Run trtllm-serve with pytorch backend on Slurm
+### :order 2
+### :section Slurm
 
 # NOTE, this feature is experimental and may not work on all systems.
 # The trtllm-llmapi-launch is a script that launches the LLM-API code on
@@ -27,7 +29,7 @@
 #   MOUNT_DIR: the directory to mount in the container
 #   MOUNT_DEST: the destination directory in the container
 #   WORKDIR: the working directory in the container
-#   SOURCE_ROOT: the path to the TensorRT-LLM source
+#   SOURCE_ROOT: the path to the TensorRT LLM source
 #   PROLOGUE: the prologue to run before the script
 #   LOCAL_MODEL: the local model directory to use, NOTE: downloading from HF is
 #      not supported in Slurm mode, you need to download the model and put it in
@@ -49,7 +51,6 @@ srun -l \
         trtllm-llmapi-launch \
          trtllm-serve $LOCAL_MODEL \
             --tp_size 16 \
-            --backend pytorch \
             --host 0.0.0.0 \
             ${ADDITIONAL_OPTIONS}
     "

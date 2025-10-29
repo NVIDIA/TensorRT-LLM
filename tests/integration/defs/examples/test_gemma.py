@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import time
 from pathlib import Path
 
 import pytest
@@ -193,6 +194,7 @@ def hf_gemma_quantization_1gpu(batch_size,
 
 
 # max_seq_len=3100, one local value that won't slide, and one that will
+@skip_post_blackwell
 @pytest.mark.parametrize("batch_size", [8])
 @pytest.mark.parametrize("data_type", ['bfloat16'])
 @pytest.mark.parametrize("test_case", ['other'])
@@ -208,6 +210,7 @@ def test_llm_gemma_1gpu_summary_vswa(batch_size, data_type, gemma_model_root,
                        max_attention_window)
 
 
+@pytest.mark.timeout(7200)
 @pytest.mark.parametrize("batch_size", [8])
 @pytest.mark.parametrize("data_type", ['float16', 'bfloat16'])
 @pytest.mark.parametrize("test_case", [
@@ -251,7 +254,7 @@ def gemma_1gpu_summary(batch_size,
     "run gemm test on 1 gpu"
     skip_fp8_pre_ada(use_fp8=test_case == "fp8_kv_cache")
     if "smooth_quant" in test_case and "bfloat16" in data_type:
-        pytest.skip("TensorRT-LLM does not support SmoothQuant with bfloat16.")
+        pytest.skip("TensorRT LLM does not support SmoothQuant with bfloat16.")
 
     if any(params in gemma_model_root for params in
            ["gemma-7b", "9b", "27b"]) and get_device_memory() < 50000:
@@ -347,7 +350,7 @@ def test_llm_gemma_1gpu_mmlu(batch_size, data_type, gemma_model_root, llm_venv,
                              llm_rouge_root, llm_datasets_root, test_case):
     "run gemm test on 1 gpu"
     if "smooth_quant" in test_case and "bfloat16" in data_type:
-        pytest.skip("TensorRT-LLM does not support SmoothQuant with bfloat16.")
+        pytest.skip("TensorRT LLM does not support SmoothQuant with bfloat16.")
     ckpt_type = get_ckpt_type(gemma_model_root)
     ckpt_dir = get_ckpt_dir(gemma_model_root)
     vocab_file = get_vocab_file(gemma_model_root)
@@ -428,7 +431,9 @@ def test_hf_gemma_fp8_base_bf16_multi_lora(gemma_model_root,
                                            batch_size=8):
     "Run Gemma models with multiple dummy LoRAs."
 
+    start_time = time.time()
     print("Convert checkpoint by modelopt...")
+    convert_start = time.time()
     kv_cache_dtype = 'fp8' if qformat == 'fp8' else 'int8'
     convert_cmd = [
         f"{gemma_example_root}/../../../quantization/quantize.py",
@@ -440,7 +445,13 @@ def test_hf_gemma_fp8_base_bf16_multi_lora(gemma_model_root,
         f"--output_dir={cmodel_dir}",
     ]
     venv_check_call(llm_venv, convert_cmd)
+    convert_end = time.time()
+    print(
+        f"Convert checkpoint completed in {(convert_end - convert_start):.2f} seconds."
+    )
 
+    test_multi_lora_start = time.time()
+    print("Calling test_multi_lora_support...")
     test_multi_lora_support(
         hf_model_dir=gemma_model_root,
         tllm_ckpt_dir=cmodel_dir,
@@ -453,3 +464,10 @@ def test_hf_gemma_fp8_base_bf16_multi_lora(gemma_model_root,
         target_trtllm_modules=["attn_q", "attn_k", "attn_v"],
         zero_lora_weights=True,
     )
+    test_multi_lora_end = time.time()
+    print(
+        f"test_multi_lora_support completed in {(test_multi_lora_end - test_multi_lora_start):.2f} seconds"
+    )
+
+    total_time = time.time() - start_time
+    print(f"Total function execution time: {total_time:.2f} seconds")

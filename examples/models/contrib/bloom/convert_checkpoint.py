@@ -156,7 +156,7 @@ def parse_arguments():
     parser.add_argument('--output_dir',
                         type=Path,
                         default='tllm_checkpoint',
-                        help='The path to save the TensorRT-LLM checkpoint')
+                        help='The path to save the TensorRT LLM checkpoint')
     parser.add_argument(
         '--calib_dataset',
         type=str,
@@ -898,7 +898,7 @@ def main():
     if not convert_from_ckpt:
         logger.info(f'Convert by using model')
         hf_bloom = BloomForCausalLM.from_pretrained(args.model_dir,
-                                                    torch_dtype="auto",
+                                                    dtype="auto",
                                                     device_map="auto",
                                                     trust_remote_code=True)
     else:

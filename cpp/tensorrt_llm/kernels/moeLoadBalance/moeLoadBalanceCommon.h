@@ -63,11 +63,12 @@ struct MoeLoadBalanceStatisticInfo
 
     // rawDataWindowSize means the size of the raw data window.
     // e.g. how many steps of raw data are kept in the memory.
-    int rawDataWindowSize = 1;
+    // current we keep only the data in current iteration, previous should sum to expertLoadFactor.
+    static constexpr int rawDataWindowSize = 1;
 
     // decayFactor means the decay factor of the raw data per step.
-    // e.g. if decayFactor is 0.9, then the raw data of expert i will be decayed by 0.9 for each step.
-    float decayFactor = 0.9f;
+    // e.g. if decayFactor is 0.95, then the raw data of expert i will be decayed by 0.95 for each step.
+    float decayFactor = 0.95f;
 };
 
 // The placement information for GPU

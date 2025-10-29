@@ -12,29 +12,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import copy
 import json
 import math
 import os
 import shutil
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional, Union
 
 import numpy as np
 import tensorrt as trt
+from pydantic import BaseModel, Field
 
 from ._common import _is_building, check_max_num_tokens, serialize_engine
 from ._utils import (get_sm_version, np_bfloat16, np_float8, str_dtype_to_trt,
                      to_json_file, trt_gte)
-from .auto_parallel import auto_parallel
-from .auto_parallel.config import AutoParallelConfig
-from .bindings import KVCacheType
 from .functional import PositionEmbeddingType
 from .graph_rewriting import optimize
+from .llmapi.kv_cache_type import KVCacheType
 from .logger import logger
-from .lora_manager import LoraConfig
+from .lora_helper import LoraConfig
 from .models import PretrainedConfig, PretrainedModel
 from .models.modeling_utils import SpeculativeDecodingMode, optimize_model
 from .network import Network, net_guard
@@ -46,10 +43,7 @@ from .version import __version__
 class ConfigEncoder(json.JSONEncoder):
 
     def default(self, obj):
-        if isinstance(obj, KVCacheType):
-            # For KVCacheType, convert it to string by split of 'KVCacheType.PAGED'.
-            return obj.__str__().split('.')[-1]
-        elif hasattr(obj, 'model_dump'):
+        if hasattr(obj, 'model_dump'):
             # Handle Pydantic models (including DecodingBaseConfig and subclasses)
             return obj.model_dump(mode='json')
         else:
@@ -82,24 +76,17 @@ class BuilderConfig(object):
             "plugin_config": {
                 # the network plugin_config (if any) attached to this BuilderConfig object
                 # inside the Builder.build_engine
-            },
-            "auto_parallel_config": {
-                # the network auto_parallel_config (if any) attached to this BuilderConfig object
-                # inside the Builder.build_engine
             }
         }
         '''
         config = {'builder_config': {}}
         for k in self.__dict__.keys():
-            if k not in [
-                    '_trt_builder_config', 'plugin_config',
-                    'auto_parallel_config'
-            ]:
+            if k not in ['_trt_builder_config', 'plugin_config']:
                 config['builder_config'][k] = self.__getattribute__(k)
         if hasattr(self, 'plugin_config'):
             assert isinstance(self.plugin_config, PluginConfig), \
                 f"Found unexpected plugin_config object with type: {type(self.plugin_config)}"
-            config['plugin_config'] = self.plugin_config.to_dict()
+            config['plugin_config'] = self.plugin_config.model_dump(mode="json")
         return config
 
 
@@ -268,17 +255,6 @@ class Builder():
                 min_shape = [*shape_profile.min]
                 opt_shape = [*shape_profile.opt]
                 max_shape = [*shape_profile.max]
-                if network._auto_parallel_config is not None:
-                    io_shards = network._auto_parallel_config["io_shards"]
-                    if input_name in io_shards:
-                        shards = io_shards[input_name]
-                        for dim, shard_num in shards.items():
-                            min_shape[dim] = int(
-                                math.floor(min_shape[dim] / shard_num))
-                            opt_shape[dim] = int(
-                                round(opt_shape[dim] / shard_num))
-                            max_shape[dim] = int(
-                                math.ceil(max_shape[dim] / shard_num))
                 profile.set_shape(input_name, min_shape, opt_shape, max_shape)
                 logger.debug(
                     f'{input_name}, min: {min_shape}, opt: {opt_shape}, max: {max_shape}, dimension names: {shape_profile.dimension_names}'
@@ -301,7 +277,7 @@ class Builder():
                                    builder_config) -> bool:
         '''
             For each profile, validate that the named dimensions of different input tensors in this profile all have same range.
-            TRT will validate the same condition, validate it earlier to make sure the modeling in TensorRT-LLM are correct and
+            TRT will validate the same condition, validate it earlier to make sure the modeling in TensorRT LLM are correct and
             makes the error msg more user friendly.
         '''
         valid = True
@@ -387,7 +363,6 @@ class Builder():
         '''
         assert isinstance(network, Network)
         builder_config.plugin_config = network.plugin_config
-        builder_config.auto_parallel_config = network.auto_parallel_config
         if builder_config.trt_builder_config.num_optimization_profiles == 0:
             self._add_optimization_profile(network, builder_config)
         logger.info(
@@ -475,40 +450,112 @@ class Builder():
         logger.info(f'Config saved to {config_path}.')
 
 
-@dataclass
-class BuildConfig:
-    max_input_len: int = 1024
-    max_seq_len: int = None
-    opt_batch_size: int = 8
-    max_batch_size: int = 2048
-    max_beam_width: int = 1
-    max_num_tokens: int = 8192
-    opt_num_tokens: Optional[int] = None
-    max_prompt_embedding_table_size: int = 0
-    kv_cache_type: KVCacheType = None
-    gather_context_logits: int = False
-    gather_generation_logits: int = False
-    strongly_typed: bool = True
-    force_num_profiles: Optional[int] = None
-    profiling_verbosity: str = 'layer_names_only'
-    enable_debug_output: bool = False
-    max_draft_len: int = 0
-    speculative_decoding_mode: SpeculativeDecodingMode = SpeculativeDecodingMode.NONE
-    use_refit: bool = False
-    input_timing_cache: str = None
-    output_timing_cache: str = 'model.cache'
-    lora_config: LoraConfig = field(default_factory=LoraConfig)
-    auto_parallel_config: AutoParallelConfig = field(
-        default_factory=AutoParallelConfig)
-    weight_sparsity: bool = False
-    weight_streaming: bool = False
-    plugin_config: PluginConfig = field(default_factory=PluginConfig)
-    use_strip_plan: bool = False
-    max_encoder_input_len: int = 1024  # for enc-dec DecoderModel
-    dry_run: bool = False
-    visualize_network: str = None
-    monitor_memory: bool = False
-    use_mrope: bool = False
+class BuildConfig(BaseModel):
+    """Configuration class for TensorRT LLM engine building parameters.
+
+    This class contains all the configuration parameters needed to build a TensorRT LLM engine,
+    including sequence length limits, batch sizes, optimization settings, and various features.
+    """
+    max_input_len: int = Field(default=1024,
+                               description="Maximum length of input sequences.")
+    max_seq_len: Optional[int] = Field(
+        default=None,
+        description=
+        "The maximum possible sequence length for a single request, including both input and generated "
+        "output tokens.")
+    opt_batch_size: int = Field(
+        default=8, description="Optimal batch size for engine optimization.")
+    max_batch_size: int = Field(
+        default=2048, description="Maximum batch size the engine can handle.")
+    max_beam_width: int = Field(
+        default=1, description="Maximum beam width for beam search decoding.")
+    max_num_tokens: int = Field(
+        default=8192,
+        description="Maximum number of batched input tokens after padding is "
+        "removed in each batch.")
+    opt_num_tokens: Optional[int] = Field(
+        default=None,
+        description=
+        "Optimal number of batched input tokens for engine optimization.")
+    max_prompt_embedding_table_size: int = Field(
+        default=0,
+        description="Maximum size of prompt embedding table for prompt tuning.")
+    kv_cache_type: Optional[KVCacheType] = Field(
+        default=None,
+        description=
+        "Type of KV cache to use (CONTINUOUS or PAGED). If None, defaults to PAGED."
+    )
+    gather_context_logits: bool = Field(
+        default=False,
+        description="Whether to gather logits during context phase.")
+    gather_generation_logits: bool = Field(
+        default=False,
+        description="Whether to gather logits during generation phase.")
+    strongly_typed: bool = Field(default=True,
+                                 description="Whether to use strongly_typed.")
+    force_num_profiles: Optional[int] = Field(
+        default=None,
+        description=
+        "Force a specific number of optimization profiles. If None, auto-determined."
+    )
+    profiling_verbosity: str = Field(
+        default='layer_names_only',
+        description=
+        "Verbosity level for TensorRT profiling ('layer_names_only', 'detailed', 'none')."
+    )
+    enable_debug_output: bool = Field(
+        default=False,
+        description="Whether to enable debug output during building.")
+    max_draft_len: int = Field(
+        default=0,
+        description="Maximum length of draft tokens for speculative decoding.")
+    speculative_decoding_mode: SpeculativeDecodingMode = Field(
+        default=SpeculativeDecodingMode.NONE,
+        description="Mode for speculative decoding (NONE, MEDUSA, EAGLE, etc.)."
+    )
+    use_refit: bool = Field(
+        default=False,
+        description="Whether to enable engine refitting capabilities.")
+    input_timing_cache: Optional[str] = Field(
+        default=None,
+        description=
+        "Path to input timing cache file. If None, no input cache used.")
+    output_timing_cache: str = Field(
+        default='model.cache', description="Path to output timing cache file.")
+    lora_config: LoraConfig = Field(
+        default_factory=LoraConfig,
+        description="Configuration for LoRA (Low-Rank Adaptation) fine-tuning.")
+    weight_sparsity: bool = Field(
+        default=False,
+        description="Whether to enable weight sparsity optimization.")
+    weight_streaming: bool = Field(
+        default=False,
+        description="Whether to enable weight streaming for large models.")
+    plugin_config: PluginConfig = Field(
+        default_factory=PluginConfig,
+        description="Configuration for TensorRT LLM plugins.")
+    use_strip_plan: bool = Field(
+        default=False,
+        description="Whether to use stripped plan for engine building.")
+    max_encoder_input_len: int = Field(
+        default=1024,
+        description="Maximum encoder input length for encoder-decoder models.")
+    dry_run: bool = Field(
+        default=False,
+        description=
+        "Whether to perform a dry run without actually building the engine.")
+    visualize_network: Optional[str] = Field(
+        default=None,
+        description=
+        "Path to save network visualization. If None, no visualization generated."
+    )
+    monitor_memory: bool = Field(
+        default=False,
+        description="Whether to monitor memory usage during building.")
+    use_mrope: bool = Field(
+        default=False,
+        description=
+        "Whether to use Multi-RoPE (Rotary Position Embedding) optimization.")
 
     # Since we have some overlapping between kv_cache_type, paged_kv_cache, and paged_state (later two will be deprecated in the future),
     # we need to handle it given model architecture.
@@ -558,112 +605,10 @@ class BuildConfig:
             override_attri('paged_state', False)
 
     @classmethod
-    def from_dict(cls, config, plugin_config=None):
-        config = copy.deepcopy(
-            config
-        )  # it just does not make sense to change the input arg `config`
-        max_input_len = config.pop('max_input_len')
-        max_seq_len = config.pop('max_seq_len')
-        max_batch_size = config.pop('max_batch_size')
-        max_beam_width = config.pop('max_beam_width')
-        max_num_tokens = config.pop('max_num_tokens')
-        opt_num_tokens = config.pop('opt_num_tokens')
-        opt_batch_size = config.pop('opt_batch_size', 8)
-        max_prompt_embedding_table_size = config.pop(
-            'max_prompt_embedding_table_size', 0)
-
-        kv_cache_type = KVCacheType(
-            config.pop('kv_cache_type')) if 'plugin_config' in config else None
-        gather_context_logits = config.pop('gather_context_logits', False)
-        gather_generation_logits = config.pop('gather_generation_logits', False)
-        strongly_typed = config.pop('strongly_typed', True)
-        force_num_profiles = config.pop('force_num_profiles', None)
-        weight_sparsity = config.pop('weight_sparsity', False)
-        profiling_verbosity = config.pop('profiling_verbosity',
-                                         'layer_names_only')
-        enable_debug_output = config.pop('enable_debug_output', False)
-        max_draft_len = config.pop('max_draft_len', 0)
-        speculative_decoding_mode = config.pop('speculative_decoding_mode',
-                                               SpeculativeDecodingMode.NONE)
-        use_refit = config.pop('use_refit', False)
-        input_timing_cache = config.pop('input_timing_cache', None)
-        output_timing_cache = config.pop('output_timing_cache', None)
-        lora_config = LoraConfig.from_dict(config.get('lora_config', {}))
-        auto_parallel_config = AutoParallelConfig.from_dict(
-            config.get('auto_parallel_config', {}))
-        max_encoder_input_len = config.pop('max_encoder_input_len', 1024)
-        weight_streaming = config.pop('weight_streaming', False)
-        use_strip_plan = config.pop('use_strip_plan', False)
-
-        if plugin_config is None:
-            plugin_config = PluginConfig()
-        if "plugin_config" in config.keys():
-            plugin_config.update_from_dict(config["plugin_config"])
-
-        dry_run = config.pop('dry_run', False)
-        visualize_network = config.pop('visualize_network', None)
-        monitor_memory = config.pop('monitor_memory', False)
-        use_mrope = config.pop('use_mrope', False)
-
-        return cls(
-            max_input_len=max_input_len,
-            max_seq_len=max_seq_len,
-            max_batch_size=max_batch_size,
-            max_beam_width=max_beam_width,
-            max_num_tokens=max_num_tokens,
-            opt_num_tokens=opt_num_tokens,
-            opt_batch_size=opt_batch_size,
-            max_prompt_embedding_table_size=max_prompt_embedding_table_size,
-            kv_cache_type=kv_cache_type,
-            gather_context_logits=gather_context_logits,
-            gather_generation_logits=gather_generation_logits,
-            strongly_typed=strongly_typed,
-            force_num_profiles=force_num_profiles,
-            profiling_verbosity=profiling_verbosity,
-            enable_debug_output=enable_debug_output,
-            max_draft_len=max_draft_len,
-            speculative_decoding_mode=speculative_decoding_mode,
-            use_refit=use_refit,
-            input_timing_cache=input_timing_cache,
-            output_timing_cache=output_timing_cache,
-            lora_config=lora_config,
-            auto_parallel_config=auto_parallel_config,
-            use_strip_plan=use_strip_plan,
-            max_encoder_input_len=max_encoder_input_len,
-            weight_sparsity=weight_sparsity,
-            weight_streaming=weight_streaming,
-            plugin_config=plugin_config,
-            dry_run=dry_run,
-            visualize_network=visualize_network,
-            monitor_memory=monitor_memory,
-            use_mrope=use_mrope)
-
-    @classmethod
-    def from_json_file(cls, config_file, plugin_config=None):
+    def from_json_file(cls, config_file):
         with open(config_file) as f:
             config = json.load(f)
-            return BuildConfig.from_dict(config, plugin_config=plugin_config)
-
-    def to_dict(self):
-        output = copy.deepcopy(self.__dict__)
-        # the enum KVCacheType cannot be converted automatically
-        if output.get('kv_cache_type', None) is not None:
-            output['kv_cache_type'] = str(output['kv_cache_type'].name)
-        output['plugin_config'] = output['plugin_config'].to_dict()
-        output['lora_config'] = output['lora_config'].to_dict()
-        output['auto_parallel_config'] = output['auto_parallel_config'].to_dict(
-        )
-        return output
-
-    def update_from_dict(self, config: dict):
-        for name, value in config.items():
-            if not hasattr(self, name):
-                raise AttributeError(
-                    f"{self.__class__} object has no attribute {name}")
-            setattr(self, name, value)
-
-    def update(self, **kwargs):
-        self.update_from_dict(kwargs)
+            return BuildConfig(**config)
 
 
 class EngineConfig:
@@ -683,11 +628,10 @@ class EngineConfig:
     def from_json_str(cls, config_str):
         config = json.loads(config_str)
         return cls(PretrainedConfig.from_dict(config['pretrained_config']),
-                   BuildConfig.from_dict(config['build_config']),
-                   config['version'])
+                   BuildConfig(**config['build_config']), config['version'])
 
     def to_dict(self):
-        build_config = self.build_config.to_dict()
+        build_config = self.build_config.model_dump(mode="json")
         build_config.pop('dry_run', None)  # Not an Engine Characteristic
         build_config.pop('visualize_network',
                          None)  # Not an Engine Characteristic
@@ -815,7 +759,6 @@ def get_engine_version(engine_dir: str) -> Union[None, str]:
 
 def optimize_model_with_config(model: PretrainedModel,
                                build_config: BuildConfig):
-    use_auto_parallel = build_config.auto_parallel_config.enabled
     gemm_swiglu_plugin = build_config.plugin_config.gemm_swiglu_plugin
     low_latency_gemm_swiglu_plugin = build_config.plugin_config.low_latency_gemm_swiglu_plugin
     if gemm_swiglu_plugin or low_latency_gemm_swiglu_plugin:
@@ -845,12 +788,11 @@ def optimize_model_with_config(model: PretrainedModel,
         use_ootb_moe=build_config.plugin_config.moe_plugin is None,
         use_fused_mlp=(build_config.plugin_config.use_fused_mlp
                        and not is_enc_dec
-                       and not (is_recurrent_gemma and is_fp8)
-                       and not use_auto_parallel),
+                       and not (is_recurrent_gemma and is_fp8)),
         gemm_swiglu_plugin_dtype=gemm_swiglu_plugin,
         low_latency_gemm_swiglu_plugin_dtype=low_latency_gemm_swiglu_plugin,
         use_fused_rg_lru=is_recurrent_gemma,
-        use_unfused_qkv_gemm=use_auto_parallel,
+        use_unfused_qkv_gemm=False,
         use_prompt_tuning=(build_config.max_prompt_embedding_table_size > 0),
         use_lora=build_config.plugin_config.lora_plugin is not None,
         max_lora_rank=build_config.lora_config.max_lora_rank,
@@ -1035,7 +977,7 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
     '''
     tic = time.time()
     # avoid changing the input config
-    build_config = copy.deepcopy(build_config)
+    build_config = build_config.model_copy(deep=True)
     build_config.plugin_config.dtype = model.config.dtype
     build_config.update_kv_cache_type(model.config.architecture)
 
@@ -1204,7 +1146,6 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
     network = builder.create_network()
     network.plugin_config = build_config.plugin_config
 
-    use_auto_parallel = build_config.auto_parallel_config.enabled
     use_weight_only = model.config.quant_mode.is_weight_only()
     per_group = model.config.quant_mode.has_per_group_scaling()
     use_smooth_quant = model.config.quant_mode.has_act_and_weight_quant()
@@ -1313,15 +1254,6 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
 
     if model.config.architecture != "DecoderModel":
         optimize(network)
-
-    if use_auto_parallel:
-        config = build_config.auto_parallel_config
-        config.builder_flags = builder_config.trt_builder_config.flags
-        sharded_networks = auto_parallel(network, config)
-        network = sharded_networks[model.config.mapping.rank]
-        if not build_config.auto_parallel_config.debug_mode:
-            mapping = network.auto_parallel_config["mapping"]
-            model.config.mapping = mapping
 
     if build_config.visualize_network is not None:
         with net_guard(network):

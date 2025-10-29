@@ -5,8 +5,7 @@ from enum import Enum
 from typing import List
 
 from tensorrt_llm.scaffolding import (Controller, ParallelProcess,
-                                      ScaffoldingLlm, ScaffoldingOutput, Task,
-                                      TaskStatus, Worker)
+                                      ScaffoldingLlm, Task, TaskStatus, Worker)
 
 
 class DummyTask(Task):
@@ -20,9 +19,9 @@ class DummyTask(Task):
         task = DummyTask(2)
         return task
 
-    def create_scaffolding_output(self) -> "ScaffoldingOutput":
+    def create_scaffolding_output(self):
         self.verify()
-        return ScaffoldingOutput()
+        return None
 
     def verify(self):
         for i in range(len(self.numbers)):
@@ -31,7 +30,7 @@ class DummyTask(Task):
 
 class DummyControllerBase(Controller):
 
-    def generate(self, prompt: str, **kwargs) -> ScaffoldingOutput:
+    def generate(self, prompt: str, **kwargs):
         task = DummyTask.create_from_prompt(prompt)
         yield from self.process([task], **kwargs)
         return task.create_scaffolding_output()
@@ -58,7 +57,8 @@ class DummyController(DummyControllerBase):
 
 
 # The flag to enable parallel process
-# We can use this flag to compare the performance of parallel process and sequence process
+# We can use this flag to compare the performance of parallel process
+# and sequence process
 ENABLE_PARALLEL_PROCESS = True
 
 

@@ -15,7 +15,7 @@
 
 from typing import Optional
 
-from .lora_manager import LoraConfig
+from .lora_helper import LoraConfig
 from .mapping import Mapping
 from .plugin.plugin import PluginConfig
 
@@ -69,4 +69,4 @@ class TopModelMixin:
         This is used when the plugin_config value is not given in to_trt() call.
         If users need to set different plugin configs, they can start from the return object and change it.
         """
-        return PluginConfig.from_dict(kwargs)
+        return PluginConfig(**kwargs)

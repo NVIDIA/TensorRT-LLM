@@ -1,4 +1,4 @@
-from tensorrt_llm.llmapi import LLM
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.llmapi.utils import (download_hf_model,
                                        download_hf_pretrained_config)
 

@@ -5,8 +5,8 @@ import modelopt.torch.opt as mto
 import torch
 from diffusers import DiffusionPipeline
 
-from tensorrt_llm._torch.auto_deploy.compile import compile_and_capture
-from tensorrt_llm._torch.auto_deploy.transformations.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.compile import CompileBackendRegistry
+from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transformations.library.fusion import fuse_gemms
 from tensorrt_llm._torch.auto_deploy.transformations.library.quantization import quantize
 from tensorrt_llm._torch.auto_deploy.utils.logger import ad_logger
@@ -138,12 +138,13 @@ def main():
 
     if args.restore_from:
         quant_state_dict = model.state_dict()
-        gm = quantize(gm, {}).to("cuda")
+        quantize(gm, {}).to("cuda")
         gm.load_state_dict(quant_state_dict, strict=False)
 
-    gm = fuse_gemms(gm)
+    fuse_gemms(gm)
 
-    gm = compile_and_capture(gm, backend="torch-opt", args=(), kwargs=flux_kwargs)
+    compiler_cls = CompileBackendRegistry.get("torch-opt")
+    gm = compiler_cls(gm, args=(), kwargs=flux_kwargs).compile()
 
     del model
     fx_model = gm

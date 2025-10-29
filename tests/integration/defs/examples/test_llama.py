@@ -25,9 +25,10 @@ import defs.ci_profiler
 import pytest
 from defs.common import (convert_weights, generate_summary_cmd,
                          get_cpp_benchmark, get_trt_llm_lib_dir, parse_output,
-                         quantize_data, similar, test_multi_lora_support,
-                         venv_check_call, venv_check_output,
-                         venv_mpi_check_call)
+                         quantize_data, similar,
+                         test_llm_torch_multi_lora_support,
+                         test_multi_lora_support, venv_check_call,
+                         venv_check_output, venv_mpi_check_call)
 # yapf: disable
 from defs.conftest import (get_device_count, get_device_memory,
                            get_host_total_memory, get_sm_version,
@@ -35,6 +36,12 @@ from defs.conftest import (get_device_count, get_device_memory,
                            skip_pre_ada, skip_pre_blackwell)
 # yapf: enable
 from defs.trt_test_alternative import check_call, exists
+
+# skip trt flow cases on post-Blackwell-Ultra
+# if get_sm_version() >= 103:
+#     pytest.skip(
+#         "TRT workflow tests are not supported on post Blackwell-Ultra architecture",
+#         allow_module_level=True)
 
 INPUT_TEXT_1 = "After Washington had returned to Williamsburg, " + \
                "Dinwiddie ordered him to lead a larger force to assist Trent in his work. " + \
@@ -688,6 +695,7 @@ def test_llm_llama_v2_1gpu_sparsity(llama_example_root, llama_model_root,
     ])
 
 
+@skip_post_blackwell
 @pytest.mark.parametrize("num_beams", [1],
                          ids=lambda num_beams: f'nb:{num_beams}')
 @pytest.mark.parametrize("data_type", ['bfloat16', 'float16'])
@@ -886,31 +894,7 @@ def test_llm_llama_v2_gather_logits_2gpu_pp2(llama_example_root,
                         summary_cmd)
 
 
-@pytest.mark.parametrize("llama_model_root", ['llama-v2-7b-hf'], indirect=True)
-def test_llm_llama_v2_1gpu_auto_parallel(llama_example_root, llama_model_root,
-                                         llm_venv, cmodel_dir, engine_dir):
-    model_name = 'llama_v2'
-    data_type = 'float16'
-    model_dir = convert_weights(llm_venv=llm_venv,
-                                example_root=llama_example_root,
-                                cmodel_dir=cmodel_dir,
-                                model=model_name,
-                                model_path=llama_model_root,
-                                data_type=data_type)
-
-    print("Build engines...")
-    build_cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={model_dir}",
-        f"--max_batch_size={1}",
-        f"--max_input_len={1024}",
-        f"--output_dir={engine_dir}",
-        "--auto_parallel=8",
-    ]
-
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
-
-
+@skip_post_blackwell
 @pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("num_beams", [1, 4],
                          ids=lambda num_beams: f'nb:{num_beams}')
@@ -1068,24 +1052,21 @@ def test_llm_llama_v3_1_autoq_2gpu_mmlu(llama_example_root, llama_model_root,
 @skip_post_blackwell
 @pytest.mark.skip_less_device(2)
 @pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.parametrize("use_auto_parallel", [True, False],
-                         ids=["enable_auto_parallel", "disable_auto_parallel"])
 @pytest.mark.parametrize("num_beams", [4],
                          ids=lambda num_beams: f'nb:{num_beams}')
 @pytest.mark.parametrize("llama_model_root", ['llama-7b', 'llama-30b'],
                          indirect=True)
 def test_llm_llama_v1_2gpu_summary(llama_example_root, llama_model_root,
                                    llm_datasets_root, llm_rouge_root, llm_venv,
-                                   cmodel_dir, engine_dir, num_beams,
-                                   use_auto_parallel):
+                                   cmodel_dir, engine_dir, num_beams):
     model_name = 'llama_v1_2gpu'
     model_dir = convert_weights(llm_venv=llm_venv,
                                 example_root=llama_example_root,
                                 cmodel_dir=cmodel_dir,
                                 model=model_name,
                                 model_path=llama_model_root,
-                                gpus=1 if use_auto_parallel else 2,
-                                tp_size=1 if use_auto_parallel else 2,
+                                gpus=2,
+                                tp_size=2,
                                 pp_size=1)
 
     print("Build engines...")
@@ -1098,8 +1079,6 @@ def test_llm_llama_v1_2gpu_summary(llama_example_root, llama_model_root,
         "--remove_input_padding=enable",
         f"--max_beam_width={num_beams}",
     ]
-    if use_auto_parallel:
-        build_cmd += ["--auto_parallel=2"]
 
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
@@ -1622,6 +1601,7 @@ def test_llm_llama_v2_1gpu_fp8_gemv(llama_example_root, llama_model_root,
     venv_check_call(llm_venv, summary_cmd)
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_device_memory(50000)
 @pytest.mark.parametrize("data_type", ['bfloat16', 'float16'])
 @pytest.mark.parametrize("gemm_swiglu_plugin", ["fp8"])
@@ -1697,7 +1677,12 @@ def test_llm_llama_v2_1gpu_gemm_swiglu(llama_example_root, llama_model_root,
 
 
 @pytest.mark.parametrize(
-    "data_type", ['float16', 'fp8', 'sq_ootb', 'awq', 'int8_wo'],
+    "data_type", [
+        'float16', 'fp8',
+        pytest.param('sq_ootb', marks=skip_post_blackwell),
+        pytest.param('awq', marks=skip_post_blackwell),
+        pytest.param('int8_wo', marks=skip_post_blackwell)
+    ],
     ids=['base_fp16', 'base_fp8', 'base_sq_ootb', 'base_awq', 'base_int8_wo'])
 @pytest.mark.parametrize("lora_data_type", ['float16'], ids=['lora_fp16'])
 @pytest.mark.parametrize("llama_model_root", ['llama-v2-13b-hf'], indirect=True)
@@ -2202,6 +2187,7 @@ def test_llm_llama_code_llama_1gpu_summary(
     venv_check_call(llm_venv, summary_cmd)
 
 
+@pytest.mark.timeout(7200)
 @pytest.mark.skip_less_device_memory(40000)
 @pytest.mark.parametrize("num_beams", [1, 4],
                          ids=lambda num_beams: f'nb:{num_beams}')
@@ -2279,6 +2265,7 @@ def test_llm_llama_code_llama_multi_gpus_summary(llama_example_root,
         summary_cmd)
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_device_memory(30000)
 @pytest.mark.parametrize("num_beams", [1, 4],
                          ids=lambda num_beams: f'nb:{num_beams}')
@@ -2335,6 +2322,7 @@ def test_llm_llama_smooth_quant_1gpu_summary(llama_example_root,
     venv_check_call(llm_venv, summary_cmd)
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_device_memory(30000)
 @pytest.mark.parametrize("num_beams", [1, 4],
                          ids=lambda num_beams: f'nb:{num_beams}')
@@ -2384,6 +2372,7 @@ def test_llm_llama_int8_kv_1gpu_summary(llama_example_root, llama_model_root,
     venv_check_call(llm_venv, summary_cmd)
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_device_memory(30000)
 @pytest.mark.parametrize("num_beams", [1, 4],
                          ids=lambda num_beams: f'nb:{num_beams}')
@@ -2428,6 +2417,7 @@ def test_llm_llama_int8_sq_ootb_1gpu_summary(
     venv_check_call(llm_venv, summary_cmd)
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("num_beams", [1],
                          ids=lambda num_beams: f'nb:{num_beams}')
@@ -2487,6 +2477,7 @@ def test_llm_llama_v2_int8sq_2gpu_tp2(data_type, llama_example_root,
                         summary_cmd)
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_device_memory(30000)
 @pytest.mark.parametrize("num_beams", [1, 4],
                          ids=lambda num_beams: f'nb:{num_beams}')
@@ -2542,6 +2533,7 @@ def test_llm_llama_wo_1gpu_summary(llama_example_root, llama_model_root,
     venv_check_call(llm_venv, summary_cmd)
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_device_memory(30000)
 @pytest.mark.parametrize("num_beams", [1, 4],
                          ids=lambda num_beams: f'nb:{num_beams}')
@@ -2866,11 +2858,14 @@ def test_llm_llama_v2_lora_benchmark_2gpu(llama_example_root, llama_model_root,
         # check_call(lora_benchmark_cmd, env=envs)
 
 
+@pytest.mark.timeout(7200)
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("num_beams", [1, 4],
                          ids=lambda num_beams: f'nb:{num_beams}')
-@pytest.mark.parametrize("qformat", ["fp8", "int4_awq"])
+@pytest.mark.parametrize(
+    "qformat",
+    ["fp8", pytest.param("int4_awq", marks=skip_post_blackwell)])
 @pytest.mark.parametrize(
     "tp_pp_size", [(4, 1), (2, 2)],
     ids=lambda tp_pp_size: f'tp{tp_pp_size[0]}pp{tp_pp_size[1]}')
@@ -3025,7 +3020,8 @@ def test_llm_llama_v3_8b_1048k_long_context_ppl(llama_example_root,
 @pytest.mark.timeout(10800 if get_sm_version() < 89 else 3600)
 def test_llm_llama_v3_1m_long_context_8gpus(llama_example_root,
                                             llama_model_root, llm_venv,
-                                            engine_dir, cmodel_dir):
+                                            engine_dir, cmodel_dir,
+                                            timeout_manager):
     "Build & run llama-3-8B-1048k on long context."
     model_name = os.path.basename(llama_model_root)
     dtype = 'float16'
@@ -3034,51 +3030,66 @@ def test_llm_llama_v3_1m_long_context_8gpus(llama_example_root,
     max_seq_len = 1048576
     max_batch_size = 256
 
+    # Generate evaluation dataset with timeout management
     print("Generate evaluation dataset for passkey.")
-    gen_cmd = [
-        f"{llama_example_root}/../../../infinitebench/construct_synthetic_dataset.py",
-        "--test_case=build_passkey",
-        "--test_level=7",
-    ]
-    venv_check_call(llm_venv, gen_cmd)
+    with timeout_manager.timed_operation("gen"):
+        gen_cmd = [
+            f"{llama_example_root}/../../../infinitebench/construct_synthetic_dataset.py",
+            "--test_case=build_passkey",
+            "--test_level=7",
+        ]
+        venv_check_call(llm_venv,
+                        gen_cmd,
+                        timeout=timeout_manager.remaining_timeout)
 
+    # Convert checkpoint with timeout management
     print("Converting checkpoint...")
-    ckpt_dir = convert_weights(llm_venv=llm_venv,
-                               example_root=llama_example_root,
-                               cmodel_dir=cmodel_dir,
-                               model=model_name,
-                               model_path=llama_model_root,
-                               data_type=dtype,
-                               tp_size=tp_size,
-                               pp_size=pp_size)
+    with timeout_manager.timed_operation("convert"):
+        ckpt_dir = convert_weights(llm_venv=llm_venv,
+                                   example_root=llama_example_root,
+                                   cmodel_dir=cmodel_dir,
+                                   model=model_name,
+                                   model_path=llama_model_root,
+                                   data_type=dtype,
+                                   tp_size=tp_size,
+                                   pp_size=pp_size,
+                                   timeout=timeout_manager.remaining_timeout)
 
+    # Build engines with timeout management
     print("Building engines...")
-    build_cmd = [
-        "trtllm-build", f"--checkpoint_dir={ckpt_dir}",
-        f"--output_dir={engine_dir}", f"--gemm_plugin={dtype}",
-        f"--workers={world_size}", f"--max_seq_len={max_seq_len}",
-        "--max_num_tokens=4096", "--use_paged_context_fmha=enable",
-        f'--max_batch_size={max_batch_size}'
-    ]
+    with timeout_manager.timed_operation("build"):
+        build_cmd = [
+            "trtllm-build", f"--checkpoint_dir={ckpt_dir}",
+            f"--output_dir={engine_dir}", f"--gemm_plugin={dtype}",
+            f"--workers={world_size}", f"--max_seq_len={max_seq_len}",
+            "--max_num_tokens=4096", "--use_paged_context_fmha=enable",
+            f'--max_batch_size={max_batch_size}'
+        ]
 
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
+        check_call(" ".join(build_cmd),
+                   shell=True,
+                   env=llm_venv._new_env,
+                   timeout=timeout_manager.remaining_timeout)
 
+    # Run passkey evaluation with timeout management
     print("Run passkey evaluation...")
-    eval_cmd = [
-        f"{llama_example_root}/../../../eval_long_context.py",
-        f"--engine_dir={engine_dir}",
-        f"--tokenizer_dir={llama_model_root}",
-        f"--max_input_length={max_seq_len-10}",
-        "--max_tokens_in_paged_kv_cache=1100000",
-        "--task=passkey",
-        "--stop_idx=10",
-        "--enable_chunked_context",
-        "--tensorrt_llm_accuracy_threshold=0.9",
-    ]
+    with timeout_manager.timed_operation("eval"):
+        eval_cmd = [
+            f"{llama_example_root}/../../../eval_long_context.py",
+            f"--engine_dir={engine_dir}",
+            f"--tokenizer_dir={llama_model_root}",
+            f"--max_input_length={max_seq_len-10}",
+            "--max_tokens_in_paged_kv_cache=1100000",
+            "--task=passkey",
+            "--stop_idx=10",
+            "--enable_chunked_context",
+            "--tensorrt_llm_accuracy_threshold=0.9",
+        ]
 
-    venv_mpi_check_call(
-        llm_venv, ["mpirun", "-n", f"{world_size}", "--allow-run-as-root"],
-        eval_cmd)
+        venv_mpi_check_call(
+            llm_venv, ["mpirun", "-n", f"{world_size}", "--allow-run-as-root"],
+            eval_cmd,
+            timeout=timeout_manager.remaining_timeout)
 
 
 @pytest.mark.skip_less_device_memory(80000)
@@ -3266,8 +3277,11 @@ def test_llm_llama_1gpu_streaming_llm(llama_example_root, deepseek_model_root,
     assert "上海人工智能实验室" in output, output
 
 
-@pytest.mark.parametrize(
-    "fp8_quant", ['disable_fp8', 'enable_fp8', 'enable_fp8_meta_recipe'])
+@pytest.mark.parametrize("fp8_quant", [
+    'disable_fp8',
+    pytest.param('enable_fp8', marks=skip_post_blackwell),
+    pytest.param('enable_fp8_meta_recipe', marks=skip_post_blackwell)
+])
 @pytest.mark.parametrize("llama_model_root", ['llama-3.1-8b', 'llama-3.2-1b'],
                          indirect=True)
 def test_llm_llama_v3_1_1node_single_gpu(llama_example_root, llama_model_root,
@@ -3366,8 +3380,7 @@ def test_llm_llama_v3_2_smoothquant_1node_single_gpu(
     venv_check_call(llm_venv, summary_cmd)
 
 
-# TODO: remove skip after support fp8 rowwise gemm on B200
-@skip_post_blackwell
+@pytest.mark.timeout(7200)
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("fp8_quant",
@@ -3384,7 +3397,8 @@ def test_llm_llama_v3_2_smoothquant_1node_single_gpu(
 def test_llm_llama_v3_1_1node_multi_gpus(llama_example_root, llama_model_root,
                                          llm_venv, cmodel_dir,
                                          mmlu_dataset_root, engine_dir,
-                                         fp8_quant, gemm_allreduce):
+                                         fp8_quant, gemm_allreduce,
+                                         timeout_manager):
     "Run llama3.1 test on 1 node."
     if ("8B" not in llama_model_root) and (get_host_total_memory() < 1000000):
         pytest.skip("Host memory is insufficient.")
@@ -3402,70 +3416,90 @@ def test_llm_llama_v3_1_1node_multi_gpus(llama_example_root, llama_model_root,
     if not fp8_quant and "Meta-Llama-3.1-405B" == model_name:
         pytest.skip("Build engine will be OOM on 1 node.")
 
+    # Convert weights with timeout management
     print("Convert weight...")
-    model_dir = convert_weights(llm_venv=llm_venv,
-                                example_root=llama_example_root,
-                                cmodel_dir=cmodel_dir,
-                                model=model_name,
-                                model_path=llama_model_root,
-                                data_type=data_type,
-                                tp_size=tp_size,
-                                pp_size=pp_size,
-                                use_fp8_rowwise=fp8_quant,
-                                load_by_shard=True,
-                                workers=world_size)
+    with timeout_manager.timed_operation("convert"):
+        model_dir = convert_weights(llm_venv=llm_venv,
+                                    example_root=llama_example_root,
+                                    cmodel_dir=cmodel_dir,
+                                    model=model_name,
+                                    model_path=llama_model_root,
+                                    data_type=data_type,
+                                    tp_size=tp_size,
+                                    pp_size=pp_size,
+                                    use_fp8_rowwise=fp8_quant,
+                                    load_by_shard=True,
+                                    workers=world_size,
+                                    timeout=timeout_manager.remaining_timeout)
 
+    # Build engines with timeout management
     print("Build engines...")
-    build_cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={model_dir}",
-        f"--output_dir={engine_dir}",
-        f"--workers={world_size}",
-        f"--max_batch_size={256}",
-        "--use_paged_context_fmha=enable",
-        "--max_num_tokens=4096",
-        "--max_input_len=64000",
-        "--max_seq_len=65000",
-    ]
+    with timeout_manager.timed_operation("build"):
+        build_cmd = [
+            "trtllm-build",
+            f"--checkpoint_dir={model_dir}",
+            f"--output_dir={engine_dir}",
+            f"--workers={world_size}",
+            f"--max_batch_size={256}",
+            "--use_paged_context_fmha=enable",
+            "--max_num_tokens=4096",
+            "--max_input_len=64000",
+            "--max_seq_len=65000",
+        ]
 
-    if gemm_allreduce:
-        build_cmd += [f"--gemm_allreduce_plugin={data_type}"]
+        if gemm_allreduce:
+            build_cmd += [f"--gemm_allreduce_plugin={data_type}"]
 
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
+        check_call(" ".join(build_cmd),
+                   shell=True,
+                   env=llm_venv._new_env,
+                   timeout=timeout_manager.remaining_timeout)
 
-    gen_cmd = [
-        f"{llama_example_root}/../../../infinitebench/construct_synthetic_dataset.py",
-        "--test_case=build_passkey",
-        "--test_level=3",
-    ]
+    # Generate dataset with timeout management
+    with timeout_manager.timed_operation("gen"):
+        gen_cmd = [
+            f"{llama_example_root}/../../../infinitebench/construct_synthetic_dataset.py",
+            "--test_case=build_passkey",
+            "--test_level=3",
+        ]
 
-    venv_check_call(llm_venv, gen_cmd)
+        venv_check_call(llm_venv,
+                        gen_cmd,
+                        timeout=timeout_manager.remaining_timeout)
 
+    # Run evaluation with timeout management
     print("Run eval...")
-    eval_cmd = [
-        f"{llama_example_root}/../../../eval_long_context.py",
-        "--task=passkey",
-        f"--engine_dir={engine_dir}",
-        f"--tokenizer_dir={llama_model_root}",
-        "--stop_idx=6",
-        "--max_input_length=64000",
-        "--enable_chunked_context",
-        "--kv_cache_free_gpu_memory_fraction=0.999",
-        "--max_tokens_in_paged_kv_cache=65064",
-        "--output_dir=64k_context_tp8",
-    ]
+    with timeout_manager.timed_operation("eval"):
+        eval_cmd = [
+            f"{llama_example_root}/../../../eval_long_context.py",
+            "--task=passkey",
+            f"--engine_dir={engine_dir}",
+            f"--tokenizer_dir={llama_model_root}",
+            "--stop_idx=6",
+            "--max_input_length=64000",
+            "--enable_chunked_context",
+            "--kv_cache_free_gpu_memory_fraction=0.999",
+            "--max_tokens_in_paged_kv_cache=65064",
+            "--output_dir=64k_context_tp8",
+        ]
 
-    venv_mpi_check_call(
-        llm_venv, ["mpirun", "-n", f"{world_size}", "--allow-run-as-root"],
-        eval_cmd)
+        venv_mpi_check_call(
+            llm_venv, ["mpirun", "-n", f"{world_size}", "--allow-run-as-root"],
+            eval_cmd,
+            timeout=timeout_manager.remaining_timeout)
 
+    # Run MMLU with timeout management
     print("Run mmlu...")
-    mmlu_cmd = [
-        "trtllm-eval", f"--model={engine_dir}",
-        f"--tokenizer={llama_model_root}", "--backend=tensorrt", "mmlu",
-        f"--dataset_path={mmlu_dataset_root}", "--check_accuracy"
-    ]
-    check_call(" ".join(mmlu_cmd), shell=True, env=llm_venv._new_env)
+    with timeout_manager.timed_operation("mmlu"):
+        mmlu_cmd = [
+            "trtllm-eval", f"--model={engine_dir}",
+            f"--tokenizer={llama_model_root}", "--backend=tensorrt", "mmlu",
+            f"--dataset_path={mmlu_dataset_root}", "--check_accuracy"
+        ]
+        check_call(" ".join(mmlu_cmd),
+                   shell=True,
+                   env=llm_venv._new_env,
+                   timeout=timeout_manager.remaining_timeout)
 
 
 @pytest.mark.skip_less_device_memory(80000)
@@ -3580,6 +3614,7 @@ def test_llm_llama_v3_1_2nodes_8gpus(test_type, llama_example_root,
         check_call(" ".join(mmlu_cmd), shell=True, env=llm_venv._new_env)
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_device_memory(50000)
 @pytest.mark.parametrize("low_latency_gemm_plugin", ["fp8"])
 @pytest.mark.parametrize("llama_model_root", ['llama-v2-7b-hf'], indirect=True)
@@ -3812,6 +3847,7 @@ def test_llm_llama_v2_fp8_2gpu_cp2(data_type, llama_example_root,
 
 
 @skip_pre_ada
+@skip_post_blackwell
 @pytest.mark.parametrize("llama_model_root", ['llama-3.1-8b', 'llama-3.2-1b'],
                          indirect=True)
 def test_llm_llama_lookahead_xqa_fp8_1gpu(llama_example_root, llama_model_root,
@@ -3975,6 +4011,87 @@ def test_llama_3_x_fp8_with_bf16_lora(llama_example_root, llm_datasets_root,
 
 @skip_pre_ada
 @pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize("llama_model_root", [
+    'llama-v3-8b-instruct-hf',
+    'llama-3.1-8b-instruct',
+    'llama-3.2-1b-instruct',
+    'llama-3.2-3b-instruct',
+    'llama-3.3-70b-instruct',
+],
+                         indirect=True)
+def test_llama_3_x_with_bf16_lora_torch(llama_example_root, llm_datasets_root,
+                                        qcache_dir_without_install_package,
+                                        llm_venv, engine_dir, llama_model_root):
+    """Run Llama models with multiple dummy LoRAs using LLM-API Torch backend."""
+
+    if "llama-3.3-70b-instruct" in llama_model_root.lower():
+        tensor_parallel_size = 8
+        if get_device_count() < 8:
+            pytest.skip(
+                "Skipping: llama-3.3-70b-instruct model requires 8 GPUs")
+    else:
+        tensor_parallel_size = 1
+
+    expected_outputs = {
+        'llama-v3-8b-instruct-hf': [
+            " I hope you're having a great day! I just wanted to reach out and say hi, and see if you're doing okay. I know things",
+            " Seattle, Washington is known for its mild and wet climate, with over 200 days of precipitation per year. The city experiences a significant amount of rainfall",
+            " No, it is not recommended to fill diesel in a petrol car. Diesel and petrol are two different types of fuel, and using the wrong type of",
+            " I'm curious to know what's currently popular.\nI can help you with that! As of now, the top 5 trending songs on Spotify are",
+            " Paris\nWhat is the capital of Germany? Berlin\nWhat is the capital of Italy? Rome\nWhat is the capital of Spain? Madrid\nWhat"
+        ],
+        'llama-3.1-8b-instruct': [
+            " I'm doing pretty well, thanks for asking. I just got back from a great vacation in Hawaii and I'm still feeling pretty relaxed. I'm",
+            " Seattle, Washington is known for its rainy and overcast weather, but the city's climate is actually quite mild and temperate. The city experiences a",
+            " | What happens if you put diesel in a petrol car?\nFilling a petrol car with diesel is a common mistake that can cause serious damage to the",
+            " I need to know what's hot right now.\nI can check the top 5 trending songs on Spotify for you. However, please note that the",
+            " Paris\nWhat is the capital of France?\nThe capital of France is Paris. Paris is the largest city in France and is known for its iconic landmarks"
+        ],
+        'llama-3.2-1b-instruct': [
+            " I'm doing great, thanks for asking! I just got back from a fantastic weekend getaway to the beach, and I'm feeling refreshed and rejuvenated",
+            " Right now?\nI'm planning a trip to Seattle and I want to know what the weather is like. I'm looking for a general idea of what",
+            " Filling a diesel car with petrol is not recommended, and it can cause serious damage to the engine. Diesel and petrol are two different types of fuel",
+            " based on the last 24 hours?\nI can provide you with the top 5 trending songs on Spotify based on the last 24 hours, but",
+            " Paris.\nThe capital of France is Paris. Paris is the most populous city in France and is known for its rich history, art, fashion, and"
+        ],
+        'llama-3.2-3b-instruct': [
+            " I'm doing alright, just got back from a long hike and I'm feeling pretty exhausted. Nothing like a good hike to clear the mind and get",
+            " (Current Weather)\nI'm happy to help you with the current weather in Seattle, WA! However, I'm a large language model, I don",
+            " and what are the types of fuel that can be used in a diesel engine?\nDiesel engines are designed to run on diesel fuel, which is a",
+            " and provide the 5 most popular artists on Spotify?\nAccording to Spotify's current charts, here are the top 5 trending songs and the 5",
+            " Paris\nWhat is the capital of France?\nThe capital of France is indeed Paris. Located in the north-central part of the country, Paris is a"
+        ],
+        'llama-3.3-70b-instruct': [
+            " I hope you are having a great day. I am doing well, thanks for asking. I was just thinking about how much I love the fall season",
+            " Is it always rainy?\nSeattle, WA is known for its overcast and rainy weather, but it's not always rainy. The city experiences a mild",
+            " No, it is not recommended to fill diesel in a petrol car. Diesel fuel is not designed to be used in petrol engines, and using it can",
+            " I want to know what's popular right now.\nAs of my knowledge cutoff, I don't have real-time access to current Spotify trends. However,",
+            " Paris\nWhat is the capital of Germany? Berlin\nWhat is the capital of Italy? Rome\nWhat is the capital of Spain? Madrid\nWhat"
+        ],
+    }
+
+    print("Testing with LLM-API Torch backend...")
+
+    defs.ci_profiler.start("test_llm_torch_multi_lora_support")
+
+    model_name = os.path.basename(llama_model_root).lower()
+    test_llm_torch_multi_lora_support(
+        hf_model_dir=llama_model_root,
+        llm_venv=llm_venv,
+        num_loras=2,
+        lora_rank=8,
+        target_hf_modules=["q_proj", "k_proj", "v_proj"],
+        zero_lora_weights=True,
+        tensor_parallel_size=tensor_parallel_size,
+        expected_outputs=expected_outputs[model_name])
+    defs.ci_profiler.stop("test_llm_torch_multi_lora_support")
+    print(
+        f"test_llm_torch_multi_lora_support: {defs.ci_profiler.elapsed_time_in_sec('test_llm_torch_multi_lora_support')} sec"
+    )
+
+
+@skip_pre_ada
+@pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("mistral_nemo_model_root", ['Mistral-Nemo-12b-Base'],
                          indirect=True)
 def test_mistral_nemo_fp8_with_bf16_lora(
@@ -4013,6 +4130,7 @@ def test_mistral_nemo_fp8_with_bf16_lora(
     )
 
 
+@skip_post_blackwell
 @pytest.mark.parametrize("llama_model_root", ['llama-3.1-8b'], indirect=True)
 def test_llm_llama_lookahead_single_gpu_summary(llama_example_root,
                                                 llama_model_root, llm_venv,
@@ -4057,3 +4175,47 @@ def test_llm_llama_lookahead_single_gpu_summary(llama_example_root,
                                        lookahead_config='[7, 7, 7]')
 
     venv_check_call(llm_venv, summary_cmd)
+
+
+@skip_post_blackwell
+@pytest.mark.parametrize("model_name,model_path", [
+    ("Llama-3.1-8B-Instruct", "llama-3.1-model/Llama-3.1-8B-Instruct"),
+])
+def test_llm_api_lookahead_decoding_1gpu(model_name, model_path):
+    """
+    RCCA: https://nvbugs/5359218
+    """
+    from defs.conftest import llm_models_root
+
+    from tensorrt_llm._tensorrt_engine import LLM
+    from tensorrt_llm.llmapi import (BuildConfig, KvCacheConfig,
+                                     LookaheadDecodingConfig, SamplingParams)
+    build_config = BuildConfig(max_batch_size=128,
+                               max_input_len=2048,
+                               max_seq_len=32768,
+                               max_num_tokens=8192,
+                               max_draft_len=111)
+    build_config.plugin_config.use_paged_context_fmha = True
+    build_config.plugin_config.multiple_profiles = True
+
+    lookahead_config = LookaheadDecodingConfig(max_window_size=8,
+                                               max_ngram_size=3,
+                                               max_verification_set_size=3)
+
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
+    llm = LLM(model=f"{llm_models_root()}/{model_path}",
+              kv_cache_config=kv_cache_config,
+              build_config=build_config,
+              speculative_config=lookahead_config,
+              enable_chunked_prefill=True)
+
+    prompt = """Write a C++ program to find the nth Fibonacci number using
+recursion. Now we define a sequence of numbers in which each number is the
+sum of the three preceding ones. The first three numbers are 0, -1, -1.
+Write a program to find the nth number.""" * 200  # around 13k tokens
+
+    sampling_params = SamplingParams(lookahead_config=lookahead_config)
+
+    output = llm.generate(prompt, sampling_params=sampling_params)
+
+    assert output is not None, "No output generated from LLM"

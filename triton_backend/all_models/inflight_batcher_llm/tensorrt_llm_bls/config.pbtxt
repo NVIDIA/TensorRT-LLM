@@ -62,6 +62,13 @@ input [
     dims: [ 1 ]
     optional: true
   },
+  # An arbitrary number of images for pixtral
+  {
+      name: "image_sizes_input"
+      data_type: TYPE_INT64
+      dims: [ -1, 2 ]
+      optional: true
+  },
   {
     name: "video_bytes_input"
     data_type: TYPE_UINT8
@@ -199,7 +206,7 @@ input [
   },
   {
     name: "prompt_embedding_table"
-    data_type: TYPE_FP16
+    data_type: ${prompt_embedding_table_data_type}
     dims: [ -1, -1 ]
     optional: true
   },
@@ -284,6 +291,20 @@ input [
   },
   {
     name: "return_perf_metrics"
+    data_type: TYPE_BOOL
+    dims: [ 1 ]
+    reshape: { shape: [ ] }
+    optional: true
+  },
+  {
+    name: "return_num_input_tokens"
+    data_type: TYPE_BOOL
+    dims: [ 1 ]
+    reshape: { shape: [ ] }
+    optional: true
+  },
+  {
+    name: "return_num_output_tokens"
     data_type: TYPE_BOOL
     dims: [ 1 ]
     reshape: { shape: [ ] }
@@ -385,6 +406,16 @@ output [
   },
   {
     name: "total_draft_tokens"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+  },
+  {
+    name: "num_input_tokens"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+  },
+  {
+    name: "num_output_tokens"
     data_type: TYPE_INT32
     dims: [ 1 ]
   }

@@ -1,129 +1,212 @@
 """Testing build_and_run_ad end2end."""
 
-from typing import Dict
-
 import pytest
 from _model_test_utils import get_small_model_config
-from build_and_run_ad import main
-from simple_config import SimpleConfig
+from build_and_run_ad import ExperimentConfig, main
 
-from tensorrt_llm._torch.auto_deploy.models import ModelFactoryRegistry
-from tensorrt_llm._torch.auto_deploy.transformations.transform import InferenceOptimizer
-from tensorrt_llm.llmapi.llm_args import _AutoDeployLlmArgs
+from tensorrt_llm._torch.auto_deploy.llm_args import AutoDeployConfig, LlmArgs, _ParallelConfig
+from tensorrt_llm._torch.auto_deploy.shim.ad_executor import ADEngine
 
 
-def _check_ad_config(simple_config: SimpleConfig, ad_config: _AutoDeployLlmArgs):
-    # Verify that ad_config was captured
-    assert ad_config is not None, "ad_config should have been captured"
+def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
+    # Verify that llm_args was captured
+    assert llm_args is not None, "llm_args should have been captured"
 
-    # Check that ad_config is an instance of _AutoDeployLlmArgs
-    assert isinstance(ad_config, _AutoDeployLlmArgs), (
-        f"Expected _AutoDeployLlmArgs, got {type(ad_config)}"
+    # Check that llm_args is an instance of LlmArgs and also an instance of AutoDeployConfig
+    assert isinstance(llm_args, LlmArgs), f"Expected LlmArgs, got {type(llm_args)}"
+    assert isinstance(llm_args, AutoDeployConfig), (
+        f"Expected AutoDeployConfig, got {type(llm_args)}"
     )
 
-    # Fields that map directly from simple_config to ad_config
-    direct_mapping_fields = {
-        "max_batch_size",
-        "attn_backend",
-        "mla_backend",
-        "skip_loading_weights",
-        "free_mem_ratio",
-        "simple_shard_only",
-        "attn_page_size",
-        "model_factory",
-        "model_kwargs",
-    }
+    # check that llm_args and experiment_config have the same args
+    expected_ad_config: AutoDeployConfig = experiment_config.args
+    expected_llm_args: LlmArgs = LlmArgs(**expected_ad_config.to_llm_kwargs())
+    assert expected_llm_args == llm_args, f"Expected llm args {expected_llm_args}, got {llm_args}"
 
-    # Check direct mappings
-    for field_name in direct_mapping_fields:
-        if hasattr(simple_config, field_name):
-            config_value = getattr(simple_config, field_name)
-            ad_config_value = getattr(ad_config, field_name)
-            assert ad_config_value == config_value, (
-                f"Field {field_name}: expected {config_value}, got {ad_config_value}"
-            )
-
-    # for model we need to the snapshot check with the factory
-    factory = ModelFactoryRegistry.get(simple_config.model_factory)(
-        model=simple_config.model,
-        model_kwargs=simple_config.model_kwargs,
-        skip_loading_weights=True,
+    # check expected parallel config
+    world_size = expected_ad_config.world_size
+    expected_parallel_config = _ParallelConfig(
+        tp_size=world_size, gpus_per_node=expected_llm_args.gpus_per_node
     )
-    assert ad_config.model == factory.model, (
-        f"Expected model {factory.model}, got {ad_config.model}"
-    )
-
-    # world_size -> tensor_parallel_size
-    assert ad_config.tensor_parallel_size == simple_config.world_size, (
-        f"Expected tensor_parallel_size {simple_config.world_size}, got {ad_config.tensor_parallel_size}"
-    )
-
-    # compile_backend -> use_cuda_graph
-    expected_cuda_graph = simple_config.compile_backend in ["torch-opt", "torch-cudagraph"]
-    assert ad_config.use_cuda_graph == expected_cuda_graph, (
-        f"Expected use_cuda_graph {expected_cuda_graph} for {simple_config.compile_backend}, "
-        f"got {ad_config.use_cuda_graph}"
-    )
-
-    # compile_backend -> torch_compile_config
-    expected_torch_compile = simple_config.compile_backend in ["torch-opt", "torch-compile"]
-    assert bool(ad_config.torch_compile_config) == expected_torch_compile, (
-        f"Expected torch_compile_config to be {expected_torch_compile} for "
-        f"{simple_config.compile_backend}, got {ad_config.torch_compile_config}"
+    assert llm_args._parallel_config == expected_parallel_config, (
+        f"Expected parallel_config {expected_parallel_config}, got {llm_args._parallel_config}"
     )
 
     # backend should always be "_autodeploy"
-    assert ad_config.backend == "_autodeploy", (
-        f"Expected backend '_autodeploy', got {ad_config.backend}"
+    assert llm_args.backend == "_autodeploy", (
+        f"Expected backend '_autodeploy', got {llm_args.backend}"
     )
 
 
 @pytest.mark.parametrize(
-    "config",
+    "model_hub_id, llm_extra_args",
     [
-        get_small_model_config(
+        (
             "meta-llama/Meta-Llama-3.1-8B-Instruct",
-            attn_backend="FlashInfer",
-            compile_backend="torch-opt",
+            {
+                "transforms": {
+                    "resize_kv_cache": {"free_mem_ratio": 0.0001},
+                    "insert_cached_attention": {"backend": "flashinfer"},
+                    "compile_model": {"backend": "torch-opt"},
+                },
+            },
         ),
-        get_small_model_config(
+        (
+            "meta-llama/Meta-Llama-3.1-8B-Instruct",
+            {
+                "transforms": {
+                    "transformers_replace_cached_attn": {"backend": "flashinfer"},
+                },
+                "mode": "transformers",
+            },
+        ),
+        (
             "mistralai/Mixtral-8x7B-Instruct-v0.1",
-            attn_backend="TritonWithFlattenedInputs",
-            compile_backend="torch-simple",
+            {
+                "transforms": {
+                    "insert_cached_attention": {"backend": "triton"},
+                    "compile_model": {"backend": "torch-simple"},
+                },
+            },
         ),
-        get_small_model_config(
+        (
+            "mistralai/Mixtral-8x7B-Instruct-v0.1",
+            {
+                "transforms": {
+                    "transformers_replace_cached_attn": {"backend": "triton"},
+                },
+                "mode": "transformers",
+            },
+        ),
+        (
+            "Qwen/Qwen3-30B-A3B",
+            {
+                "transforms": {
+                    "insert_cached_attention": {"backend": "triton"},
+                    "compile_model": {"backend": "torch-simple"},
+                },
+            },
+        ),
+        (
+            "Qwen/Qwen3-30B-A3B",
+            {
+                "transforms": {
+                    "transformers_replace_cached_attn": {"backend": "triton"},
+                },
+                "mode": "transformers",
+            },
+        ),
+        (
             "microsoft/Phi-3-mini-4k-instruct",
-            attn_backend="TritonWithFlattenedInputs",
-            compile_backend="torch-simple",
+            {
+                "transforms": {
+                    "insert_cached_attention": {"backend": "triton"},
+                    "compile_model": {"backend": "torch-simple"},
+                },
+            },
         ),
-        get_small_model_config(
+        (
+            "microsoft/Phi-3-mini-4k-instruct",
+            {
+                "transforms": {
+                    "insert_cached_attention": {"backend": "torch"},
+                    "compile_model": {"backend": "torch-simple"},
+                },
+            },
+        ),
+        (
             "meta-llama/Llama-4-Scout-17B-16E-Instruct",
-            attn_backend="FlashInfer",
-            compile_backend="torch-opt",
+            {
+                "transforms": {
+                    "insert_cached_attention": {"backend": "flashinfer"},
+                    "compile_model": {"backend": "torch-opt"},
+                },
+            },
         ),
-        get_small_model_config(
+        (
+            "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+            {
+                "transforms": {
+                    "transformers_replace_cached_attn": {"backend": "flashinfer"},
+                },
+                "mode": "transformers",
+            },
+        ),
+        (
             "deepseek-ai/DeepSeek-V3",
-            attn_backend="TritonWithFlattenedInputs",
-            compile_backend="torch-simple",
+            {
+                "transforms": {
+                    "insert_cached_attention": {"backend": "triton"},
+                    "compile_model": {"backend": "torch-simple"},
+                },
+            },
+        ),
+        (
+            "Qwen/Qwen2.5-3B-Instruct",
+            {
+                "transforms": {
+                    "insert_cached_attention": {"backend": "triton"},
+                    "compile_model": {"backend": "torch-compile"},
+                },
+            },
+        ),
+        (
+            "Qwen/Qwen2.5-3B-Instruct",
+            {
+                "transforms": {
+                    "transformers_replace_cached_attn": {"backend": "triton"},
+                },
+                "mode": "transformers",
+            },
+        ),
+        (
+            "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
+            {
+                "transforms": {
+                    "insert_cached_attention": {"backend": "flashinfer"},
+                    "compile_model": {"backend": "torch-cudagraph"},
+                },
+            },
+        ),
+        (
+            "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
+            {
+                "transforms": {
+                    "transformers_replace_cached_attn": {"backend": "flashinfer"},
+                },
+                "mode": "transformers",
+            },
+        ),
+        (
+            "nvidia/NVIDIA-Nemotron-Nano-12B-v2",
+            {
+                "transforms": {
+                    "insert_cached_attention": {"backend": "flashinfer"},
+                    "compile_model": {"backend": "torch-simple"},
+                },
+            },
         ),
     ],
 )
-def test_build_ad(config: Dict):
-    config["runtime"] = "demollm"  # Default runtime set to demollm
-    config["world_size"] = 0  # Default world_size set to 0
-    simple_config = SimpleConfig(**config)
-    print(f"Simple Config: {simple_config}")
-    original_init = InferenceOptimizer.__init__
+def test_build_ad(model_hub_id: str, llm_extra_args: dict):
+    experiment_config = get_small_model_config(model_hub_id, **llm_extra_args)
+    experiment_config["args"]["runtime"] = "demollm"  # Default runtime set to demollm
+    experiment_config["args"]["world_size"] = 0  # Default world_size set to 0
 
-    def check_and_original_init(self, factory, *, ad_config, **kwargs):
-        _check_ad_config(simple_config, ad_config)
-        return original_init(self, factory, ad_config=ad_config, **kwargs)
+    print(f"Experiment Config: {experiment_config}")
+    experiment_config = ExperimentConfig(**experiment_config)
+    original_build_from_config = ADEngine.build_from_config
 
-    # Temporarily replace the __init__ method
-    InferenceOptimizer.__init__ = check_and_original_init
+    @classmethod
+    def check_and_original_build(cls, ad_config):
+        _check_ad_config(experiment_config, ad_config)
+        return original_build_from_config.__func__(cls, ad_config)
+
+    # Temporarily replace the build_from_config classmethod
+    ADEngine.build_from_config = check_and_original_build
 
     try:
-        main(simple_config)
+        main(experiment_config)
     finally:
-        # Restore original __init__
-        InferenceOptimizer.__init__ = original_init
+        # Restore original build_from_config
+        ADEngine.build_from_config = original_build_from_config

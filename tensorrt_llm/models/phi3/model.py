@@ -8,7 +8,7 @@ from ...functional import PositionEmbeddingType, Tensor
 from ...layers import (MLP, MOE, Attention, AttentionMaskType,
                        BlockSparseAttnParams, ColumnLinear, Embedding,
                        LayerNorm, MoeConfig, RmsNorm)
-from ...lora_manager import LoraConfig, use_lora
+from ...lora_helper import LoraConfig, use_lora
 from ...mapping import Mapping
 from ...module import Module
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
@@ -302,9 +302,7 @@ class Phi3ForCausalLM(DecoderModelForCausalLM):
             trust_remote_code = kwargs.pop('trust_remote_code', True)
 
             hf_model = AutoModelForCausalLM.from_pretrained(
-                hf_model_dir,
-                torch_dtype="auto",
-                trust_remote_code=trust_remote_code)
+                hf_model_dir, dtype="auto", trust_remote_code=trust_remote_code)
 
         assert isinstance(hf_model, transformers.PreTrainedModel)
 

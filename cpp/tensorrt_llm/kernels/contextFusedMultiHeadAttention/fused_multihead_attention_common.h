@@ -81,7 +81,10 @@ enum class AttentionInputLayout
     // Q has contiguous [B, S, H, D] layout, while paged KV has [B, 2, Max_blocks_per_seq] layout
     // that contains paged block indices. The indices indicate the block offset to the pool ptr in
     // global memory
-    Q_PAGED_KV
+    Q_PAGED_KV,
+    // Q has contiguous [B, S, H, D] layout, while K has contiguous [B, S, H_kv, D] layout, and V has
+    // contiguous [B, S, H_kv, D_v] layout. Only used for context MLA now.
+    SEPARATE_Q_K_V,
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -115,6 +118,8 @@ struct MHARunnerFixedParams
     int headSize;
     // The head size of V.
     int headSizeV = 0;
+    // The head size of Q/K non-RoPE part, only used for MLA now.
+    int headSizeQkNope = 0;
     // The scaling applied to bmm1_scale.
     float qScaling;
     // The attention logit softcapping scale.
@@ -166,6 +171,7 @@ struct MHARunnerFixedParams
         case AttentionInputLayout::PACKED_QKV: output += "packed_qkv"; break;
         case AttentionInputLayout::Q_CONTIGUOUS_KV: output += "q_contiguous_kv"; break;
         case AttentionInputLayout::Q_PAGED_KV: output += "q_paged_kv"; break;
+        case AttentionInputLayout::SEPARATE_Q_K_V: output += "separate_q_k_v"; break;
         default: output += std::to_string(static_cast<int>(attentionInputLayout)) + " (unknown)"; break;
         }
 
@@ -255,14 +261,22 @@ struct MHARunnerParams
     void const* qPtr;
     // The contiguous Kv buffer ptr;
     void const* kvPtr;
+    // The K buffer ptr (for separate K input).
+    void const* kPtr;
+    // The V buffer ptr (for separate V input).
+    void const* vPtr;
     // The paged kv cache array.
     KVBlockArray pagedKvCache;
+    // The paged kv cache array for scaling factor.
+    KVBlockArray pagedKvSfCache;
     // The output buffer ptr.
     void* outputPtr;
     // The output scaling factor buffer ptr. (only used for FP4 output)
     void* outputSfPtr;
     // The softmax_status ptr for RingAttention.
     void* softmaxStatsPtr;
+    // The attention sinks ptr.
+    float const* attentionSinksPtr;
     // The packed mask ptr.
     void const* packedMaskPtr;
     // The cumulative Q sequence lengths.
@@ -342,25 +356,29 @@ struct Fused_multihead_attention_params_v2
     void const* qkv_ptr;
     // The separate Q matrice.
     void const* q_ptr;
+    // The separate K matrice.
+    void const* k_ptr;
+    // The separate V matrice.
+    void const* v_ptr;
     // The separate KV matrice.
     void const* kv_ptr;
     // The separate paged kv cache.
     KVBlockArrayForContextFMHA paged_kv_cache;
     // The mask to implement drop-out.
     void const* packed_mask_ptr;
+    // The attention sinks.
+    float const* attention_sinks_ptr;
     // The O matrix (output).
     void* o_ptr;
     // The Softmax stats vector of layout [2, B, S, H], including softmax_sum and softmax_max
     void* softmax_stats_ptr;
 
-    // The stride between rows of the Q, K and V matrices.
-    int64_t qkv_stride_in_bytes;
-    // The stride between rows of the separate Q matrice.
+    // The stride between rows of Q.
     int64_t q_stride_in_bytes;
-    // The stride between rows of the separate KV matrice.
-    int64_t kv_stride_in_bytes;
-    // The stride between rows of the separate V matrice, set if it is not same as that of K.
-    int64_t v_stride_in_bytes = 0;
+    // The stride between rows of K.
+    int64_t k_stride_in_bytes;
+    // The stride between rows of V.
+    int64_t v_stride_in_bytes;
     // The stride between matrices of packed mask.
     int64_t packed_mask_stride_in_bytes;
     // The stride between rows of O.
@@ -375,7 +393,8 @@ struct Fused_multihead_attention_params_v2
     // Kv in packed qkv layout: [B, S, 3, H, D]
     // Contiguous kv layout: [B, 2, H, S, D].
     // Paged kv layout: [UINT32_MAX, H, Tokens_per_block, D].
-    cudaTmaDesc tma_desc_kv;
+    cudaTmaDesc tma_desc_k;
+    cudaTmaDesc tma_desc_v;
     // Tma descriptor for o
     cudaTmaDesc tma_desc_o;
 
@@ -433,10 +452,6 @@ struct Fused_multihead_attention_params_v2
             float* scales;
         } q, k, v;
     } sage;
-
-    // Separate TMA descriptor for V when d != dv in packed qkv input layout, e.g. MLA + 192/128 dims
-    // We need to add this parameter in the tail of the struct for cubin compatibility
-    cudaTmaDesc tma_desc_v;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -450,7 +465,7 @@ struct Launch_params
     int total_q_seqlen = 0;
     // total kv sequence length.
     int total_kv_seqlen = 0;
-    // padded head size (new power of 2) for tma descriptors.
+    // padded head size for tma descriptors.
     int padded_d = 0;
     // flags to control small batch kernel choice
     // true: never unroll

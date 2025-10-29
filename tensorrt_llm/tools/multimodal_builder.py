@@ -25,25 +25,25 @@ from transformers import (AutoConfig, AutoModel, AutoModelForCausalLM,
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
-from safetensors.torch import save_file
+from safetensors.torch import load_model, save_file
 from transformers import CLIPImageProcessor
 
 from ..runtime.session import Session
 
 
 def add_multimodal_arguments(parser):
-    parser.add_argument('--model_type',
-                        type=str,
-                        default=None,
-                        choices=[
-                            'blip2', 'llava', 'llava_next', 'llava_onevision',
-                            'llava_onevision_lmms', 'vila', 'nougat', 'cogvlm',
-                            'fuyu', 'pix2struct', 'neva', 'kosmos-2',
-                            'video-neva', 'phi-3-vision', 'phi-4-multimodal',
-                            'mllama', 'internvl', 'qwen2_vl',
-                            'internlm-xcomposer2', 'qwen2_audio', 'pixtral'
-                        ],
-                        help="Model type")
+    parser.add_argument(
+        '--model_type',
+        type=str,
+        default=None,
+        choices=[
+            'blip2', 'llava', 'llava_next', 'llava_onevision',
+            'llava_onevision_lmms', 'vila', 'nougat', 'cogvlm', 'fuyu',
+            'pix2struct', 'neva', 'kosmos-2', 'video-neva', 'phi-3-vision',
+            'phi-4-multimodal', 'mllama', 'internvl', 'qwen2_vl',
+            'internlm-xcomposer2', 'qwen2_audio', 'pixtral', 'eclair'
+        ],
+        help="Model type")
     parser.add_argument(
         '--model_path',
         type=str,
@@ -144,6 +144,8 @@ class MultimodalEngineBuilder:
             build_qwen2_audio_engine(args)
         elif args.model_type == "pixtral":
             build_pixtral_engine(args)
+        elif args.model_type == "eclair":
+            build_eclair_engine(args)
         else:
             raise RuntimeError(f"Invalid model type {args.model_type}")
 
@@ -375,8 +377,8 @@ def build_blip2_engine(args):
                                           return_dict=True)
             return self.projector(qformer_output.last_hidden_state)
 
-    model = Blip2ForConditionalGeneration.from_pretrained(
-        args.model_path, torch_dtype=torch.float16)
+    model = Blip2ForConditionalGeneration.from_pretrained(args.model_path,
+                                                          dtype=torch.float16)
 
     blip2_llm = ""
     if model.language_model.config.architectures[
@@ -447,8 +449,8 @@ def build_pix2struct_engine(args):
             img_features = self.encoder.layernorm(img_features[0])
             return img_features
 
-    model = Pix2StructForConditionalGeneration.from_pretrained(
-        args.model_path, torch_dtype=dtype)
+    model = Pix2StructForConditionalGeneration.from_pretrained(args.model_path,
+                                                               dtype=dtype)
 
     wrapper = pix2structVisionWrapper(model.encoder.to(args.device))
     # input shape: batch size, number of patches, hidden dimension
@@ -499,7 +501,7 @@ def build_llava_engine(args):
         # Need to setup at hf_config._attn_implementation after transformers >= 4.46
         hf_config._attn_implementation = "eager"
         model = LlavaForConditionalGeneration.from_pretrained(
-            args.model_path, torch_dtype=torch.float16, config=hf_config)
+            args.model_path, dtype=torch.float16, config=hf_config)
         wrapper = LlavaVisionWrapper(
             model.vision_tower.to(args.device),
             model.multi_modal_projector.to(args.device),
@@ -528,7 +530,7 @@ def build_llava_engine(args):
         hf_config = AutoConfig.from_pretrained(args.model_path)
         hf_config.vision_config._attn_implementation = "eager"
         model = LlavaNextForConditionalGeneration.from_pretrained(
-            args.model_path, torch_dtype=torch.float16, config=hf_config)
+            args.model_path, dtype=torch.float16, config=hf_config)
         wrapper = LlavaNextVisionWrapper(
             model.vision_tower.vision_model.to(args.device),
             model.multi_modal_projector.to(args.device),
@@ -583,7 +585,7 @@ def build_llava_engine(args):
                 return image_features  # (sigma(bs, patches_i), 729, c)
 
         model = LlavaOnevisionForConditionalGeneration.from_pretrained(
-            args.model_path, torch_dtype=torch.float16)
+            args.model_path, dtype=torch.float16)
         wrapper = LlavaOnevisionVisionWrapper(
             model.vision_tower.vision_model.to(args.device),
             model.multi_modal_projector.to(args.device), model.config)
@@ -596,12 +598,12 @@ def build_llava_engine(args):
         args.output_dir,
         args.max_batch_size)
     if args.model_type == "llava_next":
-        image_newline = model.image_newline.data
+        image_newline = model.model.image_newline.data
         tensor_img_newline = {"image_newline": image_newline}
         save_file(tensor_img_newline,
                   os.path.join(args.output_dir, "image_newlines.safetensors"))
     if args.model_type == "llava_onevision":
-        image_newline = model.image_newline.data
+        image_newline = model.model.image_newline.data
         tensor_img_newline = {"image_newline": image_newline}
         save_file(tensor_img_newline,
                   os.path.join(args.output_dir, "image_newlines.safetensors"))
@@ -673,7 +675,7 @@ def build_nougat_engine(args):
             return self.encoder(image).last_hidden_state
 
     model = VisionEncoderDecoderModel.from_pretrained(args.model_path,
-                                                      torch_dtype=torch.float16)
+                                                      dtype=torch.float16)
     swin_encoder = model.get_encoder().to(args.device)
     wrapper = SwinEncoderWrapper(swin_encoder)
 
@@ -708,7 +710,7 @@ def build_cogvlm_engine(args):
             return self.encoder(image)
 
     cogvlm = AutoModelForCausalLM.from_pretrained(args.model_path,
-                                                  torch_dtype=dtype,
+                                                  dtype=dtype,
                                                   trust_remote_code=True)
     vit_encoder = cogvlm.model.vision.to(args.device).eval()
 
@@ -740,7 +742,7 @@ def build_fuyu_engine(args):
             return self.linear(patches).flatten(0, 1)
 
     model = FuyuForCausalLM.from_pretrained(args.model_path,
-                                            torch_dtype=torch.float16)
+                                            dtype=torch.float16)
 
     vision_encoder = model.vision_embed_tokens
     wrapper = FuyuEncoderWrapper(vision_encoder).to(args.device)
@@ -801,7 +803,7 @@ def build_neva_engine(args):
     if os.path.isdir(joined_path):
         vision_path = joined_path
     encoder = AutoModel.from_pretrained(vision_path,
-                                        torch_dtype=torch.bfloat16,
+                                        dtype=torch.bfloat16,
                                         trust_remote_code=True)
     vision_encoder = encoder.vision_model
     hf_config = encoder.config
@@ -882,7 +884,7 @@ def build_video_neva_engine(args):
             return vision_x
 
     encoder = AutoModel.from_pretrained(vision_config["from_pretrained"],
-                                        torch_dtype=torch.bfloat16,
+                                        dtype=torch.bfloat16,
                                         trust_remote_code=True,
                                         attn_implementation="eager")
     vision_encoder = encoder.vision_model
@@ -949,7 +951,7 @@ def build_kosmos_engine(args):
             return img_features
 
     model = AutoModelForVision2Seq.from_pretrained(args.model_path,
-                                                   torch_dtype=torch.float16)
+                                                   dtype=torch.float16)
     wrapper = VisionEncoderWrapper(
         model.vision_model.to(args.device),
         model.image_to_text_projection.to(args.device))
@@ -999,7 +1001,7 @@ def build_phi_engine(args):
                 1, pixel_values.shape[0], -1, self.vision_model.image_dim_out)
 
     model = AutoModelForCausalLM.from_pretrained(args.model_path,
-                                                 torch_dtype=torch.float16,
+                                                 dtype=torch.float16,
                                                  trust_remote_code=True)
     vision_model = model.model.vision_embed_tokens
 
@@ -1101,7 +1103,7 @@ def build_phi4mm_engine(args):
             return torch.cat((speech_out, vision_out), dim=-1)
 
     model = AutoModelForCausalLM.from_pretrained(args.model_path,
-                                                 torch_dtype='auto',
+                                                 dtype='auto',
                                                  trust_remote_code=True)
 
     vision_model = model.model.embed_tokens_extend.image_embed
@@ -1186,10 +1188,20 @@ def build_mllama_engine(args):
     # conflict with limitation of other multimodal models.
     from transformers import MllamaForConditionalGeneration
     model = MllamaForConditionalGeneration.from_pretrained(args.model_path,
-                                                           torch_dtype='auto',
+                                                           dtype='auto',
                                                            device_map='auto')
-    wrapper = MLLaMAVisionWrapper(model.vision_model,
-                                  model.multi_modal_projector)
+
+    # Check if the model structure is updated to transformers >= 4.52.0
+    if hasattr(model, 'model') and hasattr(model.model, 'vision_model'):
+        vision_model = model.model.vision_model
+        multi_modal_projector = model.model.multi_modal_projector
+    else:
+        # transformers < 4.52.0
+        vision_model = model.vision_model
+        multi_modal_projector = model.multi_modal_projector
+
+    wrapper = MLLaMAVisionWrapper(vision_model, multi_modal_projector)
+
     model_dtype = model.dtype
     image = Image.new('RGB', [2048, 2688])  # dummy image
     inputs = processor(images=image,
@@ -1267,7 +1279,7 @@ def build_internvl_engine(args):
             return vit_embeds_mlp
 
     model = AutoModelForCausalLM.from_pretrained(args.model_path,
-                                                 torch_dtype=torch.float16,
+                                                 dtype=torch.float16,
                                                  trust_remote_code=True,
                                                  use_flash_attn=False).to(
                                                      args.device)
@@ -1322,15 +1334,18 @@ def compute_rotary_pos_emb(grid_thw, hf_config, VisionRotaryEmbedding):
 
 
 def build_qwen2_vl_engine(args):
+    import transformers
     from qwen_vl_utils import process_vision_info
     from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+    from transformers.models.qwen2_vl.configuration_qwen2_vl import \
+        Qwen2VLVisionConfig
     from transformers.models.qwen2_vl.modeling_qwen2_vl import (
         Qwen2VisionTransformerPretrainedModel, Qwen2VLVisionBlock,
         VisionAttention, VisionRotaryEmbedding)
 
     model = Qwen2VLForConditionalGeneration.from_pretrained(
         args.model_path,
-        torch_dtype=torch.float32,
+        dtype=torch.float32,
         device_map="cpu",
         attn_implementation="eager")
     hf_config = AutoConfig.from_pretrained(args.model_path)
@@ -1386,9 +1401,16 @@ def build_qwen2_vl_engine(args):
 
     class VisionAttentionOpt(VisionAttention):
 
-        def __init__(self, dim: int, num_heads: int = 16):
-            super().__init__(dim, num_heads)
-            self.head_dim = dim / num_heads
+        def __init__(self, config: Qwen2VLVisionConfig):
+            # Fallback for compatibility with older transformers versions (for certain nvbugs/tests)
+            if transformers.__version__ >= '4.53.0':
+                super().__init__(config)
+                self.head_dim = config.embed_dim // config.num_heads
+            else:
+                num_heads = config.num_heads
+                dim = config.embed_dim
+                super().__init__(dim, num_heads)
+                self.head_dim = dim // num_heads
 
         def forward(self,
                     hidden_states: torch.Tensor,
@@ -1442,8 +1464,7 @@ def build_qwen2_vl_engine(args):
 
         def __init__(self, config, attn_implementation: str = "eager") -> None:
             super().__init__(config)
-            self.attn = VisionAttentionOpt(config.embed_dim,
-                                           num_heads=config.num_heads)
+            self.attn = VisionAttentionOpt(config)
 
         def forward(self, hidden_states, attention_mask,
                     rotary_pos_emb) -> torch.Tensor:
@@ -1481,7 +1502,7 @@ def build_qwen2_vl_engine(args):
             super().__init__()
             self.visual = Qwen2VisionTransformerPretrainedModelOpt._from_config(
                 model.config.vision_config,
-                torch_dtype=torch.float32,
+                dtype=torch.float32,
             )
             self.visual.load_state_dict(model.visual.state_dict())
 
@@ -1523,7 +1544,7 @@ def build_qwen2_audio_engine(args):
     from transformers import Qwen2AudioForConditionalGeneration
 
     model = Qwen2AudioForConditionalGeneration.from_pretrained(
-        args.model_path, torch_dtype=torch.float16)
+        args.model_path, dtype=torch.float16)
 
     # dummy audio features, dtype is float32
     audio = torch.randn(1,
@@ -1689,7 +1710,7 @@ def build_pixtral_engine(args):
             return out
 
     model = Mistral3ForConditionalGeneration.from_pretrained(args.model_path,
-                                                             torch_dtype="auto")
+                                                             dtype="auto")
     vision_tower = model.vision_tower
     mm_projector = model.multi_modal_projector
 
@@ -1738,3 +1759,78 @@ def build_pixtral_engine(args):
         max_batch_size=args.max_batch_size,
         engine_name=f"model.engine",
         dtype=torch.bfloat16)
+
+
+def build_eclair_engine(args):
+
+    class RadioWithNeck(torch.nn.Module):
+
+        def __init__(self):
+            super().__init__()
+
+            try:
+                self.model_encoder = torch.hub.load("NVlabs/RADIO",
+                                                    "radio_model",
+                                                    version="radio_v2.5-h")
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to load RADIO model from torch.hub: {e}")
+            self.model_encoder.summary_idxs = torch.tensor(4)
+
+            self.conv1 = torch.nn.Conv1d(1280, 1024, 1)
+            self.layer_norm1 = torch.nn.LayerNorm(1024,
+                                                  eps=1e-6,
+                                                  elementwise_affine=True)
+            self.conv2 = torch.nn.Conv2d(1024,
+                                         1024,
+                                         kernel_size=(1, 4),
+                                         stride=(1, 4),
+                                         padding=0,
+                                         bias=False)
+            self.layer_norm2 = torch.nn.LayerNorm(1024,
+                                                  eps=1e-6,
+                                                  elementwise_affine=True)
+
+        @torch.no_grad
+        def forward(self, pixel_values):
+            _, feature = self.model_encoder(pixel_values)
+            output = self.conv1(feature.permute(0, 2, 1)).permute(0, 2, 1)
+            output = self.layer_norm1(output).permute(0, 2, 1)
+
+            b, d, _ = output.shape
+            h = pixel_values.shape[-2] // 16
+            w = pixel_values.shape[-1] // 16
+            output = self.conv2(output.reshape(b, d, h, w))
+            output = output.flatten(-2, -1).permute(0, 2, 1)
+            output = self.layer_norm2(output)
+            return output
+
+    processor = NougatProcessor.from_pretrained(args.model_path)
+    model = VisionEncoderDecoderModel.from_pretrained("facebook/nougat-base")
+    model.encoder = RadioWithNeck()
+    model.decoder.resize_token_embeddings(len(processor.tokenizer))
+    model.config.decoder_start_token_id = processor.tokenizer.eos_token_id  # 2
+    model.config.pad_token_id = processor.tokenizer.pad_token_id  # 1
+    checkpoint_path = os.path.join(args.model_path, "model.safetensors")
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(
+            f"Model checkpoint not found at {checkpoint_path}")
+    load_model(model, checkpoint_path)
+
+    wrapper = model.encoder.to(args.device)
+    # temporary fix due to TRT onnx export bug
+    for block in wrapper.model_encoder.model.blocks:
+        block.attn.fused_attn = False
+
+    image = torch.randn((1, 3, 2048, 1648),
+                        device=args.device,
+                        dtype=torch.bfloat16)
+    export_onnx(wrapper, image, f'{args.output_dir}/onnx')
+    build_trt_engine(
+        args.model_type,
+        [image.shape[1], image.shape[2], image.shape[3]],  # [3, H, W]
+        f'{args.output_dir}/onnx',
+        args.output_dir,
+        args.max_batch_size,
+        dtype=torch.bfloat16,
+        engine_name='visual_encoder.engine')

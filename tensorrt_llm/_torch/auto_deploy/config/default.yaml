@@ -1,0 +1,172 @@
+# This is the set of transforms running in "graph" mode. In this mode, we capture the full graph
+# of the model and optimize it for inference.
+transforms:
+  ############################################################################################
+  # BUILD MODEL, EXPORT TO GRAPH MODULE, AND CLEAN UP
+  ############################################################################################
+  build_model:
+    stage: factory
+    run_per_gm: false
+    device: meta
+    requires_clean_graph: false
+  export_to_gm:
+    stage: export
+    clone_state_dict: false
+    strict: false
+    run_per_gm: false
+    requires_clean_graph: false
+  cleanup_noop_slice:
+    stage: post_export
+  cleanup_noop_add:
+    stage: post_export
+  cleanup_input_constraints:
+    stage: post_export
+  ############################################################################################
+  # RUN PATTERN MATCHER TRANSFORMATIONS TO STANDARDIZE GRAPH REPRESENTATION
+  ############################################################################################
+  match_moe_pattern:
+    stage: pattern_matcher
+  match_dense_moe_pattern:
+    stage: pattern_matcher
+  match_repeat_kv:
+    stage: pattern_matcher
+    run_shape_prop: true
+  match_eager_attention:
+    stage: pattern_matcher
+    requires_shape_prop: true
+  match_grouped_attention_with_repeat_kv:
+    stage: pattern_matcher
+  match_grouped_attention_without_repeat_kv:
+    stage: pattern_matcher
+  match_attention_layout:
+    stage: pattern_matcher
+    attn_layout: bsnd
+  match_rope_pattern:
+    stage: pattern_matcher
+  match_rope_layout:
+    stage: pattern_matcher
+    expected_layout: bsnd
+  ############################################################################################
+  # RUN TRANSFORMATIONS ON STANDARDIZED GRAPH REPRESENTATION
+  ############################################################################################
+  eliminate_redundant_transposes:
+    stage: pattern_matcher
+  # TODO (lucaslie): let's move this to perf optimization once TP sharding is improved
+  # see https://github.com/NVIDIA/TensorRT-LLM/pull/3668#discussion_r2052714528
+  optimize_rope:
+    stage: pattern_matcher
+  quantize_int4_linear_from_config:
+    stage: pattern_matcher
+  quantize_fp8_linear_from_config:
+    stage: pattern_matcher
+  quantize_nvfp4_linear_from_config:
+    stage: pattern_matcher
+  quantize_fp8_bmm_from_config:
+    stage: pattern_matcher
+  quantize_fp8_from_graph:
+    stage: pattern_matcher
+  quantize_nvfp4_from_graph:
+    stage: pattern_matcher
+  quantize_fp8_moe:
+    stage: pattern_matcher
+  quantize_nvfp4_moe:
+    stage: pattern_matcher
+  quantize_mxfp4_moe:
+    stage: pattern_matcher
+  # TODO: Infer sharding parameters (tp_size, row/column sharding) from the model config.
+  detect_sharding:
+    stage: sharding
+    simple_shard_only: false
+    use_sharding_from_factory: false
+    support_partial_config: false
+    sharding_dims: ['tp', 'ep', 'bmm']
+    requires_shape_prop: true
+  # TODO: (hg) need to ensure run_shape_prop after sharding.
+  sharding_transform_executor:
+    stage: sharding
+    run_shape_prop: true
+  ############################################################################################
+  # MOVE MODEL AND LOAD WEIGHTS
+  ############################################################################################
+  load_weights:
+    stage: weight_load
+    run_per_gm: false
+    checkpoint_device: null
+  move_inputs_to_device:
+    stage: weight_load
+    run_per_gm: false
+  ############################################################################################
+  # RUN POST-LOAD FUSION AND OPTIMIZATIONS
+  ############################################################################################
+  fuse_gemms:
+    stage: post_load_fusion
+    enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
+  fuse_fp4_gemms:
+    stage: post_load_fusion
+    enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
+  fuse_fp8_gemms:
+    stage: post_load_fusion
+    enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
+  fuse_fp8_linear:
+    stage: post_load_fusion
+    backend: torch
+  fuse_nvfp4_linear:
+    stage: post_load_fusion
+    backend: trtllm
+  fuse_moe:
+    stage: post_load_fusion
+    enabled: true
+  fuse_fp8_moe:
+    stage: post_load_fusion
+    enabled: true
+  fuse_allreduce_residual_rmsnorm:
+    stage: post_load_fusion
+  # TODO (lucaslie): add backend selection as part of configurable inference optimizers
+  # check if we can fuse rmsnorm
+  fuse_rmsnorm:
+    # TODO (lucaslie): add backend selection as part of configurable inference optimizers
+    # check if we can fuse rmsnorm
+    stage: post_load_fusion
+    backend: triton
+    requires_shape_prop: true
+  fuse_gated_rmsnorm:
+    stage: post_load_fusion
+
+  ############################################################################################
+  # VISUALIZE GRAPH
+  ############################################################################################
+  visualize_namespace:
+    stage: visualize
+    enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/8460
+  ############################################################################################
+  # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
+  ############################################################################################
+  update_in_out_nodes:
+    stage: cache_init
+  insert_cached_attention:
+    stage: cache_init
+    backend: flashinfer
+  insert_cached_mla_attention:
+    stage: cache_init
+    backend: MultiHeadLatentAttention
+  insert_cached_ssm_attention:
+    stage: cache_init
+    backend: triton_ssm
+  insert_cached_causal_conv:
+    stage: cache_init
+    backend: cuda_causal_conv
+  initialize_cache:
+    stage: cache_init
+    run_per_gm: false
+  resize_kv_cache:
+    stage: cache_init
+    run_per_gm: false
+    free_mem_ratio: 0.0
+  ############################################################################################
+  # COMPILE MODEL
+  ############################################################################################
+  compile_model:
+    stage: compile
+    run_per_gm: false
+    cuda_graph_batch_sizes: null
+    backend: torch-compile

@@ -33,12 +33,16 @@ class Evaluator(ABC):
     def __init__(self,
                  random_seed: int = 0,
                  apply_chat_template: bool = False,
-                 system_prompt: Optional[str] = None):
+                 fewshot_as_multiturn: bool = False,
+                 system_prompt: Optional[str] = None,
+                 chat_template_kwargs: Optional[dict[str, Any]] = None):
         random.seed(random_seed)
         np.random.seed(random_seed)
         torch.manual_seed(random_seed)
         self.apply_chat_template = apply_chat_template
+        self.fewshot_as_multiturn = fewshot_as_multiturn
         self.system_prompt = system_prompt
+        self.chat_template_kwargs = chat_template_kwargs
 
     @abstractmethod
     def generate_samples(self) -> Iterable[tuple]:
@@ -62,7 +66,9 @@ class Evaluator(ABC):
             }] + messages
         return llm.tokenizer.apply_chat_template(messages,
                                                  tokenize=False,
-                                                 add_generation_prompt=True)
+                                                 add_generation_prompt=True,
+                                                 **(self.chat_template_kwargs
+                                                    or {}))
 
     def _get_sampline_params(self, sampling_params: Optional[SamplingParams],
                              sampling_args: Optional[dict]) -> SamplingParams:
@@ -78,7 +84,8 @@ class Evaluator(ABC):
 
     def evaluate(self,
                  llm: Any,
-                 sampling_params: Optional[SamplingParams] = None) -> float:
+                 sampling_params: Optional[SamplingParams] = None,
+                 streaming: bool = False) -> float:
         profiler.start("trtllm exec")
         outputs, references, auxiliaries = [], [], []
         for prompt, sampling_args, reference, *aux in tqdm(
@@ -87,7 +94,11 @@ class Evaluator(ABC):
                 prompt = self.do_apply_chat_template(llm, prompt)
             sampling_params = self._get_sampline_params(sampling_params,
                                                         sampling_args)
-            output = llm.generate_async(prompt, sampling_params)
+            output = llm.generate_async(
+                prompt,
+                sampling_params,
+                streaming=streaming,
+            )
             outputs.append(output)
             references.append(reference)
             auxiliaries.append(aux)

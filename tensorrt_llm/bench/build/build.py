@@ -5,23 +5,24 @@ from typing import Tuple, get_args
 import click
 from click_option_group import AllOptionGroup, optgroup
 
+from tensorrt_llm._torch.pyexecutor.config_utils import is_nemotron_hybrid, load_pretrained_config
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.utils.data import create_dataset_from_stream, initialize_tokenizer
 from tensorrt_llm.bench.utils import VALID_QUANT_ALGOS
 from tensorrt_llm.builder import BuildConfig
-from tensorrt_llm.llmapi import LLM
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.llmapi.llm_utils import QuantConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
-from tensorrt_llm.bench.build.dataclasses import ModelConfig
+from tensorrt_llm.bench.build.dataclasses import ModelConfig, NemotronHybridConfig
 from tensorrt_llm.bench.build.tuning import calc_engine_setting
 
 TUNED_QUANTS = {
     QuantAlgo.NVFP4, QuantAlgo.FP8, QuantAlgo.FP8_BLOCK_SCALES,
     QuantAlgo.NO_QUANT, None
 }
-DEFAULT_MAX_BATCH_SIZE = BuildConfig.max_batch_size
-DEFAULT_MAX_NUM_TOKENS = BuildConfig.max_num_tokens
+DEFAULT_MAX_BATCH_SIZE = BuildConfig.model_fields["max_batch_size"].default
+DEFAULT_MAX_NUM_TOKENS = BuildConfig.model_fields["max_num_tokens"].default
 
 
 def get_benchmark_engine_settings(
@@ -31,6 +32,7 @@ def get_benchmark_engine_settings(
     pp_size: int,
     target_input_len: int,
     target_output_len: int,
+    kv_cache_gpu_mem_fraction: float = 0.95,
 ) -> Tuple[int, int]:
     """ Retrieve benchmark settings for a specific model + configuration.
 
@@ -58,6 +60,7 @@ def get_benchmark_engine_settings(
             pp_size,
             target_input_len,
             target_output_len,
+            kv_cache_gpu_mem_fraction,
         )
     else:
         max_batch_size = DEFAULT_MAX_BATCH_SIZE
@@ -82,6 +85,10 @@ def get_model_config(model_name: str, model_path: Path = None) -> ModelConfig:
     Raises:
         ValueError: When model is not supported.
     """
+    pretrained_config = load_pretrained_config(model_path or model_name,
+                                               trust_remote_code=True)
+    if is_nemotron_hybrid(pretrained_config):
+        return NemotronHybridConfig.from_hf(model_name, model_path)
     return ModelConfig.from_hf(model_name, model_path)
 
 
@@ -123,7 +130,7 @@ def apply_build_mode_settings(params):
 
 @click.command(name="build")
 @optgroup.group("Engine Configuration",
-                help="Configuration of the TensorRT-LLM engine.")
+                help="Configuration of the TensorRT LLM engine.")
 @optgroup.option(
     "--tp_size",
     "-tp",

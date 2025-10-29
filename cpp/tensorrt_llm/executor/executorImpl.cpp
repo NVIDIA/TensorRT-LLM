@@ -16,10 +16,8 @@
  */
 
 #include "tensorrt_llm/executor/executorImpl.h"
-#include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/batch_manager/trtEncoderModel.h"
 #include "tensorrt_llm/batch_manager/trtGptModelFactory.h"
-#include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaProfilerUtils.h"
 #include "tensorrt_llm/common/logger.h"
@@ -54,21 +52,37 @@ namespace tensorrt_llm::executor
 namespace
 {
 
-void checkOptionalParams(
-    batch_manager::TrtGptModelOptionalParams& optionalParams, runtime::ModelConfig const& modelConfig)
+[[nodiscard]] bool executorConfigIsValid(ExecutorConfig const& executorConfig, runtime::ModelConfig const& modelConfig)
 {
-    // Disable chunked context when not supported
-    if (optionalParams.enableChunkedContext)
+    // Make sure logic in this function matches fixExecutorConfig
+    if (executorConfig.getEnableChunkedContext())
     {
         if (modelConfig.isRnnBased() || !modelConfig.isKVCacheEnabled() || !modelConfig.getPagedContextFMHA())
         {
-            optionalParams.enableChunkedContext = false;
+            return false;
+        }
+    }
+    return true;
+}
+
+[[nodiscard]] ExecutorConfig fixExecutorConfig(
+    ExecutorConfig const& executorConfig, runtime::ModelConfig const& modelConfig)
+{
+    // Make sure logic in this function matches executorConfigIsValid
+    auto fixedExecutorConfig = executorConfig;
+    // Disable chunked context when not supported
+    if (executorConfig.getEnableChunkedContext())
+    {
+        if (modelConfig.isRnnBased() || !modelConfig.isKVCacheEnabled() || !modelConfig.getPagedContextFMHA())
+        {
+            fixedExecutorConfig.setEnableChunkedContext(false);
             TLLM_LOG_WARNING(
                 "Chunked context is not supported for this configuration and will be disabled. "
                 "Related configs: RNNBased: %d, KVCacheEnabled: %d, PagedContextFMHA: %d",
                 modelConfig.isRnnBased(), modelConfig.isKVCacheEnabled(), modelConfig.getPagedContextFMHA());
         }
     }
+    return fixedExecutorConfig;
 }
 
 SizeType32 getNumChildRequests(Request const& request)
@@ -488,19 +502,22 @@ std::shared_ptr<Model> Executor::Impl::createModel(runtime::RawEngine const& raw
     }();
 
     bool const isLeaderInOrchMode = (mCommMode == CommunicationMode::kORCHESTRATOR) && mIsLeader;
-    auto optionalParams = batch_manager::TrtGptModelOptionalParams(executorConfig, isLeaderInOrchMode);
-    checkOptionalParams(optionalParams, modelConfig);
-    return batch_manager::TrtGptModelFactory::create(rawEngine, modelConfig, worldConfig, gptModelType, optionalParams);
+    auto const& fixedExecutorConfig = executorConfigIsValid(executorConfig, modelConfig)
+        ? executorConfig
+        : fixExecutorConfig(executorConfig, modelConfig);
+
+    return batch_manager::TrtGptModelFactory::create(
+        rawEngine, modelConfig, worldConfig, gptModelType, fixedExecutorConfig, isLeaderInOrchMode);
 }
 
 std::shared_ptr<Model> Executor::Impl::createEncoderModel(runtime::RawEngine const& rawEngine,
     runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
     ExecutorConfig const& executorConfig)
 {
-    auto optionalParams = batch_manager::TrtGptModelOptionalParams{};
-    optionalParams.schedulerConfig = executorConfig.getSchedulerConfig();
+    auto fixedExecutorConfig = ExecutorConfig{};
+    fixedExecutorConfig.setSchedulerConfig(executorConfig.getSchedulerConfig());
     return std::make_shared<batch_manager::TrtEncoderModel>(
-        modelConfig, worldConfig, rawEngine, std::make_shared<runtime::TllmLogger>(), optionalParams);
+        modelConfig, worldConfig, rawEngine, std::make_shared<runtime::TllmLogger>(), fixedExecutorConfig);
 }
 
 void Executor::Impl::setOrchLeaderComm(
@@ -2152,15 +2169,25 @@ void Executor::Impl::terminateCancelledRequests(RequestList& activeRequests)
     }
 }
 
-void Executor::Impl::terminateContextFinishedRequests(RequestList& inTransmissionRequests)
+void Executor::Impl::terminateContextFinishedRequests(InTransList& inTransmissionRequests)
 {
     NVTX3_SCOPED_RANGE(terminateContextFinishedRequests);
     for (auto it = inTransmissionRequests.begin(); it != inTransmissionRequests.end();)
     {
-        auto req = *it;
+        auto& item = *it;
+        auto req = item.request;
         if (req->isDisaggContextCompleteState())
         {
-            mModel->terminateRequest(req);
+            // If lastBlockId was tracked, unpin it. Otherwise, just terminate.
+            auto kvMgr = mModel->getKVCacheManager();
+            if (kvMgr && item.lastBlockId.has_value())
+            {
+                kvMgr->unpinBlocksById(item.lastBlockId.value());
+            }
+            else
+            {
+                mModel->terminateRequest(req);
+            }
             it = inTransmissionRequests.erase(it);
         }
         else
@@ -2183,7 +2210,7 @@ void Executor::Impl::appendNewResponses(std::vector<Response>&& newResponses)
 }
 
 Executor::Impl::RequestList Executor::Impl::populateNewResponses(
-    RequestList& activeRequests, RequestList& inTransmissionRequests, std::vector<Response>& newResponses)
+    RequestList& activeRequests, InTransList& inTransmissionRequests, std::vector<Response>& newResponses)
 {
     NVTX3_SCOPED_RANGE(populateNewResponses);
     RequestList finishedRequests;
@@ -2206,7 +2233,14 @@ Executor::Impl::RequestList Executor::Impl::populateNewResponses(
             // move the in transmission requests to another tracker
             if (llmReq->isDisaggContextTransmissionState())
             {
-                inTransmissionRequests.push_back(*it);
+                std::optional<SizeType32> lastBlockId{};
+                auto kvMgr = mModel->getKVCacheManager();
+                if (kvMgr && kvMgr->isEnableBlockReuse() && !kvMgr->getBlockManager().isVariableWindow())
+                {
+                    lastBlockId = kvMgr->storeBlocksForReuse(llmReq->mRequestId, llmReq, /*pinBlocks=*/true);
+                    mModel->terminateRequest(llmReq);
+                }
+                inTransmissionRequests.push_back(InTransmissionItem{*it, lastBlockId});
             }
             finishedRequests.push_back(*it);
             it = activeRequests.erase(it);
@@ -2235,7 +2269,7 @@ void Executor::Impl::executionLoop()
     std::chrono::time_point<std::chrono::steady_clock> iterEnd;
     bool firstIteration{true};
     RequestList activeRequests;
-    RequestList inTransmissionRequests;
+    InTransList inTransmissionRequests;
     std::vector<Response> newResponses;
     while (!mShutdown || !activeRequests.empty())
     {

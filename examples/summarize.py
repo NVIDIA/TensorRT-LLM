@@ -41,7 +41,7 @@ from tensorrt_llm.tools.ppl import ppl
 if PYTHON_BINDINGS:
     from tensorrt_llm.runtime import ModelRunnerCpp
 
-from prompt_lookup.run_dtm_pld import run_dtm_pld
+from ngram.run_dtm_ngram import run_dtm_ngram
 
 
 def ensemble_mrope_params(batch_input_ids, max_position_embeddings,
@@ -211,6 +211,7 @@ def main(args):
     repetition_penalty = args.repetition_penalty
     presence_penalty = args.presence_penalty
     frequency_penalty = args.frequency_penalty
+    prompt_ignore_length = args.prompt_ignore_length
     random_seed = args.random_seed
     torch.manual_seed(random_seed)
 
@@ -318,17 +319,17 @@ def main(args):
             return [], [], [], {}
         input_lengths = [x.size(0) for x in batch_input_ids]
 
-        if args.prompt_lookup_config is not None:
-            # Speculative decoding of Prompt-Lookup-Decoding (PLD)
-            outputs = run_dtm_pld(batch_input_ids,
-                                  args,
-                                  runtime_rank,
-                                  end_id,
-                                  pad_id,
-                                  stop_words_list,
-                                  bad_words_list,
-                                  tokenizer.vocab_size,
-                                  target_runner=runner)
+        if args.ngram_config is not None:
+            # Speculative decoding of NGram
+            outputs = run_dtm_ngram(batch_input_ids,
+                                    args,
+                                    runtime_rank,
+                                    end_id,
+                                    pad_id,
+                                    stop_words_list,
+                                    bad_words_list,
+                                    tokenizer.vocab_size,
+                                    target_runner=runner)
             if not args.streaming:  # Unpack runner from the return value in No-Streaming mode
                 outputs, runner = list(outputs)[0]
         else:  # Normal run
@@ -353,6 +354,7 @@ def main(args):
                     repetition_penalty=repetition_penalty,
                     presence_penalty=presence_penalty,
                     frequency_penalty=frequency_penalty,
+                    prompt_ignore_length=prompt_ignore_length,
                     lora_uids=args.lora_task_uids,
                     lookahead_config=args.lookahead_config,
                     output_sequence_lengths=True,
@@ -403,7 +405,7 @@ def main(args):
                         ],
                                                 dim=0)
                         curr_ppl = ppl(curr_logits, curr_ids)
-                        logger.debug(f"TensorRT-LLM PPL: {curr_ppl:.3f} | "
+                        logger.debug(f"TensorRT LLM PPL: {curr_ppl:.3f} | "
                                      f"Generation length: {curr_gen_len}")
                         ppls[batch_idx].append(curr_ppl)
             return output_beams_list, output_ids_list, ppls, lengths_info
@@ -596,18 +598,17 @@ def main(args):
                 args.lookahead_config
             ) == 3, "Lookahead needs [max_window_size, max_ngram_size, max_verification_set_size]"
             runner_kwargs.update(lookahead_config=args.lookahead_config)
-        if args.prompt_lookup_config is not None:
+        if args.ngram_config is not None:
             assert args.kv_cache_enable_block_reuse, "`--kv_cache_enable_block_reuse` must be specified in speculative decoding."
             assert not args.use_py_session, "`--use_py_session` is not supported in Speculative decoding."
-            assert not is_enc_dec, "Encoder-Decoder model is not supported in Speculative decoding."
             assert args.num_beams == 1, "`--num_beams>1` is not supported in Speculative decoding."
-            prompt_lookup_num_tokens, _, target_device_list = ast.literal_eval(
-                args.prompt_lookup_config)
-            args.max_output_len = output_len  # Specialization for PLD
+            max_draft_len, _, target_device_list = ast.literal_eval(
+                args.ngram_config)
+            args.max_output_len = output_len  # Specialization for NGram
             runner_kwargs.update(is_orchestrator_mode=True,
                                  device_ids=target_device_list,
-                                 max_input_len=test_token_num +
-                                 prompt_lookup_num_tokens + output_len)
+                                 max_input_len=test_token_num + max_draft_len +
+                                 output_len)
 
         runner = runner_cls.from_dir(**runner_kwargs)
         assert not (args.eval_ppl and not runner.gather_context_logits), \
@@ -623,7 +624,7 @@ def main(args):
         if runtime_rank == 0 and args.eval_task != "eval_context_ppl":
             logger.info(
                 "---------------------------------------------------------")
-            logger.info("TensorRT-LLM Generated: ")
+            logger.info("TensorRT LLM Generated: ")
             logger.info(f" Input: {datapoint[dataset_input_key]}")
             logger.info(f"\n Reference: {datapoint[dataset_output_key]}")
             logger.info(f"\n Output: {output}")
@@ -684,7 +685,7 @@ def main(args):
 
                 logger.debug('-' * 100)
                 logger.debug(f"Input: {datapoint[dataset_input_key]}")
-                logger.debug(f'TensorRT-LLM Output: {output_tensorrt_llm}')
+                logger.debug(f'TensorRT LLM Output: {output_tensorrt_llm}')
                 logger.debug(f"Reference: {datapoint[dataset_output_key]}")
 
             data_point_idx += max_batch_size
@@ -713,7 +714,7 @@ def main(args):
         model = auto_model_cls.from_pretrained(
             args.hf_model_dir,
             trust_remote_code=True,
-            torch_dtype=str_dtype_to_torch(args.hf_data_type),
+            dtype=str_dtype_to_torch(args.hf_data_type),
             device_map='auto' if args.hf_device_map_auto else None)
         try:
             model.to_bettertransformer()
@@ -808,17 +809,17 @@ def main(args):
         if test_trt_llm:
             np.random.seed(0)  # rouge score use sampling to compute the score
             logger.info(
-                f'TensorRT-LLM (total latency: {profiler.elapsed_time_in_sec("tensorrt_llm")} sec)'
+                f'TensorRT LLM (total latency: {profiler.elapsed_time_in_sec("tensorrt_llm")} sec)'
             )
 
             logger.info(
-                f'TensorRT-LLM (total output tokens: {total_output_token_count_trt_llm})'
+                f'TensorRT LLM (total output tokens: {total_output_token_count_trt_llm})'
             )
             logger.info(
-                f'TensorRT-LLM (tokens per second: {total_output_token_count_trt_llm / profiler.elapsed_time_in_sec("tensorrt_llm")})'
+                f'TensorRT LLM (tokens per second: {total_output_token_count_trt_llm / profiler.elapsed_time_in_sec("tensorrt_llm")})'
             )
             for beam_idx in range(num_sequences):
-                logger.info(f"TensorRT-LLM beam {beam_idx} result")
+                logger.info(f"TensorRT LLM beam {beam_idx} result")
                 if args.eval_task != "eval_context_ppl":
                     if args.estimate_accuracy_std_dev:
                         computed_metrics_tensorrt_llm = metric_tensorrt_llm[
@@ -924,7 +925,7 @@ if __name__ == '__main__':
         type=str,
         default=None,
         help="Directory where to save output sentences. 'trtllm.out' for "
-        "TensorRT-LLM outputs, and 'hf.out' for HF outputs.  If None, do not "
+        "TensorRT LLM outputs, and 'hf.out' for HF outputs.  If None, do not "
         "save outputs.")
     parser.add_argument(
         '--rouge_dir',

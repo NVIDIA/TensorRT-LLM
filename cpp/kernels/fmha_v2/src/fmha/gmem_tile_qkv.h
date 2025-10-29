@@ -111,7 +111,8 @@ struct Gmem_tile_qkv
     inline __device__ Gmem_tile_qkv(
         Params const& params, int qkv_offset, Block_info const& binfo, int tidx, int cta_row_offset = 0)
 
-        : params_qkv_stride_in_bytes_(params.qkv_stride_in_bytes)
+        // in PACKED_QKV, q_stride = k_stride = v_stride
+        : params_qkv_stride_in_bytes_(params.q_stride_in_bytes)
         , qkv_ptr_(reinterpret_cast<char const*>(params.qkv_ptr))
     {
 
@@ -132,7 +133,7 @@ struct Gmem_tile_qkv
         preds_[0] = fmha::pack_predicates(preds);
 
         // The row offset in the batched GEMM. For each seq element, we store QKV in that order.
-        int64_t row_offset = (int64_t) (row + cta_row_offset) * params.qkv_stride_in_bytes;
+        int64_t row_offset = (int64_t) (row + cta_row_offset) * params_qkv_stride_in_bytes_;
         // Add the block index.
         int idx;
         if (HEADS_INTERLEAVED)

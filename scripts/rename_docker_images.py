@@ -5,7 +5,7 @@ import os
 import pathlib as _pl
 import subprocess as _sp
 
-MERGE_REQUEST_GROOVY = "L0_MergeRequest.groovy"
+CURRENT_TAG_FILE = "current_image_tags.properties"
 IMAGE_MAPPING = {
     "LLM_DOCKER_IMAGE":
     "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/__stage__:x86_64-__stage__-torch_skip",
@@ -78,7 +78,7 @@ def find_script_directory() -> _pl.Path:
     return _pl.Path(__file__).resolve().parent
 
 
-def extract_line_after_prefix(file_path: _pl.Path, prefix: str) -> str or None:
+def extract_line_after_prefix(file_path: _pl.Path, prefix: str) -> str | None:
     """
     Extracts the line starting with a certain prefix from the given file.
 
@@ -193,24 +193,23 @@ def rename_images(*,
     timestamp = timestamp or get_current_timestamp()
     src_branch_sanitized = src_branch.replace("/", "_")
     base_dir = find_script_directory().parent
-    mr_groovy = base_dir / "jenkins" / MERGE_REQUEST_GROOVY
+    current_tags_path = base_dir / "jenkins" / CURRENT_TAG_FILE
 
     for dst_key, src_pattern in IMAGE_MAPPING.items():
         print(f"Processing {dst_key} ...")
         src_image = f"{src_pattern}-{src_branch_sanitized}-{src_build_id}".replace(
             "__stage__", stage)
-        dst_image_old = extract_line_after_prefix(mr_groovy,
-                                                  dst_key + " = ").strip('"')
+        dst_image_old = extract_line_after_prefix(current_tags_path,
+                                                  dst_key + "=").strip('"')
         dst_image = replace_text_between_dashes(
             f"{image_prefix(dst_image_old)}-{timestamp}-{dst_mr}", 3, stage)
 
         run_shell_command(f"docker pull {src_image}", dry_run)
         run_shell_command(f"docker tag {src_image} {dst_image}", dry_run)
         run_shell_command(f"docker push {dst_image}", dry_run)
-        find_and_replace_in_files(base_dir / "jenkins", ".groovy",
-                                  dst_image_old, dst_image, dry_run)
-        find_and_replace_in_files(base_dir / ".devcontainer", ".yml",
-                                  dst_image_old, dst_image, dry_run)
+        find_and_replace_in_files(current_tags_path.parent,
+                                  current_tags_path.name, dst_image_old,
+                                  dst_image, dry_run)
 
 
 def main() -> None:

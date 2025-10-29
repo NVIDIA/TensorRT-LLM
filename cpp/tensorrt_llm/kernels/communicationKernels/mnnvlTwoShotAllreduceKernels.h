@@ -30,6 +30,7 @@ struct AllReduceParams
     int buffer_M;
     int num_tokens;
     int token_dim;
+    uint32_t buffer_size;
     void** buffer_ptrs_dev;
     void* multicast_ptr;
     void* buffer_flags;
@@ -50,6 +51,7 @@ struct RMSNormParams
     void const* gamma;
     double epsilon;
     void* residual;
+    uint32_t buffer_size;
     uint32_t* buffer_flags;
     int batch;
     int hidden_dim;

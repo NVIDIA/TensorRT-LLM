@@ -3,14 +3,14 @@ tensorrt_llm>=0.0.0.dev0
 datasets==3.1.0
 evaluate
 rouge_score
-transformers>=4.40.1
+transformers>=4.56.0
 transformers-stream-generator
 sentencepiece>=0.1.99
 tiktoken
 einops
 
 # optional dependencies
-gradio==4.36.0
+gradio==4.44.1
 mdtex2html
 sse_starlette
 aiohttp_sse_client

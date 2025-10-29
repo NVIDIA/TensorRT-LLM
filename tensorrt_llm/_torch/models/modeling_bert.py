@@ -4,7 +4,7 @@ import torch
 from torch import nn
 from transformers import BertConfig
 
-from tensorrt_llm.llmapi.utils import print_colored_debug
+from tensorrt_llm.llmapi.utils import logger_debug
 from tensorrt_llm.logger import logger
 
 from ..attention_backend import AttentionMetadata
@@ -192,7 +192,6 @@ class BertModel(nn.Module):
         self.model_config = model_config
 
         config = self.model_config.pretrained_config
-        self.padding_idx = config.pad_token_id
         self.add_pooling_layer = add_pooling_layer
 
         self.embedding = BertEmbeddings(config=config)
@@ -310,13 +309,13 @@ class BertForSequenceClassification(nn.Module):
 
         for name, module in self.named_modules():
             if len(module._parameters) > 0:
-                print_colored_debug(f"loading for: {name}")
+                logger_debug(f"loading for: {name}")
                 try:
                     # the provided modules in TRTLLM
                     if hasattr(module, 'load_weights'):
                         module.load_weights(weights=tllm_weights[name])
                     else:
-                        print_colored_debug(f" use copy_ to load {name}")
+                        logger_debug(f" use copy_ to load {name}")
                         module_weights = tllm_weights[name][0]
                         for n, p in module._parameters.items():
                             if p is not None:

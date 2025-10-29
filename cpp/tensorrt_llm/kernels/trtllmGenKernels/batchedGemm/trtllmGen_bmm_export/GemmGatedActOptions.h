@@ -58,18 +58,21 @@ namespace tg = trtllm::gen;
 // Type of the gated activation
 enum class ActType
 {
-    // silu(x) = x * sigmoid(x) = x * (1 / (1 + e^(-x)))
-    // For ActType == Silu,
-    //    gatedAct = scaleC * x0 * silu(x1 * scaleGate),
-    // where x0 and x1 are the raw numbers from Gemm, while scaleC and scaleGate are input scales.
-    Silu = 0,
     // For ActType == SwiGlu, ideally we would like to have something like
-    //    gatedAct = scaleC * (x0 * scaleAb + beta) * sigmoid(alpha * x1 * scaleGate).
+    //    gatedAct = quantScaleC * (x0 * dequantScaleAb + beta) * ((x1 * scaleGate) *
+    //    sigmoid(alpha * x1 * scaleGate)).
     // But for now, we use the simplified version
-    //    gatedAct = scaleC' * (x0 + beta') * sigmoid(alpha * x1 * scaleGate),
+    //    gatedAct = scaleC * (x0 + beta') * ((x1 * scaleGate) * sigmoid(alpha * x1 * scaleGate)),
+    // where x0 and x1 are the raw numbers from Gemm, while scaleC and scaleGate are input scales,
+    // beta' = beta / dequantScaleAb, scaleC = quantScaleC * dequantScaleAb.
+    //
+    // GatedSilu is a special case of SwiGlu where the alpha is 1.0 and the beta is 0.0.
+    SwiGlu,
+    // For ActType == GeGlu, we use the simplified version
+    //    gatedAct = scaleC' * (x0 + beta') * ((x1 * scaleGate) * phi(alpha * x1 * scaleGate)),
     // where x0 and x1 are the raw numbers from Gemm, while scaleC and scaleGate are input scales,
     // beta' = beta / scaleAb, scaleC' = scaleC * scaleAb.
-    SwiGlu
+    GeGlu,
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -82,8 +85,8 @@ enum class ActType
         return (type == ActType::actType);                                                                             \
     }
 
-TLLM_ACT_TYPE_FUNCTION(Silu)
 TLLM_ACT_TYPE_FUNCTION(SwiGlu)
+TLLM_ACT_TYPE_FUNCTION(GeGlu)
 
 #undef TLLM_ACT_TYPE_FUNCTION
 
@@ -93,8 +96,8 @@ inline std::string getActTypeName(ActType type)
 {
     switch (type)
     {
-    case ActType::Silu: return "Silu";
     case ActType::SwiGlu: return "SwiGlu";
+    case ActType::GeGlu: return "GeGlu";
     default: return "Unknown type";
     }
 }
@@ -105,14 +108,17 @@ struct GemmGatedActOptions : public gemm::GemmOptions
 {
     GemmGatedActOptions() = default;
 
-    GemmGatedActOptions(gemm::GemmOptions options, ActType actType)
+    GemmGatedActOptions(gemm::GemmOptions options, ActType actType, bool clampBeforeAct)
         : gemm::GemmOptions(options)
         , mActType(actType)
+        , mClampBeforeAct(clampBeforeAct)
     {
     }
 
     // Type of the gated activation.
-    ActType mActType{ActType::Silu};
+    ActType mActType{ActType::SwiGlu};
+    // Clamp the dequantized values to the range [-limit, limit].
+    bool mClampBeforeAct{false};
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -179,7 +185,8 @@ inline std::string dumpOptions(GemmGatedActOptions const& options)
     std::stringstream ss;
     ss << gemm::dumpOptions(options) << ", ";
     ss << "mActType="
-       << "gemmGatedAct::ActType(" << static_cast<int32_t>(options.mActType) << ")" << std::endl;
+       << "gemmGatedAct::ActType(" << static_cast<int32_t>(options.mActType) << ")," << std::endl;
+    ss << "mClampBeforeAct=" << options.mClampBeforeAct << "" << std::endl;
     return ss.str();
 }
 
@@ -200,8 +207,10 @@ struct GemmGatedActConfig
     uint32_t const mSharedMemSize{0};
     char const* mFunctionName{nullptr};
     uint32_t const mNumThreadsPerCTA{0};
+    char const* mHash{nullptr};
 #else
     trtllm::gen::CudaRunner* mCudaRunner{nullptr};
+    int32_t mInstanceIdx{0};
 #endif
 
     GemmGatedActOptions mOptions{};

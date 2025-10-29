@@ -63,6 +63,9 @@ extern "C"
         bool fp8_output;
         bool use_input_kv;
         tllmXqaJitRopeStyle rope_style; // useful only when use_input_kv is true.
+
+        bool is_spec_dec_tree
+            = true; // useful only when multi_query_tokens, should be true unless using linear tree in spec-dec.
     } tllmXqaJitContext;
 
     // tllmXqaJitProgram is an opaque handle for a program.

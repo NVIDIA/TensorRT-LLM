@@ -1,6 +1,6 @@
 import pytest
 import torch
-from _graph_test_helpers import run_test
+from _graph_test_helpers import run_test_transformed_gm
 from _model_test_utils import (
     apply_rotary_pos_emb_complex,
     apply_rotary_pos_emb_ds,
@@ -8,18 +8,16 @@ from _model_test_utils import (
 )
 from torch.export import Dim
 
-from tensorrt_llm._torch.auto_deploy.transformations.library.rope import (
-    match_rope_layout,
-    match_rope_pattern,
-    optimize_rope,
-)
+from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import extract_output_tuple, is_op
 
 torch.manual_seed(0)
 
 
-def _precompute_freqs_cis_explicit(seq_len: int, head_dim: int, rope_theta: float):
-    dtype = torch.float32
+def _precompute_freqs_cis_explicit(
+    seq_len: int, head_dim: int, rope_theta: float, dtype: torch.dtype = torch.float32
+):
     inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
     positions = torch.arange(seq_len, dtype=torch.float32)
     freqs = positions.unsqueeze(1) * inv_freq.unsqueeze(0)
@@ -84,14 +82,16 @@ class RoPEModel(torch.nn.Module):
             else:
                 unsq_dim = 2
 
-            cos, sin = _precompute_freqs_cis_explicit(s, self.head_dim, rope_theta=10000)
+            cos, sin = _precompute_freqs_cis_explicit(
+                s, self.head_dim, rope_theta=10000, dtype=x.dtype
+            )
             cos = cos.to(x.device).unsqueeze(0).expand(b, -1, -1)
             sin = sin.to(x.device).unsqueeze(0).expand(b, -1, -1)
 
             if self.mode == "match":
                 q_out, k_out = apply_rotary_pos_emb_explicit(q, k, cos, sin, unsq_dim)
             else:  # optimize
-                q_out, k_out = torch.ops.rope.torch_apply_rope_with_explicit_cos_sin(
+                q_out, k_out = torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin(
                     q, k, cos, sin, unsq_dim
                 )
 
@@ -119,7 +119,7 @@ class RoPEModel(torch.nn.Module):
             if self.mode == "match":
                 q_out, k_out = apply_rotary_pos_emb_complex(q, k, freqs, unsq_dim)
             else:
-                q_out, k_out = torch.ops.rope.torch_apply_rope_with_complex_freqs(
+                q_out, k_out = torch.ops.auto_deploy.torch_rope_with_complex_freqs(
                     q, k, freqs, unsq_dim
                 )
 
@@ -208,28 +208,62 @@ def test_rope_variants(
     ).to("cuda", torch.float16)
     x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=torch.float16)
     dyn = model.get_dynamic_shapes()
+    gm = torch_export_to_gm(model, args=(x,), dynamic_shapes=(dyn,), clone=True)
 
     if transformation == "match":
-        fn = match_rope_pattern
+        gm_transformed = InferenceOptimizer(
+            None,
+            {
+                "match_rope_pattern": {
+                    "stage": "pattern_matcher",
+                },
+            },
+        )(None, gm)
+        gm_transformed.to("cuda")
+
         check_op = (
-            torch.ops.rope.torch_apply_rope_with_explicit_cos_sin
+            torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin
             if variant == "explicit" or variant == "explicit_pm"
-            else torch.ops.rope.torch_apply_rope_with_complex_freqs
+            else torch.ops.auto_deploy.torch_rope_with_complex_freqs
         )
 
         def checker(gm):
             return any(is_op(n, check_op) for n in gm.graph.nodes)
 
+        run_test_transformed_gm(
+            model,
+            x,
+            gm_transformed,
+            checker,
+            lambda n: n,
+            atol,  # atol
+            rtol,  # rtol
+            True,  # test_load_hook
+            True,  # strict_loading
+            dyn,  # dynamic_shapes
+            1,  # check_num_matches
+            False,  # skip_output_assert
+        )
+
     elif transformation == "match_layout":
-        fn = match_rope_layout
+        gm_transformed = InferenceOptimizer(
+            None,
+            {
+                "match_rope_layout": {
+                    "stage": "pattern_matcher",
+                    "expected_layout": target_layout,
+                },
+            },
+        )(None, gm)
+        gm_transformed.to("cuda")
 
         def checker(gm):
             for n in gm.graph.nodes:
                 if is_op(
                     n,
                     {
-                        torch.ops.rope.torch_apply_rope_with_explicit_cos_sin,
-                        torch.ops.rope.torch_apply_rope_with_complex_freqs,
+                        torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin,
+                        torch.ops.auto_deploy.torch_rope_with_complex_freqs,
                     },
                 ):
                     q_arg, k_arg, *rest = n.args
@@ -250,17 +284,39 @@ def test_rope_variants(
 
             return matched if layout != target_layout else not matched
 
-    else:
-        fn = optimize_rope
+        run_test_transformed_gm(
+            model,
+            x,
+            gm_transformed,
+            checker,
+            lambda n: n,
+            atol,  # atol
+            rtol,  # rtol
+            True,  # test_load_hook
+            True,  # strict_loading
+            dyn,  # dynamic_shapes
+            None,  # check_num_matches
+            False,  # skip_output_assert
+        )
+
+    else:  # optimize
+        gm_transformed = InferenceOptimizer(
+            None,
+            {
+                "optimize_rope": {
+                    "stage": "pattern_matcher",
+                },
+            },
+        )(None, gm)
+        gm_transformed.to("cuda")
 
         def checker(gm):
-            return any(is_op(n, torch.ops.rope.flashinfer) for n in gm.graph.nodes)
+            return any(is_op(n, torch.ops.auto_deploy.flashinfer_rope) for n in gm.graph.nodes)
 
-    if transformation == "match_layout":
-        _ = run_test(
+        run_test_transformed_gm(
             model,
             x,
-            fn,
+            gm_transformed,
             checker,
             lambda n: n,
             atol,  # atol
@@ -269,35 +325,7 @@ def test_rope_variants(
             True,  # strict_loading
             dyn,  # dynamic_shapes
             None,  # check_num_matches
-            target_layout,
-        )
-    elif transformation == "match":
-        _ = run_test(
-            model,
-            x,
-            fn,
-            checker,
-            lambda n: n,
-            atol,  # atol
-            rtol,  # rtol
-            True,  # test_load_hook
-            True,  # strict_loading
-            dyn,  # dynamic_shapes
-            1,  # check_num_matches
-        )
-    else:
-        _ = run_test(
-            model,
-            x,
-            fn,
-            checker,
-            lambda n: n,
-            atol,  # atol
-            rtol,  # rtol
-            True,  # test_load_hook
-            True,  # strict_loading
-            dyn,  # dynamic_shapes
-            None,  # check_num_matches
+            False,  # skip_output_assert
         )
 
 
@@ -346,7 +374,7 @@ class DSModel(torch.nn.Module):
         else:
             cos = cos[pos_ids]
             sin = sin[pos_ids]
-            q_out, k_out = torch.ops.rope.torch_apply_rope_with_qk_interleaving(
+            q_out, k_out = torch.ops.auto_deploy.torch_rope_with_qk_interleaving(
                 q, k, cos, sin, unsq_dim
             )
         if self.layout == "BNSD":
@@ -381,22 +409,55 @@ def test_match_and_layout_deepseek(layout, num_heads, num_kv_heads, mode, target
 
     x = torch.randn(batch, seq, hid, device="cuda", dtype=torch.float16)
     dynamic_shapes = model.get_dynamic_shapes()
+    gm = torch_export_to_gm(model, args=(x,), dynamic_shapes=(dynamic_shapes,), clone=True)
 
     if mode == "match":
-        transform = match_rope_pattern
+        gm_transformed = InferenceOptimizer(
+            None,
+            {
+                "match_rope_pattern": {
+                    "stage": "pattern_matcher",
+                },
+            },
+        )(None, gm)
+        gm_transformed.to("cuda")
 
         def checker(gm):
             return any(
-                is_op(n, torch.ops.rope.torch_apply_rope_with_qk_interleaving)
+                is_op(n, torch.ops.auto_deploy.torch_rope_with_qk_interleaving)
                 for n in gm.graph.nodes
             )
 
+        run_test_transformed_gm(
+            model,
+            x,
+            gm_transformed,
+            checker,
+            lambda num_p: num_p,
+            1e-3,  # atol
+            1e-3,  # rtol
+            True,  # test_load_hook
+            True,  # strict_loading
+            dynamic_shapes,  # dynamic_shapes
+            1,  # check_num_matches
+            False,  # skip_output_assert
+        )
+
     else:  # mode == "match_layout"
-        transform = match_rope_layout
+        gm_transformed = InferenceOptimizer(
+            None,
+            {
+                "match_rope_layout": {
+                    "stage": "pattern_matcher",
+                    "expected_layout": target_layout,
+                },
+            },
+        )(None, gm)
+        gm_transformed.to("cuda")
 
         def checker(gm):
             for n in gm.graph.nodes:
-                if is_op(n, torch.ops.rope.torch_apply_rope_with_qk_interleaving):
+                if is_op(n, torch.ops.auto_deploy.torch_rope_with_qk_interleaving):
                     q_arg, k_arg, *rest = n.args
                     if not (
                         is_op(q_arg, torch.ops.aten.contiguous)
@@ -415,11 +476,10 @@ def test_match_and_layout_deepseek(layout, num_heads, num_kv_heads, mode, target
 
             return matched if layout != target_layout else not matched
 
-    if mode == "match_layout":
-        _ = run_test(
+        run_test_transformed_gm(
             model,
             x,
-            transform,
+            gm_transformed,
             checker,
             lambda num_p: num_p,
             1e-3,  # atol
@@ -428,19 +488,5 @@ def test_match_and_layout_deepseek(layout, num_heads, num_kv_heads, mode, target
             True,  # strict_loading
             dynamic_shapes,  # dynamic_shapes
             None,  # check_num_matches
-            target_layout,
-        )
-    else:
-        _ = run_test(
-            model,
-            x,
-            transform,
-            checker,
-            lambda num_p: num_p,
-            1e-3,  # atol
-            1e-3,  # rtol
-            True,  # test_load_hook
-            True,  # strict_loading
-            dynamic_shapes,  # dynamic_shapes
-            1,  # check_num_matches
+            False,  # skip_output_assert
         )
