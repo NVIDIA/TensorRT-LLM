@@ -27,10 +27,10 @@ from tensorrt_llm.models.model_weights_loader import ModelWeightsLoader
 
 from ..._common import default_net, default_trtnet
 from ..._utils import pad_vocab_size
-from ...bindings import KVCacheType
 from ...functional import (Tensor, _create_tensor, cast, concat,
                            gather_last_token_logits, index_select, shape)
 from ...layers import AttentionParams, ColumnLinear, SpecDecodingParams
+from ...llmapi.kv_cache_type import KVCacheType
 from ...module import Module, ModuleList
 from ...plugin import TRT_LLM_PLUGIN_NAMESPACE
 from ..modeling_utils import QuantConfig
