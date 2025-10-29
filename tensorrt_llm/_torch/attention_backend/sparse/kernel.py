@@ -1526,25 +1526,32 @@ def triton_interleave(input_tensor: torch.Tensor, kt_offsets: torch.Tensor,
 
 
 @triton.jit
+def extract_bin_idx(values):
+    values_fp16 = values.to(tl.float16)
+    values_u16 = values_fp16.to(tl.uint16, bitcast=True)
+    values_u16 = tl.where(values < 0.0, ~values_u16 & 0xffff,
+                          values_u16 | 0x8000) >> 6
+    bin_indices = 1023 - values_u16
+    return bin_indices
+
+
+@triton.jit
 def topk_kernel(
     input_ptr,
     output_indices_ptr,
     temp_values_ptr,
     temp_indices_ptr,
     input_offsets_ptr,
-    sparse_offsets_ptr,
+    output_offsets_ptr,
     batch_size,
     num_kv_heads,
     topk,
     total_input_tokens,
     total_sparse_indices,
-    max_seq_len,
-    max_real_tokens,
     BLOCK_SIZE: tl.constexpr,
+    NUM_BINS: tl.constexpr,
+    FINAL_SIZE: tl.constexpr,
 ):
-    """
-    Perform topk operation on each batch independently using efficient argsort implementation.
-    """
     batch_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
 
@@ -1555,133 +1562,122 @@ def topk_kernel(
     input_end = tl.load(input_offsets_ptr + batch_idx + 1)
     input_len = input_end - input_start
 
-    sparse_start = tl.load(sparse_offsets_ptr + batch_idx)
-    sparse_end = tl.load(sparse_offsets_ptr + batch_idx + 1)
-    sparse_len = sparse_end - sparse_start
+    output_start = tl.load(output_offsets_ptr + batch_idx)
+    output_end = tl.load(output_offsets_ptr + batch_idx + 1)
+    output_len = output_end - output_start
 
-    if input_len <= 0 or sparse_len <= 0:
+    if input_len <= 0 or output_len <= 0:
         return
 
-    actual_topk = tl.minimum(topk, input_len)
-    actual_topk = tl.minimum(actual_topk, sparse_len)
-
-    # Base addresses
     input_base = head_idx * total_input_tokens + input_start
-    temp_base = batch_idx * num_kv_heads * max_seq_len * 2 + head_idx * max_seq_len * 2
-    output_base = head_idx * total_sparse_indices + sparse_start
+    temp_base = head_idx * batch_size * FINAL_SIZE + batch_idx * FINAL_SIZE
+    output_base = head_idx * total_sparse_indices + output_start
 
-    # Process sequence in chunks to handle variable lengths efficiently
-    max_process_len = tl.cdiv(input_len, BLOCK_SIZE) * BLOCK_SIZE
+    if input_len <= topk:
+        for i in tl.range(0, input_len, BLOCK_SIZE):
+            block_offsets = i + tl.arange(0, BLOCK_SIZE)
+            block_mask = block_offsets < input_len
+            tl.store(output_indices_ptr + output_base + block_offsets,
+                     block_offsets,
+                     mask=block_mask)
+        return
 
-    for block_start in tl.range(0, max_process_len, BLOCK_SIZE):
-        block_offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    histogram = tl.zeros((NUM_BINS, ), dtype=tl.int32)
+    for i in tl.range(0, input_len, BLOCK_SIZE):
+        block_offsets = i + tl.arange(0, BLOCK_SIZE)
         block_mask = block_offsets < input_len
-
         values = tl.load(input_ptr + input_base + block_offsets,
                          mask=block_mask,
-                         other=0.0)
+                         other=-1e10)
 
-        # Store values to temporary storage
-        tl.store(temp_values_ptr + temp_base + block_offsets,
-                 values,
-                 mask=block_mask)
-        # Store original indices
-        tl.store(temp_indices_ptr + temp_base + block_offsets,
+        # Extract bin indices from values
+        bin_indices = extract_bin_idx(values).to(tl.int32)
+
+        histogram += tl.histogram(bin_indices, num_bins=NUM_BINS)
+
+    cum_hist = tl.cumsum(histogram)
+
+    # Find threshold bin
+    bin_range = tl.arange(0, NUM_BINS)
+    crosses_threshold = cum_hist >= topk
+
+    threshold_indices = tl.where(crosses_threshold, bin_range, NUM_BINS)
+    threshold_bin_idx = tl.min(threshold_indices)
+
+    base_offset = 0
+    final_offset = 0
+
+    final_values = tl.full((FINAL_SIZE, ), -1e10, dtype=tl.float32)
+    final_indices = tl.zeros((FINAL_SIZE, ), dtype=tl.int32)
+
+    for i in tl.range(0, input_len, BLOCK_SIZE):
+        block_offsets = i + tl.arange(0, BLOCK_SIZE)
+        block_mask = block_offsets < input_len
+        values = tl.load(input_ptr + input_base + block_offsets,
+                         mask=block_mask,
+                         other=-1e10)
+        bin_indices = extract_bin_idx(values)
+
+        # Create masks for guaranteed and candidate elements
+        guaranteed_mask = (bin_indices < threshold_bin_idx) & block_mask
+        candidate_mask = (bin_indices == threshold_bin_idx) & block_mask
+
+        # Use cumsum to compute write positions for guaranteed elements
+        guaranteed_int = guaranteed_mask.to(tl.int32)
+        write_positions = tl.cumsum(guaranteed_int, axis=0) - guaranteed_int
+        num_guaranteed = tl.sum(guaranteed_int)
+
+        candidate_int = candidate_mask.to(tl.int32)
+        candidate_positions = tl.cumsum(candidate_int, axis=0) - candidate_int
+        num_candidates = tl.sum(candidate_int)
+
+        # Vectorized write for guaranteed elements
+        guaranteed_write_offsets = base_offset + write_positions
+        tl.store(output_indices_ptr + output_base + guaranteed_write_offsets,
                  block_offsets,
-                 mask=block_mask)
+                 mask=guaranteed_mask)
 
-    # Multi-round iterative argsort approach
-    # This works for both short and long sequences uniformly
-    current_len = input_len.to(tl.int32)
-    current_base = temp_base
-    round_num = 0
+        base_offset += num_guaranteed
 
-    while current_len > BLOCK_SIZE:
-        round_num += 1
+        # Vectorized write for candidates
+        candidate_write_offsets = final_offset + temp_base + candidate_positions
+        tl.store(temp_values_ptr + candidate_write_offsets,
+                 values,
+                 mask=candidate_mask)
+        tl.store(temp_indices_ptr + candidate_write_offsets,
+                 block_offsets,
+                 mask=candidate_mask)
 
-        num_chunks = tl.cdiv(current_len, BLOCK_SIZE)
+        final_offset += num_candidates
+        tl.device_assert(final_offset < FINAL_SIZE,
+                         "Final offset is out of bounds")
 
-        # Alternate between two halves of temp storage to avoid conflicts
-        if round_num % 2 == 1:
-            next_base = temp_base + max_seq_len
-        else:
-            next_base = temp_base
-
-        next_len = 0
-
-        # Process each chunk in this round
-        for chunk_id in tl.range(0, num_chunks):
-            chunk_start = chunk_id * BLOCK_SIZE
-            chunk_end = tl.minimum(chunk_start + BLOCK_SIZE, current_len)
-            chunk_len = chunk_end - chunk_start
-
-            if chunk_len > 0:
-                # Load chunk data from current round's storage
-                chunk_offsets = tl.arange(0, BLOCK_SIZE)
-                chunk_mask = chunk_offsets < chunk_len
-
-                chunk_values = tl.load(temp_values_ptr + current_base +
-                                       chunk_start + chunk_offsets,
-                                       mask=chunk_mask,
-                                       other=0.0)
-                chunk_indices = tl.load(temp_indices_ptr + current_base +
-                                        chunk_start + chunk_offsets,
-                                        mask=chunk_mask,
-                                        other=0.0).to(tl.int32)
-
-                # Sort this chunk using argsort
-                chunk_sorted_values, chunk_sorted_indices = argsort(
-                    chunk_values, chunk_indices, dim=0, descending=True)
-
-                # Extract top-k candidates from this chunk
-                chunk_topk = tl.minimum(actual_topk, chunk_len).to(tl.int32)
-                chunk_topk_mask = chunk_offsets < chunk_topk
-
-                # Store top-k candidates to next round's storage
-                next_offsets = next_len + chunk_offsets
-                next_store_mask = chunk_topk_mask & (next_offsets < max_seq_len)
-
-                tl.store(temp_values_ptr + next_base + next_offsets,
-                         chunk_sorted_values,
-                         mask=next_store_mask)
-                tl.store(temp_indices_ptr + next_base + next_offsets,
-                         chunk_sorted_indices,
-                         mask=next_store_mask)
-
-                next_len += chunk_topk
-
-        # Update parameters for next round
-        current_len = next_len
-        current_base = next_base
-
-    final_offsets = tl.arange(0, BLOCK_SIZE)
-    final_mask = final_offsets < current_len
-
-    final_values = tl.load(temp_values_ptr + current_base + final_offsets,
+    final_offsets = tl.arange(0, FINAL_SIZE)
+    final_mask = final_offsets < final_offset
+    final_values = tl.load(temp_values_ptr + temp_base + final_offsets,
                            mask=final_mask,
                            other=-1e10)
-    final_indices = tl.load(temp_indices_ptr + current_base + final_offsets,
+    final_indices = tl.load(temp_indices_ptr + temp_base + final_offsets,
                             mask=final_mask,
-                            other=-1).to(tl.int32)
+                            other=-1)
 
     final_sorted_values, final_sorted_indices = argsort(final_values,
                                                         final_indices,
                                                         dim=0,
                                                         descending=True)
 
-    result_offsets = tl.arange(0, BLOCK_SIZE)
-    result_mask = result_offsets < actual_topk
+    remain_num = topk - base_offset
 
-    selected_indices = tl.where(result_mask, final_sorted_indices,
-                                tl.zeros_like(final_sorted_indices))
-    tl.store(output_indices_ptr + output_base + result_offsets,
-             selected_indices,
-             mask=result_mask)
+    write_offsets = tl.arange(0, FINAL_SIZE)
+    write_mask = write_offsets < remain_num
+
+    tl.store(output_indices_ptr + output_base + base_offset + write_offsets,
+             final_sorted_indices,
+             mask=write_mask)
 
 
 def triton_topk(input_tensor: torch.Tensor, input_offsets: torch.Tensor,
-                sparse_offsets: torch.Tensor, total_sparse_attn_indices: int,
-                max_attn_seq_len: int, max_real_tokens: int,
+                output_offsets: torch.Tensor, total_sparse_attn_indices: int,
                 topk: int) -> torch.Tensor:
     """
     Perform topk operation on input tensor.
@@ -1689,10 +1685,8 @@ def triton_topk(input_tensor: torch.Tensor, input_offsets: torch.Tensor,
     Args:
         input_tensor: Input scores [num_kv_heads, total_tokens]
         input_offsets: Input offsets [batch_size + 1]
-        sparse_offsets: Sparse offsets [batch_size + 1]
+        output_offsets: Sparse offsets [batch_size + 1]
         total_sparse_attn_indices: Total number of sparse attention indices
-        max_attn_seq_len: Maximum sequence length
-        max_real_tokens: Maximum real tokens (power of 2)
         topk: TopK parameter (must be power of 2)
 
     Returns:
@@ -1700,7 +1694,7 @@ def triton_topk(input_tensor: torch.Tensor, input_offsets: torch.Tensor,
     """
 
     num_kv_heads, total_tokens = input_tensor.shape
-    batch_size = sparse_offsets.shape[0] - 1
+    batch_size = output_offsets.shape[0] - 1
     device = input_tensor.device
 
     # Create output tensor
@@ -1708,20 +1702,20 @@ def triton_topk(input_tensor: torch.Tensor, input_offsets: torch.Tensor,
                                  dtype=torch.int32,
                                  device=device)
 
-    max_real_tokens = triton.next_power_of_2(max_real_tokens)
-
-    # Create temporary storage for topk algorithm (double size for dual-buffer design)
-    temp_values = torch.empty((batch_size, num_kv_heads, max_attn_seq_len * 2),
-                              dtype=input_tensor.dtype,
-                              device=device)
-    temp_indices = torch.empty((batch_size, num_kv_heads, max_attn_seq_len * 2),
-                               dtype=torch.int32,
-                               device=device)
-
     grid = (batch_size, num_kv_heads)
 
     assert topk & (topk - 1) == 0, "Topk must be a power of 2"
-    BLOCK_SIZE = max(512, 2 * topk)
+
+    BLOCK_SIZE = 512
+    NUM_BINS = 1024
+    FINAL_SIZE = 256
+
+    temp_values = torch.empty((num_kv_heads, batch_size, FINAL_SIZE),
+                              dtype=torch.float32,
+                              device=device)
+    temp_indices = torch.empty((num_kv_heads, batch_size, FINAL_SIZE),
+                               dtype=torch.int32,
+                               device=device)
 
     topk_kernel[grid](
         input_tensor,
@@ -1729,15 +1723,15 @@ def triton_topk(input_tensor: torch.Tensor, input_offsets: torch.Tensor,
         temp_values,
         temp_indices,
         input_offsets,
-        sparse_offsets,
+        output_offsets,
         batch_size,
         num_kv_heads,
         topk,
         total_tokens,
         total_sparse_attn_indices,
-        max_attn_seq_len,
-        max_real_tokens,
         BLOCK_SIZE=BLOCK_SIZE,
+        NUM_BINS=NUM_BINS,
+        FINAL_SIZE=FINAL_SIZE,
     )
 
     return output_indices

@@ -85,8 +85,6 @@ def triton_topk_wrapper(
     batch_size = len(kv_lens)
     device = input_tensor.device
 
-    max_seq_len = kv_lens.max().item()
-
     sparse_lens = torch.tensor(
         [min(topk, seq_len.item()) for seq_len in kv_lens],
         dtype=torch.int32,
@@ -97,14 +95,8 @@ def triton_topk_wrapper(
     ]).to(device)
     total_sparse_indices = sparse_offsets[-1].item()
 
-    output_indices_flat = triton_topk(
-        input_tensor,
-        kv_offsets,
-        sparse_offsets,
-        total_sparse_indices,
-        max_seq_len,
-        max_seq_len,  # max_real_tokens (will be converted to power of 2 inside)
-        topk)
+    output_indices_flat = triton_topk(input_tensor, kv_offsets, sparse_offsets,
+                                      total_sparse_indices, topk)
 
     # Convert flat format to padded format [num_kv_heads, batch_size, topk]
     output_indices_padded = torch.full((num_kv_heads, batch_size, topk),

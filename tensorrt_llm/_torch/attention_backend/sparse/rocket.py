@@ -630,17 +630,16 @@ class RocketTrtllmAttention(TrtllmAttention):
                 self.page_size)
 
             # Use interleaved scores with kv_lens
-            selected_indices = triton_topk(
-                interleaved_scores, metadata.cum_kv_gen_lens_cuda,
-                sparse_attn_offsets, metadata.total_sparse_attn_indices,
-                metadata.max_seq_len, metadata.max_real_kv_tokens, self.topk)
+            selected_indices = triton_topk(interleaved_scores,
+                                           metadata.cum_kv_gen_lens_cuda,
+                                           sparse_attn_offsets,
+                                           metadata.total_sparse_attn_indices,
+                                           self.topk)
         else:
             # Use original kt scores directly
             selected_indices = triton_topk(scores, metadata.cum_kt_lens_cuda,
                                            sparse_attn_offsets,
                                            metadata.total_sparse_attn_indices,
-                                           metadata.max_seq_len,
-                                           metadata.max_real_kt_tokens,
                                            self.topk)
 
         return selected_indices, sparse_attn_offsets
