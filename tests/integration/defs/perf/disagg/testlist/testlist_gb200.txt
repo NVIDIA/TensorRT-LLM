@@ -1,0 +1,2 @@
+test_disagg.py::TestDisaggBenchmark::test_benchmark[wideep_perf_deepseek-r1-fp4_1k1k_dep32_bs32_nixl]
+test_disagg.py::TestDisaggBenchmark::test_benchmark[disagg_perf_deepseek-r1-fp4_1k1k_dep32_bs32_nixl]
