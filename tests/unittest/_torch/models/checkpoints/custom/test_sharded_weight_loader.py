@@ -8,7 +8,7 @@ import pytest
 import tqdm
 from utils.llm_data import llm_models_root
 
-from tensorrt_llm._torch.models.checkpoints import HfWeightLoader
+from tensorrt_llm._torch.models.checkpoints import HfWeightLoader, Qwen3MoeHfWeightMapper
 from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import HfCheckpointLoader
 from tensorrt_llm._torch.models.checkpoints.hf.config_loader import HfConfigLoader
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
@@ -156,6 +156,32 @@ def test_sharded_safetensors_checkpoint_loader():
         checkpoint_loader=HfCheckpointLoader(
             weight_loader=ShardedWeightLoader(),
             weight_mapper=ShardedWeightMapper(),
+            config_loader=HfConfigLoader(),
+        ),
+    )
+    llm.shutdown()
+
+
+@register_mapper("DUMMY_FORMAT")
+class ShardedMoeWeightMapper(Qwen3MoeHfWeightMapper):
+    def __init__(self):
+        super().__init__()
+        self.already_sharded = True
+
+
+def test_sharded_safetensors_checkpoint_loader_moe():
+    """Test that the checkpoint loader can load a sharded safetensors checkpoint."""
+
+    model_dir = Path(llm_models_root()) / "Qwen3/Qwen3-30B-A3B/"
+
+    # Create LLM with the provided model
+    llm = LLM(
+        model=model_dir,
+        backend="pytorch",
+        tensor_parallel_size=2,
+        checkpoint_loader=HfCheckpointLoader(
+            weight_loader=ShardedWeightLoader(),
+            weight_mapper=ShardedMoeWeightMapper(),
             config_loader=HfConfigLoader(),
         ),
     )
