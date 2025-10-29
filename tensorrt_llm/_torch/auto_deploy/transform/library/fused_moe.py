@@ -469,7 +469,7 @@ class MatchMoePattern(BaseTransform):
             common_ancessor2 = _find_lowest_common_ancessor(arg2_list)
             if not common_ancessor2:
                 continue
-            selected_experts, _ = bfs(
+            selected_experts = bfs(
                 common_ancessor2,
                 lambda node: is_op(node, torch.ops.aten.one_hot),
                 attr_next="all_input_nodes",
