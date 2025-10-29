@@ -889,18 +889,19 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                         }
 
                     module_weights.append(fw)
+                # Note: module_weights may be empty after filtering (e.g., in streaming weight updates)
                 if module_weights:
                     module.load_weights(weights=module_weights)
 
             else:
                 module_weights = filter_weights(name, weights)
+                # Note: module_weights may be empty after filtering (e.g., in streaming weight updates)
                 if module_weights:
                     if hasattr(module, 'load_weights'):
                         module.load_weights(weights=[module_weights])
                     else:
-                        for n, p in module._parameters.items():
-                            if p is not None:
-                                p.data.copy_(module_weights[n][:])
+                        for n, p in module.named_parameters(recurse=False):
+                            p.data.copy_(module_weights[n][:])
 
     if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
                       "True") in ["True", "true", "1", "yes", "y"]:
@@ -909,6 +910,7 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                                  desc="Loading weights"):
             load_single_module(name, module)
     else:
+        # remove_duplicate=False ensures original modules sharing weights with next_layer_layernorm are not skipped
         all_modules = dict(model.named_modules(remove_duplicate=False))
         serial_load_modules = []
         if preload_weight_modules is not None:
@@ -959,10 +961,12 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
             if weight_mapper.does_require_special_handling(module_name):
                 module_weights = weight_mapper.apply_callbacks(
                     module, module_name, module_names_breakdown, weights)
+                # Note: module_weights may be empty after filtering (e.g., in streaming weight updates)
                 if module_weights:
                     module.load_weights(weights=module_weights)
             else:
                 module_weights = weight_mapper.filter_weights(name, weights)
+                # Note: module_weights may be empty after filtering (e.g., in streaming weight updates)
                 if module_weights:
                     if weight_mapper.is_special_instance_module(module):
                         weight_mapper.handle_special_instance_module(
@@ -974,10 +978,9 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                                     'weight'].squeeze(dim=1)
                             module.load_weights(weights=[module_weights])
                     else:
-                        for n, p in module._parameters.items():
-                            if p is not None:
-                                weight_mapper.handle_manual_copy(
-                                    module_name, module_weights, n, p)
+                        for n, p in module.named_parameters(recurse=False):
+                            weight_mapper.handle_manual_copy(
+                                module_name, module_weights, n, p)
 
     if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
                       "True") in ["True", "true", "1", "yes", "y"]:
@@ -986,6 +989,7 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                                  desc="Loading weights"):
             load_single_module(name, module)
     else:
+        # remove_duplicate=False ensures original modules sharing weights with next_layer_layernorm are not skipped
         all_modules = dict(model.named_modules(remove_duplicate=False))
         serial_load_modules = []
         if preload_weight_modules is not None:
