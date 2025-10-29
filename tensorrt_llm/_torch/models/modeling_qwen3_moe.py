@@ -58,7 +58,7 @@ class Qwen3Gate(nn.Module):
             hidden_states, self.weight.t(), bias=None, out_dtype=self.out_dtype)
         return logits
 
-    def load_weights(self, weights: List[Dict]):
+    def load_weights(self, weights: List[Dict], **kwargs):
         assert len(weights) == 1
 
         self.weight.copy_(weights[0]["weight"][:])
