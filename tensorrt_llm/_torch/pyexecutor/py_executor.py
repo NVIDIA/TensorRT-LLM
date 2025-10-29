@@ -2355,6 +2355,17 @@ class PyExecutor:
             else:
                 self.has_previous_draft_tokens = False
                 target_inputs, draft_outputs, draft_batch = None, None, None
+                # We are not running the draft model. Remove the draft tokens and turn off spec
+                # decode so that the requests get handled correctly.
+                # One corner case: when we have at least one context request, we have to keep spec
+                # dec on. This ensures that we capture hidden states for requests that haven't done
+                # prefill yet.
+                self.use_spec_decode = False
+                self.model_engine.enable_spec_decode = len(
+                    scheduled_batch.context_requests) > 0
+                if not self.model_engine.enable_spec_decode:
+                    for request in scheduled_batch.all_requests():
+                        request.py_draft_tokens = []
 
         return target_inputs, draft_outputs, draft_batch
 

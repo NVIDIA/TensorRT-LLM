@@ -3463,7 +3463,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                   moe_config=MoeConfig(backend=moe_backend))
 
         with llm:
-            model_name = "GPT-OSS/MXFP4"
+            model_name = "GPT-OSS/20B-MXFP4"
             task = GSM8K(model_name)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
@@ -3474,11 +3474,10 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             load_format="dummy",
         )
         with llm:
-            model_name = "GPT-OSS/MXFP4"
+            model_name = "GPT-OSS/20B-MXFP4"
             task = GSM8K(model_name)
             task.evaluate(llm, is_integration_test=True)
 
-    @pytest.mark.skip(reason="https://nvbugs/5596343")
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize(
         "kv_cache_dtype",
@@ -3498,6 +3497,10 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     def test_w4_4gpus(self, kv_cache_dtype, moe_backend, tp_size, pp_size,
                       ep_size, attention_dp, cuda_graph, overlap_scheduler,
                       mocker):
+        if get_sm_version() < 100:
+            pytest.skip(
+                "https://nvbugs/5596343: Skip Hopper due to accuracy issue.")
+
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})
@@ -3522,7 +3525,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                   moe_config=MoeConfig(backend=moe_backend))
 
         with llm:
-            model_name = "GPT-OSS/MXFP4"
+            model_name = "GPT-OSS/120B-MXFP4"
             task = GSM8K(model_name)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
@@ -3649,7 +3652,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                   moe_config=MoeConfig(backend=moe_backend))
 
         with llm:
-            model_name = "GPT-OSS/MXFP4"
+            model_name = "GPT-OSS/20B-MXFP4"
             task = GSM8K(model_name)
             mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
             mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
@@ -3676,7 +3679,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         dtype=kv_cache_dtype)
 
-        model_name = "GPT-OSS/MXFP4"
+        model_name = "GPT-OSS/120B-MXFP4"
         with LLM(self.MODEL_PATH,
                  tensor_parallel_size=4,
                  pipeline_parallel_size=1,

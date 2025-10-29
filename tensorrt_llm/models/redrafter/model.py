@@ -18,8 +18,8 @@ from collections import OrderedDict
 import tensorrt as trt
 
 from tensorrt_llm._common import default_net
-from tensorrt_llm.bindings import KVCacheType
 from tensorrt_llm.functional import Tensor, cast, categorical_sample
+from tensorrt_llm.llmapi.kv_cache_type import KVCacheType
 from tensorrt_llm.models import LLaMAForCausalLM, QWenForCausalLM
 from tensorrt_llm.models.generation_mixin import GenerationMixin
 

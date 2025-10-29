@@ -202,7 +202,7 @@ def test_llm_build_config():
         # read the build_config and check if the parameters are correctly saved
         engine_config = json.load(f)
 
-        build_config1 = BuildConfig.from_dict(engine_config["build_config"])
+        build_config1 = BuildConfig(**engine_config["build_config"])
 
         # Know issue: this will be converted to None after save engine for single-gpu
         build_config1.plugin_config.nccl_plugin = 'float16'
