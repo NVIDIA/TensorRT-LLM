@@ -1082,6 +1082,10 @@ class PyExecutor:
         scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
         )
 
+        if self.drafter is not None and not self.use_spec_decode:
+            for request in scheduled_batch.all_requests():
+                request.py_disable_speculative_decoding = True
+
         if self.kv_cache_transceiver:
             # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
             self._prepare_disagg_gen_init(fitting_disagg_gen_init_requests)
@@ -1257,7 +1261,7 @@ class PyExecutor:
                 req.py_last_draft_tokens = req.py_draft_tokens
                 max_total_draft_tokens = self.model_engine.spec_config.max_total_draft_tokens
 
-                if max_total_draft_tokens > 0 and self.use_spec_decode:
+                if max_total_draft_tokens > 0 and self.use_spec_decode and not req.py_disable_speculative_decoding:
                     req.py_draft_tokens = [0] * max_total_draft_tokens
                     req.py_draft_pages_allocated = max_total_draft_tokens
                 else:
@@ -2345,6 +2349,17 @@ class PyExecutor:
             else:
                 self.has_previous_draft_tokens = False
                 target_inputs, draft_outputs, draft_batch = None, None, None
+                # We are not running the draft model. Remove the draft tokens and turn off spec
+                # decode so that the requests get handled correctly.
+                # One corner case: when we have at least one context request, we have to keep spec
+                # dec on. This ensures that we capture hidden states for requests that haven't done
+                # prefill yet.
+                self.use_spec_decode = False
+                self.model_engine.enable_spec_decode = len(
+                    scheduled_batch.context_requests) > 0
+                if not self.model_engine.enable_spec_decode:
+                    for request in scheduled_batch.all_requests():
+                        request.py_draft_tokens = []
 
         return target_inputs, draft_outputs, draft_batch
 
