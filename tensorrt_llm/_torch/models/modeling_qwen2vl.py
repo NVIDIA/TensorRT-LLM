@@ -21,6 +21,8 @@ from tensorrt_llm._torch.attention_backend.interface import \
     PredefinedAttentionMask
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
+from tensorrt_llm._torch.models.checkpoints.hf.qwen2vl_weight_mapper import \
+    Qwen2VLHfWeightMapper
 from tensorrt_llm._torch.modules.attention import Attention
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
@@ -1129,7 +1131,10 @@ class Qwen2_5_VLModel(Qwen2VLModelBase):
         ]
 
     def load_weights(self, weights, weight_mapper: BaseWeightMapper):
+        if isinstance(weight_mapper, Qwen2VLHfWeightMapper):
+            weights = weight_mapper.preprocess_weights(weights)
+
         if not DISAGG:
             self.mm_encoder.load_weights(weights)
 
-        self.llm.load_weights(weights, weight_mapper)
+        self.llm.load_weights(weights)
