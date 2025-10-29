@@ -841,7 +841,6 @@ class Qwen2VLModelBase(PreTrainedModel):
         model_config.pretrained_config.rope_scaling['type'] = 'mrope'
         config = model_config.pretrained_config
 
-        assert model_config.attn_backend == 'TRTLLM', "Qwen2/2.5-VL only supports TRTLLM backend now"
         self._supports_sdpa = True
         super().__init__(config)
 
