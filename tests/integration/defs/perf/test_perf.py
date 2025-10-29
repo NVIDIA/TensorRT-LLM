@@ -1656,6 +1656,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             with open(pytorch_config_path, 'w') as f:
                 yaml.dump(config, f, default_flow_style=False)
             benchmark_cmd += [f"--extra_llm_api_options={pytorch_config_path}"]
+            # If guided_decoding_backend is set, we need to initialize tokenizer
+            if config.get('guided_decoding_backend') is not None:
+                benchmark_cmd += ["--no_skip_tokenizer_init"]
         elif self._config.backend == "_autodeploy":
             import yaml
             autodeploy_config_path = os.path.join(engine_dir,

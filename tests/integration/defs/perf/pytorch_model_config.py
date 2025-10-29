@@ -46,12 +46,7 @@ def get_model_yaml_config(model_label: str,
         }
     else:
         # TRT backend config
-        base_config = {
-            'extended_runtime_perf_knob_config': {
-                'cuda_graph_cache_size': 1.0,
-                'cuda_graph_mode': True,
-            },        
-        }
+        base_config = {}
     
     if 'kv_cache_dtype' in model_label:
         base_config.update({
@@ -257,6 +252,10 @@ def get_model_yaml_config(model_label: str,
         {
             'patterns': ["llama_v3.3_70b_instruct_fp8-bench-float8-maxbs:512-maxnt:2048-input_output_len:500,2000-reqs:400-con:200-gpus:8"],
             'config': {
+                'extended_runtime_perf_knob_config': {
+                    'cuda_graph_cache_size': 1.0,
+                    'cuda_graph_mode': True,
+                },
                 'guided_decoding_backend': 'xgrammar'
             }
         }
@@ -269,7 +268,8 @@ def get_model_yaml_config(model_label: str,
             patterns = [patterns]
         for pattern in patterns:
             if pattern in model_label.lower():
-                recursive_update(base_config, pattern_config['config'])
+                if pattern_config.get('config'):
+                    recursive_update(base_config, pattern_config['config'])
                 break  # Stop checking other patterns for this config once we find a match
 
     # lora-specific change for pytorch

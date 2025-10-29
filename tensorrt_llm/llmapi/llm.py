@@ -752,7 +752,6 @@ class BaseLLM:
 
     def _try_load_generation_config(
             self) -> Optional[transformers.GenerationConfig]:
-        logger.info(f"yufei: {self.args.model}")
         return ModelLoader.load_hf_generation_config(self.args.model)
 
     def _try_load_hf_model_config(
@@ -1050,7 +1049,6 @@ class _TorchLLM(BaseLLM):
         self._tokenizer = self._try_load_tokenizer()
         self._hf_model_config = self._try_load_hf_model_config()
         self._generation_config = self._try_load_generation_config()
-        logger.info(f"yufei2: {self._generation_config}")
 
         # Multimodal special handling:
         # 1. Default load_tokenizer may fail because MM has different tokenizer configuration. Hence we initialize it inside input processor
