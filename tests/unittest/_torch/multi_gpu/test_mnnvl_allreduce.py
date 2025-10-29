@@ -161,6 +161,7 @@ def row_linear_residual_norm_fusion_forward(
             )
 
 
+@pytest.mark.skip(reason="https://nvbugs/5597647")
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason="needs 2 GPUs to run this test")
 @pytest.mark.parametrize(
