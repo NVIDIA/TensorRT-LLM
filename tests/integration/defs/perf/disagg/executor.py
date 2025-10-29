@@ -168,8 +168,8 @@ class JobManager:
             
             # Call submit.py with the config file
             submit_script = os.path.join(
-                EnvManager.get_work_dir(),
-                "disagg/slurm/benchmark/submit.py"
+                EnvManager.get_script_dir(),
+                "submit.py"
             )
             
             cmd = ["python3", submit_script, "-c", test_config.config_path]

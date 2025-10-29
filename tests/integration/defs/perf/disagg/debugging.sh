@@ -6,7 +6,7 @@ source ./perf/disagg/envs/.env_oci
 poetry run pytest --disagg --collect-only -q &> testlist_h100.txt
 
 # run with test list file
-poetry run pytest test_disagg.py -s -vv --test-list=./testlist/testlist_gb200_debug.txt
+poetry run pytest --disagg test_disagg.py -s -vv --test-list=./testlist/testlist_gb200_debug.txt
 
 # Remove the .cache directory when it's too big
 # This one will lead the poetry install command to fail
