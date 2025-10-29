@@ -2379,7 +2379,7 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                  enable_attention_dp=attention_dp,
                  speculative_config=mtp_config) as llm:
 
-            # GPQA Diamond takes too long to run
+            # GPQA Diamond takes too long to run, we enable it only for fp8kv.
             if fp8kv:
                 task = GPQADiamond(self.MODEL_NAME)
                 task.evaluate(llm,
@@ -2398,8 +2398,9 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
         [
             (8, 1, 8, 0, False, True, True, True, 24, "TRTLLM"),
             (8, 1, 8, 1, False, True, True, True, 24, "TRTLLM"),
+            (8, 1, 8, 0, True, True, True, True, 24, "TRTLLM"),
         ],
-        ids=["baseline", "baseline_mtp1"])
+        ids=["baseline", "baseline_mtp1", "baseline_fp8kv"])
     def test_nvfp4_multi_gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                               attention_dp, cuda_graph, overlap_scheduler,
                               max_batch_size, moe_backend):
@@ -2435,12 +2436,18 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                  enable_attention_dp=attention_dp,
                  speculative_config=mtp_config) as llm:
 
-            # GPQA Diamond takes too long to run
-            task = GPQADiamond(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=dict(
-                              apply_chat_template=True,
-                              chat_template_kwargs=dict(thinking=True)))
+            # GPQA Diamond takes too long to run, we enable it only for fp8kv.
+            if fp8kv:
+                task = GPQADiamond(self.MODEL_NAME)
+                task.evaluate(llm,
+                              extra_evaluator_kwargs=dict(
+                                  apply_chat_template=True,
+                                  chat_template_kwargs=dict(thinking=True)))
+            else:
+                task = MMLU(self.MODEL_NAME)
+                task.evaluate(llm)
+                task = GSM8K(self.MODEL_NAME)
+                task.evaluate(llm)
 
 
 @pytest.mark.timeout(7200)
