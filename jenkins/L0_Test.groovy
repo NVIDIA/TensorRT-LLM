@@ -1368,7 +1368,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     path: /vol/scratch1/scratch.michaeln_blossom
     """
     if (type.contains("6000d")) {
-        // rtxpro-6000D nodes are located in Austin, we use a flexcache to access scratch data
+        // rtx-pro-6000d nodes are located in Austin DC, we use the FlexCache to speed up the data access.
         llmModelVolume = """
                 - name: scratch-trt-llm-data
                   nfs:
