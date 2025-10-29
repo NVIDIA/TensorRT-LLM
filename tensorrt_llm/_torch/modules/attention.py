@@ -23,7 +23,7 @@ from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
-                     is_torch_compiling)
+                     is_piecewise_running, is_torch_compiling)
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from .multi_stream_utils import maybe_execute_in_parallel
 from .rms_norm import RMSNorm
@@ -76,13 +76,24 @@ def extract_extra_attrs(layer_idx: str, attn_type: str):
     return metadata, attn_layer
 
 
-@torch.compile
-def compiled_copy_(dst, src):
+def maybe_compile(func):
+
+    def wrapper(*args, **kwargs):
+        if is_piecewise_running():
+            # When piecewise running, we don't need to compile the function to avoid host overhead in attention op.
+            return func(*args, **kwargs)
+        return torch.compile(func)(*args, **kwargs)
+
+    return wrapper
+
+
+@maybe_compile
+def maybe_compiled_copy_(dst, src):
     dst.copy_(src)
 
 
-@torch.compile
-def compiled_cat(tensors, dim):
+@maybe_compile
+def maybe_compiled_cat(tensors, dim):
     return torch.cat(tensors, dim)
 
 
@@ -1222,8 +1233,9 @@ class MLA(nn.Module):
         )
 
         k = torch.empty_like(q).view(-1, self.num_heads, self.qk_head_dim)
-        compiled_copy_(k[..., :self.qk_nope_head_dim],
-                       k_nope.view(-1, self.num_heads, self.qk_nope_head_dim))
+        maybe_compiled_copy_(
+            k[..., :self.qk_nope_head_dim],
+            k_nope.view(-1, self.num_heads, self.qk_nope_head_dim))
         if self.apply_rotary_emb:
             k[..., self.qk_nope_head_dim:] = k_pe.view(-1, 1,
                                                        self.qk_rope_head_dim)
@@ -1317,7 +1329,7 @@ class MLA(nn.Module):
         full_k_nope = full_k_nope.view(-1, self.num_heads,
                                        self.qk_nope_head_dim)
         full_k_pe = full_k_pe.view(-1, 1, self.qk_rope_head_dim)
-        full_k = compiled_cat(
+        full_k = maybe_compiled_cat(
             (full_k_nope, full_k_pe.expand(-1, self.num_heads, -1)), dim=-1)
         full_k = full_k.view(-1, self.num_heads * self.qk_head_dim)
 
@@ -1412,7 +1424,7 @@ class MLA(nn.Module):
             chunked_k_nope = chunked_k_nope.view(-1, self.num_heads,
                                                  self.qk_nope_head_dim)
             chunked_k_pe = chunked_k_pe.view(-1, 1, self.qk_rope_head_dim)
-            chunked_k = compiled_cat(
+            chunked_k = maybe_compiled_cat(
                 (chunked_k_nope, chunked_k_pe.expand(-1, self.num_heads, -1)),
                 dim=-1)
             chunked_k = chunked_k.view(-1, self.num_heads * self.qk_head_dim)
@@ -1470,7 +1482,8 @@ class MLA(nn.Module):
 
         k_nope = k_nope.view(-1, self.num_heads, self.qk_nope_head_dim)
         k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
-        k = compiled_cat((k_nope, k_pe.expand(-1, self.num_heads, -1)), dim=-1)
+        k = maybe_compiled_cat((k_nope, k_pe.expand(-1, self.num_heads, -1)),
+                               dim=-1)
         k = k.view(-1, self.num_heads * self.qk_head_dim)
 
         # copy q_lens to replace kv_lens_runtime
