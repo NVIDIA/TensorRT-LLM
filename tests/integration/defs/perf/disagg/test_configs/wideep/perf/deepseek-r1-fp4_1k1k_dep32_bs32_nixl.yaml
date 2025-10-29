@@ -22,7 +22,7 @@ slurm:
 # Benchmark Mode
 benchmark:
   mode: "e2e"
-  use_nv_sa_benchmark: false
+  use_nv_sa_benchmark: true
   multi_round: 8
   benchmark_ratio: 0.8
   streaming: true
