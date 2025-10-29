@@ -25,9 +25,8 @@ from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import \
     CuteDslFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_deepgemm import \
     DeepGemmFusedMoE
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_wide_ep import \
-    AlltoallMethodType
-from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
+from tensorrt_llm._torch.modules.fused_moe.interface import (
+    AlltoallMethodType, MoEWeightLoadingMode)
 
 # isort and yapf will fight against each other here, so we disable isort
 # isort: off
@@ -214,11 +213,14 @@ def test_fused_moe_alltoall(alltoall_method_type):
         weights = {}
         for expert_id in range(NUM_EXPERTS):
             w1_weight = torch.empty((INTERMEDIATE_SIZE, HIDDEN_SIZE),
-                                    dtype=dtype)
+                                    dtype=dtype,
+                                    device="cuda")
             w2_weight = torch.empty((HIDDEN_SIZE, INTERMEDIATE_SIZE),
-                                    dtype=dtype)
+                                    dtype=dtype,
+                                    device="cuda")
             w3_weight = torch.empty((INTERMEDIATE_SIZE, HIDDEN_SIZE),
-                                    dtype=dtype)
+                                    dtype=dtype,
+                                    device="cuda")
             torch.nn.init.xavier_uniform_(w1_weight)
             torch.nn.init.xavier_uniform_(w2_weight)
             torch.nn.init.xavier_uniform_(w3_weight)
@@ -294,7 +296,6 @@ def test_fused_moe_alltoall(alltoall_method_type):
             assert r is None
 
 
-@pytest.mark.skip(reason="https://nvbugs/5467531")
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
 @pytest.mark.parametrize("alltoall_method_type", [
@@ -303,6 +304,9 @@ def test_fused_moe_alltoall(alltoall_method_type):
 ],
                          ids=lambda s: s.name)
 def test_fused_moe_alltoall_fp4(alltoall_method_type):
+
+    if alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
+        pytest.skip("Skipped due to https://nvbugs/5467531")
 
     world_size = 4
     dtype = torch.bfloat16

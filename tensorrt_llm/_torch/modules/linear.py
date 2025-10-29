@@ -14,8 +14,10 @@ from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
+from tensorrt_llm._utils import is_device_integrated
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy)
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
@@ -67,6 +69,15 @@ def load_weight_shard(
         tensor_parallel_mode: Optional[TensorParallelMode] = None,
         device: torch.device = torch.device('cpu'),
 ) -> torch.Tensor:
+    # Skip device transfers on integrated GPUs to conserve shared memory
+    if weight.device.type != device.type and is_device_integrated():
+        # For integrated GPU systems (e.g., DGX Spark), CPU and GPU share limited physical memory.
+        # Avoiding device transfers reduces memory consumption and unnecessary data copies,
+        # enabling support for larger models on memory-constrained systems.
+        logger.warning(
+            f"[load_weight_shard] Skipping device transfer from {weight.device} to {device} on integrated GPU to conserve shared memory."
+        )
+        device = weight.device
     if isinstance(weight, torch.Tensor):
         tensor_shape = weight.shape
 
@@ -800,9 +811,23 @@ class NVFP4LinearMethod(LinearMethodBase):
                 act_fp4, module.weight, act_sf, module.weight_scale,
                 module.alpha, module.dtype)
         else:
-            output = torch.ops.trtllm.nvfp4_gemm(act_fp4, module.weight, act_sf,
-                                                 module.weight_scale,
-                                                 module.alpha, module.dtype)
+            if module.enable_cuda_core and act_fp4.shape[0] <= 8:
+                act_sf_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
+                    act_sf.view((act_fp4.shape[0] + 128 - 1) // 128 * 128, -1))
+                output = torch.ops.trtllm.cuda_core_nvfp4_gemm(
+                    act_fp4,
+                    module.weight,
+                    scale_a=act_sf_unswizzled,
+                    scale_b=module.weight_scale,
+                    alpha=module.alpha,
+                    bias=None,
+                    out_dtype=module.dtype or input.dtype,
+                )
+            else:
+                output = torch.ops.trtllm.nvfp4_gemm(act_fp4, module.weight,
+                                                     act_sf,
+                                                     module.weight_scale,
+                                                     module.alpha, module.dtype)
 
         if bias is not None:
             output = output + bias
@@ -1883,8 +1908,9 @@ class Linear(nn.Module):
         if torch.cuda.is_available():
             capability = torch.cuda.get_device_capability(
                 torch.device('cuda:0'))
-            # enable cuda core for sm89
-            self.enable_cuda_core = capability[0] == 8 and capability[1] == 9
+            # enable cuda core for sm89 and sm120
+            self.enable_cuda_core = (capability[0] == 8 and capability[1] == 9) \
+                or (capability[0] == 12 and capability[1] == 0)
 
         if not skip_create_weights_in_init:
             self.create_weights()

@@ -853,10 +853,12 @@ def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
         lines = f.readlines()
         assert len(lines) > 1
         assert lines[0].startswith(
-            "RequestID,Delay(ms),Duration(ms),Bandwidth(Gbps)")
+            "RequestID,RequestInfo,Preparation,Preprocess,Transmissions,Postprocess"
+        )
+        assert ",Delay,Duration,Bandwidth(Gbps)" in lines[0]
         # get a send sample and match the recv
         sample = lines[1].split(',')
-        assert len(sample) >= 4
+        assert len(sample) >= 9
     with open(recv_file, "r") as f:
         lines = f.readlines()
         assert len(lines) > 1

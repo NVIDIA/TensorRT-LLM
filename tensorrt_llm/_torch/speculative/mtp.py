@@ -1311,6 +1311,9 @@ class MTPEagleWorker(MTPWorker):
                     ])
                     attn_metadata.block_ids_per_seq[:batch_size, :].copy_(
                         reorder_block_ids_per_seq, non_blocking=True)
+                # update metadata
+                # some attention metadata needs to be updated when changing seq_lens/kv_lens
+                attn_metadata.update_for_spec_dec()
             elif hasattr(attn_metadata, 'kv_lens_cuda'):
 
                 @torch.compile(options={"max-autotune": True})
@@ -1318,6 +1321,9 @@ class MTPEagleWorker(MTPWorker):
                     kv_lens_cuda[:batch_size] += 1
 
                 update_kv_lens(attn_metadata.kv_lens_cuda, batch_size)
+                # update metadata
+                # some attention metadata needs to be updated when changing kv_lens
+                attn_metadata.update_for_spec_dec()
             inputs = {
                 "input_ids": new_draft_token,
                 "position_ids": position_ids,

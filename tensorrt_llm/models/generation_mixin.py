@@ -18,9 +18,9 @@ from typing import List, Optional
 
 import tensorrt as trt
 
-from ..bindings import KVCacheType
 from ..functional import Tensor
 from ..layers import MropeParams, SpecDecodingParams
+from ..llmapi.kv_cache_type import KVCacheType
 from ..mapping import Mapping
 from ..plugin import current_all_reduce_helper
 

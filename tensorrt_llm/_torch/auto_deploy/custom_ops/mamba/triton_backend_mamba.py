@@ -80,12 +80,11 @@ def _triton_cached_ssm(
     if num_prefill > 0:
         seq_len_prefill = seq_len[:num_prefill].to(torch.int32)
         total_prefill_tokens = int(seq_len_prefill.sum().item())
-        prefill_idx = torch.arange(total_prefill_tokens, device=device, dtype=torch.long)
 
-        hs_prefill = hs_flat.index_select(0, prefill_idx).unsqueeze(0)  # [1, S_p, H, D]
-        B_prefill = B_flat.index_select(0, prefill_idx).unsqueeze(0)  # [1, S_p, G, N]
-        C_prefill = C_flat.index_select(0, prefill_idx).unsqueeze(0)  # [1, S_p, G, N]
-        dt_prefill = dt_flat.index_select(0, prefill_idx).unsqueeze(0)  # [1, S_p, H]
+        hs_prefill = hs_flat[:total_prefill_tokens].unsqueeze(0)  # [1, S_p, H, D]
+        B_prefill = B_flat[:total_prefill_tokens].unsqueeze(0)  # [1, S_p, G, N]
+        C_prefill = C_flat[:total_prefill_tokens].unsqueeze(0)  # [1, S_p, G, N]
+        dt_prefill = dt_flat[:total_prefill_tokens].unsqueeze(0)  # [1, S_p, H]
 
         cu_seqlens = torch.cat(
             [
@@ -128,20 +127,20 @@ def _triton_cached_ssm(
             return_varlen_states=True,
         )
 
-        y_flat.index_copy_(0, prefill_idx, y_prefill[0].to(y_flat.dtype))
+        y_flat[:total_prefill_tokens] = y_prefill[0].to(y_flat.dtype)
         ssm_state_cache.index_copy_(
             0, slot_idx[:num_prefill].to(torch.long), varlen_states.to(ssm_state_cache.dtype)
         )
 
     # Decode: batch single-token updates via selective_state_update
     if num_decode > 0:
-        decode_idx = seq_start[num_prefill:].to(torch.long)
+        total_prefill_tokens = 0 if num_prefill == 0 else int(seq_len[:num_prefill].sum().item())
         slot_idx_decode = slot_idx[num_prefill:].to(torch.long)
 
-        x_decode = hs_flat.index_select(0, decode_idx)  # [nd, H, D]
-        B_decode = B_flat.index_select(0, decode_idx)  # [nd, G, N]
-        C_decode = C_flat.index_select(0, decode_idx)  # [nd, G, N]
-        dt_decode = dt_flat.index_select(0, decode_idx)  # [nd, H]
+        x_decode = hs_flat[total_prefill_tokens : total_prefill_tokens + num_decode]  # [nd, H, D]
+        B_decode = B_flat[total_prefill_tokens : total_prefill_tokens + num_decode]  # [nd, G, N]
+        C_decode = C_flat[total_prefill_tokens : total_prefill_tokens + num_decode]  # [nd, G, N]
+        dt_decode = dt_flat[total_prefill_tokens : total_prefill_tokens + num_decode]  # [nd, H]
 
         dt_hp = dt_decode[:, :, None].expand(-1, num_heads, head_dim)
         dt_bias_hp = dt_bias[..., None].expand(num_heads, head_dim)
@@ -165,7 +164,7 @@ def _triton_cached_ssm(
             state_batch_indices=slot_idx_decode,
         )  # [nd, H, D]
 
-        y_flat.index_copy_(0, decode_idx, y_dec.to(y_flat.dtype))
+        y_flat[total_prefill_tokens : total_prefill_tokens + num_decode] = y_dec.to(y_flat.dtype)
 
     return y
 

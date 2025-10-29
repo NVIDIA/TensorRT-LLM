@@ -26,8 +26,8 @@ import torch
 
 from tensorrt_llm._utils import (local_mpi_rank, local_mpi_size, mpi_barrier,
                                  mpi_comm, mpi_rank, mpi_world_size)
-from tensorrt_llm.bindings import KVCacheType
 from tensorrt_llm.builder import BuildConfig, Engine, build
+from tensorrt_llm.llmapi.kv_cache_type import KVCacheType
 from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraManager
@@ -35,23 +35,6 @@ from tensorrt_llm.models import MODEL_MAP, PretrainedConfig
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 from tensorrt_llm.plugin import PluginConfig, add_plugin_argument
 from tensorrt_llm.quantization.mode import QuantAlgo
-
-
-def enum_type(enum_class):
-
-    def parse_enum(value):
-        if isinstance(value, enum_class):
-            return value
-
-        if isinstance(value, str):
-            return enum_class.from_string(value)
-
-        valid_values = [e.name for e in enum_class]
-        raise argparse.ArgumentTypeError(
-            f"Invalid value '{value}' of type {type(value).__name__}. Expected one of {valid_values}"
-        )
-
-    return parse_enum
 
 
 def parse_arguments():
@@ -92,29 +75,30 @@ def parse_arguments():
     parser.add_argument(
         '--max_batch_size',
         type=int,
-        default=BuildConfig.max_batch_size,
+        default=BuildConfig.model_fields["max_batch_size"].default,
         help="Maximum number of requests that the engine can schedule.")
-    parser.add_argument('--max_input_len',
-                        type=int,
-                        default=BuildConfig.max_input_len,
-                        help="Maximum input length of one request.")
+    parser.add_argument(
+        '--max_input_len',
+        type=int,
+        default=BuildConfig.model_fields["max_input_len"].default,
+        help="Maximum input length of one request.")
     parser.add_argument(
         '--max_seq_len',
         '--max_decoder_seq_len',
         dest='max_seq_len',
         type=int,
-        default=BuildConfig.max_seq_len,
+        default=BuildConfig.model_fields["max_seq_len"].default,
         help="Maximum total length of one request, including prompt and outputs. "
         "If unspecified, the value is deduced from the model config.")
     parser.add_argument(
         '--max_beam_width',
         type=int,
-        default=BuildConfig.max_beam_width,
+        default=BuildConfig.model_fields["max_beam_width"].default,
         help="Maximum number of beams for beam search decoding.")
     parser.add_argument(
         '--max_num_tokens',
         type=int,
-        default=BuildConfig.max_num_tokens,
+        default=BuildConfig.model_fields["max_num_tokens"].default,
         help=
         "Maximum number of batched input tokens after padding is removed in each batch. "
         "Currently, the input padding is removed by default; "
@@ -123,7 +107,7 @@ def parse_arguments():
     parser.add_argument(
         '--opt_num_tokens',
         type=int,
-        default=BuildConfig.opt_num_tokens,
+        default=BuildConfig.model_fields["opt_num_tokens"].default,
         help=
         "Optimal number of batched input tokens after padding is removed in each batch "
         "It equals to ``max_batch_size * max_beam_width`` by default, set this "
@@ -132,7 +116,7 @@ def parse_arguments():
     parser.add_argument(
         '--max_encoder_input_len',
         type=int,
-        default=BuildConfig.max_encoder_input_len,
+        default=BuildConfig.model_fields["max_encoder_input_len"].default,
         help="Maximum encoder input length for enc-dec models. "
         "Set ``max_input_len`` to 1 to start generation from decoder_start_token_id of length 1."
     )
@@ -140,14 +124,15 @@ def parse_arguments():
         '--max_prompt_embedding_table_size',
         '--max_multimodal_len',
         type=int,
-        default=BuildConfig.max_prompt_embedding_table_size,
+        default=BuildConfig.model_fields["max_prompt_embedding_table_size"].
+        default,
         help=
         "Maximum prompt embedding table size for prompt tuning, or maximum multimodal input size for multimodal models. "
         "Setting a value > 0 enables prompt tuning or multimodal input.")
     parser.add_argument(
         '--kv_cache_type',
         default=argparse.SUPPRESS,
-        type=enum_type(KVCacheType),
+        type=KVCacheType,
         help=
         "Set KV cache type (continuous, paged, or disabled). For disabled case, KV cache is disabled and only context phase is allowed."
     )
@@ -156,42 +141,44 @@ def parse_arguments():
         type=str,
         default=argparse.SUPPRESS,
         help=
-        "Deprecated. Enabling this option is equvilient to ``--kv_cache_type paged`` for transformer based models."
+        "Deprecated. Enabling this option is equivalent to ``--kv_cache_type paged`` for transformer based models."
     )
 
     parser.add_argument(
         '--input_timing_cache',
         type=str,
-        default=BuildConfig.input_timing_cache,
+        default=BuildConfig.model_fields["input_timing_cache"].default,
         help=
         "The file path to read the timing cache. This option is ignored if the file does not exist."
     )
-    parser.add_argument('--output_timing_cache',
-                        type=str,
-                        default=BuildConfig.output_timing_cache,
-                        help="The file path to write the timing cache.")
+    parser.add_argument(
+        '--output_timing_cache',
+        type=str,
+        default=BuildConfig.model_fields["output_timing_cache"].default,
+        help="The file path to write the timing cache.")
     parser.add_argument(
         '--profiling_verbosity',
         type=str,
-        default=BuildConfig.profiling_verbosity,
+        default=BuildConfig.model_fields["profiling_verbosity"].default,
         choices=['layer_names_only', 'detailed', 'none'],
         help=
         "The profiling verbosity for the generated TensorRT engine. Setting to detailed allows inspecting tactic choices and kernel parameters."
     )
     parser.add_argument(
         '--strip_plan',
-        default=BuildConfig.use_strip_plan,
+        default=BuildConfig.model_fields["use_strip_plan"].default,
         action='store_true',
         help=
         "Enable stripping weights from the final TensorRT engine under the assumption that the refit weights are identical to those provided at build time."
     )
-    parser.add_argument('--weight_sparsity',
-                        default=BuildConfig.weight_sparsity,
-                        action='store_true',
-                        help="Enable weight sparsity.")
+    parser.add_argument(
+        '--weight_sparsity',
+        default=BuildConfig.model_fields["weight_sparsity"].default,
+        action='store_true',
+        help="Enable weight sparsity.")
     parser.add_argument(
         '--weight_streaming',
-        default=BuildConfig.weight_streaming,
+        default=BuildConfig.model_fields["weight_streaming"].default,
         action='store_true',
         help=
         "Enable offloading weights to CPU and streaming loading at runtime.",
@@ -213,10 +200,11 @@ def parse_arguments():
                         default='info',
                         choices=severity_map.keys(),
                         help="The logging level.")
-    parser.add_argument('--enable_debug_output',
-                        default=BuildConfig.enable_debug_output,
-                        action='store_true',
-                        help="Enable debug output.")
+    parser.add_argument(
+        '--enable_debug_output',
+        default=BuildConfig.model_fields["enable_debug_output"].default,
+        action='store_true',
+        help="Enable debug output.")
     parser.add_argument(
         '--visualize_network',
         type=str,
@@ -226,7 +214,7 @@ def parse_arguments():
     )
     parser.add_argument(
         '--dry_run',
-        default=BuildConfig.dry_run,
+        default=BuildConfig.model_fields["dry_run"].default,
         action='store_true',
         help=
         "Run through the build process except the actual Engine build for debugging."
@@ -519,65 +507,37 @@ def main():
                 f"Overriding # of builder profiles <= {force_num_profiles_from_env}."
             )
 
-        build_config = BuildConfig.from_dict(
-            {
-                'max_input_len':
-                args.max_input_len,
-                'max_seq_len':
-                args.max_seq_len,
-                'max_batch_size':
-                args.max_batch_size,
-                'max_beam_width':
-                args.max_beam_width,
-                'max_num_tokens':
-                args.max_num_tokens,
-                'opt_num_tokens':
-                args.opt_num_tokens,
-                'max_prompt_embedding_table_size':
-                args.max_prompt_embedding_table_size,
-                'gather_context_logits':
-                args.gather_context_logits,
-                'gather_generation_logits':
-                args.gather_generation_logits,
-                'strongly_typed':
-                True,
-                'force_num_profiles':
-                force_num_profiles_from_env,
-                'weight_sparsity':
-                args.weight_sparsity,
-                'profiling_verbosity':
-                args.profiling_verbosity,
-                'enable_debug_output':
-                args.enable_debug_output,
-                'max_draft_len':
-                args.max_draft_len,
-                'speculative_decoding_mode':
-                speculative_decoding_mode,
-                'input_timing_cache':
-                args.input_timing_cache,
-                'output_timing_cache':
-                args.output_timing_cache,
-                'dry_run':
-                args.dry_run,
-                'visualize_network':
-                args.visualize_network,
-                'max_encoder_input_len':
-                args.max_encoder_input_len,
-                'weight_streaming':
-                args.weight_streaming,
-                'monitor_memory':
-                args.monitor_memory,
-                'use_mrope':
-                (True if model_config.qwen_type == "qwen2_vl" else False)
-                if hasattr(model_config, "qwen_type") else False
-            },
+        build_config = BuildConfig(
+            max_input_len=args.max_input_len,
+            max_seq_len=args.max_seq_len,
+            max_batch_size=args.max_batch_size,
+            max_beam_width=args.max_beam_width,
+            max_num_tokens=args.max_num_tokens,
+            opt_num_tokens=args.opt_num_tokens,
+            max_prompt_embedding_table_size=args.
+            max_prompt_embedding_table_size,
+            kv_cache_type=getattr(args, "kv_cache_type", None),
+            gather_context_logits=args.gather_context_logits,
+            gather_generation_logits=args.gather_generation_logits,
+            strongly_typed=True,
+            force_num_profiles=force_num_profiles_from_env,
+            weight_sparsity=args.weight_sparsity,
+            profiling_verbosity=args.profiling_verbosity,
+            enable_debug_output=args.enable_debug_output,
+            max_draft_len=args.max_draft_len,
+            speculative_decoding_mode=speculative_decoding_mode,
+            input_timing_cache=args.input_timing_cache,
+            output_timing_cache=args.output_timing_cache,
+            dry_run=args.dry_run,
+            visualize_network=args.visualize_network,
+            max_encoder_input_len=args.max_encoder_input_len,
+            weight_streaming=args.weight_streaming,
+            monitor_memory=args.monitor_memory,
+            use_mrope=getattr(model_config, "qwen_type", None) == "qwen2_vl",
             plugin_config=plugin_config)
-
-        if hasattr(args, 'kv_cache_type'):
-            build_config.update_from_dict({'kv_cache_type': args.kv_cache_type})
     else:
-        build_config = BuildConfig.from_json_file(args.build_config,
-                                                  plugin_config=plugin_config)
+        build_config = BuildConfig.from_json_file(args.build_config)
+        build_config.plugin_config = plugin_config
 
     parallel_build(model_config, ckpt_dir, build_config, args.output_dir,
                    workers, args.log_level, model_cls, **kwargs)
