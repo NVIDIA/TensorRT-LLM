@@ -671,7 +671,8 @@ class CliFlowAccuracyTestHarness:
                 f"--max_tokens_in_paged_kv_cache={max_tokens_in_paged_kv_cache}"
             ])
 
-        if task.MAX_INPUT_LEN + task.MAX_OUTPUT_LEN > BuildConfig.max_num_tokens:
+        if task.MAX_INPUT_LEN + task.MAX_OUTPUT_LEN > BuildConfig.model_fields[
+                "max_num_tokens"].default:
             summarize_cmd.append("--enable_chunked_context")
 
         if self.extra_summarize_args:

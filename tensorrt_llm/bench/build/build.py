@@ -21,8 +21,8 @@ TUNED_QUANTS = {
     QuantAlgo.NVFP4, QuantAlgo.FP8, QuantAlgo.FP8_BLOCK_SCALES,
     QuantAlgo.NO_QUANT, None
 }
-DEFAULT_MAX_BATCH_SIZE = BuildConfig.max_batch_size
-DEFAULT_MAX_NUM_TOKENS = BuildConfig.max_num_tokens
+DEFAULT_MAX_BATCH_SIZE = BuildConfig.model_fields["max_batch_size"].default
+DEFAULT_MAX_NUM_TOKENS = BuildConfig.model_fields["max_num_tokens"].default
 
 
 def get_benchmark_engine_settings(

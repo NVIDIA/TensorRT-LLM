@@ -25,9 +25,8 @@ from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import \
     CuteDslFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_deepgemm import \
     DeepGemmFusedMoE
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_wide_ep import \
-    AlltoallMethodType
-from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
+from tensorrt_llm._torch.modules.fused_moe.interface import (
+    AlltoallMethodType, MoEWeightLoadingMode)
 
 # isort and yapf will fight against each other here, so we disable isort
 # isort: off
