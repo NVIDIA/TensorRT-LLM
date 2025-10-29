@@ -645,9 +645,6 @@ class TorchSampler(Sampler):
         cum_log_probs: torch.Tensor | None = None
         """Shape: batch_size, beam_width
            Usage: Stores the current cumulative logprob of each active beam for faster sampling"""
-        log_probs: torch.Tensor | None = None
-        """Shape: batch_size, beam_width, sequence_length, num_logprobs
-           Usage: Stores the current logprob of each active beam for faster beam finalization"""
         finished_beams: torch.Tensor | None = None
         """Shape: batch_size, beam_width
            Usage: Stores the information for each beam whether or not it is finished"""
@@ -668,11 +665,6 @@ class TorchSampler(Sampler):
                 cum_log_probs=torch.zeros(
                     self.CACHE_INDIRECTION_SHAPE[:-1], device="cuda", dtype=torch.float32
                 ),
-                log_probs=torch.zeros(
-                    (*self.CACHE_INDIRECTION_SHAPE, self.MAX_LOGPROBS_STORAGE),
-                    device="cuda",
-                    dtype=torch.float32,
-                ),
                 finished_beams=torch.zeros(
                     self.CACHE_INDIRECTION_SHAPE[:-1], device="cuda", dtype=torch.int32
                 ),
@@ -690,7 +682,7 @@ class TorchSampler(Sampler):
         max_num_sequences: int
         max_beam_width: int
         max_total_draft_tokens: int
-        use_overlap_scheduler: bool
+        disable_overlap_scheduler: bool
         disable_flashinfer_sampling: bool = False
 
     def __init__(self, args: Args):
@@ -705,7 +697,7 @@ class TorchSampler(Sampler):
         self.CACHE_INDIRECTION_SHAPE = (
             self.max_num_sequences,
             self.max_beam_width,
-            self.max_seq_len + args.use_overlap_scheduler,
+            self.max_seq_len + (0 if args.disable_overlap_scheduler else 1),
         )
         # AutoDeploy build creates the sampler in inference mode,
         # which would disallow in-place mutating of new_tokens.
@@ -1106,12 +1098,11 @@ class TorchSampler(Sampler):
                 self.store.cache_indirection[request.py_seq_slot, :, : request.py_prompt_len].fill_(
                     0
                 )
-                self.store.cum_log_probs[request.py_seq_slot, :].fill_(0)
-                self.store.log_probs[request.py_seq_slot, :, :].fill_(0)
-                self.store.finished_beams[request.py_seq_slot, :].fill_(
+                self.store.cum_log_probs[request.py_seq_slot].fill_(0)
+                self.store.finished_beams[request.py_seq_slot].fill_(
                     FinishReason.NOT_FINISHED.value
                 )
-                self.store.original_tokens[request.py_seq_slot, :, :].fill_(0)
+                self.store.original_tokens[request.py_seq_slot].fill_(0)
 
     @torch.inference_mode()
     def _process_draft_tokens_rejection_sampling(
@@ -1240,77 +1231,161 @@ class TorchSampler(Sampler):
                 request, new_tokens_list=new_tokens_list, new_tokens_tensor=new_tokens_tensor
             )
 
-    def _update_beam_history(
+    @dataclass(kw_only=True)
+    class BeamHistory:
+        """
+        Beam history class for beam search.
+        This class is used to store the corrected tokens and logprobs for each beam.
+        It is used to update the beam history for each beam.
+        """
+
+        tokens: torch.Tensor
+        logprobs: torch.Tensor | None = None
+        logprobs_indices: torch.Tensor | None = None
+        cum_logprobs: torch.Tensor | None = None
+
+    def _get_logprobs_from_request(self, request: LlmRequest) -> tuple[torch.Tensor, torch.Tensor]:
+        """Extract the logprobs from the request"""
+        logprobs_list = request.py_result.log_probs
+        num_generated_tokens = request.get_num_tokens(0) - request.py_prompt_len
+        logprobs_tensor = torch.empty(
+            (
+                request.sampling_config.beam_width,
+                num_generated_tokens,
+                request.py_num_logprobs,
+            ),
+            device="cuda",
+            dtype=torch.float32,
+        )
+        logprobs_indices_tensor = torch.empty(
+            (
+                request.sampling_config.beam_width,
+                num_generated_tokens,
+                request.py_num_logprobs,
+            ),
+            device="cuda",
+            dtype=torch.int32,
+        )
+        for beam_idx, beam_logprobs in enumerate(logprobs_list):
+            for token_idx, token_logprobs in enumerate(beam_logprobs):
+                for key, value in token_logprobs.items():
+                    logprobs_tensor[beam_idx, token_idx, value.rank - 1] = value.logprob
+                    logprobs_indices_tensor[beam_idx, token_idx, value.rank - 1] = key
+        return logprobs_tensor, logprobs_indices_tensor
+
+    def _create_beam_history(
         self,
         request: LlmRequest,
-        is_finished: bool,
-    ) -> None:
-        """Correct the stored tokens for each beam
+    ) -> BeamHistory:
+        """Correct the stored tokens for each beam and return it as a BeamHistory object.
 
         Beam Search sampling only adds new tokens to the beam.
         However during beam search, a beam may change its previously sampled tokens.
         This function corrects the stored tokens for each beam to match the expected tokens.
         If logprobs are requested, the function also corrects the stored logprobs for each beam.
+        The function returns a BeamHistory object that contains the corrected tokens and logprobs for each beam.
 
         arguments:
-            request: The request to update the beam history for
+            request: The request to create the beam history for
         """
+        num_tokens = request.get_num_tokens(0)
+        prompt_length = request.py_prompt_len
+        num_generated_tokens = num_tokens - prompt_length
+        num_beams = request.sampling_config.beam_width
         cache_indirection = self.store.cache_indirection[
-            request.py_seq_slot, :, : request.get_num_tokens(0)
+            request.py_seq_slot, :num_beams, prompt_length:num_tokens
         ]
         current_path = self.store.original_tokens[
-            request.py_seq_slot, :, : request.get_num_tokens(0)
+            request.py_seq_slot, :num_beams, prompt_length:num_tokens
         ]
         new_path = torch.zeros_like(current_path)
         if request.py_return_log_probs:
-            current_logprobs = self.store.log_probs[
-                request.py_seq_slot, :, : request.get_num_tokens(0)
-            ]
+            current_logprobs, current_logprobs_indices = self._get_logprobs_from_request(request)
             new_logprobs = torch.zeros_like(current_logprobs)
-        prompt_length = request.py_prompt_len
-        num_beams = new_path.shape[0]
-        num_tokens = new_path.shape[1]
-
+            new_logprobs_indices = torch.zeros_like(current_logprobs_indices)
         # initialize each beam with its own index
         basic_beams = torch.arange(num_beams, device=cache_indirection.device, dtype=torch.int32)
-        active_beams = basic_beams.clone()
+        active_beams = cache_indirection[basic_beams, num_generated_tokens - 1]
         # Traverse the cache indirection backwards to obtain the correct tokens and logprobsfor each beam.
-        for token_idx in range(num_tokens - 1, prompt_length, -1):
+        for token_idx in range(num_generated_tokens - 1, 0, -1):
             # set the current token and logprob
             new_path[:, token_idx] = current_path[active_beams, token_idx]
             if request.py_return_log_probs:
                 new_logprobs[:, token_idx] = current_logprobs[active_beams, token_idx]
+                new_logprobs_indices[:, token_idx] = current_logprobs_indices[
+                    active_beams, token_idx
+                ]
             # update the active beams
             active_beams = cache_indirection[basic_beams, token_idx - 1]
         # set the first generated token and logprob
-        new_path[:, prompt_length] = current_path[active_beams, prompt_length]
+        new_path[:, 0] = current_path[active_beams, 0]
         if request.py_return_log_probs:
-            new_logprobs[:, prompt_length] = current_logprobs[active_beams, prompt_length]
-            cum_logprobs = self.store.cum_log_probs[request.py_seq_slot, :].tolist()
+            new_logprobs[:, 0] = current_logprobs[active_beams, 0]
+            new_logprobs_indices[:, 0] = current_logprobs_indices[active_beams, 0]
+            cum_logprobs = self.store.cum_log_probs[request.py_seq_slot, :]
+            return self.BeamHistory(
+                tokens=new_path,
+                logprobs=new_logprobs,
+                logprobs_indices=new_logprobs_indices,
+                cum_logprobs=cum_logprobs,
+            )
+        else:
+            return self.BeamHistory(
+                tokens=new_path,
+                logprobs=None,
+                logprobs_indices=None,
+                cum_logprobs=None,
+            )
+
+    def _finalize_beam(
+        self,
+        request: LlmRequest,
+        beam_history: BeamHistory,
+        is_finished: bool,
+    ) -> None:
+        """Update the request with the corrected tokens and logprobs for each beam."""
+
+        beam_width = request.sampling_config.beam_width
+        assert beam_history.tokens.shape[0] == beam_width, (
+            f"Beam_history.tokens.shape[0] should equal beam width: \
+                {beam_history.tokens.shape[0]} != {beam_width}"
+        )
+        if request.py_return_log_probs:
+            assert beam_history.logprobs.shape[0] == beam_width, (
+                f"Beam_history.logprobs.shape[0] should equal beam width: \
+                    {beam_history.logprobs.shape[0]} != {beam_width}"
+            )
+            assert beam_history.logprobs_indices.shape[0] == beam_width, (
+                f"Beam_history.logprobs_indices.shape[0] should equal beam width: \
+                    {beam_history.logprobs_indices.shape[0]} != {beam_width}"
+            )
+            assert beam_history.cum_logprobs.shape[0] == beam_width, (
+                f"Beam_history.cum_logprobs.shape[0] should equal beam width: \
+                    {beam_history.cum_logprobs.shape[0]} != {beam_width}"
+            )
         if is_finished:
             # Beams that stopped early are filled with end_id tokens. We need to remove those
             stopped_due_to_end_id = (
-                self.store.finished_beams[request.py_seq_slot, :] == FinishReason.END_ID.value
+                self.store.finished_beams[request.py_seq_slot, :beam_width]
+                == FinishReason.END_ID.value
             )
-            valid_tokens = (
-                (new_path[:, prompt_length:] != request.py_end_id).sum(dim=-1)
-                + prompt_length
-                + stopped_due_to_end_id
-            )
+            valid_tokens = (beam_history.tokens != request.py_end_id).sum(
+                dim=-1
+            ) + stopped_due_to_end_id
             gen_token_list = []
             gen_log_probs_list = []
-            for beam_idx in range(num_beams):
+            for beam_idx in range(beam_width):
                 gen_token_list.append(
-                    new_path[beam_idx, prompt_length : valid_tokens[beam_idx]].tolist()
+                    beam_history.tokens[beam_idx, : valid_tokens[beam_idx]].tolist()
                 )
                 if request.py_return_log_probs:
                     gen_log_probs_list.append(
                         self._convert_logprobs_tensor_to_list(
-                            new_path[
-                                beam_idx : beam_idx + 1, prompt_length : valid_tokens[beam_idx]
-                            ].unsqueeze(-1),
-                            new_logprobs[
-                                beam_idx : beam_idx + 1, prompt_length : valid_tokens[beam_idx]
+                            beam_history.logprobs_indices[
+                                beam_idx : beam_idx + 1, : valid_tokens[beam_idx]
+                            ],
+                            beam_history.logprobs[
+                                beam_idx : beam_idx + 1, : valid_tokens[beam_idx]
                             ],
                         )[0]
                     )
@@ -1318,16 +1393,19 @@ class TorchSampler(Sampler):
             if request.py_return_log_probs:
                 # cum_log_probs will not change when padding with end tokens.
                 # Therefore, we do not need to correct it
-                request.py_result.set_log_probs(gen_log_probs_list, cum_log_probs=cum_logprobs)
+                request.py_result.set_log_probs(
+                    gen_log_probs_list, cum_log_probs=beam_history.cum_logprobs.tolist()
+                )
         else:
-            request.set_generated_tokens(new_path[:, prompt_length:].tolist())
+            request.set_generated_tokens(beam_history.tokens.tolist())
             if request.py_return_log_probs:
                 # convert logprobs to a list
                 token_log_probs = self._convert_logprobs_tensor_to_list(
-                    new_path[:, prompt_length:].unsqueeze(-1), new_logprobs[:, prompt_length:]
+                    beam_history.logprobs_indices, beam_history.logprobs
                 )
-                request.py_result.set_log_probs(token_log_probs, cum_log_probs=cum_logprobs)
-        return new_path
+                request.py_result.set_log_probs(
+                    token_log_probs, cum_log_probs=beam_history.cum_logprobs.tolist()
+                )
 
     def _add_metadata_to_grouped_requests(
         self,
@@ -1373,7 +1451,7 @@ class TorchSampler(Sampler):
         """Check if the stop criteria is met for the request"""
         return request.is_finished
 
-    def _finalize_beams(
+    def _maybe_finalize_beams(
         self,
         requests: list[LlmRequest],
     ) -> None:
@@ -1381,10 +1459,12 @@ class TorchSampler(Sampler):
 
         This function, updates the tokens and logprobs of all requests to their correct state"""
         for req in requests:
-            if self._check_stop_criteria(req):
-                self._update_beam_history(req, True)
-            elif req.streaming:
-                self._update_beam_history(req, False)
+            if self._check_stop_criteria(req) or req.streaming:
+                beam_history = self._create_beam_history(req)
+                if self._check_stop_criteria(req):
+                    self._finalize_beam(req, beam_history, True)
+                elif req.streaming:
+                    self._finalize_beam(req, beam_history, False)
         pass
 
     @override
@@ -1453,7 +1533,7 @@ class TorchSampler(Sampler):
                 processed += num_accepted
                 self.handle_logprobs(req, state, count=processed)
             req.py_decoding_iter += 1
-        self._finalize_beams(state.scheduled_requests.all_requests())
+        self._maybe_finalize_beams(state.scheduled_requests.all_requests())
 
     def return_log_probs(self, scheduled_requests: ScheduledRequests) -> bool:
         return any(req.py_return_log_probs for req in scheduled_requests.all_requests())
@@ -2140,6 +2220,7 @@ class TorchSampler(Sampler):
         # top-k/top-p masking, etc.
         if return_log_probs:
             assert logits_cuda.dim() == 2, "logits should be 2D"
+
             logprobs_req_indices = [
                 req_id for req_id, req in enumerate(requests) if req.py_num_logprobs
             ]

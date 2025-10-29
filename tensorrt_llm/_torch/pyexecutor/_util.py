@@ -831,7 +831,7 @@ def create_torch_sampler_args(
     max_batch_size: int,
     speculative_config: SpeculativeConfig,
     max_beam_width: int,
-    use_overlap_scheduler: bool,
+    disable_overlap_scheduler: bool,
     disable_flashinfer_sampling: bool):
     max_num_sequences = max_batch_size * mapping.pp_size
     max_draft_len = (0 if speculative_config is None else
@@ -839,13 +839,14 @@ def create_torch_sampler_args(
     max_total_draft_tokens = (0 if speculative_config is None else
                               speculative_config.max_total_draft_tokens)
 
-    return TorchSampler.Args(max_seq_len=max_seq_len,
-                             max_draft_len=max_draft_len,
-                             max_total_draft_tokens=max_total_draft_tokens,
-                             max_num_sequences=max_num_sequences,
-                             max_beam_width=max_beam_width,
+    return TorchSampler.Args(
+        max_seq_len=max_seq_len,
+        max_draft_len=max_draft_len,
+        max_total_draft_tokens=max_total_draft_tokens,
+        max_num_sequences=max_num_sequences,
+        max_beam_width=max_beam_width,
         disable_flashinfer_sampling=disable_flashinfer_sampling,
-                             use_overlap_scheduler=use_overlap_scheduler)
+        disable_overlap_scheduler=disable_overlap_scheduler)
 
 
 def instantiate_sampler(
@@ -868,7 +869,7 @@ def instantiate_sampler(
         max_batch_size=max_batch_size,
         speculative_config=speculative_config,
         max_beam_width=max_beam_width,
-        use_overlap_scheduler=not pytorch_backend_config.
+        disable_overlap_scheduler=pytorch_backend_config.
         disable_overlap_scheduler,
         disable_flashinfer_sampling=disable_flashinfer_sampling,
     )
