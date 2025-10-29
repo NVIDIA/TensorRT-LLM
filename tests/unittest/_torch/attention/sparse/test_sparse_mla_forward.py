@@ -200,10 +200,15 @@ def calculate_reference_output_generation(q_c, kv_c, k_pe, W_UK, W_UV,
         k_pe_seq = k_pe[kv_offset:kv_offset + kv_len]
 
         q_nope, q_pe = q_seq.split([qk_nope_head_dim, qk_rope_head_dim], dim=-1)
-        cos_sin_q = rope_cos_sin[kv_len - q_seq.shape[0]:kv_len]
-        cos_sin_pe = rope_cos_sin[:kv_len]
-        q_pe = apply_rotary_embedding(q_pe, cos_sin_q)
-        k_pe_rot = apply_rotary_embedding(k_pe_seq, cos_sin_pe)
+        # SM90: apply RoPE to q_pe, k_pe_seq
+        # SM100+: use unrotated q_pe, k_pe_seq
+        if get_sm_version() >= 100:
+            cos_sin_q = rope_cos_sin[kv_len - q_seq.shape[0]:kv_len]
+            cos_sin_pe = rope_cos_sin[:kv_len]
+            q_pe = apply_rotary_embedding(q_pe, cos_sin_q)
+            k_pe_rot = apply_rotary_embedding(k_pe_seq, cos_sin_pe)
+        else:
+            k_pe_rot = k_pe_seq
 
         ql_nope = torch.einsum("qnh,lnh->qnl", q_nope, W_UK)
         q_mqa = torch.cat([ql_nope, q_pe], dim=-1)
@@ -289,6 +294,9 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str):
     print(
         f"\n{'='*80}\nTesting: {batch_name} kv_cache_dtype: {kv_cache_dtype}\n{'='*80}"
     )
+    if kv_cache_dtype == "fp8" and get_sm_version() < 100:
+        pytest.skip(
+            "FP8 kv cache is not supported on pre-Blackwell architectures")
 
     device = torch.device('cuda')
     dtype = torch.bfloat16
@@ -772,18 +780,28 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str):
             kv_c_list.append(latent_cache[batch_start:batch_end, :kv_lora_rank])
             k_pe_list.append(k_pe_original_for_ref[batch_start:batch_end])
         else:
-            # Generation: use rotated q, combine cached + new KV from latent_cache
-            q_req = q_original_for_ref[batch_start:batch_end]
+            # Generation:
+            # SM90: use rotated q, combine rotated k_pe and new KV from latent_cache
+            # SM100+: use unrotated q, combine unrotated k_pe and new KV from latent_cache
             cached_len = cached_lens[orig_req_idx]
+            if get_sm_version() >= 100:
+                q_req = q_original_for_ref[batch_start:batch_end]
+                k_pe_list.append(
+                    torch.cat([
+                        all_cached_k_pe_original[orig_req_idx][:cached_len],
+                        latent_cache[batch_start:batch_end, kv_lora_rank:]
+                    ]))
+            else:
+                q_req = q[batch_start:batch_end]
+                k_pe_list.append(
+                    torch.cat([
+                        all_cached_k_pe_rotated[orig_req_idx][:cached_len],
+                        latent_cache[batch_start:batch_end, kv_lora_rank:]
+                    ]))
             kv_c_list.append(
                 torch.cat([
                     all_cached_compressed_kv[orig_req_idx][:cached_len],
                     latent_cache[batch_start:batch_end, :kv_lora_rank]
-                ]))
-            k_pe_list.append(
-                torch.cat([
-                    all_cached_k_pe_original[orig_req_idx][:cached_len],
-                    latent_cache[batch_start:batch_end, kv_lora_rank:]
                 ]))
 
         q_for_ref_list.append(q_req.view(-1, num_heads, qk_head_dim))
