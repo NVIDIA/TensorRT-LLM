@@ -46,12 +46,6 @@ struct SparseAttentionParams
            << "sparse_mla_kv_cache_pool: " << this->sparse_mla_kv_cache_pool << std::endl;
         return ss.str();
     }
-
-    auto data() const
-    {
-        return std::make_tuple(sparse_kv_indices, sparse_attn_indices, sparse_kv_offsets, sparse_attn_offsets,
-            sparse_mla_topk, sparse_mla_kv_cache_pool);
-    }
 };
 
 struct Pair

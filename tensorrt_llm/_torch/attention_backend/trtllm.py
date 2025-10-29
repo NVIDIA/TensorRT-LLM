@@ -448,13 +448,6 @@ class TrtllmAttentionWrapper:
             self.spec_decoding_position_offsets, self.spec_decoding_packed_mask
         ]
         mla_tensor_params = [self.helix_position_offsets]
-        sparse_attention_tensor_params = [
-            self.sparse_kv_indices,
-            self.sparse_kv_offsets,
-            self.sparse_attn_indices,
-            self.sparse_attn_offsets,
-        ]
-        sparse_attention_params = [self.sparse_mla_topk]
 
         thop.attention(
             q,
@@ -522,8 +515,11 @@ class TrtllmAttentionWrapper:
             self.softmax_stats_tensor,
             spec_decoding_bool_params,
             spec_decoding_tensor_params,
-            sparse_attention_tensor_params,
-            sparse_attention_params,
+            self.sparse_kv_indices,
+            self.sparse_kv_offsets,
+            self.sparse_attn_indices,
+            self.sparse_attn_offsets,
+            self.sparse_mla_topk,
         )
         # reset the planned states (especially tensors) to avoid memory leak
         self.plan()

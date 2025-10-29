@@ -720,7 +720,6 @@ class MLA(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.pos_embd_params = pos_embd_params
         self.dense_bias = dense_bias
-        self.sm_version = get_sm_version()
         if dense_bias is None:
             self.dense_bias = bias
 
@@ -839,7 +838,7 @@ class MLA(nn.Module):
             force_dynamic_quantization=config.force_dynamic_quantization)
         # This parameter will view into self.kv_b_proj.weight after loading weights.
         # For dummy weight initialization, this parameter is initialized with empty tensor.
-        # Used in forward_generation only
+        # Used in forward_absorption only
         self.v_b_proj = nn.Parameter(
             torch.empty(
                 (self.num_heads, self.v_head_dim, self.kv_lora_rank),
@@ -1114,7 +1113,7 @@ class MLA(nn.Module):
                 assert position_ids is not None
                 k_pe_gen = self.apply_rope(q_gen, k_pe_gen, position_ids)
 
-            self.forward_generation(
+            self.forward_absorption(
                 q_gen,
                 compressed_kv_gen,
                 k_pe_gen,
@@ -1265,8 +1264,8 @@ class MLA(nn.Module):
         latent_cache: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if self.sm_version >= 100:
-            return self.forward_generation(q,
+        if get_sm_version() >= 100:
+            return self.forward_absorption(q,
                                            compressed_kv,
                                            k_pe,
                                            attn_metadata,
@@ -1292,8 +1291,8 @@ class MLA(nn.Module):
         latent_cache: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if self.sm_version >= 100:
-            return self.forward_generation(q, compressed_kv, k_pe,
+        if get_sm_version() >= 100:
+            return self.forward_absorption(q, compressed_kv, k_pe,
                                            attn_metadata, output, latent_cache,
                                            topk_indices)
         else:
@@ -1557,7 +1556,7 @@ class MLA(nn.Module):
         return self.forward_context_default(q, compressed_kv, k_pe,
                                             attn_metadata, output, latent_cache)
 
-    def forward_generation(
+    def forward_absorption(
         self,
         q: torch.Tensor,
         compressed_kv: torch.Tensor,

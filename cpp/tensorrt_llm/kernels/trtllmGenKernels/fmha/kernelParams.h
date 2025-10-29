@@ -582,7 +582,7 @@ struct KernelParams
 
         // Check shape must be in range [1, 2^32]
         int32_t dim = shapes.size();
-        // Max five dimension and min 3 dimension.
+        // Max five dimension and min 2 dimension.
         TLLM_CHECK((dim <= 5) && (dim >= 2));
         // Check shape range.
         for (int32_t ii = 0; ii < dim; ++ii)

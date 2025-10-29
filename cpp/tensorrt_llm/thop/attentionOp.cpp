@@ -563,18 +563,10 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::vector<std::optional<torch::Tensor>> mla_tensor_params, std::optional<int64_t> attention_chunk_size,
     std::optional<torch::Tensor> softmax_stats_tensor, std::vector<bool> spec_decoding_bool_params,
     std::vector<std::optional<torch::Tensor>> spec_decoding_tensor_params,
-    std::vector<std::optional<torch::Tensor>> sparse_attention_tensor_params,
-    std::vector<int64_t> sparse_attention_params)
+    std::optional<torch::Tensor> sparse_kv_indices, std::optional<torch::Tensor> sparse_kv_offsets,
+    std::optional<torch::Tensor> sparse_attn_indices, std::optional<torch::Tensor> sparse_attn_offsets,
+    std::optional<int64_t> sparse_mla_topk)
 {
-    // Decompress sparse attention parameters
-    TORCH_CHECK(sparse_attention_tensor_params.size() == 4, "Expected 4 sparse attention tensor parameters");
-    TORCH_CHECK(sparse_attention_params.size() == 1, "Expected 1 sparse attention parameters");
-    torch::optional<torch::Tensor> sparse_kv_indices = sparse_attention_tensor_params[0];
-    torch::optional<torch::Tensor> sparse_kv_offsets = sparse_attention_tensor_params[1];
-    torch::optional<torch::Tensor> sparse_attn_indices = sparse_attention_tensor_params[2];
-    torch::optional<torch::Tensor> sparse_attn_offsets = sparse_attention_tensor_params[3];
-    int64_t const sparse_mla_topk = sparse_attention_params[0];
-
     TLLM_LOG_TRACE("Attention op starts at layer %d", layer_idx);
     // Use these tensors to infer if the attention is using KV cache
     bool const use_kv_cache = kv_cache_block_offsets.has_value() && host_kv_cache_block_offsets.has_value()
@@ -699,6 +691,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             op->mUseTllmGenSparseAttention = true;
         }
     }
+    int32_t const sparse_mla_topk_value = sparse_mla_topk.has_value() ? sparse_mla_topk.value() : 0;
 
     if (is_mla_enable)
     {
@@ -708,7 +701,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
         TLLM_CHECK(host_kv_cache_pool_mapping.has_value());
         int32_t const layer_num = host_kv_cache_pool_mapping.value().size(0);
 
-        if (sparse_mla_topk > 0 && sparse_attn_indices.has_value() && sparse_attn_indices.value().numel() > 0)
+        if (sparse_mla_topk_value > 0 && sparse_attn_indices.has_value() && sparse_attn_indices.value().numel() > 0)
         {
             op->mUseSparseAttention = true;
         }
@@ -836,7 +829,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe, block_ids_per_seq, mrope_rotary_cos_sin,
             mrope_position_deltas, mla_tensor_params, softmax_stats_tensor, spec_decoding_tensor_params,
             attention_sinks, sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets,
-            sparse_mla_topk);
+            sparse_mla_topk_value);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -854,7 +847,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe, block_ids_per_seq, mrope_rotary_cos_sin,
             mrope_position_deltas, mla_tensor_params, softmax_stats_tensor, spec_decoding_tensor_params,
             attention_sinks, sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets,
-            sparse_mla_topk);
+            sparse_mla_topk_value);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", layer_idx);

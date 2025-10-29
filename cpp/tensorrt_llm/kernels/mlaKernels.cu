@@ -923,10 +923,6 @@ __global__ void quantizeCopyInputToFp8Kernel(T const* q_buf, __nv_fp8_e4m3* quan
                 quantCopy<T, ELTS_PER_VEC>(quant_k_buf + dst_k_idx, &k_buf[src_k_idx], quant_scale_qkv_val);
             }
         }
-    }
-
-    if constexpr (!ABSORPTION_MODE)
-    {
         // Quantize V, dst V is contiguous, but src V is not contiguous, so we need to calculate the stride
         size_t const src_v_token_stride = (QK_NOPE_HEAD_DIM + V_HEAD_DIM) * head_num;
         for (int v_token_idx = (threadIdx.x / V_VECS_PER_HEAD) + blockIdx.x * V_TOKENS_PER_BLOCK;
