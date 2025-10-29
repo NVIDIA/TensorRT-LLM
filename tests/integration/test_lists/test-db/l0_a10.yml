@@ -57,6 +57,7 @@ l0_a10:
   - test_e2e.py::test_trtllm_serve_top_logprobs[pytorch]
   - test_e2e.py::test_openai_misc_example[pytorch]
   - test_e2e.py::test_openai_reasoning[pytorch]
+  - test_e2e.py::test_openai_tool_call
   - test_e2e.py::test_openai_completions_example[pytorch]
   - test_e2e.py::test_openai_chat_example[pytorch] TIMEOUT (90)
   - test_e2e.py::test_trtllm_bench_request_rate_and_concurrency[enable_concurrency-]
@@ -71,6 +72,8 @@ l0_a10:
   - unittest/llmapi/test_additional_model_outputs.py
   # executor
   - unittest/executor/test_rpc.py
+  # trtllm-serve CPU-only
+  - unittest/llmapi/apps/test_tool_parsers.py
 - condition:
     ranges:
       system_gpu_count:

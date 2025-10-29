@@ -17,7 +17,7 @@ from fastapi import Body, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Mount
-from transformers import AutoConfig, AutoProcessor
+from transformers import AutoProcessor
 
 from tensorrt_llm._tensorrt_engine import LLM
 # yapf: disable
@@ -78,12 +78,14 @@ class OpenAIServer:
     def __init__(self,
                  llm: Union[LLM, MultimodalEncoder],
                  model: str,
+                 tool_parser: Optional[str],
                  server_role: Optional[ServerRole],
                  metadata_server_cfg: MetadataServerConfig,
                  disagg_cluster_config: Optional[DisaggClusterConfig] = None,
                  multimodal_server_config: Optional[MultimodalServerConfig] = None):
         self.llm = llm
         self.tokenizer = llm.tokenizer
+        self.tool_parser = tool_parser
         self.metadata_server = create_metadata_server(metadata_server_cfg)
         self.disagg_cluster_config = disagg_cluster_config
         self.multimodal_server_config = multimodal_server_config
@@ -99,27 +101,15 @@ class OpenAIServer:
         except Exception:
             logger.debug("Failed to load AutoProcessor or AutoConfig for %s", hf_tokenizer_path)
             self.processor = None
-        # Temporary workaround for DSv3.2 config.
-        import transformers
-
-        from tensorrt_llm._torch.model_config import _CONFIG_REGISTRY
-        config_dict, _ = transformers.PretrainedConfig.get_config_dict(
-                hf_tokenizer_path,
-                trust_remote_code=trust_remote_code
-            )
-        model_type = config_dict.get("model_type")
-        if model_type in _CONFIG_REGISTRY:
-            config_class = _CONFIG_REGISTRY[model_type]
-            self.model_config = config_class.from_pretrained(
-                hf_tokenizer_path,
-                trust_remote_code=trust_remote_code
-            )
-        else:
-            try:
-                self.model_config = AutoConfig.from_pretrained(hf_tokenizer_path, trust_remote_code=trust_remote_code)
-            except Exception:
-                logger.debug("Failed to load AutoConfig for %s", hf_tokenizer_path)
-                self.model_config = None
+        # load model config
+        try:
+            from tensorrt_llm._torch.pyexecutor.config_utils import \
+                load_pretrained_config
+            self.model_config = load_pretrained_config(hf_tokenizer_path,
+                                                       trust_remote_code=trust_remote_code)
+        except Exception:
+            logger.debug("Failed to load AutoConfig for %s", hf_tokenizer_path)
+            self.model_config = None
 
         # Enable response storage for Responses API
         self.enable_store = True
@@ -532,6 +522,7 @@ class OpenAIServer:
                 prompt["multi_modal_data"] = mm_data
 
             postproc_args.reasoning_parser = self.llm.args.reasoning_parser
+            postproc_args.tool_parser = self.tool_parser
             if conversation and conversation[-1].get(
                     "content") and conversation[-1].get("role") == get_role():
                 postproc_args.last_message_content = conversation[-1]["content"]

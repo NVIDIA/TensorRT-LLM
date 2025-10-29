@@ -96,7 +96,7 @@ bool getEnvDisableKVCacheTransferOverlap();
 
 bool getEnvEnableReceiveKVCacheParallel();
 
-std::string const& getEnvKVCacheTransferOutputPath();
+std::string const& getEnvKVCacheTimeOutputPath();
 
 bool getEnvTryZCopyForKVCacheTransfer();
 
@@ -146,5 +146,7 @@ int getEnvMoeA2ADispatchBlockSize();
 int getEnvMoeA2ACombineBlockSize();
 
 bool getEnvKVCacheTransferAllBlocksForWindow();
+
+bool getEnvEplbForceGdrcopy();
 
 } // namespace tensorrt_llm::common

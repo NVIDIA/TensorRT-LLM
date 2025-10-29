@@ -26,6 +26,11 @@ deepseek-ai/DeepSeek-V3.2-Exp:
   - quant_algo: FP8_BLOCK_SCALES
     spec_dec_algo: MTP
     accuracy: 80.0
+  - quant_algo: NVFP4
+    accuracy: 80.0
+  - quant_algo: NVFP4
+    spec_dec_algo: MTP
+    accuracy: 80.0
 nvidia/Llama-3_3-Nemotron-Super-49B-v1:
   - accuracy: 44.95
   - quant_algo: FP8
