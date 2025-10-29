@@ -17,8 +17,8 @@ l0_l40s:
   - unittest/_torch/modeling -k "modeling_mllama"
   - unittest/_torch/modeling -k "modeling_siglip"
   - unittest/_torch/modeling -k "modeling_vila"
-  - unittest/_torch/test_modeling_llava_next.py::TestLlavaNext::test_all
-  - unittest/_torch/test_modeling_qwen2_5vl.py::TestQwen2_5_VL::test_all
+  - unittest/_torch/modeling/test_modeling_llava_next.py::TestLlavaNext::test_all
+  - unittest/_torch/modeling/test_modeling_qwen2_5vl.py::TestQwen2_5_VL::test_all
   - test_e2e.py::test_ptp_scaffolding[DeepSeek-R1-Distill-Qwen-7B-DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B]
   - test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[phi4-multimodal-instruct-multimodals/Phi-4-multimodal-instruct-audio]
   - test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[phi4-multimodal-instruct-multimodals/Phi-4-multimodal-instruct-image]
