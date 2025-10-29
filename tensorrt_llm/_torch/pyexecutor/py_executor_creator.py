@@ -79,6 +79,8 @@ class _ExecutorMemoryMonitor:
         "KV cache",
         ExecutorMemoryType.MODEL_ENGINE_MAIN:
         "Model",
+        ExecutorMemoryType.MODEL_ENGINE_CTX:
+        "Context model for SM-level disaggregation",
         ExecutorMemoryType.MODEL_ENGINE_DRAFT:
         "Draft model for speculative decoding",
     }
@@ -96,6 +98,9 @@ class _ExecutorMemoryMonitor:
         ExecutorMemoryType.INIT_KV_CACHE:
         "reduce max_num_tokens",
         ExecutorMemoryType.MODEL_ENGINE_MAIN:
+        ("reduce max_num_tokens and/or shard the model weights across GPUs by enabling "
+         "pipeline and/or tensor parallelism"),
+        ExecutorMemoryType.MODEL_ENGINE_CTX:
         ("reduce max_num_tokens and/or shard the model weights across GPUs by enabling "
          "pipeline and/or tensor parallelism"),
         ExecutorMemoryType.MODEL_ENGINE_DRAFT:
@@ -345,6 +350,36 @@ def create_py_executor(
 
     validate_feature_combination(llm_args, model_engine, llm_args.sampler_type)
 
+    if llm_args.sm_disagg_config is not None:
+        if llm_args.cache_transceiver_config is not None:
+            raise ValueError(
+                "SM-level disaggregation is not compatible with disaggregated serving."
+            )
+        if llm_args.parallel_config.world_size > 1:
+            raise NotImplementedError(
+                "SM-level disaggregation is not supported with parallelism.")
+        if scheduler_config.capacity_scheduler_policy != CapacitySchedulerPolicy.GUARANTEED_NO_EVICT:
+            raise NotImplementedError(
+                "SM-level disaggregation is only supported with guaranteed no evict scheduler policy."
+            )
+
+        with allocation_scope(ExecutorMemoryType.MODEL_ENGINE_CTX,
+                              RestoreMode.PINNED):
+            ctx_llm_args = copy.copy(llm_args)
+            ctx_llm_args.cuda_graph_config = None
+            ctx_model_engine = PyTorchModelEngine(
+                model_path=checkpoint_dir,
+                llm_args=ctx_llm_args,
+                mapping=mapping,
+                attn_runtime_features=attn_runtime_features,
+                dist=dist,
+                spec_config=spec_config,
+                is_sm_disagg_ctx_phase=True,
+                weight_sharing_model=model_engine.model,
+            )
+    else:
+        ctx_model_engine = None
+
     if has_draft_model_engine:
         with allocation_scope(ExecutorMemoryType.MODEL_ENGINE_DRAFT,
                               RestoreMode.PINNED):
@@ -449,9 +484,9 @@ def create_py_executor(
                 "Chunked Prefill for MLA can only be enabled on SM90/SM100/SM103/SM120, "
                 f"disable enable_chunked_context for SM{sm_version}")
             enable_chunked_context = False
-            model_engine.attn_runtime_features.chunked_prefill = False
-            if draft_model_engine is not None:
-                draft_model_engine.attn_runtime_features.chunked_prefill = False
+            for eng in [model_engine, ctx_model_engine, draft_model_engine]:
+                if eng is not None:
+                    eng.attn_runtime_features.chunked_prefill = False
 
     if enable_chunked_context:
         chunk_unit_size = tokens_per_block
@@ -644,6 +679,8 @@ def create_py_executor(
             max_batch_size=max_batch_size,
             max_beam_width=max_beam_width,
             max_num_tokens=max_num_tokens,
+            ctx_model_engine=ctx_model_engine,
+            sm_disagg_config=llm_args.sm_disagg_config,
             peft_cache_config=peft_cache_config,
             scheduler_config=scheduler_config,
             cache_transceiver_config=cache_transceiver_config,
@@ -672,11 +709,11 @@ def create_py_executor(
             max_seq_len = kv_cache_creator._max_seq_len
             update_sampler_max_seq_len(max_seq_len, sampler)
 
-            for eng in [model_engine, draft_model_engine]:
+            for eng in [model_engine, ctx_model_engine, draft_model_engine]:
                 if eng is None:
                     continue
                 if eng.attn_metadata is not None:
-                    if llm_args.cuda_graph_config is not None:
+                    if eng.cuda_graph_runner.enabled:
                         eng._release_cuda_graphs()
                     eng.attn_metadata = None
 
@@ -701,6 +738,8 @@ def create_py_executor(
                 max_batch_size=max_batch_size,
                 max_beam_width=max_beam_width,
                 max_num_tokens=max_num_tokens,
+                ctx_model_engine=ctx_model_engine,
+                sm_disagg_config=llm_args.sm_disagg_config,
                 peft_cache_config=peft_cache_config,
                 scheduler_config=scheduler_config,
                 cache_transceiver_config=cache_transceiver_config,

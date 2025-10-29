@@ -25,7 +25,8 @@ from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import \
 from tensorrt_llm.llmapi import (AutoDecodingConfig, CudaGraphConfig,
                                  EagleDecodingConfig, KvCacheConfig, MoeConfig,
                                  MTPDecodingConfig, NGramDecodingConfig,
-                                 SamplingParams, TorchCompileConfig)
+                                 SamplingParams, SmDisaggConfig,
+                                 TorchCompileConfig)
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (get_device_count, get_device_memory, llm_models_root,
@@ -485,6 +486,17 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           sampling_params=sampling_params,
                           extra_acc_spec="beam_width=2")
+
+    @pytest.mark.skip_less_device_memory(32000)
+    @parametrize_with_ids("disable_overlap_scheduler", [False, True])
+    @parametrize_with_ids("enable_iter_perf_stats", [False, True])
+    def test_sm_disagg(self, disable_overlap_scheduler, enable_iter_perf_stats):
+        with LLM(self.MODEL_PATH,
+                 disable_overlap_scheduler=disable_overlap_scheduler,
+                 enable_iter_perf_stats=enable_iter_perf_stats,
+                 sm_disagg_config=SmDisaggConfig()) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
 
 
 class TestLlama3_2_1B(LlmapiAccuracyTestHarness):

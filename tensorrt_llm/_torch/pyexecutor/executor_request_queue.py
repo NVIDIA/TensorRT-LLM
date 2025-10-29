@@ -47,10 +47,15 @@ class RequestQueueItem:
 class ExecutorRequestQueue:
     """Handles fetching and processing of new requests from the request queue."""
 
-    def __init__(self, dist: Distributed, enable_attention_dp: bool,
-                 max_batch_size: int, max_beam_width: int,
-                 max_num_active_requests: int, enable_iter_perf_stats: bool,
-                 batch_wait_timeout_ms: float):
+    def __init__(self,
+                 dist: Distributed,
+                 enable_attention_dp: bool,
+                 max_batch_size: int,
+                 max_beam_width: int,
+                 max_num_active_requests: int,
+                 enable_iter_perf_stats: bool,
+                 batch_wait_timeout_ms: float,
+                 is_sm_disagg: bool = False):
         self.dist = dist
         self.request_queue: queue.Queue[RequestQueueItem] = queue.Queue()
         self.waiting_queue: deque[RequestQueueItem] = deque()
@@ -59,6 +64,7 @@ class ExecutorRequestQueue:
         self.max_batch_size = max_batch_size
         self.max_beam_width = max_beam_width
         self.max_num_active_requests = max_num_active_requests
+        self.is_sm_disagg = is_sm_disagg
         self.enqueue_lock = threading.Lock()
         self.next_request_id = max_batch_size
         self.enable_iter_perf_stats = enable_iter_perf_stats
@@ -333,12 +339,15 @@ class ExecutorRequestQueue:
 
     @nvtx_range("_fetch_new_requests")
     def fetch_new_requests(
-            self, activate_requests: List[LlmRequest]) -> List[LlmRequest]:
+            self, activate_requests: List[LlmRequest],
+            num_active_requests_on_engine: int) -> List[LlmRequest]:
 
         if self.enable_attention_dp:
             return self._fetch_new_requests_attention_dp(activate_requests)
         else:
-            return self._fetch_new_requests_attention_tp(len(activate_requests))
+            num_active_requests = num_active_requests_on_engine if self.is_sm_disagg else len(
+                activate_requests)
+            return self._fetch_new_requests_attention_tp(num_active_requests)
 
     def _fetch_new_requests_attention_tp(
             self, num_active_requests: int) -> List[LlmRequest]:
