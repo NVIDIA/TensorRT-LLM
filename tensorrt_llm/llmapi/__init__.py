@@ -2,7 +2,7 @@ from ..disaggregated_params import DisaggregatedParams
 from ..executor import CompletionOutput, LoRARequest, RequestError
 from ..sampling_params import GuidedDecodingParams, SamplingParams
 from .build_cache import BuildCacheConfig
-from .llm import LLM, RequestOutput
+from .llm import LLM, AsyncLLM, RequestOutput
 # yapf: disable
 from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
                        CacheTransceiverConfig, CalibConfig,
@@ -23,6 +23,7 @@ from .mpi_session import MpiCommSession
 
 __all__ = [
     'LLM',
+    'AsyncLLM',
     'MultimodalEncoder',
     'CompletionOutput',
     'RequestOutput',
