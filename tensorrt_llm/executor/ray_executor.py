@@ -1,4 +1,5 @@
 import os
+import asyncio
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
@@ -23,6 +24,7 @@ from .ray_gpu_worker import RayGPUWorker, RayWorkerWrapper
 from .request import GenerationRequest
 from .result import GenerationResult
 from .rpc_proxy_mixin import RpcExecutorMixin
+from .utils import has_event_loop
 
 __all__ = [
     "RayExecutor",
@@ -77,9 +79,11 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             self.master_address = ray.util.get_node_ip_address()
             self.master_port = get_free_port()
 
-            worker_kwargs = dict(**worker_kwargs,
+            self.worker_kwargs = dict(**worker_kwargs,
                                  postproc_worker_config=postproc_worker_config,
                                  is_llm_executor=is_llm_executor)
+            if not has_event_loop():
+                self.init_workers_sync()
 
             self.init_rpc_executor()
             # Inject the generated HMAC key into worker_kwargs for workers
@@ -124,6 +128,8 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             for rank in range(self.world_size)
         ]
 
+    def init_workers_sync(self):
+        self.create_workers(RayGPUWorker, self.worker_kwargs)
         try:
             ray.get([worker.__ray_ready__.remote() for worker in self.workers])
         except ray.exceptions.ActorDiedError as e:
@@ -132,6 +138,18 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
                 raise RuntimeError(
                     "RayGPUWorker died during initialization") from e
             raise
+
+    async def init_workers_async(self):
+        self.create_workers(RayGPUWorker, self.worker_kwargs)
+        try:
+            await asyncio.gather(*[worker.__ray_ready__.remote() for worker in self.workers])
+        except ray.exceptions.ActorDiedError as e:
+            if "The actor died because of an error raised in its creation task" in str(
+                    e):
+                raise RuntimeError(
+                    "RayGPUWorker died during initialization") from e
+            raise
+
 
     @unwrap_ray_errors()
     def call_all_ray_workers(self, func: str, leader_only: bool,

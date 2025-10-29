@@ -3,7 +3,7 @@
 import base64
 import time
 import uuid
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union, Tuple
 
 import torch
 import xgrammar
@@ -966,6 +966,14 @@ class ResponsesStreamResponse(OpenAIBaseModel):
     type: Literal["response.created", "response.in_progress",
                   "response.completed", "response.failed",
                   "response.incomplete"]
+
+
+class MemoryUpdateRequest(OpenAIBaseModel):
+    tags: List[str] = Field(default=["model", "kv_cache"])
+
+
+class UpdateWeightsRequest(OpenAIBaseModel):
+    weights: Dict[str, List[Tuple[str, str]]]
 
 
 def encode_opaque_state(opaque_state: Optional[bytes]) -> Optional[str]:

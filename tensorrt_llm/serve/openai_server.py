@@ -49,7 +49,9 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ErrorResponse, ModelCard,
                                                 ModelList, PromptTokensDetails,
                                                 ResponsesRequest, UsageInfo,
-                                                to_llm_disaggregated_params)
+                                                to_llm_disaggregated_params,
+                                                MemoryUpdateRequest,
+                                                UpdateWeightsRequest)
 from tensorrt_llm.serve.postprocess_handlers import (
     ChatCompletionPostprocArgs, ChatPostprocArgs, CompletionPostprocArgs,
     chat_harmony_post_processor, chat_harmony_streaming_post_processor,
@@ -262,6 +264,15 @@ class OpenAIServer:
         self.app.add_api_route("/v1/responses",
                                self.openai_responses,
                                methods=["POST"])
+        self.app.add_api_route("/release_memory",
+                                self.release_memory,
+                                methods=["POST"])
+        self.app.add_api_route("/resume_memory",
+                                self.resume_memory,
+                                methods=["POST"])
+        self.app.add_api_route("/update_weights",
+                                self.update_weights,
+                                methods=["POST"])
         if self.llm.args.return_perf_metrics:
             # register /prometheus/metrics
             self.mount_metrics()
@@ -298,6 +309,15 @@ class OpenAIServer:
         self.app.add_api_route("/v1/chat/completions",
                                self.openai_mm_encoder,
                                methods=["POST"])
+        self.app.add_api_route("/release_memory",
+                                self.release_memory,
+                                methods=["POST"])
+        self.app.add_api_route("/resume_memory",
+                                self.resume_memory,
+                                methods=["POST"])
+        self.app.add_api_route("/update_weights",
+                                self.update_weights,
+                                methods=["POST"])
 
     async def health(self) -> Response:
         if self._check_health():
@@ -990,6 +1010,42 @@ class OpenAIServer:
 
         return JSONResponse(content={"detail": "None"})
 
+    async def release_memory(self, request: MemoryUpdateRequest) -> JSONResponse:
+        #await self.llm.sleep_async(level=2)
+
+        tags = ["sampler",
+            "drafter",
+            "guided_decoder",
+            "spec_resource_manager",
+            "_no_capture_model_extra",
+            "executor_extra",
+            "kv_cache",
+            "model",
+            "draft_model"]
+        #await self.llm._collective_rpc('sleep', args=(tags,))
+        print(f"david: release_memory {tags}")
+        return JSONResponse(content={"status": "success"})
+
+    async def resume_memory(self, request: MemoryUpdateRequest) -> JSONResponse:
+        #await self.llm.wakeup_async(level=2)
+        tags = ["sampler",
+            "drafter",
+            "guided_decoder",
+            "spec_resource_manager",
+            "_no_capture_model_extra",
+            "executor_extra",
+            "kv_cache",
+            "model",
+            "draft_model"]
+        #await self.llm._collective_rpc('wakeup', args=(tags,))
+        print(f"david: resume_memory {tags}")
+        return JSONResponse(content={"status": "success"})
+
+    async def update_weights(self, request: UpdateWeightsRequest) -> JSONResponse:
+        #await self.llm.update_weights_from_ipc_handles_async(request.weights)
+        print(f"david: update_weights {request.weights}")
+        await self.llm._collective_rpc('update_weights', args=(request.weights,))
+        return JSONResponse(content={"status": "success"})
 
     async def __call__(self, host, port, sockets: list[socket.socket] | None = None):
         # Store the binding address for server registration
