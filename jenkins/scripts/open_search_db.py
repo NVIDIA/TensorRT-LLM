@@ -358,6 +358,3 @@ class OpenSearchDB:
             OpenSearchDB.logger.warning(
                 f"Failed to query PR IDs from OpenSearchDB: {e}")
             return []
-
-
-print(OpenSearchDB.queryBuildIdFromOpenSearchDB("LLM/main/L0_MergeRequest_PR"))
