@@ -598,7 +598,7 @@ class Llama4DecoderLayer(DecoderLayer):
                         ))
 
                 # Unpack the allreduce output
-                if self.next_attn is not None and self.is_nvfp4:
+                if self.post_feed_forward_fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
                     act_fp4, act_sf, residual = allreduce_output
                     hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
                 else:
@@ -789,7 +789,7 @@ class LlamaDecoderLayer(DecoderLayer):
                         scale=scale,
                         eps=self.next_layer_layernorm.variance_epsilon,
                     ))
-                if self.next_attn is not None and self.is_nvfp4:
+                if self.post_mlp_fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
                     act_fp4, act_sf, residual = all_reduce_output
                     hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
                 else:
