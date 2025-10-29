@@ -13,6 +13,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# =============================================================================
+# open_search_db.py
+#
+# This module provides a client class for interacting with an OpenSearch database
+# used for CI/CD job and test result monitoring. It defines various project index
+# names, environment variable settings for the OpenSearch connection, and constants
+# for queries and timeouts.
+#
+# The primary interface is the `OpenSearchDB` class, which provides functionality for
+# querying and processing indexed test/job metadata within NVIDIA's CI infrastructure,
+# such as job information, stage results, test status, and related analytics for display
+# or automation.
+#
+# Typical usage requires setting environment variables for authentication and server
+# address, as used by Jenkins or related services.
+#
+# =============================================================================
+
 import hashlib
 import json
 import logging
@@ -246,7 +264,7 @@ class OpenSearchDB:
             if res.status_code in [200, 201, 202]:
                 return res.json()
             OpenSearchDB.logger.info(
-                f"nvdf query failed, will retry, error:{res.status_code} {res.text}"
+                f"OpenSearchDB query failed, will retry, error:{res.status_code} {res.text}"
             )
             retry_time -= 1
         OpenSearchDB.logger.error(
