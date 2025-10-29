@@ -1735,7 +1735,7 @@ void WindowBlockManager::offloadBlock(
     windowSizes.emplace_back(firstWindowSize);
 
     // Get blockKey for first window size
-    auto newBlockKeys = mLookup->findNewContextBlock(llmRequest, 0, true, windowSizes);
+    auto newBlockKeys = mLookup->findNewContextBlock(llmRequest, -1, true, windowSizes);
 
     // If newBlockKeys does not have an entry for firstWindowSize, it means no new context block was found
     if (newBlockKeys.count(firstWindowSize))
