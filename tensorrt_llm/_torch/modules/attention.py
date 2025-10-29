@@ -943,6 +943,7 @@ class MLA(nn.Module):
             sparse_attention_config=config.sparse_attention_config,
             dtype=dtype,
             aux_stream=aux_stream,
+            mapping=mapping,
         )
 
         self.softmax_scale = 1.0 / (math.sqrt(self.qk_head_dim) * q_scaling)

@@ -11,8 +11,9 @@ from tensorrt_llm._torch.attention_backend.interface import (
     MLAParams, PositionalEmbeddingParams)
 from tensorrt_llm._torch.attention_backend.trtllm import (
     TrtllmAttention, TrtllmAttentionMetadata)
+from tensorrt_llm._torch.distributed import AllReduce
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
-from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.multi_stream_utils import \
     maybe_execute_in_parallel
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
@@ -24,6 +25,7 @@ from tensorrt_llm.bindings.internal.batch_manager import \
     CacheType as CacheTypeCpp
 from tensorrt_llm.deep_gemm import (fp8_mqa_logits, fp8_paged_mqa_logits,
                                     get_paged_mqa_logits_metadata)
+from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -582,7 +584,8 @@ class Indexer(nn.Module):
                  sparse_attention_config: "SparseAttentionConfig",
                  dtype: Optional[torch.dtype],
                  layer_idx: int = 0,
-                 aux_stream: Optional[torch.cuda.Stream] = None):
+                 aux_stream: Optional[torch.cuda.Stream] = None,
+                 mapping: Optional[Mapping] = None):
         super().__init__()
         self.hidden_size = mla_params.hidden_size
         self.q_lora_rank = mla_params.q_lora_rank
@@ -614,6 +617,8 @@ class Indexer(nn.Module):
             self.n_heads,
             bias=False,
             dtype=dtype,
+            mapping=mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
             quant_config=None,
             skip_create_weights_in_init=skip_create_weights_in_init,
             use_custom_cublas_mm=True)
@@ -629,6 +634,10 @@ class Indexer(nn.Module):
         self.scale_fmt = "ue8m0"
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+        
+        # allreduce for TP
+        self.allreduce = AllReduce(mapping=mapping,
+                                   strategy=AllReduceStrategy.AUTO)
 
     @staticmethod
     def prepare_one_prefill_chunk(
@@ -990,6 +999,7 @@ class Indexer(nn.Module):
                         chunk.cu_seqlen_ks,
                         chunk.cu_seqlen_ke,
                     )
+                    logits = self.allreduce(logits)
                     topk_indices = logits.topk(min(self.index_topk,
                                                    logits.shape[-1]),
                                                dim=-1)[1]
@@ -1019,6 +1029,7 @@ class Indexer(nn.Module):
                     cu_seqlen_ks,
                     cu_seqlen_ke,
                 )
+                logits = self.allreduce(logits)
                 topk_indices = logits.topk(min(self.index_topk,
                                                logits.shape[-1]),
                                            dim=-1)[1]
@@ -1069,6 +1080,7 @@ class Indexer(nn.Module):
                     num_generations],  # Only pass generation request block tables
                 metadata.scheduler_metadata_buffer,
                 max_seq_len)
+            logits_decode = self.allreduce(logits_decode)
             # padded
             positions = torch.arange(
                 max_seq_len,
@@ -1184,6 +1196,7 @@ class DSATrtllmAttention(TrtllmAttention):
             sparse_attention_config: Optional["SparseAttentionConfig"] = None,
             dtype: Optional[torch.dtype] = None,
             aux_stream: Optional[torch.cuda.Stream] = None,
+            mapping: Optional[Mapping] = None,
             **kwargs):
         if sparse_attention_config is None:
             raise ValueError(
@@ -1207,7 +1220,7 @@ class DSATrtllmAttention(TrtllmAttention):
         self.indexer = Indexer(quant_config, pos_embd_params, mla_params,
                                skip_create_weights_in_init,
                                sparse_attention_config, dtype, layer_idx,
-                               aux_stream)
+                               aux_stream, mapping)
 
     def sparse_attn_predict(
         self,
