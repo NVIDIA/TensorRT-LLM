@@ -16,6 +16,13 @@ def pytest_addoption(parser):
         help="Enable disaggregated tests collection. "
              "Example: pytest --disagg"
     )
+    parser.addoption(
+        "--test-list",
+        action="store",
+        default=None,
+        help="Path to a file containing test IDs (one per line) to run. "
+             "Example: pytest --disagg --test-list=testlist/testlist_gb200.txt"
+    )
 
 
 def pytest_collect_directory(path, parent):
