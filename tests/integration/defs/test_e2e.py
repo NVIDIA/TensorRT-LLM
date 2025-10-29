@@ -2208,7 +2208,7 @@ def test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus(
             "--moe_ep_size=8",
             "--tp_size=8",
             "--use_cuda_graph",
-            f"--kv_cache_fraction={_MEM_FRACTION_80 if is_blackwell else _MEM_FRACTION_95}",
+            f"--kv_cache_fraction={_MEM_FRACTION_50 if is_blackwell else _MEM_FRACTION_95}",
             "--max_batch_size=1",
             "--max_seq_len=3000",
             "--disable_kv_cache_reuse",
