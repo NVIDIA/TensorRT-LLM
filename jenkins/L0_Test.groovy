@@ -1303,6 +1303,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     kubernetes.io/arch: ${arch}
                     kubernetes.io/os: linux
                     nvidia.com/gpu_type: ${gpuType}
+                    tensorrt/test_type: perf
                     nvidia.com/driver_version: '${driverVersion}'"""
         }
         else
