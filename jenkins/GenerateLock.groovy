@@ -38,14 +38,12 @@ def createKubernetesPodConfig()
     return podConfig
 }
 
-def getGitCredentialId (String repoUrl) {
-    if (repoUrl ==~ /https:\/\/github\.com\/[\w\-]+\/[\w\-\.]+(\.git)?/) {
+def getGitCredentialId (String repoUrlKey) {
+    if (repoUrlKey == "tensorrt_llm_internal") {
+        return 'svc_tensorrt_gitlab_api_token_no_username_as_string'
+    } else {
         return 'github-token-trtllm-ci'
     }
-    if (repoUrl ==~ /https:\/\/gitlab\-master\.nvidia\.com\/[\w\-]+\/[\w\-\.]+(\.git)?/) {
-        return 'svc_tensorrt_gitlab_api_token'
-    }
-    return null
 }
 
 def generate()
@@ -53,14 +51,19 @@ def generate()
     sh "pwd && ls -alh"
 
     container("alpine") {
-        def LLM_REPO = params.repoUrl
-        if (LLM_REPO == "Custom Repo") {
+        def LLM_REPO = "https://github.com/NVIDIA/TensorRT-LLM.git"
+        if (params.repoUrlKey == "tensorrt_llm_internal") {
+            withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
+                LLM_REPO = DEFAULT_LLM_REPO
+            }
+        }
+        if (params.repoUrlKey == "custom_repo") {
+            if (params.customRepoUrl == "") {
+                throw new Exception("Invalid custom repo url provided")
+            }
             LLM_REPO = params.customRepoUrl
         }
-        def CREDENTIAL_ID = getGitCredentialId(LLM_REPO)
-        if (CREDENTIAL_ID == null) {
-            throw new Exception("Failed to get access token for repository")
-        }
+        def CREDENTIAL_ID = getGitCredentialId(params.repoUrlKey)
         sh "apt update"
         sh "apt install -y python3-dev git curl git-lfs"
         sh "git config --global --add safe.directory ${env.WORKSPACE}"
@@ -75,13 +78,13 @@ def generate()
         def count = sh(script: "git status --porcelain security_scanning/ | wc -l", returnStdout: true).trim()
         echo "Changed/untracked file count: ${count}"
         if (count == "0") {
-            echo "No changes in Git"
+            echo "No update that needs to be checked in"
         } else {
             sh "git status"
             sh "git add \$(find . -type f \\( -name 'poetry.lock' -o -name 'pyproject.toml' \\))"
             sh "git commit -s -m \"[None][infra] Check in most recent lock file from nightly pipeline\""
-            withCredentials([usernamePassword(credentialsId: CREDENTIAL_ID, usernameVariable: 'GIT_USER', passwordVariable: 'GIT_PASS')]) {
-                def authedUrl = LLM_REPO.replaceFirst('https://', "https://${GIT_USER}:${GIT_PASS}@")
+            withCredentials([string(credentialsId: CREDENTIAL_ID, variable: 'API_TOKEN')]) {
+                def authedUrl = LLM_REPO.replaceFirst('https://', "https://svc_tensorrt:${API_TOKEN}@")
                 sh "git remote set-url origin ${authedUrl}"
                 sh "git fetch origin ${params.branchName}"
                 sh "git status"
@@ -99,8 +102,8 @@ pipeline {
     }
     parameters {
         string(name: 'branchName', defaultValue: 'main', description: 'the branch to generate the lock files')
-        choice(name: 'repoUrl', choices: ['https://github.com/NVIDIA/TensorRT-LLM.git','https://gitlab-master.nvidia.com/ftp/tekit.git', 'Custom Repo'], description: "The repo url to process, choose \"Custom repo\" if you want to set your own repo")
-        string(name: 'customRepoUrl', defaultValue: '', description: 'Your custom repo to get processed, need to select \"Custom repo\" for repoUrl, otherwise it will be ignored')
+        choice(name: 'repoUrlKey', choices: ['tensorrt_llm_github','tensorrt_llm_internal', 'custom_repo'], description: "The repo url to process, choose \"custom_repo\" if you want to set your own repo")
+        string(name: 'customRepoUrl', defaultValue: '', description: 'Your custom repo to get processed, need to select \"custom_repo\" for repoUrlKey, otherwise it will be ignored')
     }
     options {
         skipDefaultCheckout()
