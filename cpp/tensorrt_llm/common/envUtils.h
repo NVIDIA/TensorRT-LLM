@@ -147,4 +147,6 @@ int getEnvMoeA2ACombineBlockSize();
 
 bool getEnvKVCacheTransferAllBlocksForWindow();
 
+bool getEnvEplbForceGdrcopy();
+
 } // namespace tensorrt_llm::common
