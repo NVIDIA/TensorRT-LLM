@@ -380,7 +380,7 @@ size_t getEnvAllReduceWorkspaceSize()
     return workspaceSize;
 }
 
-std::string const& getEnvKVCacheTransferOutputPath()
+std::string const& getEnvKVCacheTimeOutputPath()
 {
     static std::string outputPath = getStrEnv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH").value_or("");
     return outputPath;
@@ -493,6 +493,11 @@ int getEnvMoeA2ACombineBlockSize()
 {
     static int const kBlock = sanitizeBlockSize(getIntEnv("TLLM_MOE_A2A_COMBINE_BLOCK_SIZE"));
     return kBlock;
+}
+
+bool getEnvEplbForceGdrcopy()
+{
+    return getBoolEnv("TRTLLM_EPLB_FORCE_GDRCOPY");
 }
 
 } // namespace tensorrt_llm::common

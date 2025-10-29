@@ -14,17 +14,17 @@
 # limitations under the License.
 # -*- coding: utf-8 -*-
 """
-Sample options config for trtllm-bench perf tests
+Sampler options config for trtllm-bench perf tests
 """
 
 
-def get_sample_options_config(model_label: str) -> dict:
+def get_sampler_options_config(model_label: str) -> dict:
     """
-    Return the sample options config corresponding to the model label.
+    Return the sampler options config corresponding to the model label.
     Args:
         model_label: model label from self._config.to_string()
     Returns:
-        dict: sample options config
+        dict: sampler options config
     """
     base_config = {
         'top_k': 4,
