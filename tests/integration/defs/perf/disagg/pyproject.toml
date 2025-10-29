@@ -13,6 +13,10 @@ pandas = ">=2.3.2,<3.0.0"
 psutil = "^7.1.0"
 pyyaml = "^6.0.3"
 
+[tool.pytest.ini_options]
+# Set the root directory to current directory to avoid loading parent conftest.py
+# This prevents import errors from upper level dependencies
+rootdir = "."
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
