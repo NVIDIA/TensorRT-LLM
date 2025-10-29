@@ -2,8 +2,9 @@ import copy
 import enum
 import math
 from abc import ABC, abstractmethod
-from collections import OrderedDict, defaultdict
-from typing import Dict, Iterable, List, Optional, Set, Tuple, Union
+from collections import OrderedDict, defaultdict, deque
+from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Set, Tuple,
+                    Union)
 
 import torch
 
@@ -41,6 +42,11 @@ KVCacheEventManagerCpp = tensorrt_llm.bindings.internal.batch_manager.KVCacheEve
 RequestList = list[LlmRequest]
 PeftCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.PeftCacheManager
 WorldConfig = tensorrt_llm.bindings.WorldConfig
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.attention_backend.interface import \
+        AttentionMetadata
+
 TempAttentionWindowInputs = tensorrt_llm.bindings.internal.batch_manager.TempAttentionWindowInputs
 BlocksPerWindow = Dict[int, Tuple[
     int,
@@ -166,6 +172,9 @@ class KVCacheManager(BaseResourceManager):
         max_beam_width: int = 1,
         is_draft: bool = False,
         kv_connector_manager: Optional[KvCacheConnectorManager] = None,
+        enable_indexer_k_cache: bool = False,
+        indexer_k_cache_quant_block_size: int = 128,
+        indexer_k_cache_index_head_dim: int = 0,
         **kwargs,
     ) -> None:
         self.mapping = mapping
@@ -237,6 +246,7 @@ class KVCacheManager(BaseResourceManager):
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
         self.attention_dp_events_gather_period_ms = kv_cache_config.attention_dp_events_gather_period_ms
         self.max_num_tokens = max_num_tokens
+        self.max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
 
         # Determine max_attention_window_vec
         if kv_cache_config.max_attention_window is None:
@@ -245,7 +255,6 @@ class KVCacheManager(BaseResourceManager):
         else:
             self.max_attention_window_vec = kv_cache_config.max_attention_window.copy(
             )  # Make a copy to avoid modifying original
-
             # Clamp all window sizes to max_seq_len before calculating the
             # number of KV cache blocks. This prevents the KV cache pool from
             # being skewed by the largest window values.
@@ -338,6 +347,10 @@ class KVCacheManager(BaseResourceManager):
             'enable_partial_reuse': kv_cache_config.enable_partial_reuse,
             'copy_on_partial_reuse': kv_cache_config.copy_on_partial_reuse,
             'kv_connector_manager': self.kv_connector_manager,
+            'enable_indexer_k_cache': enable_indexer_k_cache,
+            'indexer_k_cache_quant_block_size':
+            indexer_k_cache_quant_block_size,
+            'indexer_k_cache_index_head_dim': indexer_k_cache_index_head_dim
         }
 
         if self.event_buffer_max_size > 0:
@@ -517,7 +530,13 @@ class KVCacheManager(BaseResourceManager):
             requests.append(req)
         return requests
 
-    def update_resources(self, scheduled_batch: ScheduledRequests):
+    def update_resources(self,
+                         scheduled_batch: ScheduledRequests,
+                         attn_metadata: "AttentionMetadata" = None,
+                         kv_cache_dtype_byte_size: float = None):
+        self.update_kv_cache_draft_token_location(scheduled_batch,
+                                                  attn_metadata,
+                                                  kv_cache_dtype_byte_size)
         # rewind kv cache
         for request in scheduled_batch.generation_requests:
             if request.state != LlmRequestState.GENERATION_COMPLETE:
@@ -527,6 +546,77 @@ class KVCacheManager(BaseResourceManager):
         # For context requests, we store the blocks for reuse.
         for request in scheduled_batch.context_requests:
             self.impl.store_context_blocks(request)
+
+    def locate_accepted_draft_tokens(self, requests: List[LlmRequest]):
+        num_accepted_draft_tokens = []
+        accepted_draft_tokens_indices = []
+        rewind_draft_token_separate_adjustments = []
+        # for context requests, the py_num_accepted_draft_tokens = 0, and py_num_accepted_draft_tokens_indices = []
+        for seq in requests:
+            num_accepted_draft_tokens.append(seq.py_num_accepted_draft_tokens)
+            rewind_draft_token_separate_adjustments.append(
+                seq.py_rewind_draft_token_separate_adjustment)
+            accepted_draft_tokens_indices.extend(
+                seq.py_num_accepted_draft_tokens_indices)
+        batch_size = len(requests)
+        num_accepted_draft_tokens_offset = torch.zeros(batch_size + 1,
+                                                       dtype=torch.int32,
+                                                       device='cuda')
+        num_accepted_draft_tokens_offset[1:] = torch.cumsum(torch.tensor(
+            num_accepted_draft_tokens, dtype=torch.int32),
+                                                            dim=0)
+        accepted_draft_tokens_indices = torch.tensor(
+            accepted_draft_tokens_indices, dtype=torch.int32, device='cuda')
+        rewind_draft_token_separate_adjustments = torch.tensor(
+            rewind_draft_token_separate_adjustments,
+            dtype=torch.int32,
+            device='cuda')
+        return num_accepted_draft_tokens_offset, accepted_draft_tokens_indices, rewind_draft_token_separate_adjustments
+
+    def update_kv_cache_draft_token_location(self,
+                                             scheduled_batch: ScheduledRequests,
+                                             attn_metadata: "AttentionMetadata",
+                                             kv_cache_dtype_byte_size: float):
+        run_kv_cache_rellocation = False
+        for request in scheduled_batch.generation_requests:
+            if request.state != LlmRequestState.GENERATION_COMPLETE:
+                if request.py_num_accepted_draft_tokens > 0 and len(
+                        request.py_num_accepted_draft_tokens_indices) > 0:
+                    run_kv_cache_rellocation = True
+        if not run_kv_cache_rellocation:
+            return
+        requests = scheduled_batch.all_requests()
+        accepted_draft_token_offsets, packed_accepted_draft_tokens_indices, rewind_draft_token_separate_adjustments = self.locate_accepted_draft_tokens(
+            requests)
+        past_key_value_lengths = attn_metadata.kv_lens_cuda
+        if attn_metadata.kv_cache_block_offsets is not None and attn_metadata.host_kv_cache_block_offsets is not None and attn_metadata.host_kv_cache_pool_pointers is not None and attn_metadata.host_kv_cache_pool_mapping is not None:
+            use_paged_kv_cache = True
+        else:
+            use_paged_kv_cache = False
+        assert use_paged_kv_cache, "Only paged kv cache is supported"
+        assert len(
+            self.max_attention_window_vec
+        ) == 1, "Currently, only one max attention window size is supported."
+
+        if use_paged_kv_cache:
+            torch.ops.tensorrt_llm.update_kv_cache_draft_token_location(
+                accepted_draft_token_offsets,
+                packed_accepted_draft_tokens_indices,
+                past_key_value_lengths,
+                True,
+                self.num_layers,
+                self.num_kv_heads,
+                int(self.head_dim * kv_cache_dtype_byte_size),
+                self.max_draft_len,
+                self.max_attention_window_vec[0],
+                rewind_draft_token_separate_adjustments,
+                None,
+                self.kv_cache_pool_pointers,
+                attn_metadata.kv_cache_block_offsets,
+                self.max_blocks_per_seq,
+                self.tokens_per_block,
+                None,
+            )
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         return self.impl.remove_sequence(request.py_request_id, request,
@@ -733,6 +823,10 @@ class KVCacheManager(BaseResourceManager):
             self.num_kv_heads_per_layer[layer_offset],
             self.head_dim,
         )
+
+    def get_indexer_k_cache_pool_data(self, layer_idx: int) -> torch.Tensor:
+        result = self.impl.get_indexer_k_cache_pool_data(layer_idx)
+        return result.view(result.shape[0], -1)
 
     def get_unique_primary_pool(self) -> torch.Tensor:
         return self.impl.get_unique_primary_pool()
@@ -1117,6 +1211,79 @@ class SlotManager:
             self.free_slots) == self.max_num_requests
 
 
+class BlockManager:
+
+    def __init__(self, num_blocks: int, tokens_per_block: int):
+        self.num_blocks = num_blocks
+        self.tokens_per_block = tokens_per_block
+        self.max_blocks_per_seq = self.num_blocks
+
+        self.base_block_offsets = torch.arange(self.num_blocks,
+                                               device="cpu",
+                                               dtype=torch.int32)
+
+        self.block_ids = dict()
+        self.num_sequences = dict()
+        self.free_blocks = deque(range(self.num_blocks))
+
+    def add_tokens(self, request_id: int, num_tokens: int):
+        if num_tokens > 0:
+            if request_id not in self.block_ids:
+                self.block_ids[request_id] = []
+                self.num_sequences[request_id] = num_tokens
+            else:
+                self.num_sequences[request_id] += num_tokens
+            block_count_needed = self.compute_block_count(
+                self.num_sequences[request_id], self.tokens_per_block)
+            if len(self.block_ids[request_id]) < block_count_needed:
+                new_blocks = self._allocate_blocks(
+                    block_count_needed - len(self.block_ids[request_id]))
+                self.block_ids[request_id].extend(new_blocks)
+
+    def copy_block_offsets(self, request_ids: List[int],
+                           block_offsets: torch.Tensor) -> None:
+        for i in range(len(request_ids)):
+            block_ids = self.block_ids[request_ids[i]]
+            block_num = len(block_ids)
+            block_offsets[i, 0:block_num].copy_(
+                self.base_block_offsets[torch.tensor(block_ids,
+                                                     dtype=torch.int32,
+                                                     device="cpu")])
+
+    def compute_block_count(self, token_count: int,
+                            tokens_per_page: int) -> int:
+        return (token_count + tokens_per_page - 1) // tokens_per_page
+
+    def free_resources(self, request: LlmRequest):
+        request_id = request.py_request_id
+        self._free_blocks(self.block_ids[request_id])
+        del self.block_ids[request_id]
+        del self.num_sequences[request_id]
+
+    def rewind_cache(self, request: LlmRequest, rewind_len: int):
+        if rewind_len == 0:
+            return
+        request_id = request.py_request_id
+        self.num_sequences[request_id] -= rewind_len
+        updated_token_num = max(self.num_sequences[request_id], 0)
+        block_count_needed = self.compute_block_count(updated_token_num,
+                                                      self.tokens_per_block)
+        num_rewind_pages = len(self.block_ids[request_id]) - block_count_needed
+        if num_rewind_pages > 0:
+            self._free_blocks(self.block_ids[request_id][-num_rewind_pages:])
+            self.block_ids[request_id] = self.block_ids[
+                request_id][:-num_rewind_pages]
+        return
+
+    def _allocate_blocks(self, block_count: int) -> list:
+        assert len(self.free_blocks) >= block_count, "Not enough blocks."
+        blocks = [self.free_blocks.popleft() for _ in range(block_count)]
+        return blocks
+
+    def _free_blocks(self, block_list: list):
+        self.free_blocks.extend(block_list)
+
+
 class ResourceManager:
 
     def __init__(self, resource_managers: dict[str, BaseResourceManager]):
@@ -1139,10 +1306,18 @@ class ResourceManager:
                 resource_manager.prepare_resources(scheduled_batch)
 
     @nvtx_range("update_resources")
-    def update_resources(self, scheduled_batch: ScheduledRequests):
+    def update_resources(self,
+                         scheduled_batch: ScheduledRequests,
+                         attn_metadata: "AttentionMetadata" = None,
+                         kv_cache_dtype_byte_size: float = None):
         for _, resource_manager in self.resource_managers.items():
             if hasattr(resource_manager, "update_resources"):
-                resource_manager.update_resources(scheduled_batch)
+                if isinstance(resource_manager, KVCacheManager):
+                    resource_manager.update_resources(scheduled_batch,
+                                                      attn_metadata,
+                                                      kv_cache_dtype_byte_size)
+                else:
+                    resource_manager.update_resources(scheduled_batch)
 
     def free_resources(self, request: LlmRequest):
         for _, resource_manager in reversed(self.resource_managers.items()):

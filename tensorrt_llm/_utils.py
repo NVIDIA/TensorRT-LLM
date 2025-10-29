@@ -25,17 +25,17 @@ import tempfile
 import trace
 import weakref
 from contextlib import contextmanager
-from dataclasses import asdict
 from enum import EnumMeta
 from functools import lru_cache, partial, wraps
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 
 import numpy as np
 import nvtx
 from mpi4py import MPI
 from mpi4py.util import pkl5
 from packaging import version
+from typing_extensions import ParamSpec
 
 # isort: off
 import torch
@@ -578,7 +578,7 @@ def local_mpi_barrier():
 
 
 def mpi_broadcast(obj, root=0):
-    return mpi_comm().bcast(obj, root) if is_multi_device_enable() else obj
+    return mpi_comm().bcast(obj, root) if global_mpi_size() > 1 else obj
 
 
 def mpi_allgather(obj):
@@ -797,38 +797,6 @@ def trace_func(func):
         return result
 
     return wrapper
-
-
-class DictConversion:
-
-    @classmethod
-    def from_dict(cls, config: Dict[str, Any]):
-        obj = cls()
-        fields = obj.__dataclass_fields__
-        for key, value in config.items():
-            assert hasattr(obj, key), f"cannot find {key} in {obj}"
-            field_cls = fields[key].type
-            if (isinstance(field_cls, type)
-                    and issubclass(field_cls, DictConversion)
-                    and isinstance(value, dict)):
-                value = field_cls.from_dict(value)
-            setattr(obj, key, value)
-        return obj
-
-    def to_dict(self):
-        return asdict(self)
-
-    @classmethod
-    def from_json_file(cls, file):
-        with open(file) as f:
-            return cls.from_dict(json.load(f))
-
-    def set_defaults(self, **kwargs):
-        for key, default in kwargs.items():
-            value = getattr(self, key)
-            if (value is None
-                    or (isinstance(value, (list, dict)) and len(value) == 0)):
-                setattr(self, key, default)
 
 
 class BaseEnumMeta(EnumMeta):
@@ -1174,17 +1142,6 @@ class KVCacheEventSerializer:
         }
 
 
-def is_multi_device_enable():
-    """
-    This method evaluates if we are running on multiple GPUs and the flag ENABLE_MULTI_DEVICE is set.
-    So we can avoid broadcast calls on single GPU.
-    Issue: https://github.com/NVIDIA/TensorRT-LLM/issues/5927
-    ENABLE_MULTI_DEVICE is true by default when building TensorRT LLM so we need to also check
-    the number of devices
-    """
-    return local_mpi_size() > 1
-
-
 def set_prometheus_multiproc_dir() -> object:
     # Adapted from: https://github.com/sgl-project/sglang/blob/v0.4.10/python/sglang/srt/utils.py#L1266
     global prometheus_multiproc_dir
@@ -1199,6 +1156,21 @@ def set_prometheus_multiproc_dir() -> object:
         f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")
 
 
+P = ParamSpec("P")
+
+
+# From: https://stackoverflow.com/a/4104188/2749989
+def run_once(f: Callable[P, None]) -> Callable[P, None]:
+
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> None:
+        if not wrapper.has_run:  # type: ignore[attr-defined]
+            wrapper.has_run = True  # type: ignore[attr-defined]
+            return f(*args, **kwargs)
+
+    wrapper.has_run = False  # type: ignore[attr-defined]
+    return wrapper
+
+
 TORCH_PYBIND11_ABI = None
 
 
@@ -1207,3 +1179,19 @@ def torch_pybind11_abi() -> str:
     if TORCH_PYBIND11_ABI is None:
         TORCH_PYBIND11_ABI = f"{torch._C._PYBIND11_COMPILER_TYPE}{torch._C._PYBIND11_STDLIB}{torch._C._PYBIND11_BUILD_ABI}"
     return TORCH_PYBIND11_ABI
+
+
+@lru_cache(maxsize=1)
+def is_device_integrated() -> bool:
+    """Check if the current GPU device is integrated (shares physical memory with CPU).
+
+    Integrated GPU systems include DGX Spark and other unified memory architectures.
+    This function caches the result to avoid repeated CUDA device property queries.
+
+    Returns:
+        bool: True if the GPU is integrated, False otherwise. Returns False if CUDA
+              is not available.
+    """
+    if not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_properties().is_integrated

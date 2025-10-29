@@ -261,7 +261,39 @@ trtllm-serve disaggregated -c disagg_config.yaml -m ./metadata_config.yaml
 
 You can also run FP8 for context and BF16 for generation, as long as the KV-cache dtype is consistent across all workers.
 
-## Dynamic scaling (Prototype)
+## Dynamic scaling 
+  
+### Service discovery method
+
+Disaggregated server also supports dynamic service-discovery and auto-scaling of context/generation servers. This can be achieved by setting `disagg_cluster` section in the configurations of both context/generation servers and disagg-server. In this case, the context/generation servers must include an extra command line of `--server-role=[context|generation]`, also the `context/genration_servers` section of disaggregated server must be removed. You can simplify context/generation servers' config section by only passing `--disagg_cluster_uri=<disagg_cluster_uri>` in the command line (but disaggregated server's config must have this section). The omitted fields will use the defaults shown below. 
+
+```yaml
+disagg_cluster:
+  cluster_uri: <your_cluster_uri>
+  cluster_name: ""
+  minimal_instances: 
+    context_servers: 1
+    generation_servers: 1
+  heartbeat_interval_sec: 5
+  inactive_interval_sec: 10
+```
+- `cluster_uri`: the http address of disagg-server like `http://<your-disagg-server-host>:<your-disagg-server-port>` or a pre-configured Etcd server address like `etcd://<your-etcd-host>:2379`.
+- `cluster_name` : optional namespace to isolate multiple disagg-clusters in Etcd.
+- `minimal_instances`: the equivalence of `num_instances` in the auto-scaling concept, disagg-server will reject requests when 
+the active context/generation servers is below the corresponding threshold.
+- `heartbeat_interval_sec`: frequency at which context/generation servers send heartbeats to the disagg-server.
+- `inactive_interval_sec`: A server is marked inactive if no heartbeat is received within this interval (set higher than the heartbeat interval).
+
+Note that the disaggregated server and all the context/generation servers should have the same `disagg_cluster` configuration values, or the disaggregated server may not be able to keep alive or detect inactivity the other servers properly. If `disagg_cluster` section is specified, 
+
+Additionally, we offer a fully executable script—please refer to [Disaggregated SLURM Scripts](./slurm/service_discovery_example/).
+
+#### Dynamically adding servers
+
+To add servers dynamically, you can start more context/generation workers with the same `disagg_cluster`, then the disaggregated server can discover the new servers and dispatch requests to them automatically. If a context/generation server becomes inactive, the disaggregated server will also detect this and stop routing requests to it.
+
+
+### Metadata server method (Prototype)
 
 Currently, trtllm supports dynamic addition and removal of servers by leveraging ETCD. To enable this feature, you should start the context and generation servers with an additional flag ```--metadata_server_config_file``` and ```--server_role```.
 Before launching the context and generation servers, you should first start the ETCD server. By default, the ETCD server listens for client requests at ```localhost:2379```.
@@ -297,7 +329,7 @@ refersh_interval: 10.0
 
 The ```hostname``` and ```port``` must match those used when starting the ETCD server. The ```health_check_timeout``` parameter specifies how long a server will be considered dead if no healthy response is received. By default, trtllm will perform two checks before marking a server as dead. The ```refresh_interval``` parameter determines how often the latest server list is fetched from the ETCD server.
 
-### Dynamically adding servers
+#### Dynamically adding servers
 
 Users can add servers by directly launching them with trtllm-serve. For example, you can start an additional generation server as follows:
 

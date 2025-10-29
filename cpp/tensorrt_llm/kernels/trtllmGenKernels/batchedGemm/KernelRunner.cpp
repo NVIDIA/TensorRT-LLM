@@ -144,18 +144,22 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
                 }
             }
 
-            // FIXME: Disable split-k for now.
-            if (options.mClusterDimZ != 1)
-            {
-                continue;
-            }
-
             if (options.mFusedAct)
             {
                 if (options.mActType != static_cast<batchedGemm::gemmGatedAct::ActType>(mOptions.actType))
                 {
                     continue;
                 }
+            }
+
+            // FIXME: Disables a few static scheduler kernels (schedS) that appears to have issues;
+            // found after commit e257cb3533; still under investigation. Offending kernels:
+            // bmm_E2m1_E2m1E2m1_Fp32_t128x64x256_s6_et128x64_m128x64x64_cga1x1x1_16dp256b_TN_transOut_schedS_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a
+            // bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256_s3_et128x64_m128x64x32_cga1x1x1_16dp256b_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f
+            if (options.mTileScheduler == TileScheduler::Static && options.mUseTmaOobOpt == true
+                && options.mTileN == 64)
+            {
+                continue;
             }
 
             if (mOptions.transposeMmaOutput && options.mEpilogueTileM == mOptions.epilogueTileM)
@@ -165,7 +169,12 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
         }
     }
 
-    TLLM_CHECK_WITH_INFO(!mPassingConfigIndices.empty(), "No kernel found for the given options");
+    TLLM_CHECK_WITH_INFO(!mPassingConfigIndices.empty(),
+        "No kernel found for the given options: mDtypeA: %s, mDtypeB: %s, mDtypeC: %s, mUseDeepSeekFp8: %d, "
+        "mTransposeMmaOutput: %d, mRouteAct: %d, mFusedAct: %d, mIsStaticBatch: %d, mTileSize: %d",
+        tg::dtypeToString(mOptions.dtypeA).c_str(), tg::dtypeToString(mOptions.dtypeB).c_str(),
+        tg::dtypeToString(mOptions.dtypeC).c_str(), mOptions.deepSeekFp8, mOptions.transposeMmaOutput,
+        mOptions.routeAct, mOptions.fusedAct, mOptions.staticBatch, mOptions.tileSize);
 }
 
 size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(int32_t m, int32_t n, int32_t k,
@@ -277,7 +286,8 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vecto
     auto envVarVal = std::getenv("TLLM_BATCHED_GEMM_PRINT_NAME");
     if (envVarVal && std::atoi(envVarVal) == 1)
     {
-        TLLM_LOG_INFO("numBatches %d Gemm %d %d %d Kernel %s\n", numBatches, m, n, k, config.mFunctionName);
+        TLLM_LOG_INFO("NumBatches %d, MaxNumCtasInBatchDim %d, ShapeMNK %d %d %d, Kernel %s", numBatches,
+            maxNumCtasInBatchDim, m, n, k, config.mFunctionName);
     }
     // FIXME once we start using all-reduce in the epilogue of the bmm this can be moved elsewhere
     bmm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));

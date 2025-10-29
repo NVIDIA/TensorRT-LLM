@@ -1,10 +1,13 @@
 import enum
+import random
 from dataclasses import dataclass, field
 from typing import (Any, Callable, Dict, List, Optional, Protocol, Tuple, Type,
                     TypeVar)
 
 from PIL import Image
 from torch import Tensor, nn
+
+import tensorrt_llm
 
 from .._utils import nvtx_range_debug
 from ..logger import logger
@@ -47,9 +50,41 @@ class BaseDummyInputsBuilder:
     Base class for generating dummy inputs. Specially for profiling
     """
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.image_max_dim = 16384
+        self.img_min_dim = 128
+
+    def get_dummy_image(self, max_width: int, max_height: int):
+        image = Image.new("RGB", (max_width, max_height),
+                          color=random.randint(0, 256))
+        return image
+
     def get_dummy_prompt(self, input_seq_len: int):
-        raise NotImplementedError(
-            "Please ensure this method is implemented in your inherited class")
+        # TODO(yechank): We use the max resolution as starting point and keep reducing the resolution until the prompt length is less than the input sequence length.
+        # Need to find better way to calculate the dummy prompt length as this iteration may not be efficient.
+        while self.image_max_dim >= self.img_min_dim:
+            image = self.get_dummy_image(max_width=self.image_max_dim,
+                                         max_height=self.image_max_dim)
+
+            test_mm_prompt = tensorrt_llm.inputs.utils.default_multimodal_input_loader(
+                tokenizer=self.tokenizer,
+                model_dir=self.model_path,
+                model_type=self.model_config.model_type,
+                modality="image",
+                prompts=[""],
+                media=[[image]],
+                image_data_format="pt")[0]
+
+            prompt_token_ids_single_img, _ = self(test_mm_prompt, None)
+
+            if len(prompt_token_ids_single_img) <= input_seq_len:
+                return test_mm_prompt
+
+            # reduce img resolution
+            self.image_max_dim = self.image_max_dim >> 1
+
+        return None
 
 
 class BaseMultimodalInputProcessor:
@@ -60,6 +95,9 @@ class BaseMultimodalInputProcessor:
     This class provides default implementations that work with most AutoProcessor-based
     models. Specific processors can override these methods if they need custom logic.
     """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
 
     def get_processor(self) -> Optional[Any]:
         """Return the processor object if available; otherwise raise NotImplementedError.
@@ -448,20 +486,40 @@ def register_input_processor(
     return wrapper
 
 
-def create_input_processor(model_path_or_dir: str, tokenizer):
-    """
-    Create an input processor for a specific model.
+def create_input_processor(
+    model_path_or_dir: str,
+    tokenizer,
+    checkpoint_format: Optional[str] = "HF",
+) -> InputProcessor:
+    """Create an input processor for a specific model.
+
+    Args:
+        model_path_or_dir: Path or repo id used to locate pretrained config/tokenizer.
+        tokenizer: Tokenizer instance.
+        checkpoint_format: Checkpoint format identifier. "HF" uses Hugging Face-style
+            config loading; any other value skips HF config loading. Default is "HF".
+
+    Returns:
+        An InputProcessor implementation (model-specific if registered; otherwise DefaultInputProcessor).
     """
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.models import get_model_architecture
 
     model_config = None
-    try:
-        config = ModelConfig.from_pretrained(model_path_or_dir,
-                                             trust_remote_code=True)
-        model_config = config.pretrained_config
-    except (ValueError, EnvironmentError):
-        config = None
+
+    if checkpoint_format == "HF":
+        try:
+            config = ModelConfig.from_pretrained(model_path_or_dir,
+                                                 trust_remote_code=True)
+            model_config = config.pretrained_config
+        except (ValueError, EnvironmentError) as e:
+            config = None
+            logger.debug(
+                f"Unable to load HF config from {model_path_or_dir}: {e}. Falling back."
+            )
+    else:
+        logger.debug(
+            f"checkpoint_format={checkpoint_format}; skipping HF config load.")
 
     if model_config is not None:
         try:

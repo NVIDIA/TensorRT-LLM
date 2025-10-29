@@ -12,15 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import contextmanager
+from dataclasses import dataclass
 from itertools import product
-from typing import Optional, cast
+from typing import Callable, Generator, Optional, cast
 
 import pytest
-from utils.util import force_ampere
+import torch
+from utils.util import assert_no_cuda_sync, force_ampere
 
 from tensorrt_llm._torch.pyexecutor.sampler import (
     GREEDY,
     LlmRequest,
+    ScheduledRequests,
     TorchSampler,
     _request_strategy,
 )
@@ -315,3 +319,172 @@ class TestStrategySelection:
         is_greedy = strat is GREEDY
 
         assert torch_sampler.should_provide_draft_probs(request) == (not is_greedy)
+
+
+@force_ampere
+@pytest.mark.parametrize(
+    "draft_len, with_ctx, with_gen",
+    [
+        pytest.param(draft_len, with_ctx, with_gen)
+        for (draft_len, with_ctx, with_gen) in product(
+            [0, 3],
+            [False, True],
+            [False, True],
+        )
+        if with_ctx or with_gen
+    ],
+)
+def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool):
+    # Currently only checks that this works and does not sync
+
+    device = torch.device("cuda")
+
+    @contextmanager
+    def _test_runner() -> Generator[Callable[[], None], None, None]:
+        class ContextRequestMock:
+            def __init__(self, return_context_logits: bool):
+                self._return_context_logits = return_context_logits
+
+            @property
+            def py_return_context_logits(self) -> bool:
+                return self._return_context_logits
+
+        class GenRequestMock:
+            pass
+
+        class ScheduledRequestsMock:
+            @property
+            def context_requests(self) -> list[LlmRequest]:
+                return (
+                    [
+                        # NB: One request with py_return_context_logits is enough
+                        #     to trigger tested code.
+                        cast(LlmRequest, ContextRequestMock(True)),
+                        cast(LlmRequest, ContextRequestMock(False)),
+                        cast(LlmRequest, ContextRequestMock(True)),
+                    ]
+                    if with_ctx
+                    else []
+                )
+
+            @property
+            def generation_requests(self) -> list[LlmRequest]:
+                # NB: Currently this list is not inspected, UUT only checks that this
+                #     is not empty.
+                return (
+                    [
+                        cast(LlmRequest, GenRequestMock()),
+                        cast(LlmRequest, GenRequestMock()),
+                    ]
+                    if with_gen
+                    else []
+                )
+
+        vocab_size = 12
+
+        num_context_logits_prefix_sum = [
+            0,
+            *(
+                [
+                    100 + 1,  # context req. 1 (assume context len. 100)
+                    (100 + 1) + (0 + 1),  # context req. 2 (not returning context)
+                    (100 + 1) + (0 + 1) + (50 + 1),  # context req. 3 (assume context len. 50)
+                ]
+                if with_ctx
+                else []
+            ),
+        ]
+        draft_len_req1 = draft_len
+        draft_len_req2 = draft_len + 1  # test with different draft lens
+        req_num_generation_steps = [
+            *(
+                [
+                    1,  # context req. 1
+                    1,  # context req. 2
+                    1,  # context req. 3
+                ]
+                if with_ctx
+                else []
+            ),
+            *(
+                [
+                    draft_len_req1 + 1,  # gen. req. 1
+                    draft_len_req2 + 1,  # gen. req. 2
+                ]
+                if with_gen
+                else []
+            ),
+        ]
+        req_num_generation_steps_tensor = torch.tensor(req_num_generation_steps, dtype=torch.int32)
+        num_logits_to_keep = cast(int, req_num_generation_steps_tensor.sum().item())
+        generation_requests_total_steps = (draft_len_req1 + 1) + (
+            draft_len_req2 + 1
+        )  # cf. req_num_generation_steps
+
+        num_total_steps = num_context_logits_prefix_sum[-1] + generation_requests_total_steps
+        all_logits = torch.empty((num_total_steps, vocab_size))
+
+        for i in range(all_logits.size(0)):
+            all_logits[i, :] = torch.arange(i, i + vocab_size)
+
+        all_logits_cuda = all_logits.to(device=device)
+
+        expected_logit_indices = []
+        if with_ctx:
+            expected_logit_indices += [
+                100,  # gen logits from context req. 1
+                101,  # gen logits from context req. 2
+                152,  # gen logits from context req. 3
+            ]
+        if with_gen:
+            gen_logit_offset = num_context_logits_prefix_sum[-1]
+            expected_logit_indices += [
+                *range(
+                    gen_logit_offset, gen_logit_offset + draft_len_req1 + 1
+                ),  # gen logits from gen. req. 1
+                *range(
+                    gen_logit_offset + draft_len_req1 + 1,
+                    gen_logit_offset + generation_requests_total_steps,
+                ),  # gen logits from gen. req. 2
+            ]
+
+        @dataclass
+        class UutResult:
+            selected_logits: torch.Tensor
+
+        @dataclass
+        class UutResultWrapper:
+            result: Optional[UutResult] = None
+
+        res = UutResultWrapper()
+
+        def _uut(res=res):
+            selected_logits = TorchSampler._select_generated_logits(
+                cast(ScheduledRequests, ScheduledRequestsMock()),
+                all_logits_cuda,
+                req_num_generation_steps=req_num_generation_steps_tensor,
+                num_context_logits_prefix_sum=num_context_logits_prefix_sum,
+                generation_requests_total_steps=generation_requests_total_steps,
+                num_logits_to_keep=num_logits_to_keep,
+            )
+            res.result = UutResult(selected_logits=selected_logits)
+
+        yield _uut
+
+        # Check logits
+        assert res.result is not None
+        selected_logits = res.result.selected_logits
+        torch.testing.assert_close(selected_logits.to("cpu"), all_logits[expected_logit_indices])
+
+    with _test_runner() as uut:
+        # Pre-allocates a large chunk of memory, because PyTorch caching memory allocator
+        # can sync otherwise.
+        buf = torch.ones((2**30,), device=device)
+        del buf
+        # Warmup to avoid syncs due to lazy loading of kernels
+        uut()
+
+    with torch.cuda.Stream():
+        with _test_runner() as uut:
+            with assert_no_cuda_sync():
+                uut()

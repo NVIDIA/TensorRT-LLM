@@ -6,7 +6,6 @@ import yaml
 
 import tensorrt_llm.bindings.executor as tle
 from tensorrt_llm import LLM as TorchLLM
-from tensorrt_llm import AutoParallelConfig
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.builder import LoraConfig
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
@@ -65,7 +64,7 @@ speculative_config:
         dict_content = self._yaml_to_dict(yaml_content)
 
         llm_args = TrtLlmArgs(model=llama_model_path)
-        llm_args_dict = update_llm_args_with_extra_dict(llm_args.to_dict(),
+        llm_args_dict = update_llm_args_with_extra_dict(llm_args.model_dump(),
                                                         dict_content)
         llm_args = TrtLlmArgs(**llm_args_dict)
         assert llm_args.speculative_config.max_window_size == 4
@@ -81,7 +80,7 @@ pytorch_backend_config: # this is deprecated
         dict_content = self._yaml_to_dict(yaml_content)
 
         llm_args = TrtLlmArgs(model=llama_model_path)
-        llm_args_dict = update_llm_args_with_extra_dict(llm_args.to_dict(),
+        llm_args_dict = update_llm_args_with_extra_dict(llm_args.model_dump(),
                                                         dict_content)
         with pytest.raises(ValueError):
             llm_args = TrtLlmArgs(**llm_args_dict)
@@ -97,7 +96,7 @@ build_config:
         dict_content = self._yaml_to_dict(yaml_content)
 
         llm_args = TrtLlmArgs(model=llama_model_path)
-        llm_args_dict = update_llm_args_with_extra_dict(llm_args.to_dict(),
+        llm_args_dict = update_llm_args_with_extra_dict(llm_args.model_dump(),
                                                         dict_content)
         llm_args = TrtLlmArgs(**llm_args_dict)
         assert llm_args.build_config.max_beam_width == 4
@@ -114,7 +113,7 @@ kv_cache_config:
         dict_content = self._yaml_to_dict(yaml_content)
 
         llm_args = TrtLlmArgs(model=llama_model_path)
-        llm_args_dict = update_llm_args_with_extra_dict(llm_args.to_dict(),
+        llm_args_dict = update_llm_args_with_extra_dict(llm_args.model_dump(),
                                                         dict_content)
         llm_args = TrtLlmArgs(**llm_args_dict)
         assert llm_args.kv_cache_config.enable_block_reuse == True
@@ -132,7 +131,7 @@ max_seq_len: 128
         dict_content = self._yaml_to_dict(yaml_content)
 
         llm_args = TrtLlmArgs(model=llama_model_path)
-        llm_args_dict = update_llm_args_with_extra_dict(llm_args.to_dict(),
+        llm_args_dict = update_llm_args_with_extra_dict(llm_args.model_dump(),
                                                         dict_content)
         llm_args = TrtLlmArgs(**llm_args_dict)
         assert llm_args.max_batch_size == 16
@@ -179,10 +178,6 @@ def test_KvCacheConfig_declaration():
     assert pybind_config.enable_partial_reuse == True
     assert pybind_config.copy_on_partial_reuse == True
     assert pybind_config.attention_dp_events_gather_period_ms == 10
-
-
-def test_KvCacheConfig_default_values():
-    check_defaults(KvCacheConfig, tle.KvCacheConfig)
 
 
 def test_CapacitySchedulerPolicy():
@@ -334,13 +329,9 @@ def test_update_llm_args_with_extra_dict_with_nested_dict():
     plugin_config = PluginConfig(dtype='float16', nccl_plugin=None)
     build_config = BuildConfig(max_input_len=1024,
                                lora_config=LoraConfig(lora_ckpt_source='hf'),
-                               auto_parallel_config=AutoParallelConfig(
-                                   world_size=1,
-                                   same_buffer_io={},
-                                   debug_outputs=[]),
                                plugin_config=plugin_config)
     extra_llm_args_dict = {
-        "build_config": build_config.to_dict(),
+        "build_config": build_config.model_dump(mode="json"),
     }
 
     llm_api_args_dict = update_llm_args_with_extra_dict(llm_api_args_dict,
@@ -361,8 +352,9 @@ def test_update_llm_args_with_extra_dict_with_nested_dict():
                 raise ValueError(f"Mismatch at {path}: {dict1} != {dict2}")
         return True
 
-    build_config_dict1 = build_config.to_dict()
-    build_config_dict2 = initialized_llm_args.build_config.to_dict()
+    build_config_dict1 = build_config.model_dump(mode="json")
+    build_config_dict2 = initialized_llm_args.build_config.model_dump(
+        mode="json")
     check_nested_dict_equality(build_config_dict1, build_config_dict2)
 
 
@@ -507,11 +499,11 @@ class TestTrtLlmArgs:
             max_num_tokens=256,
         )
         args = TrtLlmArgs(model=llama_model_path, build_config=build_config)
-        args_dict = args.to_dict()
+        args_dict = args.model_dump()
 
         new_args = TrtLlmArgs.from_kwargs(**args_dict)
 
-        assert new_args.to_dict() == args_dict
+        assert new_args.model_dump() == args_dict
 
     def test_build_config_from_engine(self):
         build_config = BuildConfig(max_batch_size=8, max_num_tokens=256)
@@ -530,6 +522,36 @@ class TestTrtLlmArgs:
 
         assert args.max_num_tokens == 16
         assert args.max_batch_size == 4
+
+    def test_model_dump_does_not_mutate_original(self):
+        """Test that model_dump() and update_llm_args_with_extra_dict don't mutate the original."""
+        # Create args with specific build_config values
+        build_config = BuildConfig(
+            max_batch_size=8,
+            max_num_tokens=256,
+        )
+        args = TrtLlmArgs(model=llama_model_path, build_config=build_config)
+
+        # Store original values
+        original_max_batch_size = args.build_config.max_batch_size
+        original_max_num_tokens = args.build_config.max_num_tokens
+
+        # Convert to dict and pass through update_llm_args_with_extra_dict with overrides
+        args_dict = args.model_dump()
+        extra_dict = {
+            "max_batch_size": 128,
+            "max_num_tokens": 1024,
+        }
+        updated_dict = update_llm_args_with_extra_dict(args_dict, extra_dict)
+
+        # Verify original args was NOT mutated
+        assert args.build_config.max_batch_size == original_max_batch_size
+        assert args.build_config.max_num_tokens == original_max_num_tokens
+
+        # Verify updated dict has new values
+        new_args = TrtLlmArgs(**updated_dict)
+        assert new_args.build_config.max_batch_size == 128
+        assert new_args.build_config.max_num_tokens == 1024
 
 
 class TestStrictBaseModelArbitraryArgs:

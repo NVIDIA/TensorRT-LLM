@@ -15,6 +15,8 @@ l0_a10:
   tests:
   # ------------- PyTorch tests ---------------
   - unittest/_torch/sampler/test_torch_sampler.py
+  - unittest/_torch/sampler/test_torch_multi_arange.py
+  - unittest/utils/test_util.py
   - unittest/_torch/modeling/test_modeling_mistral.py
   - unittest/_torch/modeling/test_modeling_pixtral.py
   # NOTE: this is a CPU-only test, but we do not have a dedicated job for this (and therefore no
@@ -46,7 +48,7 @@ l0_a10:
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[True-False-TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[True-True-TinyLlama-1.1B-Chat-v1.0]
   - test_e2e.py::test_openai_chat_guided_decoding
-  - test_e2e.py::test_openai_chat_multimodal_example
+  - test_e2e.py::test_openai_chat_multimodal_example ISOLATION
   - test_e2e.py::test_openai_perf_metrics
   - test_e2e.py::test_openai_prometheus
   - test_e2e.py::test_openai_lora
@@ -55,6 +57,7 @@ l0_a10:
   - test_e2e.py::test_trtllm_serve_top_logprobs[pytorch]
   - test_e2e.py::test_openai_misc_example[pytorch]
   - test_e2e.py::test_openai_reasoning[pytorch]
+  - test_e2e.py::test_openai_tool_call
   - test_e2e.py::test_openai_completions_example[pytorch]
   - test_e2e.py::test_openai_chat_example[pytorch] TIMEOUT (90)
   - test_e2e.py::test_trtllm_bench_request_rate_and_concurrency[enable_concurrency-]
@@ -69,6 +72,8 @@ l0_a10:
   - unittest/llmapi/test_additional_model_outputs.py
   # executor
   - unittest/executor/test_rpc.py
+  # trtllm-serve CPU-only
+  - unittest/llmapi/apps/test_tool_parsers.py
 - condition:
     ranges:
       system_gpu_count:
@@ -120,6 +125,8 @@ l0_a10:
   - llmapi/test_llm_api_connector.py::test_connector_scheduler_output[False]
   - llmapi/test_llm_api_connector.py::test_connector_scheduler_output_chunked_context[True]
   - llmapi/test_llm_api_connector.py::test_connector_scheduler_output_chunked_context[False]
+  - llmapi/test_llm_api_connector.py::test_connector_disagg_prefill[False]
+  - llmapi/test_llm_api_connector.py::test_connector_disagg_prefill[True]
   - llmapi/test_llm_e2e.py::test_llmapi_load_engine_from_build_command[llama-llama-models/llama-7b-hf] # 5min
   - llmapi/test_llm_e2e.py::test_llmapi_build_command_parameters_align[llama-llama-models-v2/TinyLlama-1.1B-Chat-v1.0]
   - llmapi/test_llm_e2e.py::test_llmapi_load_engine_from_build_command_with_lora[llama-llama-models-v2/llama-v2-7b-hf]

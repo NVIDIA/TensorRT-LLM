@@ -1,5 +1,4 @@
 import os
-import random
 from typing import Dict, List, Optional
 
 import torch
@@ -11,7 +10,8 @@ from tensorrt_llm._torch.models.modeling_utils import \
     MODEL_CLASS_VISION_ENCODER_MAPPING
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import DecodingMode
-from tensorrt_llm.llmapi.llm_args import (EagleDecodingConfig, KvCacheConfig,
+from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig,
+                                          EagleDecodingConfig, KvCacheConfig,
                                           MTPDecodingConfig, PeftCacheConfig,
                                           SamplerType, SchedulerConfig,
                                           SparseAttentionConfig,
@@ -48,15 +48,12 @@ GB = 1 << 30
 def get_kv_cache_manager_cls(model_config: ModelConfig):
     config = model_config.pretrained_config
     sparse_attn_config = model_config.sparse_attention_config
-    if is_mla(config):
-        return KVCacheManager
-    elif is_nemotron_hybrid(config):
+    if sparse_attn_config is not None:
+        return get_sparse_attn_kv_cache_manager(sparse_attn_config)
+    elif is_nemotron_hybrid(config) or is_qwen3_next(config):
         return MambaHybridCacheManager
     else:
-        if sparse_attn_config is not None:
-            return get_sparse_attn_kv_cache_manager(sparse_attn_config)
-        else:
-            return KVCacheManager
+        return KVCacheManager
 
 
 class KvCacheCreator:
@@ -100,12 +97,6 @@ class KvCacheCreator:
         self._profiling_stage_data = profiling_stage_data
         self._kv_cache_manager_cls = get_kv_cache_manager_cls(
             model_engine.model.model_config)
-
-    def _get_free_gpu_memory_fraction(self) -> float:
-        fraction = self._kv_cache_config.free_gpu_memory_fraction
-        if fraction is None:
-            fraction = 0.9
-        return fraction
 
     def _get_kv_size_per_token(self):
         model_config = self._model_engine.model.model_config
@@ -152,39 +143,51 @@ class KvCacheCreator:
             "Profiling with the default input dummy context request. This may not take into account the memory consumption of " \
             "the image encoder")
             return requests
-        prompt = input_processor.get_dummy_prompt(input_seq_len)
 
-        prompt_token_ids, extra_processed_inputs = self._model_engine.input_processor_with_hash(
-            prompt, None)
+        max_num_tokens = self._max_num_tokens
+        max_beam_width = self._max_beam_width
+        vocab_size = self._model_engine.model.model_config.pretrained_config.vocab_size
 
-        multimodal_input = extra_processed_inputs.get('multimodal_input')
-        multimodal_data = extra_processed_inputs.get('multimodal_data')
-
-        max_num_tokens = len(prompt_token_ids)
-        assert max_num_tokens > 0, "the length of the prompt of the dummy mm req is less than or equal to 0"
-        remaining_tokens = min(max_num_tokens, input_seq_len)
-        if remaining_tokens > input_seq_len:
-            logger.warning(f"Profiling with multimedia prompt which contains more tokens than the allowed input_seq_len. " \
-                           f"Multimodal prompt has {remaining_tokens} while the input_seq_len is: {input_seq_len}")
+        input_seq_len = min(max_num_tokens, input_seq_len)
+        remaining_tokens = max_num_tokens
         while remaining_tokens > 0:
-            req_mm_input = trtllm.MultimodalInput(
-                multimodal_hashes=multimodal_input.multimodal_hashes,
-                multimodal_positions=multimodal_input.multimodal_positions,
-                multimodal_lengths=multimodal_input.multimodal_lengths
-            ) if multimodal_input else None
-            request = trtllm.Request(prompt_token_ids,
-                                     max_tokens=1,
-                                     streaming=False,
-                                     sampling_config=trtllm.SamplingConfig(
-                                         beam_width=self._max_beam_width, ),
-                                     output_config=trtllm.OutputConfig(),
-                                     end_id=-1,
-                                     multimodal_input=req_mm_input)
-            # TODO:
-            # create_input_processor_with_hash shouldn’t be required during profiling,
-            # but is temporarily needed due to the multimodal input dependency for chunked prefill
-            request.py_multimodal_data = multimodal_data
-            remaining_tokens -= max_num_tokens
+            input_seq_len = min(input_seq_len, remaining_tokens)
+            dummy_mm_prompt = input_processor.get_dummy_prompt(input_seq_len)
+
+            if dummy_mm_prompt is not None:
+                prompt_token_ids, extra_processed_inputs = self._model_engine.input_processor(
+                    dummy_mm_prompt, sampling_params=None)
+                multimodal_data = extra_processed_inputs.get('multimodal_data')
+
+                request = trtllm.Request(prompt_token_ids,
+                                         max_tokens=1,
+                                         streaming=False,
+                                         sampling_config=trtllm.SamplingConfig(
+                                             beam_width=max_beam_width, ),
+                                         output_config=trtllm.OutputConfig(),
+                                         end_id=-1)
+                request.py_multimodal_data = multimodal_data
+            else:
+                # Fall back to text-only prompt when we could not find the small image size.
+                prompt_token_ids = torch.randint(
+                    low=0, high=vocab_size, size=(input_seq_len, )).tolist()
+                request = trtllm.Request(prompt_token_ids,
+                                         max_tokens=1,
+                                         streaming=False,
+                                         sampling_config=trtllm.SamplingConfig(
+                                             beam_width=max_beam_width, ),
+                                         output_config=trtllm.OutputConfig(),
+                                         end_id=-1)
+                if self._model_engine.use_mrope:
+                    request.py_multimodal_data = {
+                        "mrope_config": {
+                            "mrope_position_ids":
+                            torch.zeros(3, 1, input_seq_len, dtype=torch.int32),
+                            "mrope_position_deltas":
+                            torch.zeros(1, 1, dtype=torch.int32)
+                        }
+                    }
+            remaining_tokens -= len(prompt_token_ids)
             requests.append(request)
 
         if self._mapping.enable_attention_dp:
@@ -198,7 +201,6 @@ class KvCacheCreator:
         if hasattr(self._model_engine.model,
                    "original_arch") and MODEL_CLASS_VISION_ENCODER_MAPPING.get(
                        self._model_engine.model.original_arch, None):
-            input_seq_len = min(self._max_num_tokens, input_seq_len)
             requests = self._create_dummy_mm_context_request(input_seq_len)
         # if succeed profiling with multimodal requests then return, otherwise profile
         # with default case
@@ -212,9 +214,9 @@ class KvCacheCreator:
         remaining_tokens = max_num_tokens
         while remaining_tokens > 0:
             input_seq_len = min(input_seq_len, remaining_tokens)
-            input_tokens = [
-                random.randint(0, vocab_size - 1) for _ in range(input_seq_len)
-            ]
+            input_tokens = torch.randint(low=0,
+                                         high=vocab_size,
+                                         size=(input_seq_len, )).tolist()
             request = trtllm.Request(input_tokens,
                                      max_tokens=1,
                                      streaming=False,
@@ -299,7 +301,7 @@ class KvCacheCreator:
         # TODO: support CP by generating dummy requests for it.
         assert 'cp_type' not in mapping.cp_config
 
-        fraction = self._get_free_gpu_memory_fraction()
+        fraction = self._kv_cache_config.free_gpu_memory_fraction
 
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
@@ -471,6 +473,7 @@ class KvCacheCreator:
                 is_draft=model_engine.is_draft_model,
                 kv_connector_manager=self._kv_connector_manager
                 if not estimating_kv_cache else None,
+                sparse_attn_config=sparse_attn_config,
             )
         elif is_nemotron_hybrid(config):
             if self._max_beam_width > 1:
@@ -542,7 +545,7 @@ class KvCacheCreator:
             num_mamba_layers = num_hidden_layers // config.full_attention_interval * (
                 config.full_attention_interval - 1)
             num_layers = num_hidden_layers - num_mamba_layers
-            kv_cache_manager = MambaHybridCacheManager(
+            kv_cache_manager = self._kv_cache_manager_cls(
                 # mamba cache parameters
                 config.linear_key_head_dim,
                 config.linear_conv_kernel_dim,
@@ -666,7 +669,7 @@ def create_py_executor_instance(
     max_num_tokens: Optional[int] = None,
     peft_cache_config: Optional[PeftCacheConfig] = None,
     scheduler_config: Optional[SchedulerConfig] = None,
-    cache_transceiver_config: Optional[trtllm.CacheTransceiverConfig] = None,
+    cache_transceiver_config: Optional[CacheTransceiverConfig] = None,
 ) -> PyExecutor:
     kv_cache_manager = resources.get(ResourceManagerType.KV_CACHE_MANAGER, None)
 

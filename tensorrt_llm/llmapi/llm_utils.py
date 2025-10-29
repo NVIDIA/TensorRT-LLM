@@ -1,21 +1,20 @@
-import copy
 import json
 import os
 import shutil
 import tempfile
 import time
 import weakref
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple, Union
 
 import torch
 import transformers
+from pydantic import BaseModel
 from tqdm import tqdm
 
 from .._utils import (global_mpi_rank, local_mpi_rank, mpi_barrier,
                       mpi_broadcast, mpi_rank, release_gc)
-from ..auto_parallel import AutoParallelConfig
 # yapf: disable
 from ..bindings.executor import (BatchingType, CapacitySchedulerPolicy,
                                  ContextChunkingPolicy, ExecutorConfig,
@@ -133,18 +132,6 @@ class ModelLoader:
         if isinstance(self.llm_args, TrtLlmArgs):
             assert self.llm_args.build_config
             self.build_config = self.llm_args.build_config
-
-            self.auto_parallel_config = AutoParallelConfig(
-                world_size=llm_args.parallel_config.world_size if llm_args.
-                parallel_config.auto_parallel else 1)
-
-            default_config = self.llm_args.auto_parallel_config
-            self.auto_parallel_config.set_defaults(
-                cluster_key=default_config.cluster_key,
-                cluster_info=default_config.cluster_info,
-                same_buffer_io=default_config.same_buffer_io,
-                sharded_io_allowlist=default_config.sharded_io_allowlist,
-            )
 
         self._gather_build_steps()
 
@@ -542,14 +529,10 @@ class ModelLoader:
 
         logger_debug(f"rank{mpi_rank()} begin to build engine...\n", "green")
 
-        # avoid the original build_config is modified, avoid the side effect
-        copied_build_config = copy.deepcopy(self.build_config)
+        # avoid side effects by copying the original build_config
+        copied_build_config = self.build_config.model_copy(deep=True)
 
-        copied_build_config.update(
-            auto_parallel_config=self.auto_parallel_config)
         copied_build_config.update_kv_cache_type(self._model_info.architecture)
-        if self.auto_parallel_config.enabled:
-            self.model.config.mapping.rank = self.rank
         assert self.model is not None, "model is loaded yet."
 
         self._engine = build(self.model, copied_build_config)
@@ -732,9 +715,9 @@ class CachedModelLoader:
     def build_cache_enabled(self) -> bool:
         _enable_build_cache, _ = get_build_cache_config_from_env()
 
-        return (self.llm_args.enable_build_cache or _enable_build_cache) and (
-            self.llm_args.model_format is _ModelFormatKind.HF
-        ) and not self.llm_args.parallel_config.auto_parallel
+        return (self.llm_args.enable_build_cache
+                or _enable_build_cache) and (self.llm_args.model_format
+                                             is _ModelFormatKind.HF)
 
     def _get_engine_cache_stage(self) -> CachedStage:
         ''' Get the cache stage for engine building. '''
@@ -743,15 +726,19 @@ class CachedModelLoader:
         assert self._hf_model_dir is not None, "HF model dir is required for cache key."
 
         def serialize(d) -> str:
-            dic = asdict(d) if not isinstance(
-                d, PretrainedConfig) else d.to_dict()
+            if hasattr(d, "to_dict"):
+                dic = d.to_dict()
+            elif is_dataclass(d):
+                dic = asdict(d)
+            elif isinstance(d, BaseModel):
+                dic = d.model_dump(mode="json")
+            else:
+                raise ValueError(f"Could not serialize type: {type(d)}")
             return json.dumps(dic, sort_keys=True)
 
         parallel_config = self.llm_args.parallel_config
 
         force_rebuild = False
-        if parallel_config.auto_parallel:
-            force_rebuild = True
         if self.llm_args.model_format is not _ModelFormatKind.HF:
             force_rebuild = True
 

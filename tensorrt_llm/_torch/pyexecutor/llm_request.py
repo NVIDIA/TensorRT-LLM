@@ -482,6 +482,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_target_probs = None
         self.py_last_draft_tokens = None
         self.py_num_accepted_draft_tokens = 0
+        self.py_num_accepted_draft_tokens_indices = []
+        self.py_rewind_draft_token_separate_adjustment = 0
         self.py_decoding_iter = 0
         self.is_attention_dp_dummy = False
         self.is_cuda_graph_dummy = False
@@ -510,6 +512,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_is_first_draft = is_first_draft
         self.d2t = None
         self.py_draft_use_greedy_sampling = False
+        self.py_disable_speculative_decoding = False
 
         # Chunked logits parameters
         self.py_use_chunked_generation_logits = use_chunked_generation_logits
@@ -762,7 +765,8 @@ def executor_request_to_llm_request(
         cache_salt_id=executor_request.cache_salt_id,
         arrival_time=getattr(executor_request, "py_arrival_time", None),
         py_multimodal_data=getattr(executor_request, "py_multimodal_data",
-                                   None))
+                                   None),
+        kv_cache_retention_config=executor_request.kv_cache_retention_config)
     if child_req_ids:
         for child_id in child_req_ids:
             llm_request.create_child_request(child_id)

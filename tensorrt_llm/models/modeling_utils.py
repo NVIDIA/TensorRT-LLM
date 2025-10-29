@@ -19,7 +19,6 @@ from .._common import default_net
 from .._utils import (QuantModeWrapper, get_init_params, numpy_to_torch,
                       release_gc, str_dtype_to_torch, str_dtype_to_trt,
                       trt_dtype_to_torch)
-from ..bindings import KVCacheType
 from ..bindings.executor import RuntimeDefaults
 from ..functional import (PositionEmbeddingType, Tensor, allgather, constant,
                           cp_split_plugin, gather_last_token_logits,
@@ -31,6 +30,7 @@ from ..layers.attention import Attention, BertAttention
 from ..layers.linear import ColumnLinear, Linear, RowLinear
 from ..layers.lora import Dora, Lora
 from ..layers.moe import MOE, MoeOOTB
+from ..llmapi.kv_cache_type import KVCacheType
 from ..logger import logger
 from ..mapping import Mapping
 from ..module import Module, ModuleList
@@ -739,9 +739,7 @@ class PretrainedModel(Module,
             config.set_rank(rank)
 
         rank = config.mapping.rank
-        if config.mapping.auto_parallel:
-            rank = 0
-        elif config.mapping.cp_size > 1:
+        if config.mapping.cp_size > 1:
             # tp_cp_pp rank -> tp_pp rank: because different cp ranks share the same ckpt
             tp_size = config.mapping.tp_size
             cp_size = config.mapping.cp_size
@@ -1307,7 +1305,7 @@ def unfuse_qkv_gemm(model: PretrainedModel) -> PretrainedModel:
 
     for name, layer in model.named_modules():
         if isinstance(layer, Attention) and not layer.cross_attention:
-            assert layer.tp_size == 1, "please disable manual tp when enable auto parallel"
+            assert layer.tp_size == 1, "unfuse_qkv_gemm requires tp_size == 1"
             if layer.qkv is None:
                 continue
             qkv_params = get_init_params(layer.qkv, ColumnLinear)

@@ -1613,6 +1613,13 @@ def test_openai_reasoning(llm_root, llm_venv, backend: str):
     ])
 
 
+def test_openai_tool_call(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd(
+        ["-m", "pytest",
+         str(test_root / "_test_openai_tool_call.py")])
+
+
 @pytest.mark.parametrize("sampler", ["torch_sampler", "trtllm_sampler"])
 def test_openai_completions_with_logit_bias(llm_root, llm_venv, sampler: str):
     test_root = unittest_path() / "llmapi" / "apps"
@@ -3494,24 +3501,36 @@ def test_ptp_quickstart_advanced_llama_multi_nodes(llm_root, llm_venv,
     pytest.param('DeepSeek-R1/DeepSeek-R1-0528-FP4', marks=skip_pre_blackwell),
     pytest.param('Kimi-K2-Instruct',
                  marks=(skip_pre_hopper, skip_post_blackwell)),
+    pytest.param('nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1',
+                 marks=skip_pre_hopper),
 ])
 def test_multi_nodes_eval(llm_venv, model_path, tp_size, pp_size, ep_size,
-                          eval_task):
+                          eval_task, mmlu_dataset_root):
     if "Llama-4" in model_path and tp_size == 16:
         pytest.skip("Llama-4 with tp16 is not supported")
 
     mmlu_threshold = 81.5
+    model_dir = f"{llm_models_root()}/{model_path}"
     run_cmd = [
         "trtllm-llmapi-launch",
         "trtllm-eval",
-        f"--model={llm_models_root()}/{model_path}",
+        f"--model={model_dir}",
         f"--ep_size={ep_size}",
         f"--tp_size={tp_size}",
         f"--pp_size={pp_size}",
         f"--kv_cache_free_gpu_memory_fraction={_MEM_FRACTION_80}",
         "--max_batch_size=32",
-        eval_task,
+        "--backend=pytorch",
     ]
+
+    if "Kimi" in model_path:
+        run_cmd.append("--trust_remote_code")
+    else:
+        run_cmd.append(f"--tokenizer={model_dir}")
+
+    run_cmd.extend([eval_task, f"--dataset_path={mmlu_dataset_root}"])
+
+    llm_venv._new_env["TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL"] = "1"
     output = check_output(" ".join(run_cmd), shell=True, env=llm_venv._new_env)
 
     if os.environ.get("SLURM_PROCID", '0') == '0':

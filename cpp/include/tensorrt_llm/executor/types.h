@@ -451,7 +451,7 @@ struct RequestPerfMetrics
         /// @brief End time of the KV cache transfer for disaggregated serving
         TimePoint kvCacheTransferEnd;
         /// @brief KV Cache size transfer for disaggregated serving
-        mutable size_t kvCacheSize = 0;
+        size_t kvCacheSize = 0;
     };
 
     struct KvCacheMetrics

@@ -327,10 +327,15 @@ protected:
         if (isSender)
         {
             auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
-            for (auto& block : blockRange)
+            auto const& windowSizes = blockRange.getWindowSizes();
+            for (auto const& windowSize : windowSizes)
             {
-                // fill cache with tokens (= request length), for reuse test
-                TLLM_CUDA_CHECK(cudaMemset(block.data(), llmRequest->getPromptLen(), block.getSizeInBytes()));
+                auto blockRangeForWindow = blockRange.getBlockRangeForWindow(windowSize);
+                for (auto it = blockRangeForWindow.begin(); it != blockRangeForWindow.end(); ++it)
+                {
+                    // fill cache with tokens (= request length), for reuse test
+                    TLLM_CUDA_CHECK(cudaMemset(it->data(), llmRequest->getPromptLen(), it->getSizeInBytes()));
+                }
             }
             mFutures.emplace_back(mSender->sendAsync(*llmRequest));
         }
@@ -340,12 +345,17 @@ protected:
             future.get();
             TLLM_CUDA_CHECK(cudaDeviceSynchronize());
             auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
-            for (auto& block : blockRange)
+            auto const& windowSizes = blockRange.getWindowSizes();
+            for (auto const& windowSize : windowSizes)
             {
-                std::vector<uint8_t> bytes(block.getSizeInBytes());
-                TLLM_CUDA_CHECK(cudaMemcpy(bytes.data(), block.data(), block.getSizeInBytes(), cudaMemcpyDeviceToHost));
-                EXPECT_TRUE(std::all_of(bytes.begin(), bytes.end(),
-                    [&llmRequest](uint8_t i) { return i == llmRequest->getPromptLen() & 0xff; }));
+                auto blockRangeForWindow = blockRange.getBlockRangeForWindow(windowSize);
+                for (auto it = blockRangeForWindow.begin(); it != blockRangeForWindow.end(); ++it)
+                {
+                    std::vector<uint8_t> bytes(it->getSizeInBytes());
+                    TLLM_CUDA_CHECK(cudaMemcpy(bytes.data(), it->data(), it->getSizeInBytes(), cudaMemcpyDeviceToHost));
+                    EXPECT_TRUE(std::all_of(bytes.begin(), bytes.end(),
+                        [&llmRequest](uint8_t i) { return i == llmRequest->getPromptLen() & 0xff; }));
+                }
             }
         }
     }
@@ -564,7 +574,7 @@ protected:
         auto maxBlocksPerSeq = 10;
         auto maxBeamWidth = 1;
         auto constexpr sinkTokenLength = 0;
-        mMaxNumSequences = 8;
+        mMaxNumSequences = 16;
         auto const stream = std::make_shared<tr::CudaStream>();
 
         auto maxNumTokens = tokensPerBlock * maxBlocksPerSeq;
@@ -806,20 +816,21 @@ protected:
         auto constexpr beamWidth{1};
         mManager->addSequence(llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth, llmRequest);
         auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
-        int blockIdx = 0;
 
         int const numPools = mManager->getBlockManager().getNumPools();
         TLLM_LOG_DEBUG(" addRequestAndTransportCacheForContext mManager numPools: %d", numPools);
-        for (int poolIdx = 0; poolIdx < numPools; poolIdx++)
+        auto const& windowSizes = blockRange.getWindowSizes();
+        int blockIdx = 0;
+        for (auto const& windowSize : windowSizes)
         {
-            blockRange.updatePoolIdx(poolIdx);
-            TLLM_LOG_DEBUG("update poolIdx: %d", poolIdx);
-            for (auto& block : blockRange)
+            auto blockRangeForWindow = blockRange.getBlockRangeForWindow(windowSize);
+            TLLM_LOG_DEBUG("update windowSize: %d", windowSize);
+            for (auto it = blockRangeForWindow.begin(); it != blockRangeForWindow.end(); ++it)
             {
-                fillBlockData(block, blockIdx, llmRequest->getPromptLen(), poolIdx);
+                fillBlockData(*it, blockIdx, llmRequest->getPromptLen(), windowSize);
                 blockIdx++;
             }
-            TLLM_LOG_DEBUG("blockPoolIdx: %d finish fill block data", poolIdx);
+            TLLM_LOG_DEBUG("windowSize: %d finish fill block data", windowSize);
         }
 
         TLLM_LOG_DEBUG(
@@ -864,12 +875,15 @@ protected:
         TLLM_CUDA_CHECK(cudaDeviceSynchronize());
 
         auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
-        int const numTotalBlocks = blockRange.getBlockIds().size();
-        auto const numPools = mManager->getBlockManager().getNumPools();
-        for (int poolIdx = 0; poolIdx < numPools; poolIdx++)
+        auto const& windowSizes = blockRange.getWindowSizes();
+        for (auto const& windowSize : windowSizes)
         {
-            blockRange.updatePoolIdx(poolIdx);
-            for (auto& block : blockRange)
+            auto blockRangeForWindow = blockRange.getBlockRangeForWindow(windowSize);
+            int maxBlockInWindow = windowSize / mCacheState->getModelConfig().mTokensPerBlock;
+            int startBlockId = std::max(0, static_cast<int>(blockRangeForWindow.size()) - (maxBlockInWindow + 1));
+            int blockIdInWindow = 0;
+            int const numTotalBlocks = blockRangeForWindow.size();
+            for (auto it = blockRangeForWindow.begin(); it != blockRangeForWindow.end(); ++it)
             {
                 if (isBlockOverallocated(blockIdx, numTotalBlocks))
                 {
@@ -879,16 +893,20 @@ protected:
                         llmRequest->mRequestId, mRank, blockIdx, numTotalBlocks);
                     break;
                 }
-                verifyBlockData(block, blockIdx, llmRequest->getPromptLen(), poolIdx);
+                if (blockIdInWindow >= startBlockId)
+                {
+                    verifyBlockData(*it, blockIdx, llmRequest->getPromptLen(), windowSize);
+                }
                 blockIdx++;
+                blockIdInWindow++;
             }
         }
     }
 
-    void fillBlockData(tensorrt_llm::runtime::ITensor& blockData, int blockId, size_t initial, int blockPoolIdx = 0)
+    void fillBlockData(tensorrt_llm::runtime::ITensor& blockData, int blockId, size_t initial, int windowSize = 0)
     {
         auto const& blockManager = mManager->getBlockManager();
-        auto const onlyWindowSize = blockManager.getPoolWindowSize(blockPoolIdx);
+        auto const onlyWindowSize = windowSize == 0 ? blockManager.getPoolWindowSize(0) : windowSize;
         auto const& bufferManager = blockManager.getBufferManager(onlyWindowSize);
         auto hostTensor = tensorrt_llm::runtime::BufferManager::cpu(blockData.getShape(), blockData.getDataType());
         int layerSizeThisRank = blockData.getDimension<1>();
@@ -936,7 +954,7 @@ protected:
                                 auto* dataPtr = static_cast<ValueType*>(hostTensor->data(keyIndex));
                                 *dataPtr = generateValue;
                             },
-                            generateExpectedValue(initial, blockPoolIdx, tokenId + startTokenId, layerId + startLayerId,
+                            generateExpectedValue(initial, windowSize, tokenId + startTokenId, layerId + startLayerId,
                                 headId + startHeadId, hiddenId, true, blockData.getDataType()));
                         if (kvFactor == 2)
                         {
@@ -947,7 +965,7 @@ protected:
                                     auto* dataPtr = static_cast<ValueType*>(hostTensor->data(valueIndex));
                                     *dataPtr = generateValue;
                                 },
-                                generateExpectedValue(initial, blockPoolIdx, tokenId + startTokenId,
+                                generateExpectedValue(initial, windowSize, tokenId + startTokenId,
                                     layerId + startLayerId, headId + startHeadId, hiddenId, false,
                                     blockData.getDataType()));
                         }
@@ -959,10 +977,11 @@ protected:
         bufferManager.getStream().synchronize();
     }
 
-    void verifyBlockData(tensorrt_llm::runtime::ITensor& blockData, int blockId, size_t initial, int blockPoolIdx = 0)
+    void verifyBlockData(tensorrt_llm::runtime::ITensor& blockData, int blockId, size_t initial, int windowSize = 0)
     {
         auto const& blockManager = mManager->getBlockManager();
-        auto const onlyWindowSize = blockManager.getPoolWindowSize(blockPoolIdx);
+
+        auto const onlyWindowSize = windowSize == 0 ? blockManager.getPoolWindowSize(0) : windowSize;
         auto const& bufferManager = blockManager.getBufferManager(onlyWindowSize);
 
         auto hostTensor = tensorrt_llm::runtime::BufferManager::cpu(blockData.getShape(), blockData.getDataType());
@@ -1015,7 +1034,7 @@ protected:
                                 auto* dataPtr = static_cast<ValueType*>(hostTensor->data(keyIndex));
                                 EXPECT_EQ(*dataPtr, generateValue);
                             },
-                            generateExpectedValue(initial, blockPoolIdx, tokenId + startTokenId, layerId + startLayerId,
+                            generateExpectedValue(initial, windowSize, tokenId + startTokenId, layerId + startLayerId,
                                 headId + startHeadId, hiddenId, true, blockData.getDataType()));
                         if (kvFactor == 2)
                         {
@@ -1026,7 +1045,7 @@ protected:
                                     auto* dataPtr = static_cast<ValueType*>(hostTensor->data(valueIndex));
                                     EXPECT_EQ(*dataPtr, generateValue);
                                 },
-                                generateExpectedValue(initial, blockPoolIdx, tokenId + startTokenId,
+                                generateExpectedValue(initial, windowSize, tokenId + startTokenId,
                                     layerId + startLayerId, headId + startHeadId, hiddenId, false,
                                     blockData.getDataType()));
                         }
@@ -1036,7 +1055,7 @@ protected:
         }
     }
 
-    std::variant<double, float, int16_t, int8_t> generateExpectedValue(size_t initial, int blockPoolIdx, int tokenId,
+    std::variant<double, float, int16_t, int8_t> generateExpectedValue(size_t initial, int windowSize, int tokenId,
         int layerId, int headId, int hiddenId, bool key, nvinfer1::DataType dataType)
     {
 
@@ -1044,7 +1063,7 @@ protected:
         std::size_t hashValue = std::hash<size_t>{}(initial);
         std::hash<int> hasher{};
         seed ^= hashValue + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-        seed ^= hasher(blockPoolIdx) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+        seed ^= hasher(windowSize) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
         seed ^= hasher(tokenId) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
         seed ^= hasher(layerId) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
         seed ^= hasher(headId) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
@@ -1235,7 +1254,7 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
         setUpCacheTransceiver();
         std::vector<std::shared_ptr<tensorrt_llm::batch_manager::LlmRequest>> requests;
         int requestId = 0;
-        for (auto len : {30, 10, 60, 30, 60, 10})
+        for (auto len : {60, 30, 60, 10})
         {
             requests.emplace_back(makeLlmRequestWithDP(len, requestId, requestId % contextTp));
             requestId++;
@@ -1313,27 +1332,23 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
     tensorrt_llm::mpi::MpiComm::world().barrier();
 }
 
-// Waive off isWindow test for now
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0, AsymmetricalCacheTest,
     testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(1), testing::Values(1, 2),
         testing::Values(1, 2), testing::Values(1), testing::Values(4), testing::Values(4), testing::Values(4),
         testing::Values(16), testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
-        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(/*true,*/ false)));
+        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(true, false)));
 
-// Waive off isWindow test for now
-// INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithWindow, AsymmetricalCacheTest,
-//     testing::Combine(testing::Values(1), testing::Values(1), testing::Values(1), testing::Values(1),
-//     testing::Values(1),
-//         testing::Values(1), testing::Values(5), testing::Values(4), testing::Values(4), testing::Values(8),
-//         testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
-//         testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(true)));
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithWindow, AsymmetricalCacheTest,
+    testing::Combine(testing::Values(1), testing::Values(1), testing::Values(1), testing::Values(1), testing::Values(1),
+        testing::Values(1), testing::Values(5), testing::Values(4), testing::Values(4), testing::Values(8),
+        testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
+        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(true)));
 
-// Waive off isWindow test for now
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1, AsymmetricalCacheTest,
     testing::Combine(testing::Values(4), testing::Values(1), testing::Values(1), testing::Values(1), testing::Values(4),
         testing::Values(1), testing::Values(8), testing::Values(4), testing::Values(4), testing::Values(8),
         testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
-        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(false /*, true*/)));
+        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(false, true)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1EvenLayer, AsymmetricalCacheTest,
     testing::Combine(testing::Values(1), testing::Values(4), testing::Values(1), testing::Values(1), testing::Values(4),

@@ -12,10 +12,12 @@ import transformers
 from transformers.utils import HF_MODULES_CACHE
 
 from tensorrt_llm import logger
-from tensorrt_llm._torch.pyexecutor.config_utils import is_nemotron_hybrid
+from tensorrt_llm._torch.pyexecutor.config_utils import (is_nemotron_hybrid,
+                                                         load_pretrained_config)
 from tensorrt_llm._utils import get_sm_version, torch_dtype_to_binding
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
+from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -255,7 +257,8 @@ class ModelConfig(Generic[TConfig]):
         # once ModelType is used in pytorch flow.
 
     @staticmethod
-    def load_modelopt_quant_config(quant_config_file, model_dir, moe_backend):
+    def load_modelopt_quant_config(quant_config_file, checkpoint_dir,
+                                   moe_backend):
         quant_config = QuantConfig()
         layer_quant_config = None
 
@@ -275,7 +278,8 @@ class ModelConfig(Generic[TConfig]):
             'exclude_modules', None)
 
         if quant_config.quant_algo == QuantAlgo.MIXED_PRECISION:
-            mixed_quant_config_file = model_dir / 'quant_cfg.json'
+            mixed_quant_config_file = transformers.utils.hub.cached_file(
+                checkpoint_dir, 'quant_cfg.json')
             with open(mixed_quant_config_file) as fm:
                 mixed_quant_configs = json.load(fm)
                 # kv_cache_quant_algo is global regardless of MIXED_PRECISION
@@ -417,35 +421,59 @@ class ModelConfig(Generic[TConfig]):
             # When handling the case where model_format is TLLM_ENGINE
             # send cyclic requests to the NONE URL.
             if checkpoint_dir is not None:
-                pretrained_config = transformers.AutoConfig.from_pretrained(
+                pretrained_config = load_pretrained_config(
                     checkpoint_dir,
                     trust_remote_code=trust_remote_code,
+                    **kwargs,
                 )
-
-                # Find the cache path by looking for the config.json file which should be in all
-                # huggingface models
-                model_dir = Path(
-                    transformers.utils.hub.cached_file(checkpoint_dir,
-                                                       'config.json')).parent
+                if pretrained_config.architectures[
+                        0] == "DeepseekV32ForCausalLM":
+                    sparse_attention_config = kwargs.get(
+                        'sparse_attention_config')
+                    if sparse_attention_config:
+                        index_n_heads = sparse_attention_config.index_n_heads or pretrained_config.index_n_heads
+                        index_head_dim = sparse_attention_config.index_head_dim or pretrained_config.index_head_dim
+                        index_topk = sparse_attention_config.index_topk or pretrained_config.index_topk
+                        indexer_max_chunk_size = sparse_attention_config.indexer_max_chunk_size
+                    else:
+                        index_n_heads = pretrained_config.index_n_heads
+                        index_head_dim = pretrained_config.index_head_dim
+                        index_topk = pretrained_config.index_topk
+                        indexer_max_chunk_size = None
+                    kwargs[
+                        'sparse_attention_config'] = DeepSeekSparseAttentionConfig(
+                            index_n_heads=index_n_heads,
+                            index_head_dim=index_head_dim,
+                            index_topk=index_topk,
+                            indexer_max_chunk_size=indexer_max_chunk_size)
             else:
                 raise ValueError(
                     "checkpoint_dir is None. Cannot load model config without a valid checkpoint directory."
                 )
+
+        # Get cached file from path or repo id, return None if not exists.
+        def cached_file(path_or_repo_id, file_name):
+            try:
+                return transformers.utils.hub.cached_file(
+                    path_or_repo_id, file_name)
+            except OSError:
+                return None
 
         quant_config = QuantConfig()
         layer_quant_config = None
         moe_backend = kwargs.get('moe_backend', 'CUTLASS')
 
         # quantized ckpt in modelopt format
-        if (quant_config_file := model_dir / 'hf_quant_config.json').exists():
+        if quant_config_file := cached_file(checkpoint_dir,
+                                            'hf_quant_config.json'):
             quant_config, layer_quant_config = cls.load_modelopt_quant_config(
-                quant_config_file, model_dir, moe_backend)
+                quant_config_file, checkpoint_dir, moe_backend)
         # quantized ckpt in other formats
         elif hasattr(pretrained_config, "quantization_config"):
             hf_quant_config = pretrained_config.quantization_config
             quant_config, layer_quant_config = cls.load_hf_quant_config(
                 hf_quant_config, moe_backend)
-        elif (quant_config_file := model_dir / 'dtypes.json').exists():
+        elif quant_config_file := cached_file(checkpoint_dir, 'dtypes.json'):
             quant_config, layer_quant_config = cls.load_quant_config_from_dtypes_json(
                 quant_config_file, moe_backend)
 
