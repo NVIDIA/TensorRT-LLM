@@ -23,6 +23,7 @@ def is_qwen3_next(config):
         0] == 'Qwen3NextForCausalLM'
 
 
+# TODO: remove this once the transformers can support all of those models in _CONFIG_REGISTRY
 class LazyConfigDict(dict):
 
     def __getitem__(self, key):
