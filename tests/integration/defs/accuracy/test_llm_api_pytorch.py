@@ -1059,7 +1059,10 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             enable_block_reuse=False,
             enable_partial_reuse=False,
         )
-        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
+        with LLM(self.MODEL_PATH,
+                 kv_cache_config=kv_cache_config,
+                 attn_backend="FLASHINFER",
+                 cuda_graph_config=None) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
@@ -1074,7 +1077,9 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
                                         dtype="fp8")
         prequantized_model_path = f"{llm_models_root()}/gemma/gemma-3-1b-it-fp8/"
         with LLM(prequantized_model_path,
-                 kv_cache_config=kv_cache_config) as llm:
+                 kv_cache_config=kv_cache_config,
+                 attn_backend="FLASHINFER",
+                 cuda_graph_config=None) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
