@@ -1926,6 +1926,8 @@ class BaseLlmArgs(StrictBaseModel):
     @field_validator("gpus_per_node", mode='before')
     @classmethod
     def validate_gpus_per_node(cls, v, info):
+        if os.getenv("RAY_LOCAL_WORLD_SIZE") is not None:
+            return info.data.get("tensor_parallel_size")
         if v is None:
             logger.warning(
                 f"Using default gpus_per_node: {torch.cuda.device_count()}")

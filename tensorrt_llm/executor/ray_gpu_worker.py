@@ -44,7 +44,6 @@ class RayWorkerWrapper:
     def __init__(self, worker_cls, worker_kwargs, world_size, rank):
         self.master_address = os.environ["MASTER_ADDR"]
         self.master_port = os.environ["MASTER_PORT"]
-
         # Ray can't pickle TensorRT logger
         global logger
         from tensorrt_llm.logger import logger
