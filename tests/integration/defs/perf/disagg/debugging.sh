@@ -1,7 +1,9 @@
 
 # How to collect the entire test list
 # Please apply the corresponding env file under ./envs before collect the test list
-poetry run pytest --collect-only -q &> testlist_h100.txt
+source ./perf/disagg/envs/.env_oci
+
+poetry run pytest --disagg --collect-only -q &> testlist_h100.txt
 
 # run with test list file
 poetry run pytest test_disagg.py -s -vv --test-list=./testlist/testlist_gb200_debug.txt
