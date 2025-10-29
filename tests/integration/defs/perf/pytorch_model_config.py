@@ -47,7 +47,7 @@ def get_model_yaml_config(model_label: str,
     else:
         # TRT backend config
         base_config = {}
-    
+
     if 'kv_cache_dtype' in model_label:
         base_config.update({
             'kv_cache_dtype':
@@ -250,7 +250,9 @@ def get_model_yaml_config(model_label: str,
         },
         # Llama-v3.3 models with xgrammar guided decoding
         {
-            'patterns': ["llama_v3.3_70b_instruct_fp8-bench-float8-maxbs:512-maxnt:2048-input_output_len:500,2000-reqs:400-con:200-gpus:8"],
+            'patterns': [
+                "llama_v3.3_70b_instruct_fp8-bench-float8-maxbs:512-maxnt:2048-input_output_len:500,2000-reqs:400-con:200-gpus:8-extra"
+            ],
             'config': {
                 'extended_runtime_perf_knob_config': {
                     'cuda_graph_cache_size': 1.0,

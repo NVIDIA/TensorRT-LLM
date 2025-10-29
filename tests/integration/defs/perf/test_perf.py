@@ -781,6 +781,8 @@ class PerfTestConfig:
         tp_size: int = 1,
         pp_size: int = 1,
         num_gpus: int = 1,
+        # only for torch-backend currently
+        extra: bool = False,
         # _autodeploy backend specific parameters
         ad_compile_backend: str = "torch-opt",
         free_mem_ratio: float = 0.9,
@@ -839,6 +841,8 @@ class PerfTestConfig:
         self.pp_size = pp_size
         # Number of GPUs.
         self.num_gpus = num_gpus
+        # Extra flag to enable pytorch_model_config reading for TRT backend
+        self.extra = extra
         # _autodeploy backend specific parameters
         self.ad_compile_backend = ad_compile_backend
         self.free_mem_ratio = free_mem_ratio
@@ -1014,6 +1018,10 @@ class PerfTestConfig:
         if self.num_gpus > 1:
             entries.append(f"gpus:{self.num_gpus}")
 
+        # Add extra flag for llm-api-config.yml.
+        if self.extra:
+            entries.append("extra")
+
         # Concatenate labels with "-".
         return "-".join(entries)
 
@@ -1177,6 +1185,11 @@ class PerfTestConfig:
         if len(labels) > 0:
             self.num_gpus = 1 if not labels[0].startswith("gpus:") else int(
                 labels.pop(0).replace("gpus:", ""))
+
+        if len(labels) > 0:
+            self.extra = True if labels[0] == "extra" else False
+            if self.extra:
+                labels.pop(0)
 
         assert len(
             labels
@@ -1642,9 +1655,10 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             benchmark_cmd += [f"--pp={self._config.pp_size}"]
         if self._config.streaming == "streaming":
             benchmark_cmd += [f"--streaming"]
-       
-        #Add extra-llm-api-config.yml for pytorch and tensorrt backend
-        if self._config.backend == "pytorch" or self._config.backend == "":
+
+        #Add extra-llm-api-config.yml for pytorch backend and tensorrt backend with extra flag
+        if self._config.backend == "pytorch" or (self._config.backend == ""
+                                                 and self._config.extra):
             import yaml
             pytorch_config_path = os.path.join(engine_dir,
                                                "extra-llm-api-config.yml")
@@ -1652,13 +1666,16 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 os.makedirs(os.path.dirname(pytorch_config_path), exist_ok=True)
             config = get_model_yaml_config(self._config.to_string(),
                                            lora_dirs=self.lora_dirs)
-            print_info(f"pytorch/TRT model config: {config}")
-            with open(pytorch_config_path, 'w') as f:
-                yaml.dump(config, f, default_flow_style=False)
-            benchmark_cmd += [f"--extra_llm_api_options={pytorch_config_path}"]
-            # If guided_decoding_backend is set, we need to initialize tokenizer
-            if config.get('guided_decoding_backend') is not None:
-                benchmark_cmd += ["--no_skip_tokenizer_init"]
+            if config:
+                print_info(f"pytorch/TRT model config: {config}")
+                with open(pytorch_config_path, 'w') as f:
+                    yaml.dump(config, f, default_flow_style=False)
+                benchmark_cmd += [
+                    f"--extra_llm_api_options={pytorch_config_path}"
+                ]
+                # If guided_decoding_backend is set, we need to initialize tokenizer
+                if config.get('guided_decoding_backend') is not None:
+                    benchmark_cmd += ["--no_skip_tokenizer_init"]
         elif self._config.backend == "_autodeploy":
             import yaml
             autodeploy_config_path = os.path.join(engine_dir,
