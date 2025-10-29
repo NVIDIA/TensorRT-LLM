@@ -2587,6 +2587,11 @@ class TorchLlmArgs(BaseLlmArgs):
         "Allows users to extend the functions of the RayGPUWorker class.",
         status="prototype")
 
+    enable_sleep: bool = Field(
+        default=False,
+        description="Enable extra setup to support sleep feature.",
+        status="prototype")
+
     # PrivateVars
     _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
 
@@ -2606,11 +2611,6 @@ class TorchLlmArgs(BaseLlmArgs):
         if v is None:
             return 'pytorch'
         return v
-
-    enable_sleep: bool = Field(
-        default=False,
-        description="Enable extra setup to support sleep feature.",
-        status="prototype")
 
     @field_validator('load_format', mode='before')
     @classmethod
