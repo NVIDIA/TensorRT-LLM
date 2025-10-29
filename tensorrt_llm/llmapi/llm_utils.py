@@ -1,4 +1,3 @@
-import copy
 import json
 import os
 import shutil
@@ -530,8 +529,8 @@ class ModelLoader:
 
         logger_debug(f"rank{mpi_rank()} begin to build engine...\n", "green")
 
-        # avoid the original build_config is modified, avoid the side effect
-        copied_build_config = copy.deepcopy(self.build_config)
+        # avoid side effects by copying the original build_config
+        copied_build_config = self.build_config.model_copy(deep=True)
 
         copied_build_config.update_kv_cache_type(self._model_info.architecture)
         assert self.model is not None, "model is loaded yet."

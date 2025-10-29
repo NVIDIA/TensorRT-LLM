@@ -130,7 +130,7 @@ COPY docker docker
 COPY scripts scripts
 COPY tensorrt_llm tensorrt_llm
 COPY 3rdparty 3rdparty
-COPY .gitmodules setup.py requirements.txt requirements-dev.txt constraints.txt ./
+COPY .gitmodules setup.py requirements.txt requirements-dev.txt constraints.txt README.md ./
 
 # Create cache directories for pip and ccache
 RUN mkdir -p /root/.cache/pip /root/.cache/ccache
