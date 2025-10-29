@@ -148,9 +148,13 @@ _config_from_pretrained_original = AutoConfig.from_pretrained
 _nemotron_h_base_model_tp_plan = {
     "in_proj": "mamba",
     "out_proj": "rowwise",
+    "q_proj": "colwise",
+    "k_proj": "colwise",
+    "v_proj": "colwise",
+    "o_proj": "rowwise",
     "up_proj": "colwise",
     "down_proj": "rowwise",
-    "*": "gather",
+    # "*": "gather",
 }
 
 

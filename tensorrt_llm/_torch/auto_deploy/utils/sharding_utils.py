@@ -83,8 +83,8 @@ def _validate_sharded_shapes(
     next_lin_node, _ = bfs(node, is_any_lin_op, include_root=False)
     nodes_to_validate = subgraph(
         [node],
-        [next_lin_node],
         include=lambda n: is_op(n, [torch.ops.aten.view, torch.ops.aten.reshape]),
+        boundary_condition=is_any_lin_op,
     )
     for view_node in nodes_to_validate:
         if len(view_node.args) < 2:
@@ -96,7 +96,7 @@ def _validate_sharded_shapes(
             continue
         if len(view_shape) >= 3 and isinstance(view_shape[2], int) and view_shape[2] != -1:
             args = list(view_node.args)
-            view_shape[2] = view_shape[2] // world_size
+            view_shape[2] = -1  # view_shape[2] // world_size
             args[1] = tuple(view_shape)
             view_node.args = tuple(args)
             view_node.meta["sharded"] = True
