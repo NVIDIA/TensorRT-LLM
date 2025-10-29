@@ -648,6 +648,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
 
                 if (partition.clusterName == "dlcluster") {
                     dockerArgs += " -e NVIDIA_IMEX_CHANNELS=0"
+                    dockerArgs += " --device=/dev/gdrdrv:/dev/gdrdrv"
                 }
                 echo "Final dockerArgs: ${dockerArgs}"
             } else {
