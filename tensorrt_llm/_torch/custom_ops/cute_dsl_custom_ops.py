@@ -53,6 +53,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
         def __hash__(self):
             return hash((self.output_dtype, ))
 
+        def __eq__(self, other):
+            if not isinstance(other, CuteDSLNVFP4BlackwellLinear):
+                return False
+            return self.output_dtype == other.output_dtype
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
