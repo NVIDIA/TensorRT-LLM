@@ -12,6 +12,7 @@ from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_deepseekv3 import (
     DeepseekV3DecoderLayer, DeepseekV3Gate)
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_wide_ep import WideEPMoE
 from tensorrt_llm._torch.modules.linear import Linear, WeightMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
@@ -139,7 +140,8 @@ class RoutingMethod(DeepseekV3Gate):
 class DeepSeekV3Runner:
 
     def __init__(self, pretrained_model_name_or_path: str, mapping: Mapping, *,
-                 moe_backend: str, layer_indices: List[int], max_seq_len: int,
+                 moe_backend: str, layer_indices: List[int],
+                 scaled_from: Optional[int], max_seq_len: int,
                  max_num_tokens: int, use_cuda_graph: bool):
 
         # Temporally replace the gate class
@@ -169,7 +171,36 @@ class DeepSeekV3Runner:
         )
 
         pretrained_config = self.model_config.pretrained_config
-        quant_config = self.model_config.quant_config
+        if scaled_from is not None:
+            # To run the problem size of $B$ GPUs on $A$ GPUs, we need:
+            # (1) Attention: If TP, reduce the number of attention heads; If DP, nothing to change.
+            # (2) MoE: If EP, reduce the number of experts; If TP, reduce head size.
+            #     Maintain the result of AllToAll method selection because it is affected by EP size.
+            if not mapping.enable_attention_dp:
+                if hasattr(pretrained_config, "index_n_heads"):
+                    raise NotImplementedError(
+                        "Not support Indexer TP for weak scaling")
+                pretrained_config.num_attention_heads = pretrained_config.num_attention_heads // scaled_from * mapping.tp_size
+                pretrained_config.num_key_value_heads = pretrained_config.num_key_value_heads // scaled_from * mapping.tp_size
+            if mapping.moe_ep_size != mapping.world_size:
+                raise NotImplementedError("Not support MoE TP for weak scaling")
+            pretrained_config.n_routed_experts = pretrained_config.n_routed_experts // scaled_from * mapping.moe_ep_size
+            select_alltoall_method_type_orig = WideEPMoE.select_alltoall_method_type
+
+            def select_alltoall_method_type(cls: type, mapping: Mapping,
+                                            top_k: int, *args, **kwargs):
+                # Replace the condition `mapping.moe_ep_size <= top_k` with `scaled_from <= top_k`
+                # by replacing `top_k` with `fake_top_k`
+                if scaled_from <= top_k:
+                    fake_top_k = mapping.moe_ep_size + 1
+                else:
+                    fake_top_k = mapping.moe_ep_size - 1
+                assert (mapping.moe_ep_size <= fake_top_k) == (scaled_from
+                                                               <= top_k)
+                return select_alltoall_method_type_orig(mapping, fake_top_k,
+                                                        *args, **kwargs)
+
+            WideEPMoE.select_alltoall_method_type = select_alltoall_method_type
 
         aux_stream_list = [torch.cuda.Stream() for _ in range(2)]
         aux_stream_dict = {
@@ -192,6 +223,7 @@ class DeepSeekV3Runner:
 
         # apply_quant_config_exclude_modules
         #   Please refer to tensorrt_llm/_torch/models/modeling_utils.py
+        quant_config = self.model_config.quant_config
         new_quant_config = QuantConfig(
             kv_cache_quant_algo=quant_config.kv_cache_quant_algo)
         for layer in layers:
@@ -235,6 +267,8 @@ class DeepSeekV3Runner:
         layers[-1].next_layer_layernorm = next_layer_layernorm
 
         self.layers = layers
+        if scaled_from is not None:
+            WideEPMoE.select_alltoall_method_type = select_alltoall_method_type_orig
         tensorrt_llm._torch.models.modeling_deepseekv3.DeepseekV3Gate = gate_cls_orig
 
     def create_run_pack(self,

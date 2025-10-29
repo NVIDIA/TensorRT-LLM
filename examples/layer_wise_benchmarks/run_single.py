@@ -25,7 +25,7 @@ parser.add_argument(
     type=comma_separated_ints,
     help="Comma separated indices of layers, should be a contiguous range")
 parser.add_argument("--run-type", type=str, choices=["CTX", "GEN"])
-parser.add_argument("--simulate-num-gpus", type=int)
+parser.add_argument("--scaled-from", type=int)
 # KV cache related args
 parser.add_argument("--max-seq-len", type=int)
 group = parser.add_mutually_exclusive_group(required=False)
@@ -89,6 +89,7 @@ runner = DeepSeekV3Runner(args.model,
                           mapping,
                           moe_backend=args.moe_backend,
                           layer_indices=args.layer_indices,
+                          scaled_from=args.scaled_from,
                           max_seq_len=args.max_seq_len,
                           max_num_tokens=args.max_num_tokens,
                           use_cuda_graph=args.use_cuda_graph)

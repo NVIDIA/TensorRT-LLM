@@ -1,7 +1,7 @@
 model: nvidia/DeepSeek-R1-0528-FP4-v2
 layer_indices: [5]
 run_type: GEN
-simulate_num_gpus: null
+scaled_from: null
 
 # KV cache related args
 max_seq_len: 9220  # 8192 + 1024 + 4
@@ -9,7 +9,7 @@ enable_attention_dp: true
 
 # Model init args
 max_num_tokens: 4096  # MTP3 as max
-moe_backend: WIDEEP
+moe_backend: CUTLASS
 use_cuda_graph: true
 
 # Per iteration args
