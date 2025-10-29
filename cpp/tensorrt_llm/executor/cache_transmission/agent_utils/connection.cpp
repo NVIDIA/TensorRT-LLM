@@ -301,7 +301,7 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(batc
                     auto validConnectionIdx = requestAndBufferInfo.mValidConnectionIdx;
                     auto remoteAgentName = requestAndBufferInfo.mAgentName;
                     TLLM_LOG_DEBUG(" recv Address:%s", address.c_str());
-                    auto connection = connect(remoteAgentName, address, metadataOpt, false);
+                    auto connection = connect(remoteAgentName, address, metadataOpt, /* isSender = */ false);
                     // to compute the offset.
                     auto offsetRatio = computeSendOffsetRatio(requestInfo.getTransState().getCacheState().value(),
                         requestInfo.getTransState().getCommState()->getSelfIdx(), mCacheState, validConnectionIdx);
