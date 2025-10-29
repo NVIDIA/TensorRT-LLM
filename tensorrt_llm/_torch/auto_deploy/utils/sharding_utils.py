@@ -341,6 +341,7 @@ def _insert_sharded_mamba(
         add_dist=False,
         min_local_shape=min_local_shape,
         fused_weight_dims=entry_fused_dims,
+        quantization_cb=quantization_cb,
     )
 
     # Get all weight nodes in the subgraph except for out_proj
@@ -573,6 +574,20 @@ class WeightShardingInfo(ShardingTransformInfo):
     # used for TP sharding of fused weights
     fused_weight_dims: Optional[list] = None
 
+    def quantization_cb(
+        self,
+        gm: GraphModule,
+        submod: nn.Module,
+        node: Node,
+        weight_key: str,
+        weight_new_shape: torch.Size,
+        dim: int,
+        rank: int,
+        world_size: int,
+    ) -> None:
+        """Quantization callback. Default does nothing for non-quantized models."""
+        return None
+
     @classmethod
     def from_node(cls, node: Node, **kwargs) -> "WeightShardingInfo":
         """
@@ -612,6 +627,7 @@ class WeightShardingInfo(ShardingTransformInfo):
                 fused_weight_dims=self.fused_weight_dims
                 if isinstance(self.fused_weight_dims, dict)
                 else None,
+                quantization_cb=self.quantization_cb,
             )
         else:
             _shard_parameter_node(
@@ -623,6 +639,7 @@ class WeightShardingInfo(ShardingTransformInfo):
                 add_dist=self.dist_op is not None,
                 min_local_shape=self.min_local_shape,
                 fused_weight_dims=self.fused_weight_dims,
+                quantization_cb=self.quantization_cb,
             )
 
 
@@ -741,18 +758,6 @@ class FP8TPShardingInfo(QuantizationShardingMixin, WeightShardingInfo):
     ) -> None:
         return
 
-    def apply(self, gm: GraphModule, node: Node) -> None:
-        _shard_parameter_node(
-            gm=gm,
-            node=node,
-            dim=self.split_dim.value,
-            rank=self.rank,
-            world_size=self.world_size,
-            add_dist=self.dist_op is not None,
-            min_local_shape=self.min_local_shape,
-            quantization_cb=self.quantization_cb,  # quant callback
-        )
-
 
 def _shard_fp4_weight_scale(weight_scale, sharded_uint8_weight_shape, dim, rank, world_size):
     assert weight_scale.dim() == 1
@@ -808,18 +813,6 @@ class FP4TPShardingInfo(QuantizationShardingMixin, WeightShardingInfo):
             state_dict[key] = _shard_fp4_weight_scale(
                 state_dict[key], weight_shape, dim, rank, world_size
             )
-
-    def apply(self, gm: GraphModule, node: Node) -> None:
-        _shard_parameter_node(
-            gm=gm,
-            node=node,
-            dim=self.split_dim.value,
-            rank=self.rank,
-            world_size=self.world_size,
-            add_dist=self.dist_op is not None,
-            min_local_shape=self.min_local_shape,
-            quantization_cb=self.quantization_cb,  # quant callback
-        )
 
 
 TP_SHARDING_RULES = [
