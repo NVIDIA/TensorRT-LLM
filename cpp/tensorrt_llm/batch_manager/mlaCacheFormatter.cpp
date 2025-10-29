@@ -122,6 +122,7 @@ bool MLACacheFormatter::needSendCache(
 void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& session)
 {
     NVTX3_SCOPED_RANGE(MLACacheFormatter_format);
+    session.setTime(TransferSession::kTimeFormatter);
     auto const& llmRequest = session.getLlmRequest();
     TLLM_LOG_DEBUG(
         mpi::MpiComm::world().getRank(), "Start sending KV cache for request ID: %ld.", llmRequest.mRequestId);
@@ -140,9 +141,6 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
     }
 
     // diff end
-
-    auto lastTokenTime = llmRequest.getPerfMetrics().timingMetrics.lastTokenTime;
-    bool recordDelay = lastTokenTime != std::chrono::steady_clock::time_point();
 
     int blockNum = 0;
     std::vector<runtime::ITensor::SharedPtr> inputKvCacheBlocks;
@@ -235,6 +233,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
         inputKvCacheBlocksPerWindow, outputSplitCaches, destConfig, selfConfig, selfIdx, bufferManager);
 
     bufferManager.getStream().synchronize();
+    session.setTime(TransferSession::kTimePreprocess);
 
     auto preAllocSendBuffer = mCacheTransBufferManager->getSendBuffer(cacheBufferId);
     if (preAllocSendBuffer != nullptr)
@@ -246,7 +245,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
         NVTX3_SCOPED_RANGE(sendBufferFun);
 
         TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
-        auto startTime = llmRequest.getSteadyClockNow();
+        auto startTime = LlmRequest::getSteadyClockNow();
         auto cacheIdx = processIdx % (pPDomainSize * cPDomainSize);
         if (cacheIdx < bufferCoverTargetNum)
         {
@@ -279,15 +278,8 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
                 remainSendSize -= sendSize;
             }
         }
-        auto endTime = llmRequest.getSteadyClockNow();
-        double delay = 0.0;
-        if (recordDelay)
-        {
-            delay = std::chrono::duration<double, std::milli>(startTime - lastTokenTime).count();
-        }
-        double cacheTransferTime
-            = std::max(0.0, std::chrono::duration<double, std::milli>(endTime - startTime).count());
-        session.appendMeasure(delay, cacheTransferTime, outputSplitCaches.at(cacheIdx)->getSizeInBytes());
+        auto endTime = LlmRequest::getSteadyClockNow();
+        session.appendMeasure(startTime, endTime, outputSplitCaches.at(cacheIdx)->getSizeInBytes());
     };
 
     if (connections.size() > 1)
@@ -331,7 +323,9 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
     {
         sendBufferFun(deviceId, 0);
     }
+    session.setTime(TransferSession::kTimeTransmissions);
     mCacheTransBufferManager->freeBufferIndexForSend(cacheBufferId);
+    session.setTime(TransferSession::kTimePostprocess);
 
     TLLM_LOG_DEBUG(
         mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID: %ld.", llmRequest.mRequestId);
@@ -340,6 +334,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
 void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& session)
 {
     NVTX3_SCOPED_RANGE(MLACacheFormatter_unformat);
+    session.setTime(TransferSession::kTimeFormatter);
     auto const& llmRequest = session.getLlmRequest();
     TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.beamWidth == 1, "Currently only supports beam width 1.");
     auto const ctxReqId = llmRequest.getContextPhaseParams().value().getReqId();
@@ -350,8 +345,6 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
     auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
     auto const& connections = session.getConnections();
     auto& bufferManager = session.getBufferManager();
-    auto arrivalTime = llmRequest.getPerfMetrics().timingMetrics.arrivalTime;
-    bool recordDelay = arrivalTime != std::chrono::steady_clock::time_point();
     auto pickUpConnections = pickRecvConnections(connections.size(), selfConfig, selfIdx, destConfig);
     auto blockRange = getBlockRangeForReceiving(mCacheManager, llmRequest, destConfig.getEnableBlockReuse());
     std::vector<runtime::ITensor::SharedPtr> recvBufferTmps;
@@ -445,6 +438,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
             TLLM_CHECK(onlyUseDynamicBuffer == false);
         }
         bufferManager.getStream().synchronize();
+        session.setTime(TransferSession::kTimePreprocess);
 
         auto preAllocRecvBuffer = mCacheTransBufferManager->getRecvBuffer(cacheBufferId);
         if (preAllocRecvBuffer != nullptr)
@@ -456,7 +450,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
         {
             NVTX3_SCOPED_RANGE(recvBufferFun);
             TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
-            auto startTime = llmRequest.getSteadyClockNow();
+            auto startTime = LlmRequest::getSteadyClockNow();
             size_t size = 0;
             if (processIdx >= remainNoCoverTargetNum)
             {
@@ -489,15 +483,8 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
                     remainRecvSize -= recvSize;
                 }
             }
-            auto endTime = llmRequest.getSteadyClockNow();
-            double delay = 0.0;
-            if (recordDelay)
-            {
-                delay = std::chrono::duration<double, std::milli>(startTime - arrivalTime).count();
-            }
-            double cacheTransferTime
-                = std::max(0.0, std::chrono::duration<double, std::milli>(endTime - startTime).count());
-            session.appendMeasure(delay, cacheTransferTime, size);
+            auto endTime = LlmRequest::getSteadyClockNow();
+            session.appendMeasure(startTime, endTime, size);
         };
 
         if (pickUpConnections.size() > 1)
@@ -546,6 +533,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
         {
             recvBufferFun(deviceId, 0);
         }
+        session.setTime(TransferSession::kTimeTransmissions);
 
         {
             std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>> outputCachesPerWindow;
@@ -564,6 +552,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
     {
         mCacheTransBufferManager->freeBufferIndexForRecv(cacheBufferId);
     }
+    session.setTime(TransferSession::kTimePostprocess);
 
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         "End receiving KV cache for request ID: %ld, context request ID: %ld.", llmRequest.mRequestId,
