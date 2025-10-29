@@ -120,7 +120,7 @@ class LMHead(Linear):
         output = input.new_empty(output_shape)
         return output
 
-    def load_weights(self, weights: List[Dict], already_sharded: bool):
+    def load_weights(self, weights: List[Dict], already_sharded: bool = False):
         original_weight = None
         if self.tp_mode == TensorParallelMode.COLUMN:
             if self.tp_rank == self.tp_size - 1 and self.padding_size > 0:

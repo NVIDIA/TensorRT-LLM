@@ -2325,7 +2325,7 @@ class Linear(nn.Module):
 
         return output
 
-    def load_weights(self, weights: List[Dict], already_sharded: bool):
+    def load_weights(self, weights: List[Dict], already_sharded: bool = False):
         assert self._weights_created
 
         weight_mode = self.weights_loading_config.weight_mode
