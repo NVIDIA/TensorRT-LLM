@@ -93,12 +93,14 @@ class EnvManager:
     @staticmethod
     def get_container_mount() -> str:
         work_dir = EnvManager.get_work_dir()
+        script_dir = EnvManager.get_script_dir()
         model_dir = EnvManager.get_model_dir()
         output_path = EnvManager.get_output_path()
         repo_dir = EnvManager.get_repo_dir()
         
         mounts = [
             f"{work_dir}:{work_dir}",
+            f"{script_dir}:{script_dir}",
             f"{model_dir}:{model_dir}",
             f"{output_path}:{output_path}",
         ]
