@@ -78,12 +78,14 @@ class OpenAIServer:
     def __init__(self,
                  llm: Union[LLM, MultimodalEncoder],
                  model: str,
+                 tool_parser: Optional[str],
                  server_role: Optional[ServerRole],
                  metadata_server_cfg: MetadataServerConfig,
                  disagg_cluster_config: Optional[DisaggClusterConfig] = None,
                  multimodal_server_config: Optional[MultimodalServerConfig] = None):
         self.llm = llm
         self.tokenizer = llm.tokenizer
+        self.tool_parser = tool_parser
         self.metadata_server = create_metadata_server(metadata_server_cfg)
         self.disagg_cluster_config = disagg_cluster_config
         self.multimodal_server_config = multimodal_server_config
@@ -532,6 +534,7 @@ class OpenAIServer:
                 prompt["multi_modal_data"] = mm_data
 
             postproc_args.reasoning_parser = self.llm.args.reasoning_parser
+            postproc_args.tool_parser = self.tool_parser
             if conversation and conversation[-1].get(
                     "content") and conversation[-1].get("role") == get_role():
                 postproc_args.last_message_content = conversation[-1]["content"]
