@@ -361,7 +361,7 @@ def _register_fake():
                                     (batch_size, ), dtype=torch.int32)
 
     @torch.library.register_fake("trtllm::fp8_quantize_1x128")
-    def _(input: torch.Tensor):
+    def _(input: torch.Tensor, use_ue8m0: bool = False):
         pad_m = fp4_utils.pad_up(input.shape[0], 4)
         blocked_n = (input.shape[1] + 127) // 128
         if get_sm_version() >= 100:
