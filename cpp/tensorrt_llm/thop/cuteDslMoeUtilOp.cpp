@@ -16,6 +16,7 @@
 
 #include "tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.h"
 #include "tensorrt_llm/thop/thUtils.h"
+#include <c10/core/ScalarType.h>
 
 namespace torch_ext
 {
@@ -36,7 +37,6 @@ std::vector<torch::Tensor> moe_topk_sort_impl(torch::optional<torch::Tensor> con
     int64_t const max_num_ctas = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::getMaxNumCtasInBatchDim(
         num_tokens, top_k, num_experts, tile_tokens_dim);
     int64_t const size_of_expert_count_histogram = std::max(num_experts * 2, int64_t(256 * 2));
-    auto const routing_bias_dtype = routing_bias.has_value() ? routing_bias->scalar_type() : at::ScalarType::BFloat16;
 
     auto routing_logits_ptr = routing_logits.has_value() ? routing_logits->data_ptr() : nullptr;
     auto routing_bias_ptr = routing_bias.has_value() ? routing_bias->data_ptr() : nullptr;
@@ -47,8 +47,7 @@ std::vector<torch::Tensor> moe_topk_sort_impl(torch::optional<torch::Tensor> con
     torch::optional<torch::Tensor> new_token_final_scales;
     if (token_final_scales_ptr == nullptr)
     {
-        new_token_final_scales
-            = torch::empty({num_tokens, top_k}, torch::dtype(routing_bias_dtype).device(torch::kCUDA));
+        new_token_final_scales = torch::empty({num_tokens, top_k}, torch::dtype(torch::kBFloat16).device(torch::kCUDA));
         token_final_scales_ptr = new_token_final_scales->data_ptr();
     }
 
