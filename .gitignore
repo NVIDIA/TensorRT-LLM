@@ -82,4 +82,5 @@ compile_commands.json
 .devcontainer/docker-compose.override.yml
 
 # Enroot sqsh files
+enroot/sw-tensorrt-docker+*.sqsh
 enroot/tensorrt_llm.devel.sqsh
