@@ -77,23 +77,6 @@ class SlurmRunCommandBuilder:
                     "bash", "-c",
                     f"cd {work_dir} && python3 {work_dir}/simple_collect.py {output_path}"
                 ]
-            elif install_mode == "wheel":
-                # Install TensorRT-LLM wheel first, then run simple_collect.py
-                install_cmd = f"""
-                    cd {repo_dir}
-                    echo '📦 Step 1: Installing requirements-dev.txt...'
-                    pip3 install -r {repo_dir}/requirements-dev.txt || echo '⚠️  requirements-dev.txt install failed, continuing...'
-                    
-                    echo '📦 Step 2: Installing TensorRT-LLM wheel...'
-                    pip3 install {repo_dir}/build/*.whl --extra-index-url https://gitlab-master.nvidia.com/api/v4/projects/100660/packages/pypi/simple || echo '⚠️  Wheel install failed, continuing...'
-                    
-                    echo '✅ Wheel installation completed'
-                    
-                    echo '🚀 Step 3: Running simple_collect.py...'
-                    cd {work_dir}
-                    python3 {work_dir}/simple_collect.py {output_path}
-                """
-                return ["bash", "-c", install_cmd]
             elif install_mode == "source":
                 install_cmd = f"""
                 cd {repo_dir}
