@@ -1895,7 +1895,7 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
     #
     # Data Generation
     #
-
+    test_invalid_topk_input = False
     act_type = ActType.SwiGlu
     num_experts = routing_info["num_experts"]
     top_k = routing_info["top_k"]
@@ -1931,10 +1931,12 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
             pytest.skip(
                 "512 experts is tested only with no autotune, mxfp8, SwiGlu")
     if use_topk_as_input:
-        if dtype_activation != "mxfp8" or top_k != 4 or act_type_str != "SwiGlu" or not use_autotune or num_tokens != 1:
+        if dtype_activation != "mxfp8" or top_k != 4 or act_type_str != "SwiGlu" or not use_autotune:
             pytest.skip(
-                "use_topk_as_input is tested only with mxfp8, topk=4, SwiGlu, autotune, and num_tokens=1"
+                "use_topk_as_input is tested only with mxfp8, topk=4, SwiGlu and not use_autotune"
             )
+        else:
+            test_invalid_topk_input = True
 
     assert top_k <= num_experts
     assert top_k <= 10
@@ -2037,6 +2039,17 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
         topk_ids = permute_info["topKIndices"].to(torch.int32)
         topk_weights = permute_info["topKLogits"]
         expert_logits = None
+        if test_invalid_topk_input:
+            extra_col = torch.full((num_tokens, 1),
+                                   -1,
+                                   dtype=topk_ids.dtype,
+                                   device=topk_ids.device)
+            topk_ids = torch.cat([topk_ids, extra_col], dim=1)
+            extra_col = torch.full((num_tokens, 1),
+                                   -1,
+                                   dtype=topk_weights.dtype,
+                                   device=topk_weights.device)
+            topk_weights = torch.cat([topk_weights, extra_col], dim=1)
     else:
         topk_ids = None
         topk_weights = None
@@ -2182,6 +2195,8 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
     # Run the TRT-LLM kernel
     #
     unpadded_hidden_size = hidden_size
+    if test_invalid_topk_input:
+        top_k = top_k + 1
     AutoTuner.get().clear_cache()
     with autotune(use_autotune):
         if dtype_activation == "mxfp8":
