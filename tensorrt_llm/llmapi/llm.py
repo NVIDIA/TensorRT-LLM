@@ -627,6 +627,12 @@ class BaseLLM:
                          is_gen_only: bool) -> None:
 
         if self.args.backend in ["pytorch", "_autodeploy"]:
+            # multiple responses (n > 1) is not supported for now, consistent with the error message in trtllm-serve
+            if sampling_params.n > 1 and self.args.backend == "pytorch":
+                raise ValueError(
+                    "Multiple responses (n > 1) is not supported in PyTorch workflow"
+                )
+            
             # Check prompt length and query length against max_num_tokens to filter illegal requests.
             # Skip check for gen-only requests
             if self.args.backend == "pytorch" and not self.args.enable_chunked_prefill and not is_gen_only:
