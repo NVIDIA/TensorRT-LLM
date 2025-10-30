@@ -254,11 +254,6 @@ Add `ISOLATION` to the test case line with proper spacing:
 - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0] ISOLATION
 ```
 
-**For Local Testing (TXT files):**
-```
-disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0] ISOLATION
-```
-
 ## 7. Combining test markers
 
 Multiple markers can be combined for the same test case using commas. Both formats are valid:
