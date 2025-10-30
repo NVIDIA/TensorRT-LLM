@@ -10,3 +10,8 @@ Efficient-Large-Model/NVILA-8B:
   - accuracy: 47.77
 Efficient-Large-Model/VILA1.5-3b:
   - accuracy: 32.33
+# MMMU for Nemotron-Nano-12B-v2-VL-BF16 requires reasoning on.
+# While enabling reasoning for current test harness is not supported,
+# the metric here is for model sanity checking.
+nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16:
+  - accuracy: 26.67
