@@ -353,13 +353,13 @@ class DeepSeekV3Runner:
 
     @staticmethod
     def create_kv_cache_manager(pretrained_model_name_or_path, mapping,
-                                max_batch_size, max_seq_len, layer_indices):
+                                tokens_per_block, max_batch_size, max_seq_len,
+                                layer_indices):
         # Please refer to `tensorrt_llm/_torch/pyexecutor/py_executor_creator.py` for `tokens_per_block`
         model_config = ModelConfig.from_pretrained(
             pretrained_model_name_or_path)
-        tokens_per_block = 32
         if model_config.enable_flash_mla:
-            tokens_per_block = 64
+            assert tokens_per_block == 64
 
         # Please refer to `tensorrt_llm/_torch/pyexecutor/_util.py` for `kv_cache_manager`
         kv_cache_manager_cls = get_kv_cache_manager_cls(model_config)

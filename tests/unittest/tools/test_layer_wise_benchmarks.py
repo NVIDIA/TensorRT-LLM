@@ -46,6 +46,7 @@ def test_deepseek_v32_ctx_dep(llm_root):
         "./run_single.sh",
         "config_ctx.yaml",
         "--model=deepseek-ai/DeepSeek-V3.2-Exp",
+        "--tokens-per-block=64",
         "--moe-backend=DEEPGEMM",
     ],
                cwd=llm_root / "examples" / "layer_wise_benchmarks",

@@ -27,6 +27,7 @@ parser.add_argument(
 parser.add_argument("--run-type", type=str, choices=["CTX", "GEN"])
 parser.add_argument("--scaled-from", type=int)
 # KV cache related args
+parser.add_argument("--tokens-per-block", type=int)
 parser.add_argument("--max-seq-len", type=int)
 group = parser.add_mutually_exclusive_group(required=False)
 group.add_argument("--enable-attention-dp",
@@ -75,6 +76,7 @@ max_batch_size = 2048
 kv_cache_manager = DeepSeekV3Runner.create_kv_cache_manager(
     args.model,
     mapping,
+    tokens_per_block=args.tokens_per_block,
     max_batch_size=max_batch_size,
     max_seq_len=args.max_seq_len,
     layer_indices=args.layer_indices)
