@@ -9,7 +9,7 @@ import time
 from common import SESSION_COLLECT_CMD_TYPE
 from typing import Dict, List, Any, Optional
 from common import  EnvManager, \
-    GPU_RESOURCE_CONFIG
+    GPU_RESOURCE_CONFIG, extract_config_fields
 from trt_test_alternative import check_output, call
 from report import LogWritter, LogParser, ResultSaver
 from pathlib import Path
@@ -218,32 +218,13 @@ class JobManager:
         Returns:
             Dict with 'success' status and other result information
         """
-        # Extract parameters from YAML config
+        # Extract parameters from YAML config using common utility
         config_data = test_config.config_data
+        fields = extract_config_fields(config_data)
         
-        isl = config_data['sequence']['input_length']
-        osl = config_data['sequence']['output_length']
-        ctx_num = config_data['hardware']['num_ctx_servers']
-        gen_num = config_data['hardware']['num_gen_servers']
-        gen_tp_size = config_data['worker_config']['gen']['tensor_parallel_size']
-        gen_batch_size = config_data['worker_config']['gen']['max_batch_size']
-        gen_enable_dp = config_data['worker_config']['gen']['enable_attention_dp']
-        eplb_slots = config_data['worker_config'].get('eplb_num_slots', 0)
-        
-        # Get MTP size if exists
-        gen_config = config_data['worker_config']['gen']
-        mtp_size = 0
-        if 'speculative_config' in gen_config:
-            mtp_size = gen_config['speculative_config'].get('num_nextn_predict_layers', 0)
-        
-        # Generate log directory names (matching submit.py logic)
-        dep_flag = "dep" if gen_enable_dp else "tep"
-        log_base = f"{isl}-{osl}"
-        context_dir = (
-            f"ctx{ctx_num}_gen{gen_num}_{dep_flag}{gen_tp_size}_"
-            f"batch{gen_batch_size}_eplb{eplb_slots}_mtp{mtp_size}"
-        )
-        
+        # Extract fields for logging and result directory
+        log_base = fields['log_base']
+        context_dir = fields['context_dir']
         log_dir_name = log_base
         
         print(f"   📁 Log directory: {log_dir_name}")

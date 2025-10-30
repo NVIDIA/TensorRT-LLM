@@ -7,7 +7,7 @@ import yaml
 from pathlib import Path
 from typing import List, Optional, Dict
 from dataclasses import dataclass
-from common import EnvManager
+from common import EnvManager, extract_config_fields
 
 
 @dataclass
@@ -234,6 +234,44 @@ class ConfigLoader:
         print(f"\n✅ Loaded {len(configs)} configurations for GPU type: {gpu_type}")
         return configs
     
+    def _make_test_id(self, test_type: str, test_category: str, test_file_name: str, config_data: dict) -> str:
+        """
+        根据测试类型、测试类别、测试文件名和配置数据生成测试ID
+        
+        格式: {test_type}_{test_category}_{model_name}_{isl}k{osl}k_{dep_flag}{gen_tp_size}_bs{gen_batch_size}_mtp{mtp_size}
+        例如: disagg_perf_deepseek-r1-fp4_1k1k_dep32_bs32_mtp3
+        
+        Args:
+            test_type: 测试类型 (disagg, widep等)
+            test_category: 测试类别 (perf, accuracy)
+            test_file_name: 测试文件名（不含扩展名）
+            config_data: YAML配置数据
+        
+        Returns:
+            生成的测试ID字符串
+        """
+        # 提取配置字段
+        fields = extract_config_fields(config_data)
+        
+        # 从metadata获取模型名称
+        metadata = config_data.get('metadata', {})
+        model_name = metadata.get('model_name', 'unknown')
+        
+        # 生成benchmark类型 (如 1k1k, 8k1k)
+        isl_k = fields['isl'] // 1024
+        osl_k = fields['osl'] // 1024
+        benchmark_type = f"{isl_k}k{osl_k}k"
+        cache_transceiver_backend = fields['cache_transceiver_backend']
+        
+        # 生成测试ID
+        test_id = (
+            f"{test_type}_{test_category}_file:{test_file_name}_model:{model_name}_{benchmark_type}_"
+            f"{fields['dep_flag']}:{fields['gen_tp_size']}_bs:{fields['gen_batch_size']}_"
+            f"mtp:{fields['mtp_size']}_ccbackend:{fields['cache_transceiver_backend']}"
+        )
+        
+        return test_id
+
     def _load_config_file(self, yaml_path: Path, test_type: str,
                          test_category: str) -> TestConfig:
         """Load single YAML config file"""
@@ -259,10 +297,10 @@ class ConfigLoader:
         metrics_config = self._get_metrics_config(test_type, test_category, config_data)
         
         # Extract test file name (without extension)
-        test_file_name = yaml_path.stem  # e.g., "deepseek-r1-fp4_1k1k_tep8_bs32_mtp3_nixl"
+        test_file_name = yaml_path.stem  # e.g., "deepseek-r1-fp4-0"
         
-        # Generate test ID with file name for uniqueness
-        test_id = f"{test_type}_{test_category}_{test_file_name}"
+        # Generate test ID using config data
+        test_id = self._make_test_id(test_type, test_category, test_file_name, config_data)
         
         return TestConfig(
             config_path=str(yaml_path),
