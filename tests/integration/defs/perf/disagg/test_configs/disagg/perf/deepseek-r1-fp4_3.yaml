@@ -1,5 +1,5 @@
-# DEEPSEEK-R1-FP4 - 1k1k - TEP8 BS32 NIXL
-# 对应 disagg_config.py 中的第 1 个配置
+# DEEPSEEK-R1-FP4 - 1k1k - DEP32 BS32 NIXL
+# 对应 disagg_config.py 中的第 4 个配置
 
 metadata:
   model_name: deepseek-r1-fp4
@@ -10,13 +10,13 @@ metadata:
   - GB300
   script_file: disaggr_torch.slurm
   benchmark_type: 1k1k
-  config_index: 0
+  config_index: 3
 slurm:
   script_file: disaggr_torch.slurm
   partition: batch
   account: coreai_comparch_trtllm
   job_time: 02:00:00
-  job_name: deepseek-r1-fp4-1k1k-tep8
+  job_name: deepseek-r1-fp4-1k1k-dep32
   numa_bind: true
 benchmark:
   mode: e2e
@@ -24,11 +24,11 @@ benchmark:
   multi_round: 8
   benchmark_ratio: 0.8
   streaming: true
-  concurrency_list: 1 2 4 8 16 36
+  concurrency_list: '1075'
 hardware:
   gpus_per_node: 4
   num_ctx_servers: 1
-  num_gen_servers: 4
+  num_gen_servers: 1
 sequence:
   input_length: 1024
   output_length: 1024
@@ -45,12 +45,12 @@ profiling:
 worker_config:
   eplb_num_slots: 0
   gen:
-    tensor_parallel_size: 8
-    moe_expert_parallel_size: 8
-    enable_attention_dp: false
+    tensor_parallel_size: 32
+    moe_expert_parallel_size: 32
+    enable_attention_dp: true
     pipeline_parallel_size: 1
     max_batch_size: 32
-    max_num_tokens: 128
+    max_num_tokens: 32
     max_seq_len: 2251
     cuda_graph_config:
       enable_padding: true
@@ -74,16 +74,12 @@ worker_config:
       free_gpu_memory_fraction: 0.9
       dtype: fp8
     moe_config:
-      backend: TRTLLM
+      backend: WIDEEP
     cache_transceiver_config:
       max_tokens_in_buffer: 4608
       backend: NIXL
     stream_interval: 20
     num_postprocess_workers: 4
-    speculative_config:
-      decoding_type: MTP
-      num_nextn_predict_layers: 3
-    allreduce_strategy: MNNVL
   ctx:
     max_batch_size: 4
     max_num_tokens: 4608
@@ -102,6 +98,3 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 4608
       backend: NIXL
-    speculative_config:
-      decoding_type: MTP
-      num_nextn_predict_layers: 3

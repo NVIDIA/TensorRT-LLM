@@ -1,22 +1,22 @@
-# DEEPSEEK-R1-FP4 - 1k1k - TEP8 BS32 NIXL
-# 对应 disagg_config.py 中的第 1 个配置
+# QWEN3-235B-A22B-FP4 - 1k1k - TEP8 BS32 UCX
+# 对应 disagg_config.py 中的第 21 个配置
 
 metadata:
-  model_name: deepseek-r1-fp4
+  model_name: Qwen3-235B-A22B-FP4
   precision: fp4
-  model_dir_name: DeepSeek-R1-0528-FP4-V2
+  model_dir_name: Qwen3-235B-A22B-FP4
   supported_gpus:
   - GB200
   - GB300
   script_file: disaggr_torch.slurm
   benchmark_type: 1k1k
-  config_index: 0
+  config_index: 20
 slurm:
   script_file: disaggr_torch.slurm
   partition: batch
   account: coreai_comparch_trtllm
   job_time: 02:00:00
-  job_name: deepseek-r1-fp4-1k1k-tep8
+  job_name: Qwen3-235B-A22B-FP4-1k1k-tep8
   numa_bind: true
 benchmark:
   mode: e2e
@@ -35,7 +35,7 @@ sequence:
 environment:
   container_mount: /lustre:/lustre
   container_image: /lustre/fsw/portfolios/coreai/users/deemon/trtllm.sqsh
-  model_path: /lustre/fsw/portfolios/coreai/users/xqiao/DeepSeek-R1-0528-FP4-V2
+  model_path: /lustre/fsw/portfolios/coreai/users/xqiao/Qwen3-235B-A22B-FP4
   trtllm_repo: /lustre/fs1/portfolios/coreai/projects/trtllm
   build_wheel: false
   dataset_file: /lustre/fs1/portfolios/coreai/datasets/prompts.json
@@ -77,7 +77,7 @@ worker_config:
       backend: TRTLLM
     cache_transceiver_config:
       max_tokens_in_buffer: 4608
-      backend: NIXL
+      backend: UCX
     stream_interval: 20
     num_postprocess_workers: 4
     speculative_config:
@@ -101,7 +101,7 @@ worker_config:
       dtype: fp8
     cache_transceiver_config:
       max_tokens_in_buffer: 4608
-      backend: NIXL
+      backend: UCX
     speculative_config:
       decoding_type: MTP
       num_nextn_predict_layers: 3
