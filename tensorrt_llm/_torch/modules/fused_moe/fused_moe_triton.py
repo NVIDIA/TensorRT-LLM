@@ -224,10 +224,15 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
     def setup_quant_scales(self, module: torch.nn.Module):
         module.quant_scales = tuple()
 
-    def load_expert_w3_w1_weight(self, module: torch.nn.Module,
-                                 w1_weight: torch.Tensor,
-                                 w3_weight: torch.Tensor,
-                                 dst_w3_w1_weight: torch.Tensor):
+    def load_expert_w3_w1_weight(
+        self,
+        *,
+        module: torch.nn.Module,
+        w1_weight: torch.Tensor,
+        w3_weight: torch.Tensor,
+        dst_w3_w1_weight: torch.Tensor,
+        already_sharded: bool,
+    ):
         """
         Load w1 and w3 weights for each expert.
         Override this method if you need to preprocess the weights differently.
@@ -235,15 +240,24 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
         device = dst_w3_w1_weight.device
         assert device.type == "cuda"
 
+        if not already_sharded:
+            tp_size = module.tp_size
+            tp_rank = module.tp_rank
+            tp_mode_column = TensorParallelMode.COLUMN
+        else:
+            tp_size = 1
+            tp_rank = 0
+            tp_mode_column = None
+
         w1_weight_shard = load_weight_shard(w1_weight,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN,
+                                            tp_size,
+                                            tp_rank,
+                                            tp_mode_column,
                                             device=device)
         w3_weight_shard = load_weight_shard(w3_weight,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN,
+                                            tp_size,
+                                            tp_rank,
+                                            tp_mode_column,
                                             device=device)
 
         w31_weight_shard = torch.cat([w3_weight_shard, w1_weight_shard], dim=0)
@@ -261,19 +275,34 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
 
         dst_w3_w1_weight.copy_(w31_weight_shard, non_blocking=True)
 
-    def load_expert_w2_weight(self, module: torch.nn.Module,
-                              w2_weight: torch.Tensor,
-                              dst_w2_weight: torch.Tensor):
+    def load_expert_w2_weight(
+        self,
+        *,
+        module: torch.nn.Module,
+        w2_weight: torch.Tensor,
+        dst_w2_weight: torch.Tensor,
+        already_sharded: bool,
+    ):
         """
         Load w2 weight for each expert.
         Override this method if you need to preprocess the weights differently.
         """
         device = dst_w2_weight.device
         assert device.type == "cuda"
+
+        if not already_sharded:
+            tp_size = module.tp_size
+            tp_rank = module.tp_rank
+            tp_mode_row = TensorParallelMode.ROW
+        else:
+            tp_size = 1
+            tp_rank = 0
+            tp_mode_row = None
+
         w2_weight_shard = load_weight_shard(w2_weight,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.ROW,
+                                            tp_size,
+                                            tp_rank,
+                                            tp_mode_row,
                                             device=device)
         # We use .to here since for Triton the bias is always in float32 and a conversion is needed.
         w2_weight_shard = w2_weight_shard.to(dst_w2_weight.dtype)
@@ -285,21 +314,34 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
         else:
             assert w2_weight_shard.dim() == 1
             # Handle TP contribution of bias
-            w2_weight_shard /= module.tp_size
+            w2_weight_shard /= tp_size
 
         dst_w2_weight.copy_(w2_weight_shard, non_blocking=True)
 
     def load_expert_weights_to_dst(
-            self, module: torch.nn.Module, weights: List[Dict],
-            weight_loading_mode: MoEWeightLoadingMode,
-            load_expert_ids: List[int], dst_w3_w1_weights_tensor: torch.Tensor,
-            dst_w2_weights_tensor: torch.Tensor,
-            dst_w3_w1_bias_tensor: Optional[torch.Tensor],
-            dst_w2_bias_tensor: Optional[torch.Tensor]):
+        self,
+        *,
+        module: torch.nn.Module,
+        weights: List[Dict],
+        weight_loading_mode: MoEWeightLoadingMode,
+        load_expert_ids: List[int],
+        dst_w3_w1_weights_tensor: torch.Tensor,
+        dst_w2_weights_tensor: torch.Tensor,
+        dst_w3_w1_bias_tensor: Optional[torch.Tensor],
+        dst_w2_bias_tensor: Optional[torch.Tensor],
+        already_sharded: bool,
+    ):
         FusedMoEMethodBase.load_expert_weights_to_dst(
-            self, module, weights, weight_loading_mode, load_expert_ids,
-            dst_w3_w1_weights_tensor, dst_w2_weights_tensor,
-            dst_w3_w1_bias_tensor, dst_w2_bias_tensor)
+            self,
+            module=module,
+            weights=weights,
+            weight_loading_mode=weight_loading_mode,
+            load_expert_ids=load_expert_ids,
+            dst_w3_w1_weights_tensor=dst_w3_w1_weights_tensor,
+            dst_w2_weights_tensor=dst_w2_weights_tensor,
+            dst_w3_w1_bias_tensor=dst_w3_w1_bias_tensor,
+            dst_w2_bias_tensor=dst_w2_bias_tensor,
+            already_sharded=already_sharded)
         module.w3_w1_weight.data = maybe_update_stride(module.w3_w1_weight.data)
         module.w2_weight.data = maybe_update_stride(module.w2_weight.data)
 
@@ -440,19 +482,30 @@ class TritonFP8QDQFusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         )
 
     def load_expert_w3_w1_weight_scale_fp8_qdq(
-            self, w1_weight_scale, w3_weight_scale,
-            dst_w3_w1_weight_scale: torch.Tensor):
+        self,
+        *,
+        w1_weight_scale: torch.Tensor,
+        w3_weight_scale: torch.Tensor,
+        dst_w3_w1_weight_scale: torch.Tensor,
+        already_sharded: bool,
+    ):
         w1_weight_scale = w1_weight_scale[...].reshape([])
         w3_weight_scale = w3_weight_scale[...].reshape([])
         dst_w3_w1_weight_scale.copy_(max(w1_weight_scale, w3_weight_scale),
                                      non_blocking=True)
 
-    def load_expert_w2_weight_scale_fp8(self, w2_weight_scale,
-                                        dst_w2_weight_scale: torch.Tensor):
+    def load_expert_w2_weight_scale_fp8(
+        self,
+        *,
+        w2_weight_scale: torch.Tensor,
+        dst_w2_weight_scale: torch.Tensor,
+        already_sharded: bool,
+    ):
         dst_w2_weight_scale.copy_(w2_weight_scale[...].reshape([]),
                                   non_blocking=True)
 
-    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+    def load_quant_scales(self, module: torch.nn.Module, weights: Dict,
+                          already_sharded: bool):
         # Step1: Load input scales.
         max_fc31_input_scale, max_fc2_input_scale = load_activation_scales_fp8_qdq(
             module, weights)
@@ -481,8 +534,10 @@ class TritonFP8QDQFusedMoEMethod(TritonUnquantizedFusedMoEMethod):
             expert_idx = local_slot_id
 
             self.load_expert_w3_w1_weight_scale_fp8_qdq(
-                w1_weight_scale, w3_weight_scale,
-                tmp_w3_w1_weight_scale[expert_idx])
+                w1_weight_scale=w1_weight_scale,
+                w3_weight_scale=w3_weight_scale,
+                dst_w3_w1_weight_scale=tmp_w3_w1_weight_scale[expert_idx],
+                already_sharded=already_sharded)
 
             # Shared code from FP8QDQFusedMoEMethod, need to pass a transposed view
             requantize_expert_w3_w1_weight_fp8_qdq(
@@ -490,7 +545,9 @@ class TritonFP8QDQFusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                 module.w3_w1_weight.data[expert_idx].transpose(0, 1))
 
             self.load_expert_w2_weight_scale_fp8(
-                w2_weight_scale, tmp_w2_weight_scale[expert_idx])
+                w2_weight_scale=w2_weight_scale,
+                dst_w2_weight_scale=tmp_w2_weight_scale[expert_idx],
+                already_sharded=already_sharded)
 
         # now we can shuffle the weights for the activation kernel
         module.w3_w1_weight.data = shuffle_weight_for_activation_kernel(
@@ -509,16 +566,29 @@ class TritonFP8QDQFusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                                             non_blocking=True)
 
     def load_expert_weights_to_dst(
-            self, module: torch.nn.Module, weights: List[Dict],
-            weight_loading_mode: MoEWeightLoadingMode,
-            load_expert_ids: List[int], dst_w3_w1_weights_tensor: torch.Tensor,
-            dst_w2_weights_tensor: torch.Tensor,
-            dst_w3_w1_bias_tensor: Optional[torch.Tensor],
-            dst_w2_bias_tensor: Optional[torch.Tensor]):
+        self,
+        *,
+        module: torch.nn.Module,
+        weights: List[Dict],
+        weight_loading_mode: MoEWeightLoadingMode,
+        load_expert_ids: List[int],
+        dst_w3_w1_weights_tensor: torch.Tensor,
+        dst_w2_weights_tensor: torch.Tensor,
+        dst_w3_w1_bias_tensor: Optional[torch.Tensor],
+        dst_w2_bias_tensor: Optional[torch.Tensor],
+        already_sharded: bool,
+    ):
         FusedMoEMethodBase.load_expert_weights_to_dst(
-            self, module, weights, weight_loading_mode, load_expert_ids,
-            dst_w3_w1_weights_tensor, dst_w2_weights_tensor,
-            dst_w3_w1_bias_tensor, dst_w2_bias_tensor)
+            self,
+            module=module,
+            weights=weights,
+            weight_loading_mode=weight_loading_mode,
+            load_expert_ids=load_expert_ids,
+            dst_w3_w1_weights_tensor=dst_w3_w1_weights_tensor,
+            dst_w2_weights_tensor=dst_w2_weights_tensor,
+            dst_w3_w1_bias_tensor=dst_w3_w1_bias_tensor,
+            dst_w2_bias_tensor=dst_w2_bias_tensor,
+            already_sharded=already_sharded)
         module.w3_w1_weight.data = maybe_update_stride(module.w3_w1_weight.data)
         module.w2_weight.data = maybe_update_stride(module.w2_weight.data)
 
@@ -808,12 +878,18 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         )
 
     def load_expert_weights_to_dst(
-            self, module: torch.nn.Module, weights: List[Dict],
-            weight_loading_mode: MoEWeightLoadingMode,
-            load_expert_ids: List[int], dst_w3_w1_weights_tensor: torch.Tensor,
-            dst_w2_weights_tensor: torch.Tensor,
-            dst_w3_w1_bias_tensor: Optional[torch.Tensor],
-            dst_w2_bias_tensor: Optional[torch.Tensor]):
+        self,
+        *,
+        module: torch.nn.Module,
+        weights: List[Dict],
+        weight_loading_mode: MoEWeightLoadingMode,
+        load_expert_ids: List[int],
+        dst_w3_w1_weights_tensor: torch.Tensor,
+        dst_w2_weights_tensor: torch.Tensor,
+        dst_w3_w1_bias_tensor: Optional[torch.Tensor],
+        dst_w2_bias_tensor: Optional[torch.Tensor],
+        already_sharded: bool,
+    ):
         # dynamic quant scales for weights
         self.w3_scales = {}
         self.w1_scales = {}
@@ -848,11 +924,17 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                 )
 
             w3_scale, w1_scale = self.load_expert_w3_w1_weight(
-                module, w1_weight, w3_weight,
-                dst_w3_w1_weights_tensor[expert_idx])
+                module=module,
+                w1_weight=w1_weight,
+                w3_weight=w3_weight,
+                dst_w3_w1_weight=dst_w3_w1_weights_tensor[expert_idx],
+                already_sharded=already_sharded)
 
             w2_scale = self.load_expert_w2_weight(
-                module, w2_weight, dst_w2_weights_tensor[expert_idx])
+                module=module,
+                w2_weight=w2_weight,
+                dst_w2_weight=dst_w2_weights_tensor[expert_idx],
+                already_sharded=already_sharded)
             if w3_scale is not None:
                 self.w3_scales[expert_id] = w3_scale
             if w1_scale is not None:
@@ -862,16 +944,19 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
 
             if module.bias:
                 self.load_expert_w3_w1_weight(
-                    module,
-                    w1_bias,
-                    w3_bias,
-                    dst_w3_w1_bias_tensor.data[expert_idx],
+                    module=module,
+                    w1_weight=w1_bias,
+                    w3_weight=w3_bias,
+                    dst_w3_w1_weight=dst_w3_w1_bias_tensor.data[expert_idx],
+                    already_sharded=already_sharded,
                     is_bias=True)
 
-                self.load_expert_w2_weight(module,
-                                           w2_bias,
-                                           dst_w2_bias_tensor.data[expert_idx],
-                                           is_bias=True)
+                self.load_expert_w2_weight(
+                    module=module,
+                    w2_weight=w2_bias,
+                    dst_w2_weight=dst_w2_bias_tensor.data[expert_idx],
+                    already_sharded=already_sharded,
+                    is_bias=True)
 
     def _permute_mxfp4_quantize(self, tensor):
         tensor = tensor.transpose(-2, -1).contiguous()
@@ -880,17 +965,29 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                                                            axis=-2)
         return tensor_fp4, tensor_scales
 
-    def load_expert_w3_w1_weight(self,
-                                 module: torch.nn.Module,
-                                 w1_weight: torch.Tensor,
-                                 w3_weight: torch.Tensor,
-                                 dst_w3_w1_weight: torch.Tensor,
-                                 is_bias: bool = False):
+    def load_expert_w3_w1_weight(
+        self,
+        *,
+        module: torch.nn.Module,
+        w1_weight: torch.Tensor,
+        w3_weight: torch.Tensor,
+        dst_w3_w1_weight: torch.Tensor,
+        already_sharded: bool,
+        is_bias: bool = False,
+    ):
         """
         Load w1 and w3 weights for each expert.
         """
         device = dst_w3_w1_weight.device
         assert device.type == "cuda"
+
+        if not already_sharded:
+            tp_size = module.tp_size
+            tp_rank = module.tp_rank
+        else:
+            tp_size = 1
+            tp_rank = 0
+
         # Use full k-padding for float tensors, half for already-packed uint8
         k_pad = self.k_alignment // 2 if w1_weight.dtype == torch.uint8 else self.k_alignment
         # n is halved per-branch because we concatenate w1/w3 along N later
@@ -899,15 +996,15 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                                                0,
                                                n_pad,
                                                k_pad,
-                                               module.tp_size,
-                                               module.tp_rank,
+                                               tp_size,
+                                               tp_rank,
                                                device=device)
         w3_weight_shard = shard_and_pad_tensor(w3_weight,
                                                0,
                                                n_pad,
                                                k_pad,
-                                               module.tp_size,
-                                               module.tp_rank,
+                                               tp_size,
+                                               tp_rank,
                                                device=device)
 
         if not is_bias and w3_weight_shard.dtype in (torch.bfloat16,
@@ -943,24 +1040,36 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         dst_w3_w1_weight.copy_(w31_weight_shard, non_blocking=True)
         return (w3_scales, w1_scales)
 
-    def load_expert_w2_weight(self,
-                              module: torch.nn.Module,
-                              w2_weight: torch.Tensor,
-                              dst_w2_weight: torch.Tensor,
-                              is_bias: bool = False):
+    def load_expert_w2_weight(
+        self,
+        *,
+        module: torch.nn.Module,
+        w2_weight: torch.Tensor,
+        dst_w2_weight: torch.Tensor,
+        already_sharded: bool,
+        is_bias: bool = False,
+    ):
         """
         Load w2 weight for each expert.
         Override this method if you need to preprocess the weights differently.
         """
         device = dst_w2_weight.device
         assert device.type == "cuda"
+
+        if not already_sharded:
+            tp_size = module.tp_size
+            tp_rank = module.tp_rank
+        else:
+            tp_size = 1
+            tp_rank = 0
+
         k_pad = self.k_alignment // 2 if w2_weight.dtype == torch.uint8 else self.k_alignment
         w2_weight_shard = shard_and_pad_tensor(w2_weight,
                                                1,
                                                self.n_alignment,
                                                k_pad,
-                                               module.tp_size,
-                                               module.tp_rank,
+                                               tp_size,
+                                               tp_rank,
                                                device=device)
         w2_scales = None
 
@@ -969,7 +1078,7 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
             w2_weight_shard = w2_weight_shard.to(dst_w2_weight.dtype)
             assert w2_weight_shard.dim() == 1
             # Handle TP contribution of bias
-            w2_weight_shard /= module.tp_size
+            w2_weight_shard /= tp_size
         else:
             if w2_weight_shard.dtype in (torch.bfloat16, torch.float16,
                                          torch.float32):
@@ -986,9 +1095,22 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         return w2_scales
 
     def _load_expert_w3_w1_weight_scale_mxfp4(
-            self, module: torch.nn.Module, w1_weight_scale: torch.Tensor,
-            w3_weight_scale: torch.Tensor, dst_w3_w1_weight_scale: torch.Tensor,
-            transpose_scales: bool):
+        self,
+        *,
+        module: torch.nn.Module,
+        w1_weight_scale: torch.Tensor,
+        w3_weight_scale: torch.Tensor,
+        dst_w3_w1_weight_scale: torch.Tensor,
+        transpose_scales: bool,
+        already_sharded: bool,
+    ):
+        if not already_sharded:
+            tp_size = module.tp_size
+            tp_rank = module.tp_rank
+        else:
+            tp_size = 1
+            tp_rank = 0
+
         if transpose_scales:
             w1_weight_scale = w1_weight_scale.transpose(
                 0, 1)  # (hidden_dim / 32, intermediate_dim)
@@ -1001,8 +1123,8 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
             1,
             self.k_alignment // 32,
             self.n_alignment // 2,
-            module.tp_size,
-            module.tp_rank,
+            tp_size,
+            tp_rank,
             device=dst_w3_w1_weight_scale.device)
 
         w3_weight_scale = shard_and_pad_tensor(
@@ -1010,8 +1132,8 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
             1,
             self.k_alignment // 32,
             self.n_alignment // 2,
-            module.tp_size,
-            module.tp_rank,
+            tp_size,
+            tp_rank,
             device=dst_w3_w1_weight_scale.device)
 
         # (hidden_dim / 32, intermediate_dim * 2)
@@ -1019,10 +1141,22 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
 
         dst_w3_w1_weight_scale.copy_(combined_scale, non_blocking=True)
 
-    def _load_expert_w2_weight_scale_mxfp4(self, module: torch.nn.Module,
-                                           w2_weight_scale: torch.Tensor,
-                                           dst_w2_weight_scale: torch.Tensor,
-                                           transpose_scales: bool):
+    def _load_expert_w2_weight_scale_mxfp4(
+        self,
+        *,
+        module: torch.nn.Module,
+        w2_weight_scale: torch.Tensor,
+        dst_w2_weight_scale: torch.Tensor,
+        transpose_scales: bool,
+        already_sharded: bool,
+    ):
+        if not already_sharded:
+            tp_size = module.tp_size
+            tp_rank = module.tp_rank
+        else:
+            tp_size = 1
+            tp_rank = 0
+
         if transpose_scales:
             w2_weight_scale = w2_weight_scale.transpose(
                 0, 1)  # (intermediate_dim / 32, hidden_dim)
@@ -1034,13 +1168,14 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
             0,
             self.k_alignment // 32,
             self.n_alignment,
-            module.tp_size,
-            module.tp_rank,
+            tp_size,
+            tp_rank,
             device=dst_w2_weight_scale.device)
 
         dst_w2_weight_scale.copy_(w2_weight_scale, non_blocking=True)
 
-    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+    def load_quant_scales(self, module: torch.nn.Module, weights: Dict,
+                          already_sharded: bool):
         # Step1: Load input scales.
         if self.activation_dtype == torch.float8_e4m3fn:
             try:
@@ -1091,12 +1226,19 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
             expert_idx = local_slot_id
 
             self._load_expert_w3_w1_weight_scale_mxfp4(
-                module, w1_weight_scale, w3_weight_scale,
-                tmp_w3_w1_weight_scale[expert_idx], need_to_transpose_scales)
+                module=module,
+                w1_weight_scale=w1_weight_scale,
+                w3_weight_scale=w3_weight_scale,
+                dst_w3_w1_weight_scale=tmp_w3_w1_weight_scale[expert_idx],
+                transpose_scales=need_to_transpose_scales,
+                already_sharded=already_sharded)
 
             self._load_expert_w2_weight_scale_mxfp4(
-                module, w2_weight_scale, tmp_w2_weight_scale[expert_idx],
-                need_to_transpose_scales)
+                module=module,
+                w2_weight_scale=w2_weight_scale,
+                dst_w2_weight_scale=tmp_w2_weight_scale[expert_idx],
+                transpose_scales=need_to_transpose_scales,
+                already_sharded=already_sharded)
 
         self.w1_scales.clear()
         self.w3_scales.clear()

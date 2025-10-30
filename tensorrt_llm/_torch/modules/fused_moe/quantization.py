@@ -325,11 +325,17 @@ class FusedMoEMethodBase(ABC):
                     dtype=module.w2_bias.data.dtype,
                     device='cpu')
             self.load_expert_weights_to_dst(
-                module, weights, weight_loading_mode,
-                local_shared_load_expert_ids, local_shared_w3_w1_tensors,
-                local_shared_w2_tensors,
-                local_shared_w3_w1_bias_tensors if module.bias else None,
-                local_shared_w2_bias_tensors if module.bias else None)
+                module=module,
+                weights=weights,
+                weight_loading_mode=weight_loading_mode,
+                load_expert_ids=local_shared_load_expert_ids,
+                dst_w3_w1_weights_tensor=local_shared_w3_w1_tensors,
+                dst_w2_weights_tensor=local_shared_w2_tensors,
+                dst_w3_w1_bias_tensor=local_shared_w3_w1_bias_tensors
+                if module.bias else None,
+                dst_w2_bias_tensor=local_shared_w2_bias_tensors
+                if module.bias else None,
+                already_sharded=already_sharded)
             weight_fns = {
                 'w3_w1_weight': local_shared_w3_w1_tensors,
                 'w2_weight': local_shared_w2_tensors
@@ -1799,32 +1805,59 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
 
     @abstractmethod
     def load_expert_w3_w1_weight_scale_nvfp4(
-            self, module: torch.nn.Module, w1_weight_scale: torch.Tensor,
-            w3_weight_scale: torch.Tensor,
-            dst_w3_w1_weight_scale: torch.Tensor):
+        self,
+        *,
+        module: torch.nn.Module,
+        w1_weight_scale: torch.Tensor,
+        w3_weight_scale: torch.Tensor,
+        dst_w3_w1_weight_scale: torch.Tensor,
+        already_sharded: bool,
+    ):
         pass
 
     @abstractmethod
-    def load_expert_w2_weight_scale_nvfp4(self, module: torch.nn.Module,
-                                          w2_weight_scale: torch.Tensor,
-                                          dst_w2_weight_scale: torch.Tensor):
+    def load_expert_w2_weight_scale_nvfp4(
+        self,
+        *,
+        module: torch.nn.Module,
+        w2_weight_scale: torch.Tensor,
+        dst_w2_weight_scale: torch.Tensor,
+        already_sharded: bool,
+    ):
         pass
 
-    def load_expert_fc31_input_scale_nvfp4(self, w1_input_scale, w3_input_scale,
-                                           dst_fc31_input_scale: torch.Tensor):
+    def load_expert_fc31_input_scale_nvfp4(
+        self,
+        *,
+        w1_input_scale,
+        w3_input_scale,
+        dst_fc31_input_scale: torch.Tensor,
+        already_sharded: bool,
+    ):
         w1_input_scale = w1_input_scale[...].reshape([])
         w3_input_scale = w3_input_scale[...].reshape([])
         assert torch.allclose(
             w1_input_scale, w3_input_scale), "w1_input_scale != w3_input_scale"
         dst_fc31_input_scale.copy_(w1_input_scale)
 
-    def load_expert_fc2_input_scale_nvfp4(self, w2_input_scale,
-                                          dst_fc2_input_scale: torch.Tensor):
+    def load_expert_fc2_input_scale_nvfp4(
+        self,
+        *,
+        w2_input_scale,
+        dst_fc2_input_scale: torch.Tensor,
+        already_sharded: bool,
+    ):
         dst_fc2_input_scale.copy_(w2_input_scale[...].reshape([]))
 
-    def load_expert_fc31_alpha_nvfp4(self, w1_weight_scale_2, w3_weight_scale_2,
-                                     final_fc31_input_scale: torch.Tensor,
-                                     dst_fc31_alpha: torch.Tensor):
+    def load_expert_fc31_alpha_nvfp4(
+        self,
+        *,
+        w1_weight_scale_2,
+        w3_weight_scale_2,
+        final_fc31_input_scale: torch.Tensor,
+        dst_fc31_alpha: torch.Tensor,
+        already_sharded: bool,
+    ):
         w1_weight_scale_2 = w1_weight_scale_2[...].reshape([])
         w3_weight_scale_2 = w3_weight_scale_2[...].reshape([])
         assert torch.allclose(
@@ -1835,17 +1868,29 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         dst_fc31_alpha.copy_(1.0 /
                              (final_fc31_input_scale * w3_w1_weight_scale_2))
 
-    def load_expert_fc2_alpha_nvfp4(self, w2_weight_scale_2,
-                                    final_fc2_input_scale: torch.Tensor,
-                                    dst_w2_alpha: torch.Tensor):
+    def load_expert_fc2_alpha_nvfp4(
+        self,
+        *,
+        w2_weight_scale_2,
+        final_fc2_input_scale: torch.Tensor,
+        dst_fc2_alpha: torch.Tensor,
+        already_sharded: bool,
+    ):
         w2_weight_scale_2 = 1.0 / w2_weight_scale_2[...].reshape([])
-        dst_w2_alpha.copy_(1.0 / (final_fc2_input_scale * w2_weight_scale_2))
+        dst_fc2_alpha.copy_(1.0 / (final_fc2_input_scale * w2_weight_scale_2))
 
     def load_all_fp4_weight_scales_and_alphas(
-            self, module: torch.nn.Module, weights: Dict,
-            load_expert_ids: List[int], dst_w3_w1_weight_scale: torch.Tensor,
-            dst_w2_weight_scale: torch.Tensor, dst_fc31_alpha: torch.Tensor,
-            dst_fc2_alpha: torch.Tensor):
+        self,
+        *,
+        module: torch.nn.Module,
+        weights: Dict,
+        load_expert_ids: List[int],
+        dst_w3_w1_weight_scale: torch.Tensor,
+        dst_w2_weight_scale: torch.Tensor,
+        dst_fc31_alpha: torch.Tensor,
+        dst_fc2_alpha: torch.Tensor,
+        already_sharded: bool,
+    ):
         for local_slot_id, expert_id in enumerate(load_expert_ids):
             if module.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
                 w1_weight_scale = weights[f"{expert_id}.w1.weight_scale"]
@@ -1880,18 +1925,28 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                 w3_weight_scale_2 = w1_weight_scale_2
 
             self.load_expert_w3_w1_weight_scale_nvfp4(
-                module, w1_weight_scale, w3_weight_scale,
-                dst_w3_w1_weight_scale[expert_idx])
+                module=module,
+                w1_weight_scale=w1_weight_scale,
+                w3_weight_scale=w3_weight_scale,
+                dst_w3_w1_weight_scale=dst_w3_w1_weight_scale[expert_idx],
+                already_sharded=already_sharded)
             self.load_expert_w2_weight_scale_nvfp4(
-                module, w2_weight_scale, dst_w2_weight_scale[expert_idx])
+                module=module,
+                w2_weight_scale=w2_weight_scale,
+                dst_w2_weight_scale=dst_w2_weight_scale[expert_idx],
+                already_sharded=already_sharded)
 
-            self.load_expert_fc31_alpha_nvfp4(w1_weight_scale_2,
-                                              w3_weight_scale_2,
-                                              module.fc31_input_scale.data,
-                                              dst_fc31_alpha[expert_idx])
-            self.load_expert_fc2_alpha_nvfp4(w2_weight_scale_2,
-                                             module.fc2_input_scale.data,
-                                             dst_fc2_alpha[expert_idx])
+            self.load_expert_fc31_alpha_nvfp4(
+                w1_weight_scale_2=w1_weight_scale_2,
+                w3_weight_scale_2=w3_weight_scale_2,
+                final_fc31_input_scale=module.fc31_input_scale.data,
+                dst_fc31_alpha=dst_fc31_alpha[expert_idx],
+                already_sharded=already_sharded)
+            self.load_expert_fc2_alpha_nvfp4(
+                w2_weight_scale_2=w2_weight_scale_2,
+                final_fc2_input_scale=module.fc2_input_scale.data,
+                dst_fc2_alpha=dst_fc2_alpha[expert_idx],
+                already_sharded=already_sharded)
 
     def load_quant_scales(self, module: torch.nn.Module, weights: Dict,
                           already_sharded: bool):
@@ -1916,9 +1971,14 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                 )
 
             self.load_expert_fc31_input_scale_nvfp4(
-                w1_input_scale, w3_input_scale, tmp_fc31_input_scale[expert_id])
+                w1_input_scale=w1_input_scale,
+                w3_input_scale=w3_input_scale,
+                dst_fc31_input_scale=tmp_fc31_input_scale[expert_id],
+                already_sharded=already_sharded)
             self.load_expert_fc2_input_scale_nvfp4(
-                w2_input_scale, tmp_fc2_input_scale[expert_id])
+                w2_input_scale=w2_input_scale,
+                dst_fc2_input_scale=tmp_fc2_input_scale[expert_id],
+                already_sharded=already_sharded)
 
         # fc31_input_scale is the reciprocal of the maximum of all w1 input scales and w3 input scales.
         module.fc31_input_scale.data.copy_(
@@ -1929,9 +1989,14 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
 
         # Step2: Load weight block scales and alphas.
         self.load_all_fp4_weight_scales_and_alphas(
-            module, weights, module.initial_local_expert_ids,
-            module.w3_w1_weight_scale.data, module.w2_weight_scale.data,
-            module.fc31_alpha.data, module.fc2_alpha.data)
+            module=module,
+            weights=weights,
+            load_expert_ids=module.initial_local_expert_ids,
+            dst_w3_w1_weight_scale=module.w3_w1_weight_scale.data,
+            dst_w2_weight_scale=module.w2_weight_scale.data,
+            dst_fc31_alpha=module.fc31_alpha.data,
+            dst_fc2_alpha=module.fc2_alpha.data,
+            already_sharded=already_sharded)
 
         # Step 3: if needed, load into shared
         if self.need_load_shared_weights(module):
@@ -1958,9 +2023,14 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                 dtype=module.fc2_alpha.data.dtype,
                 device='cpu')
             self.load_all_fp4_weight_scales_and_alphas(
-                module, weights, local_shared_load_expert_ids,
-                local_shared_w3_w1_scale_tensors, local_shared_w2_scale_tensors,
-                local_shared_fc31_alpha_tensors, local_shared_fc2_alpha_tensors)
+                module=module,
+                weights=weights,
+                load_expert_ids=local_shared_load_expert_ids,
+                dst_w3_w1_weight_scale=local_shared_w3_w1_scale_tensors,
+                dst_w2_weight_scale=local_shared_w2_scale_tensors,
+                dst_fc31_alpha=local_shared_fc31_alpha_tensors,
+                dst_fc2_alpha=local_shared_fc2_alpha_tensors,
+                already_sharded=already_sharded)
 
             module.register_all_parameter_slot_and_to_fix_weight_fns({
                 'w3_w1_weight_scale':
@@ -2216,14 +2286,15 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
                             non_blocking=True)
 
     def load_expert_w3_w1_weight_scale_nvfp4(
-            self,
-            *,
-            module: torch.nn.Module,
-            w1_weight_scale: torch.Tensor,
-            w3_weight_scale: torch.Tensor,
-            dst_w3_w1_weight_scale: torch.Tensor,
-            already_sharded: bool,
-            num_elts_per_sf: int = 16):
+        self,
+        *,
+        module: torch.nn.Module,
+        w1_weight_scale: torch.Tensor,
+        w3_weight_scale: torch.Tensor,
+        dst_w3_w1_weight_scale: torch.Tensor,
+        already_sharded: bool,
+        num_elts_per_sf: int = 16,
+    ):
         device = dst_w3_w1_weight_scale.device
         assert device.type == "cuda"
 
@@ -2287,13 +2358,15 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
             processed_w3_w1_weight_scale.view(
                 self.block_scales_dtype).reshape(orig_shape))
 
-    def load_expert_w2_weight_scale_nvfp4(self,
-                                          *,
-                                          module: torch.nn.Module,
-                                          w2_weight_scale: torch.Tensor,
-                                          dst_w2_weight_scale: torch.Tensor,
-                                          already_sharded: bool,
-                                          num_elts_per_sf: int = 16):
+    def load_expert_w2_weight_scale_nvfp4(
+        self,
+        *,
+        module: torch.nn.Module,
+        w2_weight_scale: torch.Tensor,
+        dst_w2_weight_scale: torch.Tensor,
+        already_sharded: bool,
+        num_elts_per_sf: int = 16,
+    ):
         device = dst_w2_weight_scale.device
         assert device.type == "cuda"
 
@@ -2382,10 +2455,13 @@ class W4A8NVFP4FP8TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEMethod):
         dst_w3_w1_weight_scale: torch.Tensor,
         already_sharded: bool,
     ):
-        super().load_expert_w3_w1_weight_scale_nvfp4(module, w1_weight_scale,
-                                                     w3_weight_scale,
-                                                     dst_w3_w1_weight_scale,
-                                                     already_sharded, 32)
+        super().load_expert_w3_w1_weight_scale_nvfp4(
+            module=module,
+            w1_weight_scale=w1_weight_scale,
+            w3_weight_scale=w3_weight_scale,
+            dst_w3_w1_weight_scale=dst_w3_w1_weight_scale,
+            already_sharded=already_sharded,
+            num_elts_per_sf=32)
 
     def load_expert_w2_weight_scale_nvfp4(
         self,
@@ -2395,9 +2471,12 @@ class W4A8NVFP4FP8TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEMethod):
         dst_w2_weight_scale: torch.Tensor,
         already_sharded: bool,
     ):
-        super().load_expert_w2_weight_scale_nvfp4(module, w2_weight_scale,
-                                                  dst_w2_weight_scale,
-                                                  already_sharded, 32)
+        super().load_expert_w2_weight_scale_nvfp4(
+            module=module,
+            w2_weight_scale=w2_weight_scale,
+            dst_w2_weight_scale=dst_w2_weight_scale,
+            already_sharded=already_sharded,
+            num_elts_per_sf=32)
 
 
 def _get_weight_alignment(weight_alignment, scaling_vector_size, tp_size,
