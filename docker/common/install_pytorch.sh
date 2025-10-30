@@ -69,8 +69,8 @@ install_from_pypi() {
     if [ "$ARCH" = "amd64" ];then ARCH="x86_64";fi
     if [ "$ARCH" = "aarch64" ];then ARCH="sbsa";fi
 
-    pip3 uninstall -y torch torchvision torchaudio
-    pip3 install torch==${TORCH_VERSION} torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
+    pip3 uninstall -y torch torchvision
+    pip3 install torch==${TORCH_VERSION} torchvision --index-url https://download.pytorch.org/whl/cu130
 }
 
 case "$1" in

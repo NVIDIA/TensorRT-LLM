@@ -1099,7 +1099,7 @@ def launchTestListCheck(pipeline)
             sh "tar -zxf ${tarName}"
             def llmPath = sh (script: "realpath .", returnStdout: true).trim()
             def llmSrc = "${llmPath}/TensorRT-LLM/src"
-            sh "NVIDIA_TRITON_SERVER_VERSION=25.04 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa --waive"
+            sh "NVIDIA_TRITON_SERVER_VERSION=25.09 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa --waive"
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -2250,7 +2250,7 @@ def launchTestJobs(pipeline, testFilter)
             true,
             "",
             UBUNTU_24_04_IMAGE,
-            true, // Extra PyTorch CUDA 12.8 install
+            true, // Extra PyTorch CUDA 13.0 install
         ],
     ]
 
@@ -2262,7 +2262,7 @@ def launchTestJobs(pipeline, testFilter)
             false,
             "",
             UBUNTU_24_04_IMAGE,
-            true, // Extra PyTorch CUDA 12.8 install
+            true, // Extra PyTorch CUDA 13.0 install
         ],
         "PY312-DLFW": [
             LLM_DOCKER_IMAGE,
@@ -2368,7 +2368,7 @@ def launchTestJobs(pipeline, testFilter)
                         // Extra PyTorch CUDA 13.0 install for SBSA platform and Blackwell GPUs bare-metal environments
                         if (values[6]) {
                             echo "###### Extra PyTorch CUDA 13.0 install Start ######"
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.9.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130")
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.9.0 torchvision --index-url https://download.pytorch.org/whl/cu130")
                         }
 
                         def libEnv = []
