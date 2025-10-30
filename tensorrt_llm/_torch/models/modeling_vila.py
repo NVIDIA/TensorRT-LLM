@@ -31,8 +31,8 @@ from huggingface_hub import repo_exists, snapshot_download
 from huggingface_hub.utils import HFValidationError
 from PIL import Image
 from transformers import (AutoConfig, AutoImageProcessor, AutoModel,
-                          AutoTokenizer, LlavaConfig, PretrainedConfig,
-                          PreTrainedModel)
+                          AutoProcessor, AutoTokenizer, LlavaConfig,
+                          PretrainedConfig, PreTrainedModel)
 
 from ..._utils import nvtx_range
 from ...inputs import (BaseMultimodalInputProcessor, ExtraProcessedInputs,
@@ -862,9 +862,6 @@ def _apply_chat_template(text, conv, tokenizer):
             conv.append_message(role, message["value"])
         text = conv.get_prompt()
     return text
-
-
-from transformers import AutoProcessor
 
 
 class VilaInputProcessor(BaseMultimodalInputProcessor):
