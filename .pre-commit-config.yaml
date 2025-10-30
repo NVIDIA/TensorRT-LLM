@@ -83,6 +83,7 @@ common-files: &common_files |
         examples/infinitebench/compute_scores.py |
         examples/infinitebench/construct_synthetic_dataset.py |
         examples/infinitebench/eval_utils.py |
+        examples/layer_wise_benchmarks/run_single.py |
         examples/llm-api/_tensorrt_engine/llm_eagle_decoding.py |
         examples/llm-api/_tensorrt_engine/llm_eagle2_decoding.py |
         examples/llm-api/_tensorrt_engine/llm_inference_customize.py |
@@ -561,6 +562,7 @@ common-files: &common_files |
         tensorrt_llm/llmapi/__init__.py |
         tensorrt_llm/llmapi/build_cache.py |
         tensorrt_llm/llmapi/disagg_utils.py |
+        tensorrt_llm/llmapi/kv_cache_type.py |
         tensorrt_llm/llmapi/llm_args.py |
         tensorrt_llm/llmapi/llm_utils.py |
         tensorrt_llm/llmapi/llm.py |
@@ -803,8 +805,12 @@ common-files: &common_files |
         tensorrt_llm/serve/scripts/time_breakdown/__init__.py |
         tensorrt_llm/serve/scripts/time_breakdown/__main__.py |
         tensorrt_llm/serve/scripts/time_breakdown/time_breakdown.py |
+        tensorrt_llm/serve/tool_parser/base_tool_parser.py |
+        tensorrt_llm/serve/tool_parser/qwen3_tool_parser.py |
+        tensorrt_llm/serve/tool_parser/utils.py |
         tensorrt_llm/tools/__init__.py |
         tensorrt_llm/tools/importlib_utils.py |
+        tensorrt_llm/tools/layer_wise_benchmarks/deepseekv3_runner.py |
         tensorrt_llm/tools/multimodal_builder.py |
         tensorrt_llm/tools/onnx_utils.py |
         tensorrt_llm/tools/plugin_gen/__init__.py |
@@ -896,6 +902,7 @@ common-files: &common_files |
         tests/integration/defs/perf/misc.py |
         tests/integration/defs/perf/pytorch_model_config.py |
         tests/integration/defs/perf/sample_options_config.py |
+        tests/integration/defs/perf/sampler_options_config.py |
         tests/integration/defs/perf/sanity_perf_check.py |
         tests/integration/defs/perf/session_data_writer.py |
         tests/integration/defs/perf/test_perf.py |
@@ -1105,6 +1112,7 @@ common-files: &common_files |
         tests/unittest/llmapi/apps/_test_openai_prometheus.py |
         tests/unittest/llmapi/apps/_test_openai_reasoning.py |
         tests/unittest/llmapi/apps/_test_openai_responses.py |
+        tests/unittest/llmapi/apps/_test_openai_tool_call.py |
         tests/unittest/llmapi/apps/_test_trtllm_serve_benchmark.py |
         tests/unittest/llmapi/apps/_test_trtllm_serve_duplicated_args.py |
         tests/unittest/llmapi/apps/_test_trtllm_serve_example.py |
@@ -1113,6 +1121,7 @@ common-files: &common_files |
         tests/unittest/llmapi/apps/_test_trtllm_serve_multimodal_example.py |
         tests/unittest/llmapi/apps/_test_trtllm_serve_top_logprobs.py |
         tests/unittest/llmapi/apps/openai_server.py |
+        tests/unittest/llmapi/apps/test_tool_parsers.py |
         tests/unittest/llmapi/apps/utils.py |
         tests/unittest/llmapi/lora_test_utils.py |
         tests/unittest/llmapi/run_llm_exit.py |
@@ -1173,6 +1182,7 @@ common-files: &common_files |
         tests/unittest/tools/plugin_gen/test_core.py |
         tests/unittest/tools/plugin_gen/test_plugin_gen.py |
         tests/unittest/tools/plugin_gen/test_shape_infer.py |
+        tests/unittest/tools/test_layer_wise_benchmarks.py |
         tests/unittest/tools/test_prepare_dataset.py |
         tests/unittest/tools/test_test_to_stage_mapping.py |
         tests/unittest/trt/__init__.py |
