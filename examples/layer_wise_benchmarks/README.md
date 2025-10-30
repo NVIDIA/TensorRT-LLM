@@ -42,7 +42,7 @@ NP=4 ./mpi_launch.sh ./run_single.sh config_gen.yaml --batch-size 32 --seq-len-q
 NP=4 ./mpi_launch.sh ./run_single.sh config_ctx.yaml --layer-indices 5,6,7,8
 NP=4 ./mpi_launch.sh ./run_single.sh config_gen.yaml --layer-indices 5,6,7,8
 
-# Scale DEP=16 MNNVL to 4 GPUs: reduce the number of experts, uses MNNVL A2A if applicable
+# Scale DEP=16 to 4 GPUs: reduce the number of experts, uses MNNVL A2A if applicable
 NP=4 ./mpi_launch.sh ./run_single.sh config_gen.yaml --scaled-from 16 --moe-backend WIDEEP
 
 # Scale TEP=16 to 4 GPUs: reduce the number of attention heads and experts
