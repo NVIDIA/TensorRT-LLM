@@ -8,6 +8,9 @@ try:
     from ...distributed import AllReduce, allgather
     from ...modules.linear import AllReduceFusionOp, AllReduceParams, AllReduceStrategy
 
+    # Cache AllReduce module to avoid recreating on every call
+    _allreduce_cache = {}
+
     def trtllm_allgather(tensor, dim, sizes=None):
         rank, world_size = get_rank_world_size()
         p_config = Mapping(world_size=world_size, tp_size=world_size, rank=rank)
@@ -16,9 +19,19 @@ try:
     def trtllm_allreduce(tensor, op, all_reduce_params=None):
         rank, world_size = get_rank_world_size()
         assert op == ReduceOp.SUM, "TRT-LLM all reduce only supports SUM op."
-        p_config = Mapping(world_size=world_size, tp_size=world_size, rank=rank)
-        # Use Strategy.NCCL until https://nvbugspro.nvidia.com/bug/5331013 is fixed, then change to Strategy.AUTO
-        torch_op = AllReduce(mapping=p_config, strategy=AllReduceStrategy.NCCL)
+
+        # Cache the AllReduce module to avoid recreating it on every call
+        # This is important for CUDA graph compatibility
+        # Key includes dtype to support MNNVL with different tensor types
+        cache_key = (rank, world_size, tensor.dtype)
+        if cache_key not in _allreduce_cache:
+            p_config = Mapping(world_size=world_size, tp_size=world_size, rank=rank)
+            # Pass dtype to enable MNNVL when supported
+            _allreduce_cache[cache_key] = AllReduce(
+                mapping=p_config, strategy=AllReduceStrategy.AUTO, dtype=tensor.dtype
+            )
+
+        torch_op = _allreduce_cache[cache_key]
         return torch_op(tensor, all_reduce_params=all_reduce_params)
 
     @torch.library.custom_op(
