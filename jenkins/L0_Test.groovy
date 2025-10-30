@@ -2532,7 +2532,7 @@ def runInDockerOnNodeMultiStage(image, label, dockerArgs, needToDeleteDir=true)
     }
 }
 
-def runInEnrootOnNode(label) 
+def runInEnrootOnNode(label)
 {
     return {
         runner -> node(label) {
