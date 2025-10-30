@@ -394,3 +394,6 @@ triton_server/test_triton_rcca.py::test_rcca_bug_4934893[Temperature:0.5-TOP_P:0
 unittest/_torch/thop/parallel/test_fp8_rowwise_linear.py::test_fp8_rowwise_linear[dtype0] SKIP (https://nvbugs/5619396)
 unittest/_torch/thop/parallel/test_fp8_rowwise_linear.py::test_fp8_rowwise_linear[dtype1] SKIP (https://nvbugs/5619396)
 accuracy/test_disaggregated_serving.py::TestQwen3_30B_A3B::test_mixed_ctx_gen_model[ctxpp2gentp2] SKIP (https://nvbugs/5582258)
+accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype[True] SKIP (https://nvbugs/5624367)
+accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype[False] SKIP (https://nvbugs/5624367)
+disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[llama-v3-8b-hf] SKIP (https://nvbugs/5587574)
