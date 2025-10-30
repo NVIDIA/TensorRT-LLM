@@ -2365,9 +2365,9 @@ def launchTestJobs(pipeline, testFilter)
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install cuda-toolkit-13-0")
                         }
-                        // Extra PyTorch CUDA 12.8 install for SBSA platform and Blackwell GPUs bare-metal environments
+                        // Extra PyTorch CUDA 13.0 install for SBSA platform and Blackwell GPUs bare-metal environments
                         if (values[6]) {
-                            echo "###### Extra PyTorch CUDA 12.8 install Start ######"
+                            echo "###### Extra PyTorch CUDA 13.0 install Start ######"
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.9.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130")
                         }
 

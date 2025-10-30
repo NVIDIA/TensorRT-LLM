@@ -13,7 +13,6 @@
    make sure `CUDA_HOME` environment variable is properly set.
 
    ```bash
-   # Optional step: Only required for NVIDIA Blackwell GPUs and SBSA platform
    pip3 install torch==2.9.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
 
    sudo apt-get -y install libopenmpi-dev
