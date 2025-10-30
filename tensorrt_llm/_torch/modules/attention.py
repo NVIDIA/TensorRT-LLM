@@ -1148,9 +1148,14 @@ class MLA(nn.Module):
         if position_ids is not None:
             position_ids = position_ids[..., :num_tokens]
 
-        q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(hidden_states).split(
-            [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], -1)
+        q, compressed_kv, k_pe, indexer_k, indexer_weights = self.kv_a_proj_with_mqa(
+            hidden_states).split([
+                self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim,
+                self.indexer.head_dim, self.indexer.n_heads
+            ], -1)
 
+        latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
+        # TODO: possibly fuse q_a_rmsnorm + kv_a_rmsnorm + indexer.k_layernorm?
         q, compressed_kv = maybe_execute_in_parallel(
             lambda: self.q_a_layernorm(q),
             lambda: self.kv_a_layernorm(compressed_kv),
@@ -1158,23 +1163,19 @@ class MLA(nn.Module):
             self.ln_events[1],
             self.aux_stream,
         )
+        indexer_k = self.indexer.k_norm(indexer_k)
         qr = q
-        q, latent_cache = maybe_execute_in_parallel(
-            lambda: self.q_b_proj(q),
-            lambda: torch.concat([compressed_kv, k_pe], dim=-1),
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
+        # TODO: fuse wq_b + (indexer) wlq here
+        q = self.q_b_proj(q)
+        # Indexer
+        topk_indices = self.indexer(qr, hidden_states, indexer_k,
+                                    indexer_weights, attn_metadata,
+                                    position_ids)
 
         assert q.shape[
             0] == num_tokens, f"Expect q.shape[0] to be {num_tokens}, but got {q.shape[0]}"
 
         assert output is not None, "output must be provided"
-
-        # Indexer
-        topk_indices = self.indexer(qr, hidden_states, attn_metadata,
-                                    position_ids)
 
         if num_contexts > 0:
             q_ctx = q[:num_ctx_tokens, ...]

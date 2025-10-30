@@ -353,6 +353,21 @@ class DeepseekV3WeightLoader:
                             f"{'.'.join(names[:-1])}.q_a_proj.weight"][:]
                         fused_a = torch.cat([q_a_proj, fused_a], dim=0)
 
+                    attn_module = all_named_modules[parent_module_name]
+                    # For DeepseekV32, also include indexer.wk and indexer.weights_proj
+                    has_indexer = hasattr(
+                        attn_module,
+                        'indexer') and attn_module.indexer is not None
+                    if has_indexer:
+                        indexer_wk = weights[
+                            f"{'.'.join(names[:-1])}.indexer.wk.weight"][:]
+                        indexer_weights_proj = weights[
+                            f"{'.'.join(names[:-1])}.indexer.weights_proj.weight"][:]
+                        # validate all weights have matching dtype
+                        assert fused_a.dtype == indexer_wk.dtype == indexer_weights_proj.dtype, "all weights in kv_a_proj_with_mqa module must have matching dtype"
+                        fused_a = torch.cat(
+                            [fused_a, indexer_wk, indexer_weights_proj], dim=0)
+
                     if f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight_scale_inv" in weights:
                         fused_a_scale = weights[
                             f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight_scale_inv"]
@@ -536,6 +551,51 @@ class DeepseekV3Attention(MLA):
             config.hidden_size,
             self.kv_lora_rank + self.qk_rope_head_dim +
             (self.q_lora_rank if not self.is_lite else 0),
+            bias=False,
+            dtype=config.torch_dtype,
+            quant_config=model_config.get_quant_config(),
+            skip_create_weights_in_init=model_config.
+            skip_create_weights_in_init,
+            use_custom_cublas_mm=True)
+
+
+class DeepseekV32Attention(MLA):
+
+    def __init__(
+        self,
+        model_config: ModelConfig[PretrainedConfig],
+        layer_idx: Optional[int] = None,
+        aux_stream: Optional[torch.cuda.Stream] = None,
+    ):
+        config = model_config.pretrained_config
+        predicted_tokens_per_seq = model_config.spec_config.max_total_draft_tokens + 1 if model_config.spec_config is not None else 1
+        super().__init__(hidden_size=config.hidden_size,
+                         num_attention_heads=config.num_attention_heads,
+                         num_key_value_heads=config.num_key_value_heads,
+                         qk_rope_head_dim=config.qk_rope_head_dim,
+                         qk_nope_head_dim=config.qk_nope_head_dim,
+                         q_lora_rank=config.q_lora_rank,
+                         kv_lora_rank=config.kv_lora_rank,
+                         v_head_dim=config.v_head_dim,
+                         predicted_tokens_per_seq=predicted_tokens_per_seq,
+                         max_position_embeddings=config.max_position_embeddings,
+                         bias=False,
+                         pos_embd_params=PositionalEmbeddingParams(
+                             type=PositionEmbeddingType.yarn,
+                             rope=RopeParams.from_config(config),
+                             is_neox=False,
+                         ),
+                         layer_idx=layer_idx,
+                         dtype=config.torch_dtype,
+                         config=model_config,
+                         aux_stream=aux_stream)
+
+        # For DeepseekV32, the kv_a_proj_with_mqa includes:
+        # q_a_proj + kv_a_proj_with_mqa + indexer.wk + indexer.weights_proj
+        self.kv_a_proj_with_mqa = DeepseekV3Linear(
+            config.hidden_size,
+            self.kv_lora_rank + self.qk_rope_head_dim + self.q_lora_rank +
+            self.indexer.head_dim + self.indexer.n_heads,
             bias=False,
             dtype=config.torch_dtype,
             quant_config=model_config.get_quant_config(),
@@ -952,10 +1012,16 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             #KVCacheManager only support 1 layer for separate draft engine
             layer_idx_for_attention = layer_idx - model_config.pretrained_config.num_hidden_layers
 
-        self.self_attn = DeepseekV3Attention(
-            model_config,
-            layer_idx=layer_idx_for_attention,
-            aux_stream=aux_stream_dict[AuxStreamType.Attention])
+        if config.model_type == "deepseek_v32":
+            self.self_attn = DeepseekV32Attention(
+                model_config,
+                layer_idx=layer_idx_for_attention,
+                aux_stream=aux_stream_dict[AuxStreamType.Attention])
+        else:
+            self.self_attn = DeepseekV3Attention(
+                model_config,
+                layer_idx=layer_idx_for_attention,
+                aux_stream=aux_stream_dict[AuxStreamType.Attention])
         self.enable_attention_dp = mapping.enable_attention_dp
 
         self.mlp_tp_size = mapping.tp_size

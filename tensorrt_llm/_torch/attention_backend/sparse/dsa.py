@@ -580,23 +580,23 @@ class Indexer(nn.Module):
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights_in_init,
             use_custom_cublas_mm=True)
-        self.wk = Linear(
-            self.hidden_size,
-            self.head_dim,
-            bias=False,
-            dtype=dtype,
-            quant_config=quant_config,
-            skip_create_weights_in_init=skip_create_weights_in_init,
-            use_custom_cublas_mm=True)
+        # self.wk = Linear(
+        #     self.hidden_size,
+        #     self.head_dim,
+        #     bias=False,
+        #     dtype=dtype,
+        #     quant_config=quant_config,
+        #     skip_create_weights_in_init=skip_create_weights_in_init,
+        #     use_custom_cublas_mm=True)
         self.k_norm = LayerNorm(hidden_size=self.head_dim, eps=1e-6)
-        self.weights_proj = Linear(
-            self.hidden_size,
-            self.n_heads,
-            bias=False,
-            dtype=dtype,
-            quant_config=None,
-            skip_create_weights_in_init=skip_create_weights_in_init,
-            use_custom_cublas_mm=True)
+        # self.weights_proj = Linear(
+        #     self.hidden_size,
+        #     self.n_heads,
+        #     bias=False,
+        #     dtype=dtype,
+        #     quant_config=None,
+        #     skip_create_weights_in_init=skip_create_weights_in_init,
+        #     use_custom_cublas_mm=True)
 
         self.rotary_emb = RotaryEmbedding(
             pos_embd_params.rope,
@@ -1087,29 +1087,23 @@ class Indexer(nn.Module):
 
     @torch.inference_mode()
     def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
+                indexer_k: torch.Tensor, indexer_weights: torch.Tensor,
                 metadata: DSAtrtllmAttentionMetadata,
                 position_ids: torch.Tensor):
         quant_block_size = metadata.kv_cache_manager.quant_block_size
         assert quant_block_size == 128, "Only support quant_block_size = 128 for now"
+        k = indexer_k
+        q = self.wq_b(
+            qr)  # TODO: fuse wq_b and move this outside of the indexer
 
-        q, k = maybe_execute_in_parallel(
-            lambda: self.wq_b(qr),
-            lambda: self.wk(hidden_states),
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
+        # q/k rope + possible fast_hadamard_transform
         q = q.view(-1, self.n_heads, self.head_dim)
         q_pe, q_nope = torch.split(
             q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
-        k = self.k_norm(k)
         k_pe, k_nope = torch.split(
             k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
-
-        # k_pe needs unsqueeze to match n_heads
         q_pe, k_pe = self.rotary_emb(position_ids, [q_pe, k_pe.unsqueeze(1)])
         q = torch.cat([q_pe, q_nope], dim=-1)
-        # Remove head dimension (size 1) for MQA k
         k = torch.cat([k_pe[:, 0, :], k_nope], dim=-1)
 
         q, k = maybe_execute_in_parallel(
@@ -1119,9 +1113,8 @@ class Indexer(nn.Module):
             self.ln_events[1],
             self.aux_stream,
         )
-        # we only quant q here since k quant is fused with cache insertion
+        # dyn q/k quant
         q = q.view(-1, self.head_dim)
-
         q, k = maybe_execute_in_parallel(
             lambda: fp8_utils.fp8_quantize_1x128_sf_transpose(
                 q, use_ue8m0=self.scale_fmt == "ue8m0"),
@@ -1136,7 +1129,8 @@ class Indexer(nn.Module):
         q_fp8 = q_fp8.view(-1, self.n_heads, self.head_dim)
         q_scale = q_scale.view(-1, self.n_heads, 1)
 
-        weights = self.weights_proj(hidden_states)
+        # indexer weight scaling
+        weights = indexer_weights  #self.weights_proj(hidden_states)
         weights = weights.unsqueeze(
             -1) * q_scale * self.softmax_scale * self.n_heads**-0.5
         weights = weights.squeeze(-1)
