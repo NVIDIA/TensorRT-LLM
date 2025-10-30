@@ -13,12 +13,10 @@
    make sure `CUDA_HOME` environment variable is properly set.
 
    ```bash
-   pip3 install torch==2.9.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
+   pip3 install torch==2.9.0 torchvision --index-url https://download.pytorch.org/whl/cu130
 
    sudo apt-get -y install libopenmpi-dev
    ```
-
-   PyTorch CUDA 12.8 package is required for supporting NVIDIA Blackwell GPUs and SBSA platform. On prior GPUs or Linux x86_64 platform, this extra installation is not required.
 
    ```{tip}
    Instead of manually installing the preqrequisites as described
