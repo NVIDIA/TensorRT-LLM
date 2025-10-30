@@ -587,19 +587,25 @@ class Indexer(nn.Module):
                  aux_stream: Optional[torch.cuda.Stream] = None,
                  mapping: Optional[Mapping] = None):
         super().__init__()
+        self.tp_size = mapping.tp_size
+        if mapping.enable_attention_dp:
+            self.tp_size = 1
+
         self.hidden_size = mla_params.hidden_size
         self.q_lora_rank = mla_params.q_lora_rank
         self.rope_dim = mla_params.qk_rope_head_dim
-        self.n_heads = sparse_attention_config.index_n_heads  # 64
+        self.n_heads = sparse_attention_config.index_n_heads // self.tp_size  # 64
         self.head_dim = sparse_attention_config.index_head_dim  # 128
         self.index_topk = sparse_attention_config.index_topk  # 2048
         self.layer_idx = layer_idx
 
         self.wq_b = Linear(
             self.q_lora_rank,
-            self.n_heads * self.head_dim,
+            self.n_heads * self.head_dim * self.tp_size,
             bias=False,
             dtype=dtype,
+            mapping=mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights_in_init,
             use_custom_cublas_mm=True)
@@ -614,7 +620,7 @@ class Indexer(nn.Module):
         self.k_norm = LayerNorm(hidden_size=self.head_dim, eps=1e-6)
         self.weights_proj = Linear(
             self.hidden_size,
-            self.n_heads,
+            self.n_heads * self.tp_size,
             bias=False,
             dtype=dtype,
             mapping=mapping,
@@ -634,7 +640,7 @@ class Indexer(nn.Module):
         self.scale_fmt = "ue8m0"
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
-        
+
         # allreduce for TP
         self.allreduce = AllReduce(mapping=mapping,
                                    strategy=AllReduceStrategy.AUTO)
@@ -999,7 +1005,19 @@ class Indexer(nn.Module):
                         chunk.cu_seqlen_ks,
                         chunk.cu_seqlen_ke,
                     )
-                    logits = self.allreduce(logits)
+                    if self.tp_size > 1:
+                        # The logits is a sliced tensor, the original shape[-1] is divisible by 4.
+                        # We need to align the shape[-1] back to be multiple of 4 to support allreduce.
+                        num_chunked_ctx_tokens = chunk.token_end - chunk.token_start
+                        seq_len_kv_aligned = (num_chunked_ctx_tokens +
+                                              3) // 4 * 4
+                        logits_aligned = torch.as_strided(
+                            logits,
+                            size=(num_chunked_ctx_tokens, seq_len_kv_aligned),
+                            stride=logits.stride(),
+                            storage_offset=logits.storage_offset())
+                        logits = self.allreduce(
+                            logits_aligned)[:, :num_chunked_ctx_tokens]
                     topk_indices = logits.topk(min(self.index_topk,
                                                    logits.shape[-1]),
                                                dim=-1)[1]
@@ -1029,7 +1047,16 @@ class Indexer(nn.Module):
                     cu_seqlen_ks,
                     cu_seqlen_ke,
                 )
-                logits = self.allreduce(logits)
+                if self.tp_size > 1:
+                    # The logits is a sliced tensor, the original shape[-1] is divisible by 4.
+                    # We need to align the shape[-1] back to be multiple of 4 to support allreduce.
+                    seq_len_kv_aligned = (num_ctx_tokens + 3) // 4 * 4
+                    logits_aligned = torch.as_strided(
+                        logits,
+                        size=(num_ctx_tokens, seq_len_kv_aligned),
+                        stride=logits.stride(),
+                        storage_offset=logits.storage_offset())
+                    logits = self.allreduce(logits_aligned)[:, :num_ctx_tokens]
                 topk_indices = logits.topk(min(self.index_topk,
                                                logits.shape[-1]),
                                            dim=-1)[1]
@@ -1046,7 +1073,8 @@ class Indexer(nn.Module):
                                         dtype=torch.int32)
 
         if has_decode:
-            max_seq_len = metadata.kv_cache_manager.max_seq_len
+            # round up to multiple of 4 to make sure the shape[-1] of the logits is divisible by 4 support allreduce
+            max_seq_len = (metadata.kv_cache_manager.max_seq_len + 3) // 4 * 4
             # Get decode lengths per request (from seq_lens) for validation
             gen_seq_lens = metadata.seq_lens[num_contexts:num_contexts +
                                              num_generations]
@@ -1169,8 +1197,8 @@ class Indexer(nn.Module):
         q_scale = q_scale.view(-1, self.n_heads, 1)
 
         weights = self.weights_proj(hidden_states)
-        weights = weights.unsqueeze(
-            -1) * q_scale * self.softmax_scale * self.n_heads**-0.5
+        weights = weights.unsqueeze(-1) * q_scale * (
+            self.softmax_scale * (self.n_heads * self.tp_size)**-0.5)
         weights = weights.squeeze(-1)
 
         # Return topk indices buffer for sparse attention [num_tokens, index_topk]
