@@ -392,3 +392,174 @@ def test_autotuner_tuning_configs():
                                           runners, tuning_config, [x, w])
 
     runner_0.forward(inputs=[x, w], tactic=tactic)
+
+
+def test_kernel_testing_single_context():
+    """Test kernel testing with a single choose_one context"""
+    x, w = torch.randn(16, 64), torch.randn(64, 128)
+    runners = [GemmRunner()]
+    tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        input_idx=0,
+        dim_idx=0,
+        gen_tuning_buckets=get_power_of_2_num_tokens_buckets,
+        map_to_tuning_buckets=next_positive_power_of_2), ), )
+
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+
+    # First, do tuning to populate cache
+    with autotune():
+        runner, tactic = tuner.choose_one("test_kernel_testing_single", runners,
+                                          tuning_config, [x, w])
+
+    # Capture execution context
+    with tuner.capture() as all_tactics:
+        runner, tactic = tuner.choose_one("test_kernel_testing_single", runners,
+                                          tuning_config, [x, w])
+        reference_output = runner([x, w], tactic=tactic)
+
+    # Test all tactics
+    tested_tactics = []
+    for (runner, tactic), in all_tactics:
+        tested_tactics.append((runner, tactic))
+        with tuner.replay(((runner, tactic), )):
+            runner_ret, tactic_ret = tuner.choose_one(
+                "test_kernel_testing_single", runners, tuning_config, [x, w])
+            output = runner_ret([x, w], tactic=tactic_ret)
+            # Verify output matches reference
+            torch.testing.assert_close(output, reference_output)
+            assert runner == runner_ret and tactic == tactic_ret, \
+                f"Runner and tactic mismatch: expected ({runner, tactic}), got ({runner_ret, tactic_ret})"
+
+    # Should have tested 3 tactics ([-1, 0, 1])
+    assert len(tested_tactics) == len(GemmRunner().get_valid_tactics([x, w], OptimizationProfile([[]]))), \
+        f"Expected 3 tactics to be tested, got {len(tested_tactics)}"
+
+
+class MultiContextRunner(TunableRunner):
+
+    def get_valid_tactics(self, inputs: List[FakeTensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
+        gemm_idx = kwargs.get("gemm_idx", 0)
+        # Different gemm_idx have different number of tactics
+        if gemm_idx == 0:
+            return [0, 1]
+        else:
+            return [0, 1, 2]
+
+    def forward(self,
+                /,
+                inputs: List[torch.Tensor],
+                *,
+                tactic: int = -1,
+                **kwargs) -> torch.Tensor:
+        gemm_idx = kwargs.get("gemm_idx", 0)
+        # Analogous to CUTLASS MoE trtllm::fused_moe FC1
+        if gemm_idx == 0:
+            return [gemm_0, gemm_1][tactic](inputs[0], inputs[1])
+        # Analogous to CUTLASS MoE trtllm::fused_moe FC2
+        else:
+            return [gemm_0, gemm_1, gemm_fallback][tactic](inputs[1].T,
+                                                           inputs[0].T)
+
+
+def test_kernel_testing_multiple_contexts():
+    """
+    Test kernel testing with multiple choose_one contexts
+    (e.g., CUTLASS MoE trtllm::fused_moe)
+    """
+
+    x, w = torch.randn(16, 64), torch.randn(64, 128)
+    runners = [MultiContextRunner()]
+    tuning_config = TuningConfig()
+
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+
+    # First, do tuning to populate cache
+    with autotune():
+        runner, _ = tuner.choose_one("test_multi_context",
+                                     runners,
+                                     tuning_config, [x, w],
+                                     gemm_idx=0)
+        runner, _ = tuner.choose_one("test_multi_context",
+                                     runners,
+                                     tuning_config, [x, w],
+                                     gemm_idx=1)
+
+    # Capture execution context (captures both choose_one calls)
+    with tuner.capture() as all_tactics:
+        runner_0, tactic_0 = tuner.choose_one("test_multi_context",
+                                              runners,
+                                              tuning_config, [x, w],
+                                              gemm_idx=0)
+        runner_1, tactic_1 = tuner.choose_one("test_multi_context",
+                                              runners,
+                                              tuning_config, [x, w],
+                                              gemm_idx=1)
+        ref_output_0 = runner_0([x, w], tactic=tactic_0, gemm_idx=0)
+        ref_output_1 = runner_1([x, w], tactic=tactic_1, gemm_idx=1)
+
+    # Test all tactic combinations (cartesian product)
+    tested_tactics = []
+    for tactic in all_tactics:
+        tested_tactics.append(tactic)
+        # Each tactic is ((runner_0, tactic_0), (runner_1, tactic_1))
+        assert len(tactic) == 2, f"Expected 2 contexts, got {len(tactic)}"
+
+        with tuner.replay(tactic):
+            # Make the same calls in the same order
+            runner_0, tactic_0 = tuner.choose_one("test_multi_context",
+                                                  runners,
+                                                  tuning_config, [x, w],
+                                                  gemm_idx=0)
+            runner_1, tactic_1 = tuner.choose_one("test_multi_context",
+                                                  runners,
+                                                  tuning_config, [x, w],
+                                                  gemm_idx=1)
+
+            output_0 = runner_0([x, w], tactic=tactic_0, gemm_idx=0)
+            output_1 = runner_1([x, w], tactic=tactic_1, gemm_idx=1)
+
+            # Verify each context independently
+            # Since we're testing different tactics, outputs will differ
+            # Just verify they don't crash and have correct shapes
+            assert output_0.shape == ref_output_0.shape
+            assert output_1.shape == ref_output_1.shape
+
+    # Should have tested 2*3 = 6 combinations
+    num_tactics_for_gemm_idx = lambda gemm_idx: len(runners[
+        0].get_valid_tactics([x, w], OptimizationProfile(), gemm_idx=gemm_idx))
+    assert len(tested_tactics) == num_tactics_for_gemm_idx(0) * num_tactics_for_gemm_idx(1), \
+        f"Expected 6 tactic combinations (2*3), got {len(tested_tactics)}"
+
+
+def test_kernel_testing_mismatched_ops():
+    """
+    Correctly raise and capture the exception when captured context != operation performed
+    """
+    x, w = torch.randn(16, 64), torch.randn(64, 128)
+    runners = [GemmRunner()]
+    tuning_config = TuningConfig()
+
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+
+    # Capture execution context for operation A
+    with tuner.capture() as all_tactics:
+        _ = tuner.choose_one("test_op_A", runners, tuning_config, [x, w])
+
+    # Try to test with operation B (should raise RuntimeError)
+    try:
+        for (runner, tactic), in all_tactics:
+            with tuner.replay(((runner, tactic), )):
+                # This should raise RuntimeError because custom_op doesn't match
+                _ = tuner.choose_one("test_op_B", runners, tuning_config,
+                                     [x, w])
+        assert False, "Expected RuntimeError for mismatched custom_op, but none was raised"
+    except RuntimeError as e:
+        # Verify the error message contains useful information
+        error_msg = str(e)
+        assert "Custom op mismatch" in error_msg, f"Expected 'Custom op mismatch' in error message, got: {error_msg}"
+        assert "test_op_A" in error_msg, f"Expected 'test_op_A' in error message, got: {error_msg}"
+        assert "test_op_B" in error_msg, f"Expected 'test_op_B' in error message, got: {error_msg}"
