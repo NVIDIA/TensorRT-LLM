@@ -2241,7 +2241,7 @@ def launchTestJobs(pipeline, testFilter)
             true,
             "",
             UBUNTU_22_04_IMAGE,
-            false,
+            true, // Now default pytorch is for CUDA 12.8, we need extra PyTorch CUDA 13.0 install
         ],
         "PY312-UB2404": [
             LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
@@ -2365,7 +2365,7 @@ def launchTestJobs(pipeline, testFilter)
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install cuda-toolkit-13-0")
                         }
-                        // Extra PyTorch CUDA 13.0 install for SBSA platform and Blackwell GPUs bare-metal environments
+                        // Extra PyTorch CUDA 13.0 install for all platforms and bare-metal environments (Default PyTorch is for CUDA 12.8)
                         if (values[6]) {
                             echo "###### Extra PyTorch CUDA 13.0 install Start ######"
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.9.0 torchvision --index-url https://download.pytorch.org/whl/cu130")
