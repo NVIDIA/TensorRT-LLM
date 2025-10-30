@@ -557,7 +557,6 @@ class AutoTuner:
         """
 
         def __init__(self, autotuner):
-            self.autotuner = autotuner
             # State for captured contexts
             self._captured_contexts: List[Dict[str, Any]] = []
             self._configurations = None
