@@ -28,6 +28,7 @@
 #include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include <chrono>
 #include <future>
 #include <map>
 #include <memory>
@@ -105,39 +106,65 @@ void TransferSession::setLlmRequest(LlmRequest const& llmRequest)
     mRequest = &llmRequest;
 }
 
-void TransferSession::appendMeasure(double delay, double duration, size_t size)
+void TransferSession::setTime(TimeNames name)
 {
-    if (!mRecordMeasure)
+    if (mTimes)
     {
-        return;
+        mTimes->times.at(name) = LlmRequest::getSteadyClockNow();
     }
-    auto bandwidth = size * 8 / (duration / 1000) / 1e9; // byte, ms => Gbps
-    mMeasures.emplace_back(Measure{delay, duration, bandwidth});
+}
+
+void TransferSession::appendMeasure(LlmRequest::TimePoint start, LlmRequest::TimePoint end, size_t size)
+{
+    if (mTimes)
+    {
+        mTimes->measures.emplace_back(Measure{start, end, size});
+    }
 }
 
 void TransferSession::exportMeasure(std::ofstream& outFile, bool isContext) const
 {
-    if (mMeasures.empty())
+    if (!mTimes || mTimes->measures.empty())
     {
         return;
     }
     // write header if not exist
     if (outFile.tellp() == 0)
     {
-        outFile << "RequestID";
-        for (size_t i = 0; i < mMeasures.size(); i++)
+        outFile << "RequestID,RequestInfo,Preparation,Preprocess,Transmissions,Postprocess";
+        for (size_t i = 0; i < mTimes->measures.size(); i++)
         {
-            outFile << ",Delay(ms),Duration(ms),Bandwidth(Gbps)";
+            outFile << ",Delay,Duration,Bandwidth(Gbps)";
         }
         outFile << '\n';
     }
-    // write measures
+    auto transferStart = mRequest->getPerfMetrics().timingMetrics.kvCacheTransferStart;
+    using Milliseconds = std::chrono::duration<double, std::milli>;
+
+    // write measures, time is in milliseconds
     TLLM_CHECK(isContext || mRequest->getContextPhaseParams().has_value());
     auto reqId = isContext ? mRequest->mRequestId : mRequest->getContextPhaseParams().value().getReqId();
     outFile << reqId;
-    for (auto const& measure : mMeasures)
+    auto previousTime = transferStart;
+    for (auto time : mTimes->times)
     {
-        outFile << "," << measure.delay << "," << measure.duration << "," << measure.bandwidth;
+        if (time == LlmRequest::TimePoint())
+        {
+            // timepoint is unset, skip
+            outFile << ",0.0";
+            continue;
+        }
+        double delay = Milliseconds(time - previousTime).count();
+        previousTime = time;
+        outFile << "," << delay;
+    }
+    previousTime = mTimes->times[kTimePreprocess];
+    for (auto const& measure : mTimes->measures)
+    {
+        double delay = Milliseconds(measure.start - previousTime).count();
+        double duration = Milliseconds(measure.end - measure.start).count();
+        double bandwidth = static_cast<double>(measure.size) * 8.0 / duration / 1e6; // byte, ms => Gbps
+        outFile << "," << delay << "," << duration << "," << bandwidth;
     }
     outFile << '\n' << std::flush;
 }
@@ -158,7 +185,7 @@ int32_t tagFromRequestId(LlmRequest::RequestIdType requestId)
 std::filesystem::path getTransferOutputPath(char const* tag)
 {
     namespace fs = std::filesystem;
-    auto outputPath = common::getEnvKVCacheTransferOutputPath();
+    auto outputPath = common::getEnvKVCacheTimeOutputPath();
     if (!outputPath.empty())
     {
         auto rank = mpi::MpiComm::world().getRank();
@@ -273,6 +300,7 @@ public:
     {
         std::promise<void> promise;
         auto future = promise.get_future();
+        llmRequest.setKvCacheTransferStart(LlmRequest::getSteadyClockNow());
         {
             {
                 std::scoped_lock lkResp(mSenderMutex);
@@ -309,7 +337,7 @@ public:
         std::unique_lock<std::mutex> lk(mMtxForMap);
         auto it = mRequestToSession.find(requestId);
         TLLM_CHECK(it != mRequestToSession.end());
-        if (!common::getEnvKVCacheTransferOutputPath().empty())
+        if (!common::getEnvKVCacheTimeOutputPath().empty())
         {
             if (!mMeasuresFile.is_open())
             {
@@ -363,7 +391,8 @@ public:
                 auto session = TransferSession(std::vector<Connection const*>(peerRelativeRanks.size(), nullptr),
                     DataContext{tagFromRequestId(requestId)}, mSelfState, info.getTransState(), mBufferManager,
                     info.getIndexFromEnd(), info.getLastBlockKey(), nullptr,
-                    !common::getEnvKVCacheTransferOutputPath().empty());
+                    !common::getEnvKVCacheTimeOutputPath().empty());
+                session.setTime(TransferSession::kTimeRequestInfo);
                 it = mRequestToSession.emplace(requestId, std::move(session)).first;
             }
             it->second.setConnection(peerIdx, connection);
@@ -382,6 +411,7 @@ public:
         }
         session->setLlmRequest(llmRequest);
         mFormatter->format(*session);
+        llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
     }
 
     bool cancelRequest(LlmRequest const& llmRequest)
@@ -751,7 +781,7 @@ public:
     void receiveSync(TransferSession& session)
     {
         mFormatter->unformat(session);
-        if (!common::getEnvKVCacheTransferOutputPath().empty())
+        if (!common::getEnvKVCacheTimeOutputPath().empty())
         {
             std::unique_lock<std::mutex> lock(mMeasuresFileMutex);
             if (!mMeasuresFile.is_open())
@@ -846,7 +876,7 @@ public:
         auto const& resource = getReceiveCacheResource(llmRequest);
         return TransferSession(std::move(counterPartConnections), DataContext{tagFromRequestId(requestId)}, mSelfState,
             contextState, resource->mBufferManager, requestInfo.getIndexFromEnd(), requestInfo.getLastBlockKey(),
-            &llmRequest, !common::getEnvKVCacheTransferOutputPath().empty());
+            &llmRequest, !common::getEnvKVCacheTimeOutputPath().empty());
     }
 
     std::unique_ptr<ReceiveCacheResource> const& getReceiveCacheResource(LlmRequest const& llmRequest)
@@ -957,6 +987,7 @@ private:
         llmRequest.setKvCacheTransferStart(std::chrono::steady_clock::now());
         TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
         auto session = sendRequestInfo(llmRequest);
+        session.setTime(TransferSession::kTimeRequestInfo);
         bool isReady = receiveReadySignal(session);
         if (!isReady)
         {

@@ -1,0 +1,20 @@
+[tool.poetry]
+name = "unknown-package"
+version = "0.1.0"
+description = ""
+authors = ["TensorRT LLM [90828364+tensorrt-cicd@users.noreply.github.com]"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.13"
+datasets = "3.1.0"
+evaluate = "^0.4.6"
+rouge-score = "^0.1.2"
+sentencepiece = "0.2.0"
+jaxlib = {version = "0.4.29", extras = ["cuda12-pip"]}
+dm-haiku = "0.0.12"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
