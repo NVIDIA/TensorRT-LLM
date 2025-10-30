@@ -503,7 +503,7 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String nodeName, St
             pipeline,
             script: Utils.sshUserCmd(
                 remote,
-                cleanupCommands
+                "\"${cleanupCommands}\""
             )
         )
 
