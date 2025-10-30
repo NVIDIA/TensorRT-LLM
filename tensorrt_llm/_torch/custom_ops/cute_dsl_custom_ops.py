@@ -49,7 +49,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     f"SM version {get_sm_version()} is not supported for CuteDSLNVFP4BlackwellLinear, it only supports SM 100"
                 )
 
-        # reweite the hash function because self.alpha values don't influence the tactic.
+        # rewrite the hash function because the value of self.alpha doesn't affect the tactic.
         def __hash__(self):
             return hash((self.output_dtype, ))
 
