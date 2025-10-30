@@ -403,7 +403,6 @@ test_e2e.py::test_ptp_quickstart_advanced_multi_gpus[DeepSeek-V3-671B-FP8-DeepSe
 test_e2e.py::test_trtllm_serve_multimodal_example SKIP (https://nvbugs/5596377)
 test_e2e.py::test_openai_chat_multimodal_example SKIP (https://nvbugs/5596377)
 unittest/llmapi/test_llm_multi_gpu_pytorch.py::test_llm_rpc_streaming_tp2 SKIP (https://nvbugs/5594753)
-perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-pytorch-float16-input_output_len:128,128-reqs:8192] SKIP (https://nvbugs/5620887)
 triton_server/test_triton.py::test_cpp_unit_tests[cpp-unit-tests] SKIP (https://nvbugs/5619359)
 triton_server/test_triton_rcca.py::test_rcca_bug_4934893[Temperature:0.5-TOP_P:0.95-TOP_K:10-False-1---False-True-False-0-2048-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap--max_utilization---1-1-1-False-ensemble] SKIP (https://nvbugs/5619369)
 unittest/_torch/thop/parallel/test_fp8_rowwise_linear.py::test_fp8_rowwise_linear[dtype0] SKIP (https://nvbugs/5619396)
