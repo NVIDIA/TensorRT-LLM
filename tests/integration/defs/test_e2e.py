@@ -3473,10 +3473,10 @@ def test_llmapi_generation_logits(llm_venv, model_path,
 
 
 @skip_pre_blackwell
-@pytest.mark.skip_less_device_memory(192000)
+@pytest.mark.skip_less_device_memory(189000)
 @pytest.mark.parametrize("model_name,model_path,gpu_count", [
-    ("DeepSeek-R1-0528", "DeepSeek-R1/DeepSeek-R1-0528", "8"),
-    ("DeepSeek-R1-0528-FP4", "DeepSeek-R1/DeepSeek-R1-0528-FP4", "4"),
+    ("DeepSeek-R1-0528", "DeepSeek-R1/DeepSeek-R1-0528", 8),
+    ("DeepSeek-R1-0528-FP4", "DeepSeek-R1/DeepSeek-R1-0528-FP4", 4),
 ])
 def test_longbench_v2_multigpus(llm_venv, model_name, model_path, gpu_count):
     original_model_dir = Path(llm_models_root()) / model_path
@@ -3591,6 +3591,8 @@ def test_longbench_v2_multigpus(llm_venv, model_name, model_path, gpu_count):
             "--max_len=1280000",
             "--max_input_length=1280000",
             "--max_output_length=32000",
+            "--check_accuracy",
+            "--accuracy_threshold=45.0",
         ]
 
         print(f"\nRunning command:")

@@ -813,6 +813,14 @@ class LongBenchV2(Evaluator):
                   type=int,
                   default=32000,
                   help="Maximum generation length in sampling parameters.")
+    @click.option("--check_accuracy",
+                  is_flag=True,
+                  default=False,
+                  help="Check if accuracy meets the threshold.")
+    @click.option("--accuracy_threshold",
+                  type=float,
+                  default=30.0,
+                  help="Minimum accuracy threshold for passing the evaluation.")
     @click.pass_context
     @staticmethod
     def command(ctx, dataset_path: str, prompts_dir: Optional[str],
@@ -821,7 +829,8 @@ class LongBenchV2(Evaluator):
                 cot: bool, no_context: bool, rag: int, max_len: int,
                 output_dir: Optional[str], random_seed: int,
                 apply_chat_template: bool, system_prompt: Optional[str],
-                max_input_length: int, max_output_length: int) -> None:
+                max_input_length: int, max_output_length: int,
+                check_accuracy: bool, accuracy_threshold: float) -> None:
         llm: Union[LLM, PyTorchLLM] = ctx.obj
 
         sampling_params = SamplingParams(
@@ -846,5 +855,13 @@ class LongBenchV2(Evaluator):
                                 apply_chat_template=apply_chat_template,
                                 system_prompt=system_prompt)
 
-        evaluator.evaluate(llm, sampling_params)
+        accuracy = evaluator.evaluate(llm, sampling_params)
         llm.shutdown()
+
+        if check_accuracy:
+            logger.warning(
+                "The --check_accuracy flag is not expected to be used anymore. "
+                "It is being used by some legacy accuracy tests that call evaluation commands via subprocess. "
+                "New accuracy tests should use LLM API within the pytest process; please see `tests/integration/defs/accuracy/README.md`."
+            )
+            assert accuracy >= accuracy_threshold, f"Expected accuracy >= {accuracy_threshold}, but got {accuracy}."
