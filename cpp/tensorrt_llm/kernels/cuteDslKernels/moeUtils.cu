@@ -50,6 +50,10 @@ __global__ void moePermuteKernel(InputType const* input, InputType* permuted_inp
             dst_ptr[offset] = src_ptr[offset];
         }
     }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
 }
 
 template <typename InputType, typename SFType>
@@ -78,8 +82,14 @@ void moePermute(InputType const* input, InputType* permuted_input, SFType const*
         num_non_exiting_tiles, hidden_size, top_k, tile_size);
 }
 
-template void moePermute<__nv_bfloat16, uint8_t>(__nv_bfloat16 const* input, __nv_bfloat16* permuted_input,
-    uint8_t const* input_sf, uint8_t* permuted_sf, int32_t const* permuted_idx_to_expanded_idx,
-    int32_t const* num_non_exiting_tiles, int32_t const hidden_size, int32_t const top_k, int32_t const tile_size,
-    cudaStream_t stream);
+#define INSTANTIATE_MOE_PERMUTE(InputType, SFType)                                                                     \
+    template void moePermute<InputType, SFType>(InputType const* input, InputType* permuted_input,                     \
+        SFType const* input_sf, SFType* permuted_sf, int32_t const* permuted_idx_to_expanded_idx,                      \
+        int32_t const* num_non_exiting_tiles, int32_t const hidden_size, int32_t const top_k, int32_t const tile_size, \
+        cudaStream_t stream);
+
+INSTANTIATE_MOE_PERMUTE(half, uint8_t);
+#ifdef ENABLE_BF16
+INSTANTIATE_MOE_PERMUTE(__nv_bfloat16, uint8_t);
+#endif
 } // namespace tensorrt_llm::kernels::cute_dsl

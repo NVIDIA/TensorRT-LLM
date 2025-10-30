@@ -7,7 +7,7 @@ import tensorrt_llm  # noqa
 @pytest.mark.parametrize("tile_size", [64, 128, 256])
 @pytest.mark.parametrize("top_k", [1, 2, 8])
 @pytest.mark.parametrize("num_tokens", [128, 515, 1024])
-@pytest.mark.parametrize("dtype", ["bfloat16"])
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
 def test_moe_permute(dtype: str, num_tokens: int, top_k: int, tile_size: int):
     dtype = getattr(torch, dtype)
     hidden_size = 4096

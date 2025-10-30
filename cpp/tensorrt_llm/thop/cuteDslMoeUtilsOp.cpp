@@ -139,10 +139,21 @@ std::vector<torch::Tensor> moe_permute(torch::Tensor const& input, torch::Tensor
         = torch::empty({num_permuted_tokens, hidden_size}, torch::dtype(input.scalar_type()).device(torch::kCUDA));
 
     auto const& stream = at::cuda::getCurrentCUDAStream(input.get_device());
-    tensorrt_llm::kernels::cute_dsl::moePermute<__nv_bfloat16, uint8_t>(static_cast<__nv_bfloat16*>(input.data_ptr()),
-        static_cast<__nv_bfloat16*>(permuted_input.data_ptr()), input_sf_ptr, permuted_sf_ptr,
-        permuted_idx_to_expanded_idx.data_ptr<int32_t>(), num_non_exiting_tiles.data_ptr<int32_t>(), hidden_size, top_k,
-        tile_tokens_dim, stream);
+
+    if (input.scalar_type() == torch::kBFloat16)
+    {
+        tensorrt_llm::kernels::cute_dsl::moePermute<__nv_bfloat16, uint8_t>(
+            static_cast<__nv_bfloat16*>(input.data_ptr()), static_cast<__nv_bfloat16*>(permuted_input.data_ptr()),
+            input_sf_ptr, permuted_sf_ptr, permuted_idx_to_expanded_idx.data_ptr<int32_t>(),
+            num_non_exiting_tiles.data_ptr<int32_t>(), hidden_size, top_k, tile_tokens_dim, stream);
+    }
+    else if (input.scalar_type() == torch::kHalf)
+    {
+        tensorrt_llm::kernels::cute_dsl::moePermute<half, uint8_t>(static_cast<half*>(input.data_ptr()),
+            static_cast<half*>(permuted_input.data_ptr()), input_sf_ptr, permuted_sf_ptr,
+            permuted_idx_to_expanded_idx.data_ptr<int32_t>(), num_non_exiting_tiles.data_ptr<int32_t>(), hidden_size,
+            top_k, tile_tokens_dim, stream);
+    }
     return {permuted_input};
 }
 
