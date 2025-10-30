@@ -1,0 +1,18 @@
+[tool.poetry]
+name = "unknown-package"
+version = "0.1.0"
+description = ""
+authors = ["TensorRT LLM [90828364+tensorrt-cicd@users.noreply.github.com]"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.13"
+datasets = "3.1.0"
+evaluate = "^0.4.6"
+rouge-score = "^0.1.2"
+tiktoken = "0.6.0"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

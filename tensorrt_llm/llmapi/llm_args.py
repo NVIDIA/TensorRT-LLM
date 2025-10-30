@@ -44,8 +44,7 @@ from ..bindings.executor import (BatchingType as _BatchingType,
                                  KvCacheConfig as _KvCacheConfig,
                                  LookaheadDecodingConfig as _LookaheadDecodingConfig,
                                  PeftCacheConfig as _PeftCacheConfig,
-                                 SchedulerConfig as _SchedulerConfig,
-                                 GuidedDecodingConfig as _GuidedDecodingConfig) # isort: skip
+                                 SchedulerConfig as _SchedulerConfig) # isort: skip
 # isort: on
 
 # yapf: enable
@@ -162,6 +161,26 @@ class CudaGraphConfig(StrictBaseModel):
             batch_sizes.append(max_batch_size)
 
         return batch_sizes
+
+
+class GuidedDecodingConfig(StrictBaseModel):
+
+    class GuidedDecodingBackend(Enum):
+        XGRAMMAR = 0
+        LLGUIDANCE = 1
+
+    backend: GuidedDecodingBackend = Field(
+        default=GuidedDecodingBackend.XGRAMMAR,
+        description="The backend for guided decoding config.")
+    encoded_vocab: Optional[List[str]] = Field(
+        default=None,
+        description="The encoded vocab for guided decoding config.")
+    tokenizer_str: Optional[str] = Field(
+        default=None,
+        description="The tokenizer string for guided decoding config.")
+    stop_token_ids: Optional[List[int]] = Field(
+        default=None,
+        description="The stop token ids for guided decoding config.")
 
 
 class BaseSparseAttentionConfig(StrictBaseModel):
@@ -2381,6 +2400,10 @@ class TorchCompileConfig(StrictBaseModel):
                 "torch_compile_config.max_num_streams must be >= 1")
         return v
 
+    @staticmethod
+    def _generate_capture_num_tokens() -> List[int]:
+        return [2**i for i in range(8)] + [i for i in range(256, 3073, 256)]
+
 
 class TorchLlmArgs(BaseLlmArgs):
     # Just a dummy BuildConfig to allow code reuse with the TrtLlmArgs
@@ -2694,6 +2717,18 @@ class TorchLlmArgs(BaseLlmArgs):
             config.batch_sizes = generated_sizes
             config.max_batch_size = max_batch_size
 
+        return self
+
+    @model_validator(mode='after')
+    def validate_torch_compile_config(self) -> 'TorchLlmArgs':
+        if self.torch_compile_config is None:
+            return self
+
+        config = self.torch_compile_config
+        if config.enable_piecewise_cuda_graph:
+            if config.capture_num_tokens is None:
+                config.capture_num_tokens = TorchCompileConfig._generate_capture_num_tokens(
+                )
         return self
 
     @model_validator(mode='after')
