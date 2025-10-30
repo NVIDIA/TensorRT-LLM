@@ -14,6 +14,10 @@
  * limitations under the License.
  */
 
+#pragma once
+#include <cstdint>
+#include <cuda_runtime.h>
+
 namespace tensorrt_llm::kernels::cute_dsl
 {
 template <typename InputType, typename SFType>
