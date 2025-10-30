@@ -25,7 +25,7 @@ torch>=2.9.0a0,<=2.9.0
 torchvision
 nvidia-modelopt[torch]~=0.37.0
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-10.html#rel-25-10 uses 2.27.7
-nvidia-nccl-cu13
+nvidia-nccl-cu13==2.27.7
 nvidia-cuda-nvrtc
 transformers==4.56.0
 prometheus_client
