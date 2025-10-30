@@ -35,8 +35,7 @@ def enforce_single_worker(monkeypatch):
         [True, "TRTLLM", False, True, True, False, True, False, False],
         [True, "TRTLLM", True, False, True, True, True, False, False],
         [True, "TRTLLM", True, False, True, False, True, False, False],
-        # TODO: nvbugs/5461761
-        # [True, "TRTLLM", True, False, False, True, True, False],
+        [True, "TRTLLM", True, False, False, True, True, False, False],
         [True, "TRTLLM", False, False, False, False, True, False, False],
         [False, "TRTLLM", False, False, False, False, True, False, False],
         [True, "TRTLLM", False, False, False, False, False, True, False],
@@ -154,6 +153,59 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
     for text_spec, text_ref in zip(generated_text_spec, generated_text_ref):
         # The spec decode algorithm currently guarantees identical results
         assert text_spec == text_ref
+
+
+@pytest.mark.parametrize("use_cuda_graph", [True, False])
+@pytest.mark.high_cuda_memory
+def test_llama_eagle3_long_prompt(use_cuda_graph):
+    # Eagle3 one model works with overlap scheduler and block reuse.
+    total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+    if total_mem_gb < 35:
+        pytest.skip("Not enough memory to load target + draft model")
+
+    models_path = llm_models_root()
+    eagle_model_dir = f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B"
+    target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
+
+    spec_config = EagleDecodingConfig(
+        max_draft_len=3,
+        speculative_model_dir=eagle_model_dir,
+        eagle3_one_model=False,
+    )
+
+    if use_cuda_graph:
+        cuda_graph_config = CudaGraphConfig(batch_sizes=[1])
+    else:
+        cuda_graph_config = None
+
+    llm_spec = LLM(model=target_model_dir,
+                   speculative_config=spec_config,
+                   max_batch_size=1,
+                   cuda_graph_config=cuda_graph_config,
+                   disable_overlap_scheduler=False)
+
+    prompt = [", ".join(str(i) for i in range(1000))]
+
+    sampling_params = SamplingParams(max_tokens=10, temperature=0)
+    results_spec = llm_spec.generate(prompt, sampling_params)
+
+    generated_text_spec = [result.outputs[0].text for result in results_spec]
+    llm_spec.shutdown()
+
+    llm_ref = LLM(model=target_model_dir,
+                  max_batch_size=1,
+                  cuda_graph_config=None,
+                  disable_overlap_scheduler=False)
+
+    results_ref = llm_ref.generate(prompt, sampling_params)
+
+    generated_text_ref = [result.outputs[0].text for result in results_ref]
+    llm_ref.shutdown()
+
+    # The LLM with speculation on should dynamically turn it off in this
+    # test since it goes beyond the max seqlen. Thus, the text should be
+    # _exactly_ the same, no need to use similarity scoring.
+    assert generated_text_spec[0] == generated_text_ref[0]
 
 
 def test_deepseek_eagle3():

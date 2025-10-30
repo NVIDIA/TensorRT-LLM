@@ -426,6 +426,9 @@ def run_disaggregated_test(example_dir,
             config_file
         ]
     else:
+        pytest.skip(
+            "https://nvbugs/5584607 Ray orchestrator is not supported with NIXL(DEFAULT) cache transceiver backend."
+        )
         with open(config_file, 'r') as f:
             config = yaml.safe_load(f)
 
@@ -455,7 +458,7 @@ def run_disaggregated_test(example_dir,
                                      config['generation_servers'],
                                      gen_extra_config_file, 'generation'))
 
-    server_start_timeout = 900
+    server_start_timeout = 1200
     server_cmd = [
         'trtllm-serve', 'disaggregated', '--server_start_timeout',
         str(server_start_timeout), '-c', config_file
@@ -850,10 +853,12 @@ def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
         lines = f.readlines()
         assert len(lines) > 1
         assert lines[0].startswith(
-            "RequestID,Delay(ms),Duration(ms),Bandwidth(Gbps)")
+            "RequestID,RequestInfo,Preparation,Preprocess,Transmissions,Postprocess"
+        )
+        assert ",Delay,Duration,Bandwidth(Gbps)" in lines[0]
         # get a send sample and match the recv
         sample = lines[1].split(',')
-        assert len(sample) >= 4
+        assert len(sample) >= 9
     with open(recv_file, "r") as f:
         lines = f.readlines()
         assert len(lines) > 1

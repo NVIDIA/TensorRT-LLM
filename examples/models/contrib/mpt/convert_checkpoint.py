@@ -841,8 +841,7 @@ if __name__ == '__main__':
 
     hf_model = MptForCausalLM.from_pretrained(args.model_dir,
                                               device_map="auto",
-                                              torch_dtype=getattr(
-                                                  torch, args.dtype))
+                                              dtype=getattr(torch, args.dtype))
 
     act_range = {}
     mpt_qkv_para = {}

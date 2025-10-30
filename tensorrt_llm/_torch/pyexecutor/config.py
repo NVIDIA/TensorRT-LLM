@@ -3,11 +3,8 @@ from typing import Dict, List, Optional, Union
 
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
     BaseCheckpointLoader
-from tensorrt_llm.bindings.executor import ExecutorConfig
 
 from ...llmapi.llm_args import LoadFormat, SamplerType
-from ...logger import logger
-from ...mapping import Mapping
 from ..model_config import MoeLoadBalancerConfig
 from .resource_manager import BaseResourceManager
 
@@ -115,57 +112,6 @@ class PyTorchConfig:
     # total GPU memory minus the statically allocated engine memory.
     # If false, set the PyTorch CUDA memory fraction to 1.0.
     _limit_torch_cuda_mem_fraction: bool = True
-
-
-EXETENDED_EXECUTOR_CONFIG_FIELDS = [
-    'backend',
-    'pytorch_backend_config',
-    'max_seq_len',
-    'mapping',
-    'hf_model_dir',
-    'mm_encoder_only',
-]
-
-
-def update_executor_config(
-        executor_config: ExecutorConfig,
-        backend: Optional[str] = None,
-        pytorch_backend_config: Optional[PyTorchConfig] = None,
-        mapping: Optional[Mapping] = None,
-        speculative_config: Optional["DecodingBaseConfig"] = None,
-        hf_model_dir: Optional[str] = None,
-        max_input_len: Optional[int] = None,
-        max_seq_len: Optional[int] = None,
-        checkpoint_format: Optional[str] = None,
-        checkpoint_loader: Optional[BaseCheckpointLoader] = None,
-        mm_encoder_only: bool = False):
-    if backend is None:
-        return
-
-    for field_name in EXETENDED_EXECUTOR_CONFIG_FIELDS:
-        if hasattr(executor_config, field_name):
-            raise AttributeError(
-                f"{field_name} should be dynamically assigned.")
-        setattr(executor_config, field_name, None)
-
-    executor_config.backend = backend
-    executor_config.pytorch_backend_config = pytorch_backend_config
-    executor_config.mapping = mapping
-    executor_config.speculative_config = speculative_config
-    executor_config.mm_encoder_only = mm_encoder_only
-
-    logger.info(f"{executor_config.pytorch_backend_config}")
-
-    executor_config.hf_model_dir = hf_model_dir
-
-    if max_input_len is not None:
-        executor_config.max_input_len = max_input_len
-
-    if max_seq_len is not None:
-        executor_config.max_seq_len = max_seq_len
-
-    executor_config.checkpoint_loader = _construct_checkpoint_loader(
-        backend, checkpoint_loader, checkpoint_format)
 
 
 def _construct_checkpoint_loader(

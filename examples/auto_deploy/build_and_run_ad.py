@@ -15,6 +15,7 @@ from pydantic_settings import (
 )
 
 from tensorrt_llm._torch.auto_deploy import LLM, AutoDeployConfig, DemoLLM
+from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
 from tensorrt_llm._torch.auto_deploy.utils._config import (
     DynamicYamlMixInForSettings,
     deep_merge_dicts,
@@ -139,9 +140,10 @@ class ExperimentConfig(DynamicYamlMixInForSettings, BaseSettings):
 
     ### CORE ARGS ##################################################################################
     # The main AutoDeploy arguments - contains model, tokenizer, backend configs, etc.
-    args: AutoDeployConfig = Field(
+    args: LlmArgs = Field(
         description="The main AutoDeploy arguments containing model, tokenizer, backend configs, etc. "
-        "Please check `tensorrt_llm._torch.auto_deploy.llm_args.AutoDeployConfig` for more details."
+        "Contains all the fields from `AutoDeployConfig` and `BaseLlmArgs`. "
+        "Please check `tensorrt_llm._torch.auto_deploy.llm_args.LlmArgs` for more details."
     )
 
     # Optional model field for convenience - if provided, will be used to initialize args.model
@@ -280,7 +282,7 @@ def main(config: Optional[ExperimentConfig] = None):
     # run a benchmark for the model with batch_size == config.benchmark_bs
     if config.benchmark.enabled and config.args.runtime != "trtllm":
         ad_logger.info("Running benchmark...")
-        keys_from_args = ["compile_backend", "attn_backend", "mla_backend"]
+        keys_from_args = []
         fields_to_show = [f"benchmark={config.benchmark}"]
         fields_to_show.extend([f"{k}={getattr(config.args, k)}" for k in keys_from_args])
         results["benchmark_results"] = benchmark(
@@ -304,6 +306,7 @@ def main(config: Optional[ExperimentConfig] = None):
         store_benchmark_results(results, config.benchmark.results_path)
 
     llm.shutdown()
+    return results
 
 
 if __name__ == "__main__":

@@ -27,11 +27,12 @@ from tensorrt_llm._utils import (customized_gc_thresholds, is_trace_enabled,
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats,
-                                            PeftCacheConfig, RequestStage,
-                                            RequestStats, SpecDecodingStats,
+                                            RequestStage, RequestStats,
+                                            SpecDecodingStats,
                                             StaticBatchingStats)
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
+from tensorrt_llm.llmapi.llm_args import PeftCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.runtime.generation import CUASSERT
@@ -160,6 +161,7 @@ class PyExecutor:
                  max_batch_size: int = 8,
                  max_beam_width: int = 1,
                  max_draft_len: int = 0,
+                 max_total_draft_tokens: int = 0,
                  kv_cache_transceiver: Optional[KvCacheTransceiver] = None,
                  guided_decoder: Optional[GuidedDecoder] = None,
                  garbage_collection_gen0_threshold: Optional[int] = None,
@@ -195,6 +197,7 @@ class PyExecutor:
         self.active = True
         self.max_beam_width = max_beam_width
         self.max_draft_len = max_draft_len
+        self.max_total_draft_tokens = max_total_draft_tokens
         self.max_num_tokens = model_engine.pytorch_backend_config.max_num_tokens
         self.print_log = model_engine.pytorch_backend_config.print_iter_log
         self.enable_iter_perf_stats = model_engine.pytorch_backend_config.enable_iter_perf_stats
@@ -244,7 +247,10 @@ class PyExecutor:
         self.max_num_active_requests = model_engine.get_max_num_sequences()
         self.active_requests: List[LlmRequest] = []
         self.expected_num_active_requests = 0
-        self.ctx_in_transmission_requests = []
+        self.ctx_in_transmission_requests = dict()
+        self.ctx_in_transmission_counter = (1 if kv_cache_transceiver else
+                                            0) + (1 if kv_connector_manager else
+                                                  0)
         self.previous_batch: Optional[BatchState] = None
         self.has_previous_draft_tokens = False
         self.num_scheduled_requests: int = 0
@@ -328,8 +334,8 @@ class PyExecutor:
     def _maybe_init_kv_connector_manager(self):
         if self.kv_connector_manager is not None:
             if self.kv_cache_transceiver is not None:
-                raise NotImplementedError(
-                    "KV Cache Connector is not supported with KvCacheTransceiver."
+                logger.warning(
+                    "Both KV Cache Connector and KV Cache Transceiver are enabled. Are you sure you want to do this?"
                 )
 
             if self.dist.pp_size > 1:
@@ -973,8 +979,10 @@ class PyExecutor:
                                         or req.is_finished_due_to_length):
                                     block_id = self.kv_cache_manager.store_blocks_for_reuse(
                                         req, True)
-                                    self.ctx_in_transmission_requests.append(
-                                        (req, block_id))
+                                    self.ctx_in_transmission_requests[
+                                        req.py_request_id] = (
+                                            (req, block_id,
+                                             self.ctx_in_transmission_counter))
 
                         if self.kv_cache_transceiver:
                             self._send_disagg_ctx_cache(
@@ -986,15 +994,21 @@ class PyExecutor:
 
                         finished_requests = self._handle_responses()
                         previous_scheduled_batch = previous_batch.sample_state.scheduled_requests
+                        attn_metadata = getattr(self.model_engine,
+                                                'attn_metadata', None)
+                        kv_cache_dtype_byte_size = getattr(
+                            self.model_engine, 'kv_cache_dtype_byte_size', None)
                         self.resource_manager.update_resources(
-                            previous_scheduled_batch)
+                            previous_scheduled_batch, attn_metadata,
+                            kv_cache_dtype_byte_size)
                         self._remove_inflight_ids(previous_scheduled_batch)
 
                     self.wait_on_pp_send_handles(prev_microbatch_id)
                     self.micro_batches[prev_microbatch_id] = None
 
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
-                    self._terminate_ctx_finished_requests()
+                    self._check_kv_transfer_timeout()
+                    self._terminate_disagg_ctx_finished_requests()
 
                 if self._disagg_pp_termination_handler is not None:
                     requests_to_terminate = self._disagg_pp_termination_handler.sync(
@@ -1022,6 +1036,7 @@ class PyExecutor:
 
         if self.kv_cache_transceiver:
             self._check_disagg_gen_transfer_status()
+            self._check_kv_transfer_timeout()
 
         iter_stats = None
         if self.enable_iter_perf_stats:
@@ -1040,7 +1055,7 @@ class PyExecutor:
                 self.use_spec_decode = self.drafter.should_use_spec_decode(
                     self.active_requests, self.max_batch_size,
                     self.model_engine.max_num_tokens,
-                    self.model_engine.spec_config.max_draft_len)
+                    self.model_engine.spec_config.max_total_draft_tokens)
             logger.debug(f"Use spec decode: {self.use_spec_decode}")
             self.model_engine.enable_spec_decode = self.use_spec_decode
 
@@ -1050,10 +1065,10 @@ class PyExecutor:
                         LlmRequestState.GENERATION_IN_PROGRESS,
                         LlmRequestState.DISAGG_GENERATION_INIT):
                     continue
-                max_draft_len = self.model_engine.spec_config.max_draft_len
+                max_total_draft_tokens = self.model_engine.spec_config.max_total_draft_tokens
                 request.draft_tokens = [
                     0
-                ] * max_draft_len if max_draft_len > 0 else []
+                ] * max_total_draft_tokens if max_total_draft_tokens > 0 else []
 
             # When overlap scheduler is enabled, and we already prepared the draft tokens in the previous batch,
             # we don't need to initialize py_draft_tokens at this stage because we haven't append the accepted tokens to the request yet.
@@ -1066,6 +1081,10 @@ class PyExecutor:
 
         scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
         )
+
+        if self.drafter is not None and not self.use_spec_decode:
+            for request in scheduled_batch.all_requests():
+                request.py_disable_speculative_decoding = True
 
         if self.kv_cache_transceiver:
             # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
@@ -1096,7 +1115,15 @@ class PyExecutor:
         if self.kv_connector_manager:
             reqs_to_terminate = self.kv_connector_manager.get_finished()
             for req in reqs_to_terminate:
-                self.resource_manager.free_resources(req)
+                if req.py_request_id in self.ctx_in_transmission_requests:
+                    request, block_id, counter = self.ctx_in_transmission_requests.pop(
+                        req.py_request_id)
+                    if counter == 1:
+                        self.kv_cache_manager.unpin_blocks_by_id(block_id)
+                    else:
+                        self.ctx_in_transmission_requests[req.py_request_id] = (
+                            request, block_id, counter - 1)
+                    break
 
     def _kv_connector_wait_for_save(self):
         if self.kv_connector_manager is not None:
@@ -1183,8 +1210,10 @@ class PyExecutor:
                                     or req.is_finished_due_to_length):
                                 block_id = self.kv_cache_manager.store_blocks_for_reuse(
                                     req, True)
-                                self.ctx_in_transmission_requests.append(
-                                    (req, block_id))
+                                self.ctx_in_transmission_requests[
+                                    req.py_request_id] = (
+                                        (req, block_id,
+                                         self.ctx_in_transmission_counter))
 
                     if self.kv_cache_transceiver:
                         ctx_transmission_reqs = self._send_disagg_ctx_cache(
@@ -1195,22 +1224,28 @@ class PyExecutor:
 
                     self._handle_canceled_requests()
                     finished_requests = self._handle_responses()
-                    self.resource_manager.update_resources(scheduled_batch)
+                    attn_metadata = getattr(self.model_engine, 'attn_metadata',
+                                            None)
+                    kv_cache_dtype_byte_size = getattr(
+                        self.model_engine, 'kv_cache_dtype_byte_size', None)
+                    self.resource_manager.update_resources(
+                        scheduled_batch, attn_metadata,
+                        kv_cache_dtype_byte_size)
                     if self.enable_kv_cache_events:
                         self._add_kv_cache_events()
 
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
-                    self._terminate_ctx_finished_requests()
+                    self._check_kv_transfer_timeout()
+                    self._terminate_disagg_ctx_finished_requests()
 
                 self._kv_connector_terminate_requests()
 
-                if self.enable_iter_perf_stats:
+                if self.enable_iter_perf_stats and sample_state is not None:
                     iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
                         'num_ctx_tokens']
                     self._process_iter_stats(
                         finished_requests, self.active_requests,
-                        BatchState(sample_state=SampleState(
-                            scheduled_requests=scheduled_batch),
+                        BatchState(sample_state=sample_state,
                                    iter_stats=iter_stats,
                                    iter_start_time=iter_start_time))
 
@@ -1224,11 +1259,11 @@ class PyExecutor:
                     continue
 
                 req.py_last_draft_tokens = req.py_draft_tokens
-                max_draft_len = self.model_engine.spec_config.max_draft_len
+                max_total_draft_tokens = self.model_engine.spec_config.max_total_draft_tokens
 
-                if max_draft_len > 0 and self.use_spec_decode:
-                    req.py_draft_tokens = [0] * max_draft_len
-                    req.py_draft_pages_allocated = max_draft_len
+                if max_total_draft_tokens > 0 and self.use_spec_decode and not req.py_disable_speculative_decoding:
+                    req.py_draft_tokens = [0] * max_total_draft_tokens
+                    req.py_draft_pages_allocated = max_total_draft_tokens
                 else:
                     req.py_draft_tokens = []
                     req.py_draft_pages_allocated = 0
@@ -1353,8 +1388,10 @@ class PyExecutor:
                                         or req.is_finished_due_to_length):
                                     block_id = self.kv_cache_manager.store_blocks_for_reuse(
                                         req, True)
-                                    self.ctx_in_transmission_requests.append(
-                                        (req, block_id))
+                                    self.ctx_in_transmission_requests[
+                                        req.py_request_id] = (
+                                            (req, block_id,
+                                             self.ctx_in_transmission_counter))
 
                     if self.guided_decoder is not None:
                         # add_batch must be called again to have updated new tokens.
@@ -1385,7 +1422,8 @@ class PyExecutor:
                         ctx_transmission_reqs=ctx_transmission_reqs)
 
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
-                    self._terminate_ctx_finished_requests()
+                    self._check_kv_transfer_timeout()
+                    self._terminate_disagg_ctx_finished_requests()
 
                 self._kv_connector_terminate_requests()
 
@@ -1397,7 +1435,12 @@ class PyExecutor:
         self._handle_canceled_requests()
         finished_requests = self._handle_responses()
         scheduled_requests = self.previous_batch.sample_state.scheduled_requests
-        self.resource_manager.update_resources(scheduled_requests)
+        attn_metadata = getattr(self.model_engine, 'attn_metadata', None)
+        kv_cache_dtype_byte_size = getattr(self.model_engine,
+                                           'kv_cache_dtype_byte_size', None)
+        self.resource_manager.update_resources(scheduled_requests,
+                                               attn_metadata,
+                                               kv_cache_dtype_byte_size)
         if self.enable_kv_cache_events:
             self._add_kv_cache_events()
 
@@ -1593,6 +1636,34 @@ class PyExecutor:
 
         return
 
+    @nvtx_range("_check_kv_transfer_timeout")
+    def _check_kv_transfer_timeout(self):
+        if not self.kv_cache_transceiver:
+            return
+        timeout_ms = self.kv_cache_transceiver.kv_transfer_timeout_ms
+        if timeout_ms is None:
+            return
+
+        def flag_if_kv_transfer_timed_out(req: LlmRequest, type: str) -> None:
+            current_time = time.time()
+            if req.py_kv_transfer_start_time is None:
+                return
+            elapsed_time = (current_time - req.py_kv_transfer_start_time) * 1000
+            if elapsed_time > timeout_ms and not req.py_kv_transfer_timed_out:
+                logger.warning(
+                    f"Terminating {type} request {req.py_request_id} due to KV cache transfer timeout"
+                )
+                req.py_kv_transfer_timed_out = True
+
+        for req, _ in self.ctx_in_transmission_requests:
+            flag_if_kv_transfer_timed_out(req, "context")
+
+        for req in self.active_requests:
+            if req.is_disagg_generation_transmission_in_progress:
+                flag_if_kv_transfer_timed_out(req, "generation")
+
+        return
+
     @nvtx_range("_pad_attention_dp_dummy_request")
     def _pad_attention_dp_dummy_request(self):
         """
@@ -1616,7 +1687,7 @@ class PyExecutor:
                 request_ids=[0],
                 is_gen=True,
                 prepare_resource=True,
-                max_num_draft_tokens=self.max_draft_len,
+                max_num_draft_tokens=self.max_total_draft_tokens,
             )[0]
             llm_request.is_attention_dp_dummy = True
             spec_resource_manager = self.resource_manager.get_resource_manager(
@@ -1667,6 +1738,7 @@ class PyExecutor:
                 req.context_current_position = req.prompt_len
                 req.decoding_iter = 1
                 req.py_decoding_iter = 1
+                req.py_kv_transfer_start_time = None
                 first_gen_tokens = req.context_phase_params.first_gen_tokens
                 ctx_draft_tokens = req.context_phase_params.draft_tokens
                 req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
@@ -1689,6 +1761,11 @@ class PyExecutor:
         else:
             for req in new_gen_reqs:
                 self.kv_cache_transceiver.request_and_receive_async(req)
+
+        if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
+            for req in new_gen_reqs:
+                if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
+                    req.py_kv_transfer_start_time = time.time()
 
         block_transfer = all([
             req.is_disagg_generation_transmission_in_progress
@@ -1721,6 +1798,10 @@ class PyExecutor:
             req for req in scheduled_ctx_requests
             if req.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
         ]
+
+        if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
+            for req in ctx_transmission_reqs:
+                req.py_kv_transfer_start_time = time.time()
 
         return ctx_transmission_reqs
 
@@ -1929,11 +2010,16 @@ class PyExecutor:
                 # we still need to free resources corresponding to other resource managers.
                 self.resource_manager.free_resources(request)
             else:
-                if not self.kv_connector_manager.request_finished(
-                        request, cache_block_ids):
-                    self.resource_manager.free_resources(request)
-        else:
-            self.resource_manager.free_resources(request)
+                if self.kv_connector_manager.request_finished(
+                        request,
+                        cache_block_ids) and not self.kv_cache_transceiver:
+                    block_id = self.kv_cache_manager.store_blocks_for_reuse(
+                        request, True)
+                    self.ctx_in_transmission_requests[request.py_request_id] = (
+                        (request, block_id, self.ctx_in_transmission_counter))
+
+        self.resource_manager.free_resources(request)
+
         if self.gather_all_responses or self.dist.rank == 0:
             self.result_wait_queues.pop(request.py_request_id, None)
 
@@ -2049,6 +2135,15 @@ class PyExecutor:
                 requests_to_terminate.append(request)
                 continue
 
+            # Check if generation request needs cleanup due to KV cache transfer timeout
+            if request.py_kv_transfer_timed_out:
+                is_cancelled = self.kv_cache_transceiver.cancel_request(request)
+                if is_cancelled:
+                    self._handle_errors(
+                        error_msg=f"Request {request.py_request_id} timed out",
+                        requests=[request])
+                continue
+
             if request.is_generation_only_request():
                 # If request is in transmission, so we don't need to emit a response
                 # Also, for the first iteration with overlap, we should skip since first
@@ -2073,6 +2168,7 @@ class PyExecutor:
                 response = request.create_response(False, self.dist.rank)
                 if response:
                     request_done = request.is_finished
+                    response.result.cached_tokens = request.cached_tokens
                     new_responses.append((req_id, response))
 
             if request_done:
@@ -2104,8 +2200,10 @@ class PyExecutor:
                     requests_to_terminate.append(request)
                 else:
                     if request.is_disagg_context_transmission_state:
-                        self.ctx_in_transmission_requests.append(
-                            (request, None))
+                        self.ctx_in_transmission_requests[
+                            request.py_request_id] = (
+                                (request, None,
+                                 self.ctx_in_transmission_counter))
                     else:
                         requests_to_terminate.append(request)
             else:
@@ -2119,15 +2217,31 @@ class PyExecutor:
             self._terminate_request(request)
         return requests_to_terminate
 
-    @nvtx_range("_terminate_ctx_finished_requests")
-    def _terminate_ctx_finished_requests(self):
-        for request, block_id in self.ctx_in_transmission_requests[:]:
+    @nvtx_range("_terminate_disagg_ctx_finished_requests")
+    def _terminate_disagg_ctx_finished_requests(self):
+        for request_id in list(self.ctx_in_transmission_requests.keys()):
+            request, block_id, counter = self.ctx_in_transmission_requests[
+                request_id]
+
+            if request.py_kv_transfer_timed_out:
+                is_cancelled = self.kv_cache_transceiver.cancel_request(request)
+                # If cancel is successful, mark as complete so it can be cleaned up
+                # Otherwise, try at next iteration
+                if is_cancelled:
+                    request.py_kv_transfer_start_time = None
+                    request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
+
             if request.is_disagg_context_complete_state:
+                del self.ctx_in_transmission_requests[request_id]
                 if not self.block_reuse_enabled or self.kv_cache_manager.is_vswa:
                     self._terminate_request(request)
-                else:
+                elif counter == 1:
                     self.kv_cache_manager.unpin_blocks_by_id(block_id)
-                self.ctx_in_transmission_requests.remove((request, block_id))
+                else:
+                    self.ctx_in_transmission_requests[request_id] = ((request,
+                                                                      block_id,
+                                                                      counter -
+                                                                      1))
 
     def _handle_logits_communication(self, previous_batch, prev_microbatch_id):
         """Handle logits communication between pipeline parallel ranks.
@@ -2235,6 +2349,17 @@ class PyExecutor:
             else:
                 self.has_previous_draft_tokens = False
                 target_inputs, draft_outputs, draft_batch = None, None, None
+                # We are not running the draft model. Remove the draft tokens and turn off spec
+                # decode so that the requests get handled correctly.
+                # One corner case: when we have at least one context request, we have to keep spec
+                # dec on. This ensures that we capture hidden states for requests that haven't done
+                # prefill yet.
+                self.use_spec_decode = False
+                self.model_engine.enable_spec_decode = len(
+                    scheduled_batch.context_requests) > 0
+                if not self.model_engine.enable_spec_decode:
+                    for request in scheduled_batch.all_requests():
+                        request.py_draft_tokens = []
 
         return target_inputs, draft_outputs, draft_batch
 

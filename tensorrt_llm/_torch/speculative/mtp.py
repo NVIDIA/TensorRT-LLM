@@ -1201,20 +1201,17 @@ class MTPEagleWorker(MTPWorker):
             position_ids = position_ids.squeeze(0)
             last_tokens_idx = torch.cumsum(
                 attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
-            last_tokens_idx_host = torch.cumsum(
-                attn_metadata.seq_lens, dim=0, dtype=torch.long) - 1
-            return position_ids, last_tokens_idx, last_tokens_idx_host
+            return position_ids, last_tokens_idx
 
-        position_ids, last_tokens_idx, last_tokens_idx_host = prepare_position_ids_and_last_tokens(
+        position_ids, last_tokens_idx = prepare_position_ids_and_last_tokens(
             position_ids, attn_metadata)
-        inputs = self.prepare_drafter_inputs(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            last_tokens_idx_host=last_tokens_idx_host,
-            hidden_states=hidden_states,
-            accepted_tokens=accepted_tokens,
-            attn_metadata=attn_metadata,
-            spec_metadata=spec_metadata)
+        inputs = self.prepare_drafter_inputs(input_ids=input_ids,
+                                             position_ids=position_ids,
+                                             last_tokens_idx=last_tokens_idx,
+                                             hidden_states=hidden_states,
+                                             accepted_tokens=accepted_tokens,
+                                             attn_metadata=attn_metadata,
+                                             spec_metadata=spec_metadata)
 
         # Predict draft tokens
         next_draft_tokens = []
@@ -1314,6 +1311,9 @@ class MTPEagleWorker(MTPWorker):
                     ])
                     attn_metadata.block_ids_per_seq[:batch_size, :].copy_(
                         reorder_block_ids_per_seq, non_blocking=True)
+                # update metadata
+                # some attention metadata needs to be updated when changing seq_lens/kv_lens
+                attn_metadata.update_for_spec_dec()
             elif hasattr(attn_metadata, 'kv_lens_cuda'):
 
                 @torch.compile(options={"max-autotune": True})
@@ -1321,6 +1321,9 @@ class MTPEagleWorker(MTPWorker):
                     kv_lens_cuda[:batch_size] += 1
 
                 update_kv_lens(attn_metadata.kv_lens_cuda, batch_size)
+                # update metadata
+                # some attention metadata needs to be updated when changing kv_lens
+                attn_metadata.update_for_spec_dec()
             inputs = {
                 "input_ids": new_draft_token,
                 "position_ids": position_ids,
@@ -1361,7 +1364,7 @@ class MTPEagleWorker(MTPWorker):
         self,
         input_ids: torch.IntTensor,
         position_ids: torch.IntTensor,
-        last_tokens_idx_host: torch.LongTensor,
+        last_tokens_idx: torch.LongTensor,
         hidden_states: torch.Tensor,
         accepted_tokens: torch.Tensor,
         attn_metadata: AttentionMetadata,
@@ -1376,9 +1379,7 @@ class MTPEagleWorker(MTPWorker):
                                          device="cuda")
         input_ids_ctx[:-1].copy_(input_prompt_ids[1:])
         input_ids_ctx[
-            last_tokens_idx_host[:
-                                 num_contexts]] = accepted_tokens[:num_contexts,
-                                                                  0]
+            last_tokens_idx[:num_contexts]] = accepted_tokens[:num_contexts, 0]
 
         # generation
         input_ids_gen = accepted_tokens[num_contexts:, :].flatten()

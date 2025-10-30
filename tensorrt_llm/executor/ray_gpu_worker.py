@@ -1,16 +1,16 @@
+import importlib
 import os
 from pathlib import Path
 from queue import Queue
-from typing import Optional, Union
+from typing import Any, Optional, Type, Union
 
 import ray
 import torch
 
 from ..bindings import executor as tllm
 from ..builder import Engine
-from ..llmapi.llm_args import BaseLlmArgs, KvCacheConnectorConfig
+from ..llmapi.llm_args import BaseLlmArgs
 from ..llmapi.tokenizer import TokenizerBase
-from ..lora_helper import LoraConfig
 from ..sampling_params import BatchedLogitsProcessor
 from .base_worker import BaseWorker
 from .postproc_worker import PostprocWorkerConfig
@@ -21,6 +21,13 @@ __all__ = [
     "RayGPUWorker",
     "RayWorkerWrapper",
 ]
+
+
+def resolve_obj_by_qualname(qualname: str) -> Any:
+    """Resolve an object by its fully qualified name."""
+    module_name, obj_name = qualname.rsplit(".", 1)
+    module = importlib.import_module(module_name)
+    return getattr(module, obj_name)
 
 
 @ray.remote
@@ -55,6 +62,8 @@ class RayWorkerWrapper:
 
         torch.cuda.set_device(local_gpu)
 
+        worker_cls = RayWorkerWrapper._inject_worker_extension(
+            worker_cls, worker_kwargs.pop("ray_worker_extension_cls", None))
         self.worker = worker_cls(device_id=local_gpu, **worker_kwargs)
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
@@ -73,14 +82,6 @@ class RayWorkerWrapper:
         local_id = self.physical_to_local_id(self.gpu)
         return get_device_uuid(local_id)
 
-    @staticmethod
-    def physical_to_local_id(phys_id: int) -> int:
-        visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-        if not visible_devices:
-            return phys_id
-        id_mapping = list(map(int, visible_devices.split(",")))
-        return id_mapping.index(phys_id)
-
     def call_worker_method(self, method_name: str, *args, **kwargs):
         """Generic method to call any method on the underlying worker."""
         if hasattr(self.worker, method_name):
@@ -89,10 +90,11 @@ class RayWorkerWrapper:
                 return method(*args, **kwargs)
             else:
                 raise AttributeError(
-                    f"'{method_name}' is not callable on the underlying worker")
+                    f"'{method_name}' is not a callable method of RayGPUWorker."
+                )
         else:
             raise AttributeError(
-                f"Underlying worker has no method '{method_name}'")
+                f"The RayGPUWorker has no method called '{method_name}'.")
 
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
@@ -105,6 +107,43 @@ class RayWorkerWrapper:
         else:
             return f"{self.__class__.__qualname__}"
 
+    @staticmethod
+    def physical_to_local_id(phys_id: int) -> int:
+        visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if not visible_devices:
+            return phys_id
+        id_mapping = list(map(int, visible_devices.split(",")))
+        return id_mapping.index(phys_id)
+
+    @staticmethod
+    def _inject_worker_extension(
+            worker_class: Type[BaseWorker],
+            extension_cls_name: Optional[str]) -> Type[BaseWorker]:
+        """Inject worker extension into the worker class if specified."""
+        if not extension_cls_name:
+            return worker_class
+
+        try:
+            extension_cls = resolve_obj_by_qualname(extension_cls_name)
+        except (ImportError, AttributeError, ValueError) as e:
+            raise RuntimeError(
+                f"Failed to load worker extension '{extension_cls_name}'"
+            ) from e
+
+        # Check for conflicts
+        for attr in dir(extension_cls):
+            if attr.startswith("__"):
+                continue
+            if hasattr(worker_class, attr):
+                raise ValueError(
+                    f"Worker class {worker_class.__name__} already defines '{attr}', "
+                    f"which conflicts with extension {extension_cls.__name__}.")
+
+        derived_name = f"{worker_class.__name__}With{extension_cls.__name__}"
+        ExtendedWorker = type(derived_name, (worker_class, extension_cls),
+                              {'__module__': worker_class.__module__})
+        return ExtendedWorker
+
 
 class RayGPUWorker(BaseWorker):
 
@@ -116,8 +155,6 @@ class RayGPUWorker(BaseWorker):
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
-        lora_config: Optional[LoraConfig] = None,
-        kv_connector_config: Optional[KvCacheConnectorConfig] = None,
         hf_model_dir: Optional[Path] = None,
         tokenizer: Optional[TokenizerBase] = None,
         llm_args: Optional[BaseLlmArgs] = None,
@@ -131,8 +168,6 @@ class RayGPUWorker(BaseWorker):
             batched_logits_processor=batched_logits_processor,
             postproc_worker_config=postproc_worker_config,
             is_llm_executor=is_llm_executor,
-            lora_config=lora_config,
-            kv_connector_config=kv_connector_config,
             hf_model_dir=hf_model_dir,
             tokenizer=tokenizer,
             llm_args=llm_args,

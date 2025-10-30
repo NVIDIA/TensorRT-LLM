@@ -29,14 +29,14 @@ class Drafter(ABC):
     @final
     def should_use_spec_decode(self, requests: List[LlmRequest],
                                max_batch_size: int, max_num_tokens: int,
-                               max_draft_len: int) -> bool:
+                               max_total_draft_tokens: int) -> bool:
         """
         You probably don't want to override this. ModelEngine
         assumes that speculation is always on if max_concurrency
         is not specified by the user's spec config.
         """
 
-        # Inputs typically validated upstream: max_batch_size>0, max_num_tokens>0, max_draft_len>=0
+        # Inputs typically validated upstream: max_batch_size>0, max_num_tokens>0, max_total_draft_tokens>=0
 
         if self.max_concurrency is None:
             return True
@@ -45,7 +45,7 @@ class Drafter(ABC):
         if not requests or max_batch_size <= 0 or max_num_tokens <= 0:
             return False
 
-        tokens_per_request = 1 + max_draft_len
+        tokens_per_request = 1 + max_total_draft_tokens
         token_cap = max_num_tokens // tokens_per_request
         if token_cap <= 0:
             return False
@@ -63,7 +63,7 @@ class Drafter(ABC):
             scheduled_requests: The scheduled requests to pad
         """
         for req in scheduled_requests.generation_requests:
-            max_draft_tokens = self.max_draft_tokens
+            max_draft_tokens = self.max_draft_len
             num_draft_tokens = get_draft_token_length(req)
             req.py_draft_tokens.extend(
                 0 for _ in range(max_draft_tokens - num_draft_tokens))

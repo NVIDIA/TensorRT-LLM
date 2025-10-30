@@ -31,9 +31,10 @@ from defs.trt_test_alternative import (check_call, check_call_negative_test,
 from .common import (PluginOptions, convert_weights, get_mmlu_accuracy,
                      prune_checkpoint, quantize_data, refit_model,
                      venv_check_call)
-from .conftest import (llm_models_root, skip_no_sm120, skip_nvlink_inactive,
-                       skip_post_blackwell, skip_pre_ada, skip_pre_blackwell,
-                       skip_pre_hopper, tests_path, unittest_path)
+from .conftest import (get_device_count, llm_models_root, skip_no_sm120,
+                       skip_nvlink_inactive, skip_post_blackwell, skip_pre_ada,
+                       skip_pre_blackwell, skip_pre_hopper, tests_path,
+                       unittest_path)
 
 sys.path.append(os.path.join(str(tests_path()), '/../examples/apps'))
 
@@ -1612,6 +1613,13 @@ def test_openai_reasoning(llm_root, llm_venv, backend: str):
     ])
 
 
+def test_openai_tool_call(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd(
+        ["-m", "pytest",
+         str(test_root / "_test_openai_tool_call.py")])
+
+
 @pytest.mark.parametrize("sampler", ["torch_sampler", "trtllm_sampler"])
 def test_openai_completions_with_logit_bias(llm_root, llm_venv, sampler: str):
     test_root = unittest_path() / "llmapi" / "apps"
@@ -1762,8 +1770,10 @@ def test_trtllm_multimodal_benchmark_serving(llm_root, llm_venv):
 
 @pytest.mark.skip_less_device(4)
 @pytest.mark.skip_less_device_memory(40000)
-@pytest.mark.parametrize("gen_config", ["gen_tp2pp1", "gen_tp1pp2"])
-@pytest.mark.parametrize("ctx_config", ["ctx_tp2pp1", "ctx_tp1pp2"])
+@pytest.mark.parametrize("gen_config",
+                         ["gen_tp2pp1", "gen_tp1pp2", "gen_tp1pp1"])
+@pytest.mark.parametrize("ctx_config",
+                         ["ctx_tp2pp1", "ctx_tp1pp2", "ctx_tp1pp1"])
 def test_openai_disagg_multi_nodes_completion(llm_root, llm_venv, ctx_config,
                                               gen_config):
     test_root = unittest_path() / "llmapi" / "apps"
@@ -1853,9 +1863,10 @@ def test_ptp_quickstart(llm_root, llm_venv):
         'Qwen3-30B-A3B_nvfp4_hf',
         'Qwen3/saved_models_Qwen3-30B-A3B_nvfp4_hf',
         marks=(skip_pre_blackwell, pytest.mark.skip_less_device_memory(20000))),
-    pytest.param('Llama3.3-70B-FP8',
-                 'modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8',
-                 marks=skip_pre_blackwell),
+    pytest.param(
+        'Llama3.3-70B-FP8',
+        'modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8',
+        marks=(skip_pre_blackwell, pytest.mark.skip_less_device_memory(96000))),
     pytest.param('Llama3.3-70B-FP4',
                  'modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp4',
                  marks=skip_pre_blackwell),
@@ -2261,35 +2272,41 @@ def test_ptp_quickstart_advanced_deepseek_r1_w4afp8_8gpus(
 
 
 @pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.skip_less_device(8)
-@pytest.mark.parametrize("model_name,model_path", [
-    ("Llama3.1-70B-BF16", "llama-3.1-model/Meta-Llama-3.1-70B"),
-    ("Mixtral-8x7B-BF16", "Mixtral-8x7B-v0.1"),
+@pytest.mark.parametrize("model_name,model_path,gpu_count", [
+    ("Llama3.1-70B-BF16", "llama-3.1-model/Meta-Llama-3.1-70B", 2),
+    ("Mixtral-8x7B-BF16", "Mixtral-8x7B-v0.1", 8),
     pytest.param('Llama3.1-70B-FP8',
                  'llama-3.1-model/Llama-3.1-70B-Instruct-FP8',
+                 2,
                  marks=skip_pre_hopper),
     pytest.param('Llama3.1-405B-FP8',
                  'llama-3.1-model/Llama-3.1-405B-Instruct-FP8',
+                 8,
                  marks=(skip_pre_hopper, pytest.mark.timeout(7200))),
     pytest.param('Mixtral-8x7B-NVFP4',
                  'nvfp4-quantized/Mixtral-8x7B-Instruct-v0.1',
+                 8,
                  marks=skip_pre_blackwell),
     pytest.param('Nemotron-Ultra-253B',
                  'nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1',
+                 8,
                  marks=(skip_pre_hopper, pytest.mark.timeout(12600))),
     pytest.param('DeepSeek-V3-671B-FP8',
                  'DeepSeek-V3-0324',
+                 8,
                  marks=(skip_post_blackwell,
-                        pytest.mark.skip_less_device_memory(90000))),
+                        pytest.mark.skip_less_device_memory(140000))),
 ])
-def test_ptp_quickstart_advanced_8gpus(llm_root, llm_venv, model_name,
-                                       model_path):
+def test_ptp_quickstart_advanced_multi_gpus(llm_root, llm_venv, model_name,
+                                            model_path, gpu_count):
     print(f"Testing {model_name}.")
+    if gpu_count > get_device_count():
+        pytest.skip(f"Not enough GPUs for {model_name}")
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
     mapping = {
-        "Llama3.1-70B-BF16": 21.0,
+        "Llama3.1-70B-BF16": 91.0,
         "Mixtral-8x7B-BF16": 16.5,
-        "Llama3.1-70B-FP8": 14.9,
+        "Llama3.1-70B-FP8": 58.5,
         "Llama3.1-405B-FP8": 63.2,
         "Mixtral-8x7B-NVFP4": 9.9,
         "Nemotron-Ultra-253B": 72.3,
@@ -2305,13 +2322,14 @@ def test_ptp_quickstart_advanced_8gpus(llm_root, llm_venv, model_name,
             "--enable_chunked_prefill",
             "--model_dir",
             f"{llm_models_root()}/{model_path}",
-            "--tp_size=8",
+            f"--tp_size={gpu_count}",
             "--max_batch_size=32",
             "--max_num_tokens=256",
         ],
                          stdout=running_log)
         if model_name in mapping:
-            _check_mem_usage(running_log, [mapping[model_name], 0, 0, 0], 8)
+            _check_mem_usage(running_log, [mapping[model_name], 0, 0, 0],
+                             gpu_count)
 
 
 @skip_pre_hopper
@@ -2656,6 +2674,14 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         ("qwen2.5-vl-7b-instruct", "Qwen2.5-VL-7B-Instruct", 0.8),
         ("phi4-multimodal-instruct", "multimodals/Phi-4-multimodal-instruct",
          0.8),
+        pytest.param("phi4-multimodal-instruct-fp4",
+                     "multimodals/Phi-4-multimodal-instruct-FP4",
+                     0.8,
+                     marks=skip_pre_blackwell),
+        pytest.param("phi4-multimodal-instruct-fp8",
+                     "multimodals/Phi-4-multimodal-instruct-FP8",
+                     0.8,
+                     marks=skip_pre_hopper),
         pytest.param(
             "mistral-small-3.1-24b-instruct",
             "Mistral-Small-3.1-24B-Instruct-2503",
@@ -2675,7 +2701,8 @@ def test_ptp_quickstart_multimodal_kv_cache_reuse(llm_root, llm_venv,
     print(f"Accuracy test {model_name} {modality} mode with example inputs.")
     if modality == "video" and model_name in {
             "llava-v1.6-mistral-7b", "mistral-small-3.1-24b-instruct",
-            "phi4-multimodal-instruct"
+            "phi4-multimodal-instruct", "phi4-multimodal-instruct-fp4",
+            "phi4-multimodal-instruct-fp8"
     }:
         pytest.skip(f"Skipping video modality test for {model_name}")
 
@@ -2729,6 +2756,22 @@ def test_ptp_quickstart_multimodal_kv_cache_reuse(llm_root, llm_venv,
                 ],
             ] * num_same_requests,
         },
+        "phi4-multimodal-instruct-fp4": {
+            "image": [
+                [
+                    "image", "depicts", "natural", "environment", "ocean",
+                    "water", "waves", "sky"
+                ],
+            ] * num_same_requests,
+        },
+        "phi4-multimodal-instruct-fp8": {
+            "image": [
+                [
+                    "image", "depicts", "natural", "environment", "ocean",
+                    "water", "waves", "sky"
+                ],
+            ] * num_same_requests,
+        },
     }
 
     cmd = [
@@ -2749,7 +2792,7 @@ def test_ptp_quickstart_multimodal_kv_cache_reuse(llm_root, llm_venv,
                       ] and modality == "video":
         cmd.append("--max_num_tokens=16384")
 
-    if model_name == "phi4-multimodal-instruct":
+    if model_name.startswith("phi4-multimodal-instruct"):
         cmd.append("--max_seq_len=4096")
         cmd.append("--load_lora")
         cmd.append("--auto_model_name")
@@ -2781,6 +2824,14 @@ def test_ptp_quickstart_multimodal_kv_cache_reuse(llm_root, llm_venv,
         ("qwen2.5-vl-7b-instruct", "Qwen2.5-VL-7B-Instruct", 0.8),
         ("phi4-multimodal-instruct", "multimodals/Phi-4-multimodal-instruct",
          0.8),
+        pytest.param("phi4-multimodal-instruct-fp4",
+                     "multimodals/Phi-4-multimodal-instruct-FP4",
+                     0.8,
+                     marks=skip_pre_blackwell),
+        pytest.param("phi4-multimodal-instruct-fp8",
+                     "multimodals/Phi-4-multimodal-instruct-FP8",
+                     0.8,
+                     marks=skip_pre_hopper),
         pytest.param(
             "mistral-small-3.1-24b-instruct",
             "Mistral-Small-3.1-24B-Instruct-2503",
@@ -2800,7 +2851,8 @@ def test_ptp_quickstart_multimodal_chunked_prefill(llm_root, llm_venv,
     print(f"Accuracy test {model_name} {modality} mode with example inputs.")
     if modality == "video" and model_name in {
             "llava-v1.6-mistral-7b", "mistral-small-3.1-24b-instruct",
-            "phi4-multimodal-instruct"
+            "phi4-multimodal-instruct", "phi4-multimodal-instruct-fp4",
+            "phi4-multimodal-instruct-fp8"
     }:
         pytest.skip(f"Skipping video modality test for {model_name}")
     accuracy_inputs = {
@@ -2879,6 +2931,35 @@ def test_ptp_quickstart_multimodal_chunked_prefill(llm_root, llm_venv,
                 ],
             ],
         },
+        "phi4-multimodal-instruct-fp8": {
+            "image": [
+                [
+                    "image", "depicts", "natural", "environment", "ocean",
+                    "water", "waves", "sky"
+                ],
+                [
+                    "object", "mountain", "weather", "condition", "clear",
+                    "visible"
+                ],
+                [
+                    "traffic", "condition", "road", "moderate", "vehicles",
+                    "lanes", "cars", "bus"
+                ],
+            ],
+        },
+        "phi4-multimodal-instruct-fp4": {
+            "image": [
+                [
+                    "image", "depicts", "natural", "environment", "ocean",
+                    "water", "waves", "sky"
+                ],
+                ["rock", "formation", "sunny", "sky", "clouds"],
+                [
+                    "traffic", "condition", "road", "moderate", "vehicles",
+                    "lane", "flow", "traffic"
+                ],
+            ],
+        },
     }
 
     cmd = [
@@ -2894,7 +2975,7 @@ def test_ptp_quickstart_multimodal_chunked_prefill(llm_root, llm_venv,
         "--enable_chunked_prefill",
         "--max_num_tokens=256",
     ]
-    if model_name == "phi4-multimodal-instruct":
+    if model_name.startswith("phi4-multimodal-instruct"):
         cmd.append("--max_seq_len=4096")
         cmd.append("--load_lora")
         cmd.append("--auto_model_name")
@@ -2915,10 +2996,17 @@ def test_ptp_quickstart_multimodal_chunked_prefill(llm_root, llm_venv,
 
 
 @pytest.mark.parametrize("modality", ["image", "audio", "image_audio"])
-def test_ptp_quickstart_multimodal_phi4mm(llm_root, llm_venv, modality):
-    model_name = "Phi-4-multimodal-instruct"
-    model_path = "multimodals/Phi-4-multimodal-instruct"
-
+@pytest.mark.parametrize("model_name,model_path", [
+    ("phi4-multimodal-instruct", "multimodals/Phi-4-multimodal-instruct"),
+    pytest.param("phi4-multimodal-instruct-fp4",
+                 "multimodals/Phi-4-multimodal-instruct-FP4",
+                 marks=skip_pre_blackwell),
+    pytest.param("phi4-multimodal-instruct-fp8",
+                 "multimodals/Phi-4-multimodal-instruct-FP8",
+                 marks=skip_pre_hopper),
+])
+def test_ptp_quickstart_multimodal_phi4mm(llm_root, llm_venv, model_name,
+                                          model_path, modality):
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
     test_data_root = Path(
         os.path.join(llm_models_root(), "multimodals", "test_data"))
@@ -2972,6 +3060,11 @@ def test_ptp_quickstart_multimodal_phi4mm(llm_root, llm_venv, modality):
         ],
     }
 
+    if model_name == "phi4-multimodal-instruct-fp4":
+        expected_keywords["image_audio"] = [
+            ["image", "shows", "mountain", "El", "Capitan", "road", "trees"],
+        ]
+
     cmd = [
         str(example_root / "quickstart_multimodal.py"),
         "--model_dir",
@@ -2987,8 +3080,6 @@ def test_ptp_quickstart_multimodal_phi4mm(llm_root, llm_venv, modality):
         "--load_lora",
         "--auto_model_name",
         "Phi4MMForCausalLM",
-        # TODO: remove this once kv cache reuse is supported for Phi-4-multimodal
-        "--disable_kv_cache_reuse",
     ]
     output = llm_venv.run_cmd(cmd, caller=check_output)
 
@@ -3011,7 +3102,13 @@ def test_ptp_quickstart_multimodal_phi4mm(llm_root, llm_venv, modality):
     pytest.param(
         "gemma-3-27b-it", "gemma/gemma-3-27b-it", marks=skip_post_blackwell),
     ("mistral-small-3.1-24b-instruct", "Mistral-Small-3.1-24B-Instruct-2503"),
-    ("Phi-4-multimodal-instruct", "multimodals/Phi-4-multimodal-instruct"),
+    ("phi4-multimodal-instruct", "multimodals/Phi-4-multimodal-instruct"),
+    pytest.param("phi4-multimodal-instruct-fp4",
+                 "multimodals/Phi-4-multimodal-instruct-FP4",
+                 marks=skip_pre_blackwell),
+    pytest.param("phi4-multimodal-instruct-fp8",
+                 "multimodals/Phi-4-multimodal-instruct-FP8",
+                 marks=skip_pre_hopper),
 ])
 def test_ptp_quickstart_multimodal_2gpu(llm_root, llm_venv, model_name,
                                         model_path):
@@ -3052,7 +3149,19 @@ def test_ptp_quickstart_multimodal_2gpu(llm_root, llm_venv, model_name,
                 ],
             ],
         },
-        "Phi-4-multimodal-instruct": {
+        "phi4-multimodal-instruct": {
+            "image": [
+                ["object", "mountain", "weather", "clear", "clouds"],
+                ["traffic", "road", "vehicles", "cars", "bus"],
+            ],
+        },
+        "phi4-multimodal-instruct-fp4": {
+            "image": [
+                ["object", "mountain", "weather", "clear", "clouds"],
+                ["traffic", "road", "vehicles", "cars", "bus"],
+            ],
+        },
+        "phi4-multimodal-instruct-fp8": {
             "image": [
                 ["object", "mountain", "weather", "clear", "clouds"],
                 ["traffic", "road", "vehicles", "cars", "bus"],
@@ -3085,13 +3194,11 @@ def test_ptp_quickstart_multimodal_2gpu(llm_root, llm_venv, model_name,
         cmd.append("--disable_kv_cache_reuse")
         cmd.append("--kv_cache_fraction=0.5")
         cmd.append("--max_seq_len=1024")
-    elif model_name == "Phi-4-multimodal-instruct":
+    elif model_name.startswith("phi4-multimodal-instruct"):
         # Set max_seq_len to 4096 to use short rope factor.
         cmd.append("--max_seq_len=4096")
         cmd.append("--load_lora")
         cmd.append("--auto_model_name")
-        # TODO: remove this once kv cache reuse is supported for Phi-4-multimodal
-        cmd.append("--disable_kv_cache_reuse")
         cmd.append("Phi4MMForCausalLM")
     elif model_name == "mistral-small-3.1-24b-instruct":
         # TODO: remove this once kv cache reuse is supported for Mistral
@@ -3101,7 +3208,7 @@ def test_ptp_quickstart_multimodal_2gpu(llm_root, llm_venv, model_name,
 
     # Set match ratio based on model
     match_ratio = 4.0 / 5
-    if model_name == "Phi-4-multimodal-instruct":
+    if model_name.startswith("phi4-multimodal-instruct"):
         match_ratio = 0.6
 
     # Check output accuracy
@@ -3120,7 +3227,13 @@ def test_ptp_quickstart_multimodal_2gpu(llm_root, llm_venv, model_name,
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("model_name,model_path", [
     ("mistral-small-3.1-24b-instruct", "Mistral-Small-3.1-24B-Instruct-2503"),
-    ("Phi-4-multimodal-instruct", "multimodals/Phi-4-multimodal-instruct"),
+    ("phi4-multimodal-instruct", "multimodals/Phi-4-multimodal-instruct"),
+    pytest.param("phi4-multimodal-instruct-fp4",
+                 "multimodals/Phi-4-multimodal-instruct-FP4",
+                 marks=skip_pre_blackwell),
+    pytest.param("phi4-multimodal-instruct-fp8",
+                 "multimodals/Phi-4-multimodal-instruct-FP8",
+                 marks=skip_pre_hopper),
     pytest.param(
         "gemma-3-27b-it", "gemma/gemma-3-27b-it", marks=skip_post_blackwell),
 ])
@@ -3162,7 +3275,19 @@ def test_ptp_quickstart_multimodal_multiturn(llm_root, llm_venv, model_name,
                 ["atmosphere", "serene", "majestic", "clear", "sky", "trees"],
             ],
         },
-        "Phi-4-multimodal-instruct": {
+        "phi4-multimodal-instruct": {
+            "image": [
+                ["depicts", "landscape", "mountain", "half", "dome"],
+                ["atmosphere", "serene", "sense", "scene", "majestic"],
+            ],
+        },
+        "phi4-multimodal-instruct-fp4": {
+            "image": [
+                ["depicts", "landscape", "mountain", "half", "dome"],
+                ["atmosphere", "serene", "sense", "scene", "majestic"],
+            ],
+        },
+        "phi4-multimodal-instruct-fp8": {
             "image": [
                 ["depicts", "landscape", "mountain", "half", "dome"],
                 ["atmosphere", "serene", "sense", "scene", "majestic"],
@@ -3194,14 +3319,12 @@ def test_ptp_quickstart_multimodal_multiturn(llm_root, llm_venv, model_name,
         cmd.append("--kv_cache_fraction=0.5")
         cmd.append("--max_seq_len=1024")
 
-    elif model_name == "Phi-4-multimodal-instruct":
+    elif model_name.startswith("phi4-multimodal-instruct"):
         # Set max_seq_len to 4096 to use short rope factor.
         cmd.append("--max_seq_len=4096")
         cmd.append("--load_lora")
         cmd.append("--auto_model_name")
         cmd.append("Phi4MMForCausalLM")
-        # TODO: remove this once kv cache reuse is supported for Phi-4
-        cmd.append("--disable_kv_cache_reuse")
 
     elif model_name == "mistral-small-3.1-24b-instruct":
         # TODO: remove this once kv cache reuse is supported for Mistral
@@ -3211,7 +3334,7 @@ def test_ptp_quickstart_multimodal_multiturn(llm_root, llm_venv, model_name,
     print("output:", output)
     # Set match ratio based on model
     match_ratio = 4.0 / 5
-    if model_name == "Phi-4-multimodal-instruct":
+    if model_name.startswith("Phi-4-multimodal-instruct"):
         match_ratio = 0.6
 
     # Check output accuracy
@@ -3378,24 +3501,36 @@ def test_ptp_quickstart_advanced_llama_multi_nodes(llm_root, llm_venv,
     pytest.param('DeepSeek-R1/DeepSeek-R1-0528-FP4', marks=skip_pre_blackwell),
     pytest.param('Kimi-K2-Instruct',
                  marks=(skip_pre_hopper, skip_post_blackwell)),
+    pytest.param('nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1',
+                 marks=skip_pre_hopper),
 ])
 def test_multi_nodes_eval(llm_venv, model_path, tp_size, pp_size, ep_size,
-                          eval_task):
+                          eval_task, mmlu_dataset_root):
     if "Llama-4" in model_path and tp_size == 16:
         pytest.skip("Llama-4 with tp16 is not supported")
 
     mmlu_threshold = 81.5
+    model_dir = f"{llm_models_root()}/{model_path}"
     run_cmd = [
         "trtllm-llmapi-launch",
         "trtllm-eval",
-        f"--model={llm_models_root()}/{model_path}",
+        f"--model={model_dir}",
         f"--ep_size={ep_size}",
         f"--tp_size={tp_size}",
         f"--pp_size={pp_size}",
         f"--kv_cache_free_gpu_memory_fraction={_MEM_FRACTION_80}",
         "--max_batch_size=32",
-        eval_task,
+        "--backend=pytorch",
     ]
+
+    if "Kimi" in model_path:
+        run_cmd.append("--trust_remote_code")
+    else:
+        run_cmd.append(f"--tokenizer={model_dir}")
+
+    run_cmd.extend([eval_task, f"--dataset_path={mmlu_dataset_root}"])
+
+    llm_venv._new_env["TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL"] = "1"
     output = check_output(" ".join(run_cmd), shell=True, env=llm_venv._new_env)
 
     if os.environ.get("SLURM_PROCID", '0') == '0':

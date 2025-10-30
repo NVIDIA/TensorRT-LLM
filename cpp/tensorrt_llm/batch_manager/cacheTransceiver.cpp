@@ -89,7 +89,7 @@ std::unique_ptr<BaseCacheTransceiver> CacheTransceiverFactory::createCacheTransc
         }
         else
         {
-            backendType = executor::CacheTransceiverConfig::BackendType::UCX;
+            backendType = executor::CacheTransceiverConfig::BackendType::NIXL;
         }
     }
     cacheTransceiverConfig.value().setBackendType(backendType);
@@ -603,7 +603,7 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
                 it->first->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
 
                 // Gather the kv cache transfer time from all workers and update to leader rank
-                if (!common::getEnvKVCacheTransferOutputPath().empty())
+                if (!common::getEnvKVCacheTimeOutputPath().empty())
                 {
                     auto syncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mGroupDataComm : mGroupComm;
                     updateKVCacheTransferBW(syncComm, it->first);

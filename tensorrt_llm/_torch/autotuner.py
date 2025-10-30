@@ -92,10 +92,13 @@ class TuningConfig:
             any value is provided to the choose_one function, the input tensor will be saturated
             with the provided value.
             If not provided, the autotuner will not consider the max num tokens.
+        inputs_pre_hook (Callable): A function that takes a list of input tensors, returns a list of modified input tensors.
+            It is called before the input tensors are prepared for the tuning process to match the real data distribution.
     """
     dynamic_tensor_specs: Tuple[DynamicTensorSpec, ...] = ()
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
     tune_max_num_tokens: int = None
+    inputs_pre_hook: Callable = None
 
 
 @dataclass(unsafe_hash=True)
@@ -660,6 +663,9 @@ class AutoTuner:
         min_time = float('inf')
         has_tuning_failure_occured = False
         best_runner_id, best_tactic = None, None
+        # If the inputs_pre_hook is provided, it will be called before profiling.
+        if tuning_config.inputs_pre_hook is not None:
+            input_tensors = tuning_config.inputs_pre_hook(input_tensors)
         for runner_id, runner in enumerate(runners):
             # TODO: use FakeTensor here.
             runner_arg_names = {
@@ -918,7 +924,8 @@ class AutoTuner:
         # TODO: FIXME, sometimes the content of the tensor can affect the performance, like MOE
         # One solution is to manituplate the tensor content to make it more like the real data
         # during the tuning process. This can by controlled in the preparation phase by the runner.
-        return torch.zeros(shapes, dtype=dtype, device=device)
+        # It must not use all zero tensors. Otherwise the timing results become unreliable.
+        return torch.randint(-5, 5, shapes, device=device).to(dtype)
 
     def _prepare_input_tensors(
             self, profile: OptimizationProfile,

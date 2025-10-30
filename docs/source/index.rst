@@ -70,9 +70,11 @@ Welcome to TensorRT LLM's Documentation!
    features/parallel-strategy.md
    features/quantization.md
    features/sampling.md
+   features/additional-outputs.md
    features/speculative-decoding.md
    features/checkpoint-loading.md
    features/auto_deploy/auto-deploy.md
+   features/ray-orchestrator.md
 
 .. toctree::
    :maxdepth: 2
@@ -84,6 +86,7 @@ Welcome to TensorRT LLM's Documentation!
    developer-guide/ci-overview.md
    developer-guide/dev-containers.md
    developer-guide/api-change.md
+   developer-guide/kv-transfer.md
 
 
 .. toctree::

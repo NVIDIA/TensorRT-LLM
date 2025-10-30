@@ -80,8 +80,8 @@ TEST_F(TransferAgentTest, Basic)
     RegisteredHostMemory regMem1(MemoryDescs{MemoryType::kDRAM, {MemoryDesc{memory1}}}, nixlAgent1.get());
 
     // nixlAgent0->loadRemoteAgent(agent1);
-    auto connectionInfo = nixlAgent1->getConnectionInfo();
-    nixlAgent0->connectRemoteAgent(agent1, connectionInfo);
+    auto connectionInfo = nixlAgent1->getLocalConnectionInfo();
+    nixlAgent0->loadRemoteAgent(agent1, connectionInfo);
     bool checked = false;
     do
     {
@@ -116,8 +116,8 @@ TEST_F(TransferAgentTest, Basic2)
     RegisteredHostMemory regMem1(MemoryDescs{MemoryType::kDRAM, {MemoryDesc{memory1}}}, nixlAgent1.get());
 
     // nixlAgent0->loadRemoteAgent(agent1);
-    auto connectionInfo = nixlAgent1->getConnectionInfo();
-    nixlAgent0->connectRemoteAgent(agent1, connectionInfo);
+    auto connectionInfo = nixlAgent1->getLocalConnectionInfo();
+    nixlAgent0->loadRemoteAgent(agent1, connectionInfo);
     bool checked = false;
     do
     {
@@ -159,8 +159,8 @@ TEST_F(TransferAgentTest, DeviceMemory)
         MemoryDescs{MemoryType::kVRAM, {MemoryDesc{dev_ptr1, size, deviceId}}}, nixlAgent1.get());
 
     // nixlAgent0->loadRemoteAgent(agent1);
-    auto connectionInfo = nixlAgent1->getConnectionInfo();
-    nixlAgent0->connectRemoteAgent(agent1, connectionInfo);
+    auto connectionInfo = nixlAgent1->getLocalConnectionInfo();
+    nixlAgent0->loadRemoteAgent(agent1, connectionInfo);
     bool checked = false;
     do
     {
@@ -201,8 +201,8 @@ TEST_F(TransferAgentTest, Connect)
     nixlAgent2->registerMemory(memDescs0);
 
     // nixlAgent0->loadRemoteAgent(agent1);
-    auto connectionInfo = nixlAgent1->getConnectionInfo();
-    nixlAgent0->connectRemoteAgent(agent1, connectionInfo);
+    auto connectionInfo = nixlAgent1->getLocalConnectionInfo();
+    nixlAgent0->loadRemoteAgent(agent1, connectionInfo);
     bool checked = false;
     do
     {
@@ -213,7 +213,7 @@ TEST_F(TransferAgentTest, Connect)
     status->wait();
 
     TLLM_CHECK(memory0 == memory1);
-    nixlAgent2->connectRemoteAgent(agent1, connectionInfo);
+    nixlAgent2->loadRemoteAgent(agent1, connectionInfo);
     checked = false;
     do
     {
@@ -251,17 +251,17 @@ TEST_F(TransferAgentTest, SyncMessage)
     RegisteredHostMemory regMem3(MemoryDescs{MemoryType::kDRAM, {MemoryDesc{memory1}}}, nixlAgent1.get());
 
     // nixlAgent0->loadRemoteAgent(agent1);
-    auto connectionInfo = nixlAgent1->getConnectionInfo();
-    nixlAgent0->connectRemoteAgent(agent1, connectionInfo);
+    auto connectionInfo = nixlAgent1->getLocalConnectionInfo();
+    nixlAgent0->loadRemoteAgent(agent1, connectionInfo);
     bool checked = false;
     do
     {
         checked = nixlAgent0->checkRemoteDescs(agent1, regMem3.getDescs());
     } while (!checked);
     auto syncMessage = std::string("agent_sync_message");
-    nixlAgent0->notifySyncMessage(agent1, syncMessage);
     TransferRequest writeReq{TransferOp::kWRITE, regMem0.getDescs(), regMem3.getDescs(), agent1};
     auto status = nixlAgent0->submitTransferRequests(writeReq);
+    nixlAgent0->notifySyncMessage(agent1, syncMessage);
 
     auto notif = nixlAgent1->getNotifiedSyncMessages();
     for (std::size_t i = 0; i < MAX_QUERY_TIMES && notif.size() == 0; i++)
@@ -287,8 +287,8 @@ TEST_F(TransferAgentTest, SyncMessage)
     TLLM_CHECK(notif2[agent0][0] == syncMessage2);
 
     // nixlAgent1->loadRemoteAgent(agent0);
-    auto connectionInfo2 = nixlAgent0->getConnectionInfo();
-    nixlAgent1->connectRemoteAgent(agent0, connectionInfo2);
+    auto connectionInfo2 = nixlAgent0->getLocalConnectionInfo();
+    nixlAgent1->loadRemoteAgent(agent0, connectionInfo2);
     std::string syncMessage3 = "three_agent_sync_message";
     nixlAgent1->notifySyncMessage(agent0, syncMessage3);
     auto notif3 = nixlAgent0->getNotifiedSyncMessages();
@@ -307,9 +307,10 @@ TEST_F(TransferAgentTest, SyncMessage)
     } while (!checked2);
 
     std::string syncMessage4 = "four_agent_sync_message";
-    nixlAgent1->notifySyncMessage(agent0, syncMessage4);
     TransferRequest writeReq1{TransferOp::kWRITE, regMem2.getDescs(), regMem1.getDescs(), agent0};
     auto status1 = nixlAgent1->submitTransferRequests(writeReq1);
+    nixlAgent1->notifySyncMessage(agent0, syncMessage4);
+
     auto notif4 = nixlAgent0->getNotifiedSyncMessages();
     for (std::size_t i = 0; i < MAX_QUERY_TIMES && notif4.size() == 0; i++)
     {

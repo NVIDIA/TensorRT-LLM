@@ -107,15 +107,6 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
             self.model_kwargs,
         )
 
-        # special handling for torch_dtype in model_kwargs since HF does not correctly update
-        # torch_dtype string to an actual torch.dtype object (only with default)
-        if "torch_dtype" in self.model_kwargs:
-            dtype = self.model_kwargs["torch_dtype"]
-            if isinstance(dtype, str):
-                dtype = getattr(torch, self.model_kwargs["torch_dtype"])
-            assert isinstance(dtype, torch.dtype), f"Invalid dtype: {dtype}"
-            self.model_kwargs["torch_dtype"] = dtype
-
         # set sharding config source to huggingface
         self._sharding_config["source"] = ShardingConfigSource.HUGGINGFACE
 
@@ -127,6 +118,11 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
     @property
     def automodel_cls(self) -> Type[_BaseAutoModelClass]:
         return AutoModelForCausalLM
+
+    @property
+    def vocab_size_padded(self) -> Optional[int]:
+        model_config, _ = self._get_model_config()
+        return getattr(model_config, "vocab_size", None)
 
     def _recursive_update_config(
         self, config: PretrainedConfig, update_dict: Dict[str, Any]
@@ -159,6 +155,16 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
                 setattr(config, key, updated_value)
                 if child_unused:
                     nested_unused_kwargs[key] = child_unused
+            elif (
+                key in ["torch_dtype", "dtype"]
+                and isinstance(value_new, str)
+                and value_new != "auto"
+            ):
+                # check special handling of torch_dtype (DEPRECATED!) and dtype key to ensure we
+                # use the correct torch.dtype object instead of a string.
+                dtype = getattr(torch, value_new)
+                assert isinstance(dtype, torch.dtype), f"Invalid {dtype=}"
+                setattr(config, key, dtype)
             else:
                 # Direct update for simple values
                 setattr(config, key, value_new)
@@ -166,6 +172,9 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         return config, nested_unused_kwargs
 
     def _get_model_config(self) -> Tuple[PretrainedConfig, Dict[str, Any]]:
+        # prefetch the model once without weights
+        self.prefetch_checkpoint(skip_loading_weights=True)
+
         # NOTE (lucaslie): HF doesn't recursively update nested PreTrainedConfig objects. Instead,
         # the entire subconfig will be overwritten.
         # we want to recursively update model_config from model_kwargs here.
@@ -278,7 +287,7 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
                 "trust_remote_code": True,
                 "tp_plan": "auto",
                 **unused_kwargs,
-                "torch_dtype": "auto",  # takes precedence over unused_kwargs!
+                "dtype": "auto",  # takes precedence over unused_kwargs!
             },
         )
         model.eval()

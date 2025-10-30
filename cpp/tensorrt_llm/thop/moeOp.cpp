@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -259,7 +259,8 @@ public:
         torch::optional<torch::Tensor> const& swiglu_limit, int64_t const tp_size, int64_t const tp_rank,
         int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank,
         bool const enable_alltoall, bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> const& profile_ids,
-        torch::optional<int64_t> const& unpadded_hidden_size)
+        torch::optional<int64_t> const& unpadded_hidden_size, torch::optional<int64_t> const& num_valid_tokens,
+        torch::optional<torch::Tensor> const& out_tensor)
     {
         std::lock_guard<std::mutex> lock(mMutex);
         // Free the profile workspace to save memory
@@ -405,13 +406,23 @@ public:
 
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
+        std::vector<int64_t> output_shape = {num_rows, unpadded_hidden_size_val};
+        torch::Tensor output;
+        if (out_tensor.has_value())
+        {
+            auto const& provided = out_tensor.value();
+            CHECK_INPUT(provided, mOutputDtype);
+            TORCH_CHECK(provided.sizes() == output_shape, "Provided out tensor has incorrect shape. Expected ",
+                output_shape, ", got ", provided.sizes());
+            output = provided;
+        }
+        else
+        {
+            output = torch::empty(output_shape, input.options().dtype(mOutputDtype));
+        }
+
         WorkspaceInfo const& workspace_info = getWorkspaceInfo(num_rows, hidden_size, inter_size, num_experts_total,
             static_cast<int>(experts_per_token), base_activation_type, parallelism_config, min_latency_mode, stream);
-
-        // output is smaller than workspace. Create output after workspace to avoid output_shape occupied a little
-        // piece of memory which makes a big partition of memory segment can't be used by workspace.
-        std::vector<int64_t> output_shape = {num_rows, unpadded_hidden_size_val};
-        auto output = torch::empty(output_shape, input.options().dtype(mOutputDtype));
 
         auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales);
         kernels::MoeMinLatencyParams min_latency_params{};
@@ -428,10 +439,11 @@ public:
             fc1_expert_biases.has_value() ? fc1_expert_biases.value().const_data_ptr() : nullptr, activation_params,
             fc2_expert_weights.const_data_ptr(),
             fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr, quant_params,
-            num_rows, hidden_size, unpadded_hidden_size_val, inter_size, num_experts_total,
-            static_cast<int>(experts_per_token), static_cast<char*>(workspace_info.workspace.data_ptr()),
-            output.data_ptr(), static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, enable_alltoall,
-            false, lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
+            num_rows, num_valid_tokens.has_value() ? num_valid_tokens.value() : num_rows, hidden_size,
+            unpadded_hidden_size_val, inter_size, num_experts_total, static_cast<int>(experts_per_token),
+            static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
+            static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, enable_alltoall, false, lora_params,
+            mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
 #else
         mKernelRunner->runMoe(input.const_data_ptr(),
             input_sf.has_value() ? input_sf.value().const_data_ptr() : nullptr, swizzled_input_sf,
@@ -442,7 +454,8 @@ public:
             fc1_expert_biases.has_value() ? fc1_expert_biases.value().const_data_ptr() : nullptr, activation_params,
             fc2_expert_weights.const_data_ptr(),
             fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr, quant_params,
-            num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
+            num_rows, num_valid_tokens.has_value() ? num_valid_tokens.value() : num_rows, hidden_size, inter_size,
+            num_experts_total, static_cast<int>(experts_per_token),
             static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
             static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, false, lora_params,
             mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
@@ -461,7 +474,8 @@ public:
         torch::optional<torch::Tensor> const& swiglu_limit, int64_t const tp_size, int64_t const tp_rank,
         int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank,
         bool const enable_alltoall, bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> const& profile_ids,
-        torch::optional<int64_t> const& unpadded_hidden_size)
+        torch::optional<int64_t> const& unpadded_hidden_size, torch::optional<int64_t> const& num_valid_tokens,
+        torch::optional<torch::Tensor> const& out_tensor)
     {
         std::lock_guard<std::mutex> lock(mMutex);
 
@@ -559,7 +573,19 @@ public:
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
         std::vector<int64_t> output_shape = {num_rows * num_experts_on_rank, unpadded_hidden_size_val};
-        auto output = torch::empty(output_shape, input.options().dtype(mOutputDtype));
+        torch::Tensor output;
+        if (out_tensor.has_value())
+        {
+            auto const& provided = out_tensor.value();
+            CHECK_INPUT(provided, mOutputDtype);
+            TORCH_CHECK(provided.sizes() == output_shape, "Provided out tensor has incorrect shape. Expected ",
+                output_shape, ", got ", provided.sizes());
+            output = provided;
+        }
+        else
+        {
+            output = torch::empty(output_shape, input.options().dtype(mOutputDtype));
+        }
 
         auto num_active_experts_per_node = torch::empty({1}, input.options().dtype(at::ScalarType::Int));
         auto experts_to_token_score
@@ -588,10 +614,11 @@ public:
             fc1_expert_biases.has_value() ? fc1_expert_biases.value().const_data_ptr() : nullptr, activation_params,
             fc2_expert_weights.const_data_ptr(),
             fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr, quant_params,
-            num_rows, hidden_size, unpadded_hidden_size_val, inter_size, num_experts_total,
-            static_cast<int>(experts_per_token), static_cast<char*>(workspace_info.workspace.data_ptr()),
-            output.data_ptr(), static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, enable_alltoall,
-            false, lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
+            num_rows, num_valid_tokens.has_value() ? num_valid_tokens.value() : num_rows, hidden_size,
+            unpadded_hidden_size_val, inter_size, num_experts_total, static_cast<int>(experts_per_token),
+            static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
+            static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, enable_alltoall, false, lora_params,
+            mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
 #else
         mKernelRunner->runMoe(input.const_data_ptr(),
             input_sf.has_value() ? input_sf.value().const_data_ptr() : nullptr, swizzled_input_sf,
@@ -602,7 +629,8 @@ public:
             fc1_expert_biases.has_value() ? fc1_expert_biases.value().const_data_ptr() : nullptr, activation_params,
             fc2_expert_weights.const_data_ptr(),
             fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr, quant_params,
-            num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
+            num_rows, num_valid_tokens.has_value() ? num_valid_tokens.value() : num_rows, hidden_size, inter_size,
+            num_experts_total, static_cast<int>(experts_per_token),
             static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
             static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, false, lora_params,
             mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);

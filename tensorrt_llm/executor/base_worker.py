@@ -16,11 +16,10 @@ from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..builder import ConfigEncoder, Engine, EngineConfig
-from ..llmapi.llm_args import BaseLlmArgs, KvCacheConnectorConfig, PybindMirror
+from ..llmapi.llm_args import BaseLlmArgs, PybindMirror
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
-from ..llmapi.utils import _SyncQueue, print_colored_debug
-from ..lora_helper import LoraConfig
+from ..llmapi.utils import _SyncQueue, logger_debug
 from ..lora_manager import LoraManager
 from ..metrics import RequestEventTiming
 from ..prompt_adapter_manager import PromptAdapterManager
@@ -54,8 +53,6 @@ class BaseWorker(GenerationExecutor):
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
-        lora_config: Optional[LoraConfig] = None,
-        kv_connector_config: Optional[KvCacheConnectorConfig] = None,
         hf_model_dir: Optional[Path] = None,
         tokenizer: Optional[TokenizerBase] = None,
         llm_args: Optional[BaseLlmArgs] = None,
@@ -73,8 +70,6 @@ class BaseWorker(GenerationExecutor):
         self._batched_logits_processor = batched_logits_processor
         self._postproc_worker_config = postproc_worker_config
         self._is_llm_executor = is_llm_executor
-        self._lora_config = lora_config
-        self._kv_connector_config = kv_connector_config
         self._hf_model_dir = hf_model_dir
         self._tokenizer = tokenizer
         self.llm_args = llm_args
@@ -92,10 +87,7 @@ class BaseWorker(GenerationExecutor):
         self._is_pytorch_backend = llm_args is not None and llm_args.backend in [
             "pytorch", "_autodeploy"
         ]
-
-        if not self._is_pytorch_backend and kv_connector_config is not None:
-            raise ValueError(
-                "KV connector config is only supported for PyTorch backend")
+        self._lora_config = llm_args.lora_config if self._is_pytorch_backend else None
 
         if global_mpi_size() > 1:
             logger.set_rank(self.global_rank)
@@ -130,8 +122,6 @@ class BaseWorker(GenerationExecutor):
                 args["llm_args"] = self.llm_args
                 args["checkpoint_dir"] = self._hf_model_dir
                 args["tokenizer"] = self._tokenizer
-                args["lora_config"] = self._lora_config
-                args["kv_connector_config"] = self._kv_connector_config
             elif self.llm_args.backend == "_autodeploy":
                 from tensorrt_llm._torch.auto_deploy.llm_args import \
                     LlmArgs as ADLlmArgs
@@ -140,6 +130,7 @@ class BaseWorker(GenerationExecutor):
                 create_executor = create_autodeploy_executor
                 assert isinstance(self.llm_args, ADLlmArgs)
                 args["ad_config"] = self.llm_args.get_pytorch_backend_config()
+                args["tokenizer"] = self._tokenizer
             else:
                 raise ValueError(
                     f"Unsupported backend config: {self.llm_args.backend}")
@@ -636,16 +627,15 @@ class AwaitResponseHelper:
         if self.handler_kind is HandlerKind.unknown:
             if not (self.worker.result_queue is not None
                     or self.worker.postproc_queues is not None):
-                print_colored_debug(
-                    f"creating await_response helper for Worker\n",
-                    color="yellow")
+                logger_debug(f"creating await_response helper for Worker\n",
+                             color="yellow")
                 # When ExecutorBindingWorker is used in the main process
                 # aka the single process mode
                 self.handler_kind = HandlerKind.single_process_worker
             elif self.worker.result_queue is not None or self.worker.postproc_queues is not None:
                 # The ExecutorBindingProxy is used
-                print_colored_debug(f"creating await_response helper for IPC\n",
-                                    color="yellow")
+                logger_debug(f"creating await_response helper for IPC\n",
+                             color="yellow")
                 self.handler_kind = HandlerKind.ipc_batched
             else:
                 raise NotImplementedError
@@ -897,7 +887,15 @@ def _get_metrics_dict(
                 req_perf_metrics.timing_metrics.first_scheduled_time.
                 total_seconds(),
                 RequestEventTiming.LAST_TOKEN_TIME:
-                req_perf_metrics.timing_metrics.last_token_time.total_seconds()
+                req_perf_metrics.timing_metrics.last_token_time.total_seconds(),
+                RequestEventTiming.KV_CACHE_TRANSFER_START:
+                req_perf_metrics.timing_metrics.kv_cache_transfer_start.
+                total_seconds(),
+                RequestEventTiming.KV_CACHE_TRANSFER_END:
+                req_perf_metrics.timing_metrics.kv_cache_transfer_end.
+                total_seconds(),
+                RequestEventTiming.KV_CACHE_SIZE:
+                req_perf_metrics.timing_metrics.kv_cache_size,
             }
     return metrics_dict
 

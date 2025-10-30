@@ -17,7 +17,6 @@ from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.logger import logger
 
 from .._utils import nvtx_range_debug
-from ..llmapi.llm_args import KvCacheConnectorConfig
 from .executor import GenerationExecutor
 from .postproc_worker import PostprocWorkerConfig
 from .ray_gpu_worker import RayGPUWorker, RayWorkerWrapper
@@ -36,8 +35,7 @@ class RayExecutor(GenerationExecutor):
                  model_world_size: int,
                  postproc_worker_config: PostprocWorkerConfig,
                  is_llm_executor: bool,
-                 tp_size=1,
-                 kv_connector_config: Optional[KvCacheConnectorConfig] = None):
+                 tp_size=1):
         os.environ['RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES'] = '1'
         os.environ["RAY_DEDUP_LOGS"] = "0"  # for debug
 
@@ -97,8 +95,7 @@ class RayExecutor(GenerationExecutor):
 
             worker_kwargs = dict(**worker_kwargs,
                                  postproc_worker_config=postproc_worker_config,
-                                 is_llm_executor=is_llm_executor,
-                                 kv_connector_config=kv_connector_config)
+                                 is_llm_executor=is_llm_executor)
 
             self.create_workers(RayGPUWorker, worker_kwargs)
         except Exception as e:
@@ -211,7 +208,7 @@ class RayExecutor(GenerationExecutor):
             self.call_all_ray_workers("enqueue_request",
                                       leader_only=True,
                                       request=request,
-                                      async_call=False,
+                                      async_call=True,
                                       result_wait_queue=result.queue)
 
         return result
