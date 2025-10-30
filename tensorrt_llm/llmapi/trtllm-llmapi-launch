@@ -19,7 +19,8 @@ function mpi_world_size {
     elif [ -n "$OMPI_COMM_WORLD_SIZE" ]; then
         echo "$OMPI_COMM_WORLD_SIZE"
     else
-        echo "1"
+        echo "Error: Unable to determine MPI world size. Neither SLURM_NTASKS nor OMPI_COMM_WORLD_SIZE is set." >&2
+        exit 1
     fi
 }
 
