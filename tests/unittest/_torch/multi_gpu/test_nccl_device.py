@@ -78,7 +78,6 @@ def run_single_rank_ar_rms_norm(tensor_parallel_size, a, b, c, gamma):
 
         # Split tensors for tensor parallelism - ensure equal sizes
         k_chunk_size = a.size(1) // tensor_parallel_size
-        b.size(0) // tensor_parallel_size
 
         # Ensure we get exactly tensor_parallel_size chunks
         a_partial = torch.split(a, k_chunk_size, dim=1)

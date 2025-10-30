@@ -1392,6 +1392,7 @@ repos:
         exclude: |
             (?x)^(.*cubin.cpp | .*cubin.h)$
     -   id: check-merge-conflict
+        exclude: ^ATTRIBUTIONS-CPP\.md$
     -   id: check-symlinks
     -   id: detect-private-key
     -   id: end-of-file-fixer

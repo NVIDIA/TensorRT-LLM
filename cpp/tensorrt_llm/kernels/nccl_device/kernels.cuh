@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#ifndef TRTLLM_NCCL_DEVICE_KERNELS_H
-#define TRTLLM_NCCL_DEVICE_KERNELS_H
+#ifndef TRTLLM_NCCL_DEVICE_KERNELS_CUH
+#define TRTLLM_NCCL_DEVICE_KERNELS_CUH
 
 #include "constants.h"
 #include "multimem.h"
@@ -252,4 +252,4 @@ __global__ void fusedAllReduceRMSNormKernel(ncclWindow_t input_win, ncclWindow_t
 
 } // namespace tensorrt_llm::kernels::nccl_device
 
-#endif // TRTLLM_NCCL_DEVICE_KERNELS_H
+#endif // TRTLLM_NCCL_DEVICE_KERNELS_CUH
