@@ -130,8 +130,16 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts) routingIndicesBlo
         {
             if (laneIdx < params.mTopK)
             {
-                int offset = warpIdx * MaxNumExperts + params.mPtrTopKIds[warpIdx * params.mTopK + laneIdx];
-                smemKIdx[offset] = static_cast<int8_t>(laneIdx);
+                auto expertIdx = params.mPtrTopKIds[warpIdx * params.mTopK + laneIdx];
+                if (expertIdx != -1)
+                {
+                    int offset = warpIdx * MaxNumExperts + expertIdx;
+                    smemKIdx[offset] = static_cast<int8_t>(laneIdx);
+                }
+                else
+                {
+                    params.mPtrExpandedIdxToPermutedIdx[warpIdx * params.mTopK + laneIdx] = int32_t{-1};
+                }
             }
         }
     }
