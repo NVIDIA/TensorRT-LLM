@@ -580,7 +580,23 @@ class Indexer(nn.Module):
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights_in_init,
             use_custom_cublas_mm=True)
+        self.wk = Linear(
+            self.hidden_size,
+            self.head_dim,
+            bias=False,
+            dtype=dtype,
+            quant_config=quant_config,
+            skip_create_weights_in_init=skip_create_weights_in_init,
+            use_custom_cublas_mm=True)
         self.k_norm = LayerNorm(hidden_size=self.head_dim, eps=1e-6)
+        self.weights_proj = Linear(
+            self.hidden_size,
+            self.n_heads,
+            bias=False,
+            dtype=dtype,
+            quant_config=None,
+            skip_create_weights_in_init=skip_create_weights_in_init,
+            use_custom_cublas_mm=True)
 
         self.rotary_emb = RotaryEmbedding(
             pos_embd_params.rope,
@@ -593,6 +609,19 @@ class Indexer(nn.Module):
         self.scale_fmt = "ue8m0"
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+
+    @staticmethod
+    def load_weights_to_kv_a(fused_a: torch.Tensor, weights: dict,
+                             names: list) -> torch.Tensor:
+        prefix = '.'.join(names[:-1])
+        indexer_wk = weights[f"{prefix}.indexer.wk.weight"][:]
+        indexer_weights_proj = weights[
+            f"{prefix}.indexer.weights_proj.weight"][:]
+
+        assert fused_a.dtype == indexer_wk.dtype == indexer_weights_proj.dtype, \
+            "all weights in kv_a_proj_with_mqa module must have matching dtype"
+
+        return torch.cat([fused_a, indexer_wk, indexer_weights_proj], dim=0)
 
     @staticmethod
     def prepare_one_prefill_chunk(
@@ -1071,14 +1100,30 @@ class Indexer(nn.Module):
 
     @torch.inference_mode()
     def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
-                indexer_k: torch.Tensor, indexer_weights: torch.Tensor,
+                indexer_k: Optional[torch.Tensor],
+                indexer_weights: Optional[torch.Tensor],
                 metadata: DSAtrtllmAttentionMetadata,
                 position_ids: torch.Tensor):
         quant_block_size = metadata.kv_cache_manager.quant_block_size
         assert quant_block_size == 128, "Only support quant_block_size = 128 for now"
-        k = indexer_k
-        q = self.wq_b(
-            qr)  # TODO: fuse wq_b and move this outside of the indexer
+
+        if indexer_k is not None:
+            q, k = maybe_execute_in_parallel(
+                lambda: self.wq_b(
+                    qr),  # TODO: fuse wq_b and move this outside of the indexer
+                lambda: self.k_norm(indexer_k),
+                self.ln_events[0],
+                self.ln_events[1],
+                self.aux_stream,
+            )
+        else:
+            q, k = maybe_execute_in_parallel(
+                lambda: self.wq_b(qr),
+                lambda: self.wk(hidden_states),
+                self.ln_events[0],
+                self.ln_events[1],
+                self.aux_stream,
+            )
 
         # q/k rope + possible fast_hadamard_transform
         q = q.view(-1, self.n_heads, self.head_dim)
@@ -1114,7 +1159,8 @@ class Indexer(nn.Module):
         q_scale = q_scale.view(-1, self.n_heads, 1)
 
         # indexer weight scaling
-        weights = indexer_weights  #self.weights_proj(hidden_states)
+        weights = indexer_weights if indexer_weights is not None else self.weights_proj(
+            hidden_states)
         weights = weights.unsqueeze(
             -1) * q_scale * self.softmax_scale * self.n_heads**-0.5
         weights = weights.squeeze(-1)

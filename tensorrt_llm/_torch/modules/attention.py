@@ -1148,13 +1148,21 @@ class MLA(nn.Module):
         if position_ids is not None:
             position_ids = position_ids[..., :num_tokens]
 
-        q, compressed_kv, k_pe, indexer_k, indexer_weights = self.kv_a_proj_with_mqa(
-            hidden_states).split([
-                self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim,
-                self.indexer.head_dim, self.indexer.n_heads
-            ], -1)
+        if self.fuse_a_indexer_k_weight:
+            q, compressed_kv, k_pe, indexer_k, indexer_weights = self.kv_a_proj_with_mqa(
+                hidden_states).split([
+                    self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim,
+                    self.indexer.head_dim, self.indexer.n_heads
+                ], -1)
+        else:
+            q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(
+                hidden_states).split([
+                    self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim
+                ], -1)
+            indexer_k = None
+            indexer_weights = None
 
-        # TODO: possibly fuse q_a_rmsnorm + kv_a_rmsnorm + indexer.k_layernorm?
+        # TODO: possibly overlap/fuse q_a_rmsnorm + kv_a_rmsnorm + indexer.k_layernorm?
         q, compressed_kv = maybe_execute_in_parallel(
             lambda: self.q_a_layernorm(q),
             lambda: self.kv_a_layernorm(compressed_kv),
@@ -1162,14 +1170,9 @@ class MLA(nn.Module):
             self.ln_events[1],
             self.aux_stream,
         )
-        indexer_k, latent_cache = maybe_execute_in_parallel(
-            lambda: self.indexer.k_norm(indexer_k),
-            lambda: torch.concat([compressed_kv, k_pe], dim=-1),
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
         qr = q
+        latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
+
         # TODO: fuse wq_b + (indexer) wlq here
         q = self.q_b_proj(q)
         # Indexer
