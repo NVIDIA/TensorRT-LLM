@@ -3498,3 +3498,139 @@ def test_llmapi_generation_logits(llm_venv, model_path,
     # Run the async test
     loop = asyncio.get_event_loop()
     loop.run_until_complete(async_generation_test())
+
+
+@skip_pre_blackwell
+@pytest.mark.skip_less_device_memory(192000)
+@pytest.mark.parametrize("model_name,model_path,gpu_count", [
+    ("DeepSeek-R1-0528", "DeepSeek-R1/DeepSeek-R1-0528", "8"),
+    ("DeepSeek-R1-0528-FP4", "DeepSeek-R1/DeepSeek-R1-0528-FP4", "4"),
+])
+def test_longbench_v2_multigpus(llm_venv, model_name, model_path, gpu_count):
+    original_model_dir = Path(llm_models_root()) / model_path
+    if not original_model_dir.exists():
+        pytest.skip(f"Model directory {original_model_dir} does not exist")
+    if gpu_count > get_device_count():
+        pytest.skip(f"Not enough GPUs for {model_name}")
+
+    # Create temporary directory with symlinks
+    temp_dir = None
+    extra_config_file = None
+
+    try:
+        # Create temporary model directory with symlinks
+        temp_dir = tempfile.mkdtemp(prefix="deepseek_r1_modified_")
+        print(f"Created temporary model directory: {temp_dir}")
+
+        # Create symlinks for all files except config files
+        for item in os.listdir(original_model_dir):
+            src = os.path.join(original_model_dir, item)
+            dst = os.path.join(temp_dir, item)
+
+            # Skip config files - will handle them separately
+            if item in ["config.json", "tokenizer_config.json"]:
+                continue
+
+            # Create symlink for other files/directories
+            os.symlink(src, dst)
+            print(f"  Symlinked: {item}")
+
+        # Modify and copy config.json
+        config_src = os.path.join(original_model_dir, "config.json")
+        config_dst = os.path.join(temp_dir, "config.json")
+        if os.path.exists(config_src):
+            with open(config_src, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+
+            # Modify max_position_embeddings to 1280000
+            original_max_pos = config.get('max_position_embeddings')
+            config['max_position_embeddings'] = 1280000
+            print(
+                f"  Modified config.json: max_position_embeddings {original_max_pos} -> 1280000"
+            )
+
+            with open(config_dst, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+
+        # Modify and copy tokenizer_config.json
+        tokenizer_config_src = os.path.join(original_model_dir,
+                                            "tokenizer_config.json")
+        tokenizer_config_dst = os.path.join(temp_dir, "tokenizer_config.json")
+        if os.path.exists(tokenizer_config_src):
+            with open(tokenizer_config_src, 'r', encoding='utf-8') as f:
+                tokenizer_config = json.load(f)
+
+            # Modify model_max_length to 1280000
+            original_max_len = tokenizer_config.get('model_max_length')
+            tokenizer_config['model_max_length'] = 1280000
+            print(
+                f"  Modified tokenizer_config.json: model_max_length {original_max_len} -> 1280000"
+            )
+
+            with open(tokenizer_config_dst, 'w', encoding='utf-8') as f:
+                json.dump(tokenizer_config, f, indent=2, ensure_ascii=False)
+
+        # Create extra_llm_api_options YAML file
+        extra_config_file = tempfile.NamedTemporaryFile(mode='w',
+                                                        suffix='.yml',
+                                                        delete=False,
+                                                        dir=temp_dir)
+        extra_llm_api_config = {
+            'print_iter_log': True,
+            'cuda_graph_config': {
+                'enable_padding': True,
+                'max_batch_size': 32
+            },
+            'speculative_config': {
+                'decoding_type': 'MTP',
+                'num_nextn_predict_layers': 3
+            },
+            'enable_autotuner': True,
+            'kv_cache_config': {
+                'free_gpu_memory_fraction': 0.8,
+                'enable_block_reuse': True,
+                'enable_partial_reuse': False,
+                'dtype': 'fp8'
+            },
+            'enable_chunked_prefill': True
+        }
+
+        # Add moe_config for DeepSeek-R1-0528 (non-FP4 version)
+        if "FP4" not in model_name:
+            extra_llm_api_config['moe_config'] = {
+                'backend': 'DEEPGEMM',
+                'max_num_tokens': 32000
+            }
+        yaml.dump(extra_llm_api_config, extra_config_file)
+        extra_config_file.close()
+
+        # Build trtllm-eval command
+        run_cmd = [
+            "trtllm-eval",
+            f"--model={temp_dir}",
+            f"--tp_size={gpu_count}",
+            f"--ep_size={gpu_count}",
+            "--max_num_tokens=32000",
+            "--max_batch_size=32",
+            "--kv_cache_free_gpu_memory_fraction=0.8",
+            f"--extra_llm_api_options={extra_config_file.name}",
+            "longbench_v2",
+            "--length=medium",
+            "--max_len=1280000",
+            "--max_input_length=1280000",
+            "--max_output_length=32000",
+        ]
+
+        print(f"\nRunning command:")
+        print(f"  {' '.join(run_cmd)}\n")
+
+        # Run the evaluation
+        check_call(" ".join(run_cmd), shell=True, env=llm_venv._new_env)
+
+        print(f"\n✓ Test completed successfully for {model_name}")
+
+    finally:
+        # Cleanup temporary files
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            print(f"Cleaned up temporary directory: {temp_dir}")

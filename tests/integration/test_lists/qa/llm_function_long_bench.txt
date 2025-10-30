@@ -1,0 +1,2 @@
+test_e2e.py::test_longbench_v2_multigpus[DeepSeek-R1-0528-DeepSeek-R1/DeepSeek-R1-0528-8]
+test_e2e.py::test_longbench_v2_multigpus[DeepSeek-R1-0528-FP4-DeepSeek-R1/DeepSeek-R1-0528-FP4-4]
