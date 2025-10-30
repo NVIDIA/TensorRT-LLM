@@ -657,59 +657,19 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype):
         sum(batch_query_lens[:i + 1]) for i in range(len(batch_order))
     ]
     num_ctx_tokens = sum(query_lens[i] for i in ctx_indices)
-
-    def create_causal_indices(req_indices, cache_offset_start=0):
-        """Helper to create causal attention indices with padding."""
-        indices = []
-        kv_offset = cache_offset_start
-        for req_idx in req_indices:
-            for local_pos in range(query_lens[req_idx]):
-                num_attend = min(cached_lens[req_idx] + local_pos + 1,
-                                 topk_tokens)
-                attend_indices = torch.arange(
-                    num_attend, dtype=torch.int32, device=device) + kv_offset
-                if num_attend < topk_tokens:
-                    padding = torch.full((topk_tokens - num_attend, ),
-                                         -1,
-                                         dtype=torch.int32,
-                                         device=device)
-                    attend_indices = torch.cat([attend_indices, padding])
-                indices.append(attend_indices)
-            kv_offset += seq_lens[req_idx]
-        return torch.stack(indices, dim=0)
-
-    def local_to_global_indices(local_indices,
-                                req_indices,
-                                cache_offset_start=0):
-        """
-        Transform indexer's local indices to global indices.
-        """
-        global_indices = local_indices.clone()
-        kv_offset = cache_offset_start
-        token_idx = 0
-
-        for req_idx in req_indices:
-            num_tokens = query_lens[req_idx]
-            # Add offset for this request's cache position
-            for local_pos in range(num_tokens):
-                # Only transform non-padding indices (>= 0)
-                mask = global_indices[token_idx] >= 0
-                global_indices[token_idx][mask] += kv_offset
-                token_idx += 1
-            kv_offset += seq_lens[req_idx]
-        return global_indices
-
-    topk_indices_local = mla.mqa.indexer(qr, hidden_states, attn_metadata,
-                                         position_ids)
+    topk_indices_local = mla.mqa.indexer(
+        qr,
+        hidden_states,
+        attn_metadata,
+        position_ids,
+        None,  # indexer_k
+        None,  # indexer_weights
+    )
 
     # Validate indexer output against expected causal indices (since seq_len < topk=2048)
     if num_contexts > 0:
         # Transform context indices from local to global
         ctx_topk_local = topk_indices_local[:num_ctx_tokens]
-
-        # Create expected global indices (sorted) for validation (not used but can be used for validation)
-        expected_ctx_indices = create_causal_indices(ctx_indices,
-                                                     cache_offset_start=0)
 
         mla.forward_context_dsa(
             q=q[:num_ctx_tokens],
@@ -729,11 +689,6 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype):
         num_gen_tokens = sum(query_lens[i] for i in gen_indices)
         gen_topk_local = topk_indices_local[num_ctx_tokens:num_ctx_tokens +
                                             num_gen_tokens]
-
-        # Create expected global indices (sorted) for validation (not used but can be used for validation)
-        expected_gen_indices = create_causal_indices(gen_indices,
-                                                     cache_offset_start=0)
-
         mla.forward_generation_dsa(
             q=q[num_ctx_tokens:],
             compressed_kv=compressed_kv[num_ctx_tokens:],

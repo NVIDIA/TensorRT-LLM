@@ -1100,10 +1100,9 @@ class Indexer(nn.Module):
 
     @torch.inference_mode()
     def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
-                indexer_k: Optional[torch.Tensor],
-                indexer_weights: Optional[torch.Tensor],
                 metadata: DSAtrtllmAttentionMetadata,
-                position_ids: torch.Tensor):
+                position_ids: torch.Tensor, indexer_k: Optional[torch.Tensor],
+                indexer_weights: Optional[torch.Tensor]):
         quant_block_size = metadata.kv_cache_manager.quant_block_size
         assert quant_block_size == 128, "Only support quant_block_size = 128 for now"
 
@@ -1124,6 +1123,7 @@ class Indexer(nn.Module):
                 self.ln_events[1],
                 self.aux_stream,
             )
+            k = self.k_norm(k)
 
         # q/k rope + possible fast_hadamard_transform
         q = q.view(-1, self.n_heads, self.head_dim)
