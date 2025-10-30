@@ -251,21 +251,15 @@ class ConfigLoader:
             生成的测试ID字符串
         """
         # 提取配置字段
-        fields = extract_config_fields(config_data)
-        
-        # 从metadata获取模型名称
-        metadata = config_data.get('metadata', {})
-        model_name = metadata.get('model_name', 'unknown')
-        
+        fields = extract_config_fields(config_data)      
         # 生成benchmark类型 (如 1k1k, 8k1k)
         isl_k = fields['isl'] // 1024
         osl_k = fields['osl'] // 1024
         benchmark_type = f"{isl_k}k{osl_k}k"
-        cache_transceiver_backend = fields['cache_transceiver_backend']
         
         # 生成测试ID
         test_id = (
-            f"{test_type}_{test_category}_file:{test_file_name}_model:{model_name}_{benchmark_type}_"
+            f"{test_type}_{test_category}_file:{test_file_name}_{benchmark_type}_"
             f"{fields['dep_flag']}:{fields['gen_tp_size']}_bs:{fields['gen_batch_size']}_"
             f"mtp:{fields['mtp_size']}_ccbackend:{fields['cache_transceiver_backend']}"
         )
