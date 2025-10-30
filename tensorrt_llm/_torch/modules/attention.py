@@ -1262,9 +1262,14 @@ class MLA(nn.Module):
         # TODO: fuse wq_b + (indexer) wlq here
         q = self.q_b_proj(q)
         # Indexer
-        topk_indices = self.indexer(qr, hidden_states, indexer_k,
-                                    indexer_weights, attn_metadata,
-                                    position_ids)
+        topk_indices = self.indexer(
+            qr,
+            hidden_states,
+            attn_metadata,
+            position_ids,
+            indexer_k=indexer_k,  # indexer K proj
+            indexer_weights=indexer_weights,  # indexer weights proj
+        )
 
         assert q.shape[
             0] == num_tokens, f"Expect q.shape[0] to be {num_tokens}, but got {q.shape[0]}"
