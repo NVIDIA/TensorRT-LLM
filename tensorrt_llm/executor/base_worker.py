@@ -2,11 +2,13 @@ import copy
 import datetime
 import enum
 import json
+import os
 import weakref
 from pathlib import Path
 from queue import Queue
 from typing import Dict, List, Optional, Tuple, Union
 
+import psutil
 import torch
 
 from tensorrt_llm.logger import logger
@@ -19,7 +21,7 @@ from ..builder import ConfigEncoder, Engine, EngineConfig
 from ..llmapi.llm_args import BaseLlmArgs, PybindMirror
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
-from ..llmapi.utils import _SyncQueue, logger_debug
+from ..llmapi.utils import _SyncQueue, get_numa_aware_cpu_affinity, logger_debug
 from ..lora_manager import LoraManager
 from ..metrics import RequestEventTiming
 from ..prompt_adapter_manager import PromptAdapterManager
@@ -91,6 +93,34 @@ class BaseWorker(GenerationExecutor):
         if global_mpi_size() > 1:
             logger.set_rank(self.global_rank)
 
+    def _configure_affinity(self, device_id):
+        '''
+        Probe and configure the affinity of the worker
+        '''
+
+        # Get the current affinity setting
+        pid = os.getpid()
+        process = psutil.Process(pid)
+        cpu_affinity = process.cpu_affinity()
+
+        all_cpus = list(range(psutil.cpu_count()))
+
+        constrained_affinity = (cpu_affinity != all_cpus)
+
+        # If the process is affined to a constrained set of CPUs, warn the user
+        # so as to ensure that this is what is intended
+        if constrained_affinity:
+            logger.warning(
+                f"Worker process {pid} is affined to run on the following CPUs: "
+                "{cpu_affinity} (subset of all logical CPUs). This may harm "
+                "performance if set incorrectly.", )
+
+        # If affinity is unconstrained or the user has explicitly requested it,
+        # choose the optimal affinity based upon the NUMA topology
+        if not constrained_affinity or os.environ.get(
+                "TLLM_NUMA_AWARE_WORKER_AFFINITY", "0") == "1":
+            process.cpu_affinity(get_numa_aware_cpu_affinity(device_id))
+
     def _get_comm_ranks_device_id(self):
         device_id = self.global_rank % torch.cuda.device_count()
         torch.cuda.set_device(device_id)
@@ -98,6 +128,9 @@ class BaseWorker(GenerationExecutor):
         global_rank = global_mpi_rank()
         comm_ranks = mpi_comm().allgather(global_rank)
         device_ids = mpi_comm().allgather(device_id)
+
+        self._configure_affinity(device_id)
+
         return comm_ranks, device_ids
 
     def setup_engine(self):

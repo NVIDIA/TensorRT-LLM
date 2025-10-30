@@ -1,9 +1,11 @@
 import asyncio
 import collections
+import ctypes
 import datetime
 import hashlib
 import inspect
 import io
+import math
 import os
 import re
 import sys
@@ -513,24 +515,38 @@ class _SyncQueue:
                 time.sleep(0.01)
 
 
-def set_sched_setaffinity(required_cores: int):
-    ''' Set the CPU affinity of the current process to the required number of
-    cores.
-
-    Known issue: This may race with other processes that also set the affinity.
+def get_numa_aware_cpu_affinity(device_id):
     '''
-    cpu_percentages = psutil.cpu_percent(percpu=True)
-    # sort the cores by usage
-    free_cores = sorted(range(len(cpu_percentages)),
-                        key=lambda i: cpu_percentages[i])
+    Given the CUDA device_id, query NVML and return the ideal CPU affinity (a
+    list of CPU ids) based upon NUMA topology
+    '''
+    cpu_count = psutil.cpu_count()
 
-    pid = os.getpid()
-    os.sched_setaffinity(pid, set(free_cores[:required_cores]))
+    # Get the number of bits per ulong
+    c_ulong_bits = ctypes.sizeof(ctypes.c_ulong) * 8
 
+    # Determine how large our cpu set array from NVML needs to be
+    cpu_set_size = math.ceil(cpu_count / c_ulong_bits)
 
-def clear_sched_affinity(pid: int):
-    ''' Clear the CPU affinity of the current process. '''
-    os.sched_setaffinity(pid, set(range(psutil.cpu_count())))
+    # initialize NVML
+    import pynvml
+    pynvml.nvmlInit()
+
+    # Get the Ideal CPU affinity for this device
+    handle = pynvml.nvmlDeviceGetHandleByIndex(device_id)
+    affinity_masks = pynvml.nvmlDeviceGetCpuAffinity(handle, cpu_set_size)
+
+    # Convert CPU masks to python list
+    cpu_affinity = []
+    for cpu_id in range(cpu_count):
+        mask_array_index = cpu_id // c_ulong_bits
+        mask_bit_index = cpu_id % c_ulong_bits
+        if affinity_masks[mask_array_index] & (1 << mask_bit_index):
+            cpu_affinity.append(cpu_id)
+
+    pynvml.nvmlShutdown()
+
+    return cpu_affinity
 
 
 def generate_api_docs_as_docstring(model: Type[BaseModel],
