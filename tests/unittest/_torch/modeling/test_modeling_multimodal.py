@@ -650,6 +650,7 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
             self.kv_cache_manager = None
 
         self.attn_metadata = None
+        self.runtime_features = None
 
         gc.collect()
         if torch.cuda.is_available():
@@ -657,15 +658,14 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
 
     def setup_scenario(self, scenario: MultimodalScenario):
         """Update runtime features based on scenario."""
-        self.init_kv_cache_manager(scenario)
-        self.init_attn_metadata(scenario)
-
         if scenario.chunked_prefill:
             self.runtime_features = AttentionRuntimeFeatures(
                 chunked_prefill=True, chunk_size=8192)
         elif scenario.kv_cache_reuse:
             self.runtime_features = AttentionRuntimeFeatures(cache_reuse=True,
                                                              chunk_size=8192)
+        self.init_kv_cache_manager(scenario)
+        self.init_attn_metadata(scenario)
 
     def test_all(self) -> None:
         """Test all scenarios defined in get_scenarios()."""
