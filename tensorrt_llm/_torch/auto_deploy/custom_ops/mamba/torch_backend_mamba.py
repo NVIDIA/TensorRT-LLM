@@ -325,7 +325,7 @@ class TorchBackendSSM(AttentionDescriptor):
 
     @classmethod
     def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
-        # Returns (seq_len, seq_start, slot_idx)
+        # Returns (seq_len, seq_start, slot_idx, use_initial_states)
         return torch.ops.auto_deploy.torch_ssm_prepare_metadata, 4
 
     @classmethod
@@ -338,6 +338,9 @@ class TorchBackendSSM(AttentionDescriptor):
 
         num_heads = hs_fake.shape[-2]
         head_dim = hs_fake.shape[-1]
+
+        # dtype from node itself
+        dtype = source_attn_node.meta["val"].dtype
 
         # Infer state size by assuming B has shape [b, s, n_groups * ssm_state_size]
         # During runtime we pass [b, s, n_groups, ssm_state_size]; both give the same last dim product.
@@ -354,7 +357,7 @@ class TorchBackendSSM(AttentionDescriptor):
                 head_dim,
                 ssm_state_size,
                 device=si.device,
-                dtype=cache_config.dtype or hs_fake.dtype,
+                dtype=cache_config.mamba_dtype or dtype,
             )
 
         return {"ssm_state_cache": _get_ssm_cache}

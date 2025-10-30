@@ -29,6 +29,7 @@ class CacheConfig:
     """A dataclass to hold information how to configure the cache."""
 
     dtype: Optional[torch.dtype] = None
+    mamba_dtype: Optional[torch.dtype] = None
 
 
 class SequenceInfo:
