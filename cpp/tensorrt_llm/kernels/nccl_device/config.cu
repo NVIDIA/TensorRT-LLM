@@ -1,13 +1,23 @@
-/*************************************************************************
- * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+/*
+ * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
  *
- * See LICENSE.txt for license information
- ************************************************************************/
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 #include "config.h"
 #include "nccl.h"
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
-#include "kernels.h"
+#include "kernels.cuh"
 #endif
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -176,19 +186,9 @@ bool TypedLaunchConfig<T>::isValidConfig(int threadsPerBlock, int unrollFactor) 
 {
     // Get CUDA device properties
     int dev = -1;
-    cudaError_t cudaStatus = cudaGetDevice(&dev);
-    if (cudaStatus != cudaSuccess)
-    {
-        TLLM_LOG_ERROR("Failed to get CUDA device: " + std::string(cudaGetErrorString(cudaStatus)));
-        return false;
-    }
+    TLLM_CUDA_CHECK(cudaGetDevice(&dev));
     cudaDeviceProp deviceProp;
-    cudaStatus = cudaGetDeviceProperties(&deviceProp, dev);
-    if (cudaStatus != cudaSuccess)
-    {
-        TLLM_LOG_ERROR("Failed to get CUDA device properties: " + std::string(cudaGetErrorString(cudaStatus)));
-        return false;
-    }
+    TLLM_CUDA_CHECK(cudaGetDeviceProperties(&deviceProp, dev));
 
     // Check threads per block limits
     if (threadsPerBlock <= 0 || threadsPerBlock > deviceProp.maxThreadsPerBlock)
@@ -217,13 +217,7 @@ bool TypedLaunchConfig<T>::isValidConfig(int threadsPerBlock, int unrollFactor) 
 
     // Get actual register and shared memory usage from the kernel
     cudaFuncAttributes funcAttrib;
-    cudaError_t attrStatus = cudaFuncGetAttributes(&funcAttrib, reinterpret_cast<void const*>(kernelPtr));
-    if (attrStatus != cudaSuccess)
-    {
-        TLLM_LOG_WARNING(
-            "Failed to get kernel attributes for validation: " + std::string(cudaGetErrorString(attrStatus)));
-        return false;
-    }
+    TLLM_CUDA_CHECK(cudaFuncGetAttributes(&funcAttrib, reinterpret_cast<void const*>(kernelPtr)));
 
     // Check register usage
     int const totalRegistersPerBlock = funcAttrib.numRegs * threadsPerBlock;

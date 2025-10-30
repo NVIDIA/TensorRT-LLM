@@ -558,19 +558,14 @@ private:
                     norm_weight.value().data_ptr(), nullptr, devComm, mEps, stream);
                 return {norm_out, residual_out};
             }
-            else
-            {
-                // Fall back to old strategy with warning
-                TLLM_LOG_WARNING(
-                    "NCCL device Fused AR not supported for data type %d, hidden size %d & %d nRanks on current "
-                    "architecture. Falling back to standard allreduce + separate RMSNorm.",
-                    static_cast<int>(mType), hidden_size, nRanks);
-
-                goto default_case;
-            }
+            // Fall back to old strategy with warning
+            TLLM_LOG_WARNING(
+                "NCCL device Fused AR not supported for data type %d, hidden size %d & %d nRanks on current "
+                "architecture. Falling back to standard allreduce + separate RMSNorm.",
+                static_cast<int>(mType), hidden_size, nRanks);
         }
+        // Intentional fallthrough to default
         default:
-        default_case:
             NCCLCHECK(ncclAllReduce(
                 ub_buffer0.addr, ub_buffer1.addr, size, (*getDtypeMap())[mType], ncclSum, *rawComm, stream));
             return fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, norm_out);
