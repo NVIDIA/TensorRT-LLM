@@ -2400,6 +2400,10 @@ class TorchCompileConfig(StrictBaseModel):
                 "torch_compile_config.max_num_streams must be >= 1")
         return v
 
+    @staticmethod
+    def _generate_capture_num_tokens() -> List[int]:
+        return [2**i for i in range(8)] + [i for i in range(256, 3073, 256)]
+
 
 class TorchLlmArgs(BaseLlmArgs):
     # Just a dummy BuildConfig to allow code reuse with the TrtLlmArgs
@@ -2713,6 +2717,18 @@ class TorchLlmArgs(BaseLlmArgs):
             config.batch_sizes = generated_sizes
             config.max_batch_size = max_batch_size
 
+        return self
+
+    @model_validator(mode='after')
+    def validate_torch_compile_config(self) -> 'TorchLlmArgs':
+        if self.torch_compile_config is None:
+            return self
+
+        config = self.torch_compile_config
+        if config.enable_piecewise_cuda_graph:
+            if config.capture_num_tokens is None:
+                config.capture_num_tokens = TorchCompileConfig._generate_capture_num_tokens(
+                )
         return self
 
     @model_validator(mode='after')
