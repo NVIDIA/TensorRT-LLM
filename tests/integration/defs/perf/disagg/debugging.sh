@@ -1,6 +1,9 @@
 
 # How to collect the entire test list
 # Please apply the corresponding env file under ./envs before collect the test list
+
+cd /lustre/fsw/portfolios/coreai/users/fredricz/tensorrt_llm/tests/integration/defs/perf/disagg
+
 source ./perf/disagg/envs/.env_oci
 
 poetry run pytest --disagg --collect-only -q &> testlist_h100.txt
