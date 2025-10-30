@@ -27,12 +27,15 @@ diff --git a/src/mpi4py/futures/_lib.py b/src/mpi4py/futures/_lib.py
 index f14934d1..eebfb8fc 100644
 --- a/src/mpi4py/futures/_lib.py
 +++ b/src/mpi4py/futures/_lib.py
-@@ -278,6 +278,40 @@ def _manager_comm(pool, options, comm, full=True):
+@@ -278,6 +278,43 @@ def _manager_comm(pool, options, comm, full=True):
 
 
  def _manager_split(pool, options, comm, root):
 +    if(os.getenv("TRTLLM_USE_MPI_KVCACHE")=="1"):
-+        from cuda import cudart
++        try:
++            from cuda.bindings import runtime as cudart
++        except ImportError:
++            from cuda import cudart
 +        has_slurm_rank=False
 +        has_ompi_rank=False
 +        slurm_rank=0
