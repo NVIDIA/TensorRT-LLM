@@ -21,7 +21,8 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import HfLoraLoader
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
-from ...inputs import (ExtraProcessedInputs, InputProcessor,
+from ...inputs import (BaseMultimodalDummyInputsBuilder,
+                       BaseMultimodalInputProcessor, ExtraProcessedInputs,
                        MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
@@ -1042,26 +1043,54 @@ class Llama4VisionEncoder(nn.Module):
         return [image_features]
 
 
-class Llama4InputProcessor(InputProcessor):
+from transformers import AutoTokenizer, PretrainedConfig
+
+
+class Llama4InputProcessor(BaseMultimodalInputProcessor,
+                           BaseMultimodalDummyInputsBuilder):
 
     def __init__(self,
-                 model_path,
-                 model_config,
-                 tokenizer,
+                 model_path: str,
+                 config: PretrainedConfig,
+                 tokenizer: AutoTokenizer,
                  trust_remote_code: bool = True):
-        self.use_fast = True
-        self.processor = AutoProcessor.from_pretrained(
+        super().__init__()
+        self._config = config
+        self._dtype = self._config.torch_dtype
+        self._tokenizer = tokenizer if tokenizer is not None else AutoTokenizer.from_pretrained(
+            model_path)
+        self._model_path = model_path
+        self._processor = AutoProcessor.from_pretrained(
             model_path,
-            trust_remote_code=trust_remote_code,
-            use_fast=self.use_fast)
-        self.model_config = model_config
-        self.tokenizer = tokenizer
-        self.vocab_size = model_config.text_config.vocab_size
-        self.image_token_index = model_config.image_token_index
+            use_fast=self.use_fast,
+            trust_remote_code=trust_remote_code)
+
+        self.vocab_size = self.config.text_config.vocab_size
+        self.image_token_index = self.config.image_token_index
         self.fake_image_token = self.processor.fake_image_token
         self.image_token = self.processor.img_patch_token
-        self.image_token_start_index = self.model_config.boi_token_index
-        self.image_token_end_index = self.model_config.eoi_token_index
+        self.image_token_start_index = self.config.boi_token_index
+        self.image_token_end_index = self.config.eoi_token_index
+
+    @property
+    def config(self) -> PretrainedConfig:
+        return self._config
+
+    @property
+    def tokenizer(self) -> AutoTokenizer:
+        return self._tokenizer
+
+    @property
+    def model_path(self) -> str:
+        return self._model_path
+
+    @property
+    def processor(self) -> AutoProcessor:
+        return self._processor
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._dtype
 
     def attach_multimodal_embeddings(
         self, inputs: TextPrompt, multimodal_embedding: Dict[str,

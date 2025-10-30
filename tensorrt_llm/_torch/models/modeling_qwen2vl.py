@@ -28,8 +28,8 @@ from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 from ..._utils import nvtx_range
-from ...inputs import (BaseDummyInputsBuilder, BaseMultimodalInputProcessor,
-                       ExtraProcessedInputs, InputProcessor,
+from ...inputs import (BaseMultimodalDummyInputsBuilder,
+                       BaseMultimodalInputProcessor, ExtraProcessedInputs,
                        MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
@@ -88,36 +88,55 @@ def process_weights(weights: Dict,
     return filtered_weights
 
 
-class Qwen2VLInputProcessorBase(BaseDummyInputsBuilder,
-                                BaseMultimodalInputProcessor, InputProcessor):
+class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
+                                BaseMultimodalDummyInputsBuilder):
 
     def __init__(self,
                  model_path: str,
-                 model_config: PretrainedConfig,
+                 config: PretrainedConfig,
                  tokenizer: AutoTokenizer,
                  trust_remote_code: bool = True):
 
         super().__init__()
-        self.model_config = model_config
-        self.vision_dtype = self.model_config.torch_dtype
-        self.tokenizer = tokenizer if tokenizer is not None else AutoTokenizer.from_pretrained(
+        self._config = config
+        self._dtype = self._config.torch_dtype
+        self._tokenizer = tokenizer if tokenizer is not None else AutoTokenizer.from_pretrained(
             model_path)
-        self.use_fast = True
-        self.model_path = model_path
-        self.processor = AutoProcessor.from_pretrained(
+        self._model_path = model_path
+        self._processor = AutoProcessor.from_pretrained(
             model_path,
             use_fast=self.use_fast,
             trust_remote_code=trust_remote_code)
 
-        self.tllm_multimodal_token_id = self.model_config.vocab_size + 1
+        self.tllm_multimodal_token_id = self.get_vocab_size() + 1
         # temporal patch size for video frames
-        self.temporal_patch_size = getattr(model_config.vision_config,
+        self.temporal_patch_size = getattr(self._config.vision_config,
                                            'temporal_patch_size', 1)
+
+    @property
+    def config(self) -> PretrainedConfig:
+        return self._config
+
+    @property
+    def tokenizer(self) -> AutoTokenizer:
+        return self._tokenizer
+
+    @property
+    def model_path(self) -> str:
+        return self._model_path
+
+    @property
+    def processor(self) -> AutoProcessor:
+        return self._processor
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._dtype
 
     @classmethod
     def get_rope_index(
         cls,
-        model_config: PretrainedConfig,
+        config: PretrainedConfig,
         input_ids: Optional[torch.IntTensor] = None,
         image_grid_thw: Optional[torch.LongTensor] = None,
         video_grid_thw: Optional[torch.LongTensor] = None,
@@ -131,7 +150,7 @@ class Qwen2VLInputProcessorBase(BaseDummyInputsBuilder,
         The main difference between the two implementations is how temporal position IDs are calculated.
 
         Args:
-            model_config: The model configuration
+            config: The HF model configuration
             input_ids: Indices of input sequence tokens in the vocabulary
             image_grid_thw: The temporal, height and width of feature shape of each image in LLM
             video_grid_thw: The temporal, height and width of feature shape of each video in LLM
@@ -142,10 +161,10 @@ class Qwen2VLInputProcessorBase(BaseDummyInputsBuilder,
             position_ids: A tensor of shape (3, batch_size, sequence_length)
             mrope_position_deltas: A tensor of shape (batch_size)
         """
-        spatial_merge_size = model_config.vision_config.spatial_merge_size
-        image_token_id = model_config.image_token_id
-        video_token_id = model_config.video_token_id
-        vision_start_token_id = model_config.vision_start_token_id
+        spatial_merge_size = config.vision_config.spatial_merge_size
+        image_token_id = config.image_token_id
+        video_token_id = config.video_token_id
+        vision_start_token_id = config.vision_start_token_id
         mrope_position_deltas = []
 
         # Handle case with no vision inputs
@@ -247,14 +266,14 @@ class Qwen2VLInputProcessorBase(BaseDummyInputsBuilder,
                     torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
 
                 # Calculate temporal position IDs based on model type
-                if hasattr(model_config.vision_config, 'tokens_per_second'):
+                if hasattr(config.vision_config, 'tokens_per_second'):
                     # Qwen2_5_VL style temporal position calculation
                     if isinstance(second_per_grid_t, torch.Tensor):
                         second_per_grid_t = second_per_grid_t.item()
                     range_tensor = torch.arange(llm_grid_t).view(-1, 1)
                     expanded_range = range_tensor.expand(
                         -1, llm_grid_h * llm_grid_w)
-                    time_tensor = expanded_range * second_per_grid_t * model_config.vision_config.tokens_per_second
+                    time_tensor = expanded_range * second_per_grid_t * config.vision_config.tokens_per_second
                     t_index = time_tensor.long().flatten()
                 else:
                     # Qwen2VL style temporal position calculation
@@ -312,9 +331,9 @@ class Qwen2VLInputProcessorBase(BaseDummyInputsBuilder,
                               **mm_processor_kwargs)
 
     def _postprocess(self, input_ids: torch.IntTensor) -> torch.IntTensor:
-        masks = (input_ids == self.model_config.image_token_id) | (
-            input_ids == self.model_config.vision_token_id) | (
-                input_ids == self.model_config.video_token_id)
+        masks = (input_ids == self.config.image_token_id) | (
+            input_ids == self.config.vision_token_id) | (
+                input_ids == self.config.video_token_id)
         input_ids[masks] = self.tllm_multimodal_token_id
         return input_ids
 
@@ -326,7 +345,7 @@ class Qwen2VLInputProcessorBase(BaseDummyInputsBuilder,
             attention_mask: torch.Tensor,
             second_per_grid_ts: torch.Tensor = None) -> dict[str, torch.Tensor]:
         mrope_position_ids, mrope_position_deltas = Qwen2VLInputProcessorBase.get_rope_index(
-            self.model_config, input_ids, image_grid_thw, video_grid_thw,
+            self.config, input_ids, image_grid_thw, video_grid_thw,
             attention_mask, second_per_grid_ts)
 
         mrope_config = {}
@@ -352,15 +371,14 @@ class Qwen2VLInputProcessorBase(BaseDummyInputsBuilder,
         pixel_values = processed_inputs.get('pixel_values', None)
         if pixel_values is not None:
             multimodal_data["image"] = {
-                "pixel_values": pixel_values.to(self.vision_dtype),
+                "pixel_values": pixel_values.to(self.dtype),
                 "image_grid_thw": processed_inputs.get('image_grid_thw')
             }
 
         pixel_values_videos = processed_inputs.get('pixel_values_videos', None)
         if pixel_values_videos is not None:
             multimodal_data["video"] = {
-                "pixel_values_videos":
-                pixel_values_videos.to(self.vision_dtype),
+                "pixel_values_videos": pixel_values_videos.to(self.dtype),
                 "video_grid_thw": processed_inputs.get('video_grid_thw')
             }
 

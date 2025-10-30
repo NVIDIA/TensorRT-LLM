@@ -29,8 +29,9 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.functional import PositionEmbeddingType
-from tensorrt_llm.inputs import (BaseMultimodalInputProcessor,
-                                 ExtraProcessedInputs, InputProcessor,
+from tensorrt_llm.inputs import (BaseMultimodalDummyInputsBuilder,
+                                 BaseMultimodalInputProcessor,
+                                 ExtraProcessedInputs,
                                  MultimodalPlaceholderMetadata,
                                  MultimodalPlaceholderPlacement, TextPrompt,
                                  register_input_processor)
@@ -214,26 +215,46 @@ class MistralForCausalLM(DecoderModelForCausalLM[MistralModel, MistralConfig]):
         )
 
 
-class Mistral3InputProcessor(BaseMultimodalInputProcessor, InputProcessor):
+class Mistral3InputProcessor(BaseMultimodalInputProcessor,
+                             BaseMultimodalDummyInputsBuilder):
 
     def __init__(
         self,
         model_path: str,
-        model_config: PretrainedConfig,
+        config: PretrainedConfig,
         tokenizer: Optional[AutoTokenizer],
         trust_remote_code: bool = False,
     ):
-        if tokenizer is None:
-            tokenizer = AutoTokenizer.from_pretrained(model_path,
-                                                      use_fast=False)
+        super().__init__()
+        self._config = config
+        self._dtype = self._config.torch_dtype
+        self._tokenizer = tokenizer if tokenizer is not None else AutoTokenizer.from_pretrained(
+            model_path)
+        self._model_path = model_path
+        self._processor = AutoProcessor.from_pretrained(
+            model_path,
+            use_fast=self.use_fast,
+            trust_remote_code=trust_remote_code)
 
-        # To abide by the `InputProcessor` interface.
-        self.model_path = model_path
-        self.model_config = model_config
-        self.tokenizer = tokenizer
+    @property
+    def config(self) -> PretrainedConfig:
+        return self._config
 
-        self._processor = AutoProcessor.from_pretrained(model_path,
-                                                        use_fast=False)
+    @property
+    def tokenizer(self) -> AutoTokenizer:
+        return self._tokenizer
+
+    @property
+    def model_path(self) -> str:
+        return self._model_path
+
+    @property
+    def processor(self) -> AutoProcessor:
+        return self._processor
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._dtype
 
     @torch.inference_mode()
     def __call__(
@@ -282,7 +303,7 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor, InputProcessor):
         """Return the vocab size of the model."""
         # Unlike some other VLMs, mistral3's vocab size is stored in its `text_config`, not the top-level
         # config.
-        return self.model_config.text_config.vocab_size
+        return self.config.text_config.vocab_size
 
     def get_mm_token_ids(self) -> torch.Tensor:
         """Get the IDs of all multimodal tokens (placeholders and special tokens alike)."""

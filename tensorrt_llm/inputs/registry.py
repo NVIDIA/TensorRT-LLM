@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import (Any, Callable, Dict, List, Optional, Protocol, Tuple, Type,
                     TypeVar)
 
+import torch
 from PIL import Image
 from torch import Tensor, nn
 
@@ -21,6 +22,11 @@ N = TypeVar("N", bound=Type[nn.Module])
 
 ExtraProcessedInputs = Dict[str, Any]
 
+from abc import ABC, abstractmethod
+
+from transformers import (AutoProcessor, PretrainedConfig,
+                          PreTrainedTokenizerBase)
+
 
 class InputProcessor(Protocol):
     """
@@ -35,9 +41,8 @@ class InputProcessor(Protocol):
     """
 
     model_path: any
-    model_config: any
+    config: any
     tokenizer: any
-    multimodal_hashing_supported: Optional[bool] = None
 
     def __call__(
         self, inputs: TextPrompt, sampling_params: SamplingParams
@@ -45,197 +50,16 @@ class InputProcessor(Protocol):
         ...
 
 
-class BaseDummyInputsBuilder:
-    """
-    Base class for generating dummy inputs. Specially for profiling
-    """
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.image_max_dim = 16384
-        self.img_min_dim = 128
-
-    def get_dummy_image(self, max_width: int, max_height: int):
-        image = Image.new("RGB", (max_width, max_height),
-                          color=random.randint(0, 256))
-        return image
-
-    def get_dummy_prompt(self, input_seq_len: int):
-        # TODO(yechank): We use the max resolution as starting point and keep reducing the resolution until the prompt length is less than the input sequence length.
-        # Need to find better way to calculate the dummy prompt length as this iteration may not be efficient.
-        while self.image_max_dim >= self.img_min_dim:
-            image = self.get_dummy_image(max_width=self.image_max_dim,
-                                         max_height=self.image_max_dim)
-
-            test_mm_prompt = tensorrt_llm.inputs.utils.default_multimodal_input_loader(
-                tokenizer=self.tokenizer,
-                model_dir=self.model_path,
-                model_type=self.model_config.model_type,
-                modality="image",
-                prompts=[""],
-                media=[[image]],
-                image_data_format="pt")[0]
-
-            prompt_token_ids_single_img, _ = self(test_mm_prompt, None)
-
-            if len(prompt_token_ids_single_img) <= input_seq_len:
-                return test_mm_prompt
-
-            # reduce img resolution
-            self.image_max_dim = self.image_max_dim >> 1
-
-        return None
-
-
-class BaseMultimodalInputProcessor:
-    """
-    Base class for multimodal input processors with default implementations
-    of get_num_tokens_per_image and get_num_tokens_per_video methods.
-
-    This class provides default implementations that work with most AutoProcessor-based
-    models. Specific processors can override these methods if they need custom logic.
-    """
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
-    def get_processor(self) -> Optional[Any]:
-        """Return the processor object if available; otherwise raise NotImplementedError.
-        """
-        if not hasattr(self, 'processor') and not hasattr(self, '_processor'):
-            raise NotImplementedError(
-                f"cannot find processor in {self.__class__.__name__}. "
-                "Please ensure the processor is stored under self.processor or self._processor."
-            )
-        return getattr(self, 'processor', getattr(self, '_processor', None))
-
-    def get_vocab_size(self) -> Optional[int]:
-        """Return the tokenizer/model vocabulary size if available; otherwise None.
-
-        Resolution order:
-        1) self.model_config.vocab_size
-        2) self.tokenizer.vocab_size
-        """
-        # 1) Model config
-        if hasattr(self, 'model_config') and getattr(
-                self.model_config, 'vocab_size', None) is not None:
-            return int(self.model_config.vocab_size)
-
-        # 2) Direct tokenizer on self
-        if hasattr(self, 'tokenizer') and getattr(self.tokenizer, 'vocab_size',
-                                                  None) is not None:
-            return int(self.tokenizer.vocab_size)
-
-        logger.debug(
-            f"Cannot determine vocab_size from {self.__class__.__name__}. "
-            "Please override this method to provide the vocabulary size. ")
-        return None
-
-    def get_mm_token_ids(self) -> Optional[Tensor]:
-        """Return multimodal token IDs if available; otherwise None.
-
-        The token IDs filtered by this method should be contiguous for each multimodal item, i.e. special tokens if any should be included.
-        """
-        processor = self.get_processor()
-        if processor is not None and getattr(processor, 'mm_token_ids',
-                                             None) is not None:
-            return processor.mm_token_ids
-
-        logger.debug(
-            f"Cannot determine mm_token_ids from {self.__class__.__name__}. "
-            "If needed, please override this method to return multimodal token ids. "
-        )
-        return None
-
-    def get_mm_special_token_ids(self) -> Optional[Tensor]:
-        """
-        Return multimodal special token IDs if available; otherwise None.
-
-        Special tokens refer to multimodal-related tokens (e.g. <image_end>, <image_break>) that are not part
-        of the ViT output but come from text embeddings. Some VLMs
-        (e.g., Mistral3, LLaMA4) mix special tokens with multimodal tokens,
-        so they need to be returned separately.
-        """
-        processor = self.get_processor()
-        return getattr(processor, "mm_special_token_ids",
-                       None) if processor else None
-
-    @property
-    def get_num_multimodal_tokens(self):
-        """
-        Get the Hugging Face processor's '_get_num_multimodal_tokens' method.
-        """
-        processor = self.get_processor()
-        if processor is not None and hasattr(processor,
-                                             '_get_num_multimodal_tokens'):
-            return processor._get_num_multimodal_tokens
-        else:
-            raise NotImplementedError(
-                f"get_num_multimodal_tokens not implemented for {self.__class__.__name__}. "
-                "Please override this method or ensure the processor has _get_num_multimodal_tokens method."
-            )
-
-    def get_num_tokens_per_image(
-        self,
-        *,
-        image: Image.Image,
-        **kwargs,
-    ):
-        """
-        Calculate the number of tokens generated for an image.
-
-        This (default) method delegates to the Hugging Face processor's '_get_num_multimodal_tokens' method.
-        Returns the token count for the given image.
-
-        Subclasses can override this method to provide custom logic to calculate the number of tokens.
-        """
-        image_height = image.height
-        image_width = image.width
-        image_size = (image_height, image_width)
-        return self.get_num_multimodal_tokens([image_size],
-                                              **kwargs)["num_image_tokens"][0]
-
-    def get_num_tokens_per_video(
-        self,
-        *,
-        video: List[Image.Image],
-        **kwargs,
-    ):
-        """
-        Calculate the number of tokens generated for a video.
-
-        This (default) method delegates to the Hugging Face processor's '_get_num_multimodal_tokens' method.
-        Returns the token count for the given video.
-
-        Subclasses can override this method to provide custom logic to calculate the number of tokens.
-        """
-        video_width = video[0].width
-        video_height = video[0].height
-        num_frames = len(video)
-        video_size = (num_frames, video_height, video_width)
-        try:
-            num_video_tokens = self.get_num_multimodal_tokens(
-                video_sizes=[video_size], **kwargs)["num_video_tokens"][0]
-            return num_video_tokens
-        except Exception:
-            # Fallback: treat video as sequence of frames
-            num_tokens_per_frame = self.get_num_tokens_per_image(image=video[0],
-                                                                 **kwargs)
-            temporal_patch_size = self.temporal_patch_size if hasattr(
-                self, 'temporal_patch_size') else 1
-            return num_tokens_per_frame * num_frames // temporal_patch_size
-
-
 class DefaultInputProcessor(InputProcessor):
     """Preprocess the inputs to the model."""
 
     def __init__(self,
                  model_path,
-                 model_config,
+                 config,
                  tokenizer,
                  trust_remote_code: bool = True) -> None:
         self.tokenizer = tokenizer
-        self.model_config = model_config
+        self.config = config
         self.model_path = model_path
         self.multimodal_hashing_supported = None
 
@@ -294,6 +118,243 @@ class DefaultInputProcessor(InputProcessor):
             return token_ids, {"query_token_ids": query_token_ids}
 
         return token_ids, None
+
+
+class BaseMultimodalInputProcessor(InputProcessor, ABC):
+    """
+    Base class for multimodal input processors with default implementations
+    of get_num_tokens_per_image and get_num_tokens_per_video methods.
+
+    This class provides default implementations that work with most AutoProcessor-based
+    models. Specific processors can override these methods if they need custom logic.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._use_fast: bool = kwargs.get('use_fast', True)
+        self._multimodal_hashing_supported: Optional[bool] = None
+
+    @property
+    @abstractmethod
+    def processor(self) -> AutoProcessor:
+        """The HF AutoProcessor for this model."""
+        ...
+
+    @property
+    @abstractmethod
+    def tokenizer(self) -> PreTrainedTokenizerBase:
+        """The HF tokenizer for this model."""
+        ...
+
+    @property
+    @abstractmethod
+    def config(self) -> PretrainedConfig:
+        """The HF pretrained config for this model."""
+        ...
+
+    @property
+    @abstractmethod
+    def dtype(self) -> torch.dtype:
+        """The dtype for this model."""
+        ...
+
+    @abstractmethod
+    def __call__(
+        self, inputs: TextPrompt, sampling_params: SamplingParams
+    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+        ...
+
+    @property
+    def use_fast(self) -> bool:
+        """
+        Whether to use fast tokenizer for AutoProcessor.
+        Default is True for most multimodal models.
+        """
+        return self._use_fast
+
+    @property
+    def multimodal_hashing_supported(self) -> Optional[bool]:
+        """
+        Whether multimodal hashing is supported for this processor.
+
+        Returns None if unknown (will be detected at runtime),
+        True if supported, False if not supported.
+        """
+        return self._multimodal_hashing_supported
+
+    @multimodal_hashing_supported.setter
+    def multimodal_hashing_supported(self, value: Optional[bool]) -> None:
+        """Set the multimodal hashing support status (used for runtime detection)."""
+        self._multimodal_hashing_supported = value
+
+    def get_vocab_size(self) -> Optional[int]:
+        """Return the tokenizer/model vocabulary size if available; otherwise None.
+
+        Resolution order:
+        1) self.config.vocab_size
+        2) self.tokenizer.vocab_size
+        """
+        # 1) Model config
+        if hasattr(self.config, 'vocab_size'):
+            return int(self.config.vocab_size)
+
+        # 2) Direct tokenizer on self
+        if hasattr(self.tokenizer, 'vocab_size'):
+            return int(self.tokenizer.vocab_size)
+
+        logger.debug(
+            f"Cannot determine vocab_size from {self.__class__.__name__}. "
+            "Please override this method to provide the vocabulary size. ")
+        return None
+
+    def get_mm_token_ids(self) -> Optional[Tensor]:
+        """Return multimodal token IDs if available; otherwise None.
+
+        The token IDs filtered by this method should be contiguous for each multimodal item, i.e. special tokens if any should be included.
+        """
+        if hasattr(self.processor, 'mm_token_ids'):
+            return self.processor.mm_token_ids
+
+        logger.debug(
+            f"Cannot find mm_token_ids in {self.__class__.__name__}.processor. "
+            "If needed, please override this method to return multimodal token ids. "
+        )
+        return None
+
+    def get_mm_special_token_ids(self) -> Optional[Tensor]:
+        """
+        Return multimodal special token IDs if available; otherwise None.
+
+        Special tokens refer to multimodal-related tokens (e.g. <image_end>, <image_break>) that are not part
+        of the ViT output but come from text embeddings. Some VLMs
+        (e.g., Mistral3, LLaMA4) mix special tokens with multimodal tokens,
+        so they need to be returned separately.
+        """
+        return getattr(self.processor, "mm_special_token_ids", None)
+
+    @property
+    def get_num_multimodal_tokens(self):
+        """
+        Get the Hugging Face processor's '_get_num_multimodal_tokens' method.
+        """
+        if hasattr(self.processor, '_get_num_multimodal_tokens'):
+            return self.processor._get_num_multimodal_tokens
+        else:
+            raise NotImplementedError(
+                f"get_num_multimodal_tokens not implemented for {self.__class__.__name__}. "
+                "Please override this method or ensure the processor has _get_num_multimodal_tokens method."
+            )
+
+    def get_num_tokens_per_image(
+        self,
+        *,
+        image: Image.Image,
+        **kwargs,
+    ):
+        """
+        Calculate the number of tokens generated for an image.
+
+        This (default) method delegates to the Hugging Face processor's '_get_num_multimodal_tokens' method.
+        Returns the token count for the given image.
+
+        Subclasses can override this method to provide custom logic to calculate the number of tokens.
+        """
+        image_height = image.height
+        image_width = image.width
+        image_size = (image_height, image_width)
+        return self.get_num_multimodal_tokens([image_size],
+                                              **kwargs)["num_image_tokens"][0]
+
+    def get_num_tokens_per_video(
+        self,
+        *,
+        video: List[Image.Image],
+        **kwargs,
+    ):
+        """
+        Calculate the number of tokens generated for a video.
+
+        This (default) method delegates to the Hugging Face processor's '_get_num_multimodal_tokens' method.
+        Returns the token count for the given video.
+
+        Subclasses can override this method to provide custom logic to calculate the number of tokens.
+        """
+        video_width = video[0].width
+        video_height = video[0].height
+        num_frames = len(video)
+        video_size = (num_frames, video_height, video_width)
+        try:
+            num_video_tokens = self.get_num_multimodal_tokens(
+                video_sizes=[video_size], **kwargs)["num_video_tokens"][0]
+            return num_video_tokens
+        except Exception:
+            # Fallback: treat video as sequence of frames
+            num_tokens_per_frame = self.get_num_tokens_per_image(image=video[0],
+                                                                 **kwargs)
+            temporal_patch_size = self.temporal_patch_size if hasattr(
+                self, 'temporal_patch_size') else 1
+            return num_tokens_per_frame * num_frames // temporal_patch_size
+
+
+class BaseMultimodalDummyInputsBuilder(ABC):
+    """
+    Base class for generating dummy inputs. Specially for profiling
+    """
+
+    DEFAULT_IMAGE_MAX_DIM = 16384
+    DEFAULT_IMAGE_MIN_DIM = 128
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.image_max_dim = kwargs.get('image_max_dim',
+                                        self.DEFAULT_IMAGE_MAX_DIM)
+        self.img_min_dim = kwargs.get('img_min_dim', self.DEFAULT_IMAGE_MIN_DIM)
+
+    @property
+    @abstractmethod
+    def tokenizer(self) -> PreTrainedTokenizerBase:
+        pass
+
+    @property
+    @abstractmethod
+    def config(self) -> PretrainedConfig:
+        pass
+
+    @property
+    @abstractmethod
+    def model_path(self) -> str:
+        pass
+
+    def get_dummy_image(self, max_width: int, max_height: int) -> Image.Image:
+        image = Image.new("RGB", (max_width, max_height),
+                          color=random.randint(0, 256))
+        return image
+
+    def get_dummy_prompt(self, input_seq_len: int):
+        # TODO(yechank): We use the max resolution as starting point and keep reducing the resolution until the prompt length is less than the input sequence length.
+        # Need to find better way to calculate the dummy prompt length as this iteration may not be efficient.
+        while self.image_max_dim >= self.img_min_dim:
+            image = self.get_dummy_image(max_width=self.image_max_dim,
+                                         max_height=self.image_max_dim)
+
+            test_mm_prompt = tensorrt_llm.inputs.utils.default_multimodal_input_loader(
+                tokenizer=self.tokenizer,
+                model_dir=self.model_path,
+                model_type=self.config.model_type,
+                modality="image",
+                prompts=[""],
+                media=[[image]],
+                image_data_format="pt")[0]
+
+            prompt_token_ids_single_img, _ = self(test_mm_prompt, None)
+
+            if len(prompt_token_ids_single_img) <= input_seq_len:
+                return test_mm_prompt
+
+            # reduce img resolution
+            self.image_max_dim = self.image_max_dim >> 1
+
+        return None
 
 
 class MultimodalPlaceholderPlacement(enum.Enum):
@@ -513,7 +574,6 @@ def create_input_processor(
                                                  trust_remote_code=True)
             model_config = config.pretrained_config
         except (ValueError, EnvironmentError) as e:
-            config = None
             logger.debug(
                 f"Unable to load HF config from {model_path_or_dir}: {e}. Falling back."
             )
@@ -539,7 +599,7 @@ def create_input_processor(
 
 
 def create_input_processor_with_hash(
-    input_processor: InputProcessor,
+    input_processor: BaseMultimodalInputProcessor,
     hash_lib=default_hasher,
 ) -> Callable[[TextPrompt, SamplingParams], Tuple[
         List[int], Optional[ExtraProcessedInputs]]]:
