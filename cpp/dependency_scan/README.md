@@ -9,7 +9,10 @@ A build artifact is any header file used in the build, and any linked static/dyn
 # Run scanner (scans ../build by default)
 python scan_build_artifacts.py
 
-# Output: scan_output/known.yml, scan_output/unknown.yml
+# Output:
+#   scan_output/known.yml         - Mapped artifacts
+#   scan_output/unknown.yml       - Unmapped artifacts
+#   scan_output/path_issues.yml   - Non-existent paths
 ```
 
 ## Goals and Non-Goals
@@ -70,7 +73,7 @@ python scan_build_artifacts.py --validate
 ## Resolution Strategy
 
 1. **dpkg-query**: System packages via Debian package manager
-2. **YAML patterns**: Non-dpkg packages (CUDA, TensorRT, PyTorch, etc.)
+2. **YAML patterns**: Non-dpkg packages (TensorRT, PyTorch, 3rdparty/ submodules, etc.)
 
 ## Output Format
 
@@ -108,11 +111,51 @@ summary:
 artifacts: []
 ```
 
+### path_issues.yml
+
+Reports artifacts whose resolved paths don't exist in the filesystem. This helps identify:
+- Stale build artifacts from old builds
+- Incorrectly resolved paths
+- Optional headers that may not be present
+- Temporary build files that were deleted
+
+**Note:** Library artifacts are excluded from this report since they don't have meaningful path resolution metadata.
+
+```yaml
+summary:
+  count: 1042
+  total_artifacts: 12238
+  percentage: 8.5%
+  note: These header paths were resolved from .d files but do not exist in the filesystem (libraries excluded)
+
+non_existent_paths:
+- resolved_path: /usr/local/lib/python3.12/dist-packages/torch/include/ATen/ops/_cudnn_attention_backward.h
+  type: header
+  source: /home/.../trtGptModelInflightBatching.cpp.o.d
+  d_file_path: /usr/local/lib/python3.12/dist-packages/torch/include/ATen/ops/_cudnn_attention_backward.h
+```
+
+**Field Descriptions:**
+- `resolved_path`: The final canonicalized absolute path after resolution
+- `type`: Artifact type (typically "header")
+- `source`: The .d file where this path was found
+- `d_file_path`: The original path as it appeared in the .d file (may be relative or absolute)
+
+**Common Causes:**
+- **Optional headers**: PyTorch/CUDA headers that don't exist in all installations (e.g., `_cudnn_attention_*`)
+- **Old CUDA paths**: References to previous CUDA versions no longer installed (e.g., `cuda-13.0` when only `cuda-12.9` exists)
+- **Build artifacts**: Temporary generated files deleted after build completion
+- **Stale .d files**: Dependency files from previous builds with different directory structures
+
+**Action:** Review the list and determine if these are expected (optional/temporary) or indicate path resolution issues.
+
 ## Iterative Workflow
 
 1. **Run scanner** on build directory
-2. **Review** `scan_output/unknown.yml` for unmapped artifacts
-3. **Add patterns** to `metadata/*.yml` files
+2. **Review outputs**:
+   - `scan_output/unknown.yml` - unmapped artifacts requiring pattern additions
+   - `scan_output/path_issues.yml` - non-existent paths (may indicate stale builds or optional dependencies)
+3. **Add patterns** to `metadata/*.yml` files for unknown artifacts
 4. **Re-run** to verify improved coverage
 5. **Repeat** until all artifacts mapped
 
@@ -200,7 +243,6 @@ Multiple dependencies can be grouped in list format (see `metadata/base.yml`, `m
 ```bash
 cd tests
 python -m pytest test_scan_build_artifacts.py -v
-# Expected: 40 passed
 ```
 
 ## Troubleshooting
@@ -220,6 +262,11 @@ python -m pytest test_scan_build_artifacts.py -v
 - More specific patterns should be listed first
 - Make sure the patterns are very specific, to avoid false positives, or interfering with other patterns.
 
+**High percentage in path_issues.yml**
+- If >20%, likely indicates stale build artifacts - run a clean rebuild
+- If <10%, likely optional/temporary headers - expected behavior
+- Check for references to uninstalled CUDA versions
+
 **Slow performance**
 - Use `--build-dir` to target specific subdirectories
 - Reduce build artifacts scope
@@ -227,7 +274,7 @@ python -m pytest test_scan_build_artifacts.py -v
 ## Architecture
 
 ```
-scan_build_artifacts.py (1,000 lines)
+scan_build_artifacts.py (1,300 lines)
 ├── DpkgResolver - dpkg-query for system packages
 ├── ArtifactCollector - Parse D files, link files, wheels
 ├── PatternMatcher - 3-tier YAML pattern matching
@@ -253,9 +300,31 @@ scan_build_artifacts.py (1,000 lines)
    - Parser extracts library name and converts to linker flag: `-ltest`
    - Enables proper dependency mapping for internal build artifacts
 
-3. **3rdparty Submodule Resolution** (_parse_d_file method)
+3. **CMake .d File Path Resolution** (_parse_d_file method, lines 356-364)
+   - **Critical Fix (October 2025)**: Changed context directory for path resolution
+   - CMake generates .d files with paths relative to the **target's build directory** (where the Makefile for that target is located), **NOT** the top-level build directory
+   - **Context Directory**: Parent directory of `CMakeFiles/` (e.g., `/build/tensorrt_llm/batch_manager/`)
+   - **Example**: For .d file at `/build/tensorrt_llm/batch_manager/CMakeFiles/target.dir/file.cpp.o.d`:
+     - **Context is**: `/build/tensorrt_llm/batch_manager/` (parent of CMakeFiles)
+     - **NOT**: `/build/` (top-level build directory)
+     - Relative path `../../../tensorrt_llm/...` resolves correctly from this context
+   - **Before Fix**: Used `d_file.parent` (adjacent to CMakeFiles directory) - caused 49.9% path resolution errors
+   - **After Fix**: Uses parent of CMakeFiles directory - reduced errors to 7.2%
+   - **Path Existence Tracking**: Scanner marks each artifact with `path_exists` metadata and reports non-existent paths in `path_issues.yml`
+
+   **Algorithm:**
+   ```python
+   d_file_parts = d_file.parts
+   if 'CMakeFiles' in d_file_parts:
+       cmake_idx = d_file_parts.index('CMakeFiles')
+       context_dir = Path(*d_file_parts[:cmake_idx])  # Parent of CMakeFiles
+   else:
+       context_dir = self.build_dir  # Fallback
+   ```
+
+4. **3rdparty Submodule Resolution** (_parse_d_file method)
    - When D files contain relative paths with submodule directories that don't exist relative to the build directory, the scanner attempts to resolve them from the configured submodules directory
-   - **Configuration**: Set via `THIRDPARTY_ROOT` constant in scan_build_artifacts.py (line 46)
+   - **Configuration**: Set via `THIRDPARTY_ROOT` constant in scan_build_artifacts.py
    - **Default**: `TRTLLM_ROOT/3rdparty` (3 levels up from scanner location)
    - **Customization**: Edit the `THIRDPARTY_ROOT` constant if dependencies move (e.g., to `${CMAKE_BINARY_DIR}/_deps/`)
    - **Example**: `../../../../3rdparty/xgrammar/include/file.h` resolves to `{THIRDPARTY_ROOT}/xgrammar/include/file.h`
@@ -264,14 +333,13 @@ scan_build_artifacts.py (1,000 lines)
 1. Collect artifacts from build directory
 2. Try dpkg-query resolution (PRIMARY)
 3. Fall back to YAML patterns (FALLBACK)
-4. Generate known.yml and unknown.yml reports
+4. Generate known.yml, unknown.yml, and path_issues.yml reports
 
 ## Files
 
 - `scan_build_artifacts.py` - Main scanner script
-- `metadata/*.yml` - Dependency patterns (48 dependencies defined)
+- `metadata/*.yml` - Dependency patterns
 - `metadata/_template.yml` - Template for new dependencies
 - `metadata/_schema.yml` - YAML validation schema
 - `metadata/README.md` - Pattern documentation
 - `tests/test_scan_build_artifacts.py` - Unit tests
-- `BUG_FIX_SUMMARY.md` - Historical bug fix documentation

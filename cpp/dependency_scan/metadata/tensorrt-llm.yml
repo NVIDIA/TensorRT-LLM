@@ -9,4 +9,4 @@ basename_matches:
 linker_flags_matches:
 - -ltensorrt_llm
 directory_matches:
-- tensorrt_llm
+- tensorrt_llm/cpp

@@ -13,6 +13,7 @@ Run with: python -m pytest test_scan_build_artifacts.py -v
 """
 
 # Import modules under test
+import os
 import sys
 import zipfile
 from pathlib import Path
@@ -378,6 +379,218 @@ Dynamic section at offset 0x1000 contains 20 entries:
         # Should deduplicate by path
         paths = [a.path for a in artifacts]
         assert len(paths) == len(set(paths))  # No duplicates
+
+    def test_parse_d_file_relative_path_resolution(self, tmp_path):
+        """Test _parse_d_file resolves paths relative to build_dir, not .d file's parent
+
+        This test verifies the fix for the critical bug where relative paths in CMake .d files
+        were being resolved from the wrong directory. CMake .d files use paths relative to the
+        build root, not the .d file's directory.
+        """
+        # Create a realistic directory structure:
+        # tmp_path (build_dir)
+        # ├── CMakeFiles/
+        # │   └── deeply/
+        # │       └── nested/
+        # │           └── target.dir/
+        # │               └── test.d  (contains relative paths)
+        # └── tensorrt_llm/
+        #     └── runtime/
+        #         └── layerProfiler.h  (target file)
+
+        # Create the target header file
+        runtime_dir = tmp_path / "tensorrt_llm" / "runtime"
+        runtime_dir.mkdir(parents=True)
+        target_header = runtime_dir / "layerProfiler.h"
+        target_header.write_text("// TensorRT-LLM runtime header\n")
+
+        # Create deeply nested .d file directory
+        d_file_dir = tmp_path / "CMakeFiles" / "deeply" / "nested" / "target.dir"
+        d_file_dir.mkdir(parents=True, exist_ok=True)
+        d_file = d_file_dir / "test.d"
+
+        # Write .d file with relative path from BUILD ROOT, not from .d file location
+        # From build root: tensorrt_llm/runtime/layerProfiler.h
+        # From .d file location: ../../../../../tensorrt_llm/runtime/layerProfiler.h would be wrong
+        d_file.write_text("build/foo.o: tensorrt_llm/runtime/layerProfiler.h\n")
+
+        collector = ArtifactCollector(tmp_path)
+        artifacts = collector._parse_d_file(d_file)
+
+        # Should resolve relative path using build_dir as context, not d_file.parent
+        assert len(artifacts) == 1, f"Expected 1 artifact, got {len(artifacts)}"
+        artifact = artifacts[0]
+
+        # Verify the path was resolved correctly
+        assert "layerProfiler.h" in artifact.path
+        assert artifact.type == "header"
+        assert artifact.source == str(d_file)
+
+        # Verify context_dir is build_dir, not d_file.parent
+        assert artifact.context_dir == str(tmp_path)
+
+        # Verify path exists (resolved correctly)
+        assert artifact.metadata.get('path_exists') is True
+
+        # Verify the resolved path points to the actual file
+        canonical_target = os.path.realpath(str(target_header))
+        assert artifact.path == canonical_target
+
+    def test_parse_d_file_build_root_context(self, tmp_path):
+        """Test that context_dir used for path resolution is self.build_dir
+
+        This test verifies that regardless of where the .d file is located in the build tree,
+        all relative paths are resolved from the same build root directory.
+        """
+        # Create headers at different locations
+        header1_dir = tmp_path / "include"
+        header1_dir.mkdir()
+        header1 = header1_dir / "test1.h"
+        header1.write_text("// test1 header\n")
+
+        header2_dir = tmp_path / "src" / "common"
+        header2_dir.mkdir(parents=True)
+        header2 = header2_dir / "test2.h"
+        header2.write_text("// test2 header\n")
+
+        # Create .d files at different depths
+        d_file1 = tmp_path / "shallow.d"
+        d_file1.write_text("build/obj1.o: include/test1.h\n")
+
+        d_file2_dir = tmp_path / "CMakeFiles" / "deep" / "nested"
+        d_file2_dir.mkdir(parents=True)
+        d_file2 = d_file2_dir / "deep.d"
+        d_file2.write_text("build/obj2.o: src/common/test2.h\n")
+
+        collector = ArtifactCollector(tmp_path)
+
+        # Parse both .d files
+        artifacts1 = collector._parse_d_file(d_file1)
+        artifacts2 = collector._parse_d_file(d_file2)
+
+        # Both should resolve successfully
+        assert len(artifacts1) == 1
+        assert len(artifacts2) == 1
+
+        # Both should use build_dir as context_dir
+        assert artifacts1[0].context_dir == str(tmp_path)
+        assert artifacts2[0].context_dir == str(tmp_path)
+
+        # Both should resolve to correct absolute paths
+        assert artifacts1[0].metadata.get('path_exists') is True
+        assert artifacts2[0].metadata.get('path_exists') is True
+
+        # Verify correct files were found
+        assert "test1.h" in artifacts1[0].path
+        assert "test2.h" in artifacts2[0].path
+
+    def test_parse_d_file_cross_project_paths(self, tmp_path):
+        """Test _parse_d_file handles paths that reference directories outside the build
+
+        This test verifies that paths referencing parent directories are resolved correctly
+        relative to build root, and that non-existent paths are properly marked.
+        """
+        # Create a project structure with 3rdparty dependencies:
+        # tmp_path (build_dir)
+        # ├── CMakeFiles/
+        # │   └── target.dir/
+        # │       └── test.d
+        # And simulate references to:
+        # ../../../../triton_backend/src/model.h (doesn't exist)
+        # ../../../tensorrt_llm/common/logger.h (exists)
+
+        # Create an existing header in a sibling directory structure
+        parent_dir = tmp_path.parent
+        trtllm_dir = parent_dir / "tensorrt_llm" / "common"
+        trtllm_dir.mkdir(parents=True, exist_ok=True)
+        existing_header = trtllm_dir / "logger.h"
+        existing_header.write_text("// Logger header\n")
+
+        # Create .d file with both existing and non-existing cross-project paths
+        d_file_dir = tmp_path / "CMakeFiles" / "target.dir"
+        d_file_dir.mkdir(parents=True)
+        d_file = d_file_dir / "test.d"
+
+        # These paths are relative to BUILD ROOT
+        d_file.write_text(
+            "build/foo.o: ../../../../triton_backend/src/model.h ../tensorrt_llm/common/logger.h\n"
+        )
+
+        collector = ArtifactCollector(tmp_path)
+        artifacts = collector._parse_d_file(d_file)
+
+        # Should process both paths
+        assert len(artifacts) == 2
+
+        # Find the artifacts
+        triton_artifact = None
+        logger_artifact = None
+
+        for artifact in artifacts:
+            if "triton_backend" in artifact.path:
+                triton_artifact = artifact
+            elif "logger.h" in artifact.path:
+                logger_artifact = artifact
+
+        # Verify triton_backend artifact (non-existent)
+        assert triton_artifact is not None
+        assert triton_artifact.type == "header"
+        assert triton_artifact.context_dir == str(tmp_path)
+        assert triton_artifact.metadata.get('path_exists') is False
+
+        # Verify logger artifact (exists)
+        assert logger_artifact is not None
+        assert logger_artifact.type == "header"
+        assert logger_artifact.context_dir == str(tmp_path)
+        assert logger_artifact.metadata.get('path_exists') is True
+
+        # Verify logger resolved to correct absolute path
+        canonical_existing = os.path.realpath(str(existing_header))
+        assert logger_artifact.path == canonical_existing
+
+    def test_parse_d_file_prevents_false_positives(self, tmp_path):
+        """Test that correct path resolution prevents false positives in dependency classification
+
+        This test demonstrates the practical impact of the bug fix: when paths are resolved
+        correctly from build_dir, dependencies are classified accurately.
+        """
+        # Scenario: A .d file deep in the build tree references a 3rdparty dependency
+        # OLD BUG: Would resolve from .d file's parent, potentially missing the file
+        # NEW FIX: Resolves from build root, finds the file correctly
+
+        # Create a 3rdparty dependency structure
+        third_party_dir = tmp_path / "3rdparty" / "cutlass" / "include"
+        third_party_dir.mkdir(parents=True)
+        cutlass_header = third_party_dir / "cutlass.h"
+        cutlass_header.write_text("// CUTLASS header\n")
+
+        # Create deeply nested .d file (simulating CMake's structure)
+        d_file_dir = tmp_path / "CMakeFiles" / "tensorrt_llm.dir" / "batch_manager" / "llm_request.cpp.o.d"
+        d_file_dir.parent.mkdir(parents=True, exist_ok=True)
+        d_file = d_file_dir
+
+        # .d file contains relative path from BUILD ROOT to cutlass
+        # OLD BUG: Would try to resolve from .d file's parent → incorrect path
+        # NEW FIX: Resolves from build root → correct path
+        d_file.write_text("build/obj.o: 3rdparty/cutlass/include/cutlass.h\n")
+
+        collector = ArtifactCollector(tmp_path)
+        artifacts = collector._parse_d_file(d_file)
+
+        # Should successfully resolve the path
+        assert len(artifacts) == 1
+        artifact = artifacts[0]
+
+        # Verify correct resolution
+        assert artifact.metadata.get('path_exists') is True
+        assert "cutlass.h" in artifact.path
+
+        # Verify it resolved to the actual file
+        canonical_cutlass = os.path.realpath(str(cutlass_header))
+        assert artifact.path == canonical_cutlass
+
+        # This artifact can now be correctly matched to cutlass dependency
+        # (with correct path resolution, pattern matching will work)
 
 
 # ============================================================================
@@ -1040,6 +1253,376 @@ class TestOutputGenerator:
 
         # Verify summary section is still included in YAML output
         assert "70.0%" in known_data['summary']['coverage']
+
+    def test_generate_path_issues_yml_basic(self, tmp_path):
+        """Test generate() creates path_issues.yml with non-existent headers"""
+        artifacts = [
+            Artifact(path="/usr/include/stdio.h",
+                     type="header",
+                     source="test.d",
+                     metadata={'path_exists': True}),
+            Artifact(path="/nonexistent/header.h",
+                     type="header",
+                     source="test2.d",
+                     metadata={
+                         'path_exists': False,
+                         'original_path': 'nonexistent/header.h'
+                     }),
+            Artifact(path="/missing/include.h",
+                     type="header",
+                     source="test3.d",
+                     metadata={
+                         'path_exists': False,
+                         'original_path': 'missing/include.h'
+                     }),
+        ]
+
+        mappings = [
+            Mapping(artifact=artifacts[0],
+                    dependency="libc6",
+                    confidence="high",
+                    strategy="dpkg-query")
+        ]
+
+        output_dir = tmp_path / "reports"
+        OutputGenerator.generate(mappings, artifacts, output_dir)
+
+        # Check path_issues.yml exists
+        path_issues_file = output_dir / "path_issues.yml"
+        assert path_issues_file.exists()
+
+        # Load and verify content
+        with open(path_issues_file) as f:
+            path_issues_data = yaml.safe_load(f)
+
+        # Should have 2 non-existent paths (not the existing one)
+        assert path_issues_data['summary']['count'] == 2
+        assert path_issues_data['summary']['total_artifacts'] == 3
+        assert path_issues_data['summary']['percentage'] == "66.7%"
+
+        # Verify non_existent_paths contains the right entries
+        non_existent_paths = path_issues_data['non_existent_paths']
+        assert len(non_existent_paths) == 2
+
+        # Check field names
+        assert all('resolved_path' in entry for entry in non_existent_paths)
+        assert all('type' in entry for entry in non_existent_paths)
+        assert all('source' in entry for entry in non_existent_paths)
+        assert all('d_file_path' in entry for entry in non_existent_paths)
+
+        # Check values
+        paths = [entry['resolved_path'] for entry in non_existent_paths]
+        assert "/nonexistent/header.h" in paths
+        assert "/missing/include.h" in paths
+        assert "/usr/include/stdio.h" not in paths
+
+    def test_generate_path_issues_yml_excludes_libraries(self, tmp_path):
+        """Test path_issues.yml excludes library artifacts even if they don't exist"""
+        artifacts = [
+            Artifact(path="/nonexistent/header.h",
+                     type="header",
+                     source="test.d",
+                     metadata={
+                         'path_exists': False,
+                         'original_path': 'nonexistent/header.h'
+                     }),
+            Artifact(path="-lmissing",
+                     type="library",
+                     source="link.txt",
+                     metadata={'path_exists': False}),
+            Artifact(path="/missing/libfoo.so",
+                     type="library",
+                     source="link.txt",
+                     metadata={'path_exists': False}),
+        ]
+
+        mappings = []
+
+        output_dir = tmp_path / "reports"
+        OutputGenerator.generate(mappings, artifacts, output_dir)
+
+        # Load path_issues.yml
+        path_issues_file = output_dir / "path_issues.yml"
+        with open(path_issues_file) as f:
+            path_issues_data = yaml.safe_load(f)
+
+        # Should only have 1 entry (the header, not the libraries)
+        assert path_issues_data['summary']['count'] == 1
+        assert len(path_issues_data['non_existent_paths']) == 1
+
+        # Verify it's the header
+        entry = path_issues_data['non_existent_paths'][0]
+        assert entry['resolved_path'] == "/nonexistent/header.h"
+        assert entry['type'] == "header"
+        assert entry['d_file_path'] == "nonexistent/header.h"
+
+    def test_generate_path_issues_yml_field_names(self, tmp_path):
+        """Test path_issues.yml has correct field names (not 'path', but 'resolved_path')"""
+        artifacts = [
+            Artifact(path="/resolved/absolute/path.h",
+                     type="header",
+                     source="build/CMakeFiles/test.d",
+                     metadata={
+                         'path_exists': False,
+                         'original_path': 'relative/path.h'
+                     }),
+        ]
+
+        mappings = []
+
+        output_dir = tmp_path / "reports"
+        OutputGenerator.generate(mappings, artifacts, output_dir)
+
+        # Load path_issues.yml
+        path_issues_file = output_dir / "path_issues.yml"
+        with open(path_issues_file) as f:
+            path_issues_data = yaml.safe_load(f)
+
+        entry = path_issues_data['non_existent_paths'][0]
+
+        # Verify field names
+        assert 'resolved_path' in entry
+        assert 'type' in entry
+        assert 'source' in entry
+        assert 'd_file_path' in entry
+
+        # Verify it does NOT use 'path' as field name
+        assert 'path' not in entry
+
+        # Verify values
+        assert entry['resolved_path'] == "/resolved/absolute/path.h"
+        assert entry['type'] == "header"
+        assert entry['source'] == "build/CMakeFiles/test.d"
+        assert entry['d_file_path'] == "relative/path.h"
+
+    def test_generate_path_issues_yml_percentage_calculation(self, tmp_path):
+        """Test path_issues.yml calculates percentage correctly"""
+        # Create 10 artifacts: 3 non-existent headers, 7 existing
+        artifacts = []
+        for i in range(3):
+            artifacts.append(
+                Artifact(path=f"/missing{i}.h",
+                         type="header",
+                         source="test.d",
+                         metadata={
+                             'path_exists': False,
+                             'original_path': f'missing{i}.h'
+                         }))
+        for i in range(7):
+            artifacts.append(
+                Artifact(path=f"/exists{i}.h",
+                         type="header",
+                         source="test.d",
+                         metadata={'path_exists': True}))
+
+        mappings = []
+
+        output_dir = tmp_path / "reports"
+        OutputGenerator.generate(mappings, artifacts, output_dir)
+
+        # Load path_issues.yml
+        path_issues_file = output_dir / "path_issues.yml"
+        with open(path_issues_file) as f:
+            path_issues_data = yaml.safe_load(f)
+
+        # 3 out of 10 = 30%
+        assert path_issues_data['summary']['count'] == 3
+        assert path_issues_data['summary']['total_artifacts'] == 10
+        assert path_issues_data['summary']['percentage'] == "30.0%"
+
+    def test_generate_path_issues_yml_only_includes_path_exists_false(
+            self, tmp_path):
+        """Test path_issues.yml only includes artifacts with path_exists=False"""
+        artifacts = [
+            Artifact(path="/exists.h",
+                     type="header",
+                     source="test.d",
+                     metadata={'path_exists': True}),
+            Artifact(path="/missing.h",
+                     type="header",
+                     source="test.d",
+                     metadata={
+                         'path_exists': False,
+                         'original_path': 'missing.h'
+                     }),
+            Artifact(path="/no_metadata.h", type="header",
+                     source="test.d"),  # No metadata
+        ]
+
+        mappings = []
+
+        output_dir = tmp_path / "reports"
+        OutputGenerator.generate(mappings, artifacts, output_dir)
+
+        # Load path_issues.yml
+        path_issues_file = output_dir / "path_issues.yml"
+        with open(path_issues_file) as f:
+            path_issues_data = yaml.safe_load(f)
+
+        # Only the one with path_exists=False
+        assert path_issues_data['summary']['count'] == 1
+        assert len(path_issues_data['non_existent_paths']) == 1
+        assert path_issues_data['non_existent_paths'][0][
+            'resolved_path'] == "/missing.h"
+
+    def test_generate_path_issues_yml_empty_when_all_exist(self, tmp_path):
+        """Test path_issues.yml has zero entries when all paths exist"""
+        artifacts = [
+            Artifact(path="/exists1.h",
+                     type="header",
+                     source="test.d",
+                     metadata={'path_exists': True}),
+            Artifact(path="/exists2.h",
+                     type="header",
+                     source="test.d",
+                     metadata={'path_exists': True}),
+        ]
+
+        mappings = []
+
+        output_dir = tmp_path / "reports"
+        OutputGenerator.generate(mappings, artifacts, output_dir)
+
+        # Load path_issues.yml
+        path_issues_file = output_dir / "path_issues.yml"
+        with open(path_issues_file) as f:
+            path_issues_data = yaml.safe_load(f)
+
+        # Should have 0 entries
+        assert path_issues_data['summary']['count'] == 0
+        assert path_issues_data['summary']['total_artifacts'] == 2
+        assert path_issues_data['summary']['percentage'] == "0.0%"
+        assert len(path_issues_data['non_existent_paths']) == 0
+
+    def test_generate_path_issues_yml_mixed_artifact_types(self, tmp_path):
+        """Test path_issues.yml with headers, libraries, and binaries"""
+        artifacts = [
+            Artifact(path="/missing_header.h",
+                     type="header",
+                     source="test.d",
+                     metadata={
+                         'path_exists': False,
+                         'original_path': 'missing_header.h'
+                     }),
+            Artifact(path="-lmissing",
+                     type="library",
+                     source="link.txt",
+                     metadata={'path_exists': False}),
+            Artifact(path="/missing_binary.so",
+                     type="binary",
+                     source="wheel",
+                     metadata={
+                         'path_exists': False,
+                         'original_path': 'missing_binary.so'
+                     }),
+        ]
+
+        mappings = []
+
+        output_dir = tmp_path / "reports"
+        OutputGenerator.generate(mappings, artifacts, output_dir)
+
+        # Load path_issues.yml
+        path_issues_file = output_dir / "path_issues.yml"
+        with open(path_issues_file) as f:
+            path_issues_data = yaml.safe_load(f)
+
+        # Should include header and binary, but not library
+        assert path_issues_data['summary']['count'] == 2
+        assert len(path_issues_data['non_existent_paths']) == 2
+
+        # Verify types
+        types = {
+            entry['type']
+            for entry in path_issues_data['non_existent_paths']
+        }
+        assert 'header' in types
+        assert 'binary' in types
+        assert 'library' not in types
+
+    def test_generate_path_issues_yml_original_path_metadata(self, tmp_path):
+        """Test path_issues.yml uses original_path metadata for d_file_path field"""
+        artifacts = [
+            Artifact(path="/resolved/absolute/path/include/header.h",
+                     type="header",
+                     source="build/CMakeFiles/target.dir/test.d",
+                     metadata={
+                         'path_exists': False,
+                         'original_path': 'relative/include/header.h'
+                     }),
+        ]
+
+        mappings = []
+
+        output_dir = tmp_path / "reports"
+        OutputGenerator.generate(mappings, artifacts, output_dir)
+
+        # Load path_issues.yml
+        path_issues_file = output_dir / "path_issues.yml"
+        with open(path_issues_file) as f:
+            path_issues_data = yaml.safe_load(f)
+
+        entry = path_issues_data['non_existent_paths'][0]
+
+        # d_file_path should be the original relative path from the .d file
+        assert entry['d_file_path'] == 'relative/include/header.h'
+        # resolved_path should be the absolute resolved path
+        assert entry[
+            'resolved_path'] == "/resolved/absolute/path/include/header.h"
+
+    def test_generate_path_issues_yml_missing_original_path_metadata(
+            self, tmp_path):
+        """Test path_issues.yml handles missing original_path metadata gracefully"""
+        artifacts = [
+            Artifact(path="/missing.h",
+                     type="header",
+                     source="test.d",
+                     metadata={'path_exists': False}),  # No original_path
+        ]
+
+        mappings = []
+
+        output_dir = tmp_path / "reports"
+        OutputGenerator.generate(mappings, artifacts, output_dir)
+
+        # Load path_issues.yml
+        path_issues_file = output_dir / "path_issues.yml"
+        with open(path_issues_file) as f:
+            path_issues_data = yaml.safe_load(f)
+
+        entry = path_issues_data['non_existent_paths'][0]
+
+        # Should have 'N/A' when original_path is missing
+        assert entry['d_file_path'] == 'N/A'
+        assert entry['resolved_path'] == "/missing.h"
+
+    def test_generate_path_issues_yml_note_field(self, tmp_path):
+        """Test path_issues.yml summary contains explanatory note"""
+        artifacts = [
+            Artifact(path="/missing.h",
+                     type="header",
+                     source="test.d",
+                     metadata={
+                         'path_exists': False,
+                         'original_path': 'missing.h'
+                     }),
+        ]
+
+        mappings = []
+
+        output_dir = tmp_path / "reports"
+        OutputGenerator.generate(mappings, artifacts, output_dir)
+
+        # Load path_issues.yml
+        path_issues_file = output_dir / "path_issues.yml"
+        with open(path_issues_file) as f:
+            path_issues_data = yaml.safe_load(f)
+
+        # Verify note field exists and mentions libraries are excluded
+        assert 'note' in path_issues_data['summary']
+        note = path_issues_data['summary']['note']
+        assert 'libraries excluded' in note.lower()
+        assert 'do not exist' in note.lower()
 
 
 # ============================================================================

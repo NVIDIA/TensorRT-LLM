@@ -353,7 +353,15 @@ class ArtifactCollector:
             return artifacts
 
         header_paths = tokens[1:]
-        context_dir = d_file.parent
+        # CMake .d files use paths relative to the target's build directory (where Makefile is)
+        # This is the parent of the CMakeFiles directory
+        d_file_parts = d_file.parts
+        if 'CMakeFiles' in d_file_parts:
+            cmake_idx = d_file_parts.index('CMakeFiles')
+            context_dir = Path(*d_file_parts[:cmake_idx])
+        else:
+            # Fallback to build_dir if no CMakeFiles in path
+            context_dir = self.build_dir
 
         for header_path in header_paths:
             # Strip trailing colons from paths (malformed .d files)
@@ -1158,6 +1166,47 @@ class OutputGenerator:
                         'Add patterns to YAML files in dependencies/ for these artifacts'
                     },
                     'artifacts': unknown_paths
+                },
+                f,
+                default_flow_style=False,
+                sort_keys=False)
+
+        # Generate path_issues.yml for non-existent paths
+        path_issues_file = output_dir / 'path_issues.yml'
+        non_existent_paths = []
+
+        for artifact in artifacts:
+            # Check if path_exists metadata is False
+            # Exclude libraries since they don't have meaningful original_path metadata
+            if (artifact.metadata
+                    and not artifact.metadata.get('path_exists', True)
+                    and artifact.type != 'library'):
+                non_existent_paths.append({
+                    'resolved_path':
+                    artifact.path,
+                    'type':
+                    artifact.type,
+                    'source':
+                    artifact.source,
+                    'd_file_path':
+                    artifact.metadata.get('original_path', 'N/A')
+                })
+
+        with open(path_issues_file, 'w') as f:
+            yaml.dump(
+                {
+                    'summary': {
+                        'count':
+                        len(non_existent_paths),
+                        'total_artifacts':
+                        len(artifacts),
+                        'percentage':
+                        f"{len(non_existent_paths) / len(artifacts) * 100:.1f}%"
+                        if artifacts else "0%",
+                        'note':
+                        'These header paths were resolved from .d files but do not exist in the filesystem (libraries excluded)'
+                    },
+                    'non_existent_paths': non_existent_paths
                 },
                 f,
                 default_flow_style=False,
