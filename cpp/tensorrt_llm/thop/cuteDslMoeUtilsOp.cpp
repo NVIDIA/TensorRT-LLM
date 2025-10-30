@@ -14,12 +14,13 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/kernels/cuteDslKernels/moeUtils.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.h"
 #include "tensorrt_llm/thop/thUtils.h"
-#include <c10/core/ScalarType.h>
 
 namespace torch_ext
 {
+// Sort
 using tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::RoutingMethodType;
 
 std::vector<torch::Tensor> moe_topk_sort_impl(torch::optional<torch::Tensor> const& routing_logits,
@@ -37,6 +38,7 @@ std::vector<torch::Tensor> moe_topk_sort_impl(torch::optional<torch::Tensor> con
     int64_t const max_num_ctas = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::getMaxNumCtasInBatchDim(
         num_tokens, top_k, num_experts, tile_tokens_dim);
     int64_t const size_of_expert_count_histogram = std::max(num_experts * 2, int64_t(256 * 2));
+    auto const routing_bias_dtype = routing_bias.has_value() ? routing_bias->scalar_type() : torch::kBFloat16;
 
     auto routing_logits_ptr = routing_logits.has_value() ? routing_logits->data_ptr() : nullptr;
     auto routing_bias_ptr = routing_bias.has_value() ? routing_bias->data_ptr() : nullptr;
@@ -47,7 +49,8 @@ std::vector<torch::Tensor> moe_topk_sort_impl(torch::optional<torch::Tensor> con
     torch::optional<torch::Tensor> new_token_final_scales;
     if (token_final_scales_ptr == nullptr)
     {
-        new_token_final_scales = torch::empty({num_tokens, top_k}, torch::dtype(torch::kBFloat16).device(torch::kCUDA));
+        new_token_final_scales
+            = torch::empty({num_tokens, top_k}, torch::dtype(routing_bias_dtype).device(torch::kCUDA));
         token_final_scales_ptr = new_token_final_scales->data_ptr();
     }
 
@@ -60,9 +63,9 @@ std::vector<torch::Tensor> moe_topk_sort_impl(torch::optional<torch::Tensor> con
     auto permuted_idx_to_expanded_idx
         = torch::empty({max_num_padded_tokens}, torch::dtype(torch::kInt32).device(torch::kCUDA));
     auto num_tokens_per_expert = torch::empty({num_experts}, torch::dtype(torch::kInt32).device(torch::kCUDA));
-    auto cta_idx_xy_to_batch_idx = torch::empty({max_num_ctas}, torch::dtype(torch::kInt32).device(torch::kCUDA));
-    auto cta_idx_xy_to_mn_limit = torch::empty({max_num_ctas}, torch::dtype(torch::kInt32).device(torch::kCUDA));
-    auto num_non_exiting_ctas = torch::empty({1}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+    auto tile_idx_to_batch_idx = torch::empty({max_num_ctas}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+    auto tile_idx_to_mn_limit = torch::empty({max_num_ctas}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+    auto num_non_exiting_tiles = torch::empty({1}, torch::dtype(torch::kInt32).device(torch::kCUDA));
 
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::Runner routing_runner(tile_tokens_dim);
     auto const& stream = at::cuda::getCurrentCUDAStream(
@@ -72,13 +75,13 @@ std::vector<torch::Tensor> moe_topk_sort_impl(torch::optional<torch::Tensor> con
         expert_indexes.data_ptr<int>(), expert_count_histogram.data_ptr<int>(), total_num_padded_tokens.data_ptr<int>(),
         expanded_idx_to_permuted_idx.data_ptr<int>(), permuted_idx_to_expanded_idx.data_ptr<int>(),
         nullptr /*permuted_idx_to_token_idx.data_ptr<int>()*/, token_final_scales_ptr, token_selected_experts_ptr,
-        num_tokens_per_expert.data_ptr<int>(), cta_idx_xy_to_batch_idx.data_ptr<int>(),
-        cta_idx_xy_to_mn_limit.data_ptr<int>(), num_non_exiting_ctas.data_ptr<int>(),
+        num_tokens_per_expert.data_ptr<int>(), tile_idx_to_batch_idx.data_ptr<int>(),
+        tile_idx_to_mn_limit.data_ptr<int>(), num_non_exiting_tiles.data_ptr<int>(),
         batchedGemm::trtllm::gen::Dtype::Void /* dtypeElt */, false /* use_routing_scales_on_input */,
         false /* use_deep_seek_fp8 */, static_cast<RoutingMethodType>(routing_method_type), stream);
 
-    std::vector<torch::Tensor> results{cta_idx_xy_to_batch_idx, cta_idx_xy_to_mn_limit, expanded_idx_to_permuted_idx,
-        permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_ctas};
+    std::vector<torch::Tensor> results{tile_idx_to_batch_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx,
+        permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_tiles};
     if (new_token_final_scales.has_value())
     {
         results.push_back(new_token_final_scales.value());
@@ -121,6 +124,28 @@ std::vector<torch::Tensor> moe_sort(torch::Tensor const& token_selected_experts,
         routing_method_type);
 }
 
+// Permute
+
+std::vector<torch::Tensor> moe_permute(torch::Tensor const& input, torch::Tensor const& permuted_idx_to_expanded_idx,
+    torch::Tensor const& num_non_exiting_tiles, int64_t const tile_tokens_dim, int64_t const top_k)
+{
+    int64_t const hidden_size = input.size(1);
+    int64_t const num_permuted_tokens = permuted_idx_to_expanded_idx.size(0);
+
+    uint8_t const* input_sf_ptr = nullptr;
+    uint8_t* permuted_sf_ptr = nullptr;
+
+    auto permuted_input
+        = torch::empty({num_permuted_tokens, hidden_size}, torch::dtype(input.scalar_type()).device(torch::kCUDA));
+
+    auto const& stream = at::cuda::getCurrentCUDAStream(input.get_device());
+    tensorrt_llm::kernels::cute_dsl::moePermute<__nv_bfloat16, uint8_t>(static_cast<__nv_bfloat16*>(input.data_ptr()),
+        static_cast<__nv_bfloat16*>(permuted_input.data_ptr()), input_sf_ptr, permuted_sf_ptr,
+        permuted_idx_to_expanded_idx.data_ptr<int32_t>(), num_non_exiting_tiles.data_ptr<int32_t>(), hidden_size, top_k,
+        tile_tokens_dim, stream);
+    return {permuted_input};
+}
+
 } // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -133,10 +158,14 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "moe_sort(Tensor token_final_scales, Tensor token_selected_experts, int num_experts, int top_k, int? n_group, "
         "int? topk_group, int local_expert_offset, int local_num_experts, float? routed_scaling_factor, int "
         "tile_tokens_dim, int routing_method_type) -> Tensor[]");
+    m.def(
+        "moe_permute(Tensor input, Tensor permuted_idx_to_expanded_idx, Tensor num_non_exiting_tiles, int "
+        "tile_tokens_dim, int top_k) -> Tensor[]");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("moe_topk_sort", &torch_ext::moe_topk_sort);
     m.impl("moe_sort", &torch_ext::moe_sort);
+    m.impl("moe_permute", &torch_ext::moe_permute);
 }

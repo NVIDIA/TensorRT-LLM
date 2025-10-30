@@ -1344,7 +1344,7 @@ __host__ __device__ constexpr static U arrayConvert(T const& input)
     return converter(input);
 }
 
-// Duplicated and permutes rows for MoE. In addition, reverse the permutation map to help with finalizing routing.
+// Duplicated and permutes rows for MoE.
 
 // "expanded_x_row" simply means that the number of values is num_rows x k. It is "expanded" since we will have to
 // duplicate some rows in the input matrix to match the dimensions. Duplicates will always get routed to separate

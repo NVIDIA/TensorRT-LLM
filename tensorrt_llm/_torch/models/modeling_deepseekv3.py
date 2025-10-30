@@ -701,8 +701,7 @@ class Deepseekv3RoutingImpl():
             new_mask.scatter_(-1, topk_idx, 1)
             scores = scores * new_mask
             score_sum = torch.sum(scores, dim=-1, keepdim=True) + 1e-20
-            scores = scores / score_sum * \
-                self.routed_scaling_factor
+            scores = scores / score_sum * self.routed_scaling_factor
             topk_values, topk_indices = torch.topk(scores,
                                                    k=self.top_k,
                                                    dim=-1,
@@ -742,7 +741,7 @@ class DeepseekV3Gate(DeepSeekV3MoeRoutingMethod):
                                                dtype=dtype),
                                    requires_grad=False)
         self.moe_backend = moe_backend
-        if moe_backend == 'TRTLLM':
+        if moe_backend in ("TRTLLM", "CUTEDSL"):
             bias_dtype = torch.bfloat16
         else:
             bias_dtype = torch.float32
