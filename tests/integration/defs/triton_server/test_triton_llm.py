@@ -3708,7 +3708,7 @@ def test_llmapi_backend(E2E_MODEL_NAME, DECOUPLED_MODE, TRITON_MAX_BATCH_SIZE,
                 f"--test-llmapi",
                 'dataset',
                 f"--dataset={os.path.join(llm_backend_dataset_root, 'mini_cnn_eval.json')}",
-                f"--tokenizer-dir=TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+                f"--tokenizer-dir={tiny_llama_model_root}",
             ]
 
             print_info("DEBUG:: run_cmd: python3 " + " ".join(run_cmd))
