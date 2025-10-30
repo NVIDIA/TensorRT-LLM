@@ -7,7 +7,6 @@ import torch.nn as nn
 
 import tensorrt_llm
 import tensorrt_llm.bindings
-import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm._torch.attention_backend.interface import (
     MLAParams, PositionalEmbeddingParams)
 from tensorrt_llm._torch.attention_backend.trtllm import (
@@ -17,10 +16,7 @@ from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.multi_stream_utils import \
     maybe_execute_in_parallel
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
-from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequestState,
-                                                        get_draft_token_length)
-from tensorrt_llm._torch.pyexecutor.resource_manager import (BlockManager,
-                                                             KVCacheManager)
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -32,6 +28,7 @@ from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.utils import fp8_utils
 
 from .kernel import triton_convert_req_index_to_global_index
 
@@ -47,6 +44,24 @@ try:
 except ImportError:
     hadamard_transform = None
     HAS_FAST_HADAMARD = False
+
+
+def _unravel_indices(flat_indices: torch.Tensor,
+                     shape: Tuple[int, ...]) -> Tuple[torch.Tensor, ...]:
+    """
+    Unravel indices into multiple dimensions.
+    """
+    d3 = shape[3]
+    i3 = flat_indices % d3
+    flat_indices = flat_indices // d3
+    d2 = shape[2]
+    i2 = flat_indices % d2
+    flat_indices = flat_indices // d2
+    d1 = shape[1]
+    i1 = flat_indices % d1
+    flat_indices = flat_indices // d1
+    i0 = flat_indices
+    return i0, i1, i2, i3
 
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
@@ -270,7 +285,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     indexer_prefill_chunks: Optional[List[IndexerPrefillChunkMetadata]] = None
     # Max chunk size for two-level chunking:
     # 1. Request-level: Pack multiple small requests into one chunk (up to indexer_max_chunk_size)
-    # 2. Intra-request: Split large requests into chunks if seq_len > max_chunk_size
+    # 2. Intra-request: Split large requests into Q-blocks when seq_len > max_chunk_size
     indexer_max_chunk_size: int
 
     def __init__(self, *args, **kwargs):
@@ -400,8 +415,14 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     def prepare(self):
         super().prepare()
         if self.kv_cache_manager is not None:
-            self.kv_cache_manager.copy_indexer_k_cache_offsets(
-                self.request_ids, self.host_indexer_k_cache_block_offsets)
+            block_ids = self.kv_cache_manager.get_batch_cache_indices(
+                self.request_ids)
+            for i in range(len(block_ids)):
+                self.host_indexer_k_cache_block_offsets[
+                    i, :len(block_ids[i])].copy_(
+                        torch.tensor(block_ids[i],
+                                     dtype=torch.int32,
+                                     device='cpu'))
             self.indexer_k_cache_block_offsets[:self.num_seqs].copy_(
                 self.host_indexer_k_cache_block_offsets[:self.num_seqs],
                 non_blocking=True)
@@ -584,6 +605,7 @@ class Indexer(nn.Module):
         )
 
         self.softmax_scale = self.head_dim**-0.5
+        # TODO: make it configurable from hf config
         self.scale_fmt = "ue8m0"
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
@@ -807,9 +829,9 @@ class Indexer(nn.Module):
         if metadata.kv_cache_manager is None or metadata.slot_mapping_fp8 is None:
             return
 
+        # [num_blocks, block_size, 1, per_token_size ]
         k_cache = metadata.kv_cache_manager.get_indexer_k_cache_buffers(
             self.layer_idx)
-        k_cache_flat = k_cache.view(-1)  # Flatten to 1D for byte-level indexing
 
         num_tokens = k_fp8.shape[0]
         head_dim = k_fp8.shape[1]
@@ -835,14 +857,18 @@ class Indexer(nn.Module):
             0)  # [1, head_dim]
         scatter_indices_fp8 = flat_indices_fp8.unsqueeze(
             1) + byte_offsets  # [num_tokens, head_dim]
-        k_cache_flat[scatter_indices_fp8] = k_fp8_bytes
+        scatter_indices_fp8 = _unravel_indices(scatter_indices_fp8,
+                                               k_cache.shape)
+        k_cache[scatter_indices_fp8] = k_fp8_bytes
 
         flat_indices_scale = metadata.slot_mapping_scale[:num_tokens]
         byte_offsets = torch.arange(
             scale_size, device=k_cache.device).unsqueeze(0)  # [1, scale_size]
         scatter_indices_scale = flat_indices_scale.unsqueeze(
             1) + byte_offsets  # [num_tokens, scale_size]
-        k_cache_flat[scatter_indices_scale] = k_scale_bytes
+        scatter_indices_scale = _unravel_indices(scatter_indices_scale,
+                                                 k_cache.shape)
+        k_cache[scatter_indices_scale] = k_scale_bytes
 
     def _gather_k_cache_for_chunk(
         self,
@@ -865,7 +891,6 @@ class Indexer(nn.Module):
         """
         k_cache = metadata.kv_cache_manager.get_indexer_k_cache_buffers(
             self.layer_idx)
-        k_cache_flat = k_cache.view(-1)  # Flatten to 1D for byte-level indexing
 
         head_dim = self.head_dim
         scale_size = 4  # float32 = 4 bytes
@@ -886,7 +911,8 @@ class Indexer(nn.Module):
             head_dim, device=k_cache.device).unsqueeze(0)  # [1, head_dim]
         gather_indices_fp8 = slot_mapping_fp8_chunk.unsqueeze(
             1) + byte_offsets_fp8  # [num_k_tokens, head_dim]
-        k_fp8_bytes = k_cache_flat[gather_indices_fp8]
+        gather_indices_fp8 = _unravel_indices(gather_indices_fp8, k_cache.shape)
+        k_fp8_bytes = k_cache[gather_indices_fp8]
         k_fp8 = k_fp8_bytes.view(torch.float8_e4m3fn).view(
             num_k_tokens, head_dim)
 
@@ -895,7 +921,9 @@ class Indexer(nn.Module):
             scale_size, device=k_cache.device).unsqueeze(0)  # [1, 4]
         gather_indices_scale = slot_mapping_scale_chunk.unsqueeze(
             1) + byte_offsets_scale  # [num_k_tokens, 4]
-        k_scale_bytes = k_cache_flat[gather_indices_scale]
+        gather_indices_scale = _unravel_indices(gather_indices_scale,
+                                                k_cache.shape)
+        k_scale_bytes = k_cache[gather_indices_scale]
         k_scale = k_scale_bytes.view(torch.float32).view(num_k_tokens, 1)
 
         return k_fp8, k_scale
@@ -905,7 +933,8 @@ class Indexer(nn.Module):
         metadata: DSAtrtllmAttentionMetadata,
         hidden_states: torch.Tensor,
         q_fp8: torch.Tensor,
-        k: torch.Tensor,
+        k_fp8: torch.Tensor,
+        k_scale: torch.Tensor,
         weights: torch.Tensor,
     ) -> torch.Tensor:
 
@@ -924,15 +953,7 @@ class Indexer(nn.Module):
             device=hidden_states.device)
         topk_indices_buffer[:hidden_states.shape[0]] = -1
 
-        # Quantize k and store into indexer k cache
-        k_fp8, k_scale = torch.ops.trtllm.fp8_quantize_1x128(k[:num_tokens])
-        # Handle SM version differences (SM90: 1D padded, SM100+: 2D)
-        if k_scale.ndim == 1:
-            num_blocks = (k.shape[1] + 127) // 128
-            m_padded = (num_tokens + 3) // 4 * 4
-            k_scale = k_scale[:num_blocks * m_padded].view(
-                num_blocks, m_padded)[:, :num_tokens]
-        k_scale = k_scale.contiguous().transpose(0, 1)
+        # Store k_fp8 and k_scale into indexer k cache
         self._update_k_cache(k_fp8, k_scale, metadata)
 
         if has_prefill:
@@ -1069,6 +1090,7 @@ class Indexer(nn.Module):
                 metadata: DSAtrtllmAttentionMetadata,
                 position_ids: torch.Tensor):
         quant_block_size = metadata.kv_cache_manager.quant_block_size
+        assert quant_block_size == 128, "Only support quant_block_size = 128 for now"
 
         q, k = maybe_execute_in_parallel(
             lambda: self.wq_b(qr),
@@ -1099,8 +1121,18 @@ class Indexer(nn.Module):
         )
         # we only quant q here since k quant is fused with cache insertion
         q = q.view(-1, self.head_dim)
-        q_fp8, q_scale = fp8_utils.per_token_quant_and_transform(
-            q, quant_block_size, scale_ue8m0=self.scale_fmt == "ue8m0")
+
+        q, k = maybe_execute_in_parallel(
+            lambda: fp8_utils.fp8_quantize_1x128_sf_transpose(
+                q, use_ue8m0=self.scale_fmt == "ue8m0"),
+            lambda: fp8_utils.fp8_quantize_1x128_sf_transpose(
+                k, use_ue8m0=self.scale_fmt == "ue8m0"),
+            self.ln_events[0],
+            self.ln_events[1],
+            self.aux_stream,
+        )
+        q_fp8, q_scale = q
+        k_fp8, k_scale = k
         q_fp8 = q_fp8.view(-1, self.n_heads, self.head_dim)
         q_scale = q_scale.view(-1, self.n_heads, 1)
 
@@ -1110,8 +1142,8 @@ class Indexer(nn.Module):
         weights = weights.squeeze(-1)
 
         # Return topk indices buffer for sparse attention [num_tokens, index_topk]
-        return self.sparse_attn_indexer(metadata, hidden_states, q_fp8, k,
-                                        weights.to(torch.float32))
+        return self.sparse_attn_indexer(metadata, hidden_states, q_fp8, k_fp8,
+                                        k_scale, weights.to(torch.float32))
 
 
 class DSATrtllmAttention(TrtllmAttention):
@@ -1271,6 +1303,7 @@ class DSACacheManager(KVCacheManager):
         self.index_head_dim = sparse_attn_config.index_head_dim
         # Use a fixed tokens_per_block for indexer k cache due to DG kernel constraints
         self.indexer_k_cache_tokens_per_block = 64
+        assert self.indexer_k_cache_tokens_per_block == tokens_per_block, "tokens_per_block must be set to 64 for DeepSeek v3.2"
 
         super().__init__(
             kv_cache_config,
@@ -1288,121 +1321,29 @@ class DSACacheManager(KVCacheManager):
             max_num_tokens=max_num_tokens,
             model_config=model_config,
             max_beam_width=max_beam_width,
+            enable_indexer_k_cache=True,
+            indexer_k_cache_quant_block_size=128,
+            indexer_k_cache_index_head_dim=self.index_head_dim,
             **kwargs,
         )
-
         self.num_blocks = self.blocks_in_primary_pool
-
-        # Block manager to manage the indexer k cache blocks for each request. Different layers share the
-        # same block ids.
-        self.indexer_k_cache_manager = BlockManager(
-            self.num_blocks, self.indexer_k_cache_tokens_per_block)
 
         # Indexer K cache pool for DSA attention
         # Shape: [num_blocks, self.indexer_k_cache_tokens_per_block * (index_head_dim + scale_size)]
         # Non-interleaved layout: [fp8_tok0 | fp8_tok1 | ... | scale_tok0 | scale_tok1 | ...]
         # Store FP8-quantized k values from the indexer
-        scale_size = self.index_head_dim // self.quant_block_size * 4
         self.indexer_k_cache_pool_per_layer = [
-            torch.empty(
-                (self.num_blocks, self.indexer_k_cache_tokens_per_block *
-                 (self.index_head_dim + scale_size)),
-                device="cuda",
-                dtype=torch.uint8) for _ in range(self.num_local_layers)
+            self.get_indexer_k_cache_pool_data(layer_idx)
+            for layer_idx in range(self.num_local_layers)
         ]
-
-    def add_dummy_requests(
-        self,
-        request_ids: List[int],
-        token_nums: Optional[List[int]] = None,
-        is_gen: bool = False,
-        prepare_resource: bool = True,
-        max_num_draft_tokens: int = 0,
-        use_mrope: bool = False,
-        max_beam_width: int = 1,
-        num_extra_decoding_steps: int = 0,
-    ):
-        requests = super().add_dummy_requests(
-            request_ids=request_ids,
-            token_nums=token_nums,
-            is_gen=is_gen,
-            prepare_resource=prepare_resource,
-            max_num_draft_tokens=max_num_draft_tokens,
-            use_mrope=use_mrope,
-            max_beam_width=max_beam_width,
-            num_extra_decoding_steps=num_extra_decoding_steps,
-        )
-        if prepare_resource:
-            for req in requests:
-                request_id = req.py_request_id
-                self.indexer_k_cache_manager.add_tokens(request_id,
-                                                        req.max_beam_num_tokens)
-                self.indexer_k_cache_manager.add_tokens(
-                    request_id, self.num_extra_kv_tokens)
-                self.indexer_k_cache_manager.add_tokens(
-                    request_id, num_extra_decoding_steps)
-                if is_gen:
-                    self.indexer_k_cache_manager.add_tokens(
-                        request_id, max_num_draft_tokens)
-        return requests
-
-    def copy_indexer_k_cache_offsets(
-            self, request_ids: List[int],
-            block_offsets: torch.Tensor) -> torch.Tensor:
-        self.indexer_k_cache_manager.copy_block_offsets(request_ids,
-                                                        block_offsets)
 
     def get_indexer_k_cache_buffers(self, layer_idx: int):
         """Get indexer k cache buffer from a specific layer pool."""
-        block_size = self.indexer_k_cache_manager.tokens_per_block
+        block_size = self.tokens_per_block
         per_token_size = self.index_head_dim + self.index_head_dim // self.quant_block_size * 4
         layer_offset = self.layer_offsets[layer_idx]
         return self.indexer_k_cache_pool_per_layer[layer_offset].view(
             self.num_blocks, block_size, 1, per_token_size)
-
-    def prepare_resources(self, scheduled_batch):
-        """
-        Prepare resources for both low rank cache and indexer K cache.
-        """
-        super().prepare_resources(scheduled_batch)
-        context_batch = scheduled_batch.context_requests
-        generation_batch = scheduled_batch.generation_requests
-
-        # Allocate blocks for context requests
-        for req in context_batch:
-            request_id = req.py_request_id
-            if req.is_first_context_chunk:
-                self.indexer_k_cache_manager.add_tokens(request_id,
-                                                        req.prompt_len)
-                self.indexer_k_cache_manager.add_tokens(
-                    request_id, self.num_extra_kv_tokens)
-                self.indexer_k_cache_manager.add_tokens(
-                    request_id, get_draft_token_length(req))
-
-        # Allocate blocks for generation requests
-        for req in generation_batch:
-            request_id = req.py_request_id
-            self.indexer_k_cache_manager.add_tokens(request_id, 1)
-            self.indexer_k_cache_manager.add_tokens(request_id,
-                                                    get_draft_token_length(req))
-
-        # TODO: Support beam search, current assume beam_width=1
-
-    def update_resources(self,
-                         scheduled_batch,
-                         attn_metadata: "AttentionMetadata" = None,
-                         kv_cache_dtype_byte_size: float = None):
-        super().update_resources(scheduled_batch, attn_metadata,
-                                 kv_cache_dtype_byte_size)
-        # rewind indexer k cache
-        for req in scheduled_batch.generation_requests:
-            if req.state != LlmRequestState.GENERATION_COMPLETE and req.py_rewind_len > 0:
-                self.indexer_k_cache_manager.rewind_cache(
-                    req, req.py_rewind_len)
-
-    def free_resources(self, request):
-        super().free_resources(request)
-        self.indexer_k_cache_manager.free_resources(request)
 
     @staticmethod
     def get_cache_size_per_token(model_config: ModelConfig, mapping: Mapping,

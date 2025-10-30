@@ -66,7 +66,7 @@ repos:
         additional_dependencies:
         - tomli
         # add ignore words list
-        args: ["-L", "Mor,ans,thirdparty", "--skip", "ATTRIBUTIONS-*.md"]
+        args: ["-L", "Mor,ans,thirdparty", "--skip", "ATTRIBUTIONS-*.md,*.svg", "--skip", "security_scanning/*"]
 -   repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.9.4
     hooks:

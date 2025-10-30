@@ -10,8 +10,6 @@ import aiohttp
 import pytest
 import yaml
 from defs.conftest import skip_no_hopper
-from defs.disaggregated.test_disaggregated_single_gpu import \
-    model_path as get_model_path
 from defs.trt_test_alternative import popen
 from transformers import AutoTokenizer
 
@@ -206,13 +204,10 @@ class KvCacheEventWorkerTester(BasicWorkerTester):
                  gen_servers: List[str],
                  req_timeout_secs: int = DEFAULT_TIMEOUT_REQUEST,
                  server_start_timeout_secs: int = DEFAULT_TIMEOUT_SERVER_START,
-                 model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-                 model_path: Optional[str] = None):
+                 model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"):
         super().__init__(ctx_servers, gen_servers, req_timeout_secs,
                          server_start_timeout_secs)
-        if model_path is None:
-            model_path = get_model_path(model_name)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model_name = model_name
         self.kv_cache_block_maps: dict[str, KvCacheAwareServerState] = {}
         self.kv_cache_event_maps: dict[str, list[dict]] = {}
@@ -489,6 +484,7 @@ def load_default_prompts(disaggregated_example_root: str):
 @contextlib.contextmanager
 def background_workers(llm_venv, config_file: str, num_ranks: int = None):
     cwd = llm_venv.get_working_directory()
+    os.chdir(cwd)
     with open(os.path.join(cwd, 'output_workers.log'), 'w+') as log_file:
         workers_proc, ctx_servers, gen_servers = run_disaggregated_workers(
             config_file=config_file,
@@ -603,7 +599,6 @@ def test_workers_kv_cache_aware_router_deepseek_v3_lite_bf16(
 
     with background_workers(llm_venv, config_file,
                             4) as (ctx_servers, gen_servers):
-        os.chdir(llm_venv.get_working_directory())
         tester = KvCacheAwareRouterTester(ctx_servers,
                                           gen_servers,
                                           model_name="DeepSeek-V3-Lite/bf16",

@@ -140,7 +140,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
 
         pipeline.stage('Submit Test Results') {
             sh "mkdir -p ${stageName}"
-            def resultsFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/results/results.xml"
+            def resultsFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/results.xml"
             def downloadResultCmd = "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${resultsFilePath} ${stageName}/"
             downloadSucceed = sh(script: downloadResultCmd, returnStatus: true) == 0
             if (downloadSucceed) {
@@ -2543,8 +2543,7 @@ def launchTestJobs(pipeline, testFilter)
     // may break the mapping functionality.
 
     x86TestConfigs = [
-        "DGX_H100-4_GPUs-PyTorch-DeepSeek-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 2, 4],
-        "DGX_H100-4_GPUs-PyTorch-DeepSeek-2": ["dgx-h100-x4", "l0_dgx_h100", 2, 2, 4],
+        "DGX_H100-4_GPUs-PyTorch-DeepSeek-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-2_GPUs-PyTorch-Others-1": ["dgx-h100-x2", "l0_dgx_h100", 1, 1, 2],
         "DGX_H100-4_GPUs-PyTorch-GptOss-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-PyTorch-Others-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],

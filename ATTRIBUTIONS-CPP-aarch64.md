@@ -14907,6 +14907,7 @@ Mingxing Zhang
 Yongwei Wu
 Weimin Zheng
 Xinran Xu
+## flashinfer
 
 ### License Text
 ```
@@ -15111,4 +15112,32 @@ Xinran Xu
    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
    See the License for the specific language governing permissions and
    limitations under the License.
+
+-------------------------------------------------------------------------------------------------
+Some of the code in this project are adapted from other open-source projects with different
+licenses. This product also bundles some third-party components under other open source licenses.
+This section summarizes those components and their licenses.
+See licenses/ for text of these licenses.
+
+BSD 3-Clause License
+--------------------
+
+include/flashinfer/attention/hopper/epilogue.cuh
+include/flashinfer/attention/hopper/mainloop.cuh
+include/flashinfer/attention/hopper/kernel_traits.cuh
+include/flashinfer/attention/hopper/named_barrier.cuh
+include/flashinfer/attention/hopper/tile_scheduler.cuh
+include/flashinfer/attention/hopper/utils.cuh
+
+BSD 3-Clause "New" License
+--------------------------
+
+3rdparty/cutlass
+include/flashinfer/attention/hopper/block_sparse_gather.cuh
+
+MIT License
+-----------
+
+3rdparty/spdlog
+3rdparty/spdlog/include/spdlog/fmt/bundled (fmt library)
 ```

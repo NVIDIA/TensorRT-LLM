@@ -1613,6 +1613,13 @@ def test_openai_reasoning(llm_root, llm_venv, backend: str):
     ])
 
 
+def test_openai_tool_call(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd(
+        ["-m", "pytest",
+         str(test_root / "_test_openai_tool_call.py")])
+
+
 @pytest.mark.parametrize("sampler", ["torch_sampler", "trtllm_sampler"])
 def test_openai_completions_with_logit_bias(llm_root, llm_venv, sampler: str):
     test_root = unittest_path() / "llmapi" / "apps"
@@ -1665,7 +1672,6 @@ def test_openai_lora(llm_root, llm_venv):
     llm_venv.run_cmd(["-m", "pytest", str(test_root / "_test_openai_lora.py")])
 
 
-@pytest.mark.skip(reason="https://nvbugs/5596377")
 def test_openai_chat_multimodal_example(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd(

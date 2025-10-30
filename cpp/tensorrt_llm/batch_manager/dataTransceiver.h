@@ -56,29 +56,48 @@ using UniqueToken = tensorrt_llm::runtime::UniqueToken;
 class TransferSession
 {
 public:
+    // measures for each single transmission
     struct Measure
     {
-        double delay;     // from last token (ctx) or arrival time (gen), in ms
-        double duration;  // in ms
-        double bandwidth; // in Gbps
+        LlmRequest::TimePoint start;
+        LlmRequest::TimePoint end;
+        size_t size = 0;
+    };
+
+    enum TimeNames : uint8_t
+    {
+        kTimeRequestInfo = 0,
+        kTimeFormatter,
+        kTimePreprocess,
+        kTimeTransmissions,
+        kTimePostprocess,
+        kTimeCounts
+    };
+
+    struct KVCacheTimes
+    {
+        std::array<LlmRequest::TimePoint, kTimeCounts> times;
+        std::vector<Measure> measures;
     };
 
     TransferSession(std::vector<Connection const*> connections, DataContext dataContext,
         executor::DataTransceiverState const& selfState, executor::DataTransceiverState otherState,
         runtime::BufferManager const& bufferManager, int32_t indexFromEnd, BlockKey const& lastBlockKey,
-        LlmRequest const* llmRequest = nullptr, bool recordMeasure = false)
+        LlmRequest const* llmRequest = nullptr, bool recordTiming = false)
         : mConnections(std::move(connections))
         , mDataContext(std::move(dataContext))
         , mSelfState(&selfState)
         , mOtherState(std::move(otherState))
         , mBufferManager(&bufferManager)
         , mRequest(llmRequest)
-        , mMeasures()
-        , mRecordMeasure(recordMeasure)
         , mIndexFromEnd(indexFromEnd)
         , mLastBlockKey(lastBlockKey)
     {
         TLLM_CHECK(!mConnections.empty());
+        if (recordTiming)
+        {
+            mTimes = std::make_unique<KVCacheTimes>();
+        }
     }
 
     [[nodiscard]] std::vector<Connection const*> const& getConnections() const;
@@ -103,7 +122,9 @@ public:
     // in CacheSender, the LlmRequest is not available until the sendSync is called
     void setLlmRequest(LlmRequest const& llmRequest);
 
-    void appendMeasure(double delay, double duration, size_t size);
+    void setTime(TimeNames name);
+
+    void appendMeasure(LlmRequest::TimePoint start, LlmRequest::TimePoint end, size_t size);
 
     // TODO: 1. use global id instead of context request id; 2. export to llm metrics instead of file
     void exportMeasure(std::ofstream& outFile, bool isContext) const;
@@ -125,8 +146,7 @@ private:
     executor::DataTransceiverState mOtherState;
     runtime::BufferManager const* mBufferManager;
     LlmRequest const* mRequest;
-    std::vector<Measure> mMeasures;
-    bool mRecordMeasure{false};
+    std::unique_ptr<KVCacheTimes> mTimes;
     int32_t mIndexFromEnd{0};
     BlockKey mLastBlockKey{};
 };
