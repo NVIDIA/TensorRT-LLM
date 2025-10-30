@@ -36,6 +36,7 @@ class CUDAGraphRunnerConfig:
     spec_config: Optional["DecodingBaseConfig"]
     cuda_graph_mem_pool: Any
     use_mrope: bool
+    original_max_draft_len: int
     original_max_total_draft_tokens: int
     is_draft_model: bool
     enable_attention_dp: bool

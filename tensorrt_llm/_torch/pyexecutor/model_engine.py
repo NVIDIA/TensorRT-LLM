@@ -372,6 +372,7 @@ class PyTorchModelEngine(ModelEngine):
             cuda_graph_mem_pool=self._cuda_graph_mem_pool,
             max_num_tokens=self.max_num_tokens,
             use_mrope=self.use_mrope,
+            original_max_draft_len=self.original_max_draft_len,
             original_max_total_draft_tokens=self.
             original_max_total_draft_tokens,
             is_draft_model=self.is_draft_model,

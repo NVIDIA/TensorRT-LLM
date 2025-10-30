@@ -182,6 +182,7 @@ def create_mock_cuda_graph_runner(batch_size: int, use_mrope: bool = False):
         spec_config=None,
         cuda_graph_mem_pool=None,
         enable_attention_dp=False,
+        original_max_draft_len=0,
         original_max_total_draft_tokens=0,
         is_draft_model=False,
         mapping=Mapping(),
