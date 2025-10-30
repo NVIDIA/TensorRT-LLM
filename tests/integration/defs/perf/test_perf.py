@@ -1646,7 +1646,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             benchmark_cmd += [f"--streaming"]
         #use default yaml config
         if self._config.backend == "pytorch":
-            import yaml
             pytorch_config_path = os.path.join(engine_dir,
                                                "extra-llm-api-config.yml")
             if not os.path.exists(pytorch_config_path):
@@ -1658,7 +1657,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 yaml.dump(config, f, default_flow_style=False)
             benchmark_cmd += [f"--extra_llm_api_options={pytorch_config_path}"]
         elif self._config.backend == "_autodeploy":
-            import yaml
             autodeploy_config_path = os.path.join(engine_dir,
                                                   "extra_llm_api_options.yaml")
             if not os.path.exists(autodeploy_config_path):
