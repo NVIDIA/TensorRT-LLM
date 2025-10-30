@@ -624,6 +624,17 @@ class Indexer(nn.Module):
         return torch.cat([fused_a, indexer_wk, indexer_weights_proj], dim=0)
 
     @staticmethod
+    def load_weights_to_q_b(mla_q_b: torch.Tensor, weights: dict,
+                            names: list) -> torch.Tensor:
+        prefix = '.'.join(names[:-1])
+        indexer_wq_b = weights[f"{prefix}.indexer.wq_b.weight"][:]
+
+        assert mla_q_b.dtype == indexer_wq_b.dtype, \
+            "all weights in q_b_proj module must have matching dtype"
+
+        return torch.cat([mla_q_b, indexer_wq_b], dim=0)
+
+    @staticmethod
     def prepare_one_prefill_chunk(
         metadata: DSAtrtllmAttentionMetadata,
         chunk_specs: List[Tuple[int, int, int, int]],
@@ -1102,11 +1113,15 @@ class Indexer(nn.Module):
     def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
                 metadata: DSAtrtllmAttentionMetadata,
                 position_ids: torch.Tensor, indexer_k: Optional[torch.Tensor],
-                indexer_weights: Optional[torch.Tensor]):
+                indexer_weights: Optional[torch.Tensor],
+                indexer_q: Optional[torch.Tensor]):
         quant_block_size = metadata.kv_cache_manager.quant_block_size
         assert quant_block_size == 128, "Only support quant_block_size = 128 for now"
 
-        if indexer_k is not None:
+        if indexer_q is not None and indexer_k is not None:
+            k = self.k_norm(indexer_k)
+            q = indexer_q
+        elif indexer_k is not None:
             q, k = maybe_execute_in_parallel(
                 lambda: self.wq_b(
                     qr),  # TODO: fuse wq_b and move this outside of the indexer

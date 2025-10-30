@@ -760,6 +760,7 @@ class MLA(nn.Module):
             gpus_per_node=config.mapping.gpus_per_node,
             enable_attention_dp=config.mapping.enable_attention_dp,
         )
+        self.mapping = mapping
 
         assert self.num_heads % tp_size == 0
         self.num_heads = self.num_heads // tp_size
@@ -1174,7 +1175,18 @@ class MLA(nn.Module):
         latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
 
         # TODO: fuse wq_b + (indexer) wlq here
-        q = self.q_b_proj(q)
+        if self.fuse_indexer_q_b:
+            indexer_attn_dim = self.indexer.n_heads * self.indexer.head_dim
+            mla_attn_dim = self.num_heads * self.qk_head_dim * self.mapping.tp_size
+            q, indexer_q = self.q_b_proj(q).split(
+                [mla_attn_dim, indexer_attn_dim], -1)
+            # TODO: This would introduce noticeable overhead and eat up all fuse q benefit
+            #       Needed as mla_rope_append_paged_kv_assign_q requires contiguous q
+            q = q.contiguous()
+        else:
+            q = self.q_b_proj(q)
+            indexer_q = None
+
         # Indexer
         topk_indices = self.indexer(
             qr,
@@ -1182,7 +1194,8 @@ class MLA(nn.Module):
             attn_metadata,
             position_ids,
             indexer_k=indexer_k,  # indexer K proj
-            indexer_weights=indexer_weights,  # indexer weights proj
+            indexer_weights=indexer_weights,
+            indexer_q=indexer_q,  # indexer weights proj
         )
 
         assert q.shape[

@@ -376,6 +376,31 @@ class DeepseekV3WeightLoader:
                         module.weight_scale.data.copy_(fused_a_scale)
 
                     module.weight.data.copy_(fused_a)
+                elif names[-1] == "q_b_proj":
+                    prefix = '.'.join(names[:-1])
+                    mla_q_b = weights[f"{prefix}.q_b_proj.weight"][:]
+
+                    attn_module = all_named_modules[parent_module_name]
+                    fuse_indexer = (hasattr(attn_module, 'indexer')
+                                    and attn_module.indexer is not None
+                                    and attn_module.fuse_indexer_q_b)
+
+                    # For DeepseekV32, fuse with indexer.wq_b if enabled
+                    if fuse_indexer:
+                        from tensorrt_llm._torch.attention_backend.sparse.dsa import \
+                            Indexer
+
+                        # skip weight_scale loading and only support bf16 wq_b/wlq_b weights
+                        # TODO: Enable weight_scale loading for fp8 wq_b/wlq_b weights.
+                        #       This requires us turn on indexer q_b fusion for fp8 ckpt.
+                        mla_q_b = Indexer.load_weights_to_q_b(
+                            mla_q_b, weights, names)
+                    elif f"{prefix}.q_b_proj.weight_scale_inv" in weights:
+                        # Only load weight_scale when not fusing (fused weights are bf16)
+                        module.weight_scale.data.copy_(
+                            weights[f"{prefix}.q_b_proj.weight_scale_inv"][:])
+
+                    module.weight.data.copy_(mla_q_b)
                 elif names[-1] in params_map:
                     module_weights = []
                     for new_name in params_map[names[-1]]:
@@ -569,9 +594,12 @@ class DeepseekV32Attention(MLA):
         # DSV3.2 nvfp4 ckpt has kv_a_proj_with_mqa module in bfloat16
         # TODO: check it more directly/robustly, e.g., indexer_weight_quant == fuseA_quant == indexer_quant
         if model_config.get_quant_config().quant_algo == QuantAlgo.NVFP4:
+            # TODO: merge these two fuse flags
             self.fuse_a_indexer_k_weight = True
+            self.fuse_indexer_q_b = True
         else:
             self.fuse_a_indexer_k_weight = False
+            self.fuse_indexer_q_b = False
 
         super().__init__(hidden_size=config.hidden_size,
                          num_attention_heads=config.num_attention_heads,
@@ -598,6 +626,9 @@ class DeepseekV32Attention(MLA):
             # avoid loading indexer.wk and indexer.weights_proj twice
             self.indexer.wk = None
             self.indexer.weights_proj = None
+        if self.fuse_indexer_q_b:
+            # avoid loading indexer.wq_b twice
+            self.indexer.wq_b = None
 
         # For DeepseekV32, the kv_a_proj_with_mqa includes:
         # q_a_proj + kv_a_proj_with_mqa + indexer.wk + indexer.weights_proj
@@ -612,6 +643,24 @@ class DeepseekV32Attention(MLA):
             skip_create_weights_in_init=model_config.
             skip_create_weights_in_init,
             use_custom_cublas_mm=True)
+
+        # For DeepseekV32, the q_b_proj includes:
+        # q_b_proj + indexer.wq_b
+        # TODO: support indexer TP
+        self.q_b_proj = Linear(
+            self.q_lora_rank,
+            self.mapping.tp_size * self.num_heads * self.qk_head_dim +
+            (self.indexer.n_heads *
+             self.indexer.head_dim if self.fuse_indexer_q_b else 0),
+            bias=False,
+            dtype=config.torch_dtype,
+            mapping=self.mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+            quant_config=model_config.get_quant_config(),
+            skip_create_weights_in_init=model_config.
+            skip_create_weights_in_init,
+            allreduce_strategy=model_config.allreduce_strategy,
+            force_dynamic_quantization=model_config.force_dynamic_quantization)
 
 
 class Deepseekv3RoutingImpl():

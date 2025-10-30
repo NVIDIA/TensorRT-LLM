@@ -338,7 +338,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype):
         max_position_embeddings=max_position_embeddings,
         rope_theta=10000.0,
         qk_rope_head_dim=qk_rope_head_dim,
-        model_type="deepseek_v2",
+        model_type="deepseek_v32",
     )
 
     # Generate RoPE cos/sin embeddings for reference calculation
@@ -664,6 +664,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype):
         position_ids,
         None,  # indexer_k
         None,  # indexer_weights
+        None,  # indexer_q
     )
 
     # Validate indexer output against expected causal indices (since seq_len < topk=2048)
