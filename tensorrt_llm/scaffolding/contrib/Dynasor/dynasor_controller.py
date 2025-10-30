@@ -126,18 +126,10 @@ class DynasorGenerationController(Controller):
                         probe_answers[-self.certainty_threshold:])
                     == self.certainty_threshold
                     and sum(probe_certain_count) == self.certainty_threshold):
-                tasks[0].result = probe_task.result
-                # If the current prompt indicates the chain-of-thought phase has ended, use one type of suffix.
-                if "</think>" in current_prompt:
-                    tasks[0].output_str = (current_prompt + self.answer_suffix +
-                                           probe_answers[-1] + "}\n\\]")
-                    return
-                else:
-                    # Otherwise, use the suffix with marker to transition clearly.
-                    tasks[0].output_str = (current_prompt +
-                                           self.answer_suffix_with_marker +
-                                           probe_answers[-1] + "}\n\\]")
-                    return
+                suffix = self.answer_suffix if "</think>" in current_prompt else self.answer_suffix_with_marker
+                suffix += probe_answers[-1] + "}\n\\]"
+                current_prompt += suffix
+                break
 
             # If not confident, do another round of generation
             # Append the newly generated text from the proposer to the current prompt for the next iteration.
@@ -145,7 +137,6 @@ class DynasorGenerationController(Controller):
 
         # If the maximum token limit is reached without satisfying the certainty condition,
         # output the accumulated prompt as the final output.
-        tasks[0].result = proposer_task.result
         tasks[0].output_str = current_prompt
         return
 
