@@ -600,23 +600,7 @@ class Indexer(nn.Module):
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights_in_init,
             use_custom_cublas_mm=True)
-        # self.wk = Linear(
-        #     self.hidden_size,
-        #     self.head_dim,
-        #     bias=False,
-        #     dtype=dtype,
-        #     quant_config=quant_config,
-        #     skip_create_weights_in_init=skip_create_weights_in_init,
-        #     use_custom_cublas_mm=True)
         self.k_norm = LayerNorm(hidden_size=self.head_dim, eps=1e-6)
-        # self.weights_proj = Linear(
-        #     self.hidden_size,
-        #     self.n_heads,
-        #     bias=False,
-        #     dtype=dtype,
-        #     quant_config=None,
-        #     skip_create_weights_in_init=skip_create_weights_in_init,
-        #     use_custom_cublas_mm=True)
 
         self.rotary_emb = RotaryEmbedding(
             pos_embd_params.rope,
