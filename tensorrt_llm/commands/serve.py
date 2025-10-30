@@ -33,6 +33,7 @@ from tensorrt_llm.llmapi.mpi_session import find_free_port
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
+from tensorrt_llm.serve.tool_parser import ToolParserFactory
 
 # Global variable to store the Popen object of the child process
 _child_p_global: Optional[subprocess.Popen] = None
@@ -150,6 +151,7 @@ def launch_server(
         host: str,
         port: int,
         llm_args: dict,
+        tool_parser: Optional[str] = None,
         metadata_server_cfg: Optional[MetadataServerConfig] = None,
         server_role: Optional[ServerRole] = None,
         disagg_cluster_config: Optional[DisaggClusterConfig] = None,
@@ -173,6 +175,7 @@ def launch_server(
 
     server = OpenAIServer(llm=llm,
                           model=model,
+                          tool_parser=tool_parser,
                           server_role=server_role,
                           metadata_server_cfg=metadata_server_cfg,
                           disagg_cluster_config=disagg_cluster_config,
@@ -311,6 +314,12 @@ class ChoiceWithAlias(click.Choice):
     default=None,
     help="[Experimental] Specify the parser for reasoning models.",
 )
+@click.option(
+    "--tool_parser",
+    type=click.Choice(ToolParserFactory.parsers.keys()),
+    default=None,
+    help="[Experimental] Specify the parser for tool models.",
+)
 @click.option("--metadata_server_config_file",
               type=str,
               default=None,
@@ -352,7 +361,8 @@ def serve(
         gpus_per_node: Optional[int], kv_cache_free_gpu_memory_fraction: float,
         num_postprocess_workers: int, trust_remote_code: bool,
         extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
-        metadata_server_config_file: Optional[str], server_role: Optional[str],
+        tool_parser: Optional[str], metadata_server_config_file: Optional[str],
+        server_role: Optional[str],
         fail_fast_on_attention_window_too_large: bool,
         otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
         disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str]):
@@ -423,8 +433,8 @@ def serve(
 
     multimodal_server_config = MultimodalServerConfig(
         media_io_kwargs=parsed_media_io_kwargs)
-    launch_server(host, port, llm_args, metadata_server_cfg, server_role,
-                  disagg_cluster_config, multimodal_server_config)
+    launch_server(host, port, llm_args, tool_parser, metadata_server_cfg,
+                  server_role, disagg_cluster_config, multimodal_server_config)
 
 
 @click.command("mm_embedding_serve")
