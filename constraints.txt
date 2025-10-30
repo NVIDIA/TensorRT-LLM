@@ -1,2 +1,2 @@
-# These vulnerabilities were inherited from the base image (pytorch:25.06-py3) and should be removed when the base image
+# These vulnerabilities were inherited from the base image (pytorch:25.10-py3) and should be removed when the base image
 # is updated.
