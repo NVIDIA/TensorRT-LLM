@@ -16,7 +16,7 @@ from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
 VILA_1_5_3B_CONFIG = {
-    "_name_or_path": "Efficient-Large-Model/VILA1.5-3b",
+    "_name_or_path": "vila/VILA1.5-3b",
     "architectures": ["LlavaLlamaModel"],
     "drop_path_rate": 0.0,
     "hidden_size": 2560,
