@@ -351,7 +351,10 @@ class MNNVLAllReduce(nn.Module):
 
     SUPPORTED_FUSION_HIDDEN_DIMS = [2048, 2880, 4096, 5120, 7168, 8192]
 
-    def __init__(self, mapping: Mapping, dtype: torch.dtype):
+    def __init__(self,
+                 mapping: Mapping,
+                 dtype: torch.dtype,
+                 defer_init: bool = False):
         super().__init__()
         self.mapping = mapping
         self.dtype = dtype
@@ -360,8 +363,23 @@ class MNNVLAllReduce(nn.Module):
             and (not mapping.has_cp())
         ), "MNNVL all reduce only supports dtype {MNNVLAllReduce.get_supported_dtypes()} and without cp."
 
-        self.mcast_buffer_mnnvl, self.buffer_mnnvl, self.buffer_flags_mnnvl, self.max_num_elements_mnnvl = get_allreduce_mnnvl_workspace(
-            self.mapping, dtype)
+        # Support deferred initialization to allow workspace allocation before CUDA graph capture
+        self._workspace_initialized = False
+        self.mcast_buffer_mnnvl = None
+        self.buffer_mnnvl = None
+        self.buffer_flags_mnnvl = None
+        self.max_num_elements_mnnvl = None
+
+        if not defer_init:
+            self._initialize_workspace()
+
+    def _initialize_workspace(self):
+        """Initialize MNNVL workspace. Can be called explicitly before CUDA graph capture."""
+        if not self._workspace_initialized:
+            self.mcast_buffer_mnnvl, self.buffer_mnnvl, self.buffer_flags_mnnvl, self.max_num_elements_mnnvl = get_allreduce_mnnvl_workspace(
+                self.mapping, self.dtype)
+            self._workspace_initialized = True
+            logger.debug("MNNVL workspace initialized")
 
     @staticmethod
     def get_supported_dtypes():
@@ -392,6 +410,17 @@ class MNNVLAllReduce(nn.Module):
         Returns:
             Union[torch.Tensor, Tuple[torch.Tensor, ...]]: Reduced tensor(s)
         """
+
+        # Ensure workspace is initialized (no-op if already done)
+        # This is safe to call during inference, but not during CUDA graph capture
+        if not self._workspace_initialized:
+            # If we're in CUDA graph capture, we can't initialize now - return None to fallback
+            if torch.cuda.is_current_stream_capturing():
+                logger.debug(
+                    "MNNVL workspace not initialized and in CUDA graph capture - falling back"
+                )
+                return None
+            self._initialize_workspace()
 
         fusion_op = all_reduce_params.fusion_op
         shape = input.shape
@@ -514,14 +543,37 @@ class AllReduce(nn.Module):
                 self.workspace = get_allreduce_workspace(self.mapping)
 
             # Initialize MNNVL AllReduce if needed
+            # Use deferred initialization during CUDA graph capture/warmup to avoid
+            # CPU synchronization (torch.cuda.synchronize() and comm.Barrier()) which is
+            # incompatible with CUDA graph capture and will cause hangs
+            is_capturing = torch.cuda.is_current_stream_capturing()
+
+            # Also check for CUDA graph warmup phase if available
+            in_warmup = False
+            try:
+                from tensorrt_llm._torch.auto_deploy.utils.cuda_graph import \
+                    CudaGraphState
+                in_warmup = CudaGraphState.in_warm_up()
+            except ImportError:
+                pass  # auto_deploy utils not available, that's okay
+
             if self.strategy in (AllReduceStrategy.AUTO,
                                  AllReduceStrategy.MNNVL):
                 if MNNVLAllReduce.is_mnnvl(self.mapping, dtype):
                     try:
+                        # Use deferred initialization if in CUDA graph context
+                        # The workspace can be initialized later by calling initialize_mnnvl_before_capture()
+                        defer_init = is_capturing or in_warmup
                         self.mnnvl_allreduce = MNNVLAllReduce(
-                            self.mapping, dtype) if dtype else None
+                            self.mapping, dtype,
+                            defer_init=defer_init) if dtype else None
                         if self.mnnvl_allreduce:
-                            logger.debug(f"MNNVLAllReduce is enabled")
+                            if defer_init:
+                                logger.debug(
+                                    f"MNNVLAllReduce created with deferred initialization (CUDA graph context detected)"
+                                )
+                            else:
+                                logger.debug(f"MNNVLAllReduce is enabled")
                         else:
                             logger.debug(f"MNNVLAllReduce is disabled")
                     except Exception as e:
@@ -536,6 +588,34 @@ class AllReduce(nn.Module):
 
     def is_mnnvl(self) -> bool:
         return self.mnnvl_allreduce is not None
+
+    def initialize_mnnvl_before_capture(self):
+        """
+        Initialize MNNVL workspace before CUDA graph capture.
+
+        Call this method BEFORE entering CUDA graph warmup/capture phase to enable
+        MNNVL with CUDA graphs. This performs the necessary CPU synchronization
+        outside of the graph capture context.
+
+        Example:
+            model = build_model(...)  # Creates AllReduce modules with defer_init=True
+
+            # Initialize MNNVL workspaces before graph capture
+            for module in model.modules():
+                if isinstance(module, AllReduce):
+                    module.initialize_mnnvl_before_capture()
+
+            # Now safe to capture CUDA graph
+            with torch.cuda.graph(graph):
+                output = model(input)
+        """
+        if self.mnnvl_allreduce and not self.mnnvl_allreduce._workspace_initialized:
+            logger.info(
+                "Initializing MNNVL workspace before CUDA graph capture")
+            self.mnnvl_allreduce._initialize_workspace()
+            logger.info(
+                "MNNVL workspace initialized successfully - ready for CUDA graph capture"
+            )
 
     def forward(
         self,

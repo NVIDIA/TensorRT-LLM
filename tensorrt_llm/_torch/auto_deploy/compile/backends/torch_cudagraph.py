@@ -66,8 +66,39 @@ class CapturedGraph(nn.Module):
         """Round batch size to the nearest cuda batch size."""
         return self.round_up_to_closest(self.cuda_graph_batch_sizes, bs)
 
+    def _initialize_mnnvl_workspaces(self):
+        """
+        Initialize MNNVL workspaces before CUDA graph capture.
+
+        This allows MNNVL AllReduce to work with CUDA graphs by performing
+        the workspace allocation (which includes CPU synchronization) before
+        entering the warmup/capture phase.
+        """
+        try:
+            from tensorrt_llm._torch.distributed import AllReduce
+
+            mnnvl_count = 0
+            for module in self.model.modules():
+                if isinstance(module, AllReduce):
+                    module.initialize_mnnvl_before_capture()
+                    if module.is_mnnvl():
+                        mnnvl_count += 1
+
+            if mnnvl_count > 0:
+                ad_logger.info(
+                    f"Initialized {mnnvl_count} MNNVL AllReduce workspace(s) before CUDA graph capture"
+                )
+        except ImportError:
+            # AllReduce not available, skip
+            pass
+        except Exception as e:
+            ad_logger.warning(f"Failed to initialize MNNVL workspaces: {e}")
+
     def _capture_one_graph(self, *args, **kwargs) -> torch.cuda.CUDAGraph:
         """Capture and return one cuda graph."""
+        # Initialize MNNVL workspaces before warmup to enable MNNVL with CUDA graphs
+        self._initialize_mnnvl_workspaces()
+
         # warm-up and invoke autotuner
         with CudaGraphWarmUpPhase(), autotune():
             for _ in range(3):
