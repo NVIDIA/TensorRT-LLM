@@ -1,5 +1,6 @@
 import enum
 import random
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import (Any, Callable, Dict, List, Optional, Protocol, Tuple, Type,
                     TypeVar)
@@ -7,6 +8,8 @@ from typing import (Any, Callable, Dict, List, Optional, Protocol, Tuple, Type,
 import torch
 from PIL import Image
 from torch import Tensor, nn
+from transformers import (AutoProcessor, PretrainedConfig,
+                          PreTrainedTokenizerBase)
 
 import tensorrt_llm
 
@@ -21,11 +24,6 @@ from .multimodal import (MultimodalInput, apply_mm_hashes, default_hasher,
 N = TypeVar("N", bound=Type[nn.Module])
 
 ExtraProcessedInputs = Dict[str, Any]
-
-from abc import ABC, abstractmethod
-
-from transformers import (AutoProcessor, PretrainedConfig,
-                          PreTrainedTokenizerBase)
 
 
 class InputProcessor(Protocol):
