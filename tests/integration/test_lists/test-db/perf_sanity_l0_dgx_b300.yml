@@ -8,6 +8,7 @@ perf_sanity_l0_dgx_b300:
     wildcards:
       gpu:
       - '*gb110*'
+      - '*b300*'
       linux_distribution_name: ubuntu*
       cpu: x86_64
     terms:
@@ -25,6 +26,7 @@ perf_sanity_l0_dgx_b300:
     wildcards:
       gpu:
       - '*gb110*'
+      - '*b300*'
       linux_distribution_name: ubuntu*
       cpu: x86_64
     terms:
