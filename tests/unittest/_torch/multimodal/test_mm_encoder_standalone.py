@@ -149,7 +149,7 @@ def test_single_image_chat(model_key, pd_disagg, multimodal_model_config):
         assert len(outputs) == 1
         pd_disaggregated_params = outputs[0].disaggregated_params
         pd_disaggregated_params.request_type = "generation_only"
-        sampling_params = SamplingParams(max_tokens=max_tokens, ignore_eos=True)
+        sampling_params = SamplingParams(max_tokens=max_tokens)
 
         outputs = llm_decode.generate(
             inputs,
