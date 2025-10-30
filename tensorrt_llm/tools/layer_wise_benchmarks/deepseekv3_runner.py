@@ -48,7 +48,7 @@ class RoutingMethod(DeepseekV3Gate):
         super().__init__(*args, **kwargs)
         self.world_size = mpi_world_size()
         self.rank = mpi_rank()
-        self.balance_method = None
+        self.balance_method = BalanceMethod.NotModified
         self.balance_ratio = None
 
     def apply(self, router_logits) -> (torch.Tensor, torch.Tensor):
@@ -276,7 +276,7 @@ class DeepSeekV3Runner:
                         batch_size: int,
                         seq_len_q: int,
                         seq_len_kv_cache: int,
-                        kv_cache_manager: Optional[KVCacheManager] = None,
+                        kv_cache_manager: KVCacheManager,
                         attn_workspace: Optional[torch.Tensor] = None):
         if self.model_config.moe_backend == "TRTLLM" and os.getenv(
                 "TRTLLM_ENABLE_PDL") != "1":
