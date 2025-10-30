@@ -611,14 +611,19 @@ class PyTorchModelEngine(ModelEngine):
             kv_cache_manager.get_num_available_tokens(
                 self.original_max_draft_len), self.max_num_tokens,
             self.batch_size * (self.max_seq_len - 1))
+        max_batch_size = min(
+            self.batch_size,
+            curr_max_num_tokens // (1 + self.runtime_draft_len))
 
         warmup_requests_configs = {
             (1, 1),  # Specialize for 1 token.
-            (self.batch_size,
-             self.batch_size),  # max_batch_size, pure generation
+            (max_batch_size, max_batch_size),  # max_batch_size, pure generation
             (2, 0),  # Non-one, pure context
             (curr_max_num_tokens, 0),  # max_num_tokens, pure context
         }
+
+        warmup_requests_configs = sorted(list(warmup_requests_configs),
+                                         reverse=reverse)
 
         for num_tokens, num_gen_tokens in warmup_requests_configs:
             with self._release_batch_context(
@@ -872,7 +877,7 @@ class PyTorchModelEngine(ModelEngine):
             self,
             resource_manager: ResourceManager,
             num_tokens: int,
-            num_gen_tokens: int,
+            num_gen_requests: int,
             least_requests: bool = True) -> Optional[ScheduledRequests]:
         """Creates a generic dummy ScheduledRequests object for warmup."""
         kv_cache_manager = resource_manager.get_resource_manager(
@@ -890,7 +895,10 @@ class PyTorchModelEngine(ModelEngine):
         if num_extra_decoding_steps > 0:
             return None  # Disable autotuning for fused drafting loops for now.
 
-        if num_gen_tokens > self.batch_size:
+        if num_gen_requests > self.batch_size:
+            return None
+        num_gen_tokens = num_gen_requests * (1 + self.runtime_draft_len)
+        if num_gen_tokens > self.max_num_tokens:
             return None
 
         num_ctx_tokens = num_tokens - num_gen_tokens
@@ -902,7 +910,7 @@ class PyTorchModelEngine(ModelEngine):
         num_full_seqs = 0
         num_left_over_tokens = 0
 
-        max_context_requests = self.batch_size - num_gen_tokens
+        max_context_requests = self.batch_size - num_gen_requests
         if max_context_requests * max_seq_len < num_ctx_tokens:
             return None
 
@@ -912,7 +920,7 @@ class PyTorchModelEngine(ModelEngine):
                 num_left_over_tokens = num_ctx_tokens - num_full_seqs * max_seq_len
 
             else:
-                max_bs = min(num_ctx_tokens, self.batch_size - num_gen_tokens)
+                max_bs = min(num_ctx_tokens, max_context_requests)
                 if num_ctx_tokens % max_bs == 0:
                     num_full_seqs = max_bs
                 else:
@@ -920,13 +928,13 @@ class PyTorchModelEngine(ModelEngine):
                 max_seq_len = num_ctx_tokens // num_full_seqs
                 num_left_over_tokens = num_ctx_tokens - max_seq_len * num_full_seqs
 
-        if num_ctx_requests + num_gen_tokens > self.batch_size:
+        if num_ctx_requests + num_gen_requests > self.batch_size:
             return None  # Not enough batch size to fill the request
 
         blocks_to_use = num_full_seqs * math.ceil(
             max_seq_len / kv_cache_manager.tokens_per_block) + math.ceil(
                 num_left_over_tokens /
-                kv_cache_manager.tokens_per_block) + num_gen_tokens
+                kv_cache_manager.tokens_per_block) + num_gen_requests
 
         if blocks_to_use > available_blocks:
             return None
@@ -947,17 +955,21 @@ class PyTorchModelEngine(ModelEngine):
                 spec_resource_manager.add_dummy_requests(
                     request_ids=list(range(num_ctx_requests)))
 
-        if num_gen_tokens > 0:
+        if num_gen_requests > 0:
             gen_requests = kv_cache_manager.add_dummy_requests(
-                list(range(num_ctx_requests,
-                           num_ctx_requests + num_gen_tokens)),
-                token_nums=[1] * num_gen_tokens,
+                list(
+                    range(num_ctx_requests,
+                          num_ctx_requests + num_gen_requests)),
+                token_nums=[1] * num_gen_requests,
                 is_gen=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
-                use_mrope=self.use_mrope)
+                use_mrope=self.use_mrope,
+                max_beam_width=self.max_beam_width,
+                num_extra_decoding_steps=num_extra_decoding_steps)
             if spec_resource_manager is not None:
                 spec_resource_manager.add_dummy_requests(request_ids=list(
-                    range(num_ctx_requests, num_ctx_requests + num_gen_tokens)))
+                    range(num_ctx_requests, num_ctx_requests +
+                          num_gen_requests)))
 
         result = ScheduledRequests()
         result.context_requests = ctx_requests
