@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@user/yiqingy/retry_stage']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -151,7 +151,7 @@ EOF_TIMEOUT_XML
                 sh "ls ${stageName}"
                 echo "Upload test results."
                 sh "tar -czvf results-${stageName}.tar.gz ${stageName}/"
-                ensureStageResultNotUploaded(stageName)
+                ensureStageResultNotUploaded(stageName + "-Attempt" + GlobalState.stageAttemptTimes[stageName])
                 trtllm_utils.uploadArtifacts(
                     "results-${stageName}.tar.gz",
                     "${UPLOAD_PATH}/test-results/"
@@ -159,10 +159,6 @@ EOF_TIMEOUT_XML
             } else {
                 println("No results xml to submit")
             }
-        }
-
-        if (hasTimeoutTest || downloadResultSucceed) {
-            junit(allowEmptyResults: true, testResults: "${stageName}/results*.xml")
         }
     }
 }
@@ -1472,6 +1468,7 @@ def globalVars = [
 
 class GlobalState {
     static def uploadResultStageNames = []
+    static def stageAttemptTimes = [:]
 
     // HOST_NODE_NAME to starting port section map
     // This map maintains the next available starting port for each host node
@@ -1572,7 +1569,7 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
         stageIsInterrupted = true
         throw e
     } finally {
-        ensureStageResultNotUploaded(stageName + postTag)
+        ensureStageResultNotUploaded(stageName + postTag + "-Attempt" + GlobalState.stageAttemptTimes[stageName])
         if (stageIsInterrupted) {
             echo "Stage is interrupted, skip to upload test result."
         } else {
@@ -1614,7 +1611,6 @@ EOF_TIMEOUT_XML
                 "results-${stageName}${postTag}.tar.gz",
                 "${UPLOAD_PATH}/test-results/"
             )
-            junit(testResults: "${stageName}/results*.xml")
         }
 
         // Clean up the workspace
@@ -1651,6 +1647,24 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         containerConfig = """
                   - name: alpine
                     image: urm.nvidia.com/docker/alpine:latest
+                    command: ['cat']
+                    tty: true
+                    resources:
+                      requests:
+                        cpu: '2'
+                        memory: 10Gi
+                        ephemeral-storage: 25Gi
+                      limits:
+                        cpu: '2'
+                        memory: 10Gi
+                        ephemeral-storage: 25Gi
+                    imagePullPolicy: Always"""
+        nodeLabelPrefix = "cpu"
+        break
+    case "package":
+        containerConfig = """
+                  - name: trt-llm
+                    image: ${image}
                     command: ['cat']
                     tty: true
                     resources:
@@ -2293,7 +2307,7 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
         generate_rerun_tests_list \
         --output-dir=${rerunDir}/ \
         --input-file=${WORKSPACE}/${stageName}/${resultFileName} \
-        --fail-signatures='${failSignaturesList}'
+        --fail-signatures="${failSignaturesList}"
     """
 
     // If there are some failed tests that cannot be rerun (e.g. test duration > 10 min and no known failure signatures),
@@ -3715,15 +3729,31 @@ def launchTestJobs(pipeline, testFilter)
     pipeline.echo "Now we will run stages: [\n${keysStr}\n]"
 
     parallelJobsFiltered = parallelJobsFiltered.collectEntries { key, values -> [key, {
-        stage(key) {
-            if (key in testFilter[REUSE_STAGE_LIST]) {
+        def stageName = key
+        stage(stageName) {
+            if (stageName in testFilter[REUSE_STAGE_LIST]) {
                 stage("Skip - Reused") {
                     echo "Skip - Passed in the previous pipelines."
                 }
             } else if (values instanceof List) {
-                trtllm_utils.launchKubernetesPod(pipeline, values[0], "trt-llm", {
-                    values[1]()
-                })
+                def stageIsInterrupted = false
+                try {
+                    trtllm_utils.llmStageWithRetry(pipeline, stageName, {
+                        GlobalState.stageAttemptTimes[stageName] = GlobalState.stageAttemptTimes.getOrDefault(stageName, 0) + 1
+                        echo "GlobalState.stageAttemptTimes[${stageName}]: ${GlobalState.stageAttemptTimes[stageName]}"
+                        trtllm_utils.launchKubernetesPod(pipeline, values[0], "trt-llm", {
+                            values[1]()
+                        })
+                    })
+                } catch (InterruptedException e) {
+                    stageIsInterrupted = true
+                    throw e
+                } finally {
+                    def image = "urm.nvidia.com/docker/golang:1.22"
+                    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "package"), "trt-llm", {
+                        publishJunitTestResults(pipeline, stageName, stageIsInterrupted)
+                    })
+                }
             } else {
                 values()
             }
@@ -3733,6 +3763,39 @@ def launchTestJobs(pipeline, testFilter)
     return parallelJobsFiltered
 }
 
+
+def publishJunitTestResults(pipeline, stageName, stageIsInterrupted) {
+    stage("Publish the junit test results") {
+        if (stageIsInterrupted) {
+            echo "Stage is interrupted, skip to upload test result."
+        } else {
+            def resultsTar = "results-${stageName}.tar.gz"
+            def remoteResultsPath = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/${resultsTar}"
+            sh "echo 'Attempting to download: ${remoteResultsPath}'"
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install wget")
+            try {
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${remoteResultsPath}")
+            } catch (Exception e) {
+                // wget returns exit code 8 for server errors (404, 500, etc.)
+                if (e.message.contains("exit code 8") || e.message.contains("404")) {
+                    echo "Test result not found (HTTP error), skip to upload test result."
+                    return
+                }
+                throw e
+            }
+            sh "tar -xzvf ${resultsTar}"
+            sh "cd ${stageName} && ls -alh"
+            junit(allowEmptyResults: true, testResults: "${stageName}/results*.xml")
+            // Clean up the workspace
+            sh """
+                env | sort
+                pwd && ls -alh
+                rm -rf ./*
+            """
+        }
+    }
+}
 
 
 def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
