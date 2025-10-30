@@ -732,7 +732,7 @@ def executor_request_to_llm_request(
         mrope_rotary_cos_sin=mrope_rotary_cos_sin,
         mrope_position_deltas=mrope_position_deltas,
         lookahead_config=None,
-        return_log_probs=getattr(executor_request, "py_num_logprobs", 0) > 0,
+        return_log_probs=executor_request.output_config.return_log_probs,
         num_logprobs=getattr(executor_request, "py_num_logprobs", 0),
         return_context_logits=executor_request.output_config.
         return_context_logits,
