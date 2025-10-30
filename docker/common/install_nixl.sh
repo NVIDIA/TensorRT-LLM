@@ -39,7 +39,8 @@ meson setup builddir \
     -Dcudapath_lib="$CUDA_PATH/lib64" \
     -Dcudapath_inc="$CUDA_PATH/include" \
     -Dgds_path="$GDS_PATH" \
-    -Dinstall_headers=true
+    -Dinstall_headers=true \
+    --buildtype=release
 
 cd builddir && ninja install
 cd ../..
