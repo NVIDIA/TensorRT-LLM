@@ -94,8 +94,14 @@ class BaseWorker(GenerationExecutor):
             logger.set_rank(self.global_rank)
 
     def _configure_affinity(self, device_id):
-        '''
-        Probe and configure the affinity of the worker
+        '''Probe and configure the CPU affinity of the worker based on NUMA topology.
+
+        Args:
+            device_id: The CUDA device ID to determine optimal CPU affinity.
+
+        Note:
+            If the process already has constrained affinity, a warning is logged.
+            Affinity is only changed if unconstrained or if TLLM_NUMA_AWARE_WORKER_AFFINITY=1.
         '''
 
         # Get the current affinity setting
@@ -112,8 +118,8 @@ class BaseWorker(GenerationExecutor):
         if constrained_affinity:
             logger.warning(
                 f"Worker process {pid} is affined to run on the following CPUs: "
-                "{cpu_affinity} (subset of all logical CPUs). This may harm "
-                "performance if set incorrectly.", )
+                f"{cpu_affinity} (subset of all logical CPUs). This may harm "
+                f"performance if set incorrectly.")
 
         # If affinity is unconstrained or the user has explicitly requested it,
         # choose the optimal affinity based upon the NUMA topology

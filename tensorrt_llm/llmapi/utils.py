@@ -516,9 +516,16 @@ class _SyncQueue:
 
 
 def get_numa_aware_cpu_affinity(device_id):
-    '''
-    Given the CUDA device_id, query NVML and return the ideal CPU affinity (a
-    list of CPU ids) based upon NUMA topology
+    '''Query NVML for NUMA-aware CPU affinity for the specified CUDA device.
+
+    Args:
+        device_id: The CUDA device ID to query for optimal CPU affinity.
+
+    Returns:
+        List of CPU IDs representing the optimal CPU affinity mask for the device.
+
+    Raises:
+        pynvml.NVMLError: If NVML operations fail or device_id is invalid.
     '''
     cpu_count = psutil.cpu_count()
 
