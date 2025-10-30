@@ -2411,7 +2411,8 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
 
         moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
         kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                        free_gpu_memory_fraction=0.7)
+                                        free_gpu_memory_fraction=0.7,
+                                        tokens_per_block=64)
         cuda_graph_config = CudaGraphConfig(
             enable_padding=True,
             max_batch_size=max_batch_size) if cuda_graph else None
