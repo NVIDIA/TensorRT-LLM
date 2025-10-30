@@ -1678,7 +1678,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 if config.get('guided_decoding_backend') is not None:
                     benchmark_cmd += ["--no_skip_tokenizer_init"]
         elif self._config.backend == "_autodeploy":
-            import yaml
             autodeploy_config_path = os.path.join(engine_dir,
                                                   "extra_llm_api_options.yaml")
             if not os.path.exists(autodeploy_config_path):

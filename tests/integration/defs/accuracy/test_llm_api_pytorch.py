@@ -2329,7 +2329,7 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3.2-Exp-hf"
 
     @pytest.mark.skip_less_mpi_world_size(8)
-    @skip_pre_blackwell  # TODO: Hopper untested
+    @skip_pre_blackwell
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
         [
@@ -2345,14 +2345,16 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
             moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
             # TODO: Support block reuse for DeepSeek-V3.2
             kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                            free_gpu_memory_fraction=0.6)
+                                            free_gpu_memory_fraction=0.6,
+                                            tokens_per_block=64)
         else:
             if moe_backend != "_DEFAULT":
                 pytest.skip("Not supported MoE backend!")
             moe_config = MoeConfig()
             # TODO: Support block reuse for DeepSeek-V3.2
             kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                            free_gpu_memory_fraction=0.7)
+                                            free_gpu_memory_fraction=0.7,
+                                            tokens_per_block=64)
 
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -2384,6 +2386,56 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
             # task = GPQADiamond(self.MODEL_NAME)
             # task.evaluate(llm,
             #               extra_evaluator_kwargs=dict(apply_chat_template=True, chat_template_kwargs=dict(thinking=True)))
+
+    @skip_pre_blackwell
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
+        [
+            (8, 1, 8, 0, False, True, True, True, 24, "TRTLLM"),
+            (8, 1, 8, 1, False, True, True, True, 24, "TRTLLM"),
+        ],
+        ids=["baseline", "baseline_mtp1"])
+    def test_nvfp4_multi_gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
+                              attention_dp, cuda_graph, overlap_scheduler,
+                              max_batch_size, moe_backend):
+        if moe_backend == "TRTLLM" and (get_sm_version() == 120
+                                        or get_sm_version() == 121):
+            pytest.skip(
+                "MOE TRTLLM backend does not support SM version 120 or 121")
+
+        moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        free_gpu_memory_fraction=0.7)
+        cuda_graph_config = CudaGraphConfig(
+            enable_padding=True,
+            max_batch_size=max_batch_size) if cuda_graph else None
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=cuda_graph_config,
+            moe_config=moe_config,
+        )
+
+        if fp8kv:
+            kv_cache_config.dtype = "fp8"
+        mtp_config = None
+        if mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+        with LLM(f"{llm_models_root()}/DeepSeek-V3.2-Exp-FP4-v2",
+                 max_batch_size=max_batch_size,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config,
+                 enable_attention_dp=attention_dp,
+                 speculative_config=mtp_config) as llm:
+
+            # GPQA Diamond takes too long to run
+            task = GPQADiamond(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=dict(
+                              apply_chat_template=True,
+                              chat_template_kwargs=dict(thinking=True)))
 
 
 @pytest.mark.timeout(7200)
@@ -2780,7 +2832,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                       False,
                       True,
                       True,
-                      False,
+                      True,
                       marks=pytest.mark.skip_less_mpi_world_size(8))],
         ids=["latency", "multi_gpus_no_cache"])
     def test_bf16(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,

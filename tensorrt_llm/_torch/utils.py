@@ -12,6 +12,7 @@ from tensorrt_llm.math_utils import ceil_div, pad_up
 from tensorrt_llm.quantization.utils import fp4_utils
 
 is_torch_compiling_flag = False
+is_piecewise_running_flag = False
 
 aux_stream_name_list = [
     'Attention',
@@ -38,6 +39,16 @@ def set_torch_compiling(enable: bool):
 def is_torch_compiling() -> bool:
     global is_torch_compiling_flag
     return is_torch_compiling_flag
+
+
+def set_piecewise_running(enable: bool):
+    global is_piecewise_running_flag
+    is_piecewise_running_flag = enable
+
+
+def is_piecewise_running() -> bool:
+    global is_piecewise_running_flag
+    return is_piecewise_running_flag
 
 
 _global_attrs = threading.local()

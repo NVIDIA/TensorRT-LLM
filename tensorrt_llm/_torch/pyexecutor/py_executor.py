@@ -1082,6 +1082,10 @@ class PyExecutor:
         scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
         )
 
+        if self.drafter is not None and not self.use_spec_decode:
+            for request in scheduled_batch.all_requests():
+                request.py_disable_speculative_decoding = True
+
         if self.kv_cache_transceiver:
             # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
             self._prepare_disagg_gen_init(fitting_disagg_gen_init_requests)
@@ -1257,7 +1261,7 @@ class PyExecutor:
                 req.py_last_draft_tokens = req.py_draft_tokens
                 max_total_draft_tokens = self.model_engine.spec_config.max_total_draft_tokens
 
-                if max_total_draft_tokens > 0 and self.use_spec_decode:
+                if max_total_draft_tokens > 0 and self.use_spec_decode and not req.py_disable_speculative_decoding:
                     req.py_draft_tokens = [0] * max_total_draft_tokens
                     req.py_draft_pages_allocated = max_total_draft_tokens
                 else:
