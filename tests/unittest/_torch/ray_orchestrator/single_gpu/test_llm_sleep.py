@@ -14,7 +14,6 @@ def test_llm_sleep(process_gpu_memory_info_available):
     llm = LLM(
         model=llama_model_path,
         enable_sleep=True,
-        ray_worker_extension_cls="tensorrt_llm.rlhf_utils.WorkerExtension",
         cuda_graph_config=None,  # CUDA Graph unsupported yet
         kv_cache_config=kv_cache_config)
 
@@ -53,7 +52,3 @@ def test_llm_sleep(process_gpu_memory_info_available):
                              generated_after_sleep,
                              strict=True):
         assert before == after, "Generated result mismatch before and after sleep"
-
-
-if __name__ == "__main__":
-    test_llm_sleep(True)

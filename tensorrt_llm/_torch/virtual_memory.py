@@ -81,7 +81,7 @@ class ExecutorMemoryType(StrEnum):
     MODEL_ENGINE_DRAFT = "draft_model"
 
 
-def verify_sleep_wakeup_tags(tags_strs: List[str]):
+def verify_sleep_wakeup_tags(tags_strs: List[str]) -> List[ExecutorMemoryType]:
     tags = []
     for tag_str in tags_strs:
         try:

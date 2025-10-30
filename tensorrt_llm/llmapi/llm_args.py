@@ -2589,7 +2589,9 @@ class TorchLlmArgs(BaseLlmArgs):
 
     enable_sleep: bool = Field(
         default=False,
-        description="Enable extra setup to support sleep feature.",
+        description=
+        "Enable LLM sleep feature. Sleep feature requires extra setup that may slowdown model loading."
+        "Only enable it if you intend to use this feature.",
         status="prototype")
 
     # PrivateVars
