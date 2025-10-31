@@ -529,19 +529,23 @@ def get_numa_aware_cpu_affinity(device_id):
     '''
     cpu_count = psutil.cpu_count()
 
-    # Get the number of bits per ulong
-    c_ulong_bits = ctypes.sizeof(ctypes.c_ulong) * 8
-
-    # Determine how large our cpu set array from NVML needs to be
-    cpu_set_size = math.ceil(cpu_count / c_ulong_bits)
-
-    # If we hit an exception, default to unconstrained CPU affinity
+    # If this is not a NUMA system, or we hit an exception, default to
+    # unconstrained CPU affinity
     cpu_affinity = list(range(cpu_count))
+
+    if not os.path.isdir("/sys/devices/system/node/node1"):
+        return cpu_affinity
 
     try:
         # initialize NVML
         import pynvml
         pynvml.nvmlInit()
+
+        # Get the number of bits per ulong
+        c_ulong_bits = ctypes.sizeof(ctypes.c_ulong) * 8
+
+        # Determine how large our cpu set array from NVML needs to be
+        cpu_set_size = math.ceil(cpu_count / c_ulong_bits)
 
         # Get the optimal CPU affinity for this device according to the NUMA
         # topology
