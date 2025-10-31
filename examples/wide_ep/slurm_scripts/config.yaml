@@ -5,7 +5,7 @@ slurm:
   account: "<account>"
   job_time: "02:00:00"
   job_name: "<job_name>"
-  numa_bind: true
+  numa_bind: true # Only enable for GB200 NVL72
 
 # Hardware Configuration
 hardware:
@@ -43,7 +43,6 @@ profiling:
 
 # Worker Configuration
 worker_config:
-  eplb_num_slots: 288
   gen:
     enable_layerwise_nvtx_marker: true
     tensor_parallel_size: 32
@@ -79,7 +78,9 @@ worker_config:
     moe_config:
       backend: WIDEEP
       use_low_precision_moe_combine: true
-      load_balancer: "<path_to_load_balancer_yaml>"
+      load_balancer:
+        num_slots: 288
+        layer_updates_per_iter: 1
     cache_transceiver_config:
       max_tokens_in_buffer: 8448
       backend: DEFAULT

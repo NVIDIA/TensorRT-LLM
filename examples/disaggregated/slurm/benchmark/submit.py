@@ -82,9 +82,9 @@ def submit_job(config):
 
     # Determine directory suffix based on attention_dp
     if gen_enable_attention_dp:
-        dir_suffix = f"ctx{ctx_num}_gen{gen_num}_dep{gen_tp_size}_batch{gen_batch_size}_eplb{config['worker_config']['eplb_num_slots']}_mtp{mtp_size}"
+        dir_suffix = f"ctx{ctx_num}_gen{gen_num}_dep{gen_tp_size}_batch{gen_batch_size}_eplb{config['worker_config']['gen']['moe_config']['load_balancer']['num_slots']}_mtp{mtp_size}"
     else:
-        dir_suffix = f"ctx{ctx_num}_gen{gen_num}_tep{gen_tp_size}_batch{gen_batch_size}_eplb{config['worker_config']['eplb_num_slots']}_mtp{mtp_size}"
+        dir_suffix = f"ctx{ctx_num}_gen{gen_num}_tep{gen_tp_size}_batch{gen_batch_size}_eplb{config['worker_config']['gen']['moe_config']['load_balancer']['num_slots']}_mtp{mtp_size}"
 
     # Create full log directory path
     log_dir = os.path.join(log_base, dir_suffix)

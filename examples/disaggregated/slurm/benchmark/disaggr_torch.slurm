@@ -167,7 +167,7 @@ echo "ctx_nodes_num_in_single_server: ${ctx_nodes_num_in_single_server}"
 echo "Starting gen workers..."
 for i in $(seq 0 $((num_gen_servers - 1))); do
     srun -l -N ${gen_nodes_num_in_single_server} \
-        --ntasks=${gen_tp_size} \
+        --ntasks=$((gen_tp_size * gen_pp_size)) \
         --ntasks-per-node=${gpus_per_node} \
         --container-image=${container_image} \
         --container-name=${container_name} \
@@ -182,7 +182,7 @@ done
 echo "Starting ctx workers..."
 for i in $(seq 0 $((num_ctx_servers - 1))); do
     srun -l -N ${ctx_nodes_num_in_single_server} \
-        --ntasks=${ctx_tp_size} \
+        --ntasks=$((ctx_tp_size * ctx_pp_size)) \
         --ntasks-per-node=${gpus_per_node} \
         --container-image=${container_image} \
         --container-name=${container_name} \
