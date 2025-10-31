@@ -417,7 +417,7 @@ class TRTLLMGenFusedMoE(MoE):
                 payloads.append(token_selected_experts)
                 payloads.append(token_final_scales)
 
-                recv_buffers = self.moe_a2a.dispatch(
+                recv_tensors = self.moe_a2a.dispatch(
                     token_selected_experts,
                     payloads,
                     runtime_max_tokens_per_rank,
@@ -427,10 +427,10 @@ class TRTLLMGenFusedMoE(MoE):
                 )
 
                 if x_sf is not None:
-                    x_recv, x_sf_recv, token_selected_experts_recv, token_final_scales_recv = recv_buffers
+                    x_recv, x_sf_recv, token_selected_experts_recv, token_final_scales_recv = recv_tensors
                     x_sf = x_sf_recv.view(-1, x_sf_recv.shape[-1])
                 else:
-                    x_recv, token_selected_experts_recv, token_final_scales_recv = recv_buffers
+                    x_recv, token_selected_experts_recv, token_final_scales_recv = recv_tensors
                 x = x_recv.view(-1, x_recv.shape[-1])
                 token_selected_experts = token_selected_experts_recv.view(
                     -1, token_selected_experts_recv.shape[-1])

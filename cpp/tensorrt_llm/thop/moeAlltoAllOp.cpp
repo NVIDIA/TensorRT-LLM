@@ -515,7 +515,7 @@ torch::Tensor moeA2AGetCombinePayloadTensorOp(torch::Tensor const& workspace, in
 // PyTorch bindings
 TORCH_LIBRARY_FRAGMENT(trtllm, module)
 {
-    // Note that we returns recv_buffers as a list of views into workspace, we need to upcast its alias
+    // Note that we returns recv_tensors as a list of views into workspace, we need to upcast its alias
     // group to wildcard (a!->*). See
     // https://github.com/pytorch/pytorch/blob/b1eb6dede556136f9fdcee28415b0358d58ad877/aten/src/ATen/native/README.md#annotations
     module.def(

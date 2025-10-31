@@ -154,7 +154,7 @@ class MoeAlltoAll:
             expert_id_payload_index: The index of token_selected_experts in the input_payloads. Must be provided if invalid_token_expert_id is not None.
 
         Returns:
-            recv_buffers: List of tensors received, each has shape [ep_size, max_tokens_per_rank, payload_num_elements_per_token]
+            recv_tensors: List of tensors received, each has shape [ep_size, max_tokens_per_rank, payload_num_elements_per_token]
         """
         assert self._state.phase == "idle", "dispatch called twice without an intervening combine"
         assert runtime_max_tokens_per_rank <= self.max_num_tokens, "runtime_max_tokens_per_rank must not exceed max_num_tokens"
