@@ -16,7 +16,7 @@ SCALING_VECTOR_SIZE = 16  # NVFP4 block size along K
 INT4_BLOCK_SIZE = 128
 
 
-@pytest.mark.parametrize("M", [3])
+@pytest.mark.parametrize("M", [3, 12])  # NOTE: ensures both kernels are called
 @pytest.mark.parametrize("N", [18, 28, 30, 32])
 @pytest.mark.parametrize("K", [16, 32])
 @pytest.mark.parametrize("bias", [True, False])
@@ -40,7 +40,7 @@ def test_fp8_linear(M, N, K, bias):
 
     assert output_fp8_gemm.shape == output_fp32_gemm.shape
 
-    assert torch.allclose(output_fp8_gemm, output_fp32_gemm, rtol=0.01, atol=0.15)
+    torch.testing.assert_close(output_fp8_gemm, output_fp32_gemm, rtol=0.01, atol=0.15)
 
 
 @pytest.mark.skipif(

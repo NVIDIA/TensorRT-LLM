@@ -86,7 +86,7 @@ def fp8_linear(
 
     # Use TensorRT-LLM FP8 scaled matrix multiply
     # Choose between CUDA core (for small M) and cuBLAS (for large M) implementations
-    if input_fp8.shape[0] <= 8:
+    if input_fp8.shape[0] <= 8 or n % 16 != 0:
         # Use CUDA core for small M dimension (better for small batch sizes)
         output = torch.ops.trtllm.cuda_scaled_mm(
             input_fp8,
