@@ -1622,16 +1622,16 @@ void gemm_dispatch_sm89(void* mat_a, void* mat_b, void* mat_d, float* scales_a, 
     dim3 grid = dim3(grid_m, grid_n, grid_k);
     dim3 block = dim3(kThreadCount, 1, 1);
 
-    if (kSmemSize > (48 << 10))
-    {
-        cudaFuncSetAttribute(ada_blockwise_gemm::sm89_fp8_gemm_1d1d_impl<GemmKernel>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize);
-        auto result = cudaGetLastError();
-        TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm89 gemm kernel cannot launch: %s", cudaGetErrorString(result));
-    }
+    cudaFuncSetAttribute(ada_blockwise_gemm::sm89_fp8_gemm_1d1d_impl<GemmKernel>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize);
+    auto result = cudaGetLastError();
+    TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm89 gemm kernel cannot launch: %s", cudaGetErrorString(result));
 
     ada_blockwise_gemm::sm89_fp8_gemm_1d1d_impl<GemmKernel>
         <<<grid, block, kSmemSize, stream>>>(shape_m, shape_n, shape_k, mat_a, mat_b, mat_d, scales_a, scales_b);
+
+    result = cudaGetLastError();
+    TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm89 gemm kernel runtime error: %s", cudaGetErrorString(result));
 }
 
 void fp8_gemm_run(__nv_fp8_e4m3* mat_a, int ld_a, __nv_fp8_e4m3* mat_b, int ld_b, __nv_bfloat16* mat_d, int ld_d,
@@ -1643,7 +1643,7 @@ void fp8_gemm_run(__nv_fp8_e4m3* mat_a, int ld_a, __nv_fp8_e4m3* mat_b, int ld_b
     }
 #ifndef PLACEHOLDER_KERNELS
     int arch = tensorrt_llm::common::getSMVersion();
-    if (arch == 89)
+    if (arch == 89 || arch == 120)
     {
         gemm_dispatch_sm89(mat_a, mat_b, mat_d, scales_a, scales_b, shape_m, shape_n, shape_k, stream);
         return;
@@ -1883,7 +1883,7 @@ void fp8_stride_batch_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_ma
     }
 
     int arch = tensorrt_llm::common::getSMVersion();
-    if (arch == 89)
+    if (arch == 89 || arch == 120)
     {
         strided_batch_gemm_dispatch_sm89(fp8_mat_a, ld_a, stride_a, fp8_mat_b, ld_b, stride_b, mat_d, ld_d, stride_d,
             scales_a, stride_scales_a, scales_b, num_problems, shape_m, shape_n, shape_k, stream);

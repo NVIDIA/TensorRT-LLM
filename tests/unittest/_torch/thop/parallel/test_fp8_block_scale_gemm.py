@@ -63,7 +63,7 @@ def test_fp8_block_scale_deep_gemm(dtype, m, k, n):
 
 
 @pytest.mark.skipif(
-    getSMVersion() != 100 and getSMVersion() != 89,
+    getSMVersion() != 100 and getSMVersion() != 89 and getSMVersion() != 120,
     reason="The test is for Blackwell and Ada only. Current SM is %d." %
     getSMVersion(),
 )
@@ -99,7 +99,7 @@ def test_fp8_block_scale_gemm(dtype, m, k, n):
 
 
 @pytest.mark.skipif(
-    getSMVersion() != 90 and getSMVersion() != 89,
+    getSMVersion() != 90 and getSMVersion() != 89 and getSMVersion() != 120,
     reason="The test is for Hopper and Ada only. Current SM is %d." %
     getSMVersion(),
 )
