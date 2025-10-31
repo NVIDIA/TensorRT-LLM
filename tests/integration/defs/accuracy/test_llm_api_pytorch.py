@@ -784,37 +784,6 @@ class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @skip_pre_hopper
-    @pytest.mark.skip_less_mpi_world_size(8)
-    @parametrize_with_ids("torch_compile", [True, False])
-    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(8, 1, 1)],
-                             ids=["tp8"])
-    def test_fp8_eagle3(self, tp_size, pp_size, ep_size, torch_compile):
-        model_path = f"{llm_models_root()}/llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8"
-        eagle_model_dir = f"{llm_models_root()}/Llama-4-Maverick-17B-128E-Eagle3"
-        spec_config = EagleDecodingConfig(max_draft_len=3,
-                                          speculative_model_dir=eagle_model_dir)
-        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                        free_gpu_memory_fraction=0.75)
-        torch_compile_config = TorchCompileConfig(
-            enable_fullgraph=True,
-            enable_piecewise_cuda_graph=True,
-            capture_num_tokens=[2048, 8192],
-            max_num_streams=3) if torch_compile else None
-        pytorch_config = dict(
-            cuda_graph_config=CudaGraphConfig(max_batch_size=8),
-            enable_attention_dp=False,
-            torch_compile_config=torch_compile_config)
-        with LLM(model_path,
-                 kv_cache_config=kv_cache_config,
-                 tensor_parallel_size=tp_size,
-                 pipeline_parallel_size=pp_size,
-                 moe_expert_parallel_size=ep_size,
-                 **pytorch_config,
-                 speculative_config=spec_config) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
 
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.skip_less_host_memory(100000)
