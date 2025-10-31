@@ -1660,7 +1660,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         #Add extra-llm-api-config.yml for pytorch backend and tensorrt backend with extra flag
         if self._config.backend == "pytorch" or (self._config.backend == ""
                                                  and self._config.extra):
-            import yaml
             pytorch_config_path = os.path.join(engine_dir,
                                                "extra-llm-api-config.yml")
             if not os.path.exists(pytorch_config_path):
