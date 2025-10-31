@@ -3435,7 +3435,6 @@ class TestEXAONE4(LlmapiAccuracyTestHarness):
     kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                     enable_partial_reuse=False)
 
-    @pytest.mark.skip(reason="https://nvbugs/5624367")
     def test_auto_dtype(self):
         model_path = f"{llm_models_root()}/EXAONE-4.0-32B"
         with LLM(model_path, kv_cache_config=self.kv_cache_config) as llm:
