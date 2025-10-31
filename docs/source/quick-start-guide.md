@@ -79,6 +79,10 @@ _Example Output_
 
 For detailed examples and command syntax, refer to the [trtllm-serve](commands/trtllm-serve/trtllm-serve.rst) section.
 
+```{note}
+Pre-configured settings for deploying popular models with `trtllm-serve` can be found in our [deployment guides](deployment-guide/index.rst).
+```
+
 ## Run Offline Inference with LLM API
 The LLM API is a Python API designed to facilitate setup and inference with TensorRT LLM directly within Python. It enables model optimization by simply specifying a HuggingFace repository name or a model checkpoint. The LLM API streamlines the process by managing model loading, optimization, and inference, all through a single `LLM` instance.
 
@@ -92,33 +96,6 @@ Here is a simple example to show how to use the LLM API with TinyLlama.
 You can also directly load pre-quantized models [quantized checkpoints on Hugging Face](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4) in the LLM constructor.
 To learn more about the LLM API, check out the [](llm-api/index) and [](examples/llm_api_examples).
 
-## Quick Start for Popular Models
-
-The table below contains one-line `trtllm-serve` commands that can be used to easily deploy popular models including DeepSeek-R1, gpt-oss, Llama 4, Qwen3, and more.
-
-We maintain LLM API configuration files for these models containing recommended performance settings in the [`examples/configs`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/configs) directory. The TensorRT LLM Docker container makes the config files available at `/app/tensorrt_llm/examples/configs`, but you can customize this as needed:
-
-```bash
-export TRTLLM_DIR="/app/tensorrt_llm" # path to the TensorRT LLM repo in your local environment
-```
-
-Disclaimer: the configs here are specifically optimized for a target ISL/OSL (Input/Output Sequence Length) of 1024/1024. If your traffic pattern is different, you may benefit from additional tuning. In the future, we plan to provide more configs for a wider range of traffic patterns.
-
-This table is designed to provide a straightforward starting point; for detailed model-specific deployment guides, check out the [Model Recipes](deployment-guide/index.rst).
-
-| Model Name | GPU | Inference Scenario | Config | Command |
-|------|------|------|------|------|
-| [DeepSeek-R1](https://huggingface.co/deepseek-ai/DeepSeek-R1-0528) | H100, H200 | Max Throughput | [deepseek-r1-throughput.yaml](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/deepseek-r1-throughput.yaml) | `trtllm-serve deepseek-ai/DeepSeek-R1-0528 --extra_llm_api_options ${TRTLLM_DIR}/examples/configs/deepseek-r1-throughput.yaml` |
-| [DeepSeek-R1](https://huggingface.co/deepseek-ai/DeepSeek-R1-0528) | B200, GB200 | Max Throughput | [deepseek-r1-deepgemm.yaml](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/deepseek-r1-deepgemm.yaml) | `trtllm-serve deepseek-ai/DeepSeek-R1-0528 --extra_llm_api_options ${TRTLLM_DIR}/examples/configs/deepseek-r1-deepgemm.yaml` |
-| [DeepSeek-R1 (NVFP4)](https://huggingface.co/nvidia/DeepSeek-R1-FP4) | B200, GB200 | Max Throughput | [deepseek-r1-throughput.yaml](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/deepseek-r1-throughput.yaml) | `trtllm-serve nvidia/DeepSeek-R1-FP4 --extra_llm_api_options ${TRTLLM_DIR}/examples/configs/deepseek-r1-throughput.yaml` |
-| [DeepSeek-R1 (NVFP4)](https://huggingface.co/nvidia/DeepSeek-R1-FP4-v2) | B200, GB200 | Min Latency | [deepseek-r1-latency.yaml](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/deepseek-r1-latency.yaml) | `trtllm-serve nvidia/DeepSeek-R1-FP4-v2 --extra_llm_api_options ${TRTLLM_DIR}/examples/configs/deepseek-r1-latency.yaml` |
-| [gpt-oss-120b](https://huggingface.co/openai/gpt-oss-120b) | Any | Max Throughput | [gpt-oss-120b-throughput.yaml](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/gpt-oss-120b-throughput.yaml) | `trtllm-serve openai/gpt-oss-120b --extra_llm_api_options ${TRTLLM_DIR}/examples/configs/gpt-oss-120b-throughput.yaml` |
-| [gpt-oss-120b](https://huggingface.co/openai/gpt-oss-120b) | Any | Min Latency | [gpt-oss-120b-latency.yaml](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/gpt-oss-120b-latency.yaml) | `trtllm-serve openai/gpt-oss-120b --extra_llm_api_options ${TRTLLM_DIR}/examples/configs/gpt-oss-120b-latency.yaml` |
-| [Qwen3-Next-80B-A3B-Thinking](https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Thinking) | Any | Max Throughput | [qwen3-next.yaml](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/qwen3-next.yaml) | `trtllm-serve Qwen/Qwen3-Next-80B-A3B-Thinking --extra_llm_api_options ${TRTLLM_DIR}/examples/configs/qwen3-next.yaml` |
-| Qwen3 family (e.g. [Qwen3-30B-A3B](https://huggingface.co/Qwen/Qwen3-30B-A3B)) | Any | Max Throughput | [qwen3.yaml](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/qwen3.yaml) | `trtllm-serve Qwen/Qwen3-30B-A3B --extra_llm_api_options ${TRTLLM_DIR}/examples/configs/qwen3.yaml` <br>(swap to another Qwen3 model name as needed) |
-| [Llama-3.3-70B (FP8)](https://huggingface.co/nvidia/Llama-3.3-70B-Instruct-FP8) | Any | Max Throughput | [llama-3.3-70b.yaml](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/llama-3.3-70b.yaml) | `trtllm-serve nvidia/Llama-3.3-70B-Instruct-FP8 --extra_llm_api_options ${TRTLLM_DIR}/examples/configs/llama-3.3-70b.yaml` |
-| [Llama 4 Scout (FP8)](https://huggingface.co/nvidia/Llama-4-Scout-17B-16E-Instruct-FP8) | Any | Max Throughput | [llama-4-scout.yaml](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/llama-4-scout.yaml) | `trtllm-serve nvidia/Llama-4-Scout-17B-16E-Instruct-FP8 --extra_llm_api_options ${TRTLLM_DIR}/examples/configs/llama-4-scout.yaml` |
-
 ## Next Steps
 
 In this Quick Start Guide, you have:
@@ -129,6 +106,7 @@ In this Quick Start Guide, you have:
 To continue your journey with TensorRT LLM, explore these resources:
 
 - **[Installation Guide](installation/index.rst)** - Detailed installation instructions for different platforms
+- **[Model-Specific Deployment Guides](deployment-guide/index.rst)** - Instructions for serving specific models with TensorRT LLM
 - **[Deployment Guide](examples/llm_api_examples)** - Comprehensive examples for deploying LLM inference in various scenarios
 - **[Model Support](models/supported-models.md)** - Check which models are supported and how to add new ones
 - **CLI Reference** - Explore TensorRT LLM command-line tools:
