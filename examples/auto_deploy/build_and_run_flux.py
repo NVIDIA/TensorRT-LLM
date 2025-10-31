@@ -4,11 +4,11 @@ from collections import abc
 import modelopt.torch.opt as mto
 import torch
 from diffusers import DiffusionPipeline
-from diffusers.models.transformers import FluxTransformer2DModel
 from tqdm import tqdm
 
 from tensorrt_llm._torch.auto_deploy.compile import CompileBackendRegistry
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils._graph import load_buffers_and_params
 from tensorrt_llm._torch.auto_deploy.utils.logger import ad_logger
 
@@ -43,6 +43,7 @@ class TransformerWrapper(torch.nn.Module):
         return noop_context()
 
 
+@torch.inference_mode()
 def generate_image(pipe: DiffusionPipeline, prompt: str, image_name: str) -> None:
     """Generate an image using the given pipeline and prompt."""
     image = pipe(
@@ -55,54 +56,47 @@ def generate_image(pipe: DiffusionPipeline, prompt: str, image_name: str) -> Non
     ad_logger.info(f"Image generated saved as {image_name}")
 
 
-def benchmark_model(
-    pipe, prompt, num_warmup=10, num_runs=50, num_inference_steps=20, model_dtype="BFloat16"
+@torch.inference_mode()
+def benchmark_backbone_standalone(
+    pipe, num_warmup=10, num_benchmark=100, model_name="flux-dev", model_dtype="Half"
 ):
-    """Benchmark the backbone model inference time."""
+    """Benchmark the backbone model directly without running the full pipeline."""
     backbone = pipe.transformer if hasattr(pipe, "transformer") else pipe.unet
 
-    backbone_times = []
+    # Generate dummy inputs for the backbone
+    dummy_inputs = _gen_dummy_inp_flux(backbone)
+
+    # Warmup
+    print(f"Warming up: {num_warmup} iterations")
+    for _ in tqdm(range(num_warmup), desc="Warmup"):
+        _ = backbone(**dummy_inputs)
+
+    # Benchmark
+    torch.cuda.synchronize()
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
 
-    def forward_pre_hook(_module, _input):
+    print(f"Benchmarking: {num_benchmark} iterations")
+    times = []
+    for _ in tqdm(range(num_benchmark), desc="Benchmark"):
         start_event.record()
-
-    def forward_hook(_module, _input, _output):
+        _ = backbone(**dummy_inputs)
         end_event.record()
         torch.cuda.synchronize()
-        backbone_times.append(start_event.elapsed_time(end_event))
+        times.append(start_event.elapsed_time(end_event))
 
-    pre_handle = backbone.register_forward_pre_hook(forward_pre_hook)
-    post_handle = backbone.register_forward_hook(forward_hook)
+    avg_latency = sum(times) / len(times)
+    times = sorted(times)
+    p50 = times[len(times) // 2]
+    p95 = times[int(len(times) * 0.95)]
+    p99 = times[int(len(times) * 0.99)]
 
-    try:
-        print(f"Starting warmup: {num_warmup} runs")
-        for _ in tqdm(range(num_warmup), desc="Warmup"):
-            _ = pipe(
-                prompt,
-                output_type="pil",
-                num_inference_steps=num_inference_steps,
-                generator=torch.Generator("cuda").manual_seed(42),
-            )
+    print(f"\nBackbone-only inference latency ({model_dtype}):")
+    print(f"  Average: {avg_latency:.2f} ms")
+    print(f"  P50: {p50:.2f} ms")
+    print(f"  P95: {p95:.2f} ms")
+    print(f"  P99: {p99:.2f} ms")
 
-        backbone_times.clear()
-
-        print(f"Starting benchmark: {num_runs} runs")
-        for _ in tqdm(range(num_runs), desc="Benchmark"):
-            _ = pipe(
-                prompt,
-                output_type="pil",
-                num_inference_steps=num_inference_steps,
-                generator=torch.Generator("cuda").manual_seed(42),
-            )
-    finally:
-        pre_handle.remove()
-        post_handle.remove()
-
-    total_backbone_time = sum(backbone_times)
-    avg_latency = total_backbone_time / (num_runs * num_inference_steps)
-    print(f"Inference latency of the torch backbone: {avg_latency:.2f} ms")
     return avg_latency
 
 
@@ -118,12 +112,11 @@ def torch_to(data, *args, **kwargs):
 
 
 def _gen_dummy_inp_flux(backbone, min_bs=1):
-    assert isinstance(backbone, FluxTransformer2DModel)
     cfg = backbone.config
     text_maxlen = 512
     img_dim = 4096
 
-    dtype = backbone.dtype
+    dtype = torch.bfloat16
     dummy_input = {
         "hidden_states": torch.randn(min_bs, img_dim, cfg.in_channels, dtype=dtype),
         "encoder_hidden_states": torch.randn(
@@ -139,7 +132,7 @@ def _gen_dummy_inp_flux(backbone, min_bs=1):
     if cfg.guidance_embeds:  # flux-dev
         dummy_input["guidance"] = torch.full((1,), 3.5, dtype=torch.float32)
 
-    dummy_input = torch_to(dummy_input, device=backbone.device)
+    dummy_input = torch_to(dummy_input, device="cuda")
 
     return dummy_input
 
@@ -219,7 +212,7 @@ def main():
             generate_image(pipe, args.prompt, hf_image_path)
         if args.benchmark:
             ad_logger.info("Benchmarking HuggingFace model")
-            latency = benchmark_model(pipe, args.prompt)
+            latency = benchmark_backbone_standalone(pipe, model_dtype="BFloat16")
             ad_logger.info(f"HuggingFace Average Inference Latency: {latency:.2f} ms")
     model = pipe.transformer
     flux_config = pipe.transformer.config
@@ -239,6 +232,22 @@ def main():
             ad_logger.error(f"Failed to restore model from {args.restore_from}: {e}")
             raise
 
+    # Apply inference optimizer fusions
+    ad_logger.info("Applying inference optimizer fusions (FP8 and FP4)...")
+    optimizer_config = {
+        "fuse_fp8_linear": {
+            "stage": "post_load_fusion",
+            "backend": "torch",
+        },
+        "fuse_nvfp4_linear": {
+            "stage": "post_load_fusion",
+            "backend": "trtllm",
+        },
+    }
+    optimizer = InferenceOptimizer(factory=None, config=optimizer_config)
+    gm = optimizer(cm=None, mod=gm)
+    ad_logger.info("Inference optimizer fusions applied successfully")
+
     # Validate backend availability
     if not CompileBackendRegistry.has(args.backend):
         available = CompileBackendRegistry.list()
@@ -256,7 +265,7 @@ def main():
 
     if args.benchmark:
         ad_logger.info("Benchmarking AutoDeploy model")
-        latency = benchmark_model(pipe, args.prompt)
+        latency = benchmark_backbone_standalone(pipe, model_dtype="BFloat16")
         ad_logger.info(f"AutoDeploy Average Inference Latency: {latency:.2f} ms")
 
 
