@@ -101,7 +101,13 @@ class BaseWorker(GenerationExecutor):
 
         Note:
             If the process already has constrained affinity, a warning is logged.
-            Affinity is only changed if unconstrained or if TLLM_NUMA_AWARE_WORKER_AFFINITY=1.
+            Configuration is handled as follows:
+                TLLM_NUMA_WORKER_AFFINITY = <unset>
+                    -> affinity is auto-configured only if it is unconstrained
+                TLLM_NUMA_WORKER_AFFINITY = 1
+                    -> affinity is unconditionally auto-configured
+                TLLM_NUMA_WORKER_AFFINITY = 0 or any other value
+                    -> affinity is unconditionally _not_ auto-configured
         '''
 
         # Get the current affinity setting
@@ -121,10 +127,12 @@ class BaseWorker(GenerationExecutor):
                 f"{cpu_affinity} (subset of all logical CPUs). This may harm "
                 f"performance if set incorrectly.")
 
-        # If affinity is unconstrained or the user has explicitly requested it,
-        # choose the optimal affinity based upon the NUMA topology
-        if not constrained_affinity or os.environ.get(
-                "TLLM_NUMA_AWARE_WORKER_AFFINITY", "0") == "1":
+        # If affinity is unconstrained and the user hasn't explicitly
+        # prohibited it or the user has explicitly requested it, choose the
+        # optimal affinity based upon the NUMA topology
+        numa_aware_affinity = os.environ.get("TLLM_NUMA_AWARE_WORKER_AFFINITY")
+        if ((numa_aware_affinity is None and not constrained_affinity)
+                or (numa_aware_affinity == "1")):
             process.cpu_affinity(get_numa_aware_cpu_affinity(device_id))
 
     def _get_comm_ranks_device_id(self):
