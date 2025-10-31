@@ -556,6 +556,7 @@ class ExecutorRequestQueue:
                     req_id_to_obj[item.id] = obj
         return None if not req_id_to_obj else (attribute_name, req_id_to_obj)
 
+    @nvtx_range("_broadcast_new_requests")
     def _broadcast_new_requests(
             self, new_requests: List[RequestQueueItem], py_request_objects
     ) -> Tuple[List[RequestQueueItem], Optional[Dict]]:
@@ -574,16 +575,20 @@ class ExecutorRequestQueue:
 
         # Send payloads
         if not self.dist.is_first_pp_rank:
-            payloads = self.dist.recv_object(self.dist.prev_pp_rank, tag)
+            with nvtx_range("recv_requests_from_prev_pp"):
+                payloads = self.dist.recv_object(self.dist.prev_pp_rank, tag)
 
         if not self.dist.is_last_pp_rank:
-            if self._disable_mpi:
-                isend_payload = self.dist.isend_object(payloads,
-                                                       self.dist.next_pp_rank,
-                                                       tag)
-                isend_payload.wait()
-            else:
-                self.dist.send_object(payloads, self.dist.next_pp_rank, tag)
+            with nvtx_range("send_requests_to_next_pp"):
+                if self._disable_mpi:
+                    isend_payload = self.dist.isend_object(
+                        payloads,
+                        self.dist.next_pp_rank,
+                        tag,
+                    )
+                    isend_payload.wait()
+                else:
+                    self.dist.send_object(payloads, self.dist.next_pp_rank, tag)
 
         return payloads
 

@@ -1,10 +1,13 @@
 import enum
+import random
 from dataclasses import dataclass, field
 from typing import (Any, Callable, Dict, List, Optional, Protocol, Tuple, Type,
                     TypeVar)
 
 from PIL import Image
 from torch import Tensor, nn
+
+import tensorrt_llm
 
 from .._utils import nvtx_range_debug
 from ..logger import logger
@@ -42,6 +45,48 @@ class InputProcessor(Protocol):
         ...
 
 
+class BaseDummyInputsBuilder:
+    """
+    Base class for generating dummy inputs. Specially for profiling
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.image_max_dim = 16384
+        self.img_min_dim = 128
+
+    def get_dummy_image(self, max_width: int, max_height: int):
+        image = Image.new("RGB", (max_width, max_height),
+                          color=random.randint(0, 256))
+        return image
+
+    def get_dummy_prompt(self, input_seq_len: int):
+        # TODO(yechank): We use the max resolution as starting point and keep reducing the resolution until the prompt length is less than the input sequence length.
+        # Need to find better way to calculate the dummy prompt length as this iteration may not be efficient.
+        while self.image_max_dim >= self.img_min_dim:
+            image = self.get_dummy_image(max_width=self.image_max_dim,
+                                         max_height=self.image_max_dim)
+
+            test_mm_prompt = tensorrt_llm.inputs.utils.default_multimodal_input_loader(
+                tokenizer=self.tokenizer,
+                model_dir=self.model_path,
+                model_type=self.model_config.model_type,
+                modality="image",
+                prompts=[""],
+                media=[[image]],
+                image_data_format="pt")[0]
+
+            prompt_token_ids_single_img, _ = self(test_mm_prompt, None)
+
+            if len(prompt_token_ids_single_img) <= input_seq_len:
+                return test_mm_prompt
+
+            # reduce img resolution
+            self.image_max_dim = self.image_max_dim >> 1
+
+        return None
+
+
 class BaseMultimodalInputProcessor:
     """
     Base class for multimodal input processors with default implementations
@@ -50,6 +95,9 @@ class BaseMultimodalInputProcessor:
     This class provides default implementations that work with most AutoProcessor-based
     models. Specific processors can override these methods if they need custom logic.
     """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
 
     def get_processor(self) -> Optional[Any]:
         """Return the processor object if available; otherwise raise NotImplementedError.
@@ -78,7 +126,7 @@ class BaseMultimodalInputProcessor:
                                                   None) is not None:
             return int(self.tokenizer.vocab_size)
 
-        logger.warning(
+        logger.debug(
             f"Cannot determine vocab_size from {self.__class__.__name__}. "
             "Please override this method to provide the vocabulary size. ")
         return None
@@ -93,7 +141,7 @@ class BaseMultimodalInputProcessor:
                                              None) is not None:
             return processor.mm_token_ids
 
-        logger.warning(
+        logger.debug(
             f"Cannot determine mm_token_ids from {self.__class__.__name__}. "
             "If needed, please override this method to return multimodal token ids. "
         )
@@ -438,20 +486,40 @@ def register_input_processor(
     return wrapper
 
 
-def create_input_processor(model_path_or_dir: str, tokenizer):
-    """
-    Create an input processor for a specific model.
+def create_input_processor(
+    model_path_or_dir: str,
+    tokenizer,
+    checkpoint_format: Optional[str] = "HF",
+) -> InputProcessor:
+    """Create an input processor for a specific model.
+
+    Args:
+        model_path_or_dir: Path or repo id used to locate pretrained config/tokenizer.
+        tokenizer: Tokenizer instance.
+        checkpoint_format: Checkpoint format identifier. "HF" uses Hugging Face-style
+            config loading; any other value skips HF config loading. Default is "HF".
+
+    Returns:
+        An InputProcessor implementation (model-specific if registered; otherwise DefaultInputProcessor).
     """
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.models import get_model_architecture
 
     model_config = None
-    try:
-        config = ModelConfig.from_pretrained(model_path_or_dir,
-                                             trust_remote_code=True)
-        model_config = config.pretrained_config
-    except (ValueError, EnvironmentError):
-        config = None
+
+    if checkpoint_format == "HF":
+        try:
+            config = ModelConfig.from_pretrained(model_path_or_dir,
+                                                 trust_remote_code=True)
+            model_config = config.pretrained_config
+        except (ValueError, EnvironmentError) as e:
+            config = None
+            logger.debug(
+                f"Unable to load HF config from {model_path_or_dir}: {e}. Falling back."
+            )
+    else:
+        logger.debug(
+            f"checkpoint_format={checkpoint_format}; skipping HF config load.")
 
     if model_config is not None:
         try:
@@ -493,45 +561,47 @@ def create_input_processor_with_hash(
         """
         assert 'multi_modal_data' in inputs, "multi_modal_data must be provided for hashing support."
         mm_data = inputs['multi_modal_data']
+        mm_hashes = apply_mm_hashes(mm_data, hash_lib)
+        prompt_token_ids, extra_processed_inputs = input_processor(
+            inputs, sampling_params)
+
         num_mm_tokens = find_mm_token_lengths(mm_data, input_processor)
         # TODO: here we assume there is only one modality for now
         num_mm_tokens = next(iter(num_mm_tokens.values()))
-        if len(num_mm_tokens) > 0:
-            mm_hashes = apply_mm_hashes(mm_data, hash_lib)
-            prompt_token_ids, extra_processed_inputs = input_processor(
-                inputs, sampling_params)
-            vocab_size = input_processor.get_vocab_size()
-            mm_ids = input_processor.get_mm_token_ids()
-            mm_special_token_ids = input_processor.get_mm_special_token_ids()
-            if vocab_size is None and mm_ids is None:
-                raise ValueError(
-                    "Cannot locate vocab_size or mm_token_ids for multimodal token preprocessing"
-                )
-            start_positions, start_special_token_positions = find_mm_token_positions(
-                input_ids=prompt_token_ids,  # token sequence
-                num_mm_tokens=
-                num_mm_tokens,  # list of lengths of each chunk of visual tokens
-                vocab_size=vocab_size,
-                mm_token_ids=mm_ids,
-                mm_special_token_ids=mm_special_token_ids,
-            )
-            # Store special token offsets if available
-            if len(start_special_token_positions
-                   ) > 0 and mm_special_token_ids is not None:
-                extra_processed_inputs["multimodal_data"][
-                    "special_token_offsets"] = start_special_token_positions
-            # flatten the hashes from dict to a single list
-            mm_hashes = [h for hashes in mm_hashes.values() for h in hashes]
-            validate_mm_inputs(prompt_token_ids, mm_hashes, start_positions,
-                               num_mm_tokens)
-            mm_hashes_int32 = [hexdigest_to_int32(h) for h in mm_hashes
-                               ]  # nested list w/ multiple int32 per hash
+        if len(num_mm_tokens) <= 0:
+            return [], None
 
-            extra_processed_inputs[
-                "multimodal_input"] = MultimodalInput.from_components(
-                    mm_hashes_int32, start_positions, num_mm_tokens)
-            return prompt_token_ids, extra_processed_inputs
-        return [], None
+        vocab_size = input_processor.get_vocab_size()
+        mm_ids = input_processor.get_mm_token_ids()
+        mm_special_token_ids = input_processor.get_mm_special_token_ids()
+        if vocab_size is None and mm_ids is None:
+            raise ValueError(
+                "Cannot locate vocab_size or mm_token_ids for multimodal token preprocessing"
+            )
+        start_positions, start_special_token_positions = find_mm_token_positions(
+            input_ids=prompt_token_ids,  # token sequence
+            num_mm_tokens=
+            num_mm_tokens,  # list of lengths of each chunk of visual tokens
+            vocab_size=vocab_size,
+            mm_token_ids=mm_ids,
+            mm_special_token_ids=mm_special_token_ids,
+        )
+        # Store special token offsets if available
+        if len(start_special_token_positions
+               ) > 0 and mm_special_token_ids is not None:
+            extra_processed_inputs["multimodal_data"][
+                "special_token_offsets"] = start_special_token_positions
+        # flatten the hashes from dict to a single list
+        mm_hashes = [h for hashes in mm_hashes.values() for h in hashes]
+        validate_mm_inputs(prompt_token_ids, mm_hashes, start_positions,
+                           num_mm_tokens)
+        mm_hashes_int32 = [hexdigest_to_int32(h) for h in mm_hashes
+                           ]  # nested list w/ multiple int32 per hash
+
+        extra_processed_inputs[
+            "multimodal_input"] = MultimodalInput.from_components(
+                mm_hashes_int32, start_positions, num_mm_tokens)
+        return prompt_token_ids, extra_processed_inputs
 
     def input_processor_wrapper(
         inputs: TextPrompt, sampling_params: SamplingParams

@@ -93,20 +93,31 @@ class CUDAGraphRunner:
     @property
     def max_possible_draft_len(self):
         engine = self._get_engine()
-        return (engine.original_max_draft_len if self.enable_spec_decode else 0)
+        return (engine.original_max_total_draft_tokens
+                if self.enable_spec_decode else 0)
 
     def get_graph_key(
             self,
-            batch_size,
+            batch: ScheduledRequests,
             spec_resource_manager: Optional[BaseResourceManager] = None):
         engine = self._get_engine()
         if engine.is_draft_model and spec_resource_manager is not None and isinstance(
                 spec_resource_manager, Eagle3ResourceManager):
+            # If 'is_first_draft' is True, even with tree decoding, the length of draft_len will only be 'max_draft_len', not 'max_total_draft_token'.
+            # Because we will pad the input to 'max_draft_len' length for the first draft layer.
             draft_len = engine.original_max_draft_len if spec_resource_manager.is_first_draft else 0
-            key = (batch_size, draft_len, spec_resource_manager.is_first_draft)
+            key = (batch.batch_size, draft_len,
+                   spec_resource_manager.is_first_draft)
         else:
-            draft_len = self.spec_config.max_draft_len if self.enable_spec_decode else 0
-            key = (batch_size, draft_len, False)
+            # With dynamic spec decode, the draft length maybe zero even when enable_spec_decode is True,
+            # so we need to get the draft length from the batch instead of using enable_spec_decode.
+            draft_len_list = []
+            for request in batch.generation_requests:
+                draft_len_list.append(len(request.py_draft_tokens))
+            draft_len = max(draft_len_list)
+            assert len(
+                set(draft_len_list)) == 1, "All draft lengths must be the same"
+            key = (batch.batch_size, draft_len, False)
         return key
 
     @property
@@ -168,7 +179,7 @@ class CUDAGraphRunner:
 
         if not self.enabled or not can_run_cuda_graph:
             return False, None, None, None
-        key = self.get_graph_key(batch_size, spec_resource_manager)
+        key = self.get_graph_key(batch, spec_resource_manager)
 
         if key in self.graphs:
             return True, self.graph_metadata[key][
@@ -193,6 +204,15 @@ class CUDAGraphRunner:
     def needs_capture(self, key: Tuple[int, int, int]):
 
         return key not in self.graph_outputs
+
+    def get_graph_pool(self):
+        """Returns the CUDA memory pool used by this graph runner.
+
+        Returns:
+            The CUDA memory pool associated with captured graphs, or None if
+            no graphs have been captured yet.
+        """
+        return self.memory_pool
 
     def capture(self,
                 key: Tuple[int, int, int],
@@ -255,6 +275,7 @@ class CUDAGraphRunner:
                                                  capture_inputs)
                 if postprocess_fn is not None:
                     postprocess_fn(capture_inputs)
+
             with torch.cuda.graph(graph, pool=self.memory_pool):
                 output = _setup_spec_decoding_and_forward(
                     key, forward_fn, capture_inputs)

@@ -1,7 +1,7 @@
 """Test that the attention matcher works with HF's SDPA backends."""
 
 import copy
-from typing import Any, Callable, Dict
+from typing import Any, Dict
 
 import pytest
 import torch
@@ -12,27 +12,12 @@ from torch.fx import GraphModule
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaModel
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import AttentionDescriptor
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
-from tensorrt_llm._torch.auto_deploy.transformations._graph import move_to_device
+from tensorrt_llm._torch.auto_deploy.utils._graph import move_to_device
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
 torch.manual_seed(0)
-
-
-class MockAttentionDescriptor(AttentionDescriptor):
-    """A mock class that mimics the AttentionDescriptor interface for testing."""
-
-    layout: str = "bsnd"
-
-    @classmethod
-    def get_attention_layout(cls) -> str:
-        return cls.layout
-
-    @classmethod
-    def get_source_attention_op(cls) -> Callable:
-        return torch.ops.auto_deploy.torch_attention
 
 
 class HFWrapper(nn.Module):
@@ -56,12 +41,15 @@ def _joint_transform(gm: GraphModule) -> None:
             "match_eager_attention": {
                 "stage": "pattern_matcher",
             },
-            "match_grouped_attention": {
+            "match_grouped_attention_with_repeat_kv": {
+                "stage": "pattern_matcher",
+            },
+            "match_grouped_attention_without_repeat_kv": {
                 "stage": "pattern_matcher",
             },
             "match_attention_layout": {
                 "stage": "pattern_matcher",
-                "attention_op": MockAttentionDescriptor,
+                "attn_layout": "bsnd",
             },
         },
     )(None, gm)

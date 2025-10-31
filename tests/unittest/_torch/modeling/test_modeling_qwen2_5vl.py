@@ -2,15 +2,16 @@ import os
 import unittest
 from copy import deepcopy
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List
 
-import pytest
 import torch
 from _torch.helpers import create_mock_engine
 from parameterized import parameterized
 from transformers import AutoProcessor, AutoTokenizer, Qwen2_5_VLConfig
 from transformers import \
     Qwen2_5_VLForConditionalGeneration as HFQwen2_5_VLForConditionalLM
+from utils.llm_data import llm_models_root
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
@@ -26,16 +27,6 @@ from tensorrt_llm.inputs import (create_input_processor,
                                  default_multimodal_input_loader, prompt_inputs)
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.mapping import Mapping
-
-
-def llm_models_root() -> str:
-    '''return LLM_MODELS_ROOT path if it is set in env, assert when it's set but not a valid path
-    '''
-    DEFAULT_LLM_MODEL_ROOT = os.path.join("/scratch.trt_llm_data", "llm-models")
-    LLM_MODELS_ROOT = os.environ.get("LLM_MODELS_ROOT", DEFAULT_LLM_MODEL_ROOT)
-
-    return LLM_MODELS_ROOT
-
 
 QWEN2_5_VL_7B_CONFIG = {
     "architectures": ["Qwen2_5_VLForConditionalGeneration"],
@@ -107,20 +98,24 @@ class Scenario:
 class TestQwen2_5_VL(unittest.TestCase):
 
     def get_test_inputs(self, modality: str):
+
+        test_data_root = Path(
+            os.path.join(llm_models_root(), "multimodals", "test_data"))
+
         if modality == "image":
             return ["Describe the natural environment in the image."], \
-                ["https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png"]
+                [str(test_data_root / "seashore.png")]
         elif modality == "multiple_image":
             return ["Describe the difference between the two images."], \
-                ["https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/inpaint.png",
-                 "https://huggingface.co/datasets/Sayali9141/traffic_signal_images/resolve/main/61.jpg"]
+                [str(test_data_root / "inpaint.png"),
+                 str(test_data_root / "61.jpg")]
         elif modality == "video":
             return ["Tell me what you see in the video briefly."], \
-                ["https://huggingface.co/datasets/Efficient-Large-Model/VILA-inference-demos/resolve/main/OAI-sora-tokyo-walk.mp4"]
+                [str(test_data_root / "OAI-sora-tokyo-walk.mp4")]
         elif modality == "mixture_text_image":
             return ["Describe the scene in the image briefly.",
                     "Who invented the internet?"], \
-                ["https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/inpaint.png",
+                [str(test_data_root / "inpaint.png"),
                  ""]
         elif modality == "text":
             return ["Who invented the internet?"], []
@@ -217,7 +212,8 @@ class TestQwen2_5_VL(unittest.TestCase):
             images = [input['multi_modal_data']['image'] for input in inputs]
         elif modality == "video":
             videos = [
-                input['multi_modal_data'][f'{modality}'] for input in inputs
+                input['multi_modal_data'][f'{modality}'][0].frames
+                for input in inputs
             ]
         elif modality == "text":
             # For text-only modality, no images or videos needed
@@ -235,7 +231,6 @@ class TestQwen2_5_VL(unittest.TestCase):
         ).to(device)
         return processor_inputs
 
-    @pytest.mark.skip(reason="https://nvbugs/5550722")
     def test_qwen2_5_vl_sanity(self):
 
         config_dict = deepcopy(QWEN2_5_VL_7B_CONFIG)
@@ -354,7 +349,6 @@ class TestQwen2_5_VL(unittest.TestCase):
                  use_cuda_graph=False,
                  disable_fuse_rope=False),
     ])
-    @pytest.mark.skip(reason="https://nvbugs/5550722")
     @torch.no_grad()
     def test_qwen2_5_vl_allclose_to_hf(self, scenario: Scenario) -> None:
         """

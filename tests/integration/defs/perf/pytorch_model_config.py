@@ -221,6 +221,26 @@ def get_model_yaml_config(model_label: str,
                 'stream_interval': 10,
                 'num_postprocess_workers': 4
             }
+        },
+        # Phi-4-multimodal-instruct with chunked prefill and kv_cache_reuse
+        {
+            'patterns': [
+                'phi_4_multimodal_instruct-bench-pytorch-bfloat16-maxbs:48-maxnt:256-input_output_len:500,2000-con:250',
+                'phi_4_multimodal_instruct-bench-pytorch-bfloat16-maxbs:128-maxnt:512-input_output_len:1000,1000-con:250'
+            ],
+            'config': {
+                'enable_chunked_prefill': True,
+            }
+        },
+        # Mistral-Small-3.1-24B-Instruct-2503 with chunked prefill and kv_cache_reuse
+        {
+            'patterns': [
+                'mistral_small_v3.1_24b-bench-pytorch-bfloat16-maxbs:48-maxnt:256-input_output_len:1000,2000-reqs:500-con:200',
+                'mistral_small_v3.1_24b-bench-pytorch-bfloat16-maxbs:128-maxnt:512-input_output_len:1000,2000-reqs:500-con:200'
+            ],
+            'config': {
+                'enable_chunked_prefill': True,
+            }
         }
     ]
 

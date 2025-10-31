@@ -21,7 +21,7 @@ class WorkerInfo:
     role: ServerRole = ServerRole.CONTEXT
 
 
-def get_worker_key_prefix(cluster_name: str):
+def get_worker_key_prefix(cluster_name: str) -> str:
     return f"/trtllm-disagg/{cluster_name}/workers"
 
 
@@ -46,14 +46,19 @@ class DisaggClusterManager:
         self._watch_handle = None
 
     def __del__(self):
-        if asyncio.get_event_loop():
-            asyncio.run_coroutine_threadsafe(self.unwatch_workers(),
-                                             asyncio.get_event_loop())
+        try:
+            if asyncio.get_event_loop():
+                asyncio.run_coroutine_threadsafe(self.stop(),
+                                                 asyncio.get_event_loop())
+        except RuntimeError:
+            # the event loop may not be running when the cluster manager is destroyed
+            pass
 
     async def start(self) -> None:
         await self._cluster_storage.start()
 
     async def stop(self) -> None:
+        await self.unwatch_workers()
         await self._cluster_storage.stop()
 
     async def cluster_info(self) -> Dict[str, Any]:
@@ -89,23 +94,27 @@ class DisaggClusterManager:
 
     async def watch_workers(self, get_existing_first: bool = True):
         workers = []
+        self._watch_handle = await self._cluster_storage.watch(
+            self.worker_key_prefix)
         if get_existing_first:
             # There is a tiny gap between getting existing workers and watching the key,
             # which may cause we missing some workers registered in between.
             resp = await self._cluster_storage.get_prefix(
                 self.worker_key_prefix, keys_only=False)
+            events = []
             for worker_id, data in resp.items():
                 event = WatchEvent(storage_item=StorageItem(key=worker_id,
                                                             value=data),
                                    event_type=WatchEventType.SET)
                 workers.append(self._parse_worker_info(event))
-        self._watch_handle = await self._cluster_storage.watch(
-            self.worker_key_prefix)
+                events.append(event)
+            await self._watch_handle.add_events(events)
         return workers
 
     async def unwatch_workers(self) -> None:
-        await self._cluster_storage.unwatch(self.worker_key_prefix)
-        self._watch_handle = None
+        if self._watch_handle:
+            await self._cluster_storage.unwatch(self.worker_key_prefix)
+            self._watch_handle = None
 
     async def get_worker_events(
             self) -> List[Tuple[WorkerInfo, WatchEventType]]:
@@ -206,9 +215,13 @@ class DisaggClusterWorker:
         self._worker_id = f"{role.name}-{host}:{port}-{int(time.time()*1000)}-{os.getpid()}-{random.randint(0, 1000):03}"
 
     def __del__(self):
-        if asyncio.get_event_loop():
-            asyncio.run_coroutine_threadsafe(self.deregister_worker(),
-                                             asyncio.get_event_loop())
+        try:
+            if asyncio.get_event_loop():
+                asyncio.run_coroutine_threadsafe(self.deregister_worker(),
+                                                 asyncio.get_event_loop())
+        except RuntimeError:
+            # the event loop may not be running when the worker is destroyed
+            pass
 
     @property
     def worker_id(self) -> str:

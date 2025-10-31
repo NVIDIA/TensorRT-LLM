@@ -14,6 +14,11 @@ class CachedSequenceInterface:
     def __init__(
         self, sequence_info: SequenceInfo, device: Optional[DeviceLikeType] = None
     ) -> None:
+        # TODO (lucaslie): this is somewhat circular/confusing. Here `device` denotes the desired
+        # device and not the actual device unlike, e.g., in SequenceInfo. We rely on the attribute
+        # here to read the desired device across the inference optimizer pipeline. We should ideally
+        # think about a better way to handle this,
+        # see https://github.com/NVIDIA/TensorRT-LLM/issues/8371
         self.device = device or "cuda"
         self.info = sequence_info
         self._cache_initializers: Dict[str, GetCacheCallable] = {}
@@ -59,6 +64,17 @@ class CachedSequenceInterface:
         for name, cache in self._caches.items():
             # this hack is needed since _caches also contains global buffers such as freqs_cis.
             if "cache" in name:
+                total_size += cache.element_size() * cache.numel()
+        return total_size
+
+    def current_kv_cache_size_bytes(self) -> int:
+        """Return size in bytes of KV caches only (k_cache_*, v_cache_*).
+
+        Excludes SSM/conv/etc. which do not scale with num_pages.
+        """
+        total_size = 0
+        for name, cache in self._caches.items():
+            if name.startswith("k_cache_") or name.startswith("v_cache_"):
                 total_size += cache.element_size() * cache.numel()
         return total_size
 

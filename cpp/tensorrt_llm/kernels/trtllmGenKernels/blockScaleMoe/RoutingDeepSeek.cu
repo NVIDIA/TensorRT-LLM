@@ -24,11 +24,12 @@ namespace routingDeepSeek
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-static constexpr int NumThreads = 256;
-static constexpr int NumWarps = NumThreads / WarpSize;
+static constexpr int NumKimiK2Experts = 384;
+static constexpr int NumDeepseekExperts = 256;
 static constexpr int NumTopGroupScores = 2;
 static constexpr int MaxNumTopExperts = 8;
 static constexpr int MaxNumTopGroups = 4;
+static constexpr int MaxNumGroups = 8;
 
 template <typename KernelParams>
 __global__ void routingMainKernel(KernelParams params)
@@ -39,10 +40,10 @@ __global__ void routingMainKernel(KernelParams params)
 
     // declare shared memory structure
     // number of experts is bounded by number of threads
-    __shared__ float __attribute((aligned(128))) smemScoreSigmoid[NumThreads];
-    __shared__ float __attribute((aligned(128))) smemScoreBias[NumThreads];
+    __shared__ float __attribute((aligned(128))) smemScoreSigmoid[KernelParams::MaxNumExperts];
+    __shared__ float __attribute((aligned(128))) smemScoreBias[KernelParams::MaxNumExperts];
     // number of expert groups is bounded by number of warps
-    __shared__ float __attribute((aligned(128))) smemGroupScores[NumWarps];
+    __shared__ float __attribute((aligned(128))) smemGroupScores[MaxNumGroups];
 
     // needed for warp reduce
     auto block = cg::this_thread_block();
@@ -79,8 +80,8 @@ __global__ void routingMainKernel(KernelParams params)
     // initialize the mPtrExpertCounts
     if (params.mPtrExpertCounts)
     {
-        int32_t globalThreadIdx = blockIdx.x * NumThreads + threadIdx.x;
-        int32_t globalThreadStride = gridDim.x * NumThreads;
+        int32_t globalThreadIdx = blockIdx.x * blockDim.x + threadIdx.x;
+        int32_t globalThreadStride = gridDim.x * blockDim.x;
         int32_t expertCountsNum = 2 * params.mNumExperts;
         initArr(globalThreadIdx, expertCountsNum, globalThreadStride, params.mPtrExpertCounts, 0);
     }
@@ -131,7 +132,6 @@ __global__ void routingMainKernel(KernelParams params)
         {
             topk::reduceTopK(warp, topExpGroupScores, topExpGroupIdx, scoreBias, threadExpert,
                 /* minValue */ invalidScoreFloat);
-
             // get the final group score and write it to shared
             if (cute::elect_one_sync())
             {
@@ -144,16 +144,13 @@ __global__ void routingMainKernel(KernelParams params)
         __syncthreads();
 
         auto localExpertExtent = params.mNumLocalExperts << params.mLocalExpertsStrideLog2;
-        if (warpIdx == 0)
-        {
-            // a single warp performs the selection of top groups, and goes on to select the final experts
-            if constexpr (KernelParams::UseGroups)
+        if constexpr (KernelParams::UseGroups)
+        { // a single warp performs the selection of top groups, and goes on to select the final experts
+            if (warpIdx == 0)
             {
                 float groupScore = laneIdx < params.mNumExpertGroups ? smemGroupScores[laneIdx] : invalidScoreFloat;
-
                 topk::reduceTopK(warp, topGroups, topGroupIdx, groupScore, laneIdx,
                     /* minValue */ invalidScoreFloat);
-
                 // final expert selection: get relevant indexes and scores from shared
 
 #pragma unroll
@@ -171,11 +168,67 @@ __global__ void routingMainKernel(KernelParams params)
                         ? smemScoreBias[expertIdxGroup[ii]]
                         : invalidScoreFloat;
                 }
+
+                topk::reduceTopK(warp, topScores, topExperts, expertScoreGroup, expertIdxGroup,
+                    /* minValue */ invalidScoreFloat, params.mTopK);
             }
-            else
+        }
+        else if constexpr (KernelParams::MaxNumExperts > topk::MaxNumExpertsUnit)
+        {
+            // without groups, each thread just takes `MaxNumTopGroups` experts
+            int constexpr NumExpertWarps = (KernelParams::MaxNumExperts - 1) / topk::MaxNumExpertsUnit + 1;
+            int constexpr NumInterTopK = NumExpertWarps * MaxNumTopExperts;
+            __shared__ float __attribute((aligned(128))) smemInterTopScores[NumInterTopK];
+            __shared__ int32_t __attribute((aligned(128))) smemInterTopExperts[NumInterTopK];
+            if (warpIdx < NumExpertWarps)
+            {
+                int offset = warpIdx * WarpSize * MaxNumTopGroups;
+#pragma unroll
+                for (int ii = 0; ii < MaxNumTopGroups; ++ii)
+                {
+                    auto expertIdx = ii * WarpSize + laneIdx;
+                    expertIdxGroup[ii] = offset + expertIdx;
+                    expertScoreGroup[ii] = offset + expertIdx < params.mNumExperts ? smemScoreBias[offset + expertIdx]
+                                                                                   : invalidScoreFloat;
+                }
+                topk::reduceTopK(warp, topScores, topExperts, expertScoreGroup, expertIdxGroup,
+                    /* minValue */ invalidScoreFloat, params.mTopK);
+
+                if (laneIdx < params.mTopK)
+                {
+                    smemInterTopScores[warpIdx * MaxNumTopExperts + laneIdx] = topScores[laneIdx];
+                    smemInterTopExperts[warpIdx * MaxNumTopExperts + laneIdx] = topExperts[laneIdx];
+                }
+            }
+            __syncthreads();
+            if (warpIdx == 0)
+            {
+                int constexpr NumInterTopKPerThread = (NumInterTopK * NumExpertWarps - 1) / WarpSize + 1;
+                float intermidiateScore[NumInterTopKPerThread];
+                int32_t intermidiateExpert[NumInterTopKPerThread];
+                for (int i = laneIdx; i < NumInterTopKPerThread * WarpSize; i += WarpSize)
+                {
+                    int ii = i / WarpSize;
+                    if (i < NumInterTopK)
+                    {
+                        intermidiateScore[ii] = smemInterTopScores[i];
+                        intermidiateExpert[ii] = smemInterTopExperts[i];
+                    }
+                    else
+                    {
+                        intermidiateScore[ii] = invalidScoreFloat;
+                        intermidiateExpert[ii] = KernelParams::MaxNumExperts - 1;
+                    }
+                }
+                topk::reduceTopK(warp, topScores, topExperts, intermidiateScore, intermidiateExpert,
+                    /* minValue */ invalidScoreFloat, params.mTopK);
+            }
+        }
+        else
+        {
+            if (warpIdx == 0)
             {
                 // without groups, each thread just takes `MaxNumTopGroups` experts
-
 #pragma unroll
                 for (int ii = 0; ii < MaxNumTopGroups; ++ii)
                 {
@@ -184,11 +237,13 @@ __global__ void routingMainKernel(KernelParams params)
                     expertScoreGroup[ii]
                         = expertIdx < params.mNumExperts ? smemScoreBias[expertIdx] : invalidScoreFloat;
                 }
+                topk::reduceTopK(warp, topScores, topExperts, expertScoreGroup, expertIdxGroup,
+                    /* minValue */ invalidScoreFloat, params.mTopK);
             }
+        }
 
-            topk::reduceTopK(warp, topScores, topExperts, expertScoreGroup, expertIdxGroup,
-                /* minValue */ invalidScoreFloat, params.mTopK);
-
+        if (warpIdx == 0)
+        {
             // determine our lane's expert index and write to output
             int32_t expertIdx = 0;
 #pragma unroll
@@ -225,7 +280,7 @@ __global__ void routingMainKernel(KernelParams params)
 
 template <typename KernelParams>
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-__global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(NumThreads)
+__global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(KernelParams::MaxNumExperts)
     routingIndicesClusterKernel(KernelParams params)
 {
     using OutputT = typename KernelParams::OutputT;
@@ -239,9 +294,8 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
     {
         cudaGridDependencySynchronize();
     }
-
-    routingPermutation<KernelParams, OutputT, NumThreads, NumWarps, MaxNumTopExperts, /*LoadExpertIdxFromGlobal=*/true>(
-        params, nullptr, warpIdx, clusterBlockRank);
+    routingPermutation<KernelParams, OutputT, KernelParams::MaxNumExperts, KernelParams::MaxNumExperts / WarpSize,
+        MaxNumTopExperts, /*LoadExpertIdxFromGlobal=*/true>(params, nullptr, warpIdx, clusterBlockRank);
 }
 #else
 __global__ void routingIndicesClusterKernel(KernelParams params)
@@ -254,9 +308,10 @@ __global__ void routingIndicesClusterKernel(KernelParams params)
 
 template <typename KernelParams>
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-__global__ void __launch_bounds__(NumThreads) routingIndicesCoopKernel(KernelParams params)
+__global__ void __launch_bounds__(KernelParams::MaxNumExperts) routingIndicesCoopKernel(KernelParams params)
 {
     // number of experts is bounded by number of threads
+    int constexpr NumThreads = KernelParams::MaxNumExperts;
     __shared__ int32_t __attribute((aligned(128))) smemExpertCount[NumThreads];
     __shared__ int32_t __attribute((aligned(128))) smemExpertOffset[NumThreads];
     // needed for the exclusive sum of token offsets
@@ -374,7 +429,17 @@ __global__ void __launch_bounds__(NumThreads) routingIndicesCoopKernel(KernelPar
     // Compute the runtime config for projections
     // Whether or not an expert is local is taken into account when smemExpertCount is computed
     // so we do not need to take it into account here.
-    const int32_t numCta = divUpLog2<int32_t>(count, params.mPaddingLog2);
+
+    int32_t numCta;
+    if constexpr (KernelParams::isPow2)
+    {
+        numCta = divUpLog2<int32_t>(count, params.mPaddingLog2);
+    }
+    else
+    {
+        numCta = divUpTileN<int32_t>(count, params.mTileTokensDim);
+    }
+
     int32_t ctaOffset;
     int32_t numNonExitingCtas;
     Scan(tempStorage).ExclusiveSum(numCta, ctaOffset, numNonExitingCtas);
@@ -383,16 +448,43 @@ __global__ void __launch_bounds__(NumThreads) routingIndicesCoopKernel(KernelPar
     {
         const int32_t localExpertIdx = (threadIdx.x - params.mLocalExpertsStartIdx) >> params.mLocalExpertsStrideLog2;
         params.mPtrCtaIdxXyToBatchIdx[ctaOffset + cta] = localExpertIdx;
-        params.mPtrCtaIdxXyToMnLimit[ctaOffset + cta] = min(mulLog2<int32_t>(ctaOffset + cta + 1, params.mPaddingLog2),
-            mulLog2<int32_t>(ctaOffset, params.mPaddingLog2) + count);
+        int32_t mnLimit1;
+        int32_t mnLimit2;
+        if constexpr (KernelParams::isPow2)
+        {
+            mnLimit1 = mulLog2<int32_t>(ctaOffset + cta + 1, params.mPaddingLog2);
+            mnLimit2 = mulLog2<int32_t>(ctaOffset, params.mPaddingLog2) + count;
+        }
+        else
+        {
+            mnLimit1 = mulTileN<int32_t>(ctaOffset + cta + 1, params.mTileTokensDim);
+            mnLimit2 = mulTileN<int32_t>(ctaOffset, params.mTileTokensDim) + count;
+        }
+        params.mPtrCtaIdxXyToMnLimit[ctaOffset + cta] = min(mnLimit1, mnLimit2);
     }
 
     // get the padded offset associated with this expert
-    const int32_t offset = mulLog2<int32_t>(ctaOffset, params.mPaddingLog2);
-    const int32_t permutedIdxSize = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
+    int32_t offset;
+    if constexpr (KernelParams::isPow2)
+    {
+        offset = mulLog2<int32_t>(ctaOffset, params.mPaddingLog2);
+    }
+    else
+    {
+        offset = mulTileN<int32_t>(ctaOffset, params.mTileTokensDim);
+    }
+    int32_t permutedIdxSize;
+    if constexpr (KernelParams::isPow2)
+    {
+        permutedIdxSize = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
+    }
+    else
+    {
+        permutedIdxSize = mulTileN<int32_t>(numNonExitingCtas, params.mTileTokensDim);
+    }
 
     // write out padded count
-    if (gridBlockIdx == 0 && warpIdx == NumWarps - 1 && cute::elect_one_sync())
+    if (gridBlockIdx == 0 && warpIdx == NumThreads / WarpSize - 1 && cute::elect_one_sync())
     {
         params.mPtrPermutedIdxSize[0] = permutedIdxSize;
         params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
@@ -448,7 +540,49 @@ __global__ void routingIndicesCoopKernel(KernelParams params)
 }
 #endif
 
+int constexpr getMaxNumExperts(int32_t numExperts)
+{
+    if (numExperts <= topk::MaxNumExpertsUnit)
+    {
+        return topk::MaxNumExpertsUnit;
+    }
+    else if (numExperts <= NumDeepseekExperts)
+    {
+        return NumDeepseekExperts;
+    }
+    else if (numExperts <= NumKimiK2Experts)
+    {
+        return NumKimiK2Experts;
+    }
+    else
+    {
+        TLLM_LOG_ERROR("Unsupported numExperts");
+        return 0;
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+#define LAUNCH_ROUTING_DEEPSEEK(                                                                                       \
+    data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, extraFlag1, forceFloatInput)                    \
+    if (data.mNumExperts <= topk::MaxNumExpertsUnit)                                                                   \
+    {                                                                                                                  \
+        LAUNCH_ROUTING_WITH_NUM_EXPERTS_FORCE_FLOAT_INPUT(data, coopLaunch, kernel, numBlocks, numThreads, smemSize,   \
+            stream, extraFlag1, forceFloatInput, topk::MaxNumExpertsUnit);                                             \
+    }                                                                                                                  \
+    else if (data.mNumExperts <= NumDeepseekExperts)                                                                   \
+    {                                                                                                                  \
+        LAUNCH_ROUTING_WITH_NUM_EXPERTS_FORCE_FLOAT_INPUT(data, coopLaunch, kernel, numBlocks, numThreads, smemSize,   \
+            stream, extraFlag1, forceFloatInput, NumDeepseekExperts);                                                  \
+    }                                                                                                                  \
+    else if (data.mNumExperts <= NumKimiK2Experts)                                                                     \
+    {                                                                                                                  \
+        LAUNCH_ROUTING_WITH_NUM_EXPERTS_FORCE_FLOAT_INPUT(data, coopLaunch, kernel, numBlocks, numThreads, smemSize,   \
+            stream, extraFlag1, forceFloatInput, NumKimiK2Experts);                                                    \
+    }                                                                                                                  \
+    else                                                                                                               \
+    {                                                                                                                  \
+        TLLM_LOG_ERROR("Unsupported numExperts");                                                                      \
+    }
 
 void run(Data& data, void* stream)
 {
@@ -474,33 +608,31 @@ void run(Data& data, void* stream)
         data.mNumLimitedGroups);
     TLLM_CHECK_WITH_INFO(data.mNumExperts >= MaxNumTopExperts, "Routing kernel expects %d to be at most #experts %d",
         MaxNumTopExperts, data.mNumExperts);
-    TLLM_CHECK_WITH_INFO(data.mNumExperts <= NumThreads, "Routing kernel expects #experts %d  <= #threads %d",
-        data.mNumExperts, NumThreads);
+    TLLM_CHECK_WITH_INFO(data.mNumExperts <= NumKimiK2Experts, "Routing kernel expects #experts %d  <= #threads %d",
+        data.mNumExperts, NumKimiK2Experts);
     TLLM_CHECK_WITH_INFO(data.mNumExpertGroups >= data.mNumLimitedGroups,
         "Routing kernel expects top groups %d to be limited by #expert groups %d", data.mNumLimitedGroups,
         data.mNumExpertGroups);
     if (data.mNumExpertGroups > 1)
     {
-        TLLM_CHECK_WITH_INFO(data.mNumExpertGroups <= NumWarps,
-            "Routing kernel expects #experts groups %d to be <= #warps %d", data.mNumExpertGroups, NumWarps);
+        TLLM_CHECK_WITH_INFO(data.mNumExpertGroups <= MaxNumGroups,
+            "Routing kernel expects #experts groups %d to be <= #warps %d", data.mNumExpertGroups, MaxNumGroups);
         TLLM_CHECK_WITH_INFO(data.mNumExperts % data.mNumExpertGroups == 0,
             "Routing kernel expects #experts %d to be a multiple of #expert groups %d", data.mNumExperts,
             data.mNumExpertGroups);
         TLLM_CHECK_WITH_INFO(data.mNumExperts / data.mNumExpertGroups <= WarpSize,
-            "Routing kernel expects #experts per group <= warp size, got %d", data.mNumExperts / data.mNumExpertGroups);
+            "Routing kernel expects #experts per group <= warp size, got %d, data.mNumExpertGroups %d",
+            data.mNumExperts / data.mNumExpertGroups, data.mNumExpertGroups);
     }
     else
     {
-        TLLM_CHECK_WITH_INFO(data.mNumExperts <= WarpSize * MaxNumTopGroups,
-            "Routing kernel expects #experts %d <= WarpSize * MaxNumTopGroups %d", data.mNumExperts,
-            WarpSize * MaxNumTopGroups);
-        TLLM_CHECK_WITH_INFO(
-            data.mTopK <= NumWarps, "Routing kernel expects top K %d to be <= #warps %d", data.mTopK, NumWarps);
+        TLLM_CHECK_WITH_INFO(data.mTopK <= topk::MaxNumTopK, "Routing kernel expects top K %d to be <= #warps %d",
+            data.mTopK, topk::MaxNumTopK);
     }
     TLLM_CHECK_WITH_INFO(
         data.mNumExperts % 4 == 0, "Routing kernel expects #experts %d to be a multiple of 4.", data.mNumExperts);
-    TLLM_CHECK_WITH_INFO(data.mPaddingLog2 < 8, "Routing kernel expects padding log2 < 8, got %d", data.mPaddingLog2);
     int const numBlocks = data.mNumTokens;
+    int const numThreadsHist = getMaxNumExperts(data.mNumExperts);
 
     bool const useSingleCluster = data.mNumTokens <= 1024;
     if (!useSingleCluster)
@@ -528,20 +660,20 @@ void run(Data& data, void* stream)
     int const numBlocksCoop = 128;
 
     // Maximum number of tokens supported by the kernel using a cooperative launch.
-    int const maxTokensCoop = (numBlocksCoop * NumThreads * 64) / data.mTopK;
-
+    int const maxTokensCoop = (numBlocksCoop * numThreadsHist * 64) / data.mTopK;
     if (data.mPtrTopKIds == nullptr)
     {
-        LAUNCH_ROUTING_WITH_EXTRA_FLAG(data,
-            /*coopLaunch=*/false, routingMainKernel, numBlocks, NumThreads,
+        int const numThreadsMain = data.mNumExperts < NumDeepseekExperts ? NumDeepseekExperts : NumKimiK2Experts;
+        LAUNCH_ROUTING_DEEPSEEK(data,
+            /*coopLaunch=*/false, routingMainKernel, numBlocks, numThreadsMain,
             /*smemSize=*/0, // No dynamic smem
             stream, data.mNumExpertGroups > 1, /*forceFloatInput=*/true);
     }
     else
     {
         // Reset the global histograms.
-        LAUNCH_ROUTING_WITH_EXTRA_FLAG(data, false, routingInitExpertCounts,
-            (2 * data.mNumExperts - 1) / NumThreadsHist + 1, NumThreadsHist,
+        LAUNCH_ROUTING_DEEPSEEK(data, false, routingInitExpertCounts, (2 * data.mNumExperts - 1) / numThreadsHist + 1,
+            numThreadsHist,
             /*smemSize=*/0, // No dynamic smem
             stream, data.mNumExpertGroups > 1, /*forceFloatInput=*/false);
     }
@@ -550,24 +682,23 @@ void run(Data& data, void* stream)
     {
         if (useSingleCluster)
         {
-            LAUNCH_ROUTING_WITH_EXTRA_FLAG(data,
-                /*coopLaunch=*/false, routingIndicesClusterKernel, NumBlocksPerCluster, NumThreads,
+            LAUNCH_ROUTING_DEEPSEEK(data,
+                /*coopLaunch=*/false, routingIndicesClusterKernel, NumBlocksPerCluster, numThreadsHist,
                 /*smemSize=*/0, // No dynamic smem
                 stream, data.mNumExpertGroups > 1, /*forceFloatInput=*/true);
         }
         else if (data.mNumTokens <= maxTokensCoop)
         {
-            LAUNCH_ROUTING_WITH_EXTRA_FLAG(data,
-                /*coopLaunch=*/true, routingIndicesCoopKernel, numBlocksCoop, NumThreads,
+            LAUNCH_ROUTING_DEEPSEEK(data,
+                /*coopLaunch=*/true, routingIndicesCoopKernel, numBlocksCoop, numThreadsHist,
                 /*smemSize=*/0, // No dynamic smem
                 stream, data.mNumExpertGroups > 1, /*forceFloatInput=*/true);
         }
         else
         {
             const int32_t expandedIdxSize = data.mNumTokens * data.mTopK;
-
-            const int32_t histogramEltsPerBlock = 8 * NumThreads;
-            const int32_t offsetEltsPerBlock = NumEltsPerOffsetTilePerThread * NumThreads;
+            const int32_t histogramEltsPerBlock = 8 * numThreadsHist;
+            const int32_t offsetEltsPerBlock = NumEltsPerOffsetTilePerThread * numThreadsHist;
 
             // Limit grid size (both kernels use a grid-stride loop).
             const int32_t maxNumBlocks = 1024;
@@ -577,12 +708,12 @@ void run(Data& data, void* stream)
             int const numBlocksOffsets
                 = std::min((expandedIdxSize + offsetEltsPerBlock - 1) / offsetEltsPerBlock, maxNumBlocks);
 
-            LAUNCH_ROUTING_WITH_EXTRA_FLAG(data,
-                /*coopLaunch=*/false, routingIndicesHistogramKernel, numBlocksHistogram, NumThreads,
+            LAUNCH_ROUTING_DEEPSEEK(data,
+                /*coopLaunch=*/false, routingIndicesHistogramKernel, numBlocksHistogram, numThreadsHist,
                 /*smemSize=*/0, // No dynamic smem
                 stream, data.mNumExpertGroups > 1, /*forceFloatInput=*/true);
-            LAUNCH_ROUTING_WITH_EXTRA_FLAG(data,
-                /*coopLaunch=*/false, routingIndicesOffsetsKernel, numBlocksOffsets, NumThreads,
+            LAUNCH_ROUTING_DEEPSEEK(data,
+                /*coopLaunch=*/false, routingIndicesOffsetsKernel, numBlocksOffsets, numThreadsHist,
                 /*smemSize=*/0, // No dynamic smem
                 stream, data.mNumExpertGroups > 1, /*forceFloatInput=*/true);
         }

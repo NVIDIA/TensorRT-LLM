@@ -14,7 +14,8 @@ from _torch.helpers import (calc_woq_tolerence, per_block_cast_to_fp8,
                             per_token_cast_to_fp8_e8m0)
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
-from utils.util import (check_accuracy, skip_neither_ada_nor_hopper_unittest,
+from utils.util import (check_accuracy, skip_blackwell, skip_blackwell_geforce,
+                        skip_neither_ada_nor_hopper_unittest,
                         skip_non_hopper_unittest, skip_pre_blackwell,
                         skip_pre_hopper)
 
@@ -24,9 +25,8 @@ from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import \
     CuteDslFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_deepgemm import \
     DeepGemmFusedMoE
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_wide_ep import \
-    AlltoallMethodType
-from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
+from tensorrt_llm._torch.modules.fused_moe.interface import (
+    AlltoallMethodType, MoEWeightLoadingMode)
 
 # isort and yapf will fight against each other here, so we disable isort
 # isort: off
@@ -38,7 +38,7 @@ from tensorrt_llm._torch.modules.fused_moe import (
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import \
     IS_TRITON_KERNELS_AVAILABLE
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
-from tensorrt_llm._utils import mpi_rank
+from tensorrt_llm._utils import get_sm_version, mpi_rank
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -213,11 +213,14 @@ def test_fused_moe_alltoall(alltoall_method_type):
         weights = {}
         for expert_id in range(NUM_EXPERTS):
             w1_weight = torch.empty((INTERMEDIATE_SIZE, HIDDEN_SIZE),
-                                    dtype=dtype)
+                                    dtype=dtype,
+                                    device="cuda")
             w2_weight = torch.empty((HIDDEN_SIZE, INTERMEDIATE_SIZE),
-                                    dtype=dtype)
+                                    dtype=dtype,
+                                    device="cuda")
             w3_weight = torch.empty((INTERMEDIATE_SIZE, HIDDEN_SIZE),
-                                    dtype=dtype)
+                                    dtype=dtype,
+                                    device="cuda")
             torch.nn.init.xavier_uniform_(w1_weight)
             torch.nn.init.xavier_uniform_(w2_weight)
             torch.nn.init.xavier_uniform_(w3_weight)
@@ -293,7 +296,6 @@ def test_fused_moe_alltoall(alltoall_method_type):
             assert r is None
 
 
-@pytest.mark.skip(reason="https://nvbugs/5467531")
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
 @pytest.mark.parametrize("alltoall_method_type", [
@@ -302,6 +304,9 @@ def test_fused_moe_alltoall(alltoall_method_type):
 ],
                          ids=lambda s: s.name)
 def test_fused_moe_alltoall_fp4(alltoall_method_type):
+
+    if alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
+        pytest.skip("Skipped due to https://nvbugs/5467531")
 
     world_size = 4
     dtype = torch.bfloat16
@@ -574,10 +579,6 @@ def test_fused_moe_fp8(moe_backend, dtype, routing_cls, bias):
         fused_moe.cuda()
         fused_moe.load_weights([weights])
 
-        AutoTuner.get().clear_cache()
-        with torch.inference_mode(), autotune():
-            fused_moe.forward(x, router_logits)
-
         ref_fused_moe = RefGatedMLPFusedMoE(
             num_experts=NUM_EXPERTS,
             routing_method=routing_method,
@@ -588,13 +589,27 @@ def test_fused_moe_fp8(moe_backend, dtype, routing_cls, bias):
             bias=bias)
         ref_fused_moe.load_weights([weights])
         ref_fused_moe.cuda()
+
+        AutoTuner.get().clear_cache()
         with torch.inference_mode():
-            output = fused_moe.forward(x, router_logits)
             ref_output = ref_fused_moe.forward(x, router_logits)
 
-        # compare
-        torch.cuda.synchronize()
-        check_accuracy(output, ref_output, rtol=0.04, atol=0.1, percent=0.99)
+        with torch.inference_mode(), autotune():
+            fused_moe.forward(x, router_logits)
+
+        # Explicitly capture context for kernel testing
+        with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
+            output = fused_moe.forward(x, router_logits)
+
+        # Test all kernel tactics
+        for tactic in all_tactics:
+            with AutoTuner.get().replay(tactic), torch.inference_mode():
+                output = fused_moe.forward(x, router_logits)
+                check_accuracy(output,
+                               ref_output,
+                               rtol=0.04,
+                               atol=0.1,
+                               percent=0.99)
 
 
 def set_tensor_value_2(x, num_row, num_cols):
@@ -1308,19 +1323,31 @@ def test_fused_moe_fp8_blockwise_cute_dsl_multi_gpu(ep_size, routing_method,
 
 @skip_pre_blackwell
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_fused_moe_nvfp4(dtype):
+@pytest.mark.parametrize(
+    "moe_backend",
+    [pytest.param("TRTLLM", marks=skip_blackwell_geforce), "CUTLASS"])
+def test_fused_moe_nvfp4(dtype, moe_backend):
+
+    if moe_backend == "TRTLLM" and dtype == torch.float16:
+        pytest.skip("TRTLLM NVFP4 MoE backend does not support float16 yet")
+
+    test_all_kernels = True
+    if get_sm_version() == 120:
+        # Disable; got "Assertion failed: Failed to initialize cutlass TMA WS grouped gemm. Error: Error Internal"
+        test_all_kernels = False
+
     mapping = Mapping()
     mapping.rank = mpi_rank()
 
-    with torch.device(f'cuda:{mapping.rank}'):
+    with torch.device(f"cuda:{mapping.rank}"):
         SCALING_VECTOR_SIZE = 16
 
         SEQ_LEN = 4
-        HIDDEN_SIZE = 128
-        INTERMEDIATE_SIZE = 128
-        NUM_EXPERTS = 3
+        HIDDEN_SIZE = 512
+        INTERMEDIATE_SIZE = 512
+        NUM_EXPERTS = 4
         TOP_K = 2
-        routing_method = DefaultMoeRoutingMethod(top_k=TOP_K)
+        routing_method = RenormalizeMoeRoutingMethod(top_k=TOP_K)
         torch.manual_seed(0)
         torch.cuda.manual_seed(0)
         x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype, device="cuda")
@@ -1331,19 +1358,19 @@ def test_fused_moe_nvfp4(dtype):
 
         weights = {}
         for expert_id in range(NUM_EXPERTS):
-            w1_weight = torch.randn((INTERMEDIATE_SIZE, HIDDEN_SIZE),
-                                    dtype=dtype,
-                                    device="cuda")
+            w1_weight = torch.randn(
+                (INTERMEDIATE_SIZE, HIDDEN_SIZE), dtype=dtype,
+                device="cuda") * 0.05
             w1_sf_global = (448 * 6) / w1_weight.abs().max().float()
 
-            w2_weight = torch.randn((HIDDEN_SIZE, INTERMEDIATE_SIZE),
-                                    dtype=dtype,
-                                    device="cuda")
+            w2_weight = torch.randn(
+                (HIDDEN_SIZE, INTERMEDIATE_SIZE), dtype=dtype,
+                device="cuda") * 0.05
             w2_sf_global = (448 * 6) / w2_weight.abs().max().float()
 
-            w3_weight = torch.randn((INTERMEDIATE_SIZE, HIDDEN_SIZE),
-                                    dtype=dtype,
-                                    device="cuda")
+            w3_weight = torch.randn(
+                (INTERMEDIATE_SIZE, HIDDEN_SIZE), dtype=dtype,
+                device="cuda") * 0.05
             w3_sf_global = (448 * 6) / w3_weight.abs().max().float()
 
             w3_w1_global = min(
@@ -1389,14 +1416,16 @@ def test_fused_moe_nvfp4(dtype):
             weights[f"{expert_id}.w3.weight_scale_2"] = 1.0 / w3_w1_global
 
         quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
-        fused_moe = CutlassFusedMoE(
+        fused_moe = create_moe(
             num_experts=NUM_EXPERTS,
             routing_method=routing_method,
             hidden_size=HIDDEN_SIZE,
             intermediate_size=INTERMEDIATE_SIZE,
             dtype=dtype,
-            reduce_results=False,
-            model_config=ModelConfig(quant_config=quant_config))
+            reduce_results=True,
+            model_config=ModelConfig(quant_config=quant_config,
+                                     moe_backend=moe_backend),
+        )
         fused_moe.load_weights([weights])
         fused_moe.cuda()
 
@@ -1412,20 +1441,37 @@ def test_fused_moe_nvfp4(dtype):
         ref_fused_moe.cuda()
 
         AutoTuner.get().clear_cache()
+        with torch.inference_mode():
+            ref_output = ref_fused_moe.forward(x, router_logits)
+
         with torch.inference_mode(), autotune():
             fused_moe.forward(x, router_logits)
 
-        with torch.inference_mode():
-            output = fused_moe.forward(x, router_logits)
-            ref_output = ref_fused_moe.forward(x, router_logits)
-
-        # compare
-        torch.cuda.synchronize()
+        output = fused_moe.forward(x, router_logits)
         torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.15)
+
+        if not test_all_kernels:
+            return
+
+        # Explicitly capture context for kernel testing
+        with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
+            output = fused_moe.forward(x, router_logits)
+
+        # Test all kernel tactics
+        for tactic in all_tactics:
+            with AutoTuner.get().replay(tactic), torch.inference_mode():
+                output = fused_moe.forward(x, router_logits)
+                torch.testing.assert_close(output,
+                                           ref_output,
+                                           rtol=1e-2,
+                                           atol=0.15)
 
 
 @skip_pre_blackwell
-def test_fused_moe_w4a8_nvfp4_fp8():
+@pytest.mark.parametrize(
+    "moe_backend",
+    [pytest.param("TRTLLM", marks=skip_blackwell_geforce), "CUTLASS"])
+def test_fused_moe_w4a8_nvfp4_fp8(moe_backend):
     dtype = torch.bfloat16
     mapping = Mapping()
     mapping.rank = mpi_rank()
@@ -1514,14 +1560,15 @@ def test_fused_moe_w4a8_nvfp4_fp8():
             weights[f"{expert_id}.w3.weight_scale_2"] = 1.0 / w3_w1_global
 
         quant_config = QuantConfig(quant_algo=QuantAlgo.W4A8_NVFP4_FP8)
-        fused_moe = TRTLLMGenFusedMoE(
-            num_experts=NUM_EXPERTS,
-            routing_method=routing_method,
-            hidden_size=HIDDEN_SIZE,
-            intermediate_size=INTERMEDIATE_SIZE,
-            dtype=dtype,
-            reduce_results=False,
-            model_config=ModelConfig(quant_config=quant_config))
+        fused_moe = TRTLLMGenFusedMoE(num_experts=NUM_EXPERTS,
+                                      routing_method=routing_method,
+                                      hidden_size=HIDDEN_SIZE,
+                                      intermediate_size=INTERMEDIATE_SIZE,
+                                      dtype=dtype,
+                                      reduce_results=False,
+                                      model_config=ModelConfig(
+                                          quant_config=quant_config,
+                                          moe_backend=moe_backend))
         fused_moe.load_weights([weights])
         fused_moe.cuda()
 
@@ -1537,16 +1584,24 @@ def test_fused_moe_w4a8_nvfp4_fp8():
         ref_fused_moe.cuda()
 
         AutoTuner.get().clear_cache()
+        with torch.inference_mode():
+            ref_output = ref_fused_moe.forward(x, router_logits)
+
         with torch.inference_mode(), autotune():
             fused_moe.forward(x, router_logits)
 
-        with torch.inference_mode():
+        # Explicitly capture context for kernel testing
+        with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
             output = fused_moe.forward(x, router_logits)
-            ref_output = ref_fused_moe.forward(x, router_logits)
 
-        # compare
-        torch.cuda.synchronize()
-        torch.testing.assert_close(output, ref_output, rtol=1e-1, atol=0.5)
+        # Test all kernel tactics
+        for tactic in all_tactics:
+            with AutoTuner.get().replay(tactic), torch.inference_mode():
+                output = fused_moe.forward(x, router_logits)
+                torch.testing.assert_close(output,
+                                           ref_output,
+                                           rtol=1e-1,
+                                           atol=0.5)
 
 
 @skip_neither_ada_nor_hopper_unittest
@@ -1612,15 +1667,14 @@ def test_fused_moe_w4afp8(dtype, weight_loading_mode):
                                       dtype=torch.int8).cuda()
 
             # The pre-quant scale to be multiplied with the input activation.
-            w1_pre_quant_scale = torch.ones(HIDDEN_SIZE,
-                                            dtype=dtype,
-                                            device="cuda")
-            w2_pre_quant_scale = torch.ones(INTERMEDIATE_SIZE,
-                                            dtype=dtype,
-                                            device="cuda")
-            w3_pre_quant_scale = torch.ones(HIDDEN_SIZE,
-                                            dtype=dtype,
-                                            device="cuda")
+            # Use random pre-quant scales [0.95, 1.05] instead of fixed 1.0 to ensure the kernel handles
+            # non-uniform pre-quant scaling factors correctly
+            w1_pre_quant_scale = torch.rand(
+                HIDDEN_SIZE, dtype=dtype, device="cuda") * 0.1 + 0.95
+            w2_pre_quant_scale = torch.rand(
+                INTERMEDIATE_SIZE, dtype=dtype, device="cuda") * 0.1 + 0.95
+            w3_pre_quant_scale = torch.rand(
+                HIDDEN_SIZE, dtype=dtype, device="cuda") * 0.1 + 0.95
 
             # The weight scale to dequantize int4 weights (by multiplication).
             w1_scale = torch.randn(
@@ -1794,35 +1848,51 @@ def test_fused_moe_w4afp8(dtype, weight_loading_mode):
             return results
 
         AutoTuner.get().clear_cache()
+        with torch.inference_mode():
+            ref_output = ref()
+
         with torch.inference_mode(), autotune():
             fused_moe.forward(x, router_logits)
 
-        torch.cuda.synchronize()
-        with torch.inference_mode():
+        # Explicitly capture context for kernel testing
+        with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
             output = fused_moe.forward(x, router_logits)
-            ref_output = ref()
+
+        # Test all kernel tactics
+        for tactic in all_tactics:
+            with AutoTuner.get().replay(tactic), torch.inference_mode():
+                output = fused_moe.forward(x, router_logits)
+                # assert that result does not contain NaN or is all 0s
+                assert not torch.isnan(output).any(), "output contains NaN"
+                assert torch.nonzero(output).numel() > 0, "output is empty"
+                torch.testing.assert_close(output,
+                                           ref_output,
+                                           rtol=1e-2,
+                                           atol=0.1)
 
         torch.cuda.synchronize()
-        # assert that result does not contain NaN or is all 0s
         assert not torch.isnan(ref_output).any(), "ref_output contains NaN"
         assert not torch.isnan(output).any(), "output contains NaN"
         assert torch.nonzero(output).numel() > 0, "output is empty"
         assert torch.nonzero(ref_output).numel() > 0, "ref_output is empty"
-        # compare
+        # Final comparison
         torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
 
 
 @skip_pre_blackwell
-@pytest.mark.parametrize("moe_backend", ["TRTLLM", "CUTLASS"])
+@pytest.mark.parametrize(
+    "moe_backend",
+    [pytest.param("TRTLLM", marks=skip_blackwell_geforce), "CUTLASS"])
 @pytest.mark.parametrize("bias", [True, False])
 def test_fused_moe_mxfp4_mxfp8(moe_backend, bias):
+
     SCALING_VECTOR_SIZE = 32
     dtype = torch.bfloat16
     SEQ_LEN = 128
     HIDDEN_SIZE = 256
     INTERMEDIATE_SIZE = 256
     NUM_EXPERTS = 8
-    TOP_K = 1
+    TOP_K = 4
     routing_method = RenormalizeMoeRoutingMethod(top_k=TOP_K)
     torch.manual_seed(0)
     torch.cuda.manual_seed(0)
@@ -1900,22 +1970,37 @@ def test_fused_moe_mxfp4_mxfp8(moe_backend, bias):
     ref_fused_moe.load_weights([weights])
 
     AutoTuner.get().clear_cache()
+    with torch.inference_mode():
+        ref_output = ref_fused_moe.forward(x, router_logits)
+
     with torch.inference_mode(), autotune():
         fused_moe.forward(x, router_logits)
 
-    with torch.inference_mode():
+    # Capture fused_moe underlying runners as autotuner context
+    with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
         output = fused_moe.forward(x, router_logits)
-        ref_output = ref_fused_moe.forward(x, router_logits)
 
-    # compare
-    torch.cuda.synchronize()
-    torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.15)
+    # Test different tactics using captured context
+    for tactic in all_tactics:
+        with AutoTuner.get().replay(tactic), torch.inference_mode():
+            output = fused_moe.forward(x, router_logits)
+            torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.15)
 
 
-@skip_non_hopper_unittest
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("hidden_size", [768, 2880])
-def test_fused_moe_wfp4a16(dtype, hidden_size):
+@pytest.mark.parametrize(
+    "moe_backend",
+    [
+        # smVersion
+        pytest.param("TRTLLM",
+                     marks=[skip_blackwell_geforce, skip_pre_blackwell]),
+        pytest.param(
+            "CUTLASS",
+            marks=[skip_pre_hopper, skip_blackwell, skip_blackwell_geforce]),
+    ],
+)
+def test_fused_moe_wfp4a16(dtype, hidden_size, moe_backend):
 
     mapping = Mapping()
     mapping.rank = mpi_rank()
@@ -1925,7 +2010,7 @@ def test_fused_moe_wfp4a16(dtype, hidden_size):
         HIDDEN_SIZE = hidden_size
         INTERMEDIATE_SIZE = 640
         SCALING_GROUP_SIZE = 32
-        NUM_EXPERTS = 3
+        NUM_EXPERTS = 4
         TOP_K = 2
         routing_method = RenormalizeMoeRoutingMethod(top_k=TOP_K)
         torch.manual_seed(0)
@@ -1970,19 +2055,25 @@ def test_fused_moe_wfp4a16(dtype, hidden_size):
             weights[f"{expert_id}.w1.weight"] = w1_weight
             weights[f"{expert_id}.w2.weight"] = w2_weight
             weights[f"{expert_id}.w3.weight"] = w3_weight
+            # WFP4A16FusedMoEMethod
             weights[f"{expert_id}.w1.weight_scale_inv"] = w1_scale
             weights[f"{expert_id}.w2.weight_scale_inv"] = w2_scale
             weights[f"{expert_id}.w3.weight_scale_inv"] = w3_scale
+            # MXFP4WeightFusedMoEMethod
+            weights[f"{expert_id}.w1.weight_scale"] = w1_scale
+            weights[f"{expert_id}.w2.weight_scale"] = w2_scale
+            weights[f"{expert_id}.w3.weight_scale"] = w3_scale
 
         quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_MXFP4)
-        fused_moe = CutlassFusedMoE(
-            num_experts=NUM_EXPERTS,
-            routing_method=routing_method,
-            hidden_size=HIDDEN_SIZE,
-            intermediate_size=INTERMEDIATE_SIZE,
-            dtype=dtype,
-            reduce_results=False,
-            model_config=ModelConfig(quant_config=quant_config))
+        fused_moe = create_moe(num_experts=NUM_EXPERTS,
+                               routing_method=routing_method,
+                               hidden_size=HIDDEN_SIZE,
+                               intermediate_size=INTERMEDIATE_SIZE,
+                               dtype=dtype,
+                               reduce_results=False,
+                               model_config=ModelConfig(
+                                   quant_config=quant_config,
+                                   moe_backend=moe_backend))
         fused_moe.load_weights([weights])
         fused_moe.cuda()
 
@@ -2025,17 +2116,29 @@ def test_fused_moe_wfp4a16(dtype, hidden_size):
             return results
 
         AutoTuner.get().clear_cache()
+        with torch.inference_mode():
+            ref_output = ref()
+
         with torch.inference_mode(), autotune():
             fused_moe.forward(x, router_logits)
 
-        torch.cuda.synchronize()
-        with torch.inference_mode():
+        # Explicitly capture context for kernel testing
+        with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
             output = fused_moe.forward(x, router_logits)
-            ref_output = ref()
+
+        # Test all kernel tactics
+        for tactic in all_tactics:
+            with AutoTuner.get().replay(tactic), torch.inference_mode():
+                output = fused_moe.forward(x, router_logits)
+                check_accuracy(output,
+                               ref_output,
+                               rtol=1e-2,
+                               atol=0.1,
+                               percent=0.99)
 
         # compare
         torch.cuda.synchronize()
-        torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
+        check_accuracy(output, ref_output, rtol=1e-2, atol=0.1, percent=0.99)
 
 
 @skip_pre_hopper
@@ -2288,18 +2391,25 @@ def test_fused_moe_int8_woq_per_channel(dtype, weight_dtype):
             return results
 
         AutoTuner.get().clear_cache()
+        with torch.inference_mode():
+            ref_output = ref()
+
         with torch.inference_mode(), autotune():
             fused_moe.forward(x, router_logits)
 
-        torch.cuda.synchronize()
-        with torch.inference_mode():
+        # Explicitly capture context for kernel testing
+        with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
             output = fused_moe.forward(x, router_logits)
-            ref_output = ref()
 
-        # compare
-        torch.cuda.synchronize()
+        # Test all kernel tactics
         atol = calc_woq_tolerence(ref_output, weight_dtype)
-        torch.testing.assert_close(output, ref_output, rtol=1e-7, atol=atol)
+        for tactic in all_tactics:
+            with AutoTuner.get().replay(tactic), torch.inference_mode():
+                output = fused_moe.forward(x, router_logits)
+                torch.testing.assert_close(output,
+                                           ref_output,
+                                           rtol=1e-7,
+                                           atol=atol)
 
 
 class RefGatedMLPFusedMoE(nn.Module):

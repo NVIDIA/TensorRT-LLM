@@ -1,12 +1,11 @@
 from __future__ import annotations
-from transformers import AutoConfig
 
 from pathlib import Path
 from typing import Tuple, get_args
 import click
 from click_option_group import AllOptionGroup, optgroup
 
-from tensorrt_llm._torch.pyexecutor.config_utils import is_nemotron_hybrid
+from tensorrt_llm._torch.pyexecutor.config_utils import is_nemotron_hybrid, load_pretrained_config
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.utils.data import create_dataset_from_stream, initialize_tokenizer
 from tensorrt_llm.bench.utils import VALID_QUANT_ALGOS
@@ -22,8 +21,8 @@ TUNED_QUANTS = {
     QuantAlgo.NVFP4, QuantAlgo.FP8, QuantAlgo.FP8_BLOCK_SCALES,
     QuantAlgo.NO_QUANT, None
 }
-DEFAULT_MAX_BATCH_SIZE = BuildConfig.max_batch_size
-DEFAULT_MAX_NUM_TOKENS = BuildConfig.max_num_tokens
+DEFAULT_MAX_BATCH_SIZE = BuildConfig.model_fields["max_batch_size"].default
+DEFAULT_MAX_NUM_TOKENS = BuildConfig.model_fields["max_num_tokens"].default
 
 
 def get_benchmark_engine_settings(
@@ -86,9 +85,9 @@ def get_model_config(model_name: str, model_path: Path = None) -> ModelConfig:
     Raises:
         ValueError: When model is not supported.
     """
-    if is_nemotron_hybrid(
-            AutoConfig.from_pretrained(model_path or model_name,
-                                       trust_remote_code=True)):
+    pretrained_config = load_pretrained_config(model_path or model_name,
+                                               trust_remote_code=True)
+    if is_nemotron_hybrid(pretrained_config):
         return NemotronHybridConfig.from_hf(model_name, model_path)
     return ModelConfig.from_hf(model_name, model_path)
 

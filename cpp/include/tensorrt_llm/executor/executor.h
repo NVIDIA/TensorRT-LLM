@@ -71,6 +71,7 @@ public:
         std::optional<FloatType> const& repetitionPenalty = std::nullopt,
         std::optional<FloatType> const& presencePenalty = std::nullopt,
         std::optional<FloatType> const& frequencyPenalty = std::nullopt,
+        std::optional<SizeType32> const& promptIgnoreLength = std::nullopt,
         std::optional<FloatType> const& lengthPenalty = std::nullopt,
         std::optional<SizeType32> const& earlyStopping = std::nullopt,
         std::optional<SizeType32> const& noRepeatNgramSize = std::nullopt,
@@ -94,6 +95,7 @@ public:
     [[nodiscard]] std::optional<FloatType> getRepetitionPenalty() const;
     [[nodiscard]] std::optional<FloatType> getPresencePenalty() const;
     [[nodiscard]] std::optional<FloatType> getFrequencyPenalty() const;
+    [[nodiscard]] std::optional<SizeType32> getPromptIgnoreLength() const;
     [[nodiscard]] std::optional<FloatType> getLengthPenalty() const;
     [[nodiscard]] std::optional<SizeType32> getEarlyStopping() const;
     [[nodiscard]] std::optional<SizeType32> getNoRepeatNgramSize() const;
@@ -114,6 +116,7 @@ public:
     void setRepetitionPenalty(std::optional<FloatType> const& repetitionPenalty);
     void setPresencePenalty(std::optional<FloatType> const& presencePenalty);
     void setFrequencyPenalty(std::optional<FloatType> const& frequencyPenalty);
+    void setPromptIgnoreLength(std::optional<SizeType32> const& promptIgnoreLength);
     void setLengthPenalty(std::optional<FloatType> const& lengthPenalty);
     void setEarlyStopping(std::optional<SizeType32> const& earlyStopping);
     void setNoRepeatNgramSize(std::optional<SizeType32> const& noRepeatNgramSize);
@@ -133,6 +136,8 @@ private:
     static std::optional<FloatType> const& checkBeamSearchDiversityRate(
         std::optional<FloatType> const& beamSearchDiversityRate);
     static std::optional<FloatType> const& checkRepetitionPenalty(std::optional<FloatType> const& repetitionpenalty);
+    static std::optional<SizeType32> const& checkPromptIgnoreLength(
+        std::optional<SizeType32> const& promptIgnoreLength);
     static std::optional<FloatType> const& checkLengthPenalty(std::optional<FloatType> const& lengthPenalty);
     static std::optional<SizeType32> const& checkEarlyStopping(std::optional<SizeType32> const& earlyStopping);
     static std::optional<SizeType32> const& checkNoRepeatNgramSize(std::optional<SizeType32> const& noRepeatNgramSize);
@@ -174,6 +179,9 @@ private:
     /// @brief Used to penalize tokens already present in the sequence (dependent on the number of appearances). It can
     /// have any values. Values < 0.f encourage repetition, values > 0.f discourage it. Default is 0.f
     std::optional<FloatType> mFrequencyPenalty;
+    /// @brief Controls how many tokens to ignore from the prompt for presence and frequency penalties. Values <= 0 have
+    /// no effect. Values > input (prompt) length will be clamped. Default is 0.
+    std::optional<SizeType32> mPromptIgnoreLength;
     /// @brief Controls how to penalize longer sequences in beam search. Default is 0.f
     std::optional<FloatType> mLengthPenalty;
     /// @brief Controls whether the generation process finishes once beamWidth sentences are generated (ends with
@@ -1456,13 +1464,15 @@ public:
         UCX = 2,
         NIXL = 3
     };
-    explicit CacheTransceiverConfig(
-        std::optional<BackendType> backendType = std::nullopt, std::optional<size_t> maxNumTokens = std::nullopt);
+    explicit CacheTransceiverConfig(std::optional<BackendType> backendType = std::nullopt,
+        std::optional<size_t> maxNumTokens = std::nullopt, std::optional<int> kvTransferTimeoutMs = std::nullopt);
 
     bool operator==(CacheTransceiverConfig const& other) const;
     void setBackendType(std::optional<BackendType> backendType);
     void setMaxTokensInBuffer(std::optional<size_t> maxTokensInBuffer);
+    void setKvTransferTimeoutMs(std::optional<int> kvTransferTimeoutMs);
 
+    [[nodiscard]] std::optional<int> getKvTransferTimeoutMs() const;
     [[nodiscard]] std::optional<size_t> getMaxTokensInBuffer() const;
     [[nodiscard]] std::optional<BackendType> getBackendType() const;
 
@@ -1472,6 +1482,7 @@ private:
     /// kvCache tokens to be transferred for a single request is greater than this value, the performance of the cache
     /// transfer may be degraded.
     std::optional<size_t> mMaxTokensInBuffer;
+    std::optional<int> mKvTransferTimeoutMs;
 };
 
 /// @brief Configuration class for the model executor

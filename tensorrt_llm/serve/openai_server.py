@@ -17,7 +17,7 @@ from fastapi import Body, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Mount
-from transformers import AutoConfig, AutoProcessor
+from transformers import AutoProcessor
 
 from tensorrt_llm._tensorrt_engine import LLM
 # yapf: disable
@@ -25,15 +25,19 @@ from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.data import TokensPrompt
+from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
-from tensorrt_llm.llmapi import MultimodalEncoder
-from tensorrt_llm.llmapi.disagg_utils import MetadataServerConfig, ServerRole
+from tensorrt_llm.llmapi import MultimodalEncoder, tracing
+from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
+                                              MetadataServerConfig, ServerRole)
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
 from tensorrt_llm.metrics.collector import MetricsCollector
 from tensorrt_llm.serve.chat_utils import (check_multiple_response,
                                            parse_chat_messages_coroutines)
+from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
+from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatCompletionResponse,
@@ -42,8 +46,8 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 CompletionResponse,
                                                 CompletionResponseChoice,
                                                 ErrorResponse, ModelCard,
-                                                ModelList, ResponsesRequest,
-                                                UsageInfo,
+                                                ModelList, PromptTokensDetails,
+                                                ResponsesRequest, UsageInfo,
                                                 to_llm_disaggregated_params)
 from tensorrt_llm.serve.postprocess_handlers import (
     ChatCompletionPostprocArgs, ChatPostprocArgs, CompletionPostprocArgs,
@@ -74,13 +78,22 @@ class OpenAIServer:
     def __init__(self,
                  llm: Union[LLM, MultimodalEncoder],
                  model: str,
+                 tool_parser: Optional[str],
                  server_role: Optional[ServerRole],
-                 metadata_server_cfg: MetadataServerConfig):
+                 metadata_server_cfg: MetadataServerConfig,
+                 disagg_cluster_config: Optional[DisaggClusterConfig] = None,
+                 multimodal_server_config: Optional[MultimodalServerConfig] = None):
         self.llm = llm
         self.tokenizer = llm.tokenizer
+        self.tool_parser = tool_parser
         self.metadata_server = create_metadata_server(metadata_server_cfg)
+        self.disagg_cluster_config = disagg_cluster_config
+        self.multimodal_server_config = multimodal_server_config
         self.server_role = server_role
-        self.binding_addr = None  # Will be set in __call__
+        # Will be set in __call__
+        self.binding_addr = None
+        self.host = None
+        self.port = None
         hf_tokenizer_path = llm._hf_model_dir or self.tokenizer.tokenizer.name_or_path
         trust_remote_code = llm.args.trust_remote_code
         try:
@@ -88,8 +101,12 @@ class OpenAIServer:
         except Exception:
             logger.debug("Failed to load AutoProcessor or AutoConfig for %s", hf_tokenizer_path)
             self.processor = None
+        # load model config
         try:
-            self.model_config = AutoConfig.from_pretrained(hf_tokenizer_path, trust_remote_code=trust_remote_code)
+            from tensorrt_llm._torch.pyexecutor.config_utils import \
+                load_pretrained_config
+            self.model_config = load_pretrained_config(hf_tokenizer_path,
+                                                       trust_remote_code=trust_remote_code)
         except Exception:
             logger.debug("Failed to load AutoConfig for %s", hf_tokenizer_path)
             self.model_config = None
@@ -129,6 +146,10 @@ class OpenAIServer:
         else:
             self.use_harmony = (self.model_config.model_type == "gpt_oss")
 
+        # as disagg-worker
+        self.disagg_cluster_storage = None
+        self.disagg_cluster_worker = None
+
         @asynccontextmanager
         async def lifespan(app: FastAPI):
             if self.metadata_server is not None:
@@ -144,12 +165,19 @@ class OpenAIServer:
                 self.metadata_server.put(f"trtllm/{self.llm.llm_id}", metadata)
                 logger.info(f"trtllm/{self.llm.llm_id} is registered")
 
+            if self.disagg_cluster_config:
+                self.disagg_cluster_storage = create_cluster_storage_client(self.disagg_cluster_config.cluster_uri, self.disagg_cluster_config.cluster_name)
+                self.disagg_cluster_worker= DisaggClusterWorker(self.server_role, self.host, self.port, self.disagg_cluster_config, self.disagg_cluster_storage)
+                await self.disagg_cluster_worker.register_worker()
+
             # terminate rank0 worker
             yield
 
             if self.metadata_server is not None:
                 self.metadata_server.remove(f"trtllm/{self.llm.llm_id}")
                 logger.info(f"trtllm/{self.llm.llm_id} is unregistered")
+            if self.disagg_cluster_worker:
+                await self.disagg_cluster_worker.deregister_worker()
             self.llm.shutdown()
 
         self.app = FastAPI(lifespan=lifespan)
@@ -470,7 +498,7 @@ class OpenAIServer:
             postproc_args = ChatPostprocArgs.from_request(request)
             disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
 
-            conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(request.messages, self.model_config)
+            conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(request.messages, self.model_config, self.multimodal_server_config)
 
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
@@ -494,6 +522,7 @@ class OpenAIServer:
                 prompt["multi_modal_data"] = mm_data
 
             postproc_args.reasoning_parser = self.llm.args.reasoning_parser
+            postproc_args.tool_parser = self.tool_parser
             if conversation and conversation[-1].get(
                     "content") and conversation[-1].get("role") == get_role():
                 postproc_args.last_message_content = conversation[-1]["content"]
@@ -503,6 +532,8 @@ class OpenAIServer:
                 postproc_args=postproc_args,
             )
 
+            trace_headers = (None if raw_request is None else tracing.extract_trace_headers(raw_request.headers))
+
             promise = self.llm.generate_async(
                 inputs=prompt,
                 sampling_params=sampling_params,
@@ -511,6 +542,7 @@ class OpenAIServer:
                 lora_request=request.lora_request,
                 disaggregated_params=disaggregated_params,
                 cache_salt=request.cache_salt,
+                trace_headers=trace_headers,
             )
             asyncio.create_task(self.await_disconnected(raw_request, promise))
             if not self.postproc_worker_enabled:
@@ -628,12 +660,13 @@ class OpenAIServer:
         def merge_completion_responses(responses: List[CompletionResponse]) -> CompletionResponse:
             all_choices: List[CompletionResponseChoice] = []
             all_prompt_token_ids: List[List[int]] = []
-            num_prompt_tokens = num_gen_tokens = 0
+            num_prompt_tokens = num_gen_tokens = num_cached_tokens = 0
             for rsp in responses:
                 choices, usage = rsp.choices, rsp.usage
                 all_choices.extend(choices)
                 num_prompt_tokens += usage.prompt_tokens
                 num_gen_tokens += usage.completion_tokens
+                num_cached_tokens += usage.prompt_tokens_details.cached_tokens
                 # Aggregate prompt token ids for context-only requests
                 if rsp.prompt_token_ids is not None:
                     all_prompt_token_ids.append(rsp.prompt_token_ids)
@@ -642,6 +675,9 @@ class OpenAIServer:
                 prompt_tokens=num_prompt_tokens,
                 completion_tokens=num_gen_tokens,
                 total_tokens=num_gen_tokens + num_prompt_tokens,
+                prompt_tokens_details=PromptTokensDetails(
+                    cached_tokens=num_cached_tokens,
+                ),
             )
             merged_rsp = CompletionResponse(
                 model=self.model,
@@ -721,6 +757,7 @@ class OpenAIServer:
                     if request.stream else completion_response_post_processor,
                     postproc_args=postproc_args,
                 )
+                trace_headers = (None if raw_request is None else tracing.extract_trace_headers(raw_request.headers))
 
                 prompt = prompt_inputs(prompt)
                 if prompt.get("prompt") is not None:
@@ -735,7 +772,8 @@ class OpenAIServer:
                     _postproc_params=postproc_params,
                     streaming=request.stream,
                     lora_request=request.lora_request,
-                    disaggregated_params=disaggregated_params
+                    disaggregated_params=disaggregated_params,
+                    trace_headers=trace_headers
                 )
                 asyncio.create_task(self.await_disconnected(raw_request, promise))
                 if not self.postproc_worker_enabled:
@@ -945,6 +983,8 @@ class OpenAIServer:
     async def __call__(self, host, port):
         # Store the binding address for server registration
         self.binding_addr = f"http://{host}:{port}"
+        self.host = host
+        self.port = port
         config = uvicorn.Config(self.app,
                                 host=host,
                                 port=port,
