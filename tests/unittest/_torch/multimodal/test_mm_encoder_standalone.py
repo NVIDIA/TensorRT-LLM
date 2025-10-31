@@ -173,9 +173,9 @@ def test_single_image_chat(model_key, pd_disagg, multimodal_model_config):
     ), f"Number of outputs don't match: {len(outputs_ref)} vs {len(outputs)}"
 
     for i, (ref_output, test_output) in enumerate(zip(outputs_ref, outputs)):
-        # Compare prompts
-        assert ref_output.prompt == test_output.prompt, \
-            f"Prompts don't match for output {i}:\nReference: {ref_output.prompt!r}\nTest: {test_output.prompt!r}"
+        # Cannot compare prompts as decoder worker would void it
+        #assert ref_output.prompt == test_output.prompt, \
+        #    f"Prompts don't match for output {i}:\nReference: {ref_output.prompt!r}\nTest: {test_output.prompt!r}"
 
         # Compare number of generated outputs
         assert len(ref_output.outputs) == len(test_output.outputs), \
