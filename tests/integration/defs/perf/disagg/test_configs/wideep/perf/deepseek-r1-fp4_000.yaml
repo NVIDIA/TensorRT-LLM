@@ -1,62 +1,45 @@
-# DeepSeek R1 FP4 - 1k1k - DEP32 BS32 NIXL
-# 对应 disagg_config.py 中的第4个配置
-
-# Metadata - 测试元数据
 metadata:
-  model_name: "deepseek-r1-fp4"
-  precision: "fp4"
-  model_dir_name: "DeepSeek-R1-0528-FP4-V2"
-  supported_gpus: ["GB200", "GB300"]
-  script_file: "disaggr_torch.slurm"
-  dataset_file: "datasets/ShareGPT_V3_unfiltered_cleaned_split.json"
-
-# SLURM Configuration
+  model_name: deepseek-r1-fp4
+  precision: fp4
+  model_dir_name: DeepSeek-R1-0528-FP4-V2
+  supported_gpus:
+  - GB200
+  - GB300
+  script_file: disaggr_torch.slurm
+  dataset_file: datasets/ShareGPT_V3_unfiltered_cleaned_split.json
 slurm:
-  script_file: "disaggr_torch.slurm"
-  partition: "batch"
-  account: "coreai_comparch_trtllm"
-  job_time: "02:00:00"
-  job_name: "deepseek-r1-fp4-1k1k-dep32"
+  script_file: /lustre/fsw/portfolios/coreai/users/fredric/tensorrt_llm/examples/disaggregated/slurm/benchmark/disaggr_torch.slurm
+  partition: batch
+  account: coreai_comparch_trtllm
+  job_time: 02:00:00
+  job_name: unified-benchmark
   numa_bind: true
-
-# Benchmark Mode
 benchmark:
-  mode: "e2e"
+  mode: e2e
   use_nv_sa_benchmark: true
   multi_round: 8
   benchmark_ratio: 0.8
   streaming: true
-  concurrency_list: "1075"
-
-# Hardware Configuration
+  concurrency_list: '1075'
 hardware:
   gpus_per_node: 4
   num_ctx_servers: 1
   num_gen_servers: 1
-
-# Sequence Configuration
 sequence:
   input_length: 1024
   output_length: 1024
-
-# Environment Configuration
 environment:
-  container_mount: "/lustre:/lustre"
-  container_image: "/lustre/fsw/portfolios/coreai/users/deemon/trtllm.sqsh"
-  model_path: "/lustre/fsw/portfolios/coreai/users/xqiao/DeepSeek-R1-0528-FP4-V2"
-  trtllm_repo: "/lustre/fs1/portfolios/coreai/projects/trtllm"
+  container_mount: /mnt/c/code/TensorRT-LLM/tests/integration/defs/perf/disagg:/mnt/c/code/TensorRT-LLM/tests/integration/defs/perf/disagg,/lustre/fsw/portfolios/coreai/users/fredric/tensorrt_llm/examples/disaggregated/slurm/benchmark:/lustre/fsw/portfolios/coreai/users/fredric/tensorrt_llm/examples/disaggregated/slurm/benchmark,/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/common:/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/common,/mnt/c/code/TensorRT-LLM/tests/integration/defs/perf/disagg/output:/mnt/c/code/TensorRT-LLM/tests/integration/defs/perf/disagg/output
+  container_image: /lustre/fsw/portfolios/coreai/users/deemod/TRTLLM-7952/deemod+trtllm-2956978da3bf-aarch64-20251023.sqsh
+  model_path: /lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/common/DeepSeek-R1-0528-FP4-V2
+  trtllm_repo: ''
   build_wheel: false
-  dataset_file: "/lustre/fs1/portfolios/coreai/datasets/prompts.json"
-  work_dir: "/lustre/fs1/portfolios/coreai/perf_test"
-
-# Profiling Configuration
+  dataset_file: /lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/common/datasets/ShareGPT_V3_unfiltered_cleaned_split.json
+  work_dir: /lustre/fsw/portfolios/coreai/users/fredric/tensorrt_llm/examples/disaggregated/slurm/benchmark
 profiling:
   nsys_on: false
-
-# Worker Configuration
 worker_config:
   eplb_num_slots: 0
-  
   gen:
     tensor_parallel_size: 32
     moe_expert_parallel_size: 32
@@ -67,7 +50,16 @@ worker_config:
     max_seq_len: 2251
     cuda_graph_config:
       enable_padding: true
-      batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256]
+      batch_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
     print_iter_log: true
     kv_cache_config:
       enable_block_reuse: false
@@ -75,13 +67,11 @@ worker_config:
       dtype: fp8
     moe_config:
       backend: CUTLASS
-      # use_low_precision_moe_combine: true
     cache_transceiver_config:
       max_tokens_in_buffer: 4608
       backend: NIXL
     stream_interval: 20
     num_postprocess_workers: 4
-  
   ctx:
     max_batch_size: 4
     max_num_tokens: 4608
@@ -100,4 +90,3 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 4608
       backend: NIXL
-

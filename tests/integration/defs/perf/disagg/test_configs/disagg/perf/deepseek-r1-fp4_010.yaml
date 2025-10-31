@@ -1,6 +1,3 @@
-# DEEPSEEK-R1-FP4 - 8k1k - DEP32 BS16 NIXL
-# 对应 disagg_config.py 中的第 11 个配置
-
 metadata:
   model_name: deepseek-r1-fp4
   precision: fp4
@@ -12,11 +9,11 @@ metadata:
   benchmark_type: 8k1k
   config_index: 10
 slurm:
-  script_file: disaggr_torch.slurm
+  script_file: /lustre/fsw/portfolios/coreai/users/fredric/tensorrt_llm/examples/disaggregated/slurm/benchmark/disaggr_torch.slurm
   partition: batch
   account: coreai_comparch_trtllm
   job_time: 02:00:00
-  job_name: deepseek-r1-fp4-8k1k-dep32
+  job_name: unified-benchmark
   numa_bind: true
 benchmark:
   mode: e2e
@@ -33,13 +30,13 @@ sequence:
   input_length: 8192
   output_length: 1024
 environment:
-  container_mount: /lustre:/lustre
-  container_image: /lustre/fsw/portfolios/coreai/users/deemon/trtllm.sqsh
-  model_path: /lustre/fsw/portfolios/coreai/users/xqiao/DeepSeek-R1-0528-FP4-V2
-  trtllm_repo: /lustre/fs1/portfolios/coreai/projects/trtllm
+  container_mount: /mnt/c/code/TensorRT-LLM/tests/integration/defs/perf/disagg:/mnt/c/code/TensorRT-LLM/tests/integration/defs/perf/disagg,/lustre/fsw/portfolios/coreai/users/fredric/tensorrt_llm/examples/disaggregated/slurm/benchmark:/lustre/fsw/portfolios/coreai/users/fredric/tensorrt_llm/examples/disaggregated/slurm/benchmark,/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/common:/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/common,/mnt/c/code/TensorRT-LLM/tests/integration/defs/perf/disagg/output:/mnt/c/code/TensorRT-LLM/tests/integration/defs/perf/disagg/output
+  container_image: /lustre/fsw/portfolios/coreai/users/deemod/TRTLLM-7952/deemod+trtllm-2956978da3bf-aarch64-20251023.sqsh
+  model_path: /lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/common/DeepSeek-R1-0528-FP4-V2
+  trtllm_repo: ''
   build_wheel: false
-  dataset_file: /lustre/fs1/portfolios/coreai/datasets/prompts.json
-  work_dir: /lustre/fs1/portfolios/coreai/perf_test
+  dataset_file: /lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/common/
+  work_dir: /lustre/fsw/portfolios/coreai/users/fredric/tensorrt_llm/examples/disaggregated/slurm/benchmark
 profiling:
   nsys_on: false
 worker_config:
