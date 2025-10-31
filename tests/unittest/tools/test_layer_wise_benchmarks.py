@@ -1,32 +1,23 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 import os
 
 import pytest
 import torch
+from defs.conftest import deepseek_r1_model_root  # noqa: F401
+from defs.conftest import deepseek_v3_model_root  # noqa: F401
 from defs.trt_test_alternative import check_call
 from utils.cpp_paths import llm_root  # noqa: F401
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
-def test_deepseek_r1_ctx_tep(llm_root):
+@pytest.mark.parametrize("deepseek_r1_model_root", ["DeepSeek-R1-0528-FP4-v2"],
+                         indirect=True)
+def test_deepseek_r1_ctx_tep(llm_root, deepseek_r1_model_root):
     check_call([
         "./mpi_launch.sh",
         "./run_single.sh",
         "config_ctx.yaml",
+        "--model=" + deepseek_r1_model_root,
         "--no-enable-attention-dp",
         "--moe-backend=TRTLLM",
     ],
@@ -40,12 +31,14 @@ def test_deepseek_r1_ctx_tep(llm_root):
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
-def test_deepseek_v32_ctx_dep(llm_root):
+@pytest.mark.parametrize("deepseek_v3_model_root", ["DeepSeek-V3.2-Exp"],
+                         indirect=True)
+def test_deepseek_v32_ctx_dep(llm_root, deepseek_v3_model_root):
     check_call([
         "./mpi_launch.sh",
         "./run_single.sh",
         "config_ctx.yaml",
-        "--model=deepseek-ai/DeepSeek-V3.2-Exp",
+        "--model=" + deepseek_v3_model_root,
         "--tokens-per-block=64",
         "--moe-backend=DEEPGEMM",
     ],
@@ -58,14 +51,17 @@ def test_deepseek_v32_ctx_dep(llm_root):
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
-def test_deepseek_r1_gen_scaled_from_16_dep(llm_root):
+@pytest.mark.parametrize("deepseek_r1_model_root", ["DeepSeek-R1-0528-FP4-v2"],
+                         indirect=True)
+def test_deepseek_r1_gen_scaled_from_16_dep(llm_root, deepseek_r1_model_root):
     check_call([
         "./mpi_launch.sh",
         "./run_single.sh",
         "config_gen.yaml",
+        "--model=" + deepseek_r1_model_root,
+        "--layer-indices=5,6",
         "--scaled-from=16",
         "--moe-backend=WIDEEP",
-        "--layer-indices=5,6",
     ],
                cwd=llm_root / "examples" / "layer_wise_benchmarks",
                env={

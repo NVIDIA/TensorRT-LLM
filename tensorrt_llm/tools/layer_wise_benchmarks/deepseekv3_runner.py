@@ -48,7 +48,7 @@ class RoutingMethod(DeepseekV3Gate):
         super().__init__(*args, **kwargs)
         self.world_size = mpi_world_size()
         self.rank = mpi_rank()
-        self.balance_method = None
+        self.balance_method = BalanceMethod.NotModified
         self.balance_ratio = None
 
     def apply(self, router_logits) -> (torch.Tensor, torch.Tensor):
@@ -276,7 +276,7 @@ class DeepSeekV3Runner:
                         batch_size: int,
                         seq_len_q: int,
                         seq_len_kv_cache: int,
-                        kv_cache_manager: Optional[KVCacheManager] = None,
+                        kv_cache_manager: KVCacheManager,
                         attn_workspace: Optional[torch.Tensor] = None):
         if self.model_config.moe_backend == "TRTLLM" and os.getenv(
                 "TRTLLM_ENABLE_PDL") != "1":
@@ -292,11 +292,11 @@ class DeepSeekV3Runner:
             max_num_requests=kv_cache_manager.max_batch_size,
             num_contexts={
                 "CTX": batch_size,
-                "GEN": 0
+                "GEN": 0,
             }[run_type],
             prompt_lens=[{
                 "CTX": seq_len_q,
-                "GEN": seq_len_kv_cache
+                "GEN": seq_len_kv_cache,
             }[run_type]] * batch_size,
             max_num_tokens=batch_size * seq_len_q,
             kv_cache_manager=kv_cache_manager,
@@ -380,7 +380,7 @@ class DeepSeekV3Runner:
             mapping=mapping,
             dtype=torch_dtype_to_binding({
                 None: torch.bfloat16,
-                "FP8": torch.float8_e4m3fn
+                "FP8": torch.float8_e4m3fn,
             }[model_config.quant_config.kv_cache_quant_algo]),
             sparse_attn_config=model_config.sparse_attention_config,
         )
