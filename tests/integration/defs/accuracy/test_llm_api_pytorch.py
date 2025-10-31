@@ -2380,7 +2380,6 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
     def test_nvfp4_multi_gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                               attention_dp, cuda_graph, overlap_scheduler,
                               max_batch_size, moe_backend):
-        pytest.skip("Skip this test due to the tokens_per_block issue, will fix it later.")
         if moe_backend == "TRTLLM" and (get_sm_version() == 120
                                         or get_sm_version() == 121):
             pytest.skip(
