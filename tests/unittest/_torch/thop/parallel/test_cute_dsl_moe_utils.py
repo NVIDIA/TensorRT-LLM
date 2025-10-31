@@ -1,7 +1,22 @@
 import pytest
 import torch
 
-import tensorrt_llm  # noqa
+from tensorrt_llm._torch.utils import unswizzle_sf
+
+
+def get_max_num_tiles(num_tokens: int, top_k: int, tile_size: int,
+                      num_local_experts: int) -> int:
+    num_expanded_tokens = num_tokens * top_k
+    if num_expanded_tokens <= num_local_experts:
+        return num_expanded_tokens
+    return (num_expanded_tokens +
+            (tile_size - 1) * num_local_experts) // tile_size
+
+
+def get_max_num_permuted_tokens(num_tokens: int, top_k: int, tile_size: int,
+                                num_local_experts: int) -> int:
+    return get_max_num_tiles(num_tokens, top_k, tile_size,
+                             num_local_experts) * tile_size
 
 
 @pytest.mark.parametrize("tile_size", [128, 256])
@@ -9,8 +24,9 @@ import tensorrt_llm  # noqa
 @pytest.mark.parametrize("num_tokens", [128, 515, 1024])
 @pytest.mark.parametrize("dtype", ["bfloat16", "float16", "float8", "float4"])
 def test_moe_permute(dtype: str, num_tokens: int, top_k: int, tile_size: int):
+    sf_vec_size = 16
     hidden_size = 4096
-    num_experts = 256
+    num_local_experts = 256 // 32
     x = torch.randint(-100,
                       100, (num_tokens, hidden_size),
                       dtype=torch.int32,
@@ -19,7 +35,7 @@ def test_moe_permute(dtype: str, num_tokens: int, top_k: int, tile_size: int):
     if dtype == "float4":
         x = x[:, :hidden_size // 2].to(torch.int8).view(torch.float4_e2m1fn_x2)
         x_sf = torch.randint(-100,
-                             100, (num_tokens, hidden_size // 16),
+                             100, (num_tokens, hidden_size // sf_vec_size),
                              dtype=torch.int32,
                              device="cuda").to(torch.float8_e4m3fn).view(
                                  torch.uint8)
@@ -28,7 +44,9 @@ def test_moe_permute(dtype: str, num_tokens: int, top_k: int, tile_size: int):
     else:
         x = x.to(getattr(torch, dtype))
 
-    num_permuted_tokens = num_tokens * top_k + (tile_size - 1) * num_experts
+    num_permuted_tokens = get_max_num_permuted_tokens(num_tokens, top_k,
+                                                      tile_size,
+                                                      num_local_experts)
     permuted_idx_to_expanded_idx = torch.randint(0,
                                                  num_tokens * top_k,
                                                  (num_permuted_tokens, ),
@@ -43,6 +61,8 @@ def test_moe_permute(dtype: str, num_tokens: int, top_k: int, tile_size: int):
         top_k)
     if dtype == "float4":
         assert permuted_sf is not None
+        permuted_sf = unswizzle_sf(permuted_sf, num_permuted_tokens,
+                                   hidden_size, sf_vec_size)
     else:
         assert permuted_sf is None
 
