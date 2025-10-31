@@ -1,13 +1,13 @@
 metadata:
-  model_name: deepseek-r1-fp4
+  model_name: Qwen3-235B-A22B-FP4
   precision: fp4
-  model_dir_name: DeepSeek-R1-0528-FP4-V2
+  model_dir_name: Qwen3-235B-A22B-FP4
   supported_gpus:
   - GB200
   - GB300
   script_file: disaggr_torch.slurm
   benchmark_type: 1k1k
-  config_index: 0
+  config_index: 9
   dataset_file: datasets/deepseek-r1-1024-1024-100000-ratio-1_for_serve.json
 slurm:
   script_file: /lustre/fsw/portfolios/coreai/users/fredric/tensorrt_llm/examples/disaggregated/slurm/benchmark/disaggr_torch.slurm
@@ -33,7 +33,7 @@ sequence:
 environment:
   container_mount: /mnt/c/code/TensorRT-LLM/tests/integration/defs/perf/disagg:/mnt/c/code/TensorRT-LLM/tests/integration/defs/perf/disagg,/lustre/fsw/portfolios/coreai/users/fredric/tensorrt_llm/examples/disaggregated/slurm/benchmark:/lustre/fsw/portfolios/coreai/users/fredric/tensorrt_llm/examples/disaggregated/slurm/benchmark,/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/common:/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/common,/mnt/c/code/TensorRT-LLM/tests/integration/defs/perf/disagg/output:/mnt/c/code/TensorRT-LLM/tests/integration/defs/perf/disagg/output
   container_image: /lustre/fsw/portfolios/coreai/users/deemod/TRTLLM-7952/deemod+trtllm-2956978da3bf-aarch64-20251023.sqsh
-  model_path: /lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/common/DeepSeek-R1-0528-FP4-V2
+  model_path: /lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/common/Qwen3-235B-A22B-FP4
   trtllm_repo: ''
   build_wheel: false
   dataset_file: /lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/common/
@@ -70,7 +70,7 @@ worker_config:
     print_iter_log: true
     kv_cache_config:
       enable_block_reuse: false
-      free_gpu_memory_fraction: 0.9
+      free_gpu_memory_fraction: 0.7
       dtype: fp8
     moe_config:
       backend: WIDEEP
@@ -85,7 +85,7 @@ worker_config:
     num_postprocess_workers: 4
     speculative_config:
       decoding_type: MTP
-      num_nextn_predict_layers: 3
+      num_nextn_predict_layers: 1
   ctx:
     max_batch_size: 4
     max_num_tokens: 4608
@@ -106,4 +106,4 @@ worker_config:
       backend: NIXL
     speculative_config:
       decoding_type: MTP
-      num_nextn_predict_layers: 3
+      num_nextn_predict_layers: 1

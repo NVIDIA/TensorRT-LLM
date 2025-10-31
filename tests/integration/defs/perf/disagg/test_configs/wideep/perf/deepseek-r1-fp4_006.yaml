@@ -6,9 +6,9 @@ metadata:
   - GB200
   - GB300
   script_file: disaggr_torch.slurm
-  benchmark_type: 1k1k
-  config_index: 0
-  dataset_file: datasets/deepseek-r1-1024-1024-100000-ratio-1_for_serve.json
+  benchmark_type: 8k1k
+  config_index: 6
+  dataset_file: datasets/deepseek-r1-8192-1024-200000-ratio-1_for_serve.json
 slurm:
   script_file: /lustre/fsw/portfolios/coreai/users/fredric/tensorrt_llm/examples/disaggregated/slurm/benchmark/disaggr_torch.slurm
   partition: batch
@@ -22,13 +22,13 @@ benchmark:
   multi_round: 8
   benchmark_ratio: 0.8
   streaming: true
-  concurrency_list: '2150'
+  concurrency_list: '538'
 hardware:
   gpus_per_node: 4
-  num_ctx_servers: 2
+  num_ctx_servers: 8
   num_gen_servers: 1
 sequence:
-  input_length: 1024
+  input_length: 8192
   output_length: 1024
 environment:
   container_mount: /mnt/c/code/TensorRT-LLM/tests/integration/defs/perf/disagg:/mnt/c/code/TensorRT-LLM/tests/integration/defs/perf/disagg,/lustre/fsw/portfolios/coreai/users/fredric/tensorrt_llm/examples/disaggregated/slurm/benchmark:/lustre/fsw/portfolios/coreai/users/fredric/tensorrt_llm/examples/disaggregated/slurm/benchmark,/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/common:/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/common,/mnt/c/code/TensorRT-LLM/tests/integration/defs/perf/disagg/output:/mnt/c/code/TensorRT-LLM/tests/integration/defs/perf/disagg/output
@@ -43,14 +43,14 @@ profiling:
 worker_config:
   eplb_num_slots: 0
   gen:
-    tensor_parallel_size: 16
-    moe_expert_parallel_size: 16
+    tensor_parallel_size: 32
+    moe_expert_parallel_size: 32
     enable_attention_dp: true
     enable_lm_head_tp_in_adp: true
     pipeline_parallel_size: 1
-    max_batch_size: 128
-    max_num_tokens: 256
-    max_seq_len: 2251
+    max_batch_size: 16
+    max_num_tokens: 64
+    max_seq_len: 9419
     cuda_graph_config:
       enable_padding: true
       batch_sizes:
@@ -70,7 +70,7 @@ worker_config:
     print_iter_log: true
     kv_cache_config:
       enable_block_reuse: false
-      free_gpu_memory_fraction: 0.9
+      free_gpu_memory_fraction: 0.7
       dtype: fp8
     moe_config:
       backend: WIDEEP
@@ -79,17 +79,17 @@ worker_config:
         num_slots: 288
         layer_updates_per_iter: 1
     cache_transceiver_config:
-      max_tokens_in_buffer: 4608
-      backend: NIXL
+      max_tokens_in_buffer: 8448
+      backend: UCX
     stream_interval: 20
     num_postprocess_workers: 4
     speculative_config:
       decoding_type: MTP
       num_nextn_predict_layers: 3
   ctx:
-    max_batch_size: 4
-    max_num_tokens: 4608
-    max_seq_len: 1227
+    max_batch_size: 1
+    max_num_tokens: 8448
+    max_seq_len: 8395
     tensor_parallel_size: 4
     moe_expert_parallel_size: 4
     enable_attention_dp: true
@@ -99,11 +99,11 @@ worker_config:
     disable_overlap_scheduler: true
     kv_cache_config:
       enable_block_reuse: false
-      free_gpu_memory_fraction: 0.85
+      free_gpu_memory_fraction: 0.75
       dtype: fp8
     cache_transceiver_config:
-      max_tokens_in_buffer: 4608
-      backend: NIXL
+      max_tokens_in_buffer: 8448
+      backend: UCX
     speculative_config:
       decoding_type: MTP
       num_nextn_predict_layers: 3

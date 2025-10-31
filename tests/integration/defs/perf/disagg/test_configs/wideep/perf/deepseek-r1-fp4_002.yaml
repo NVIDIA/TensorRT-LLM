@@ -7,7 +7,7 @@ metadata:
   - GB300
   script_file: disaggr_torch.slurm
   benchmark_type: 1k1k
-  config_index: 0
+  config_index: 2
   dataset_file: datasets/deepseek-r1-1024-1024-100000-ratio-1_for_serve.json
 slurm:
   script_file: /lustre/fsw/portfolios/coreai/users/fredric/tensorrt_llm/examples/disaggregated/slurm/benchmark/disaggr_torch.slurm
@@ -80,7 +80,7 @@ worker_config:
         layer_updates_per_iter: 1
     cache_transceiver_config:
       max_tokens_in_buffer: 4608
-      backend: NIXL
+      backend: UCX
     stream_interval: 20
     num_postprocess_workers: 4
     speculative_config:
@@ -103,7 +103,7 @@ worker_config:
       dtype: fp8
     cache_transceiver_config:
       max_tokens_in_buffer: 4608
-      backend: NIXL
+      backend: UCX
     speculative_config:
       decoding_type: MTP
       num_nextn_predict_layers: 3
