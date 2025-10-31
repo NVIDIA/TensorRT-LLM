@@ -397,20 +397,22 @@ def get_all_layer_subgraphs(gm: GraphModule) -> List[List[Node]]:
 
     assert gm.graph.nodes, "Graph is empty"
     layer_subgraphs = []
-    linear_nodes = list(filtered_nodes(gm.graph.nodes, is_linear_op))
+    linear_nodes = list(filtered_nodes(gm.graph.nodes, is_any_lin_op))
     unprocessed_linear_nodes = set(linear_nodes)
     assert len(linear_nodes) > 0, "Could not find any linear nodes in the graph"
 
     terminating_indices = [-1]
+    last_lin_index = terminating_indices[-1] + 1
 
     # for each linear node, find its layer subgraph defined as regions between consecutive linear nodes
-    while True:
-        layer_subgraph = get_layer_after_linear_node(linear_nodes, terminating_indices)
-        unprocessed_linear_nodes -= set(layer_subgraph)
-        layer_subgraphs.append(layer_subgraph)
+    while last_lin_index < len(linear_nodes):
+        opening, layer_subgraph, closing = get_layer_after_linear_node(
+            linear_nodes, terminating_indices
+        )
+        if opening is not None:
+            unprocessed_linear_nodes -= set(opening) | set([closing])
+            layer_subgraphs.append([opening, layer_subgraph, closing])
         last_lin_index = terminating_indices[-1] + 1
-        if last_lin_index >= len(linear_nodes):
-            break
 
     # unprocessed linear nodes can be "simple sharded".
     return layer_subgraphs, unprocessed_linear_nodes
@@ -654,11 +656,18 @@ def get_layer_after_linear_node(
     linear_nodes: List[Node], terminating_indices: List[int]
 ) -> List[Node]:
     """Get the layer after a linear node."""
+
+    def boundary_condition(node: Node) -> bool:
+        return is_any_lin_op(node) or is_op(node, ops=[torch.ops.aten.arange, torch.ops.aten.to])
+
     lin_nodes_in_subgraph = []
     start_lin_index = terminating_indices[-1] + 1
     while len(lin_nodes_in_subgraph) != 1:
+        if start_lin_index >= len(linear_nodes):
+            terminating_indices.append(len(linear_nodes))
+            return None, None, None
         forward_subgraph = subgraph(
-            sources=[linear_nodes[start_lin_index]], boundary_condition=is_linear_op
+            sources=[linear_nodes[start_lin_index]], boundary_condition=boundary_condition
         )
         lin_nodes_in_subgraph = list(
             filtered_nodes(forward_subgraph, ops=torch.ops.auto_deploy.torch_linear_simple)
@@ -667,7 +676,7 @@ def get_layer_after_linear_node(
     terminating_linear_node = lin_nodes_in_subgraph[0]
     # get all opening linear nodes
     opening_linear_nodes = subgraph(
-        sinks=[terminating_linear_node], include=is_linear_op, boundary_condition=is_linear_op
+        sinks=[terminating_linear_node], include=is_any_lin_op, boundary_condition=is_any_lin_op
     )
     # opening nodes must succeed last terminating node
     last_terminating_index = terminating_indices[-1]
@@ -677,7 +686,7 @@ def get_layer_after_linear_node(
     assert linear_nodes[start_lin_index - 1] in opening_linear_nodes, (
         "Linear node not found in opening linear nodes"
     )
-    layer_subgraph = opening_linear_nodes + forward_subgraph
+    layer_subgraph = [opening_linear_nodes, forward_subgraph, terminating_linear_node]
 
     # return the index of the terminating linear node
     if terminating_linear_node == linear_nodes[-1]:
