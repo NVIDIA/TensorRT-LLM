@@ -70,15 +70,15 @@ def fp8_linear(
     Returns:
         The linear output with the original dtype as the input.
     """
-    assert input.shape[-1] % 16 == 0
-    assert weight_fp8.shape[-1] % 16 == 0
-
     input_shape = input.shape
     input_dtype = input.dtype
 
     n = weight_fp8.shape[0]
     k = input_shape[-1]
     input = input.reshape(-1, k)
+
+    assert n % 2 == 0
+    assert k % 16 == 0
 
     # Use TensorRT-LLM FP8 per-tensor quantization
     assert input_scale is not None
