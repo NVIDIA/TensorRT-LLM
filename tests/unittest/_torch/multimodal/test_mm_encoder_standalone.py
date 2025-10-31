@@ -150,6 +150,10 @@ def test_single_image_chat(model_key, pd_disagg, multimodal_model_config):
         pd_disaggregated_params = outputs[0].disaggregated_params
         pd_disaggregated_params.request_type = "generation_only"
         sampling_params = SamplingParams(max_tokens=max_tokens)
+        inputs[0][
+            'multi_modal_data'] = None  # remove multimodal data from input as decoder worker doesn't need it
+        inputs[0]['prompt_token_ids'] = outputs[
+            0].prompt_token_ids  # use prompt token ids from encoder output
 
         outputs = llm_decode.generate(
             inputs,
