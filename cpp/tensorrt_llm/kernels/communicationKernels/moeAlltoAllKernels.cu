@@ -23,7 +23,7 @@
 #include <cstdint>
 #include <type_traits>
 
-namespace tensorrt_llm::kernels::moe_a2a
+namespace tensorrt_llm::kernels::MnnvlThroughput
 {
 
 #define ENABLE_DEBUG_PRINT 0
@@ -506,7 +506,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
     TLLM_CHECK(params.num_payloads > 0 && params.num_payloads <= kMaxPayloads);
 
     // Prepare kernel pointers struct
-    DispatchKernelPointers kernel_ptrs = {}; // Zero-initialize
+    DispatchKernelPointers kernel_ptrs = {};
 
     // Fill source data pointers and payload sizes
     for (int i = 0; i < params.num_payloads; i++)
@@ -958,4 +958,4 @@ void moe_a2a_sanitize_expert_ids_launch(int32_t* expert_ids, int32_t const* recv
         expert_ids, recv_counters, ep_size, max_tokens_per_rank, top_k, invalid_id);
 }
 
-} // namespace tensorrt_llm::kernels::moe_a2a
+} // namespace tensorrt_llm::kernels::MnnvlThroughput

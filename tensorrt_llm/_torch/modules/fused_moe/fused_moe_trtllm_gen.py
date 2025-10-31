@@ -134,7 +134,7 @@ class TRTLLMGenFusedMoE(MoE):
                         os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB", "512"))
                     self.moe_a2a = MoeAlltoAll(
                         mapping=self.mapping,
-                        max_num_tokens_per_rank=model_config.max_num_tokens,
+                        max_num_tokens=model_config.max_num_tokens,
                         top_k=self.routing_method.experts_per_token,
                         num_experts=self.num_experts,
                         workspace_size_per_rank=workspace_mb * 1024 * 1024,
@@ -353,7 +353,7 @@ class TRTLLMGenFusedMoE(MoE):
         if self.enable_alltoall:
             assert all_rank_num_tokens is not None, "all_rank_num_tokens required for alltoall"
 
-            max_num_token = max(
+            runtime_max_tokens_per_rank = max(
                 all_rank_num_tokens) if all_rank_num_tokens else token_count
 
             if token_final_scales is None:
@@ -368,7 +368,7 @@ class TRTLLMGenFusedMoE(MoE):
                     token_selected_experts,
                     None,
                     self.alltoall_prepare_workspace,
-                    max_num_token,
+                    runtime_max_tokens_per_rank,
                     self.ep_rank,
                     self.ep_size,
                     self.num_experts,
@@ -391,7 +391,7 @@ class TRTLLMGenFusedMoE(MoE):
                 torch.ops.trtllm.memset_expert_ids(
                     token_selected_experts,
                     alltoall_info.recv_rank_count_cumsum,
-                    max_num_token,
+                    runtime_max_tokens_per_rank,
                     top_k,
                     self.num_slots,
                     self.ep_size,
@@ -420,6 +420,7 @@ class TRTLLMGenFusedMoE(MoE):
                 recv_buffers = self.moe_a2a.dispatch(
                     token_selected_experts,
                     payloads,
+                    runtime_max_tokens_per_rank,
                     invalid_token_expert_id=
                     -1,  # Note Cutlass MoE uses num_experts as invalid token expert id
                     expert_id_payload_index=expert_id_payload_index,
@@ -718,15 +719,19 @@ class TRTLLMGenFusedMoE(MoE):
                         ep_rank=self.ep_rank,
                         ep_size=self.ep_size,
                         top_k=top_k,
-                        use_low_precision_combine=self.use_low_precision_combine,
+                        use_low_precision_combine=self.
+                        use_low_precision_combine,
                         token_count=token_count,
                     )
             elif self.moe_alltoall_backend == "mnnvlthroughput":
                 hidden = final_hidden_states.shape[-1]
-                payload = final_hidden_states.view(
-                    self.ep_size, self.moe_a2a.max_num_tokens_per_rank, hidden)
+                payload = final_hidden_states.view(self.ep_size,
+                                                   runtime_max_tokens_per_rank,
+                                                   hidden)
                 final_hidden_states = self.moe_a2a.combine(
-                    payload, payload_in_workspace=False)
+                    payload,
+                    runtime_max_tokens_per_rank,
+                    payload_in_workspace=False)
             else:
                 raise ValueError(
                     f"Unsupported moe alltoall backend: {self.moe_alltoall_backend}"

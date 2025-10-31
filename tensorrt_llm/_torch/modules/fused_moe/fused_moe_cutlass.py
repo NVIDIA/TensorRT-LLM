@@ -408,7 +408,7 @@ class CutlassFusedMoE(MoE):
             assert all_rank_num_tokens is not None, "all_rank_num_tokens required for alltoall"
             # Prepare alltoall indices
             top_k = self.routing_method.experts_per_token
-            max_num_token = max(
+            max_tokens_per_rank = max(
                 all_rank_num_tokens) if all_rank_num_tokens else token_count
 
             # Handle case where token_final_scales might be None (when apply_router_weight_on_input=True)
@@ -420,7 +420,7 @@ class CutlassFusedMoE(MoE):
                 assert self.alltoall_prepare_workspace is not None, "alltoall_prepare_workspace should be initialized"
                 alltoall_info, _ = MnnvlMoe.mnnvl_moe_alltoallv_prepare_without_allgather(
                     token_selected_experts, None,
-                    self.alltoall_prepare_workspace, max_num_token,
+                    self.alltoall_prepare_workspace, max_tokens_per_rank,
                     self.ep_rank, self.ep_size, self.num_experts,
                     self.num_experts, top_k)
 
@@ -437,8 +437,8 @@ class CutlassFusedMoE(MoE):
 
                 torch.ops.trtllm.memset_expert_ids(
                     token_selected_experts,
-                    alltoall_info.recv_rank_count_cumsum, max_num_token, top_k,
-                    self.num_experts, self.ep_size)
+                    alltoall_info.recv_rank_count_cumsum, max_tokens_per_rank,
+                    top_k, self.num_experts, self.ep_size)
             elif self.moe_alltoall_backend == "mnnvlthroughput":
                 # Python MoeAlltoAll path
                 if x_sf is not None:
@@ -498,9 +498,12 @@ class CutlassFusedMoE(MoE):
         # Optionally provide an output tensor to fused_moe so it writes directly to our buffer
         moe_output: Optional[torch.Tensor] = None
         if self.enable_alltoall and self.moe_alltoall_backend == "mnnvlthroughput":
-            # Retrieve a workspace-backed output tensor
+            # Retrieve a workspace-backed output tensor sized by runtime tokens
+            runtime_max_tokens_per_rank = max(
+                all_rank_num_tokens) if all_rank_num_tokens else x.shape[0]
             moe_output = self.moe_a2a.get_combine_payload_tensor_in_workspace(
-                self.unpadded_hidden_size, output_dtype)
+                runtime_max_tokens_per_rank, self.unpadded_hidden_size,
+                output_dtype)
         final_hidden_states = torch.ops.trtllm.fused_moe(
             x,
             token_selected_experts,
@@ -556,11 +559,14 @@ class CutlassFusedMoE(MoE):
                         use_low_precision_combine,
                         token_count=token_count)
             elif self.moe_alltoall_backend == "mnnvlthroughput":
-                hidden = final_hidden_states.shape[-1]
+                output_hidden_size = final_hidden_states.shape[-1]
+                runtime_max_tokens_per_rank = max(
+                    all_rank_num_tokens) if all_rank_num_tokens else token_count
                 final_hidden_states = self.moe_a2a.combine(
-                    final_hidden_states.view(
-                        self.ep_size, self.moe_a2a.max_num_tokens_per_rank,
-                        hidden),
+                    final_hidden_states.view(self.ep_size,
+                                             runtime_max_tokens_per_rank,
+                                             output_hidden_size),
+                    runtime_max_tokens_per_rank,
                     payload_in_workspace=True)
             else:
                 raise ValueError(
