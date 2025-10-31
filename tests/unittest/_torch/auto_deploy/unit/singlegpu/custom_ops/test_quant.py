@@ -32,18 +32,23 @@ def test_fp8_linear(M, N, K, bias):
     weight_scale = (torch.max(torch.abs(weight)) / 448).to("cuda")
     weight_fp8 = (weight / weight_scale).to(torch.float8_e4m3fn)
 
-    output_fp8_gemm = torch.ops.auto_deploy.torch_quant_fp8_linear(
+    output_fp8_trtllm = torch.ops.auto_deploy.trtllm_quant_fp8_linear(
         input,
         weight_fp8,
         bias=bias,
         input_scale=torch.tensor(1.0).to("cuda"),
         weight_scale=weight_scale,
     )
-    output_fp32_gemm = torch.ops.aten.linear.default(input, weight, bias=bias)
+    output_fp8_torch = torch.ops.auto_deploy.torch_quant_fp8_linear(
+        input,
+        weight_fp8,
+        bias=bias,
+        input_scale=torch.tensor(1.0).to("cuda"),
+        weight_scale=weight_scale,
+    )
+    assert output_fp8_trtllm.shape == output_fp8_torch.shape
 
-    assert output_fp8_gemm.shape == output_fp32_gemm.shape
-
-    torch.testing.assert_close(output_fp8_gemm, output_fp32_gemm, rtol=0.01, atol=0.15)
+    torch.testing.assert_close(output_fp8_trtllm, output_fp8_torch, rtol=0.01, atol=0.05)
 
 
 @pytest.mark.skipif(

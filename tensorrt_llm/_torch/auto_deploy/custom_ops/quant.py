@@ -11,6 +11,7 @@ from tensorrt_llm._torch.autotuner import autotune
 
 from ..distributed import common as dist
 from ..distributed import trtllm as trtllm_dist
+from .torch_libs.float8_python_api import addmm_float8_unwrapped
 
 TRTLLM_FP4_OP_AVAILABLE = True
 
@@ -51,8 +52,8 @@ def _to_fp8(x, scale):
     return (x / scale).clamp(FP8_MIN, FP8_MAX).to(torch.float8_e4m3fn)
 
 
-@torch.library.custom_op("auto_deploy::torch_quant_fp8_linear", mutates_args=())
-def fp8_linear(
+@torch.library.custom_op("auto_deploy::trtllm_quant_fp8_linear", mutates_args=())
+def trtllm_quant_fp8_linear(
     input: torch.Tensor,
     weight_fp8: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
@@ -97,8 +98,6 @@ def fp8_linear(
             bias=None,
             out_dtype=input_dtype,
         )
-        if bias is not None:
-            output = output + bias
     else:
         # Use cuBLAS for large M dimension
         output = torch.ops.trtllm.cublas_scaled_mm(
@@ -106,10 +105,67 @@ def fp8_linear(
             weight_fp8.t(),
             scale_a=input_scale,
             scale_b=weight_scale,
-            bias=bias,
+            bias=None,
             out_dtype=input_dtype,
         )
+    if bias is not None:
+        output = output + bias
     return output.reshape(*input_shape[:-1], n)
+
+
+@trtllm_quant_fp8_linear.register_fake
+def trtllm_quant_fp8_linear_fake(
+    input: torch.Tensor,
+    weight_fp8: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    input_scale: Optional[torch.Tensor] = None,
+    weight_scale: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    return torch.ops.aten.linear(input, weight_fp8.to(input.dtype), bias)
+
+
+@torch.library.custom_op("auto_deploy::torch_quant_fp8_linear", mutates_args=())
+@torch.compile(dynamic=True)
+def fp8_linear(
+    input: torch.Tensor,
+    weight_fp8: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    input_scale: Optional[torch.Tensor] = None,
+    weight_scale: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """FP8 linear op similar to torch.nn.linear.
+
+    Args:
+        input: unquantized input tensor
+        weight_fp8: pre-quantized weight tensor, with dtype torch.float8_e4m3fn
+        input_scale: a scalar tensor defined as amax / max value (448.0).
+        weight_scale: a scalar tensor defined as amax / max value (448.0).
+
+    Returns:
+        The linear output with the original dtype as the input.
+    """
+    assert input.shape[-1] % 16 == 0
+    assert weight_fp8.shape[-1] % 16 == 0
+
+    input_shape = input.shape
+    weight_shape = weight_fp8.shape
+
+    # Cuda graph compatibility
+    assert input_scale is not None
+    input_fp8 = _to_fp8(input, input_scale)
+
+    weight_fp8_t = weight_fp8.reshape(-1, weight_shape[-1]).t()
+    output = addmm_float8_unwrapped(
+        input_fp8.reshape(-1, input_shape[-1]),
+        input_scale,
+        weight_fp8_t,
+        weight_scale,
+        input.dtype,
+        bias=bias,
+        use_fast_accum=True,
+    )
+
+    return output.reshape(*input_shape[:-1], output.shape[-1])
 
 
 @fp8_linear.register_fake
