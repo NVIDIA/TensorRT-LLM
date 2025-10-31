@@ -26,8 +26,8 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from .kernel import (triton_bmm, triton_flatten_to_batch, triton_index_gather,
                      triton_interleave, triton_paged_kt_cache_bmm,
                      triton_qk_split, triton_rocket_batch_to_flatten,
-                     triton_softmax, triton_topk, triton_update_kt_cache_ctx,
-                     triton_update_kt_cache_gen)
+                     triton_rocket_reduce_scores, triton_softmax, triton_topk,
+                     triton_update_kt_cache_ctx, triton_update_kt_cache_gen)
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
@@ -201,11 +201,11 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.context_lens[:self.num_contexts], non_blocking=True)
 
         self.context_cumsum[1:self.num_contexts + 1] = torch.cumsum(
-            self.context_lens, dim=0)
+            self.context_lens[:self.num_contexts], dim=0)
         self.context_cumsum_cuda[:self.num_contexts + 1].copy_(
             self.context_cumsum[:self.num_contexts + 1], non_blocking=True)
 
-        valid_mask = self.context_lens >= self.prompt_budget
+        valid_mask = self.context_lens[:self.num_contexts] >= self.prompt_budget
         valid_seq_indices = torch.where(valid_mask)[0]
         invalid_seq_indices = torch.where(~valid_mask)[0]
         valid_batch_size = len(valid_seq_indices)
@@ -260,11 +260,10 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.max_kt_tokens = (self.max_seq_len + self.page_size -
                               1) // self.page_size
         if self.num_generations > 0:
-            self.max_real_kt_tokens = self.num_kt_tokens[:self.
-                                                         num_generations].max(
-                                                         ).item()
+            self.total_real_kt_tokens = self.cum_kt_lens[
+                self.num_generations].item()
         else:
-            self.max_real_kt_tokens = 0
+            self.total_real_kt_tokens = 0
 
         self.total_kt_tokens = self.num_generations * self.max_kt_tokens
         self.total_kv_tokens = self.num_generations * self.max_seq_len
@@ -514,15 +513,21 @@ class RocketTrtllmAttention(TrtllmAttention):
             metadata.page_size,
             metadata.kt_tokens_per_block,
             metadata.kv_cache_manager.max_kt_blocks_per_seq,
-            metadata.max_real_kt_tokens,
             metadata.total_kt_tokens,
+            metadata.total_real_kt_tokens,
         )
 
         scores = triton_softmax(scores, metadata.cum_kt_lens_cuda,
                                 metadata.num_generations)
 
-        scores = scores.view(self.num_kv_heads,
-                             self.num_heads // self.num_kv_heads, -1).sum(dim=1)
+        # Mean over num_heads_per_kv for each batch separately
+        scores = triton_rocket_reduce_scores(
+            scores,
+            metadata.cum_kt_lens_cuda,
+            metadata.num_generations,
+            self.num_kv_heads,
+            self.num_heads // self.num_kv_heads,
+        )
 
         sparse_attn_offsets = metadata.sparse_offsets_gen_cuda[:metadata.
                                                                num_generations +

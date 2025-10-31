@@ -1074,83 +1074,88 @@ def triton_update_kt_cache_ctx(
 ########################################################
 
 
-# TODO: Bottleneck of inference here. Need to optimize.
 @triton.autotune(
     configs=[
         triton.Config({
-            'KT_BLOCK_SIZE': 32,
-            'DIM_BLOCK_SIZE': 16
-        },
-                      num_warps=2,
-                      num_stages=2),
+            'KT_BLOCK_SIZE': 16,
+            'DIM_BLOCK_SIZE': 64,
+            'NUM_STAGES': 3,
+            'NUM_WARPS': 4
+        }),
+        triton.Config({
+            'KT_BLOCK_SIZE': 16,
+            'DIM_BLOCK_SIZE': 64,
+            'NUM_STAGES': 4,
+            'NUM_WARPS': 4
+        }),
+        triton.Config({
+            'KT_BLOCK_SIZE': 16,
+            'DIM_BLOCK_SIZE': 64,
+            'NUM_STAGES': 4,
+            'NUM_WARPS': 8
+        }),
         triton.Config({
             'KT_BLOCK_SIZE': 32,
-            'DIM_BLOCK_SIZE': 32
-        },
-                      num_warps=2,
-                      num_stages=2),
+            'DIM_BLOCK_SIZE': 64,
+            'NUM_STAGES': 3,
+            'NUM_WARPS': 4
+        }),
         triton.Config({
             'KT_BLOCK_SIZE': 32,
-            'DIM_BLOCK_SIZE': 64
-        },
-                      num_warps=4,
-                      num_stages=2),
+            'DIM_BLOCK_SIZE': 64,
+            'NUM_STAGES': 4,
+            'NUM_WARPS': 8
+        }),
+        triton.Config({
+            'KT_BLOCK_SIZE': 32,
+            'DIM_BLOCK_SIZE': 128,
+            'NUM_STAGES': 3,
+            'NUM_WARPS': 8
+        }),
+        triton.Config({
+            'KT_BLOCK_SIZE': 32,
+            'DIM_BLOCK_SIZE': 128,
+            'NUM_STAGES': 4,
+            'NUM_WARPS': 16
+        }),
         triton.Config({
             'KT_BLOCK_SIZE': 64,
-            'DIM_BLOCK_SIZE': 16
-        },
-                      num_warps=2,
-                      num_stages=2),
+            'DIM_BLOCK_SIZE': 64,
+            'NUM_STAGES': 3,
+            'NUM_WARPS': 4
+        }),
         triton.Config({
             'KT_BLOCK_SIZE': 64,
-            'DIM_BLOCK_SIZE': 32
-        },
-                      num_warps=4,
-                      num_stages=2),
+            'DIM_BLOCK_SIZE': 64,
+            'NUM_STAGES': 4,
+            'NUM_WARPS': 8
+        }),
         triton.Config({
             'KT_BLOCK_SIZE': 64,
-            'DIM_BLOCK_SIZE': 64
-        },
-                      num_warps=4,
-                      num_stages=3),
+            'DIM_BLOCK_SIZE': 128,
+            'NUM_STAGES': 4,
+            'NUM_WARPS': 8
+        }),
         triton.Config({
             'KT_BLOCK_SIZE': 64,
-            'DIM_BLOCK_SIZE': 64
-        },
-                      num_warps=8,
-                      num_stages=2),
+            'DIM_BLOCK_SIZE': 128,
+            'NUM_STAGES': 4,
+            'NUM_WARPS': 16
+        }),
         triton.Config({
             'KT_BLOCK_SIZE': 128,
-            'DIM_BLOCK_SIZE': 16
-        },
-                      num_warps=4,
-                      num_stages=2),
+            'DIM_BLOCK_SIZE': 128,
+            'NUM_STAGES': 3,
+            'NUM_WARPS': 16
+        }),
         triton.Config({
             'KT_BLOCK_SIZE': 128,
-            'DIM_BLOCK_SIZE': 32
-        },
-                      num_warps=4,
-                      num_stages=3),
-        triton.Config({
-            'KT_BLOCK_SIZE': 128,
-            'DIM_BLOCK_SIZE': 32
-        },
-                      num_warps=8,
-                      num_stages=2),
-        triton.Config({
-            'KT_BLOCK_SIZE': 128,
-            'DIM_BLOCK_SIZE': 64
-        },
-                      num_warps=8,
-                      num_stages=3),
-        triton.Config({
-            'KT_BLOCK_SIZE': 128,
-            'DIM_BLOCK_SIZE': 64
-        },
-                      num_warps=8,
-                      num_stages=4),
+            'DIM_BLOCK_SIZE': 128,
+            'NUM_STAGES': 4,
+            'NUM_WARPS': 16
+        }),
     ],
-    key=['max_num_kt_tokens', 'head_dim'],
+    key=['total_kt_tokens_key'],
     use_cuda_graph=True,
 )
 @triton.jit
@@ -1169,15 +1174,23 @@ def paged_kt_cache_bmm_kernel(
     kt_page_size,
     tokens_per_block,
     max_kt_blocks_per_seq,
-    max_num_kt_tokens,
     total_kt_tokens,
+    total_kt_tokens_key,
     sm_scale,
     KT_BLOCK_SIZE: tl.constexpr,
     DIM_BLOCK_SIZE: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+    NUM_WARPS: tl.constexpr,
 ):
-    batch_idx = tl.program_id(0)
-    kt_block_idx = tl.program_id(1)
-    global_head_idx = tl.program_id(2)
+    kt_block_idx = tl.program_id(0)
+    global_head_idx = tl.program_id(1)
+
+    batch_idx = 0
+    kt_block_idx_start = kt_block_idx * KT_BLOCK_SIZE
+    for i in range(num_gen_tokens):
+        kt_lens_pre = tl.load(output_offsets_ptr + i)
+        if kt_lens_pre <= kt_block_idx_start:
+            batch_idx = i
 
     total_num_heads = num_kv_heads * num_heads_per_kv
 
@@ -1187,28 +1200,26 @@ def paged_kt_cache_bmm_kernel(
     kv_head_idx = global_head_idx // num_heads_per_kv
     q_head_idx = global_head_idx % num_heads_per_kv
 
-    kv_len = tl.load(kv_lens_ptr + batch_idx)
-    num_kt_tokens = (kv_len + kt_page_size - 1) // kt_page_size
-
-    if num_kt_tokens <= 0:
-        return
-
-    kt_token_start = kt_block_idx * KT_BLOCK_SIZE
-
-    kt_token_offsets = tl.arange(0, KT_BLOCK_SIZE)
-    kt_token_indices = kt_token_start + kt_token_offsets
-    kt_token_mask = kt_token_indices < num_kt_tokens
+    kt_block_idx_end = tl.minimum(kt_block_idx_start + KT_BLOCK_SIZE,
+                                  tl.load(output_offsets_ptr + batch_idx + 1))
 
     q_base = (batch_idx * num_kv_heads * num_heads_per_kv * head_dim +
               kv_head_idx * num_heads_per_kv * head_dim + q_head_idx * head_dim)
     dim_pos_base = (batch_idx * num_kv_heads * head_dim +
                     kv_head_idx * head_dim)
 
-    block_offsets = batch_idx * max_kt_blocks_per_seq + kt_token_indices // tokens_per_block
+    output_offset = tl.load(output_offsets_ptr + batch_idx)
+
+    kt_token_indices = kt_block_idx_start + tl.arange(0, KT_BLOCK_SIZE)
+    kt_token_mask = kt_token_indices < kt_block_idx_end
+
+    rel_kt_token_indices = kt_token_indices - output_offset
+
+    block_offsets = batch_idx * max_kt_blocks_per_seq + rel_kt_token_indices // tokens_per_block
     block_indices = tl.load(kt_cache_block_offsets_ptr + block_offsets,
                             mask=kt_token_mask,
                             other=0)
-    token_indices_in_block = kt_token_indices % tokens_per_block
+    token_indices_in_block = rel_kt_token_indices % tokens_per_block
 
     cache_bases = ((block_indices * tokens_per_block + token_indices_in_block) *
                    num_kv_heads * 2 * head_dim + kv_head_idx * 2 * head_dim)
@@ -1221,43 +1232,38 @@ def paged_kt_cache_bmm_kernel(
         dim_mask = dim_indices < head_dim
 
         q_indices = q_base + dim_indices
-        q_values = tl.load(q_ptr + q_indices, mask=dim_mask, other=0.0)
+        q_values = tl.load(q_ptr + q_indices, mask=dim_mask,
+                           other=0.0)[None, :]  # Shape: [1, DIM_BLOCK_SIZE]
 
         dim_pos_indices = dim_pos_base + dim_indices
         kt_cache_offsets = tl.load(dim_pos_ptr + dim_pos_indices,
                                    mask=dim_mask,
                                    other=0)
+        kt_cache_offsets = tl.broadcast_to(kt_cache_offsets[None, :],
+                                           [KT_BLOCK_SIZE, DIM_BLOCK_SIZE])
 
-        dim_indices_expanded = dim_indices[:,
-                                           None]  # Shape: [DIM_BLOCK_SIZE, 1]
-        cache_bases_expanded = cache_bases[None, :]  # Shape: [1, KT_BLOCK_SIZE]
-        dim_mask_expanded = dim_mask[:, None]  # Shape: [DIM_BLOCK_SIZE, 1]
+        combined_mask = dim_mask[
+            None, :] & kt_token_mask[:,
+                                     None]  # Shape: [KT_BLOCK_SIZE, DIM_BLOCK_SIZE]
 
-        kt_cache_offsets_expanded = kt_cache_offsets[:,
-                                                     None]  # Shape: [DIM_BLOCK_SIZE, 1]
-        kt_cache_indices = cache_bases_expanded + kt_cache_offsets_expanded + dim_indices_expanded  # Shape: [DIM_BLOCK_SIZE, KT_BLOCK_SIZE]
+        kt_cache_indices_min = cache_bases[:, None] + dim_indices[
+            None, :]  # Shape: [KT_BLOCK_SIZE, DIM_BLOCK_SIZE]
+        kt_cache_indices_max = kt_cache_indices_min + head_dim  # Shape: [KT_BLOCK_SIZE, DIM_BLOCK_SIZE]
+        kt_cache_values_min = tl.load(kt_cache_tensor_ptr +
+                                      kt_cache_indices_min,
+                                      mask=combined_mask,
+                                      other=0.0)
+        kt_cache_values_max = tl.load(kt_cache_tensor_ptr +
+                                      kt_cache_indices_max,
+                                      mask=combined_mask,
+                                      other=0.0)
 
-        kt_token_mask_expanded = kt_token_mask[
-            None, :]  # Shape: [1, KT_BLOCK_SIZE]
-        combined_mask = dim_mask_expanded & kt_token_mask_expanded  # Shape: [DIM_BLOCK_SIZE, KT_BLOCK_SIZE]
+        kt_cache_values = tl.where(kt_cache_offsets == head_dim,
+                                   kt_cache_values_max, kt_cache_values_min)
 
-        kt_cache_flat = tl.reshape(kt_cache_indices,
-                                   [DIM_BLOCK_SIZE * KT_BLOCK_SIZE])
-        mask_flat = tl.reshape(combined_mask, [DIM_BLOCK_SIZE * KT_BLOCK_SIZE])
+        results += tl.sum(q_values * kt_cache_values, axis=1)
 
-        kt_values_flat = tl.load(kt_cache_tensor_ptr + kt_cache_flat,
-                                 mask=mask_flat,
-                                 other=0.0)
-        kt_values = tl.reshape(kt_values_flat, [DIM_BLOCK_SIZE, KT_BLOCK_SIZE])
-
-        q_values_expanded = q_values[:, None]  # Shape: [DIM_BLOCK_SIZE, 1]
-        products = q_values_expanded * kt_values  # Shape: [DIM_BLOCK_SIZE, KT_BLOCK_SIZE]
-        masked_products = tl.where(combined_mask, products, 0.0)
-
-        results += tl.sum(masked_products, axis=0)  # Shape: [KT_BLOCK_SIZE]
-
-    output_offset = tl.load(output_offsets_ptr + batch_idx)
-    output_indices = global_head_idx * total_kt_tokens + output_offset + kt_token_indices
+    output_indices = global_head_idx * total_kt_tokens + kt_token_indices
     tl.store(output_ptr + output_indices,
              results * sm_scale,
              mask=kt_token_mask)
@@ -1273,8 +1279,8 @@ def triton_paged_kt_cache_bmm(
     kt_page_size: int,
     tokens_per_block: int,
     max_kt_blocks_per_seq: int,
-    max_real_kt_tokens: int,
     total_kt_tokens: int,
+    total_real_kt_tokens: int,
     sm_scale: float = None,
 ) -> torch.Tensor:
     """
@@ -1290,17 +1296,15 @@ def triton_paged_kt_cache_bmm(
         kt_page_size: Page size for KT tokens
         tokens_per_block: Tokens per cache block
         max_kt_blocks_per_seq: Maximum KT blocks per sequence
-        max_real_kt_tokens: Maximum real KT tokens
         total_kt_tokens: Total number of KT tokens
         sm_scale: Scale factor for softmax
-
+        total_real_kt_tokens: Total number of real KT tokens
     Returns:
         output: BMM results [num_heads, 1, total_kt_tokens]
     """
     num_gen_tokens, num_kv_heads, num_heads_per_kv, head_dim = q.shape
     total_num_heads = num_kv_heads * num_heads_per_kv
-
-    max_num_kt_tokens = triton.next_power_of_2(max_real_kt_tokens)
+    total_kt_tokens_key = triton.next_power_of_2(total_real_kt_tokens)
 
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(head_dim)
@@ -1310,11 +1314,8 @@ def triton_paged_kt_cache_bmm(
                          dtype=torch.float32,
                          device=q.device)
 
-    # Grid: (num_gen_tokens, ceil(max_num_kt_tokens / KT_BLOCK_SIZE), total_num_heads)
-    def grid(meta):
-        return (num_gen_tokens,
-                (max_num_kt_tokens + meta['KT_BLOCK_SIZE'] - 1) //
-                meta['KT_BLOCK_SIZE'], total_num_heads)
+    grid = lambda meta: ((total_real_kt_tokens + meta['KT_BLOCK_SIZE'] - 1) //
+                         meta['KT_BLOCK_SIZE'], total_num_heads)
 
     paged_kt_cache_bmm_kernel[grid](
         q,
@@ -1331,8 +1332,8 @@ def triton_paged_kt_cache_bmm(
         kt_page_size,
         tokens_per_block,
         max_kt_blocks_per_seq,
-        max_num_kt_tokens,
         total_kt_tokens,
+        total_kt_tokens_key,
         sm_scale,
     )
 
@@ -1525,15 +1526,66 @@ def argsort(x,
 
 
 @triton.jit
-def extract_bin_idx(values):
+def extract_bin_idx(values, NUM_BINS: tl.constexpr):
     values_fp16 = values.to(tl.float16)
     values_u16 = values_fp16.to(tl.uint16, bitcast=True)
     values_u16 = tl.where(values < 0.0, ~values_u16 & 0xffff,
-                          values_u16 | 0x8000) >> 6
-    bin_indices = 1023 - values_u16
+                          values_u16 | 0x8000)
+    if NUM_BINS == 1024:
+        bin_indices = 1023 - (values_u16 >> 6)
+    elif NUM_BINS == 512:
+        bin_indices = 511 - (values_u16 >> 7)
+    else:
+        tl.device_assert(False, "Invalid number of bins")
     return bin_indices
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({
+            'BLOCK_SIZE': 512,
+            'NUM_STAGES': 4,
+            'NUM_WARPS': 4
+        }),
+        triton.Config({
+            'BLOCK_SIZE': 512,
+            'NUM_STAGES': 3,
+            'NUM_WARPS': 8
+        }),
+        triton.Config({
+            'BLOCK_SIZE': 512,
+            'NUM_STAGES': 4,
+            'NUM_WARPS': 8
+        }),
+        triton.Config({
+            'BLOCK_SIZE': 512,
+            'NUM_STAGES': 4,
+            'NUM_WARPS': 16
+        }),
+        triton.Config({
+            'BLOCK_SIZE': 1024,
+            'NUM_STAGES': 4,
+            'NUM_WARPS': 8
+        }),
+        triton.Config({
+            'BLOCK_SIZE': 1024,
+            'NUM_STAGES': 3,
+            'NUM_WARPS': 16
+        }),
+        triton.Config({
+            'BLOCK_SIZE': 1024,
+            'NUM_STAGES': 4,
+            'NUM_WARPS': 16
+        }),
+        triton.Config({
+            'BLOCK_SIZE': 1024,
+            'NUM_STAGES': 3,
+            'NUM_WARPS': 32
+        }),
+    ],
+    key=['topk'],
+    use_cuda_graph=True,
+)
 @triton.jit
 def topk_kernel(
     input_ptr,
@@ -1550,6 +1602,8 @@ def topk_kernel(
     BLOCK_SIZE: tl.constexpr,
     NUM_BINS: tl.constexpr,
     FINAL_SIZE: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+    NUM_WARPS: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
@@ -1590,7 +1644,7 @@ def topk_kernel(
                          other=-1e10)
 
         # Extract bin indices from values
-        bin_indices = extract_bin_idx(values).to(tl.int32)
+        bin_indices = extract_bin_idx(values, NUM_BINS).to(tl.int32)
 
         histogram += tl.histogram(bin_indices, num_bins=NUM_BINS)
 
@@ -1615,7 +1669,7 @@ def topk_kernel(
         values = tl.load(input_ptr + input_base + block_offsets,
                          mask=block_mask,
                          other=-1e10)
-        bin_indices = extract_bin_idx(values)
+        bin_indices = extract_bin_idx(values, NUM_BINS)
 
         # Create masks for guaranteed and candidate elements
         guaranteed_mask = (bin_indices < threshold_bin_idx) & block_mask
@@ -1638,6 +1692,9 @@ def topk_kernel(
 
         base_offset += num_guaranteed
 
+        tl.device_assert(final_offset + num_candidates < FINAL_SIZE,
+                         "Final offset is out of bounds")
+
         # Vectorized write for candidates
         candidate_write_offsets = final_offset + temp_base + candidate_positions
         tl.store(temp_values_ptr + candidate_write_offsets,
@@ -1648,8 +1705,6 @@ def topk_kernel(
                  mask=candidate_mask)
 
         final_offset += num_candidates
-        tl.device_assert(final_offset < FINAL_SIZE,
-                         "Final offset is out of bounds")
 
     final_offsets = tl.arange(0, FINAL_SIZE)
     final_mask = final_offsets < final_offset
@@ -1705,8 +1760,7 @@ def triton_topk(input_tensor: torch.Tensor, input_offsets: torch.Tensor,
 
     grid = (batch_size, num_kv_heads)
 
-    BLOCK_SIZE = 512
-    NUM_BINS = 1024
+    NUM_BINS = 512
     FINAL_SIZE = 512
 
     temp_values = torch.empty((num_kv_heads, batch_size, FINAL_SIZE),
@@ -1728,12 +1782,110 @@ def triton_topk(input_tensor: torch.Tensor, input_offsets: torch.Tensor,
         topk,
         total_input_tokens,
         total_output_tokens,
-        BLOCK_SIZE=BLOCK_SIZE,
         NUM_BINS=NUM_BINS,
         FINAL_SIZE=FINAL_SIZE,
     )
 
     return output_indices
+
+
+########################################################
+# Reduce scores generation kernel
+########################################################
+
+
+@triton.jit
+def rocket_reduce_scores_kernel(
+    input_ptr,
+    output_ptr,
+    cum_kt_lens_ptr,
+    batch_size,
+    num_kv_heads,
+    num_heads_per_kv,
+    total_kt_tokens,
+    BLOCK_SIZE: tl.constexpr,
+):
+    batch_idx = tl.program_id(0)
+    kv_head_idx = tl.program_id(1)
+
+    if batch_idx >= batch_size or kv_head_idx >= num_kv_heads:
+        return
+
+    # Get KT token boundaries for this batch
+    kt_start = tl.load(cum_kt_lens_ptr + batch_idx)
+    kt_end = tl.load(cum_kt_lens_ptr + batch_idx + 1)
+    kt_len = kt_end - kt_start
+
+    if kt_len <= 0:
+        return
+
+    # Process KT tokens in blocks
+    for kt_block_start in tl.range(0, kt_len, BLOCK_SIZE):
+        kt_offsets = kt_block_start + tl.arange(0, BLOCK_SIZE)
+        kt_mask = kt_offsets < kt_len
+        kt_global_offsets = kt_start + kt_offsets
+
+        # Accumulate over num_heads_per_kv
+        sum_vals = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+
+        for head_idx in range(num_heads_per_kv):
+            global_head_idx = kv_head_idx * num_heads_per_kv + head_idx
+
+            # Input indices: [global_head_idx, 1, kt_global_offsets]
+            input_indices = global_head_idx * total_kt_tokens + kt_global_offsets
+
+            values = tl.load(input_ptr + input_indices, mask=kt_mask, other=0.0)
+            sum_vals += values
+
+        # Compute mean
+        mean_vals = sum_vals / num_heads_per_kv
+
+        # Store output: [kv_head_idx, kt_global_offsets]
+        output_indices = kv_head_idx * total_kt_tokens + kt_global_offsets
+        tl.store(output_ptr + output_indices, mean_vals, mask=kt_mask)
+
+
+def triton_rocket_reduce_scores(
+    scores: torch.Tensor,
+    cum_kt_lens: torch.Tensor,
+    batch_size: int,
+    num_kv_heads: int,
+    num_heads_per_kv: int,
+) -> torch.Tensor:
+    """
+    Reduce scores for generation phase with batch-aware processing.
+
+    Args:
+        scores: Input scores [num_kv_heads * num_heads_per_kv, 1, total_kt_tokens]
+        cum_kt_lens: Cumulative KT lengths [batch_size + 1]
+        batch_size: Number of batches
+        num_kv_heads: Number of KV heads
+        num_heads_per_kv: Number of Q heads per KV head
+
+    Returns:
+        output: Reduced scores [num_kv_heads, total_kt_tokens]
+    """
+    total_kt_tokens = scores.shape[-1]
+
+    output = torch.empty((num_kv_heads, total_kt_tokens),
+                         dtype=torch.float32,
+                         device=scores.device)
+
+    BLOCK_SIZE = 256
+    grid = (batch_size, num_kv_heads)
+
+    rocket_reduce_scores_kernel[grid](
+        scores,
+        output,
+        cum_kt_lens,
+        batch_size,
+        num_kv_heads,
+        num_heads_per_kv,
+        total_kt_tokens,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+    return output
 
 
 ########################################################
