@@ -9,19 +9,17 @@ apt-get update
 
 # https://kvcache-ai.github.io/Mooncake/getting_started/build.html
 # libboost-all-dev is removed because it will install a duplicated MPI library
+# triton also installed boost so the requirement is already met
 apt-get install -y --no-install-recommends \
     build-essential \
-    cmake \
     libibverbs-dev \
     libgoogle-glog-dev \
     libgtest-dev \
     libjsoncpp-dev \
     libnuma-dev \
     libunwind-dev \
-    libpython3-dev \
     libssl-dev \
     libyaml-cpp-dev \
-    pybind11-dev \
     libcurl4-openssl-dev \
     libhiredis-dev \
     pkg-config \
