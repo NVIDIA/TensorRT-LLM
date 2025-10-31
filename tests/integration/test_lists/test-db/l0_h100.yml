@@ -65,9 +65,7 @@ l0_h100:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_fp8[latency-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_dummy_load_format
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[enable_chunked_prefill=False-eagle3_one_model=False]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[enable_chunked_prefill=True-eagle3_one_model=True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[enable_chunked_prefill=False-eagle3_one_model=True]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[enable_chunked_prefill=True-eagle3_one_model=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_cuda_graph_padding[mtp_nextn=0]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_cuda_graph_padding[mtp_nextn=2]
   - test_e2e.py::test_trtllm_bench_pytorch_backend_sanity[meta-llama/Llama-3.1-8B-llama-3.1-8b-False-False]
@@ -102,6 +100,10 @@ l0_h100:
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[True-1]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[False]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[True]
+  # ------------- Feature Combination tests ---------------
+  - accuracy/test_feature_combination.py::TestChunkedPrefill::test_eagle3_one_model
+  - accuracy/test_feature_combination.py::TestChunkedPrefill::test_eagle3_two_model
+  - accuracy/test_feature_combination.py::TestChunkedPrefill::test_kvcache_reuse
 - condition:
     ranges:
       system_gpu_count:
