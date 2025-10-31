@@ -422,7 +422,7 @@ class TRTLLMGenFusedMoE(MoE):
                     payloads,
                     runtime_max_tokens_per_rank,
                     invalid_token_expert_id=
-                    -1,  # Note Cutlass MoE uses num_experts as invalid token expert id
+                    -1,  # Caution: TRTLLM-Gen uses -1 as invalid token expert id
                     expert_id_payload_index=expert_id_payload_index,
                 )
 

@@ -459,7 +459,8 @@ class CutlassFusedMoE(MoE):
                 recv_buffers = self.moe_a2a.dispatch(
                     token_selected_experts,
                     payloads,
-                    invalid_token_expert_id=self.num_experts,
+                    invalid_token_expert_id=self.
+                    num_slots,  # Caution: Cutlass MoE uses num_slots as invalid token expert id
                     expert_id_payload_index=expert_id_payload_index,
                 )
 
