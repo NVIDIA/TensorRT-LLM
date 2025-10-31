@@ -86,10 +86,13 @@ void moePermute(InputType const* input, InputType* permuted_input, SFType const*
     template void moePermute<InputType, SFType>(InputType const* input, InputType* permuted_input,                     \
         SFType const* input_sf, SFType* permuted_sf, int32_t const* permuted_idx_to_expanded_idx,                      \
         int32_t const* num_non_exiting_tiles, int32_t const hidden_size, int32_t const top_k, int32_t const tile_size, \
-        cudaStream_t stream);
+        cudaStream_t stream)
 
 INSTANTIATE_MOE_PERMUTE(half, uint8_t);
 #ifdef ENABLE_BF16
 INSTANTIATE_MOE_PERMUTE(__nv_bfloat16, uint8_t);
+#endif
+#ifdef ENABLE_FP8
+INSTANTIATE_MOE_PERMUTE(__nv_fp8_e4m3, uint8_t);
 #endif
 } // namespace tensorrt_llm::kernels::cute_dsl

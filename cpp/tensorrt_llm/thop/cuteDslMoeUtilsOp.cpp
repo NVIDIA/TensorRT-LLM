@@ -132,28 +132,35 @@ std::vector<torch::Tensor> moe_permute(torch::Tensor const& input, torch::Tensor
     int64_t const hidden_size = input.size(1);
     int64_t const num_permuted_tokens = permuted_idx_to_expanded_idx.size(0);
 
-    uint8_t const* input_sf_ptr = nullptr;
-    uint8_t* permuted_sf_ptr = nullptr;
+    void* input_sf_ptr = nullptr;
+    void* permuted_sf_ptr = nullptr;
 
     auto permuted_input
         = torch::empty({num_permuted_tokens, hidden_size}, torch::dtype(input.scalar_type()).device(torch::kCUDA));
 
     auto const& stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
+#define DISPATCH_MOE_PERMUTE(InputType, SFType)                                                                        \
+    tensorrt_llm::kernels::cute_dsl::moePermute<InputType, SFType>(static_cast<InputType*>(input.data_ptr()),          \
+        static_cast<InputType*>(permuted_input.data_ptr()), static_cast<SFType*>(input_sf_ptr),                        \
+        static_cast<SFType*>(permuted_sf_ptr), permuted_idx_to_expanded_idx.data_ptr<int32_t>(),                       \
+        num_non_exiting_tiles.data_ptr<int32_t>(), hidden_size, top_k, tile_tokens_dim, stream)
+
     if (input.scalar_type() == torch::kBFloat16)
     {
-        tensorrt_llm::kernels::cute_dsl::moePermute<__nv_bfloat16, uint8_t>(
-            static_cast<__nv_bfloat16*>(input.data_ptr()), static_cast<__nv_bfloat16*>(permuted_input.data_ptr()),
-            input_sf_ptr, permuted_sf_ptr, permuted_idx_to_expanded_idx.data_ptr<int32_t>(),
-            num_non_exiting_tiles.data_ptr<int32_t>(), hidden_size, top_k, tile_tokens_dim, stream);
+        DISPATCH_MOE_PERMUTE(__nv_bfloat16, uint8_t);
     }
     else if (input.scalar_type() == torch::kHalf)
     {
-        tensorrt_llm::kernels::cute_dsl::moePermute<half, uint8_t>(static_cast<half*>(input.data_ptr()),
-            static_cast<half*>(permuted_input.data_ptr()), input_sf_ptr, permuted_sf_ptr,
-            permuted_idx_to_expanded_idx.data_ptr<int32_t>(), num_non_exiting_tiles.data_ptr<int32_t>(), hidden_size,
-            top_k, tile_tokens_dim, stream);
+        DISPATCH_MOE_PERMUTE(half, uint8_t);
     }
+    else if (input.scalar_type() == torch::kFloat8_e4m3fn)
+    {
+        DISPATCH_MOE_PERMUTE(__nv_fp8_e4m3, uint8_t);
+    }
+
+#undef DISPATCH_MOE_PERMUTE
+
     return {permuted_input};
 }
 
