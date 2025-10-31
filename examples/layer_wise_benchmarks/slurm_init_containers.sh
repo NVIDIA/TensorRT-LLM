@@ -22,6 +22,7 @@ if [ "${CONTAINER_IMAGE:-}" == "" ]; then
         DOCKER_IMAGE=$LLM_SBSA_DOCKER_IMAGE
     else
         echo "Unsupported machine hardware name \"$MACHINE\""
+        exit 1
     fi
 
     # Change "urm.nvidia.com/sw-tensorrt-docker/..." to "urm.nvidia.com#sw-tensorrt-docker/..." to bypass credentials
