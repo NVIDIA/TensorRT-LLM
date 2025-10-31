@@ -1622,9 +1622,8 @@ void gemm_dispatch_sm89(void* mat_a, void* mat_b, void* mat_d, float* scales_a, 
     dim3 grid = dim3(grid_m, grid_n, grid_k);
     dim3 block = dim3(kThreadCount, 1, 1);
 
-    cudaFuncSetAttribute(ada_blockwise_gemm::sm89_fp8_gemm_1d1d_impl<GemmKernel>,
+    auto result = cudaFuncSetAttribute(ada_blockwise_gemm::sm89_fp8_gemm_1d1d_impl<GemmKernel>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize);
-    auto result = cudaGetLastError();
     TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm89 gemm kernel cannot launch: %s", cudaGetErrorString(result));
 
     ada_blockwise_gemm::sm89_fp8_gemm_1d1d_impl<GemmKernel>
