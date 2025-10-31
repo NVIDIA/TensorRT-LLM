@@ -456,6 +456,7 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
         layer_idx=0,
         dtype=scenario.dtype,
         config=config,
+        enable_unit_test=True,
     ).cuda()
     # above should have the same config as the reference MLA except for the mapping
     # we update the weights accordingly and should be able to load them
@@ -678,6 +679,7 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario,
         pos_embd_params=pos_embd_params,
         layer_idx=0,
         dtype=scenario.dtype,
+        enable_unit_test=True,
     ).cuda()
     _generate_random_weights(mla)
     weights = mla.state_dict()
