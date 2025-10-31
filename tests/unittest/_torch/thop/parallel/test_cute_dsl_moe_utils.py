@@ -7,15 +7,15 @@ import tensorrt_llm  # noqa
 @pytest.mark.parametrize("tile_size", [64, 128, 256])
 @pytest.mark.parametrize("top_k", [1, 2, 8])
 @pytest.mark.parametrize("num_tokens", [128, 515, 1024])
-@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16", "float8_e4m3fn"])
 def test_moe_permute(dtype: str, num_tokens: int, top_k: int, tile_size: int):
     dtype = getattr(torch, dtype)
     hidden_size = 4096
     num_experts = 256
-    x = torch.randint(0,
+    x = torch.randint(-100,
                       100, (num_tokens, hidden_size),
-                      dtype=dtype,
-                      device="cuda")
+                      dtype=torch.int32,
+                      device="cuda").to(dtype)
 
     num_permuted_tokens = num_tokens * top_k + (tile_size - 1) * num_experts
     permuted_idx_to_expanded_idx = torch.randint(0,
