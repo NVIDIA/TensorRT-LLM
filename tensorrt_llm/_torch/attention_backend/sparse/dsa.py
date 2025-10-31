@@ -630,6 +630,9 @@ class Indexer(nn.Module):
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
+        # Lazy compilation for weight_scale
+        self._weight_scale_compiled = None
+
     @staticmethod
     def load_weights_to_kv_a(fused_a: torch.Tensor, weights: dict,
                              names: list) -> torch.Tensor:
@@ -1118,6 +1121,16 @@ class Indexer(nn.Module):
 
         return topk_indices_buffer
 
+    def weight_scale(self, hidden_states: torch.Tensor,
+                     indexer_weights: Optional[torch.Tensor],
+                     q_scale: torch.Tensor) -> torch.Tensor:
+        weights = indexer_weights if indexer_weights is not None else self.weights_proj(
+            hidden_states)
+        weights = weights.unsqueeze(
+            -1) * q_scale * self.softmax_scale * self.n_heads**-0.5
+        weights = weights.squeeze(-1).to(torch.float32)
+        return weights
+
     @torch.inference_mode()
     def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
                 metadata: DSAtrtllmAttentionMetadata,
@@ -1147,47 +1160,56 @@ class Indexer(nn.Module):
 
         # q/k rope + possible fast_hadamard_transform
         q = q.view(-1, self.n_heads, self.head_dim)
-        q_pe, q_nope = torch.split(
-            q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
-        k_pe, k_nope = torch.split(
-            k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
-        q_pe, k_pe = self.rotary_emb(position_ids, [q_pe, k_pe.unsqueeze(1)])
-        q = torch.cat([q_pe, q_nope], dim=-1)
-        k = torch.cat([k_pe[:, 0, :], k_nope], dim=-1)
 
         q, k = maybe_execute_in_parallel(
-            lambda: rotate_activation(q),
-            lambda: rotate_activation(k),
+            lambda: torch.split(
+                q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1),
+            lambda: torch.split(
+                k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1),
             self.ln_events[0],
             self.ln_events[1],
             self.aux_stream,
         )
-        # dyn q/k quant
-        q = q.view(-1, self.head_dim)
+
+        q_pe, q_nope = q
+        k_pe, k_nope = k
+        q_pe, k_pe = self.rotary_emb(position_ids, [q_pe, k_pe.unsqueeze(1)])
+
+        k_pe = k_pe[:, 0, :]
+
+        def _prep_q_or_k(qk_pe, qk_nope):
+            q_or_k = torch.cat([qk_pe, qk_nope], dim=-1)
+            q_or_k = rotate_activation(q_or_k)
+            q_or_k = q_or_k.view(-1, self.head_dim)
+            q_or_k = fp8_utils.fp8_quantize_1x128_sf_transpose(
+                q_or_k, use_ue8m0=self.scale_fmt == "ue8m0")
+            return q_or_k
+
         q, k = maybe_execute_in_parallel(
-            lambda: fp8_utils.fp8_quantize_1x128_sf_transpose(
-                q, use_ue8m0=self.scale_fmt == "ue8m0"),
-            lambda: fp8_utils.fp8_quantize_1x128_sf_transpose(
-                k, use_ue8m0=self.scale_fmt == "ue8m0"),
+            lambda: _prep_q_or_k(q_pe, q_nope),
+            lambda: _prep_q_or_k(k_pe, k_nope),
             self.ln_events[0],
             self.ln_events[1],
             self.aux_stream,
         )
+
         q_fp8, q_scale = q
         k_fp8, k_scale = k
         q_fp8 = q_fp8.view(-1, self.n_heads, self.head_dim)
         q_scale = q_scale.view(-1, self.n_heads, 1)
 
         # indexer weight scaling
-        weights = indexer_weights if indexer_weights is not None else self.weights_proj(
-            hidden_states)
-        weights = weights.unsqueeze(
-            -1) * q_scale * self.softmax_scale * self.n_heads**-0.5
-        weights = weights.squeeze(-1)
+        # Lazy compilation on first call
+        if self._weight_scale_compiled is None:
+            self._weight_scale_compiled = torch.compile(self.weight_scale,
+                                                        mode="max-autotune",
+                                                        dynamic=True)
+        weights = self._weight_scale_compiled(hidden_states, indexer_weights,
+                                              q_scale)
 
         # Return topk indices buffer for sparse attention [num_tokens, index_topk]
         return self.sparse_attn_indexer(metadata, hidden_states, q_fp8, k_fp8,
-                                        k_scale, weights.to(torch.float32))
+                                        k_scale, weights)
 
 
 class DSATrtllmAttention(TrtllmAttention):
