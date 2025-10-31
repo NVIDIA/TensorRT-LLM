@@ -34,15 +34,18 @@ class TRT_Exporter(object):
                              *self.latent_shape).cuda()
         self.pytorch_model.cuda().eval()
         with torch.inference_mode():
-            torch.onnx.export(self.pytorch_model,
-                              latent,
-                              onnxFile,
-                              opset_version=17,
-                              input_names=['input'],
-                              output_names=['output'],
-                              dynamic_axes={'input': {
-                                  0: 'batch'
-                              }})
+            torch.onnx.export(
+                self.pytorch_model,
+                latent,
+                onnxFile,
+                opset_version=17,
+                input_names=['input'],
+                output_names=['output'],
+                dynamic_axes={'input': {
+                    0: 'batch'
+                }},
+                # Required for pytorch>=2.9.0 as dynamo becomes the default and introduces bugs as it does not support opset_version=17 natively
+                dynamo=False)
 
     def generate_trt_engine(self, onnxFile, planFile):
         print(f"Start exporting TRT model to {planFile}!")
