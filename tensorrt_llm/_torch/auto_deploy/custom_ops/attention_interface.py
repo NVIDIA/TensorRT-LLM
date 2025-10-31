@@ -576,6 +576,7 @@ class SequenceInfo:
             else:
                 self._extra_args[name] = None
 
+    @nvtx_range("ad_get_unique_value")
     def _get_unique_value(self, occupied: Sequence[int], max_val: int) -> int:
         """Get un unoccupied value from the range indicated by max_val.
 
