@@ -53,14 +53,12 @@ def test_async(prompt, proposer_worker):
             prototype_controller,
             {NativeGenerationController.WorkerTag.GENERATION: proposer_worker},
         )
-        i = 0
 
+        step = 0
         async for result in llm.generate_async(prompt):
-            i += 1
-            print(">>>", i, result)
-            async for output in result.cur_output:
-                print(">>>", i, len(output.outputs[0].token_ids), "\n",
-                      output.outputs[0].text)
+            step += 1
+            print(">>>", step, len(result.outputs[0].token_ids), "\n",
+                  result.outputs[0].text)
         print(f">>> final output {len(result.outputs[0].token_ids)}\n",
               result.outputs[0].text)
 

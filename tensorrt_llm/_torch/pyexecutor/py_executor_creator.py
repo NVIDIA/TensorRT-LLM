@@ -14,9 +14,9 @@ from strenum import StrEnum
 import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._utils import get_sm_version, mpi_disabled
-from tensorrt_llm.bindings.executor import GuidedDecodingConfig
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
-                                          ContextChunkingPolicy, LoadFormat,
+                                          ContextChunkingPolicy,
+                                          GuidedDecodingConfig, LoadFormat,
                                           TorchLlmArgs)
 from tensorrt_llm.llmapi.tokenizer import (TokenizerBase,
                                            _llguidance_tokenizer_info,
