@@ -34,8 +34,8 @@ l0_dgx_h200:
   - accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype[False]
   - accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype[True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_bf16_4gpu[tp4ep4_cudagraph_overlap]
-  - disaggregated/test_disaggregated.py::test_disaggregated_ctxtp2pp2_gentp2pp2[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp4_genpp4[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated_parametrized.py::test_disagg[1ctx_tp2pp2_1gen_tp2pp2]
+  - disaggregated/test_disaggregated_parametrized.py::test_disagg[1ctx_tp1pp4_1gen_tp1pp4]
   - unittest/llmapi/test_llm_pytorch.py::test_nemotron_nas_lora
 - condition:
     ranges:
@@ -122,10 +122,10 @@ l0_dgx_h200:
   - test_e2e.py::test_trtllm_bench_llmapi_launch[pytorch_backend-llama-v3-llama3-8b]
   - test_e2e.py::test_trtllm_bench_mgmn
   - unittest/_torch/multi_gpu -m "post_merge" TIMEOUT (90)
-  - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[DeepSeek-V3-Lite-bf16]
-  - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[llama-v3-8b-hf]
-  - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[llama-3.1-8b-instruct-hf-fp8]
-  - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[DeepSeek-V3-Lite-fp8]
+  - disaggregated/test_disaggregated_benchmark.py::test_disaggregated_benchmark_on_diff_backends[DeepSeek-V3-Lite-bf16]
+  - disaggregated/test_disaggregated_benchmark.py::test_disaggregated_benchmark_on_diff_backends[llama-v3-8b-hf]
+  - disaggregated/test_disaggregated_benchmark.py::test_disaggregated_benchmark_on_diff_backends[llama-3.1-8b-instruct-hf-fp8]
+  - disaggregated/test_disaggregated_benchmark.py::test_disaggregated_benchmark_on_diff_backends[DeepSeek-V3-Lite-fp8]
   # ------------- AutoDeploy tests ---------------
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[False-4]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_bf16
