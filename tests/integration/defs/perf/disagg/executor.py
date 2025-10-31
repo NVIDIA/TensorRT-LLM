@@ -326,6 +326,36 @@ class JobManager:
         return sorted(files)
 
     @staticmethod
+    def _print_logs_to_console(job_id: str, result_dir: str) -> None:
+        """
+        Print SLURM log and all .log/.yaml files in result_dir to console
+        
+        Args:
+            job_id: SLURM job ID for finding the slurm log file
+            result_dir: Result directory containing log and config files
+        """
+        # Print the slurm log to console
+        slurm_log_writer = LogWritter(EnvManager.get_work_dir())
+        slurm_log_writer.print_to_console(f"slurm-{job_id}.out")
+        
+        # Print all .log and .yaml files in result_dir (except output_server.log)
+        log_writer = LogWritter(result_dir)
+        files_to_print = []
+        if os.path.exists(result_dir):
+            for file in os.listdir(result_dir):
+                if (file.endswith('.log') or file.endswith('.yaml')) and file != 'output_server.log':
+                    files_to_print.append(file)
+        
+        # Sort files for consistent output order
+        files_to_print.sort()
+
+        for file in files_to_print:
+            if os.path.exists(os.path.join(result_dir, file)):
+                log_writer.print_to_console(file)
+            else:
+                print(f"   ⚠️  {file} not found: {file}")
+
+    @staticmethod
     def _check_job_result(job_id: str, benchmark_type: str, config: dict, 
                          metrics_config, model_name: str, 
                          result_dir: str, 
@@ -350,19 +380,8 @@ class JobManager:
         result = {"job_id": job_id, "status": "UNKNOWN", "success": False}
         print(f"   📁 Checking result directory: {result_dir}")
         
-        # Print the slurm log to console
-        slurm_log_writer = LogWritter(EnvManager.get_work_dir())
-        slurm_log_writer.print_to_console(f"slurm-{job_id}.out")
-        
-        # Print the metrics log file specified in metrics_config and ctx_config.yaml, gen_config.yaml
-        log_writer = LogWritter(result_dir)
-        files_to_print = ["ctx_config.yaml", "gen_config.yaml", metrics_config.log_file]
-
-        for file in files_to_print:
-            if os.path.exists(os.path.join(result_dir, file)):
-                log_writer.print_to_console(file)
-            else:
-                print(f"   ⚠️  {file} not found: {file}")
+        # Print logs and config files to console
+        JobManager._print_logs_to_console(job_id, result_dir)
         
         # Parse using metrics config
         log_parser = LogParser(benchmark_type, config, metrics_config, result_dir)
