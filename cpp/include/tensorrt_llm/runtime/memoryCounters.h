@@ -21,6 +21,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <limits>
 #include <string>
 
 namespace tensorrt_llm::runtime
