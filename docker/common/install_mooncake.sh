@@ -5,7 +5,7 @@ MOONCAKE_VERSION="v0.3.6.post1"
 MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
 MOONCAKE_INSTALL_PATH="/usr/local/Mooncake"
 
-sudo apt-get update
+apt-get update
 
 # https://kvcache-ai.github.io/Mooncake/getting_started/build.html
 # libboost-all-dev is removed because it will install a duplicated MPI library
