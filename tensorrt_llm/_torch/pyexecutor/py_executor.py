@@ -208,8 +208,8 @@ class PyExecutor:
             self.llm_args.attention_dp_config is not None
             and self.llm_args.attention_dp_config.enable_balance)
         if self.attention_dp_enable_balance:
-            self.attention_dp_time_out_iters = self.llm_args.attention_dp_config.attention_dp_time_out_iters
-            self.attention_dp_batching_wait_iters = self.llm_args.attention_dp_config.attention_dp_batching_wait_iters
+            self.attention_dp_time_out_iters = self.llm_args.attention_dp_config.timeout_iters
+            self.attention_dp_batching_wait_iters = self.llm_args.attention_dp_config.batching_wait_iters
         self.batch_wait_timeout_ms = self.llm_args.batch_wait_timeout_ms
         self.batch_wait_timeout_iters = self.llm_args.batch_wait_timeout_iters
         self.batch_wait_max_tokens_ratio = self.llm_args.batch_wait_max_tokens_ratio
