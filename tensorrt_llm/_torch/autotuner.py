@@ -95,12 +95,15 @@ class TuningConfig:
             If not provided, the autotuner will not consider the max num tokens.
         inputs_pre_hook (Callable): A function that takes a list of input tensors, returns a list of modified input tensors.
             It is called before the input tensors are prepared for the tuning process to match the real data distribution.
+        use_cold_l2_cache (bool): Whether to use cold L2 cache.
+            This flag is to create circular buffer of input tensors to avoid L2 cache hits to simulate cold L2 cache.
+            Notice that not all tuning processes can benefit from this feature.
     """
     dynamic_tensor_specs: Tuple[DynamicTensorSpec, ...] = ()
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
     tune_max_num_tokens: int = None
     inputs_pre_hook: Callable = None
-    use_cold_l2_cache: bool = True
+    use_cold_l2_cache: bool = False
 
 
 @dataclass(unsafe_hash=True)
@@ -748,7 +751,7 @@ class AutoTuner:
                     self.stats.tuned_op_successful_configs[
                         custom_op] = self.stats.tuned_op_successful_configs.get(
                             custom_op, 0) + 1
-                    logger.info(
+                    logger.debug(
                         f"[Autotuner] Profiling runner={runners[best_runner_id]}, tactic={best_tactic} for cache_key={cache_key}."
                     )
                 else:
@@ -1092,7 +1095,7 @@ class AutoTuner:
             input.element_size() if isinstance(input, torch.Tensor) else 0
             for input in inputs)
         if one_buffer_bytes <= 0:
-            logger.info(
+            logger.debug(
                 "[Autotuner] No tensor inputs or zero-sized tensors; falling back to single-batch profiling."
             )
             return [inputs]
@@ -1107,7 +1110,7 @@ class AutoTuner:
                 list(t.clone() if isinstance(t, torch.Tensor) else t
                      for t in inputs))
 
-        logger.info(
+        logger.debug(
             f"[Autotuner] use_cold_l2_cache={tuning_config.use_cold_l2_cache}, use {num_buffers} different tensors for profiling"
         )
         return inputs_list
