@@ -6,7 +6,11 @@ cd /lustre/fsw/portfolios/coreai/users/fredricz/tensorrt_llm/tests/integration/d
 
 source ./perf/disagg/envs/.env_oci
 
+# Local test cases collect
+export WORK_DIR="/mnt/c/code/TensorRT-LLM/tests/integration/defs/perf/disagg"
+export OUTPUT_PATH=/mnt/c/code/TensorRT-LLM/tests/integration/defs/perf/disagg/output
 poetry run pytest --disagg --collect-only -q &> testlist_h100.txt
+
 
 # run with test list file
 poetry run pytest --disagg test_disagg.py -s -vv --test-list=./testlist/testlist_gb200_debug.txt
