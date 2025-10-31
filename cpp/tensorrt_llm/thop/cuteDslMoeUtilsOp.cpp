@@ -134,6 +134,8 @@ std::tuple<torch::Tensor, torch::optional<torch::Tensor>> moe_permute(torch::Ten
 {
     int64_t const hidden_size = input.scalar_type() == torch::kFloat4_e2m1fn_x2 ? input.size(1) * 2 : input.size(1);
     int64_t const num_permuted_tokens = permuted_idx_to_expanded_idx.size(0);
+    TORCH_CHECK(
+        num_permuted_tokens % tile_tokens_dim == 0, "num_permuted_tokens must be divisible by tile_tokens_dim.");
 
     auto permuted_input
         = torch::empty({num_permuted_tokens, input.size(1)}, torch::dtype(input.scalar_type()).device(torch::kCUDA));
@@ -146,7 +148,7 @@ std::tuple<torch::Tensor, torch::optional<torch::Tensor>> moe_permute(torch::Ten
         TORCH_CHECK(input_sf.has_value(), "input_sf is required for NVFP4.");
         input_sf_ptr = input_sf->data_ptr();
         int64_t constexpr kSFVecSize = 16;
-        permuted_sf = torch::empty({num_permuted_tokens, hidden_size / kSFVecSize},
+        permuted_sf = torch::empty({num_permuted_tokens * hidden_size / kSFVecSize},
             torch::dtype(input_sf->scalar_type()).device(torch::kCUDA));
         permuted_sf_ptr = permuted_sf->data_ptr();
     }

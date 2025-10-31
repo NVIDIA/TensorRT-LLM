@@ -18,6 +18,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/cuteDslKernels/moeUtils.h"
+#include "tensorrt_llm/kernels/quantization.cuh"
 
 #include <cuda_fp4.h>
 #include <cute/numeric/numeric_types.hpp>
@@ -74,9 +75,8 @@ __global__ void moePermuteKernel(InputType const* input, InputType* permuted_inp
         }
         int32_t const token_idx = expanded_idx / top_k;
 
-        auto const* src_ptr = reinterpret_cast<ElemCopyType const*>(input) + hidden_size * token_idx / kElemPerCopy;
-        auto* dst_ptr = reinterpret_cast<ElemCopyType*>(permuted_input) + hidden_size * permuted_idx / kElemPerCopy;
-
+        auto const* src_ptr = reinterpret_cast<ElemCopyType const*>(input) + token_idx * hidden_size / kElemPerCopy;
+        auto* dst_ptr = reinterpret_cast<ElemCopyType*>(permuted_input) + permuted_idx * hidden_size / kElemPerCopy;
         for (int32_t i = threadIdx.x; i < hidden_size / kElemPerCopy; i += kThreadsPerBlock)
         {
             dst_ptr[i] = src_ptr[i];
@@ -85,13 +85,18 @@ __global__ void moePermuteKernel(InputType const* input, InputType* permuted_inp
 #ifdef ENABLE_FP4
         if constexpr (std::is_same_v<InputType, __nv_fp4_e2m1>)
         {
-            auto const* sf_src_ptr = reinterpret_cast<SFCopyType const*>(input_sf)
-                + hidden_size * token_idx / (kSFVecSize * kSFElemPerCopy);
-            auto* sf_dst_ptr = reinterpret_cast<SFCopyType*>(permuted_sf)
-                + hidden_size * permuted_idx / (kSFVecSize * kSFElemPerCopy);
-            for (int32_t i = threadIdx.x; i < hidden_size / (kSFVecSize * kSFElemPerCopy); i += kThreadsPerBlock)
+            int32_t const sf_hidden_size = hidden_size / kSFVecSize;
+            auto const* sf_src_ptr = reinterpret_cast<SFCopyType const*>(input_sf);
+            auto* sf_dst_ptr = reinterpret_cast<SFCopyType*>(permuted_sf);
+            for (int32_t i = threadIdx.x; i < sf_hidden_size / kSFElemPerCopy; i += kThreadsPerBlock)
             {
-                sf_dst_ptr[i] = sf_src_ptr[i];
+                // input_sf is not swizzled, while permuted_sf is swizzled.
+                int32_t const src_offset = token_idx * sf_hidden_size / kSFElemPerCopy + i;
+                int32_t const dst_offset = get_sf_out_offset_128x4(/* batchIdx= */ std::nullopt, permuted_idx,
+                                               i * kSFElemPerCopy, /* numRows= */ std::nullopt, sf_hidden_size)
+                    / kSFElemPerCopy;
+
+                sf_dst_ptr[dst_offset] = sf_src_ptr[src_offset];
             }
         }
 #endif
