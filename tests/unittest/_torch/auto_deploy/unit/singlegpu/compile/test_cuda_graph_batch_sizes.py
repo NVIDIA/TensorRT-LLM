@@ -145,7 +145,6 @@ class TestCudaGraphBatchSizes:
         assert captured_graph.cuda_graph_max_batch_size == max(cuda_graph_batch_sizes)
         assert captured_graph.cuda_graph_batch_sizes == sorted(cuda_graph_batch_sizes, reverse=True)
 
-    @pytest.mark.skip(reason="https://nvbugs/5606166")
     def test_forward_fallback_for_oversized_batch(self, simple_model_and_inputs):
         """Test that forward method falls back to regular execution for oversized batches."""
         data = simple_model_and_inputs
