@@ -535,23 +535,31 @@ def get_numa_aware_cpu_affinity(device_id):
     # Determine how large our cpu set array from NVML needs to be
     cpu_set_size = math.ceil(cpu_count / c_ulong_bits)
 
-    # initialize NVML
-    import pynvml
-    pynvml.nvmlInit()
+    # If we hit an exception, default to unconstrained CPU affinity
+    cpu_affinity = list(range(cpu_count))
 
-    # Get the Ideal CPU affinity for this device
-    handle = pynvml.nvmlDeviceGetHandleByIndex(device_id)
-    affinity_masks = pynvml.nvmlDeviceGetCpuAffinity(handle, cpu_set_size)
+    try:
+        # initialize NVML
+        import pynvml
+        pynvml.nvmlInit()
 
-    # Convert CPU masks to python list
-    cpu_affinity = []
-    for cpu_id in range(cpu_count):
-        mask_array_index = cpu_id // c_ulong_bits
-        mask_bit_index = cpu_id % c_ulong_bits
-        if affinity_masks[mask_array_index] & (1 << mask_bit_index):
-            cpu_affinity.append(cpu_id)
+        # Get the optimal CPU affinity for this device according to the NUMA
+        # topology
+        handle = pynvml.nvmlDeviceGetHandleByIndex(device_id)
+        affinity_masks = pynvml.nvmlDeviceGetCpuAffinity(handle, cpu_set_size)
 
-    pynvml.nvmlShutdown()
+        # Convert CPU masks to python list
+        cpu_affinity = []
+        for cpu_id in range(cpu_count):
+            mask_array_index = cpu_id // c_ulong_bits
+            mask_bit_index = cpu_id % c_ulong_bits
+            if affinity_masks[mask_array_index] & (1 << mask_bit_index):
+                cpu_affinity.append(cpu_id)
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except:
+            pass  # Ignore shutdown errors
 
     return cpu_affinity
 
