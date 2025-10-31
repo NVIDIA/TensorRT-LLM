@@ -543,6 +543,7 @@ class TestLlama(unittest.TestCase):
             is_spec_dec_tree=is_spec_dec_tree,
             max_draft_len=max_total_draft_tokens,
             max_total_draft_tokens=max_total_draft_tokens,
+            model_is_wrapped=False,
             spec_decoding_tensor=spec_decoding_tensor,
         )
 
@@ -590,7 +591,8 @@ class TestLlama(unittest.TestCase):
             is_spec_dec_tree=is_spec_dec_tree,
             is_spec_dec_dynamic_tree=False,
             max_draft_len=gen_input_ids_1.size(-1) - 1,
-            max_total_draft_tokens=gen_input_ids_1.size(-1) - 1)
+            max_total_draft_tokens=gen_input_ids_1.size(-1) - 1,
+            model_is_wrapped=False)
 
         gen_position_ids_1 = [
             torch.full(
@@ -637,7 +639,7 @@ class TestLlama(unittest.TestCase):
             is_spec_dec_dynamic_tree=False,
             max_draft_len=gen_input_ids_ref.size(-1) - 1,
             max_total_draft_tokens=gen_input_ids_ref.size(-1) - 1,
-        )
+            model_is_wrapped=False)
 
         gen_position_ids_ref = [
             torch.full((gen_input_ids_ref.size(-1), ),

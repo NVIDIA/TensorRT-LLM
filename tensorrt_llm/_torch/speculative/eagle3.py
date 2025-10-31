@@ -205,19 +205,23 @@ class Eagle3SpecMetadata(SpecMetadata):
                 accepted_path = self.request_accepted_path[req_id]
 
                 if accepted_path == []:
-                    # This is a context request. We need to read all the hidden states.
+                    # Case 1: This is a context request, We need to read all the hidden states.
+                    # Case 2: This is a generation request, but no accepted tokens are accepted. Actually only the first token's hidden states is needed. The others are just padding tokens.
                     hidden_states_read_indices.extend(
                         list(range(start_idx, start_idx + seq_len)))
                 else:
-                    # This is a generation request. We only read the accepted tokens' hidden states.
-                    assert len(
-                        accepted_path
-                    ) + 1 == seq_len, f"Accepted path length + 1 ({len(accepted_path) + 1}) is not equal to sequence length ({seq_len})"
+                    # This is a generation request. And there are draft tokens accepted.
+                    # We only read the accepted tokens' hidden states.
                     accepted_path = [0] + accepted_path  # add the root node
+                    accepted_path_pad = accepted_path + [0] * (
+                        seq_len - len(accepted_path))
+                    assert len(accepted_path_pad) == seq_len
                     hidden_states_read_indices.extend([
                         start_idx + accepted_draft_token_offset
-                        for accepted_draft_token_offset in accepted_path
+                        # for accepted_draft_token_offset in accepted_path
+                        for accepted_draft_token_offset in accepted_path_pad
                     ])
+
                 # For the write indices, we just write all the hidden states.
                 hidden_states_write_indices.extend(
                     list(range(start_idx, start_idx + seq_len)))

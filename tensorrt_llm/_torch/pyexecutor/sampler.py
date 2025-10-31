@@ -874,9 +874,7 @@ class TorchSampler(Sampler):
                     longest_accepted_len = cur_accepted_len
                     longest_match_path_idx = path_idx
 
-            request.py_num_accepted_draft_tokens_indices = list(
-                range(1, spec_tree_manager.max_draft_len + 1)
-            )
+            request.py_num_accepted_draft_tokens_indices = []
             if longest_accepted_len == 0:
                 # No draft tokens are accepted.
                 # Take the top-1 token of the first layer as the next new token.
@@ -893,9 +891,9 @@ class TorchSampler(Sampler):
                     ):
                         break
 
-                request.py_num_accepted_draft_tokens_indices[: num_accepted_draft_tokens - 1] = (
-                    eagle_paths[longest_match_path_idx][1:longest_accepted_len]
-                )  # exclude the root node
+                request.py_num_accepted_draft_tokens_indices = eagle_paths[longest_match_path_idx][
+                    1:longest_accepted_len
+                ].tolist()  # exclude the root node
                 return num_accepted_draft_tokens - 1
 
     @torch.inference_mode()

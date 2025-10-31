@@ -1073,7 +1073,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         is_spec_dec_dynamic_tree,
         max_draft_len,
         max_total_draft_tokens,
-        model_is_wrapped: Optional[bool] = False,
+        model_is_wrapped: bool = False,
         spec_metadata: Optional['SpecMetadata'] = None,
         spec_tree_manager: Optional['SpecTreeManager'] = None,
         spec_decoding_tensor: Optional['SpecDecodingTensor'] = None,
@@ -1143,8 +1143,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 device='cuda',
             )
 
-            is_target_model = not spec_metadata.is_draft_model if hasattr(
-                spec_metadata, 'is_draft_model') else False
+            is_target_model = not getattr(spec_metadata, 'is_draft_model',
+                                          False)
 
             # Case 1: dynamic tree
             if self.is_spec_dec_tree and self.is_spec_dec_dynamic_tree:
@@ -1210,6 +1210,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
             # Case 4: linear tree
             else:
+                assert max_draft_len == max_total_draft_tokens, "max_draft_len should be equal to max_total_draft_tokens for linear tree"
                 # Prepare for the linear-tree.
                 # Populate the mask that won't change during inference phase.
                 self.generate_spec_decoding_position_offsets(
@@ -1229,12 +1230,16 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                                                   non_blocking=True)
 
     def generate_spec_decoding_packed_mask(self, max_draft_len):
-        # FIXME: remove this limitation
-        assert max_draft_len < 32, "max_draft_len should be less than 32, will be fixed later"
-        dummy_idx = torch.arange(max_draft_len + 1)
-        spec_decoding_packed_mask = torch.pow(2, dummy_idx + 1) - 1
-        self.spec_decoding_packed_mask[:, :, 0].copy_(spec_decoding_packed_mask,
-                                                      non_blocking=True)
+        num_blocks = math.ceil((max_draft_len + 1) / 32)
+        tmp_max_draft_len = max_draft_len + 1
+        for block_idx in range(num_blocks):
+            if tmp_max_draft_len < 0:
+                break
+            dummy_idx = torch.arange(min(32, tmp_max_draft_len))
+            spec_decoding_packed_mask = torch.pow(2, dummy_idx + 1) - 1
+            self.spec_decoding_packed_mask[:, :, block_idx].copy_(
+                spec_decoding_packed_mask, non_blocking=True)
+            tmp_max_draft_len -= 32
 
     def generate_spec_decoding_generation_length(self, max_draft_len):
         spec_decoding_generation_length = torch.full((self.max_num_requests, ),
