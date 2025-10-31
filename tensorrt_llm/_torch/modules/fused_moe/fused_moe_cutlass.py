@@ -163,7 +163,7 @@ class CutlassFusedMoE(MoE):
                         os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB", "512"))
                     self.moe_a2a = MoeAlltoAll(
                         mapping=self.mapping,
-                        max_num_tokens_per_rank=model_config.max_num_tokens,
+                        max_num_tokens=model_config.max_num_tokens,
                         top_k=self.routing_method.experts_per_token,
                         num_experts=self.num_experts,
                         workspace_size_per_rank=workspace_mb * 1024 * 1024,
@@ -408,7 +408,7 @@ class CutlassFusedMoE(MoE):
             assert all_rank_num_tokens is not None, "all_rank_num_tokens required for alltoall"
             # Prepare alltoall indices
             top_k = self.routing_method.experts_per_token
-            max_tokens_per_rank = max(
+            runtime_max_tokens_per_rank = max(
                 all_rank_num_tokens) if all_rank_num_tokens else token_count
 
             # Handle case where token_final_scales might be None (when apply_router_weight_on_input=True)
@@ -420,9 +420,9 @@ class CutlassFusedMoE(MoE):
                 assert self.alltoall_prepare_workspace is not None, "alltoall_prepare_workspace should be initialized"
                 alltoall_info, _ = MnnvlMoe.mnnvl_moe_alltoallv_prepare_without_allgather(
                     token_selected_experts, None,
-                    self.alltoall_prepare_workspace, max_tokens_per_rank,
-                    self.ep_rank, self.ep_size, self.num_experts,
-                    self.num_experts, top_k)
+                    self.alltoall_prepare_workspace,
+                    runtime_max_tokens_per_rank, self.ep_rank, self.ep_size,
+                    self.num_experts, self.num_experts, top_k)
 
                 if x_sf is not None:
                     x_sf = x_sf.view(x_row,
@@ -437,8 +437,9 @@ class CutlassFusedMoE(MoE):
 
                 torch.ops.trtllm.memset_expert_ids(
                     token_selected_experts,
-                    alltoall_info.recv_rank_count_cumsum, max_tokens_per_rank,
-                    top_k, self.num_experts, self.ep_size)
+                    alltoall_info.recv_rank_count_cumsum,
+                    runtime_max_tokens_per_rank, top_k, self.num_experts,
+                    self.ep_size)
             elif self.moe_alltoall_backend == "mnnvlthroughput":
                 # Python MoeAlltoAll path
                 if x_sf is not None:
@@ -459,6 +460,7 @@ class CutlassFusedMoE(MoE):
                 recv_tensors = self.moe_a2a.dispatch(
                     token_selected_experts,
                     payloads,
+                    runtime_max_tokens_per_rank,
                     invalid_token_expert_id=self.
                     num_slots,  # Caution: Cutlass MoE uses num_slots as invalid token expert id
                     expert_id_payload_index=expert_id_payload_index,
