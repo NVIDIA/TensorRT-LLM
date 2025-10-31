@@ -14,19 +14,51 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/cuteDslKernels/moeUtils.h"
 
+#include <cuda_fp4.h>
+#include <cute/numeric/numeric_types.hpp>
+
 namespace tensorrt_llm::kernels::cute_dsl
 {
-template <typename InputType, typename SFType, int32_t kThreadsPerBlock>
+namespace
+{
+using ElemCopyType = uint4;
+using SFCopyType = uint32_t;
+
+template <typename T>
+auto constexpr bitsPerElem()
+{
+#ifdef ENABLE_FP4
+    return std::is_same_v<T, __nv_fp4_e2m1> ? 4 : cute::sizeof_bits_v<T>;
+#else
+    return cute::sizeof_bits_v<T>;
+#endif
+}
+
+template <typename T>
+auto constexpr elemPerCopy()
+{
+    return bitsPerElem<ElemCopyType>() / bitsPerElem<T>();
+}
+
+template <typename T>
+auto constexpr sfElemPerCopy()
+{
+    return bitsPerElem<SFCopyType>() / bitsPerElem<T>();
+}
+} // namespace
+
+template <typename InputType, typename SFType, int32_t kSFVecSize, int32_t kThreadsPerBlock>
 __global__ void moePermuteKernel(InputType const* input, InputType* permuted_input, SFType const* input_sf,
     SFType* permuted_sf, int32_t const* permuted_idx_to_expanded_idx, int32_t const* num_non_exiting_tiles,
     int32_t const hidden_size, int32_t const top_k, int32_t const tile_size)
 {
-    using CopyType = float4;
-    int32_t constexpr kElemPerThread = sizeof(CopyType) / sizeof(InputType);
+    int32_t constexpr kElemPerCopy = elemPerCopy<InputType>();
+    int32_t constexpr kSFElemPerCopy = sfElemPerCopy<SFType>();
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     asm volatile("griddepcontrol.wait;");
@@ -42,13 +74,27 @@ __global__ void moePermuteKernel(InputType const* input, InputType* permuted_inp
         }
         int32_t const token_idx = expanded_idx / top_k;
 
-        auto const* src_ptr = reinterpret_cast<CopyType const*>(input + hidden_size * token_idx);
-        auto* dst_ptr = reinterpret_cast<CopyType*>(permuted_input + hidden_size * permuted_idx);
+        auto const* src_ptr = reinterpret_cast<ElemCopyType const*>(input) + hidden_size * token_idx / kElemPerCopy;
+        auto* dst_ptr = reinterpret_cast<ElemCopyType*>(permuted_input) + hidden_size * permuted_idx / kElemPerCopy;
 
-        for (int32_t offset = threadIdx.x; offset < hidden_size / kElemPerThread; offset += kThreadsPerBlock)
+        for (int32_t i = threadIdx.x; i < hidden_size / kElemPerCopy; i += kThreadsPerBlock)
         {
-            dst_ptr[offset] = src_ptr[offset];
+            dst_ptr[i] = src_ptr[i];
         }
+
+#ifdef ENABLE_FP4
+        if constexpr (std::is_same_v<InputType, __nv_fp4_e2m1>)
+        {
+            auto const* sf_src_ptr = reinterpret_cast<SFCopyType const*>(input_sf)
+                + hidden_size * token_idx / (kSFVecSize * kSFElemPerCopy);
+            auto* sf_dst_ptr = reinterpret_cast<SFCopyType*>(permuted_sf)
+                + hidden_size * permuted_idx / (kSFVecSize * kSFElemPerCopy);
+            for (int32_t i = threadIdx.x; i < hidden_size / (kSFVecSize * kSFElemPerCopy); i += kThreadsPerBlock)
+            {
+                sf_dst_ptr[i] = sf_src_ptr[i];
+            }
+        }
+#endif
     }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -62,11 +108,26 @@ void moePermute(InputType const* input, InputType* permuted_input, SFType const*
     int32_t const top_k, int32_t const tile_size, cudaStream_t stream)
 {
     int32_t constexpr kThreadsPerBlock = 256;
+    int32_t constexpr kSFVecSize = 16;
+    int32_t constexpr kElemPerCopy = elemPerCopy<InputType>();
+    TLLM_CHECK_WITH_INFO(hidden_size % kElemPerCopy == 0, "hidden_size must be divisible by %d.", kElemPerCopy);
+
+#ifdef ENABLE_FP4
+    if constexpr (std::is_same_v<InputType, __nv_fp4_e2m1>)
+    {
+        int32_t constexpr kSFElemPerCopy = sfElemPerCopy<SFType>();
+        TLLM_CHECK_WITH_INFO(hidden_size % (kSFVecSize * kSFElemPerCopy) == 0, "hidden_size must be divisible by %d.",
+            kSFVecSize * kSFElemPerCopy);
+        TLLM_CHECK_WITH_INFO(input_sf != nullptr, "input_sf is required for NVFP4.");
+        TLLM_CHECK_WITH_INFO(permuted_sf != nullptr, "permuted_sf is required for NVFP4.");
+    }
+#endif
+
     static int64_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
     int32_t const blocks = smCount;
     int32_t const threads = kThreadsPerBlock;
 
-    auto kernel = &moePermuteKernel<InputType, SFType, kThreadsPerBlock>;
+    auto kernel = &moePermuteKernel<InputType, SFType, kSFVecSize, kThreadsPerBlock>;
 
     cudaLaunchConfig_t config;
     config.gridDim = blocks;
@@ -94,5 +155,8 @@ INSTANTIATE_MOE_PERMUTE(__nv_bfloat16, uint8_t);
 #endif
 #ifdef ENABLE_FP8
 INSTANTIATE_MOE_PERMUTE(__nv_fp8_e4m3, uint8_t);
+#endif
+#ifdef ENABLE_FP4
+INSTANTIATE_MOE_PERMUTE(__nv_fp4_e2m1, uint8_t);
 #endif
 } // namespace tensorrt_llm::kernels::cute_dsl
