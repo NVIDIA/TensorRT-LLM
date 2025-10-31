@@ -137,7 +137,7 @@ std::tuple<torch::Tensor, torch::optional<torch::Tensor>> moe_permute(torch::Ten
     TORCH_CHECK(
         num_permuted_tokens % tile_tokens_dim == 0, "num_permuted_tokens must be divisible by tile_tokens_dim.");
 
-    auto permuted_input
+    auto permuted_output
         = torch::empty({num_permuted_tokens, input.size(1)}, torch::dtype(input.scalar_type()).device(torch::kCUDA));
 
     void* input_sf_ptr = nullptr;
@@ -157,7 +157,7 @@ std::tuple<torch::Tensor, torch::optional<torch::Tensor>> moe_permute(torch::Ten
 
 #define DISPATCH_MOE_PERMUTE(InputType, SFType)                                                                        \
     tensorrt_llm::kernels::cute_dsl::moePermute<InputType, SFType>(static_cast<InputType*>(input.data_ptr()),          \
-        static_cast<InputType*>(permuted_input.data_ptr()), static_cast<SFType*>(input_sf_ptr),                        \
+        static_cast<InputType*>(permuted_output.data_ptr()), static_cast<SFType*>(input_sf_ptr),                       \
         static_cast<SFType*>(permuted_sf_ptr), permuted_idx_to_expanded_idx.data_ptr<int32_t>(),                       \
         num_non_exiting_tiles.data_ptr<int32_t>(), hidden_size, top_k, tile_tokens_dim, stream)
 
@@ -184,7 +184,7 @@ std::tuple<torch::Tensor, torch::optional<torch::Tensor>> moe_permute(torch::Ten
 
 #undef DISPATCH_MOE_PERMUTE
 
-    return {permuted_input, permuted_sf};
+    return {permuted_output, permuted_sf};
 }
 
 } // namespace torch_ext

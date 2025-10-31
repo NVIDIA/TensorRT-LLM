@@ -54,7 +54,7 @@ auto constexpr sfElemPerCopy()
 } // namespace
 
 template <typename InputType, typename SFType, int32_t kSFVecSize, int32_t kThreadsPerBlock>
-__global__ void moePermuteKernel(InputType const* input, InputType* permuted_input, SFType const* input_sf,
+__global__ void moePermuteKernel(InputType const* input, InputType* permuted_output, SFType const* input_sf,
     SFType* permuted_sf, int32_t const* permuted_idx_to_expanded_idx, int32_t const* num_non_exiting_tiles,
     int32_t const hidden_size, int32_t const top_k, int32_t const tile_size)
 {
@@ -76,7 +76,7 @@ __global__ void moePermuteKernel(InputType const* input, InputType* permuted_inp
         int32_t const token_idx = expanded_idx / top_k;
 
         auto const* src_ptr = reinterpret_cast<ElemCopyType const*>(input) + token_idx * hidden_size / kElemPerCopy;
-        auto* dst_ptr = reinterpret_cast<ElemCopyType*>(permuted_input) + permuted_idx * hidden_size / kElemPerCopy;
+        auto* dst_ptr = reinterpret_cast<ElemCopyType*>(permuted_output) + permuted_idx * hidden_size / kElemPerCopy;
         for (int32_t i = threadIdx.x; i < hidden_size / kElemPerCopy; i += kThreadsPerBlock)
         {
             dst_ptr[i] = src_ptr[i];
@@ -108,7 +108,7 @@ __global__ void moePermuteKernel(InputType const* input, InputType* permuted_inp
 }
 
 template <typename InputType, typename SFType>
-void moePermute(InputType const* input, InputType* permuted_input, SFType const* input_sf, SFType* permuted_sf,
+void moePermute(InputType const* input, InputType* permuted_output, SFType const* input_sf, SFType* permuted_sf,
     int32_t const* permuted_idx_to_expanded_idx, int32_t const* num_non_exiting_tiles, int32_t const hidden_size,
     int32_t const top_k, int32_t const tile_size, cudaStream_t stream)
 {
@@ -144,12 +144,12 @@ void moePermute(InputType const* input, InputType* permuted_input, SFType const*
     attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
     config.numAttrs = 1;
     config.attrs = attrs;
-    cudaLaunchKernelEx(&config, kernel, input, permuted_input, input_sf, permuted_sf, permuted_idx_to_expanded_idx,
+    cudaLaunchKernelEx(&config, kernel, input, permuted_output, input_sf, permuted_sf, permuted_idx_to_expanded_idx,
         num_non_exiting_tiles, hidden_size, top_k, tile_size);
 }
 
 #define INSTANTIATE_MOE_PERMUTE(InputType, SFType)                                                                     \
-    template void moePermute<InputType, SFType>(InputType const* input, InputType* permuted_input,                     \
+    template void moePermute<InputType, SFType>(InputType const* input, InputType* permuted_output,                    \
         SFType const* input_sf, SFType* permuted_sf, int32_t const* permuted_idx_to_expanded_idx,                      \
         int32_t const* num_non_exiting_tiles, int32_t const hidden_size, int32_t const top_k, int32_t const tile_size, \
         cudaStream_t stream)
@@ -164,4 +164,6 @@ INSTANTIATE_MOE_PERMUTE(__nv_fp8_e4m3, uint8_t);
 #ifdef ENABLE_FP4
 INSTANTIATE_MOE_PERMUTE(__nv_fp4_e2m1, uint8_t);
 #endif
+#undef INSTANTIATE_MOE_PERMUTE
+
 } // namespace tensorrt_llm::kernels::cute_dsl
