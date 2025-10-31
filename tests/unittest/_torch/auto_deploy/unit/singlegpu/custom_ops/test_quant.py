@@ -22,6 +22,9 @@ INT4_BLOCK_SIZE = 128
 @pytest.mark.parametrize("bias", [True, False])
 @pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
 def test_fp8_linear(M, N, K, bias):
+    if N % 16 != 0 or K % 16 != 0:
+        pytest.skip("https://github.com/NVIDIA/TensorRT-LLM/issues/8811")
+
     input = torch.rand(M, K, device="cuda")
     weight = torch.rand(N, K, device="cuda")
     bias = torch.rand(N).to("cuda") * 10 if bias else None

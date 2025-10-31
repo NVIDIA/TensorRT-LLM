@@ -77,7 +77,8 @@ def fp8_linear(
     k = input_shape[-1]
     input = input.reshape(-1, k)
 
-    assert n % 2 == 0
+    # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/8811
+    assert n % 16 == 0
     assert k % 16 == 0
 
     # Use TensorRT-LLM FP8 per-tensor quantization
@@ -86,7 +87,7 @@ def fp8_linear(
 
     # Use TensorRT-LLM FP8 scaled matrix multiply
     # Choose between CUDA core (for small M) and cuBLAS (for large M) implementations
-    if input_fp8.shape[0] <= 8 or n % 16 != 0:
+    if input_fp8.shape[0] <= 8:  # NOTE: this kernel work with n % 2 == 0 as well??
         # Use CUDA core for small M dimension (better for small batch sizes)
         output = torch.ops.trtllm.cuda_scaled_mm(
             input_fp8,
