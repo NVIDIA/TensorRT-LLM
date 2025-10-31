@@ -577,7 +577,6 @@ class SampleStateTensorsHostTorch(SampleStateTensors):
 
     def finish_reasons_list(self) -> FinishReasonsList:
         """`(num_seq_slots, num_steps)`"""
-        print(self.finish_reasons)
         return self.finish_reasons[:, :, BEAM].T.tolist()
 
 
@@ -1060,7 +1059,6 @@ class TorchSampler(Sampler):
         new_tokens = state.host.new_tokens
         finish_reasons = state.host.finish_reasons_list()
 
-        print(finish_reasons)
         new_tokens_list = new_tokens.tolist()
 
         for req in state.scheduled_requests.context_requests:
@@ -1672,10 +1670,13 @@ class TorchSampler(Sampler):
                 words[step, :length] = torch.tensor(swl[start : start + length], dtype=torch.int32)
             words_device = words.to("cuda", non_blocking=True)
 
-            for step, step_seq in enumerate(new_tokens):
+            draft_token_length = get_draft_token_length(request)
+            for step, step_seq in enumerate(new_tokens[:draft_token_length]):
                 for word, L in zip(words_device, lens_device):
-                    truncated_seq = step_seq[step_seq >= 0][-L:]
-                    if torch.equal(truncated_seq, word[-L:]):
+                    truncated_seq = step_seq[
+                        -(L + draft_token_length - step) : -(draft_token_length - step)
+                    ]
+                    if torch.equal(truncated_seq, word[:L]):
                         # We don't care about subsequent steps because we already found a stop word match
                         return step
             return None
