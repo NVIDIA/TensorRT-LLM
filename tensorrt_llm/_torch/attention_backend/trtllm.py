@@ -197,6 +197,7 @@ class TrtllmAttentionWrapper:
         sparse_kv_offsets: Optional[torch.Tensor] = None,
         sparse_attn_indices: Optional[torch.Tensor] = None,
         sparse_attn_offsets: Optional[torch.Tensor] = None,
+        sparse_mla_topk: int = 0,
         **kwargs,
     ):
         """
@@ -240,6 +241,7 @@ class TrtllmAttentionWrapper:
             sparse_kv_offsets (torch.Tensor): The batch offsets for the sparse KV indices, with shape of (num_contexts + 1) on GPU.
             sparse_attn_indices (torch.Tensor): The sparse indices for the attention layer, with shape of (num_heads_kv, num_sparse_tokens) on GPU.
             sparse_attn_offsets (torch.Tensor): The batch offsets for the sparse attention indices, with shape of (num_generations + 1) on GPU.
+            sparse_mla_topk (int): The topk for the sparse MLA, used by DSA attention.
         """
         self.layer_idx = layer_idx
         self.tokens_per_block = tokens_per_block
@@ -281,6 +283,7 @@ class TrtllmAttentionWrapper:
         self.sparse_kv_offsets = sparse_kv_offsets
         self.sparse_attn_indices = sparse_attn_indices
         self.sparse_attn_offsets = sparse_attn_offsets
+        self.sparse_mla_topk = sparse_mla_topk
         if max_sequence_length > self.rope_params.max_positions:
             self.rope_params.max_positions = max_sequence_length
             self.rotary_inv_freq, self.rotary_cos_sin = self.rope_params.create_rope_const_params(
@@ -385,7 +388,14 @@ class TrtllmAttentionWrapper:
             else:
                 raise ValueError("Unexpected attention mask type")
         else:
-            if self.attention_input_type == AttentionInputType.context_only:
+            # For DSA, use the same qkv hidden size for context and generation phases
+            is_sparse_attn = self.sparse_attn_indices is not None and self.sparse_attn_indices.numel(
+            ) > 0
+            if self.attention_input_type == AttentionInputType.context_only and is_sparse_attn:
+                assert is_fused_qkv
+                qkv_hidden_size = self.num_heads * (self.kv_lora_rank +
+                                                    self.qk_rope_head_dim)
+            elif self.attention_input_type == AttentionInputType.context_only:
                 assert not is_fused_qkv
                 qkv_hidden_size = self.num_heads * (self.qk_nope_head_dim +
                                                     self.qk_rope_head_dim)
@@ -438,12 +448,6 @@ class TrtllmAttentionWrapper:
             self.spec_decoding_position_offsets, self.spec_decoding_packed_mask
         ]
         mla_tensor_params = [self.helix_position_offsets]
-        sparse_attention_params = [
-            self.sparse_kv_indices,
-            self.sparse_kv_offsets,
-            self.sparse_attn_indices,
-            self.sparse_attn_offsets,
-        ]
 
         thop.attention(
             q,
@@ -511,7 +515,11 @@ class TrtllmAttentionWrapper:
             self.softmax_stats_tensor,
             spec_decoding_bool_params,
             spec_decoding_tensor_params,
-            sparse_attention_params,
+            self.sparse_kv_indices,
+            self.sparse_kv_offsets,
+            self.sparse_attn_indices,
+            self.sparse_attn_offsets,
+            self.sparse_mla_topk,
         )
         # reset the planned states (especially tensors) to avoid memory leak
         self.plan()
@@ -1354,7 +1362,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             sparse_kv_offsets=sparse_kv_offsets,
             sparse_attn_indices=sparse_attn_indices,
             sparse_attn_offsets=sparse_attn_offsets,
-        )
+            sparse_mla_topk=metadata.sparse_mla_topk if hasattr(
+                metadata, 'sparse_mla_topk') else 0)
         out_dtype = None
         if out_scale is not None:
             if use_nvfp4_output:
