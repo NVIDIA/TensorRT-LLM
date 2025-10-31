@@ -93,7 +93,7 @@ def fp8_linear(
             weight_fp8.t(),
             scale_a=input_scale,
             scale_b=weight_scale,
-            bias=bias,
+            bias=None,
             out_dtype=input_dtype,
         )
     else:
@@ -103,10 +103,11 @@ def fp8_linear(
             weight_fp8.t(),
             scale_a=input_scale,
             scale_b=weight_scale,
-            bias=bias,
+            bias=None,
             out_dtype=input_dtype,
         )
-
+    if bias is not None:
+        output = output + bias
     return output.reshape(*input_shape[:-1], n)
 
 
