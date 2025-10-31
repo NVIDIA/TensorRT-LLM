@@ -36,7 +36,7 @@ environment:
   model_path: /lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/common/Qwen3-235B-A22B-FP4
   trtllm_repo: ''
   build_wheel: false
-  dataset_file: /lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/common/
+  dataset_file: /lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/common/datasets/deepseek-r1-1024-1024-100000-ratio-1_for_serve.json
   work_dir: /lustre/fsw/portfolios/coreai/users/fredric/tensorrt_llm/examples/disaggregated/slurm/benchmark
 profiling:
   nsys_on: false
