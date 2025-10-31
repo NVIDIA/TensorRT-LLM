@@ -140,7 +140,7 @@ class LogParser(object):
         
         for item in raw_results:
             concurrency = item.get("concurrency", "1")
-            base_test_name = f"{test_prefix}-con-{concurrency}"
+            base_test_name = f"{test_prefix}_con:{concurrency}"
             
             # Create a separate row for each performance metric
             for metric_name, metric_value in item.items():
