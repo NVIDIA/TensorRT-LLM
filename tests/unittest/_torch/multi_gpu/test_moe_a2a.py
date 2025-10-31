@@ -585,7 +585,6 @@ class TestMoEAlltoAll:
 
         hidden_size = 2880  # gpt-oss
         num_experts_per_rank = 8
-        max(all_num_tokens)
 
         # Large enough workspace
         workspace_size_per_rank = 512 * 1024 * 1024
