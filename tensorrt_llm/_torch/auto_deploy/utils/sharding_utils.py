@@ -28,6 +28,8 @@ from .quantization_utils import (
     modelopt_fp4_scale_to_cutlass_fp4_scale,
 )
 
+INSERT_ALL_REDUCE = False
+
 
 def _load_hook(
     state_dict,
@@ -110,8 +112,9 @@ def _validate_sharded_shapes(
         split_nodes = subgraph(
             [node],
             [next_lin_node],
-            include=lambda n: is_op(n, [torch.ops.aten.split, torch.ops.aten.split_with_sizes]),
+            include=lambda n: is_op(n, [torch.ops.aten.split_with_sizes]),
         )
+        world_size = min(world_size, 4)
         for split_node in split_nodes:
             orig_sizes = split_node.args[1]
             new_sizes = [orig_sizes[i] // world_size for i in range(len(orig_sizes))]
@@ -153,6 +156,9 @@ def shard_weight_tensor(
         Tuple of (sharded_tensor, sharded_shape)
     """
 
+    def ceil(x: int, y: int) -> int:
+        return (x + y - 1) // y
+
     def split_tensor(
         t: torch.Tensor,
         d: int = dim,
@@ -169,7 +175,7 @@ def shard_weight_tensor(
                 + f"Splitting tensor to {num_groups} chunks"
             )
             return torch.tensor_split(t, max_split_size, dim=d)[r // num_groups]
-        return torch.tensor_split(t, ws, dim=d)[r]
+        return torch.tensor_split(t, min(ws, 4), dim=d)[r // ceil(ws, 4)]
 
     # Handle fused weights
     if fused_weight_dims is not None:
@@ -490,6 +496,11 @@ def _shard_parameter_node(
         0: (torch.ops.auto_deploy.torch_dist_all_gather.default, -1),
         1: (torch.ops.auto_deploy.torch_dist_all_reduce.default,),
     }
+
+    if not INSERT_ALL_REDUCE and dim == 1:
+        # ad_logger.warning(f"\nSkipping all_reduce for dim 1 because INSERT_ALL_REDUCE is False")
+        return
+
     fn_dist, *dist_args = dist_lookup[dim]
 
     # add reduction node

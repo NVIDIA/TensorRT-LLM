@@ -32,6 +32,7 @@ from ...utils.node_utils import (
     bfs,
     extract_weight_node,
     filtered_nodes,
+    get_all_layer_subgraphs,
     identify_regions_between_residuals,
     is_any_lin_op,
     is_op,
@@ -232,7 +233,7 @@ class Sharding(BaseTransform):
 
                 # run TP sharding across ranks
                 if ShardingDim.TP in sharding_config.sharding_dims:
-                    info += detect_column_row_shard(gm, sharding_config)
+                    info += detect_column_row_shard_new(gm, sharding_config)
 
                 # run EP sharding across ranks
                 if ShardingDim.EP in sharding_config.sharding_dims:
@@ -430,15 +431,40 @@ def _process_ssm_sharding(
 def _process_column_sharding(
     gm: GraphModule,
     linear_nodes: List[Node],
+    subgraph_nodes: List[Node],
     sharding_config: ShardingConfig,
     rank: int,
     world_size: int,
     min_local_shape: int = 1,
-    fused_weight: bool = False,
 ) -> None:
     """
     Parse the column sharding from the candidate nodes and update the view and split nodes accordingly.
     """
+    fused_weight_dims = None
+    # check if there are split nodes in the subgraph. They may indicate fused weights (e.g., QKV)
+    split_nodes = list(filtered_nodes(subgraph_nodes, ops=[torch.ops.aten.split_with_sizes]))
+    if len(split_nodes) > 0:
+        assert len(linear_nodes) == 1
+        linear_node = linear_nodes[0]
+        assert len(split_nodes) == 1, "Expecting exactly one split node for fused weights"
+        fused_weight_dims = split_nodes[0].args[1]
+    slice_nodes = list(filtered_nodes(subgraph_nodes, ops=[torch.ops.aten.slice]))
+    if len(slice_nodes) > 0:
+        # we are probably in fused QKV case with single linear node and 3 slice nodes
+        assert len(linear_nodes) == 1
+        linear_node = linear_nodes[0]
+        assert all(s.args[1] == 2 for s in linear_node.users), "Expecting slice nodes with dim=3"
+        fused_weight_dims = [s.args[3] - s.args[2] for s in linear_node.users]
+        weight_dim = linear_node.meta["val"].shape[2]
+        if sum(fused_weight_dims) != weight_dim:
+            if fused_weight_dims[-1] > weight_dim:
+                fused_weight_dims[-1] = weight_dim - sum(fused_weight_dims[:-1])
+            else:
+                ad_logger.warning(
+                    f"Fused weight dims {fused_weight_dims} do not sum to weight dim {weight_dim}. Skipping."
+                )
+                return
+
     for linear_node in linear_nodes:
         sharding_config.add(
             WeightShardingInfo.from_node(
@@ -448,15 +474,9 @@ def _process_column_sharding(
                 world_size=world_size,
                 dist_op=None,  # for column sharding, no dist op is performed
                 min_local_shape=min_local_shape,
+                fused_weight_dims=fused_weight_dims,
             )
         )
-
-    # get the subgraph of this module. Subgraph boundary is the next linear node.
-    next_lin_node, _ = bfs(linear_nodes[0], is_any_lin_op, include_root=False)
-    subgraph_nodes = subgraph(
-        linear_nodes,
-        [next_lin_node],
-    )
 
     nodes_to_validate = [
         n for n in subgraph_nodes if is_op(n, [torch.ops.aten.view, torch.ops.aten.reshape])
@@ -479,13 +499,15 @@ def _process_column_sharding(
             ad_logger.debug(f"\nUpdated view node {view_node} arguments to {view_node.args}")
 
     # if fused_weight_dims is provided, we need to update all split sizes
-    if fused_weight:
-        assert len(linear_nodes) == 1, "Fused weight should be only one linear node"
-        node = linear_nodes[0]
+    if fused_weight_dims is not None:
         assert world_size is not None, "World size is required to update the split node params"
-        assert len(node.users) == 1, "Fused linear node should have only one user: a split node"
-        user = list(node.users)[0]
-        if is_op(user, [torch.ops.aten.split_with_sizes]):
+
+        # fused weight may either be processed by several slice nodes or a single split node
+        assert len(split_nodes) > 0 or len(slice_nodes) > 0, (
+            "Expecting at least one split or slice node for fused weights"
+        )
+        if len(split_nodes) > 0:
+            user = split_nodes[0]
             orig_sizes = user.args[1]
             new_sizes = [orig_sizes[i] // world_size for i in range(len(orig_sizes))]
             args = list(user.args)
@@ -495,9 +517,19 @@ def _process_column_sharding(
                     rank=rank, world_size=world_size, target_node=user.name, args=tuple(args)
                 )
             )
-            ad_logger.debug(
-                f"\nInserted parameter update transformation for split node {user} arguments to {user.args}"
-            )
+        else:
+            for slice_node in linear_node.users:
+                args = list(slice_node.args)
+                args[2] = args[2] // world_size
+                args[3] = args[3] // world_size
+                sharding_config.add(
+                    ParameterUpdateInfo(
+                        rank=rank,
+                        world_size=world_size,
+                        target_node=slice_node.name,
+                        args=tuple(args),
+                    )
+                )
 
 
 def detect_sharding_from_factory_config(
@@ -749,7 +781,7 @@ def detect_ssm_shard(
     )
 
 
-def detect_column_row_shard(
+def detect_column_row_shard_new(
     gm: GraphModule,
     sharding_config: ShardingConfig,
 ) -> TransformInfo:
@@ -780,8 +812,135 @@ def detect_column_row_shard(
 
     ad_logger.info("Running TP sharding detection")
 
+    layer_subgraphs, unprocessed_linear_nodes = get_all_layer_subgraphs(gm)
+
+    # acceptable attention nodes between sharded GEMMs
+    shardable_attention_nodes = {
+        torch.ops.auto_deploy.torch_attention_sdpa,
+        torch.ops.auto_deploy.torch_attention,
+    }
+
+    # acceptable SSM nodes between sharded GEMMs
+    shardable_ssm_nodes = {
+        torch.ops.auto_deploy.torch_ssm,
+    }
+
+    num_shards = 0
+    num_simple_shards = 0
+    num_ssm_shards = 0
+    num_attention_shards = 0
+    num_column_row_shards = 0
+    for opening, layer_subgraph, closing in layer_subgraphs:
+        nodes_linear = opening + [closing]
+        num_shards += 1
+
+        if sharding_config.simple_shard_only:
+            ad_logger.debug(f"Forcing Simple Shard on nodes: {nodes_linear}")
+            num_simple_shards += _process_simple_shard(
+                nodes_linear, rank, world_size, sharding_config
+            )
+            continue
+
+        ssm_nodes = list(filtered_nodes(layer_subgraph, ops=shardable_ssm_nodes))
+        attention_nodes = list(filtered_nodes(layer_subgraph, ops=shardable_attention_nodes))
+        min_local_shape = 1
+
+        if len(ssm_nodes) > 0:
+            # Mamba layers need special handling due to the fused weights for in_proj and conv1d
+            ad_logger.debug(f"Found SSM nodes in layer subgraph: {ssm_nodes}")
+            num_ssm_shards += _process_ssm_sharding(
+                gm, opening[0], sharding_config, rank, world_size
+            )
+            continue
+
+        if len(attention_nodes) > 0:
+            ad_logger.debug(f"Found attention nodes in layer subgraph: {attention_nodes}")
+            if len(attention_nodes) > 1:
+                # Column-row shard boundary region detection is probably wrong - there should be
+                # only one attention operation. Fall back to simple shard.
+                ad_logger.debug(f"More than one attention node: {attention_nodes}")
+                num_simple_shards += _process_simple_shard(
+                    nodes_linear, rank, world_size, sharding_config
+                )
+                continue
+            # Extract head dimension. We cannot shard below the head_dim size.
+            # Assume that head_dim is the last (innermost) dimension of the tensor
+            min_local_shape = attention_nodes.pop().meta["val"].shape[-1]
+            num_attention_shards += 1
+
+        # column-row sharding
+        _process_column_sharding(
+            gm,
+            linear_nodes=opening,
+            subgraph_nodes=layer_subgraph,
+            sharding_config=sharding_config,
+            rank=rank,
+            world_size=world_size,
+            min_local_shape=min_local_shape,
+        )
+
+        # shard single row node
+        sharding_config.weight_sharding_transforms.append(
+            WeightShardingInfo.from_node(
+                closing,
+                split_dim=SplitDimension.ROW,
+                rank=rank,
+                world_size=world_size,
+                dist_op="all_reduce",
+                min_local_shape=min_local_shape,
+            )
+        )
+
+        num_column_row_shards += 1
+
+    # simple shard remaining linear nodes
+    num_simple_shards += _process_simple_shard(
+        unprocessed_linear_nodes, rank, world_size, sharding_config
+    )
+
+    ad_logger.info(
+        f"Found {num_shards} TP shards (simple: {num_simple_shards}, row-col: {num_column_row_shards}, "
+        f"ssm: {num_ssm_shards}, attention: {num_attention_shards})"
+    )
+    return TransformInfo(
+        skipped=False, num_matches=num_shards, is_clean=False, has_valid_shapes=False
+    )
+
+
+def detect_column_row_shard(
+    gm: GraphModule,
+    sharding_config: ShardingConfig,
+) -> TransformInfo:
+    """A transformation to apply sharding to the model following tensor parallelism.
+
+    The transformation is based on the following steps:
+
+    1. Identify boundary nodes between residual nodes to identify shardable regions.
+    2. Identify the GEMM nodes that can be sharded
+    3. Trace through the subgraph using DFS/BFS between each pair of boundary nodes
+    4. Account for each node in the trace to ensure the op is correct even after sharding. This is
+       necessary to ensure that the sharding is correct and we need to be able to account for
+       **all** nodes in the subgraph. The subgraph here is defined as the region between the first
+       linear node to the last linear node of an identified sharding region.
+    # 5. Shard the GEMM nodes or skip accordingly.
+
+    min_local_shape is the minimum size of the local tensor shard, to prevent TP parallelism
+    splitting, e.g., the individual heads into smaller shards.
+    """
+    ad_logger.debug("Before sharding graph: " + str(gm))
+
+    rank, world_size = sharding_config.rank, sharding_config.world_size
+    if world_size < 2:
+        ad_logger.info("Skipping TP sharding for single device")
+        return TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
+
+    assert isinstance(gm, GraphModule), "Expecting GraphModule"
+
+    ad_logger.info("Running TP sharding detection")
     # find boundary nodes of regions we want to shard
     boundary_nodes = identify_regions_between_residuals(gm)
+
+    layer_subgraphs, unprocessed_linear_nodes = get_all_layer_subgraphs(gm)
 
     # TODO: continue updating these lists
     # pointwise ops that don't affect the sharder
