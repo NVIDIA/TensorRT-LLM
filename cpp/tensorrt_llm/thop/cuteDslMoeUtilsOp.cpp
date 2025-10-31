@@ -18,6 +18,8 @@
 #include "tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
+#include <cuda_fp4.h>
+
 namespace torch_ext
 {
 // Sort
@@ -126,17 +128,28 @@ std::vector<torch::Tensor> moe_sort(torch::Tensor const& token_selected_experts,
 
 // Permute
 
-std::vector<torch::Tensor> moe_permute(torch::Tensor const& input, torch::Tensor const& permuted_idx_to_expanded_idx,
+std::tuple<torch::Tensor, torch::optional<torch::Tensor>> moe_permute(torch::Tensor const& input,
+    torch::optional<torch::Tensor> const& input_sf, torch::Tensor const& permuted_idx_to_expanded_idx,
     torch::Tensor const& num_non_exiting_tiles, int64_t const tile_tokens_dim, int64_t const top_k)
 {
-    int64_t const hidden_size = input.size(1);
+    int64_t const hidden_size = input.scalar_type() == torch::kFloat4_e2m1fn_x2 ? input.size(1) * 2 : input.size(1);
     int64_t const num_permuted_tokens = permuted_idx_to_expanded_idx.size(0);
+
+    auto permuted_input
+        = torch::empty({num_permuted_tokens, input.size(1)}, torch::dtype(input.scalar_type()).device(torch::kCUDA));
 
     void* input_sf_ptr = nullptr;
     void* permuted_sf_ptr = nullptr;
-
-    auto permuted_input
-        = torch::empty({num_permuted_tokens, hidden_size}, torch::dtype(input.scalar_type()).device(torch::kCUDA));
+    torch::optional<torch::Tensor> permuted_sf;
+    if (input.scalar_type() == torch::kFloat4_e2m1fn_x2)
+    {
+        TORCH_CHECK(input_sf.has_value(), "input_sf is required for NVFP4.");
+        input_sf_ptr = input_sf->data_ptr();
+        int64_t constexpr kSFVecSize = 16;
+        permuted_sf = torch::empty({num_permuted_tokens, hidden_size / kSFVecSize},
+            torch::dtype(input_sf->scalar_type()).device(torch::kCUDA));
+        permuted_sf_ptr = permuted_sf->data_ptr();
+    }
 
     auto const& stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
@@ -146,22 +159,30 @@ std::vector<torch::Tensor> moe_permute(torch::Tensor const& input, torch::Tensor
         static_cast<SFType*>(permuted_sf_ptr), permuted_idx_to_expanded_idx.data_ptr<int32_t>(),                       \
         num_non_exiting_tiles.data_ptr<int32_t>(), hidden_size, top_k, tile_tokens_dim, stream)
 
-    if (input.scalar_type() == torch::kBFloat16)
-    {
-        DISPATCH_MOE_PERMUTE(__nv_bfloat16, uint8_t);
-    }
-    else if (input.scalar_type() == torch::kHalf)
+    if (input.scalar_type() == torch::kHalf)
     {
         DISPATCH_MOE_PERMUTE(half, uint8_t);
+    }
+    else if (input.scalar_type() == torch::kBFloat16)
+    {
+        DISPATCH_MOE_PERMUTE(__nv_bfloat16, uint8_t);
     }
     else if (input.scalar_type() == torch::kFloat8_e4m3fn)
     {
         DISPATCH_MOE_PERMUTE(__nv_fp8_e4m3, uint8_t);
     }
+    else if (input.scalar_type() == torch::kFloat4_e2m1fn_x2)
+    {
+        DISPATCH_MOE_PERMUTE(__nv_fp4_e2m1, uint8_t);
+    }
+    else
+    {
+        TORCH_CHECK(false, "Unsupported input dtype: ", input.scalar_type());
+    }
 
 #undef DISPATCH_MOE_PERMUTE
 
-    return {permuted_input};
+    return {permuted_input, permuted_sf};
 }
 
 } // namespace torch_ext
@@ -177,8 +198,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int? topk_group, int local_expert_offset, int local_num_experts, float? routed_scaling_factor, int "
         "tile_tokens_dim, int routing_method_type) -> Tensor[]");
     m.def(
-        "moe_permute(Tensor input, Tensor permuted_idx_to_expanded_idx, Tensor num_non_exiting_tiles, int "
-        "tile_tokens_dim, int top_k) -> Tensor[]");
+        "moe_permute(Tensor input, Tensor? input_sf, Tensor permuted_idx_to_expanded_idx, Tensor "
+        "num_non_exiting_tiles, "
+        "int tile_tokens_dim, int top_k) -> (Tensor, Tensor?)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
