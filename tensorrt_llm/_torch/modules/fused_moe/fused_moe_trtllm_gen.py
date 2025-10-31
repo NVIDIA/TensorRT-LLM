@@ -465,6 +465,13 @@ class TRTLLMGenFusedMoE(MoE):
         router_logits_arg = router_logits if not post_quant_comm else None
         routing_bias_arg = routing_bias if not post_quant_comm else None
 
+        moe_output: Optional[torch.Tensor] = None
+        use_workspace_output = False
+        if self.enable_alltoall and self.moe_alltoall_backend == "mnnvlthroughput":
+            moe_output = self.moe_a2a.get_combine_payload_tensor_in_workspace(
+                runtime_max_tokens_per_rank, self.hidden_size, torch.bfloat16)
+            use_workspace_output = True
+
         # TODO: since routing kernel is integrated into moe_runner for fp8,
         #       here we just route the I/Os for moe_runner
         if self.has_deepseek_fp8_block_scales:
@@ -702,6 +709,7 @@ class TRTLLMGenFusedMoE(MoE):
                 0,  # act_type
                 token_final_scales,
                 token_selected_experts,
+                output_tensor=moe_output,
             )
         else:
             raise NotImplementedError(
@@ -724,14 +732,26 @@ class TRTLLMGenFusedMoE(MoE):
                         token_count=token_count,
                     )
             elif self.moe_alltoall_backend == "mnnvlthroughput":
-                hidden = final_hidden_states.shape[-1]
-                payload = final_hidden_states.view(self.ep_size,
-                                                   runtime_max_tokens_per_rank,
-                                                   hidden)
-                final_hidden_states = self.moe_a2a.combine(
-                    payload,
-                    runtime_max_tokens_per_rank,
-                    payload_in_workspace=False)
+                # If use_workspace_output=True, the MoE result is already in workspace
+                # Otherwise, we need to reshape and pass it
+                if use_workspace_output:
+                    # Workspace payload is returned as 2D [ep_size * max_tokens, hidden]; reshape to 3D.
+                    hidden = final_hidden_states.shape[-1]
+                    payload = moe_output.view(self.ep_size,
+                                              runtime_max_tokens_per_rank,
+                                              hidden)
+                    final_hidden_states = self.moe_a2a.combine(
+                        payload,
+                        runtime_max_tokens_per_rank,
+                        payload_in_workspace=True)
+                else:
+                    hidden = final_hidden_states.shape[-1]
+                    payload = final_hidden_states.view(
+                        self.ep_size, runtime_max_tokens_per_rank, hidden)
+                    final_hidden_states = self.moe_a2a.combine(
+                        payload,
+                        runtime_max_tokens_per_rank,
+                        payload_in_workspace=False)
             else:
                 raise ValueError(
                     f"Unsupported moe alltoall backend: {self.moe_alltoall_backend}"

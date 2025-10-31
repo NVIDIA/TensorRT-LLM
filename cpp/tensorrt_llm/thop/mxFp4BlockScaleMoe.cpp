@@ -45,7 +45,8 @@ torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::optional<torch::Tensor>
     std::optional<int64_t> const hidden_size_output, int64_t const local_expert_offset, int64_t const local_num_experts,
     std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim, int64_t const routing_method_type,
     btg::Dtype const dtype, MoeRunnerType& moe_runner, int64_t moeConfigIndex,
-    torch::optional<torch::Tensor> const& topk_weights, torch::optional<torch::Tensor> const& topk_ids)
+    torch::optional<torch::Tensor> const& topk_weights, torch::optional<torch::Tensor> const& topk_ids,
+    torch::optional<torch::Tensor> const& out_tensor)
 {
     TORCH_CHECK(tensorrt_llm::common::isSM100Family(), "Only SM100f is supported by MXFP4 block scale MOE");
     TORCH_CHECK(tile_tokens_dim == 8 || tile_tokens_dim == 16 || tile_tokens_dim == 32 || tile_tokens_dim == 64
@@ -402,9 +403,23 @@ torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::optional<torch::Tensor>
             output2_scale_scalar->sizes()[0] == local_num_experts, "output2_scales_scalar has incorrect dim 0.");
     }
 
-    // allocate output
-    at::Tensor output = at::detail::empty_cuda({args.num_tokens, args.hidden_size_output.value()},
-        at::ScalarType::BFloat16, hidden_states.device(), std::nullopt);
+    // allocate or use provided output
+    at::Tensor output;
+    if (out_tensor.has_value())
+    {
+        TORCH_CHECK(out_tensor->scalar_type() == at::ScalarType::BFloat16, "out_tensor must be bfloat16.");
+        TORCH_CHECK(out_tensor->dim() == 2, "out_tensor must be 2D.");
+        TORCH_CHECK(
+            out_tensor->sizes()[0] == args.num_tokens && out_tensor->sizes()[1] == args.hidden_size_output.value(),
+            "out_tensor has incorrect shape.");
+        TORCH_CHECK(out_tensor->device() == hidden_states.device(), "out_tensor must be on the same device as inputs.");
+        output = out_tensor.value();
+    }
+    else
+    {
+        output = at::detail::empty_cuda({args.num_tokens, args.hidden_size_output.value()}, at::ScalarType::BFloat16,
+            hidden_states.device(), std::nullopt);
+    }
 
     // setup workspace
     workspace.total_num_padded_tokens = total_num_padded_tokens.data_ptr<int>();
@@ -513,7 +528,8 @@ public:
             gemm1_weights, gemm1_weights_scale, gemm1_bias, gemm1_alpha, gemm1_beta, gemm1_clamp_limit, gemm2_weights,
             gemm2_weights_scale, gemm2_bias, std::nullopt, std::nullopt, std::nullopt, num_experts, top_k, n_group,
             topk_group, intermediate_size, std::nullopt, local_expert_offset, local_num_experts, routed_scaling_factor,
-            tileN, routing_method_type, mDtypeAct, *mRunners[tileN], config, topk_weights, topk_ids);
+            tileN, routing_method_type, mDtypeAct, *mRunners[tileN], config, topk_weights, topk_ids,
+            /*out_tensor=*/torch::nullopt); // TODO: Support user-provided output
     }
 
 private:
@@ -574,7 +590,8 @@ public:
         std::optional<int64_t> const n_group, std::optional<int64_t> const topk_group, int64_t intermediate_size,
         std::optional<int64_t> const hidden_size_output, int64_t local_expert_offset, int64_t local_num_experts,
         std::optional<double> routed_scaling_factor, int64_t routing_method_type, std::vector<int64_t> tile_config_pair,
-        torch::optional<torch::Tensor> const& topk_weights, torch::optional<torch::Tensor> const& topk_ids)
+        torch::optional<torch::Tensor> const& topk_weights, torch::optional<torch::Tensor> const& topk_ids,
+        torch::optional<torch::Tensor> const& out_tensor)
     {
         // tile_config_pair corresponds to pair (tileN, config)
         auto [tileN, config] = std::tie(tile_config_pair[0], tile_config_pair[1]);
@@ -597,7 +614,7 @@ public:
             gemm2_weights_scale, gemm2_bias, output1_scale_scalar, output1_scale_gate_scalar, output2_scale_scalar,
             num_experts, top_k, n_group, topk_group, intermediate_size, hidden_size_output, local_expert_offset,
             local_num_experts, routed_scaling_factor, tileN, routing_method_type, mDtypeAct, *mRunners[tileN], config,
-            topk_weights, topk_ids);
+            topk_weights, topk_ids, out_tensor);
     }
 
 private:
