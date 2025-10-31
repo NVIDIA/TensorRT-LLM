@@ -596,7 +596,7 @@ class DeepseekV32Attention(MLA):
         if model_config.get_quant_config().quant_algo == QuantAlgo.NVFP4:
             # TODO: merge these two fuse flags
             self.fuse_a_indexer_k_weight = True
-            self.fuse_indexer_q_b = True
+            self.fuse_indexer_q_b = False
         else:
             self.fuse_a_indexer_k_weight = False
             self.fuse_indexer_q_b = False
