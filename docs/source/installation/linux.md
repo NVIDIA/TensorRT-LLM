@@ -13,7 +13,7 @@
    make sure `CUDA_HOME` environment variable is properly set.
 
    ```bash
-   # By default, PyTorch is installed with CUDA 12.8 support. To enable LLM features, install the PyTorch version built for CUDA 13.0.
+   # By default, PyTorch CUDA 12.8 package is installed. Install PyTorch CUDA 13.0 package to align with the CUDA version used for building TensorRT LLM wheels.
    pip3 install torch==2.9.0 torchvision --index-url https://download.pytorch.org/whl/cu130
 
    sudo apt-get -y install libopenmpi-dev
