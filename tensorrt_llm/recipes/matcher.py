@@ -71,13 +71,13 @@ def load_recipe_file(recipe_path: str) -> Dict[str, Any]:
 
 
 def find_recipe_files() -> list[Path]:
-    """Find all recipe YAML files in the examples directory.
+    """Find all recipe YAML files in the db directory.
 
     Returns:
         List of Path objects pointing to recipe files
     """
     # Get the directory where this file is located
-    recipes_dir = Path(__file__).parent / "examples"
+    recipes_dir = Path(__file__).parent / "db"
 
     if not recipes_dir.exists():
         return []

@@ -1,0 +1,1 @@
+- perf/test_perf.py::test_perf[recipe-gptoss-fp4-h100-throughput]

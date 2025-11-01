@@ -29,7 +29,7 @@ trtllm-configure \
 
 ```bash
 trtllm-configure \
-    --recipe tensorrt_llm/recipes/examples/gptoss-fp4-h100-throughput.yaml \
+    --recipe tensorrt_llm/recipes/db/gptoss-fp4-h100-throughput.yaml \
     --output config.yaml
 ```
 
@@ -93,7 +93,7 @@ overrides:
 
 ## Example Recipes
 
-See the `examples/` directory for validated recipes:
+See the `db/` directory for validated recipes:
 - `gptoss-fp4-h100-throughput.yaml` - GPT-OSS 120B on H100 GPUs
 - `dsr1-fp4-b200-throughput.yaml` - DeepSeek-R1 FP4 on B200 GPUs
 
@@ -135,7 +135,7 @@ Generate a config file, then use it with trtllm-serve:
 ```bash
 # Generate config
 trtllm-configure \
-    --recipe tensorrt_llm/recipes/examples/gptoss-fp4-h100-throughput.yaml \
+    --recipe tensorrt_llm/recipes/db/gptoss-fp4-h100-throughput.yaml \
     --output config.yaml
 
 # Use with serve (set env vars manually)
@@ -152,11 +152,11 @@ TRTLLM_ENABLE_PDL=1 NCCL_GRAPH_REGISTER=0 \
 
 ```bash
 # Recipe YAML provides everything: config, env vars, and serves as deployment descriptor
-trtllm-serve --extra_llm_api_options tensorrt_llm/recipes/examples/gptoss-fp4-h100-throughput.yaml
+trtllm-serve --extra_llm_api_options tensorrt_llm/recipes/db/gptoss-fp4-h100-throughput.yaml
 
 # CLI flags override recipe values (priority: CLI > recipe > defaults)
 trtllm-serve --tp_size 4 \
-    --extra_llm_api_options tensorrt_llm/recipes/examples/gptoss-fp4-h100-throughput.yaml
+    --extra_llm_api_options tensorrt_llm/recipes/db/gptoss-fp4-h100-throughput.yaml
 ```
 
 **Benefits of using recipe YAMLs directly:**
@@ -184,7 +184,7 @@ When using recipe YAMLs with serve/bench:
 
 To contribute a new recipe:
 
-1. Create a YAML file in `examples/`
+1. Create a YAML file in `db/`
 2. Test the configuration with your model
 3. Submit a PR with CI test results
 4. Document any specific requirements or constraints

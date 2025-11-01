@@ -228,7 +228,7 @@ def configure(
     \b
     # Load from an existing recipe file
     trtllm-configure \\
-        --recipe examples/gptoss-fp4-h100.yaml \\
+        --recipe tensorrt_llm/recipes/db/gptoss-fp4-h100-throughput.yaml \\
         --output config.yaml
     """
     try:

@@ -940,6 +940,10 @@ class PerfTestConfig:
         self.server_configs = []
         self.server_client_configs = {}
 
+        # Used for recipe-based tests
+        # recipe_file: Name of recipe YAML file in tensorrt_llm/recipes/db/
+        self.recipe_file = None
+
     def _to_string_disagg(self, entries: List[str]):
         entries.append(f"disagg_server")
         if self.ctx_tp_size > 1:
@@ -963,6 +967,10 @@ class PerfTestConfig:
                   custom_input_len: int = None,
                   custom_output_len: int = None,
                   device_subtype: str = None) -> str:
+
+        # Used for recipe-based tests
+        if self.recipe_file is not None:
+            return f"recipe-{self.recipe_file}"
 
         # Used for perf sanity test
         if self.config_file is not None:
@@ -1141,6 +1149,15 @@ class PerfTestConfig:
 
         # Extract configs from test param labels.
         labels = test_param_labels.split("-")
+
+        # Used for recipe-based tests
+        if labels[0] == "recipe":
+            assert len(labels) >= 2, "recipe test must specify recipe file!"
+            self.runtime = "bench"
+            # Reconstruct full recipe filename (everything after "recipe-")
+            self.recipe_file = "-".join(labels[1:])
+            # Recipe provides all config, no further parsing needed
+            return
 
         # Used for perf sanity test
         if "perf_sanity" in labels[0]:
@@ -1694,6 +1711,22 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         return data_cmd
 
     def get_trtllm_bench_command(self, engine_dir):
+        # Handle recipe-based tests
+        if self._config.recipe_file:
+            recipe_path = os.path.join(self._llm_root,
+                                       "tensorrt_llm/recipes/db",
+                                       f"{self._config.recipe_file}.yaml")
+            # Recipe provides model, config, and all parameters
+            # We only need dataset and report paths
+            dataset_path = os.path.join(engine_dir, "synthetic_data.json")
+            report_path = os.path.join(engine_dir, "report.json")
+            benchmark_cmd = [
+                self._benchmark_script, "throughput",
+                f"--dataset={dataset_path}", f"--report_json={report_path}",
+                f"--extra_llm_api_options={recipe_path}"
+            ]
+            return benchmark_cmd
+
         model_dir = self.get_trtllm_bench_model()
         model_name = self._config.model_name
         dataset_path = os.path.join(engine_dir, "synthetic_data.json")
