@@ -25,7 +25,6 @@ from tensorrt_llm.mapping import CpType, Mapping
 from ..attention_backend import get_sparse_attn_kv_cache_manager
 from ..model_config import ModelConfig
 from ..speculative import get_num_extra_kv_tokens, get_spec_decoder
-from .config import PyTorchConfig
 from .config_utils import is_mla, is_nemotron_hybrid, is_qwen3_next
 from .guided_decoder import GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
@@ -73,7 +72,7 @@ class KvCacheCreator:
         max_seq_len: int,
         max_batch_size: int,
         kv_cache_config: KvCacheConfig,
-        pytorch_backend_config: PyTorchConfig,
+        llm_args: TorchLlmArgs,
         speculative_config: SpeculativeConfig,
         sparse_attention_config: SparseAttentionConfig,
         profiling_stage_data: Optional[dict],
@@ -86,7 +85,7 @@ class KvCacheCreator:
         self._max_num_tokens = max_num_tokens
         self._max_beam_width = max_beam_width
         self._kv_connector_manager = kv_connector_manager
-        self._pytorch_backend_config = pytorch_backend_config
+        self._llm_args = llm_args
         self._speculative_config = speculative_config
         self._sparse_attention_config = sparse_attention_config
         self._tokens_per_block = tokens_per_block
@@ -248,9 +247,8 @@ class KvCacheCreator:
         # estimate_max_kv_cache_tokens submits self._dummy_reqs
         num_cache_blocks = 0
         num_extra_tokens_per_seq = 1  # account for generated tokens
-        pytorch_backend_config = self._pytorch_backend_config
         spec_cfg = self._speculative_config
-        if not pytorch_backend_config.disable_overlap_scheduler:
+        if not self._llm_args.disable_overlap_scheduler:
             num_extra_tokens_per_seq = num_extra_tokens_per_seq + 1
             if spec_cfg is not None:
                 num_extra_tokens_per_seq += spec_cfg.max_total_draft_tokens
@@ -653,7 +651,7 @@ def create_py_executor_instance(
     dist,
     resources,
     mapping,
-    pytorch_backend_config,
+    llm_args,
     ctx_chunk_config,
     model_engine,
     start_worker,
@@ -679,7 +677,7 @@ def create_py_executor_instance(
         f"max_seq_len={max_seq_len}, max_num_requests={max_batch_size}, max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}"
     )
 
-    for key, value in pytorch_backend_config.extra_resource_managers.items():
+    for key, value in llm_args.extra_resource_managers.items():
         if key in resources:
             raise ValueError(
                 f"Cannot overwrite existing resource manager {key}.")
@@ -804,8 +802,7 @@ def create_py_executor_instance(
         drafter=drafter,
         dist=dist,
         max_num_sequences=max_num_sequences,
-        disable_overlap_scheduler=pytorch_backend_config.
-        disable_overlap_scheduler,
+        disable_overlap_scheduler=llm_args.disable_overlap_scheduler,
         max_batch_size=max_batch_size,
         max_beam_width=max_beam_width,
         max_draft_len=spec_config.max_draft_len
@@ -840,13 +837,11 @@ def create_torch_sampler_args(mapping: Mapping, *, max_seq_len: int,
     )
 
 
-def instantiate_sampler(engine: PyTorchModelEngine,
-                        pytorch_backend_config: PyTorchConfig, mapping: Mapping,
-                        max_batch_size: int, max_beam_width: int,
-                        max_seq_len: int, mm_encoder_only: bool,
-                        speculative_config: SpeculativeConfig,
-                        decoding_config: trtllm.DecodingConfig,
-                        kv_cache_config: KvCacheConfig):
+def instantiate_sampler(
+        engine: PyTorchModelEngine, llm_args: TorchLlmArgs, mapping: Mapping,
+        max_batch_size: int, max_beam_width: int, max_seq_len: int,
+        mm_encoder_only: bool, speculative_config: SpeculativeConfig,
+        decoding_config: trtllm.DecodingConfig, kv_cache_config: KvCacheConfig):
     sampler_args = create_torch_sampler_args(
         mapping,
         max_seq_len=engine.max_seq_len,
@@ -856,7 +851,7 @@ def instantiate_sampler(engine: PyTorchModelEngine,
     decoding_mode = get_decoding_mode(decoding_config=decoding_config,
                                       max_beam_width=max_beam_width)
     if mapping.cp_config.get('cp_type') == CpType.STAR:
-        assert pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
+        assert llm_args.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
         return TorchSampler(sampler_args)
     if engine.spec_config is not None and engine.spec_config.spec_dec_mode.has_spec_decoder(
     ):
@@ -865,15 +860,15 @@ def instantiate_sampler(engine: PyTorchModelEngine,
     if mm_encoder_only:
         # NOTE: handle model outputs specially for mm encoder executor/engine
         return EarlyStopWithMMResult()
-    if pytorch_backend_config.sampler_type == SamplerType.TRTLLMSampler or (
-            pytorch_backend_config.sampler_type == SamplerType.auto
+    if llm_args.sampler_type == SamplerType.TRTLLMSampler or (
+            llm_args.sampler_type == SamplerType.auto
             and decoding_mode.isBeamSearch()):
         logger.debug(f"DecodingMode: {decoding_mode.name}")
         return TRTLLMSampler(engine.model,
                              engine.dtype,
                              mapping,
                              decoding_mode,
-                             pytorch_backend_config.disable_overlap_scheduler,
+                             llm_args.disable_overlap_scheduler,
                              max_seq_len=max_seq_len,
                              max_batch_size=max_batch_size,
                              max_beam_width=max_beam_width,
@@ -935,7 +930,12 @@ def _try_infer_num_experts(model_config: ModelConfig) -> int:
     return num_experts
 
 
-def _adjust_torch_mem_fraction(pytorch_backend_config: PyTorchConfig):
+def _adjust_torch_mem_fraction():
+    # If true, adjust PyTorch CUDA memory fraction to correspond to the
+    # total GPU memory minus the statically allocated engine memory.
+    # If false, set the PyTorch CUDA memory fraction to 1.0.
+    _limit_torch_cuda_mem_fraction: bool = True
+
     # FIXME: PyTorch only uses the garbage_collection_threshold setting
     #        if a memory fraction is set, cf.
     #   https://github.com/pytorch/pytorch/blob/cd995bfb2aac8891465809be3ce29543bd524287/c10/cuda/CUDACachingAllocator.cpp#L1357
@@ -964,7 +964,7 @@ def _adjust_torch_mem_fraction(pytorch_backend_config: PyTorchConfig):
     #       lead PyTorch to release all unused memory before hitting the set fraction. This
     #       still mitigates OOM, although at a higher performance impact, because it
     #       effectively resets the allocator cache.
-    if not pytorch_backend_config._limit_torch_cuda_mem_fraction:
+    if not _limit_torch_cuda_mem_fraction:
         return
     mem_reserved = torch.cuda.memory_reserved()
     mem_free, mem_total = torch.cuda.mem_get_info()
