@@ -11,6 +11,7 @@ import com.nvidia.bloom.SlurmConfig
 import com.nvidia.bloom.SlurmCluster
 import com.nvidia.bloom.SlurmPartition
 import com.nvidia.bloom.Utils
+import com.nvidia.bloom.ContainerRuntime
 import org.jenkinsci.plugins.workflow.cps.CpsThread
 import org.jsoup.Jsoup
 import org.jenkinsci.plugins.pipeline.modeldefinition.Utils as jUtils
@@ -140,7 +141,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
 
         pipeline.stage('Submit Test Results') {
             sh "mkdir -p ${stageName}"
-            def resultsFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/results/results.xml"
+            def resultsFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/results.xml"
             def downloadResultCmd = "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${resultsFilePath} ${stageName}/"
             downloadSucceed = sh(script: downloadResultCmd, returnStatus: true) == 0
             if (downloadSucceed) {
@@ -494,11 +495,16 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String nodeName, St
 
         Utils.exec(pipeline, script: "echo Sleeping to allow Slurm job termination; sleep 30")
 
+        def entrypoint = SlurmConfig.containerRuntimeToEntrypoint[cluster.containerRuntime]
+        def cleanupCommands = [
+            "rm -rf /home/svc_tensorrt/bloom/scripts/agent-${nodeName}.jar /home/svc_tensorrt/bloom/scripts/${nodeName}-${entrypoint} || true",
+            "rm -rf /lustre/fs1/portfolios/coreai/projects/coreai_tensorrt_ci/users/svc_tensorrt/containers/container-${slurmJobID}.sqsh || true",
+        ].join(" && ")
         Utils.exec(
             pipeline,
             script: Utils.sshUserCmd(
                 remote,
-                "\"rm -rf /home/svc_tensorrt/bloom/scripts/agent-${nodeName}.jar /home/svc_tensorrt/bloom/scripts/${nodeName}-slurm_jenkins_agent_setup.sh || true\""
+                "\"${cleanupCommands}\""
             )
         )
 
@@ -510,6 +516,8 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
 {
     SlurmPartition partition = SlurmConfig.partitionConfig[platform] as SlurmPartition
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
+
+    def entrypoint = SlurmConfig.containerRuntimeToEntrypoint[cluster.containerRuntime]
 
     // Create a unique suffix for the node name and workspace
     String customSuffix = "${env.BUILD_TAG}-${UUID.randomUUID().toString().replaceAll("-", "").substring(0, 6)}".toLowerCase()
@@ -536,22 +544,28 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
             stage('Request Node via SLURM') {
                 println("Selected Cluster: ${cluster.name}")
 
-                def jenkinsSetupPath = Utils.copyLibraryResource(pipeline, "slurm_jenkins_agent_setup.sh")
+                def jenkinsSetupPath = Utils.copyLibraryResource(pipeline, entrypoint)
 
                 Utils.exec(pipeline, script: "chmod +x ${jenkinsSetupPath}", returnStdout: true)
 
-                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${jenkinsSetupPath} ${remote.user}@${remote.host}:~/bloom/scripts/${nodeName}-slurm_jenkins_agent_setup.sh", numRetries: 3)
+                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${jenkinsSetupPath} ${remote.user}@${remote.host}:~/bloom/scripts/${nodeName}-${entrypoint}", numRetries: 3)
 
                 Utils.exec(pipeline, script: "cat ${jenkinsSetupPath}")
 
                 Utils.exec(pipeline, script: "echo Sleeping before Slurm job submission; sleep \$((RANDOM % 29 + 1))")
 
+                // Specific for OCI machines
+                def mounts = [
+                    "/lustre/fs1/portfolios/coreai/projects/coreai_tensorrt_ci:/scratch.trt_llm_data:ro",
+                    "/home/svc_tensorrt:/home/svc_tensorrt",
+                    "/home/svc_tensorrt/.cache:/root/.cache"
+                ].join(",")
                 def slurmSubmitOutput = Utils.exec(
                     pipeline,
                     timeout: false,
                     script: Utils.sshUserCmd(
                         remote,
-                        "\"${SlurmConfig.generateCommand(cluster, partition, nodeSecret, nodeName, Jenkins.instance.rootUrl)}\""
+                        "\"${SlurmConfig.generateCommand(cluster, partition, nodeSecret, nodeName, Jenkins.instance.rootUrl, LLM_DOCKER_IMAGE, mounts)}\""
                     ),
                     returnStdout: true,
                     numRetries: 3
@@ -648,6 +662,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
 
                 if (partition.clusterName == "dlcluster") {
                     dockerArgs += " -e NVIDIA_IMEX_CHANNELS=0"
+                    dockerArgs += " --device=/dev/gdrdrv:/dev/gdrdrv"
                 }
                 echo "Final dockerArgs: ${dockerArgs}"
             } else {
@@ -655,7 +670,14 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
             }
         }
 
-        slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, true)
+        slurmRunner = null
+        if (cluster.containerRuntime == ContainerRuntime.DOCKER) {
+            slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, true)
+        } else if (cluster.containerRuntime == ContainerRuntime.ENROOT) {
+            slurmRunner = runInEnrootOnNode(nodeName)
+        } else {
+            throw new Exception("Unsupported container runtime: ${cluster.containerRuntime}")
+        }
         executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner)
     } finally {
         stage("Clean up SLURM Resources") {
@@ -1296,14 +1318,14 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     kubernetes.io/os: linux
                     nvidia.com/gpu_type: ${gpuType}"""
         } else if (perfMode && !hasMultipleGPUs) {
-        // Not using the "perf" node currently due to hardware resource constraint.
         // Use single GPU machine with "tensorrt/test_type: perf" for stable perf testing.
         // H100 / A100 single GPU machine has this unique label in TensorRT Blossom pool.
             selectors = """
                     kubernetes.io/arch: ${arch}
                     kubernetes.io/os: linux
                     nvidia.com/gpu_type: ${gpuType}
-                    nvidia.com/driver_version: '${driverVersion}'"""
+                    nvidia.com/driver_version: '${driverVersion}'
+                    tensorrt/test_type: perf"""
         }
         else
         {
@@ -2171,6 +2193,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             cat ${coverageConfigFile}
         """
         echoNodeAndGpuInfo(pipeline, stageName)
+        // Some clusters do not allow dmesg -C so we add || true
         sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C || true; fi'
         def pytestCommand = getPytestBaseCommandLine(
             llmSrc,
@@ -2506,6 +2529,17 @@ def runInDockerOnNodeMultiStage(image, label, dockerArgs, needToDeleteDir=true)
                 } else {
                     throw e // Re-throw if it's a different Exception
                 }
+            }
+        }
+    }
+}
+
+def runInEnrootOnNode(label)
+{
+    return {
+        runner -> node(label) {
+            timeout(time: SlurmConfig.DEFAULT_TIMEOUT_SHORT, unit: 'MINUTES') {
+                runner()
             }
         }
     }
@@ -3247,6 +3281,8 @@ pipeline {
         // force datasets to be offline mode, to prevent CI jobs are downloading HF dataset causing test failures
         HF_DATASETS_OFFLINE=1
         CMAKE_POLICY_VERSION_MINIMUM="3.5"
+        OPEN_SEARCH_DB_BASE_URL=credentials("open_search_db_base_url")
+        OPEN_SEARCH_DB_CREDENTIALS=credentials("open_search_db_credentials")
     }
     stages {
         stage("Setup environment")

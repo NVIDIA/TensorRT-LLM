@@ -42,21 +42,22 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
-BlockRange getBlockRangeForSending(
-    BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest, BlockKey const& lastBlockKey, int32_t indexFromEnd)
+BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
+    BlockKey const& lastBlockKey, int32_t indexFromEnd, bool recvSideHasCP)
 {
     auto poolNum = cacheManager->getBlockManager().getNumPools();
-    if (poolNum > 1 || !cacheManager->isEnableBlockReuse() || lastBlockKey.uniqueTokens.size() == 0)
+    // Note: When recv side has CP, the requested seqLen is lesser than seqLen on the sender side as seqLen is
+    // distributed among CP ranks. So, we transfer all blocks from send side.
+    if (poolNum > 1 || !cacheManager->isEnableBlockReuse() || lastBlockKey.uniqueTokens.size() == 0 || recvSideHasCP)
     {
         // disable reuse path, and vwsa don't support reuse.
         bool needSendAllForWindow = common::getEnvKVCacheTransferAllBlocksForWindow();
 
         auto blockRange = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId);
-        // auto inputLen = llmRequest.getPromptLen();
 
         auto const& windowsMetadata = cacheManager->getBlockManager().getWindowSizesMetadata();
 
-        if ((windowsMetadata.size() == 1 || needSendAllForWindow))
+        if (windowsMetadata.size() == 1 || needSendAllForWindow || recvSideHasCP)
         {
             return blockRange;
         }
@@ -85,10 +86,11 @@ BlockRange getBlockRangeForSending(
 }
 
 BlockRange getBlockRangeForReceiving(
-    BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest, bool srcEnableBlockReuse)
+    BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest, bool srcEnableBlockReuse, bool recvSideHasCP)
 {
     auto poolNum = cacheManager->getBlockManager().getNumPools();
-    if (poolNum == 1 && srcEnableBlockReuse)
+    // Note: When recv side has CP, we request all blocks from send side right now.
+    if (poolNum == 1 && srcEnableBlockReuse && !recvSideHasCP)
     {
         // Build from all block ids, then slice off the reused blocks so we only transfer newly allocated ones.
         auto windowSize = cacheManager->getBlockManager().getWindowSizesMetadata().begin()->first;
@@ -121,9 +123,8 @@ BlockRange getBlockRangeForReceiving(
     }
 
     auto const& windowsMetadata = cacheManager->getBlockManager().getWindowSizesMetadata();
-    if (windowsMetadata.size() == 1 || common::getEnvKVCacheTransferAllBlocksForWindow())
+    if (windowsMetadata.size() == 1 || common::getEnvKVCacheTransferAllBlocksForWindow() || recvSideHasCP)
     {
-
         return BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId);
     }
     auto blockRange = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId);

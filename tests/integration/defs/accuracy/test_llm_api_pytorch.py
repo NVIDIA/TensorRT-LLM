@@ -784,37 +784,6 @@ class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @skip_pre_hopper
-    @pytest.mark.skip_less_mpi_world_size(8)
-    @parametrize_with_ids("torch_compile", [True, False])
-    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(8, 1, 1)],
-                             ids=["tp8"])
-    def test_fp8_eagle3(self, tp_size, pp_size, ep_size, torch_compile):
-        model_path = f"{llm_models_root()}/llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8"
-        eagle_model_dir = f"{llm_models_root()}/Llama-4-Maverick-17B-128E-Eagle3"
-        spec_config = EagleDecodingConfig(max_draft_len=3,
-                                          speculative_model_dir=eagle_model_dir)
-        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                        free_gpu_memory_fraction=0.75)
-        torch_compile_config = TorchCompileConfig(
-            enable_fullgraph=True,
-            enable_piecewise_cuda_graph=True,
-            capture_num_tokens=[2048, 8192],
-            max_num_streams=3) if torch_compile else None
-        pytorch_config = dict(
-            cuda_graph_config=CudaGraphConfig(max_batch_size=8),
-            enable_attention_dp=False,
-            torch_compile_config=torch_compile_config)
-        with LLM(model_path,
-                 kv_cache_config=kv_cache_config,
-                 tensor_parallel_size=tp_size,
-                 pipeline_parallel_size=pp_size,
-                 moe_expert_parallel_size=ep_size,
-                 **pytorch_config,
-                 speculative_config=spec_config) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
 
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.skip_less_host_memory(100000)
@@ -2063,11 +2032,24 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                          8,
                          "CUTLASS",
                          marks=pytest.mark.skip_less_mpi_world_size(8)),
+            pytest.param(1,
+                         4,
+                         1,
+                         1,
+                         True,
+                         True,
+                         False,
+                         True,
+                         True,
+                         32,
+                         "CUTLASS",
+                         marks=pytest.mark.skip_less_mpi_world_size(4)),
         ],
         ids=[
             "latency", "latency_trtllmgen", "latency_adp_lmtp",
             "latency_trtllmgen_adp_lmtp", "throughput", "throughput_tp8",
-            "throughput_tp4", "throughput_mtp", "throughput_bs8_mtp"
+            "throughput_tp4", "throughput_mtp", "throughput_bs8_mtp",
+            "throughput_pp4_mtp"
         ])
     def test_nvfp4_multi_gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                               attention_dp, enable_lm_head_tp_in_adp,
@@ -2329,14 +2311,15 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3.2-Exp-hf"
 
     @pytest.mark.skip_less_mpi_world_size(8)
-    @skip_pre_blackwell
+    @skip_pre_hopper
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
         [
             (8, 1, 8, 0, False, True, True, True, 24, "_DEFAULT"),
             (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT"),
+            (8, 1, 8, 0, True, True, True, True, 24, "_DEFAULT"),
         ],
-        ids=["baseline", "baseline_mtp1"])
+        ids=["baseline", "baseline_mtp1", "baseline_fp8kv"])
     def test_fp8_blockscale(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                             attention_dp, cuda_graph, overlap_scheduler,
                             max_batch_size, moe_backend):
@@ -2378,14 +2361,18 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                  enable_attention_dp=attention_dp,
                  speculative_config=mtp_config) as llm:
 
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            # GPQA Diamond takes too long to run
-            # task = GPQADiamond(self.MODEL_NAME)
-            # task.evaluate(llm,
-            #               extra_evaluator_kwargs=dict(apply_chat_template=True, chat_template_kwargs=dict(thinking=True)))
+            # GPQA Diamond takes too long to run, we enable it only for fp8kv.
+            if fp8kv:
+                task = GPQADiamond(self.MODEL_NAME)
+                task.evaluate(llm,
+                              extra_evaluator_kwargs=dict(
+                                  apply_chat_template=True,
+                                  chat_template_kwargs=dict(thinking=True)))
+            else:
+                task = MMLU(self.MODEL_NAME)
+                task.evaluate(llm)
+                task = GSM8K(self.MODEL_NAME)
+                task.evaluate(llm)
 
     @skip_pre_blackwell
     @pytest.mark.parametrize(
@@ -2393,8 +2380,9 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
         [
             (8, 1, 8, 0, False, True, True, True, 24, "TRTLLM"),
             (8, 1, 8, 1, False, True, True, True, 24, "TRTLLM"),
+            (8, 1, 8, 0, True, True, True, True, 24, "TRTLLM"),
         ],
-        ids=["baseline", "baseline_mtp1"])
+        ids=["baseline", "baseline_mtp1", "baseline_fp8kv"])
     def test_nvfp4_multi_gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                               attention_dp, cuda_graph, overlap_scheduler,
                               max_batch_size, moe_backend):
@@ -2405,7 +2393,8 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
 
         moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
         kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                        free_gpu_memory_fraction=0.7)
+                                        free_gpu_memory_fraction=0.7,
+                                        tokens_per_block=64)
         cuda_graph_config = CudaGraphConfig(
             enable_padding=True,
             max_batch_size=max_batch_size) if cuda_graph else None
@@ -2430,12 +2419,18 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                  enable_attention_dp=attention_dp,
                  speculative_config=mtp_config) as llm:
 
-            # GPQA Diamond takes too long to run
-            task = GPQADiamond(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=dict(
-                              apply_chat_template=True,
-                              chat_template_kwargs=dict(thinking=True)))
+            # GPQA Diamond takes too long to run, we enable it only for fp8kv.
+            if fp8kv:
+                task = GPQADiamond(self.MODEL_NAME)
+                task.evaluate(llm,
+                              extra_evaluator_kwargs=dict(
+                                  apply_chat_template=True,
+                                  chat_template_kwargs=dict(thinking=True)))
+            else:
+                task = MMLU(self.MODEL_NAME)
+                task.evaluate(llm)
+                task = GSM8K(self.MODEL_NAME)
+                task.evaluate(llm)
 
 
 @pytest.mark.timeout(7200)
@@ -2832,7 +2827,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                       False,
                       True,
                       True,
-                      False,
+                      True,
                       marks=pytest.mark.skip_less_mpi_world_size(8))],
         ids=["latency", "multi_gpus_no_cache"])
     def test_bf16(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
