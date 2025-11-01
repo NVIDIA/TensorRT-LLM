@@ -198,17 +198,21 @@ class PyExecutor:
         self.max_beam_width = max_beam_width
         self.max_draft_len = max_draft_len
         self.max_total_draft_tokens = max_total_draft_tokens
-        self.max_num_tokens = model_engine.pytorch_backend_config.max_num_tokens
-        self.print_log = model_engine.pytorch_backend_config.print_iter_log
-        self.enable_iter_perf_stats = model_engine.pytorch_backend_config.enable_iter_perf_stats
-        self.enable_iter_req_stats = model_engine.pytorch_backend_config.enable_iter_req_stats
-        self.stream_interval = model_engine.pytorch_backend_config.stream_interval
-        self.attention_dp_enable_balance = model_engine.pytorch_backend_config.attention_dp_enable_balance
-        self.attention_dp_time_out_iters = model_engine.pytorch_backend_config.attention_dp_time_out_iters
-        self.attention_dp_batching_wait_iters = model_engine.pytorch_backend_config.attention_dp_batching_wait_iters
-        self.batch_wait_timeout_ms = model_engine.pytorch_backend_config.batch_wait_timeout_ms
-        self.batch_wait_timeout_iters = model_engine.pytorch_backend_config.batch_wait_timeout_iters
-        self.batch_wait_max_tokens_ratio = model_engine.pytorch_backend_config.batch_wait_max_tokens_ratio
+        self.llm_args = self.model_engine.llm_args
+        self.max_num_tokens = self.llm_args.max_num_tokens
+        self.print_log = self.llm_args.print_iter_log
+        self.enable_iter_perf_stats = self.llm_args.enable_iter_perf_stats
+        self.enable_iter_req_stats = self.llm_args.enable_iter_req_stats
+        self.stream_interval = self.llm_args.stream_interval
+        self.attention_dp_enable_balance = (
+            self.llm_args.attention_dp_config is not None
+            and self.llm_args.attention_dp_config.enable_balance)
+        if self.attention_dp_enable_balance:
+            self.attention_dp_time_out_iters = self.llm_args.attention_dp_config.timeout_iters
+            self.attention_dp_batching_wait_iters = self.llm_args.attention_dp_config.batching_wait_iters
+        self.batch_wait_timeout_ms = self.llm_args.batch_wait_timeout_ms
+        self.batch_wait_timeout_iters = self.llm_args.batch_wait_timeout_iters
+        self.batch_wait_max_tokens_ratio = self.llm_args.batch_wait_max_tokens_ratio
         self.enable_batch_waiting = self.batch_wait_timeout_iters > 0 or self.batch_wait_max_tokens_ratio > 0
 
         self.num_fetch_requests_cur_rank = 0
