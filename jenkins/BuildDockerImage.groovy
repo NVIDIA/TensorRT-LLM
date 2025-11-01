@@ -586,7 +586,7 @@ pipeline {
                     catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
                         container("python3") {
                             // Install wget
-                            trtllm_utils.llmExecStepWithRetry(this, script: "apt-get update && apt-get -y install wget")
+                            trtllm_utils.llmExecStepWithRetry(this, script: "apt-get update && apt-get install -y wget")
 
                             // Poll for build artifacts
                             def artifactBaseUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/"
