@@ -393,7 +393,7 @@ class TRTLLMGenFusedMoE(MoE):
                     alltoall_info.recv_rank_count_cumsum,
                     runtime_max_tokens_per_rank,
                     top_k,
-                    self.num_slots,
+                    -1,  # Caution: TRTLLM-Gen uses -1 as invalid token expert id
                     self.ep_size,
                 )
 
