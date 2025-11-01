@@ -20,9 +20,8 @@ except ImportError:
 
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManagerType, request_context)
-from tensorrt_llm._utils import (customized_gc_thresholds, gc_nvtx_watcher,
-                                 is_trace_enabled, mpi_disabled, nvtx_range,
-                                 trace_func)
+from tensorrt_llm._utils import (customized_gc_thresholds, is_trace_enabled,
+                                 mpi_disabled, nvtx_range, trace_func)
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats,
@@ -139,7 +138,6 @@ class PyExecutor:
         # profile config
         self.profile_start_iters, self.profile_stop_iters = _load_iteration_indexes(
             PROFILE_START_STOP_ENV_VAR_NAME)
-        self.gc_nvtx_watcher_handle = gc_nvtx_watcher()
 
         # related modules
         self.resource_manager = resource_manager

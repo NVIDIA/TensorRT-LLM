@@ -1218,15 +1218,30 @@ class _GCNvtxHandle:
     """Handle object for GC NVTX watcher to keep it alive."""
 
 
-def gc_nvtx_watcher() -> Optional[_GCNvtxHandle]:
+# Singleton for the GC NVTX watcher handle.
+_gc_watcher_handle: Optional[_GCNvtxHandle] = None
+
+
+def _setup_gc_nvtx_profiling() -> Optional[_GCNvtxHandle]:
     """
-    Set up NVTX range markers for Python garbage collection events.
+    Set up NVTX range markers for Python garbage collection events (singleton).
     This helps in profiling to visualize when GC occurs during execution.
+
+    This function is called automatically at module import time. The environment
+    variable TLLM_PROFILE_RECORD_GC must be set before importing this module.
+
+    This is an internal function and should not be called directly by users.
 
     Returns:
         _GCNvtxHandle or None: A handle object that keeps the GC callback alive,
                                or None if GC profiling is not enabled.
     """
+    global _gc_watcher_handle
+
+    # Return existing handle if already initialized
+    if _gc_watcher_handle is not None:
+        return _gc_watcher_handle
+
     enabled = os.environ.get(PROFILE_RECORD_GC_ENV_VAR_NAME, None)
     if not enabled:
         return None
@@ -1253,4 +1268,10 @@ def gc_nvtx_watcher() -> Optional[_GCNvtxHandle]:
 
     handle = _GCNvtxHandle()
     weakref.finalize(handle, gc_cleanup, gc_callback)
+
+    _gc_watcher_handle = handle
     return handle
+
+
+# Initialize GC NVTX profiling singleton at module import time
+_setup_gc_nvtx_profiling()
