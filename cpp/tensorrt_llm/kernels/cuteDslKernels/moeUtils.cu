@@ -166,4 +166,88 @@ INSTANTIATE_MOE_PERMUTE(__nv_fp4_e2m1, uint8_t);
 #endif
 #undef INSTANTIATE_MOE_PERMUTE
 
+template <typename InputType, int32_t kThreadsPerBlock>
+__global__ void moeUnpermuteKernel(InputType const* permuted_input, InputType* output,
+    int32_t const* expanded_idx_to_permuted_idx, int32_t const hidden_size, int32_t const top_k)
+{
+    int32_t constexpr kElemPerCopy = elemPerCopy<InputType>();
+    InputType rmemAcc[kElemPerCopy];
+    InputType rmem[kElemPerCopy];
+
+    int32_t const token_idx = blockIdx.x;
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.wait;");
+#endif
+
+    auto* dst_ptr = reinterpret_cast<ElemCopyType*>(output) + token_idx * hidden_size / kElemPerCopy;
+    for (int32_t i = threadIdx.x; i < hidden_size / kElemPerCopy; i += kThreadsPerBlock)
+    {
+#pragma unroll
+        for (int32_t j = 0; j < kElemPerCopy; j++)
+        {
+            rmemAcc[j] = 0;
+        }
+        for (int32_t k = 0; k < top_k; k++)
+        {
+            int32_t const permuted_idx = expanded_idx_to_permuted_idx[token_idx * top_k + k];
+            if (permuted_idx < 0)
+            {
+                continue;
+            }
+            auto const* src_ptr
+                = reinterpret_cast<ElemCopyType const*>(permuted_input) + permuted_idx * hidden_size / kElemPerCopy;
+            *reinterpret_cast<ElemCopyType*>(rmem) = src_ptr[i];
+
+#pragma unroll
+            for (int32_t j = 0; j < kElemPerCopy; j++)
+            {
+                rmemAcc[j] += rmem[j];
+            }
+        }
+        dst_ptr[i] = *reinterpret_cast<ElemCopyType*>(rmemAcc);
+    }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
+
+template <typename InputType>
+void moeUnpermute(InputType const* permuted_input, InputType* output, int32_t const* expanded_idx_to_permuted_idx,
+    int32_t const num_tokens, int32_t const hidden_size, int32_t const top_k, cudaStream_t stream)
+{
+    int32_t constexpr kThreadsPerBlock = 256;
+    int32_t constexpr kElemPerCopy = elemPerCopy<InputType>();
+    TLLM_CHECK_WITH_INFO(hidden_size % kElemPerCopy == 0, "hidden_size must be divisible by %d.", kElemPerCopy);
+
+    int32_t const blocks = num_tokens;
+    int32_t const threads = kThreadsPerBlock;
+
+    auto kernel = &moeUnpermuteKernel<InputType, kThreadsPerBlock>;
+
+    cudaLaunchConfig_t config;
+    config.gridDim = blocks;
+    config.blockDim = threads;
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    config.numAttrs = 1;
+    config.attrs = attrs;
+    cudaLaunchKernelEx(&config, kernel, permuted_input, output, expanded_idx_to_permuted_idx, hidden_size, top_k);
+}
+
+#define INSTANTIATE_MOE_UNPERMUTE(InputType)                                                                           \
+    template void moeUnpermute<InputType>(InputType const* permuted_input, InputType* output,                          \
+        int32_t const* expanded_idx_to_permuted_idx, int32_t const num_tokens, int32_t const hidden_size,              \
+        int32_t const top_k, cudaStream_t stream)
+
+INSTANTIATE_MOE_UNPERMUTE(half);
+#ifdef ENABLE_BF16
+INSTANTIATE_MOE_UNPERMUTE(__nv_bfloat16);
+#endif
+#undef INSTANTIATE_MOE_UNPERMUTE
+
 } // namespace tensorrt_llm::kernels::cute_dsl
