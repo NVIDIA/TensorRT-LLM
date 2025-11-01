@@ -245,6 +245,7 @@ common-files: &common_files |
         examples/wide_ep/ep_load_balancer/utils.py |
         examples/wide_ep/slurm_scripts/process_gen_iterlog.py |
         jenkins/scripts/mergeWaiveList.py |
+        jenkins/scripts/open_search_db.py |
         jenkins/scripts/test_rerun.py |
         scripts/build_cpp_examples.py |
         scripts/build_wheel.py |
@@ -938,6 +939,8 @@ common-files: &common_files |
         tests/microbenchmarks/all_reduce.py |
         tests/microbenchmarks/build_time_benchmark.py |
         tests/microbenchmarks/build_time_dashboard.py |
+        tests/scripts/allreduce_perf/allreduce_heuristic_code_gen.py |
+        tests/scripts/allreduce_perf/allreduce_perf_viz.py |
         tests/scripts/iteration_log_parser.py |
         tests/scripts/perf-sanity/parse_benchmark_results.py |
         tests/scripts/perf-sanity/run_benchmark_serve.py |
@@ -1090,6 +1093,8 @@ common-files: &common_files |
         tests/unittest/gc_utils.py |
         tests/unittest/llmapi/__init__.py |
         tests/unittest/llmapi/_run_mpi_comm_task.py |
+        tests/unittest/llmapi/_run_multi_llm_tasks.py |
+        tests/unittest/llmapi/_run_multi_mpi_comm_tasks.py |
         tests/unittest/llmapi/apps/__init__.py |
         tests/unittest/llmapi/apps/_test_disagg_serving_multi_nodes.py |
         tests/unittest/llmapi/apps/_test_llm_chat.py |
@@ -1311,6 +1316,7 @@ common-files: &common_files |
         tests/unittest/utils/llm_data.py |
         tests/unittest/utils/runtime_defaults.py |
         tests/unittest/utils/test_medusa_utils.py |
+        tests/unittest/utils/test_prebuilt_whl_cpp_extensions.py |
         tests/unittest/utils/test_util.py |
         tests/unittest/utils/torch_ref.py |
         tests/unittest/utils/util.py |
