@@ -22,24 +22,6 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
-/**
- * @brief Calculate the number of blocks allocated to a specific Context Parallelism (CP) rank.
- *
- * This function determines how many blocks should be allocated to a given CP rank when
- * distributing a total number of blocks across multiple CP ranks. It supports two distribution
- * modes: strict and non-strict.
- *
- * @param cpRank The rank (index) of the current CP process. Must be in range [0, cpSize).
- * @param cpSize The total number of CP ranks/processes in the parallel group.
- * @param numTotalBlocks The total number of blocks to be distributed across all CP ranks.
- * @param strict Flag controlling the distribution strategy:
- *               - true: Use strict round-robin distribution with exact allocation
- *               - false: Use ceiling division which may over-allocate
- *
- * @return The number of blocks allocated to the specified CP rank.
- */
-int getBlockNumAccountingForCP(int cpRank, int cpSize, int numTotalBlocks, bool strict);
-
 // Simple cache block copy. Because it does not involve data splitting or merging, it performs best when the
 // parallel topology is completely identical, making it the preferred method.
 class MLACacheFormatter final : public BaseCacheFormatter
