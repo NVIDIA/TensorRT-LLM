@@ -22,6 +22,7 @@
 #include <stdint.h>
 
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
+#include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 
 namespace tensorrt_llm
 {
@@ -140,6 +141,8 @@ struct MHARunnerFixedParams
     int sageBlockSizeK = 0;
     // v tensor quant block size in sage attention
     int sageBlockSizeV = 0;
+    // Use sparse MLA ?
+    bool useSparseMLA = false;
 
     // Convert to string for debug.
     std::string convertToStrOutput()
@@ -307,6 +310,8 @@ struct MHARunnerParams
     int qMaxNBlock;
     int kMaxNBlock;
     int vMaxNBlock;
+    // sparse attention parameters
+    SparseAttentionParams sparse_params;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
