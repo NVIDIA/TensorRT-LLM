@@ -2109,31 +2109,26 @@ __global__ void convertData(Dst* dst, Src const* src, int64_t size, float const*
     using SrcPack = Vec<Src, packSize>;
     using DstPack = Vec<Dst, packSize>;
     int64_t const stride = packSize * nbThrds;
-    for (int64_t i = tid * packSize; i < size; i += stride)
+
+    int64_t const aligned_size = (size / packSize) * packSize;
+
+    for (int64_t i = tid * packSize; i < aligned_size; i += stride)
     {
-        if (i + packSize < size)
-        {
-            auto const srcPack = reinterpret_cast<SrcPack const&>(src[i]);
-            DstPack dstPack;
+        auto const srcPack = reinterpret_cast<SrcPack const&>(src[i]);
+        DstPack dstPack;
+
 #pragma unroll
-            for (int32_t j = 0; j < packSize; j++)
-            {
-                dstPack[j] = Dst{float{srcPack[j]} * scale};
-            }
-            reinterpret_cast<DstPack&>(dst[i]) = dstPack;
-        }
-        else
+        for (int32_t j = 0; j < packSize; j++)
         {
-#pragma unroll
-            for (int64_t j = 0; j < packSize; j++)
-            {
-                if (i + j >= size)
-                {
-                    break;
-                }
-                dst[i + j] = Dst{float{src[i + j]} * scale};
-            }
+            dstPack[j] = Dst{float{srcPack[j]} * scale};
         }
+
+        reinterpret_cast<DstPack&>(dst[i]) = dstPack;
+    }
+    // Handle tail elements
+#pragma unroll
+    for (int64_t j = aligned_size; j < size; j++){
+        dst[j] = Dst{float{src[j]} * scale};
     }
 }
 
@@ -2343,6 +2338,8 @@ void invokeConversion(Dst* dst, Src const* src, int64_t size, float const* __res
         Dst * dst, Src const* src, int64_t size, float const* __restrict__ scale, cudaStream_t stream)
 INSTANTIATE_invokeConversion(__nv_fp8_e4m3, half);
 INSTANTIATE_invokeConversion(__nv_fp8_e4m3, __nv_bfloat16);
+INSTANTIATE_invokeConversion(half, __nv_fp8_e4m3);
+INSTANTIATE_invokeConversion(__nv_bfloat16, __nv_fp8_e4m3);
 #undef INSTANTIATE_invokeConversion
 
 template <typename T>

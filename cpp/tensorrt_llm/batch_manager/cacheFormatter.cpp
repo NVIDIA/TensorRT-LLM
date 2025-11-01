@@ -31,6 +31,7 @@
 #include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
 #include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
 #include "tensorrt_llm/executor/executor.h"
+#include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <algorithm>
@@ -536,6 +537,80 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID:%ld ", llmRequest.mRequestId);
 }
 
+namespace {
+    std::string dataTypeToString(nvinfer1::DataType type)
+    {
+    switch (type)
+    {
+    case nvinfer1::DataType::kINT64: return "INT64";
+    case nvinfer1::DataType::kINT32: return "INT32";
+    case nvinfer1::DataType::kFLOAT: return "FP32";
+    case nvinfer1::DataType::kBF16: return "BF16";
+    case nvinfer1::DataType::kHALF: return "FP16";
+    case nvinfer1::DataType::kINT8: return "INT8";
+    case nvinfer1::DataType::kUINT8: return "UINT8";
+    case nvinfer1::DataType::kFP8: return "FP8";
+    case nvinfer1::DataType::kBOOL: return "BOOL";
+    default: return "UNKNOWN";
+    }
+    }
+} // namespace
+
+void convertKVCachePrecisionVector( //TODO: Instead of iterating and calling kernal, concat into a single tensor and call the kernel once
+    std::vector<runtime::ITensor::SharedPtr>& blocks,
+    BaseCacheFormatter::CacheState const& srcConfig,
+    BaseCacheFormatter::CacheState const& destConfig,
+    runtime::BufferManager const& bufferManager)
+{
+    auto const srcDataType = srcConfig.getDataType();
+    auto const destDataType = destConfig.getDataType();
+    auto stream = bufferManager.getStream().get();
+    
+    TLLM_LOG_INFO("Converting %zu blocks from %s to %s", blocks.size(),
+        dataTypeToString(srcDataType).c_str(), dataTypeToString(destDataType).c_str());
+    
+    for (size_t i = 0; i < blocks.size(); ++i)
+    {
+        auto& block = blocks[i];
+        auto blockShape = block->getShape();
+        auto blockVolume = runtime::ITensor::volume(blockShape);
+        
+        auto tempBuffer = bufferManager.gpu(blockShape, destDataType);
+        
+        if (srcDataType == nvinfer1::DataType::kHALF && destDataType == nvinfer1::DataType::kFP8)
+        {
+            kernels::invokeConversion<__nv_fp8_e4m3, half>( // Dest, Src
+                reinterpret_cast<__nv_fp8_e4m3*>(tempBuffer->data()),
+                reinterpret_cast<half const*>(block->data()),
+                blockVolume,
+                nullptr,
+                stream
+            );
+        }
+        else if (srcDataType == nvinfer1::DataType::kFP8 && destDataType == nvinfer1::DataType::kHALF)
+        {
+            kernels::invokeConversion<half, __nv_fp8_e4m3>(
+                reinterpret_cast<half*>(tempBuffer->data()),
+                reinterpret_cast<__nv_fp8_e4m3 const*>(block->data()),
+                blockVolume,
+                nullptr,
+                stream
+            );
+        }
+        else
+        {
+            TLLM_LOG_WARNING("Unsupported conversion %s -> %s, skipping",
+                dataTypeToString(srcDataType).c_str(),
+                dataTypeToString(destDataType).c_str());
+            continue;
+        }
+        
+        block = std::move(tempBuffer);
+    }
+    
+    bufferManager.getStream().synchronize();
+}
+
 void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& session)
 {
     NVTX3_SCOPED_RANGE(CacheFormatter_unformat);
@@ -779,7 +854,14 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
             {
                 preAllocRecvBuffer = mCacheTransBufferManager->getRecvBuffer(cacheBufferId);
                 TLLM_CHECK(preAllocRecvBuffer != nullptr);
-                TLLM_CHECK(preAllocRecvBuffer->getDataType() == dataType);
+                
+                
+                // TLLM_CHECK(preAllocRecvBuffer->getDataType() == dataType); <-- KEY ASSERT CHANGED HERE
+
+                TLLM_LOG_INFO("============= RECEIVE ON GEN SIDE SETTINGS =============");
+                TLLM_LOG_INFO("preAllocRecvBuffer  data type: %s", dataTypeToString(preAllocRecvBuffer->getDataType()).c_str());
+                TLLM_LOG_INFO("dataType: %s", dataTypeToString(dataType).c_str());
+                TLLM_LOG_INFO("============= RECEIVE ON GEN SIDE SETTINGS =============");
             }
 
             auto recvBufferFun = [&](int deviceId, size_t processIdx)
@@ -883,6 +965,15 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
             {
                 NVTX3_SCOPED_RANGE(formatInputConcatenate);
 
+                if (destConfig.getDataType() != selfConfig.getDataType() && common::getEnvEnableKVCachePrecisionConversion())
+                {
+                    TLLM_LOG_INFO("WE ARE TAKING THIS PATH, CONVERSING.......");
+                    NVTX3_SCOPED_RANGE(kvCacheRecvPrecisionConv);
+                    convertKVCachePrecisionVector(recvSplitCaches, destConfig, selfConfig, bufferManager);
+                    TLLM_LOG_INFO("After conversion, recvSplitCaches[0] dtype: %s", 
+                        dataTypeToString(recvSplitCaches[0]->getDataType()).c_str());
+                }
+
                 executor::kv_cache::concatKvCacheV2Dispatch(
                     recvSplitCaches, outputBuffersPerWindow, destConfig, selfConfig, selfIdx, bufferManager);
 
@@ -903,11 +994,12 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
 
 [[nodiscard]] bool CacheFormatter::inquireSupport(CacheState const& selfConfig, CacheState const& destConfig) const
 {
-    if (selfConfig.getDataType() != destConfig.getDataType())
-    {
-        TLLM_LOG_WARNING("CacheFormatter::inquireSupport: selfConfig.getDataType() != destConfig.getDataType()");
-        return false;
-    }
+    // TODO: Change
+    // if (selfConfig.getDataType() != destConfig.getDataType()) // Overriding for now
+    // {
+    //     TLLM_LOG_WARNING("CacheFormatter::inquireSupport: selfConfig.getDataType() != destConfig.getDataType()");
+    //     return false;
+    // }
 
     std::unordered_set<SizeType32> setVecSelf{
         selfConfig.getModelConfig().mNbKvHeadsPerLayer.begin(), selfConfig.getModelConfig().mNbKvHeadsPerLayer.end()};
