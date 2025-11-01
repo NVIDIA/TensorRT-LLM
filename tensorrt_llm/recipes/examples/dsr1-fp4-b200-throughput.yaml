@@ -1,0 +1,43 @@
+# DeepSeek-R1 FP4 Recipe for B200 GPUs (High Throughput)
+#
+# This recipe provides optimized settings for running DeepSeek-R1 FP4 models
+# on B200 GPUs targeting high-throughput scenarios with high concurrency.
+#
+# Based on: InferenceMAX/benchmarks/dsr1_fp4_b200_trt_slurm.sh
+
+scenario:
+  model: nvidia/DeepSeek-R1-0528-FP4
+  gpu: B200
+  num_gpus: 8
+  target_isl: 8192
+  target_osl: 1024
+  target_concurrency: 256
+  profile: dsr1-fp4
+
+env: {}
+
+config:
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 512
+  enable_attention_dp: true
+  kv_cache_config:
+    dtype: fp8
+    free_gpu_memory_fraction: 0.8
+    enable_block_reuse: false
+  print_iter_log: true
+  stream_interval: 10
+  moe_config:
+    backend: CUTLASS
+  attention_dp_config:
+    batching_wait_iters: 0
+    enable_balance: true
+    timeout_iters: 60
+
+# Optional overrides section for power users
+# Uncomment and modify as needed
+overrides:
+  # kv_cache_config:
+  #   free_gpu_memory_fraction: 0.85
+  # moe_config:
+  #   backend: TRTLLM

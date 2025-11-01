@@ -84,7 +84,28 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
     kv_cache_config = {}
     if extra_llm_api_options:
         with open(extra_llm_api_options, 'r') as f:
-            llm_args_dict = yaml.safe_load(f)
+            loaded_data = yaml.safe_load(f)
+
+            # Detect recipe format (has 'scenario' and 'config' keys)
+            if isinstance(
+                    loaded_data, dict
+            ) and 'scenario' in loaded_data and 'config' in loaded_data:
+                # Recipe format - extract config section for LLM args
+                llm_args_dict = loaded_data['config']
+
+                # Set environment variables from 'env' section (if not already set)
+                import os
+                env_vars = loaded_data.get('env', {})
+                for key, value in env_vars.items():
+                    if key not in os.environ:
+                        os.environ[key] = str(value)
+                        logger.info(
+                            f"Set environment variable from recipe: {key}={value}"
+                        )
+            else:
+                # Simple format - use loaded data directly
+                llm_args_dict = loaded_data
+
             kv_cache_config = llm_args_dict.get("kv_cache_config", {
                 "dtype": "auto",
             })
