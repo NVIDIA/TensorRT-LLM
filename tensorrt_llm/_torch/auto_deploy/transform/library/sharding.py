@@ -160,28 +160,32 @@ class ShardingTransformExecutor(BaseTransform):
 
 
 def _process_simple_shard(
-    nodes_linear: Dict[Node, List[Node]],
+    nodes_linear: Union[Dict[Node, List[Node]], List[Node]],
     rank: int,
     world_size: int,
     sharding_config: ShardingTransformContainer,
 ) -> int:
     # for every linear node:
     # --> row_split (dim 0 of weight) + all_gather (dim -1 of output)
+    # if nodes_linear is a dict, flatten it to a 1D list of nodes
+
+    if isinstance(nodes_linear, dict):
+        nodes_linear = [n for group in nodes_linear.values() for n in group]
+
     num_simple_shards = 0
-    for node_group in nodes_linear.values():
-        for n in node_group:
-            num_simple_shards += int(
-                sharding_config.add(
-                    WeightShardingInfo.from_node(
-                        n,
-                        split_dim=SplitDimension.COLUMN,
-                        rank=rank,
-                        world_size=world_size,
-                        dist_op="all_gather",
-                        min_local_shape=1,
-                    )
+    for n in nodes_linear:
+        num_simple_shards += int(
+            sharding_config.add(
+                WeightShardingInfo.from_node(
+                    n,
+                    split_dim=SplitDimension.COLUMN,
+                    rank=rank,
+                    world_size=world_size,
+                    dist_op="all_gather",
+                    min_local_shape=1,
                 )
             )
+        )
     return num_simple_shards
 
 

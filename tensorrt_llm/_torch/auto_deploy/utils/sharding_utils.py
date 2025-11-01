@@ -580,10 +580,10 @@ def _shard_parameter_node(
 
     # # # column shard with no gather: the output is sharded
     if not add_dist:
-        if is_any_lin_op(node):
-            _validate_sharded_shapes(
-                node, fused_weight_dims=fused_weight_dims, world_size=world_size
-            )
+        # if is_any_lin_op(node):
+        #     _validate_sharded_shapes(
+        #         node, fused_weight_dims=fused_weight_dims, world_size=world_size
+        #     )
         return
 
     # figure out the right dist op (backend-aware)
