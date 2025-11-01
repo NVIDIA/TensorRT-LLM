@@ -1,3 +1,4 @@
+import os
 from typing import Dict, List, Optional, Union
 
 import torch
@@ -206,8 +207,21 @@ class TRTLLMGenFusedMoE(MoE):
         x_sf = None
         token_selected_experts = None
         token_final_scales = None
+        
+        # Check if ENABLE_PERFECT_ROUTER is enabled for TP attention
+        enable_perfect_router = os.environ.get('ENABLE_PERFECT_ROUTER', '0') == '1'
         x_row = x.shape[0]
         x_col = x.shape[1]
+        
+        # For TP attention with ENABLE_PERFECT_ROUTER, we need to apply routing to get token_selected_experts
+        if not run_post_quant_allgather and enable_perfect_router:
+            # Apply routing to get token_selected_experts and token_final_scales for perfect router
+            token_selected_experts, token_final_scales = self.routing_method.apply(
+                router_logits)
+            token_final_scales = token_final_scales.to(torch.bfloat16)
+            assert token_final_scales.dtype == torch.bfloat16
+            assert token_selected_experts.dtype == torch.int32
+        
         if run_post_quant_allgather:
             # apply routing
             token_selected_experts, token_final_scales = self.routing_method.apply(
