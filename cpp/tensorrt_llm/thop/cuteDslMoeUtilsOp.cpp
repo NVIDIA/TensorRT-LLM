@@ -187,6 +187,44 @@ std::tuple<torch::Tensor, torch::optional<torch::Tensor>> moe_permute(torch::Ten
     return {permuted_output, permuted_sf};
 }
 
+torch::Tensor moe_unpermute(torch::Tensor const& permuted_input, torch::Tensor const& expanded_idx_to_permuted_idx)
+{
+    TORCH_CHECK(permuted_input.dim() == 2, "permuted_input must be 2D.");
+    int64_t const num_permuted_tokens = permuted_input.size(0);
+    int64_t const hidden_size = permuted_input.size(1);
+    TORCH_CHECK(expanded_idx_to_permuted_idx.dim() == 2, "expanded_idx_to_permuted_idx must be 2D.");
+    int64_t const num_tokens = expanded_idx_to_permuted_idx.size(0);
+    int64_t const top_k = expanded_idx_to_permuted_idx.size(1);
+    TORCH_CHECK(num_permuted_tokens >= num_tokens * top_k,
+        "num_permuted_tokens must be greater than or equal to num_tokens * top_k.");
+
+    auto output
+        = torch::empty({num_tokens, hidden_size}, torch::dtype(permuted_input.scalar_type()).device(torch::kCUDA));
+    auto const& stream = at::cuda::getCurrentCUDAStream(permuted_input.get_device());
+
+#define DISPATCH_MOE_UNPERMUTE(InputType)                                                                              \
+    tensorrt_llm::kernels::cute_dsl::moeUnpermute<InputType>(static_cast<InputType*>(permuted_input.data_ptr()),       \
+        static_cast<InputType*>(output.data_ptr()), expanded_idx_to_permuted_idx.data_ptr<int32_t>(), num_tokens,      \
+        hidden_size, top_k, stream)
+
+    if (permuted_input.scalar_type() == torch::kHalf)
+    {
+        DISPATCH_MOE_UNPERMUTE(half);
+    }
+    else if (permuted_input.scalar_type() == torch::kBFloat16)
+    {
+        DISPATCH_MOE_UNPERMUTE(__nv_bfloat16);
+    }
+    else
+    {
+        TORCH_CHECK(false, "Unsupported input dtype: ", permuted_input.scalar_type());
+    }
+
+#undef DISPATCH_MOE_UNPERMUTE
+
+    return output;
+}
+
 } // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -201,8 +239,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "tile_tokens_dim, int routing_method_type) -> Tensor[]");
     m.def(
         "moe_permute(Tensor input, Tensor? input_sf, Tensor permuted_idx_to_expanded_idx, Tensor "
-        "num_non_exiting_tiles, "
-        "int tile_tokens_dim, int top_k) -> (Tensor, Tensor?)");
+        "num_non_exiting_tiles, int tile_tokens_dim, int top_k) -> (Tensor, Tensor?)");
+    m.def("moe_unpermute(Tensor permuted_input, Tensor expanded_idx_to_permuted_idx) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
@@ -210,4 +248,5 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
     m.impl("moe_topk_sort", &torch_ext::moe_topk_sort);
     m.impl("moe_sort", &torch_ext::moe_sort);
     m.impl("moe_permute", &torch_ext::moe_permute);
+    m.impl("moe_unpermute", &torch_ext::moe_unpermute);
 }
