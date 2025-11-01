@@ -166,13 +166,15 @@ INSTANTIATE_MOE_PERMUTE(__nv_fp4_e2m1, uint8_t);
 #endif
 #undef INSTANTIATE_MOE_PERMUTE
 
-template <typename InputType, int32_t kThreadsPerBlock>
+template <typename InputType, typename TopKScaleType, int32_t kThreadsPerBlock>
 __global__ void moeUnpermuteKernel(InputType const* permuted_input, InputType* output,
-    int32_t const* expanded_idx_to_permuted_idx, int32_t const hidden_size, int32_t const top_k)
+    int32_t const* expanded_idx_to_permuted_idx, TopKScaleType const* topk_scales, int32_t const hidden_size,
+    int32_t const top_k)
 {
+    using AccumType = float;
     int32_t constexpr kElemPerCopy = elemPerCopy<InputType>();
-    InputType rmemAcc[kElemPerCopy];
     InputType rmem[kElemPerCopy];
+    AccumType rmemAccum[kElemPerCopy];
 
     int32_t const token_idx = blockIdx.x;
 
@@ -186,11 +188,12 @@ __global__ void moeUnpermuteKernel(InputType const* permuted_input, InputType* o
 #pragma unroll
         for (int32_t j = 0; j < kElemPerCopy; j++)
         {
-            rmemAcc[j] = 0;
+            rmemAccum[j] = 0;
         }
         for (int32_t k = 0; k < top_k; k++)
         {
             int32_t const permuted_idx = expanded_idx_to_permuted_idx[token_idx * top_k + k];
+            TopKScaleType const scale = topk_scales[token_idx * top_k + k];
             if (permuted_idx < 0)
             {
                 continue;
@@ -202,10 +205,15 @@ __global__ void moeUnpermuteKernel(InputType const* permuted_input, InputType* o
 #pragma unroll
             for (int32_t j = 0; j < kElemPerCopy; j++)
             {
-                rmemAcc[j] += rmem[j];
+                rmemAccum[j] += static_cast<AccumType>(rmem[j]) * static_cast<AccumType>(scale);
             }
         }
-        dst_ptr[i] = *reinterpret_cast<ElemCopyType*>(rmemAcc);
+#pragma unroll
+        for (int32_t j = 0; j < kElemPerCopy; j++)
+        {
+            rmem[j] = static_cast<InputType>(rmemAccum[j]);
+        }
+        dst_ptr[i] = *reinterpret_cast<ElemCopyType*>(rmem);
     }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -213,9 +221,10 @@ __global__ void moeUnpermuteKernel(InputType const* permuted_input, InputType* o
 #endif
 }
 
-template <typename InputType>
+template <typename InputType, typename TopKScaleType>
 void moeUnpermute(InputType const* permuted_input, InputType* output, int32_t const* expanded_idx_to_permuted_idx,
-    int32_t const num_tokens, int32_t const hidden_size, int32_t const top_k, cudaStream_t stream)
+    TopKScaleType const* topk_scales, int32_t const num_tokens, int32_t const hidden_size, int32_t const top_k,
+    cudaStream_t stream)
 {
     int32_t constexpr kThreadsPerBlock = 256;
     int32_t constexpr kElemPerCopy = elemPerCopy<InputType>();
@@ -224,7 +233,7 @@ void moeUnpermute(InputType const* permuted_input, InputType* output, int32_t co
     int32_t const blocks = num_tokens;
     int32_t const threads = kThreadsPerBlock;
 
-    auto kernel = &moeUnpermuteKernel<InputType, kThreadsPerBlock>;
+    auto kernel = &moeUnpermuteKernel<InputType, TopKScaleType, kThreadsPerBlock>;
 
     cudaLaunchConfig_t config;
     config.gridDim = blocks;
@@ -236,17 +245,20 @@ void moeUnpermute(InputType const* permuted_input, InputType* output, int32_t co
     attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
     config.numAttrs = 1;
     config.attrs = attrs;
-    cudaLaunchKernelEx(&config, kernel, permuted_input, output, expanded_idx_to_permuted_idx, hidden_size, top_k);
+    cudaLaunchKernelEx(
+        &config, kernel, permuted_input, output, expanded_idx_to_permuted_idx, topk_scales, hidden_size, top_k);
 }
 
-#define INSTANTIATE_MOE_UNPERMUTE(InputType)                                                                           \
+#define INSTANTIATE_MOE_UNPERMUTE(InputType, TopKScaleType)                                                            \
     template void moeUnpermute<InputType>(InputType const* permuted_input, InputType* output,                          \
-        int32_t const* expanded_idx_to_permuted_idx, int32_t const num_tokens, int32_t const hidden_size,              \
-        int32_t const top_k, cudaStream_t stream)
+        int32_t const* expanded_idx_to_permuted_idx, TopKScaleType const* topk_scales, int32_t const num_tokens,       \
+        int32_t const hidden_size, int32_t const top_k, cudaStream_t stream)
 
-INSTANTIATE_MOE_UNPERMUTE(half);
+INSTANTIATE_MOE_UNPERMUTE(half, float);
+INSTANTIATE_MOE_UNPERMUTE(half, half);
 #ifdef ENABLE_BF16
-INSTANTIATE_MOE_UNPERMUTE(__nv_bfloat16);
+INSTANTIATE_MOE_UNPERMUTE(__nv_bfloat16, float);
+INSTANTIATE_MOE_UNPERMUTE(__nv_bfloat16, __nv_bfloat16);
 #endif
 #undef INSTANTIATE_MOE_UNPERMUTE
 

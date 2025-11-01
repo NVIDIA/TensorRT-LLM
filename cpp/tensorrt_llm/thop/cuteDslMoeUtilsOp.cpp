@@ -187,7 +187,8 @@ std::tuple<torch::Tensor, torch::optional<torch::Tensor>> moe_permute(torch::Ten
     return {permuted_output, permuted_sf};
 }
 
-torch::Tensor moe_unpermute(torch::Tensor const& permuted_input, torch::Tensor const& expanded_idx_to_permuted_idx)
+torch::Tensor moe_unpermute(torch::Tensor const& permuted_input, torch::Tensor const& expanded_idx_to_permuted_idx,
+    torch::Tensor const& topk_scales)
 {
     TORCH_CHECK(permuted_input.dim() == 2, "permuted_input must be 2D.");
     int64_t const num_permuted_tokens = permuted_input.size(0);
@@ -195,6 +196,10 @@ torch::Tensor moe_unpermute(torch::Tensor const& permuted_input, torch::Tensor c
     TORCH_CHECK(expanded_idx_to_permuted_idx.dim() == 2, "expanded_idx_to_permuted_idx must be 2D.");
     int64_t const num_tokens = expanded_idx_to_permuted_idx.size(0);
     int64_t const top_k = expanded_idx_to_permuted_idx.size(1);
+    TORCH_CHECK(topk_scales.dim() == 2, "topk_scales must be 2D.");
+    TORCH_CHECK(topk_scales.size(0) == num_tokens, "topk_scales.size(0) must be num_tokens.");
+    TORCH_CHECK(topk_scales.size(1) == top_k, "topk_scales.size(1) must be top_k.");
+
     TORCH_CHECK(num_permuted_tokens >= num_tokens * top_k,
         "num_permuted_tokens must be greater than or equal to num_tokens * top_k.");
 
@@ -202,22 +207,31 @@ torch::Tensor moe_unpermute(torch::Tensor const& permuted_input, torch::Tensor c
         = torch::empty({num_tokens, hidden_size}, torch::dtype(permuted_input.scalar_type()).device(torch::kCUDA));
     auto const& stream = at::cuda::getCurrentCUDAStream(permuted_input.get_device());
 
-#define DISPATCH_MOE_UNPERMUTE(InputType)                                                                              \
+#define DISPATCH_MOE_UNPERMUTE(InputType, TopKScaleType)                                                               \
     tensorrt_llm::kernels::cute_dsl::moeUnpermute<InputType>(static_cast<InputType*>(permuted_input.data_ptr()),       \
-        static_cast<InputType*>(output.data_ptr()), expanded_idx_to_permuted_idx.data_ptr<int32_t>(), num_tokens,      \
-        hidden_size, top_k, stream)
+        static_cast<InputType*>(output.data_ptr()), expanded_idx_to_permuted_idx.data_ptr<int32_t>(),                  \
+        static_cast<TopKScaleType*>(topk_scales.data_ptr()), num_tokens, hidden_size, top_k, stream)
 
-    if (permuted_input.scalar_type() == torch::kHalf)
+    if (permuted_input.scalar_type() == torch::kHalf && topk_scales.scalar_type() == torch::kFloat)
     {
-        DISPATCH_MOE_UNPERMUTE(half);
+        DISPATCH_MOE_UNPERMUTE(half, float);
     }
-    else if (permuted_input.scalar_type() == torch::kBFloat16)
+    else if (permuted_input.scalar_type() == torch::kHalf && topk_scales.scalar_type() == torch::kHalf)
     {
-        DISPATCH_MOE_UNPERMUTE(__nv_bfloat16);
+        DISPATCH_MOE_UNPERMUTE(half, half);
+    }
+    else if (permuted_input.scalar_type() == torch::kBFloat16 && topk_scales.scalar_type() == torch::kFloat)
+    {
+        DISPATCH_MOE_UNPERMUTE(__nv_bfloat16, float);
+    }
+    else if (permuted_input.scalar_type() == torch::kBFloat16 && topk_scales.scalar_type() == torch::kBFloat16)
+    {
+        DISPATCH_MOE_UNPERMUTE(__nv_bfloat16, __nv_bfloat16);
     }
     else
     {
-        TORCH_CHECK(false, "Unsupported input dtype: ", permuted_input.scalar_type());
+        TORCH_CHECK(false, "Unsupported input dtype: ", permuted_input.scalar_type(),
+            " and/or topk_scales dtype: ", topk_scales.scalar_type());
     }
 
 #undef DISPATCH_MOE_UNPERMUTE
@@ -240,7 +254,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "moe_permute(Tensor input, Tensor? input_sf, Tensor permuted_idx_to_expanded_idx, Tensor "
         "num_non_exiting_tiles, int tile_tokens_dim, int top_k) -> (Tensor, Tensor?)");
-    m.def("moe_unpermute(Tensor permuted_input, Tensor expanded_idx_to_permuted_idx) -> Tensor");
+    m.def("moe_unpermute(Tensor permuted_input, Tensor expanded_idx_to_permuted_idx, Tensor topk_scales) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

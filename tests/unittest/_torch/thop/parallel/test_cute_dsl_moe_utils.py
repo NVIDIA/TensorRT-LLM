@@ -86,21 +86,29 @@ def test_moe_permute(dtype: str, num_tokens: int, top_k: int, tile_size: int):
 @pytest.mark.parametrize("num_tokens", [128, 515, 1024])
 @pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
 def test_moe_unpermute(dtype: str, num_tokens: int, top_k: int, tile_size: int):
+    dtype = getattr(torch, dtype)
     hidden_size = 4096
     num_local_experts = 256 // 32
     num_permuted_tokens = get_max_num_permuted_tokens(num_tokens, top_k,
                                                       tile_size,
                                                       num_local_experts)
-    permuted_x = torch.randint(-100 // top_k,
-                               100 // top_k, (num_permuted_tokens, hidden_size),
+    permuted_x = torch.randint(-100,
+                               100, (num_permuted_tokens, hidden_size),
                                dtype=torch.int32,
-                               device="cuda").to(getattr(torch, dtype))
+                               device="cuda").to(dtype)
 
     expanded_idx_to_permuted_idx = torch.randint(0,
                                                  num_permuted_tokens,
                                                  (num_tokens, top_k),
                                                  dtype=torch.int32,
                                                  device="cuda")
-    x = torch.ops.trtllm.moe_unpermute(permuted_x, expanded_idx_to_permuted_idx)
-    torch.testing.assert_close(
-        x, permuted_x[expanded_idx_to_permuted_idx].sum(dim=1))
+    topk_scales = torch.randn(num_tokens,
+                              top_k,
+                              dtype=torch.float32,
+                              device="cuda").softmax(dim=-1)
+    x = torch.ops.trtllm.moe_unpermute(permuted_x, expanded_idx_to_permuted_idx,
+                                       topk_scales)
+
+    x_ref = (permuted_x[expanded_idx_to_permuted_idx] *
+             topk_scales.unsqueeze(-1)).sum(dim=1).to(dtype)
+    torch.testing.assert_close(x, x_ref)
