@@ -65,12 +65,6 @@ def test_free_mem_ratio_validation():
         InferenceOptimizer(None, get_transform_config(1.1))
 
 
-def test_get_pytorch_backend_config():
-    """Test that get_pytorch_backend_config returns self."""
-    args = LlmArgs(model="test-model")
-    assert args.get_pytorch_backend_config() == args
-
-
 # ================================
 # Config Flow Tests
 # ================================

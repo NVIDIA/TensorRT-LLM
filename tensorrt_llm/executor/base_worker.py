@@ -128,7 +128,7 @@ class BaseWorker(GenerationExecutor):
                     create_autodeploy_executor
                 create_executor = create_autodeploy_executor
                 assert isinstance(self.llm_args, ADLlmArgs)
-                args["ad_config"] = self.llm_args.get_pytorch_backend_config()
+                args["ad_config"] = self.llm_args
                 args["tokenizer"] = self._tokenizer
             else:
                 raise ValueError(f"Unsupported backend config: {self._backend}")
