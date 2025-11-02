@@ -192,6 +192,7 @@ jenkins-rockylinux8_%: PYTHON_VERSION_TAG_ID = $(if $(findstring 3.12,${PYTHON_V
 jenkins-rockylinux8_%: IMAGE_WITH_TAG = $(shell . ../jenkins/current_image_tags.properties && echo $$LLM_ROCKYLINUX8_${PYTHON_VERSION_TAG_ID}_DOCKER_IMAGE)
 jenkins-rockylinux8_%: STAGE = tritondevel
 jenkins-rockylinux8_%: BASE_IMAGE = nvcr.io/nvidia/cuda
+# [TODO] Update to NVIDIA CUDA 13.0.2 when it's available
 jenkins-rockylinux8_%: BASE_TAG = 13.0.1-devel-rockylinux8
 
 rockylinux8_%: STAGE = tritondevel
