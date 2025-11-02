@@ -12,6 +12,7 @@ from tensorrt_llm.llmapi import (BatchingType, CapacitySchedulerPolicy,
                                  ContextChunkingPolicy, DynamicBatchConfig,
                                  ExtendedRuntimePerfKnobConfig, KvCacheConfig,
                                  SchedulerConfig)
+from tensorrt_llm.llmapi.llm_args import CudaGraphConfig
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_options
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 
@@ -87,9 +88,9 @@ class RuntimeConfig(BaseModel):
             llm_args, self.extra_llm_api_options)
 
         if self.backend == "pytorch":
-            cuda_graph_config = updated_llm_args.pop(
-                "cuda_graph_config", llm_args["cuda_graph_config"])
-            if cuda_graph_config:
+            cuda_graph_config = updated_llm_args.pop("cuda_graph_config",
+                                                     CudaGraphConfig())
+            if cuda_graph_config is not None:
                 # Use runtime max_batch_size as cuda_graph_config.max_batch_size
                 # if both max_batch_size and batch_sizes are not set.
                 batch_sizes_set = cuda_graph_config.get("batch_sizes",
@@ -114,7 +115,6 @@ class PerformanceOptions:
     cuda_graphs: bool = False
     multi_block_mode: bool = True
     cuda_graph_cache_size: int = 1000
-    pytorch_config: Dict[str, Any] = Field(default_factory=dict)
 
     def get_perf_config(self) -> ExtendedRuntimePerfKnobConfig:
         config = ExtendedRuntimePerfKnobConfig()
