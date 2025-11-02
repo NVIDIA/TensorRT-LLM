@@ -280,7 +280,7 @@ __global__ void computeCumsumDevice(int* sendCountsCumsum, int* recvCountsCumsum
 }
 
 __global__ void memsetExpertIdsDevice(
-    int* expertIds, int* recvCountsCumsum, int maxTokenCountPerRank, int topK, int slotCount, int rankCount)
+    int* expertIds, int* recvCountsCumsum, int maxTokenCountPerRank, int topK, int invalidExpertId, int rankCount)
 {
     int maxTokenCount = maxTokenCountPerRank * rankCount;
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -291,7 +291,7 @@ __global__ void memsetExpertIdsDevice(
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i + totalRecvTokenCount * topK < maxTokenCount * topK;
          i += gridDim.x * blockDim.x)
     {
-        *(expertIds + i + totalRecvTokenCount * topK) = slotCount;
+        *(expertIds + i + totalRecvTokenCount * topK) = invalidExpertId;
     }
 }
 
@@ -355,7 +355,7 @@ void moveIndice(int* sendCountsCumsum, int* recvCountsCumsum, int* sendIndice, i
         maxTokenCountPerRank);
 }
 
-void memsetExpertIds(int* expertIds, int* recvCountsCumsum, int maxTokenCountPerRank, int topK, int slotCount,
+void memsetExpertIds(int* expertIds, int* recvCountsCumsum, int maxTokenCountPerRank, int topK, int invalidExpertId,
     int rankCount, cudaStream_t stream)
 {
     int smCount = tensorrt_llm::common::getMultiProcessorCount();
@@ -364,7 +364,7 @@ void memsetExpertIds(int* expertIds, int* recvCountsCumsum, int maxTokenCountPer
     dim3 grid(smCount);
 
     launchWithPdlWhenEnabled("memsetExpertIds", memsetExpertIdsDevice, grid, block, 0, stream, expertIds,
-        recvCountsCumsum, maxTokenCountPerRank, topK, slotCount, rankCount);
+        recvCountsCumsum, maxTokenCountPerRank, topK, invalidExpertId, rankCount);
 }
 
 size_t getMoePrepareWorkspaceSize(int epSize)
