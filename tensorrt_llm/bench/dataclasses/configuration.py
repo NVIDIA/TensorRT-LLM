@@ -8,7 +8,6 @@ from pydantic import (BaseModel, Field, PositiveFloat, field_validator,
                       model_validator)
 
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.llmapi import (BatchingType, CapacitySchedulerPolicy,
                                  ContextChunkingPolicy, DynamicBatchConfig,
                                  ExtendedRuntimePerfKnobConfig, KvCacheConfig,
@@ -74,7 +73,6 @@ class RuntimeConfig(BaseModel):
         }
 
         backend_config_map = {
-            "pytorch": self.performance_options.get_pytorch_perf_config,
             "_autodeploy": self.performance_options.get_autodeploy_perf_config
         }
 
@@ -125,9 +123,6 @@ class PerformanceOptions:
         config.cuda_graph_cache_size = self.cuda_graph_cache_size
 
         return config
-
-    def get_pytorch_perf_config(self) -> PyTorchConfig:
-        return self.pytorch_config
 
     def get_autodeploy_perf_config(self) -> Dict:
         AutoDeployPerfConfig = dict

@@ -137,7 +137,7 @@ class BaseWorker(GenerationExecutor):
             self.mapping = self.llm_args.parallel_config.to_mapping()
             self.checkpoint_loader = None
             if self._backend == "pytorch":
-                from tensorrt_llm._torch.pyexecutor.config import \
+                from tensorrt_llm._torch.pyexecutor.model_loader import \
                     _construct_checkpoint_loader
                 self.checkpoint_loader = _construct_checkpoint_loader(
                     self.llm_args.backend, self.llm_args.checkpoint_loader,
