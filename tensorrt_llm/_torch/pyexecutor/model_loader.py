@@ -23,7 +23,6 @@ from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_utils import MetaInitMode, timing
 from ..modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, maybe_create_moe_load_balancer)
-from .config import LoadFormat
 
 _KV_CACHE_MAP = {
     "fp8": QuantAlgo.FP8.value,
