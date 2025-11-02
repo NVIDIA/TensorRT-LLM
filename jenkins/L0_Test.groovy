@@ -425,19 +425,21 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String jobUID){
 
         Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
 
+        Utils.exec(pipeline, script: "echo Sleeping to allow Slurm job completion; sleep 30")
+
         def slurmJobID = Utils.exec(
             pipeline,
             // Try to grab the job id from ${jobWorkspace}/slurm_job_id.txt.
             // The slurm_run.sh will add the slurm job id in that file.
             script: Utils.sshUserCmd(
                 remote,
-                "'test -f ${jobWorkspace}/slurm_job_id.txt && cat ${jobWorkspace}/slurm_job_id.txt'"
+                "\"test -f ${jobWorkspace}/slurm_job_id.txt && cat ${jobWorkspace}/slurm_job_id.txt || true\""
             ),
             returnStdout: true
         ).trim()
 
         if (!slurmJobID || !slurmJobID.isNumber()) {
-            echo "Slurm job did not submit successfully. No job ID found."
+            echo "Slurm job may not submit successfully. No job ID found."
         } else {
             Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
 
@@ -448,14 +450,15 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String jobUID){
                     "\"scancel ${slurmJobID} || true; sacct -j ${slurmJobID} --format=JobID,JobName%100,Partition%15,Account%15,State,ExitCode,NodeList%30 || true; scontrol show job ${slurmJobID} || true\""
                 )
             )
-
         }
+
+        Utils.exec(pipeline, script: "echo Sleeping to allow Slurm job termination; sleep 30")
 
         Utils.exec(
             pipeline,
             script: Utils.sshUserCmd(
                 remote,
-                "rm -rf ${jobWorkspace}"
+                "\"rm -rf ${jobWorkspace} || true\""
             )
         )
 
@@ -1480,8 +1483,7 @@ def runLLMDocBuild(pipeline, config)
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
 
     // Step 3: build doc
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get install doxygen python3-pip graphviz -y")
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y doxygen python3-pip graphviz")
 
     def containerPATH = sh(script: "echo \${PATH}", returnStdout: true).replaceAll("\\s", "")
     if (!containerPATH.contains("/usr/local/bin:")) {
@@ -1520,9 +1522,7 @@ def launchTestListCheck(pipeline)
     trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(LLM_DOCKER_IMAGE, "a10"), "trt-llm", {
         try {
             echoNodeAndGpuInfo(pipeline, stageName)
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: """apt-get update && apt-get install \
-            libffi-dev \
-            -y""")
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y libffi-dev")
             sh "nvidia-smi && nvidia-smi -q && nvidia-smi topo -m"
             // download TRT-LLM tarfile
             def tarName = BUILD_CONFIGS[VANILLA_CONFIG][TARNAME]
@@ -2040,8 +2040,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         // setup HF_HOME to cache model and datasets
         // init the huggingface cache from nfs, since the nfs is read-only, and HF_HOME needs to be writable, otherwise it will fail at creating file lock
         sh "mkdir -p ${HF_HOME} && ls -alh ${HF_HOME}"
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get install -y rsync")
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y rsync")
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "rsync -r ${MODEL_CACHE_DIR}/hugging-face-cache/ ${HF_HOME}/ && ls -lh ${HF_HOME}")
         sh "df -h"
 
@@ -2932,8 +2931,7 @@ def launchTestJobs(pipeline, testFilter)
                         if (values[5] == DLFW_IMAGE || values[5] == DLFW_IMAGE_12_9) {
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "[ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt || true")
                         }
-                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
-                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install python3-pip git rsync curl wget")
+                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y python3-pip git rsync curl wget")
                         trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install requests")
@@ -2943,11 +2941,10 @@ def launchTestJobs(pipeline, testFilter)
                             def platform = cpu_arch == X86_64_TRIPLE ? "x86_64" : "sbsa"
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget https://developer.download.nvidia.com/compute/cuda/repos/${ubuntu_version}/${platform}/cuda-keyring_1.1-1_all.deb")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "dpkg -i cuda-keyring_1.1-1_all.deb")
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
                             if (key.contains("CU12")) {
-                                trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install cuda-toolkit-12-9")
+                                trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y cuda-toolkit-12-9")
                             } else {
-                                trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install cuda-toolkit-13-0")
+                                trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y cuda-toolkit-13-0")
                             }
                         }
                         if (key.contains("CU12")) {
