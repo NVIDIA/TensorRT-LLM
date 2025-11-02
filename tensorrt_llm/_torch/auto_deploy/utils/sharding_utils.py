@@ -585,27 +585,21 @@ class BMMShardingInfo(ShardingTransformInfo):
             gather_node.replace_input_with(gather_node, node)
 
 
-def _insert_sharded_moe(
+def _insert_ep_sharded_moe(
     gm: GraphModule,
     node: Node,
     rank: int,
     world_size: int,
     scale_names: Sequence[str] = (),
 ):
-    """Update the torch_moe node with sharded weight lists,
-    sharded `selected_experts` and `final_scales(router_logics)`.
-    Add an all_reduce node after the moe node.
+    """Update the torch_moe node with EP-sharded weight lists.
 
-    DRAFT FIX: Replace Expert Parallelism with Tensor Parallelism for MoE
-    Instead of partitioning experts across devices (EP), we shard weight dimensions (TP)
+    Expert Parallelism (EP): Partition experts across devices.
+    - Modifies selected_experts and final_scales for routing
+    - Each device gets a subset of experts (e.g., device 0: experts 0-3, device 1: experts 4-7)
+    - Adds all_reduce collective to combine results
     """
-    TP_SHARD_MOE = True  # GAGAM: TODO: add config flag / heuristic to control this
-    if TP_SHARD_MOE:
-        ad_logger.debug("Applying TP-style sharding instead of EP")
-        _insert_tp_sharded_moe(gm, node, rank, world_size, scale_names)
-        return
 
-    # Original EP sharding code
     scale_names = list(scale_names)
 
     num_experts = len(node.args[3])
@@ -860,6 +854,7 @@ class EPShardingInfo(ShardingTransformInfo):
 
     rank: int
     world_size: int
+    strategy: Literal["tp", "ep"] = "ep"
 
     @classmethod
     def from_node(cls, node: Node, **kwargs) -> "EPShardingInfo":
@@ -877,8 +872,14 @@ class EPShardingInfo(ShardingTransformInfo):
         return True
 
     def apply(self, gm: GraphModule, node: Node) -> None:
-        """Apply EP sharding transformation to the graph module."""
-        _insert_sharded_moe(gm, node, self.rank, self.world_size, [])
+        """Apply EP/TP sharding transformation to the graph module based on strategy."""
+        ad_logger.info(
+            f"Applying {self.strategy.upper()} sharding strategy to MoE node '{node.name}'"
+        )
+        if self.strategy == "tp":
+            _insert_tp_sharded_moe(gm, node, self.rank, self.world_size, [])
+        else:  # "ep"
+            _insert_ep_sharded_moe(gm, node, self.rank, self.world_size, [])
 
 
 class MXFP4EPShardingInfo(EPShardingInfo):
@@ -908,7 +909,13 @@ class FP8EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
         return ["input_scale", "weight_scale"]
 
     def apply(self, gm: GraphModule, node: Node) -> None:
-        _insert_sharded_moe(gm, node, self.rank, self.world_size, self.scale_names())
+        ad_logger.info(
+            f"Applying {self.strategy.upper()} sharding strategy to FP8 MoE node '{node.name}'"
+        )
+        if self.strategy == "tp":
+            _insert_tp_sharded_moe(gm, node, self.rank, self.world_size, self.scale_names())
+        else:  # "ep"
+            _insert_ep_sharded_moe(gm, node, self.rank, self.world_size, self.scale_names())
 
 
 class NVFP4EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
@@ -924,7 +931,13 @@ class NVFP4EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
         return ["input_scale", "weight_scale", "alpha"]
 
     def apply(self, gm: GraphModule, node: Node) -> None:
-        _insert_sharded_moe(gm, node, self.rank, self.world_size, self.scale_names())
+        ad_logger.info(
+            f"Applying {self.strategy.upper()} sharding strategy to NVFP4 MoE node '{node.name}'"
+        )
+        if self.strategy == "tp":
+            _insert_tp_sharded_moe(gm, node, self.rank, self.world_size, self.scale_names())
+        else:  # "ep"
+            _insert_ep_sharded_moe(gm, node, self.rank, self.world_size, self.scale_names())
 
 
 EP_SHARDING_RULES = [
@@ -957,6 +970,7 @@ class ShardingConfig(BaseModel):
     use_sharding_from_factory: bool = False
     support_partial_config: bool = False
     sharding_dims: List[str] = Field(default_factory=list)
+    moe_sharding_strategy: Literal["tp", "ep"] = Field(default="ep")
     tp_transforms: List[TPShardingInfo] = Field(default_factory=list)
     bmm_transforms: List[BMMShardingInfo] = Field(default_factory=list)
     ep_transforms: List[EPShardingInfo] = Field(default_factory=list)

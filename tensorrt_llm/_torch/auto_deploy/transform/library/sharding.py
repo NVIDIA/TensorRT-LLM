@@ -19,7 +19,7 @@ Our sharding algorithm for tensor parallelism (TP) is based on the following ste
 import operator
 import re
 from collections import defaultdict
-from typing import DefaultDict, Dict, List, Set, Tuple, Type
+from typing import DefaultDict, Dict, List, Literal, Set, Tuple, Type
 
 import torch
 from pydantic import Field
@@ -130,6 +130,8 @@ class ShardingTransformConfig(TransformConfig):
     support_partial_config: bool = Field(default=False)
     # Which sharding families to run: any subset of {"tp", "ep", "bmm"}
     sharding_dims: List[str] = Field(default_factory=lambda: ["tp", "ep", "bmm"])
+    # MOE sharding strategy: "tp" (tensor parallel) or "ep" (expert parallel)
+    moe_sharding_strategy: Literal["tp", "ep"] = Field(default="ep")
 
 
 @TransformRegistry.register("detect_sharding")
@@ -188,12 +190,21 @@ class Sharding(BaseTransform):
         shared_config.sharding_config.simple_shard_only = self.config.simple_shard_only
         shared_config.sharding_config.support_partial_config = self.config.support_partial_config
         shared_config.sharding_config.sharding_dims = self.config.sharding_dims
+        shared_config.sharding_config.moe_sharding_strategy = self.config.moe_sharding_strategy
 
         shared_config.sharding_config.use_sharding_from_factory = (
             self.config.use_sharding_from_factory
         )
 
         sharding_config = shared_config.sharding_config
+
+        # Allow factory to override MOE sharding strategy (e.g., Mixtral prefers TP)
+        factory_config = sharding_config.predefined_config
+        if factory_config and "moe_sharding_strategy" in factory_config:
+            sharding_config.moe_sharding_strategy = factory_config["moe_sharding_strategy"]
+            ad_logger.info(
+                f"Factory override: using MOE sharding strategy '{factory_config['moe_sharding_strategy']}'"
+            )
         sharding_config.validate_config()
 
         if (
@@ -735,6 +746,7 @@ def detect_ep_shard(gm: GraphModule, sharding_config: ShardingConfig) -> Transfo
                 node,
                 rank=rank,
                 world_size=world_size,
+                strategy=sharding_config.moe_sharding_strategy,
             )
         )
         num_moe_patterns += 1
