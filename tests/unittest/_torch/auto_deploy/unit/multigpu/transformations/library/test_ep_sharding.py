@@ -10,6 +10,7 @@ from _model_test_utils import MoEOpModel
 
 import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.models.factory import ShardingConfigSource
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 from tensorrt_llm._torch.auto_deploy.utils.sharding_utils import (
@@ -152,4 +153,70 @@ def test_sharding_pattern_detection(world_size: int, num_experts: int):
         num_experts=num_experts,
         rank=0,
         world_size=world_size,
+    )
+
+
+class _MockFactoryTP:
+    """Mock factory that returns TP strategy preference (like Mixtral)."""
+
+    def get_sharding_config(self):
+        return {
+            "source": ShardingConfigSource.HUGGINGFACE,
+            "moe_sharding_strategy": "tp",
+            "head_dim": 128,
+            "tp_plan": {},
+        }
+
+
+@pytest.mark.parametrize(
+    "factory_cls,expected_strategy",
+    [
+        (None, "ep"),
+        (_MockFactoryTP, "tp"),
+    ],
+    ids=["default_ep", "factory_tp_override"],
+)
+def test_moe_sharding_strategy(factory_cls, expected_strategy):
+    """Test MoE sharding strategy selection logic.
+
+    Parametrized tests verify:
+    1. default_ep: Default MoE sharding strategy is EP (no factory)
+    2. factory_tp_override: Factory can override strategy (e.g., Mixtral uses TP)
+    """
+    device = "cuda"
+    hidden_size = 32
+    intermediate_size = 16
+    num_experts = 8
+    rank = 0
+    world_size = 2
+
+    model = MoEOpModel(
+        hidden_size=hidden_size, num_experts=num_experts, intermediate_size=intermediate_size
+    ).to(device=device, dtype=torch.bfloat16)
+    x = model.get_input(device=device, dtype=torch.bfloat16)
+
+    # Create factory instance if provided
+    factory = factory_cls() if factory_cls else None
+
+    # Build config
+    config = {
+        "detect_sharding": {
+            "stage": "sharding",
+            "use_sharding_from_factory": False,
+            "sharding_dims": ["ep"],
+        }
+    }
+
+    # Create optimizer and run
+    optimizer = InferenceOptimizer(factory, config)
+    optimizer.shared_config.local_rank = rank
+    optimizer.shared_config.world_size = world_size
+    _ = optimizer(None, torch_export_to_gm(model, args=(x,), clone=True))
+
+    # Verify detected strategy
+    detected = optimizer.shared_config.sharding_config.ep_transforms
+    assert len(detected) > 0, "Should detect at least one MoE node"
+    actual_strategies = [t.strategy for t in detected]
+    assert all(s == expected_strategy for s in actual_strategies), (
+        f"Expected {expected_strategy}, got {actual_strategies}"
     )
