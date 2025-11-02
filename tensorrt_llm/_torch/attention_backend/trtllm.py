@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import torch
 
+from tensorrt_llm.quantization.mode import QuantAlgo
+
 if TYPE_CHECKING:
     from ..speculative.utils import SpecDecodingTensor
 
@@ -1290,6 +1292,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         if self.is_mla_enable:
             # Context MLA uses separate qkv instead of paged_context_fmha
+            use_paged_context_fmha = False
+
+        if self.quant_config.layer_quant_mode.has_fp8_kv_cache(
+        ) and self.quant_config.quant_algo == QuantAlgo.W4A16_AWQ and use_paged_context_fmha:
+            logger.warning(
+                "Disabling Paged context FMHA, as it is not supported with FP8 KV cache, for W4A16 AWQ quantization"
+            )
             use_paged_context_fmha = False
 
         use_nvfp4_output = False
