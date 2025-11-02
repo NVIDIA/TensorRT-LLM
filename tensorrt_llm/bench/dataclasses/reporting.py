@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 from collections import defaultdict
-from typing import Any, Dict, List, NamedTuple, Optional
+from typing import Any, Dict, List, NamedTuple
 
 import torch
 
@@ -206,43 +207,33 @@ class ReportUtility:
         self.streaming = streaming
 
     @staticmethod
-    def _query_gpu_info(
-            gpu_indices: Optional[List[int]] = None) -> Dict[str, Any]:
-        """Query GPU info and return a dict of minimal fields per GPU.
+    def _query_gpu_info() -> Dict[str, Any]:
+        """Query first GPU info (all GPUs must be identical for TRT-LLM)."""
+        if not torch.cuda.is_available():
+            return None
 
-        Returns a dict: {"gpus": [{"index", "name", "memory.total", "clocks.mem"}, ...]}
-        """
-        gpus: List[Dict[str, Any]] = []
-        num_devices = torch.cuda.device_count() if torch.cuda.is_available(
-        ) else 0
-        indices_to_query = gpu_indices or range(num_devices)
+        try:
+            cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+            physical_idx = int(
+                cuda_visible.split(",")[0].strip()) if cuda_visible else 0
 
-        for idx in indices_to_query:
+            props = torch.cuda.get_device_properties(physical_idx)
             gpu_info = {
-                "index": idx,
-                "name": "Unknown",
-                "memory.total": None,
-                "clocks.mem": None,
+                "name":
+                getattr(props, "name", "Unknown"),
+                "memory.total":
+                float(getattr(props, "total_memory", 0.0)) / (1024.0**3),
+                "clocks.mem":
+                None,
             }
-            try:
-                props = torch.cuda.get_device_properties(idx)
-                gpu_info["name"] = getattr(props, "name", "Unknown")
-                gpu_info["memory.total"] = float(
-                    getattr(props, "total_memory", 0.0)) / (1024.0**3)  # GB
-                if pynvml:
-                    # For memory clock, we must use pynvml
-                    handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
-                    mem_clock_ghz = pynvml.nvmlDeviceGetMaxClockInfo(
-                        handle, pynvml.NVML_CLOCK_MEM) / 1000.0
-                    gpu_info["clocks.mem"] = mem_clock_ghz
-            except (RuntimeError, AssertionError):
-                # Skip this GPU if we can't get its info, but continue with others
-                continue
-            gpus.append(gpu_info)
-
-        note = None if gpus else (
-            "No CUDA devices available" if num_devices == 0 else None)
-        return {"gpus": gpus, "note": note}
+            if pynvml:
+                # Memory clock information is not reported by torch, using NVML instead
+                handle = pynvml.nvmlDeviceGetHandleByIndex(physical_idx)
+                gpu_info["clocks.mem"] = pynvml.nvmlDeviceGetMaxClockInfo(
+                    handle, pynvml.NVML_CLOCK_MEM) / 1000.0
+            return gpu_info
+        except (RuntimeError, AssertionError):
+            return None
 
     @staticmethod
     def convert_to_ms(ns: float) -> float:
@@ -319,9 +310,8 @@ class ReportUtility:
             },
         }
 
-        # Machine / GPU details - only show GPUs used in this benchmark run
-        gpu_indices = list(range(self.rt_cfg.mapping["world_size"]))
-        stats_dict["machine"] = self._query_gpu_info(gpu_indices)
+        # Machine / GPU details - query only first GPU (all GPUs must be identical)
+        stats_dict["machine"] = self._query_gpu_info()
 
         # Retrieve KV cache information.
         kv_cache_config = self.kwargs.get("kv_cache_config", KvCacheConfig())
@@ -528,7 +518,7 @@ class ReportUtility:
         """
         stats_dict = self.get_statistics_dict()
         engine = stats_dict["engine"]
-        machine = stats_dict.get("machine", {"gpus": []})
+        machine = stats_dict.get("machine")
         world_info = stats_dict["world_info"]
         requests = stats_dict["request_info"]
         perf = stats_dict["performance"]
@@ -581,22 +571,15 @@ class ReportUtility:
             "===========================================================\n"
             "= MACHINE DETAILS \n"
             "===========================================================\n")
-        gpus = machine.get("gpus", [])
-        if not gpus:
-            note = machine.get("note", "No GPU info available")
-            machine_info += f"{note}\n\n"
+        if machine is None:
+            machine_info += "No GPU info available\n\n"
         else:
-            for gpu in gpus:
-                name = gpu.get("name", "Unknown")
-                idx = gpu.get("index", 0)
-                mem_total_str = f"{gpu['memory.total']:.2f} GB" if gpu.get(
-                    "memory.total") is not None else "N/A"
-                mem_clock_str = f"{gpu['clocks.mem']:.2f} GHz" if gpu.get(
-                    'clocks.mem') is not None else "N/A"
-
-                machine_info += (
-                    f"GPU {idx}: {name}, memory {mem_total_str}, {mem_clock_str}\n"
-                )
+            name = machine.get("name", "Unknown")
+            mem_total_str = f"{machine['memory.total']:.2f} GB" if machine.get(
+                "memory.total") is not None else "N/A"
+            mem_clock_str = f"{machine['clocks.mem']:.2f} GHz" if machine.get(
+                'clocks.mem') is not None else "N/A"
+            machine_info += f"{name}, memory {mem_total_str}, {mem_clock_str}\n\n"
 
         world_info = (
             "===========================================================\n"
