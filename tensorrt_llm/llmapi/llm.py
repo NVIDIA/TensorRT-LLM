@@ -426,10 +426,8 @@ class BaseLLM:
             prompt = inputs.get("prompt", None)
             query_token_ids = inputs.get("query_token_ids", None)
             if is_gen_only:
-                # TODO: support generation-only mode for multimodal disaggregated inference
-                # Need to set multimodal_params = None; but not tested yet
                 raise ValueError(
-                    "Multimodal disaggregated inference is not supported for generation-only mode"
+                    "Generation-only mode should not need multimodal parameters"
                 )
             else:
                 mm_hashes = disaggregated_params.multimodal_hashes
