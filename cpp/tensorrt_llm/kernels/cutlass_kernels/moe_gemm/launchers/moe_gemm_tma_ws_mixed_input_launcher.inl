@@ -1,17 +1,13 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
  */
 
 #ifdef __GNUC__ // Check if the compiler is GCC or Clang
@@ -19,17 +15,13 @@
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
 #endif // __GNUC__
 
+#include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/epilogue/collective/default_epilogue.hpp"
 #include "cutlass/epilogue/thread/linear_combination.h"
 #include "cutlass/gemm/collective/collective_builder.hpp"
-#include "cutlass/gemm/dispatch_policy.hpp"
-
-#include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
+#include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
-
-#include "cutlass/util/packed_stride.hpp"
-
 #include "cutlass/util/command_line.h"
 #include "cutlass/util/distribution.h"
 #include "cutlass/util/host_tensor.h"
@@ -43,7 +35,6 @@
 #include "cutlass/util/reference/host/tensor_fill.h"
 #include "cutlass/util/reference/host/tensor_norm.h"
 #include "cutlass/util/tensor_view_io.h"
-
 #include "cutlass_extensions/compute_occupancy.h"
 #include "cutlass_extensions/epilogue_helpers.h"
 #include "cutlass_extensions/gemm/collective/collective_builder_mixed_input.hpp"
@@ -58,20 +49,19 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/launchers/moe_gemm_tma_ws_mixed_input_launcher.h"
 
-#include "moe_gemm_tma_ws_mixed_input_launcher.h"
+namespace tk = tensorrt_llm::common;
+namespace tkc = tensorrt_llm::cutlass_extensions;
+
+using namespace cute;
 
 namespace tensorrt_llm
 {
 namespace kernels
 {
-namespace cutlass_kernels_oss
+namespace cutlass_kernels
 {
-using namespace tensorrt_llm::kernels::cutlass_kernels;
-namespace tk = tensorrt_llm::common;
-namespace tkc = tensorrt_llm::cutlass_extensions;
-
-using namespace cute;
 
 template <typename T, typename WeightType, typename GemmOutputType, typename EpilogueTag, typename CTAShape,
     typename ClusterShape, typename MainloopScheduleType, typename EpilogueScheduleType,
@@ -79,25 +69,23 @@ template <typename T, typename WeightType, typename GemmOutputType, typename Epi
 void sm90_generic_mixed_moe_gemm_kernelLauncher(GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs,
     TmaWarpSpecializedGroupedGemmInput hopper_inputs, int sm_count_, size_t* workspace_size)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-
     /////////////////////////////////////////////////////////////////////////////////////////////////
     /// GEMM kernel configurations
     /////////////////////////////////////////////////////////////////////////////////////////////////
 
     // A matrix configuration
     using ElementA = typename TllmToCutlassTypeAdapter<T>::type;
-    using LayoutA = cutlass::layout::RowMajor;         // Layout type for A matrix operand
-    constexpr int AlignmentA
-        = 128 / cutlass::sizeof_bits<ElementA>::value; // Alignment of A matrix in units of elements (up to 16 bytes)
+    using LayoutA = cutlass::layout::RowMajor;                              // Layout type for A matrix operand
+    constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value; // Alignment of A matrix in units of
+                                                                            // elements (up to 16 bytes)
 
     // B matrix configuration
     using ElementB_ = typename TllmToCutlassTypeAdapter<WeightType>::type;
     using ElementB = std::conditional_t<std::is_same_v<WeightType, cutlass::uint4b_t>, cutlass::int4b_t, ElementB_>;
     using LayoutB = cutlass::layout::ColumnMajor;      // Layout type for B matrix operand
     constexpr int AlignmentB
-        = 128 / cutlass::sizeof_bits<ElementB>::value; // Memory access granularity/alignment of B matrix in units of
-                                                       // elements (up to 16 bytes)
+        = 128 / cutlass::sizeof_bits<ElementB>::value; // Memory access granularity/alignment of B
+                                                       // matrix in units of elements (up to 16 bytes)
 
     // This example manually swaps and transposes, so keep transpose of input layouts
     using LayoutA_Transpose = typename cutlass::layout::LayoutTranspose<LayoutA>::type;
@@ -121,8 +109,8 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(GroupedGemmInput<T, WeightType, 
     using ElementC = typename TllmToCutlassTypeAdapter<GemmOutputType>::type;
     using LayoutC = cutlass::layout::RowMajor;         // Layout type for C and D matrix operands
     constexpr int AlignmentC
-        = 128 / cutlass::sizeof_bits<ElementC>::value; // Memory access granularity/alignment of C matrix in units of
-                                                       // elements (up to 16 bytes)
+        = 128 / cutlass::sizeof_bits<ElementC>::value; // Memory access granularity/alignment of C
+                                                       // matrix in units of elements (up to 16 bytes)
 
     // D matrix configuration
     using ElementD = ElementC;
@@ -151,9 +139,9 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(GroupedGemmInput<T, WeightType, 
         EpilogueSchedule>::CollectiveOp;
 
     // =========================================================== MIXED INPUT WITH SCALES
-    // =========================================================================== The Scale information must get paired
-    // with the operand that will be scaled. In this example, B is scaled so we make a tuple of B's information and the
-    // scale information.
+    // =========================================================================== The Scale
+    // information must get paired with the operand that will be scaled. In this example, B is scaled
+    // so we make a tuple of B's information and the scale information.
     using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilderMixedInput<ArchTag, OperatorClass,
         cute::tuple<ElementB, ElementScalePacked>, LayoutB_Transpose*, AlignmentB, ElementA, LayoutA_Transpose*,
         AlignmentA, ElementAccumulator, TileShape, ClusterShape,
@@ -188,34 +176,39 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(GroupedGemmInput<T, WeightType, 
     hw_info.device_id = 0;
     hw_info.sm_count = sm_count_;
 
-    arguments = Args{cutlass::gemm::GemmUniversalMode::kGrouped,
-        {inputs.num_experts, hopper_inputs.int4_groupwise_params.shape.problem_shapes, nullptr},
-        {reinterpret_cast<ElementB const**>(hopper_inputs.ptr_weight),
-            reinterpret_cast<StrideB*>(hopper_inputs.stride_weight),
-            reinterpret_cast<ElementA const**>(hopper_inputs.ptr_act),
-            reinterpret_cast<StrideA*>(hopper_inputs.stride_act),
-            reinterpret_cast<ElementScalePacked const**>(hopper_inputs.int4_groupwise_params.ptr_s_a),
-            reinterpret_cast<StrideS*>(hopper_inputs.int4_groupwise_params.stride_s_a), group_size},
-        {fusion_args, reinterpret_cast<ElementC const**>(hopper_inputs.ptr_c),
-            reinterpret_cast<StrideC*>(hopper_inputs.stride_c), reinterpret_cast<ElementD**>(hopper_inputs.ptr_d),
-            reinterpret_cast<StrideD*>(hopper_inputs.stride_d)},
-        hw_info};
-
-    assert(group_size == int(inputs.groupwise_quant_group_size));
     if (workspace_size != nullptr)
     {
-        *workspace_size = gemm.get_workspace_size(arguments);
+        const Args args{cutlass::gemm::GemmUniversalMode::kGrouped,
+            {inputs.num_experts, hopper_inputs.int4_groupwise_params.shape.problem_shapes, nullptr},
+            {reinterpret_cast<ElementB const**>(hopper_inputs.ptr_b), hopper_inputs.stride_b,
+                reinterpret_cast<ElementA const**>(hopper_inputs.ptr_a), hopper_inputs.stride_a,
+                reinterpret_cast<ElementScalePacked const**>(hopper_inputs.int4_groupwise_params.ptr_s_a),
+                hopper_inputs.int4_groupwise_params.stride_s_a, group_size},
+            {fusion_args, reinterpret_cast<ElementC const**>(hopper_inputs.ptr_c), hopper_inputs.stride_c,
+                reinterpret_cast<ElementD**>(hopper_inputs.default_epilogue.ptr_d),
+                hopper_inputs.default_epilogue.stride_d},
+            hw_info};
+        *workspace_size = gemm.get_workspace_size(args);
         return;
     }
+
+    assert(group_size == int(inputs.groupwise_quant_group_size));
+    arguments = Args{cutlass::gemm::GemmUniversalMode::kGrouped,
+        {inputs.num_experts, hopper_inputs.int4_groupwise_params.shape.problem_shapes, nullptr},
+        {reinterpret_cast<ElementB const**>(hopper_inputs.ptr_b), hopper_inputs.stride_b,
+            reinterpret_cast<ElementA const**>(hopper_inputs.ptr_a), hopper_inputs.stride_a,
+            reinterpret_cast<ElementScalePacked const**>(hopper_inputs.int4_groupwise_params.ptr_s_a),
+            hopper_inputs.int4_groupwise_params.stride_s_a, group_size},
+        {fusion_args, reinterpret_cast<ElementC const**>(hopper_inputs.ptr_c), hopper_inputs.stride_c,
+            reinterpret_cast<ElementD**>(hopper_inputs.default_epilogue.ptr_d),
+            hopper_inputs.default_epilogue.stride_d},
+        hw_info};
 
     if (gemm.get_workspace_size(arguments) > hopper_inputs.gemm_workspace_size)
     {
         TLLM_LOG_ERROR("[Mixed dtype WS grouped GEMM] given workspace size insufficient, %d < %d.",
             gemm.get_workspace_size(arguments), hopper_inputs.gemm_workspace_size);
     }
-
-    // This is not initialized during workspace size calculation so check after
-    TLLM_CHECK_WITH_INFO(hopper_inputs.swap_ab, "swap_ab must be true for mixed dtype WS grouped GEMM");
 
     auto can_implement = gemm.can_implement(arguments);
     if (can_implement != cutlass::Status::kSuccess)
@@ -244,6 +237,6 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(GroupedGemmInput<T, WeightType, 
     return;
 }
 
-} // namespace cutlass_kernels_oss
+} // namespace cutlass_kernels
 } // namespace kernels
 } // namespace tensorrt_llm

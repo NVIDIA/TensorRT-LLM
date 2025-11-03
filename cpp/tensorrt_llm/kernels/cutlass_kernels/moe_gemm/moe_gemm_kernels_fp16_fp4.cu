@@ -14,9 +14,11 @@
  * limitations under the License.
  */
 
-#include "moe_gemm_template_dispatch.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_template_dispatch.h"
 
 namespace tensorrt_llm::kernels::cutlass_kernels
 {
+#if defined(ENABLE_FP4)
 template class MoeGemmRunner<half, __nv_fp4_e2m1, half>;
-}
+#endif
+} // namespace tensorrt_llm::kernels::cutlass_kernels
