@@ -219,7 +219,12 @@ GPT-OSS/BF16:
     accuracy: 90.3
 GPT-OSS/120B-MXFP4:
   - accuracy: 90.3
+  - spec_dec_algo: Eagle
+    accuracy: 90.3
   - quant_algo: W4A8_MXFP4_MXFP8
+    accuracy: 90.3
+  - quant_algo: W4A8_MXFP4_MXFP8
+    spec_dec_algo: Eagle
     accuracy: 90.3
   - quant_algo: W4A8_MXFP4_MXFP8
     kv_cache_quant_algo: FP8
@@ -230,6 +235,9 @@ GPT-OSS/120B-MXFP4:
     kv_cache_quant_algo: FP8
     accuracy: 90.3
   - quant_algo: W4A16_MXFP4
+    accuracy: 90.3
+  - quant_algo: W4A16_MXFP4
+    spec_dec_algo: Eagle
     accuracy: 90.3
   - quant_algo: W4A16_MXFP4
     kv_cache_quant_algo: FP8
