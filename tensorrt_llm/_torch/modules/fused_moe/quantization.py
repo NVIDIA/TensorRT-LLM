@@ -1888,7 +1888,7 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         module.fc2_input_scale.data.copy_(
             tmp_fc2_input_scale.max().reciprocal())
 
-        # Step1.5: Load pre_quant_scale if it exists (for NVFP4_AWQ)
+        # Load pre_quant_scale if it exists (for NVFP4_AWQ)
         if has_pre_quant_scale:
             from ..linear import TensorParallelMode, load_weight_shard
 
