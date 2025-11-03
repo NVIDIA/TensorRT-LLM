@@ -7,24 +7,24 @@ slurm:
   job_name: "<job_name>"
   numa_bind: true # Only enable for GB200 NVL72
 
+# Hardware Configuration
+hardware:
+  gpus_per_node: 4  # Modify this with your hardware configuration
+  num_ctx_servers: 2  # Number of context servers
+  num_gen_servers: 1  # Number of generation servers
+
 # Benchmark Mode
 benchmark:
   mode: "e2e"  # Options: e2e, gen_only
   use_nv_sa_benchmark: false  # Whether to use NVIDIA SA benchmark script
-  multi_round: 8  # Number of benchmark rounds
+  multi_round: 1  # Number of benchmark rounds
   benchmark_ratio: 0.8  # Benchmark ratio
   streaming: true  # Enable streaming mode
-  concurrency_list: "16"
-
-# Hardware Configuration
-hardware:
-  gpus_per_node: 4  # Modify this with your hardware configuration
-  num_ctx_servers: 1  # Number of context servers
-  num_gen_servers: 1  # Number of generation servers
+  concurrency_list: "1024"
 
 # Sequence Configuration
 sequence:
-  input_length: 1024  # Input sequence length
+  input_length: 8196  # Input sequence length
   output_length: 1024  # Output sequence length
 
 # Environment Configuration
@@ -41,16 +41,18 @@ environment:
 profiling:
   nsys_on: false  # Set to true to enable profiling
 
+# Worker Configuration
 worker_config:
   gen:
-    tensor_parallel_size: 8
-    moe_expert_parallel_size: 8
+    enable_layerwise_nvtx_marker: true
+    tensor_parallel_size: 32
+    moe_expert_parallel_size: 32
     enable_attention_dp: true
     enable_lm_head_tp_in_adp: true
     pipeline_parallel_size: 1
-    max_batch_size: 256
+    max_batch_size: 128
     max_num_tokens: 512
-    max_seq_len: 2251
+    max_seq_len: 9236
     cuda_graph_config:
       enable_padding: true
       batch_sizes:
@@ -67,29 +69,31 @@ worker_config:
       - 768
       - 1024
       - 2048
-      - 256
+      - 128
     print_iter_log: true
     kv_cache_config:
       enable_block_reuse: false
-      free_gpu_memory_fraction: 0.8
+      free_gpu_memory_fraction: 0.6
       dtype: fp8
     moe_config:
-      backend: CUTLASS
+      backend: WIDEEP
       use_low_precision_moe_combine: true
       load_balancer:
-        num_slots: 0
+        num_slots: 288
+        layer_updates_per_iter: 1
     cache_transceiver_config:
-      max_tokens_in_buffer: 4608
+      max_tokens_in_buffer: 8448
       backend: DEFAULT
     stream_interval: 20
     num_postprocess_workers: 4
-    speculative_config: # when mtp_size is 0, remove this section.
+    speculative_config:
       decoding_type: MTP
-      num_nextn_predict_layers: 1
+      num_nextn_predict_layers: 3
   ctx:
-    max_batch_size: 4
-    max_num_tokens: 4608
-    max_seq_len: 1227
+    enable_layerwise_nvtx_marker: true
+    max_batch_size: 1
+    max_num_tokens: 8448
+    max_seq_len: 8212
     tensor_parallel_size: 4
     moe_expert_parallel_size: 4
     enable_attention_dp: true
@@ -99,11 +103,11 @@ worker_config:
     disable_overlap_scheduler: true
     kv_cache_config:
       enable_block_reuse: false
-      free_gpu_memory_fraction: 0.85
+      free_gpu_memory_fraction: 0.75
       dtype: fp8
     cache_transceiver_config:
-      max_tokens_in_buffer: 4608
+      max_tokens_in_buffer: 8448
       backend: DEFAULT
-    speculative_config: # when mtp_size is 0, remove this section.
+    speculative_config:
       decoding_type: MTP
-      num_nextn_predict_layers: 1
+      num_nextn_predict_layers: 3
