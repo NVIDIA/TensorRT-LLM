@@ -437,6 +437,8 @@ class KVCacheManager(BaseResourceManager):
                             self.kv_connector_manager.update_state_after_alloc(
                                 req, block_ids)
 
+            self.impl.refresh_blocks()
+
             for req in generation_batch:
                 self.impl.add_token(req.py_request_id)
                 for _ in range(get_draft_token_length(req)):
