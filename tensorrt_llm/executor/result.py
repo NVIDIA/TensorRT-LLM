@@ -272,6 +272,8 @@ class GenerationResultBase:
         self._done = False
         self.metrics_dict = {}
         self.trace_headers: Optional[dict[str, str]] = None
+        # torch backend will use trtllm sampler in beam search mode, but it does not support return logprobs incrementally
+        self.use_trtllm_sampler = sampling_params.use_beam_search and sampling_params.best_of > 1
 
         if ray_queue is not None:
             if has_event_loop():
@@ -378,18 +380,27 @@ class GenerationResultBase:
             # each streamed response_tensors.log_probs[src_idx]
             # contains a streamwise monotonically growing list of logprobs.
             # so we need to accumulate only the new ones unique to that particular streamed response
-            output.logprobs += response_tensors.log_probs[src_idx]
+            if self.use_trtllm_sampler:
+                assert output._last_logprobs_len <= len(
+                    response_tensors.log_probs[src_idx]
+                ), (f"_last_logprobs_len ({output._last_logprobs_len}) > log_probs length ("
+                    f"{len(response_tensors.log_probs[src_idx])})")
+                output.logprobs += response_tensors.log_probs[src_idx][
+                    output._last_logprobs_len:]
+            else:
+                output.logprobs += response_tensors.log_probs[src_idx]
 
             # overcome some WAR in the cpp executor
-            if finish_reasons[src_idx] != tllm.FinishReason.CANCELLED:
+            if finish_reasons[
+                    src_idx] != tllm.FinishReason.CANCELLED and self.use_trtllm_sampler:
                 # Check if logprobs is a list (not a dict or other structure)
                 if len(output.logprobs) > output.length:
                     # LlmResult holds a reference to LogProbStorage, which may be updated by the worker before the result is serialized.
                     # Therefore, we treat extra logprobs/logits as expected and only consume what's needed.
                     output.logprobs = output.logprobs[:output.length]
-                assert len(
-                    output.logprobs
-                ) == output.length, f"logprobs length: {len(output.logprobs)} != output.length: {output.length}"
+            assert len(
+                output.logprobs
+            ) == output.length, f"logprobs length: {len(output.logprobs)} != output.length: {output.length}"
 
         if response_tensors.generation_logits is not None:
             output.generation_logits = response_tensors.generation_logits[
