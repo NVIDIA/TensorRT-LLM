@@ -40,6 +40,7 @@
 #include "tensorrt_llm/nanobind/batch_manager/llmRequest.h"
 #include "tensorrt_llm/nanobind/common/tllmExceptions.h"
 #include "tensorrt_llm/nanobind/executor/bindings.h"
+#include "tensorrt_llm/nanobind/process_group/bindings.h"
 #include "tensorrt_llm/nanobind/runtime/bindings.h"
 #include "tensorrt_llm/nanobind/testing/modelSpecBinding.h"
 #include "tensorrt_llm/nanobind/thop/bindings.h"
@@ -125,6 +126,7 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
     // Create submodule for executor bindings.
     auto mExecutor = m.def_submodule("executor", "Executor bindings");
     auto mInternal = m.def_submodule("internal", "Internal submodule of TRTLLM runtime");
+    auto mInternalProcessGroup = mInternal.def_submodule("process_group", "PyTorch ProcessGroup internal bindings");
     auto mInternalRuntime = mInternal.def_submodule("runtime", "Runtime internal bindings");
     auto mInternalTesting = mInternal.def_submodule("testing", "Testing internal bindings");
     auto mInternalBatchManager = mInternal.def_submodule("batch_manager", "Batch manager internal bindings");
@@ -368,14 +370,14 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
     auto SamplingConfigGetState = [](tr::SamplingConfig const& config) -> nb::tuple
     {
         return nb::make_tuple(config.beamWidth, config.temperature, config.minLength, config.repetitionPenalty,
-            config.presencePenalty, config.frequencyPenalty, config.topK, config.topP, config.randomSeed,
-            config.topPDecay, config.topPMin, config.topPResetIds, config.beamSearchDiversityRate, config.lengthPenalty,
-            config.earlyStopping, config.noRepeatNgramSize, config.numReturnSequences, config.minP,
-            config.beamWidthArray);
+            config.presencePenalty, config.frequencyPenalty, config.promptIgnoreLength, config.topK, config.topP,
+            config.randomSeed, config.topPDecay, config.topPMin, config.topPResetIds, config.beamSearchDiversityRate,
+            config.lengthPenalty, config.earlyStopping, config.noRepeatNgramSize, config.numReturnSequences,
+            config.minP, config.beamWidthArray);
     };
     auto SamplingConfigSetState = [](tr::SamplingConfig& self, nb::tuple t)
     {
-        if (t.size() != 19)
+        if (t.size() != 20)
         {
             throw std::runtime_error("Invalid SamplingConfig state!");
         }
@@ -387,19 +389,20 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         config.repetitionPenalty = nb::cast<OptVec<float>>(t[3]);
         config.presencePenalty = nb::cast<OptVec<float>>(t[4]);
         config.frequencyPenalty = nb::cast<OptVec<float>>(t[5]);
-        config.topK = nb::cast<OptVec<SizeType32>>(t[6]);
-        config.topP = nb::cast<OptVec<float>>(t[7]);
-        config.randomSeed = nb::cast<OptVec<uint64_t>>(t[8]);
-        config.topPDecay = nb::cast<OptVec<float>>(t[9]);
-        config.topPMin = nb::cast<OptVec<float>>(t[10]);
-        config.topPResetIds = nb::cast<OptVec<TokenIdType>>(t[11]);
-        config.beamSearchDiversityRate = nb::cast<OptVec<float>>(t[12]);
-        config.lengthPenalty = nb::cast<OptVec<float>>(t[13]);
-        config.earlyStopping = nb::cast<OptVec<SizeType32>>(t[14]);
-        config.noRepeatNgramSize = nb::cast<OptVec<SizeType32>>(t[15]);
-        config.numReturnSequences = nb::cast<SizeType32>(t[16]);
-        config.minP = nb::cast<OptVec<float>>(t[17]);
-        config.beamWidthArray = nb::cast<OptVec<std::vector<SizeType32>>>(t[18]);
+        config.promptIgnoreLength = nb::cast<OptVec<SizeType32>>(t[6]);
+        config.topK = nb::cast<OptVec<SizeType32>>(t[7]);
+        config.topP = nb::cast<OptVec<float>>(t[8]);
+        config.randomSeed = nb::cast<OptVec<uint64_t>>(t[9]);
+        config.topPDecay = nb::cast<OptVec<float>>(t[10]);
+        config.topPMin = nb::cast<OptVec<float>>(t[11]);
+        config.topPResetIds = nb::cast<OptVec<TokenIdType>>(t[12]);
+        config.beamSearchDiversityRate = nb::cast<OptVec<float>>(t[13]);
+        config.lengthPenalty = nb::cast<OptVec<float>>(t[14]);
+        config.earlyStopping = nb::cast<OptVec<SizeType32>>(t[15]);
+        config.noRepeatNgramSize = nb::cast<OptVec<SizeType32>>(t[16]);
+        config.numReturnSequences = nb::cast<SizeType32>(t[17]);
+        config.minP = nb::cast<OptVec<float>>(t[18]);
+        config.beamWidthArray = nb::cast<OptVec<std::vector<SizeType32>>>(t[19]);
 
         new (&self) tr::SamplingConfig(config);
     };
@@ -414,6 +417,7 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .def_rw("repetition_penalty", &tr::SamplingConfig::repetitionPenalty)
         .def_rw("presence_penalty", &tr::SamplingConfig::presencePenalty)
         .def_rw("frequency_penalty", &tr::SamplingConfig::frequencyPenalty)
+        .def_rw("prompt_ignore_length", &tr::SamplingConfig::promptIgnoreLength)
         .def_rw("top_k", &tr::SamplingConfig::topK)
         .def_rw("top_p", &tr::SamplingConfig::topP)
         .def_rw("random_seed", &tr::SamplingConfig::randomSeed)
@@ -485,6 +489,7 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .def_prop_ro("pinned", &tr::MemoryCounters::getPinned)
         .def_prop_ro("uvm", &tr::MemoryCounters::getUVM);
 
+    tensorrt_llm::nanobind::process_group::initBindings(mInternalProcessGroup);
     tensorrt_llm::nanobind::runtime::initBindings(mInternalRuntime);
     tensorrt_llm::nanobind::testing::initBindings(mInternalTesting);
     tpb::initBindings(mInternalBatchManager);

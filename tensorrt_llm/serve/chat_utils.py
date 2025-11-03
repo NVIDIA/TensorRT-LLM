@@ -1,3 +1,4 @@
+import uuid
 from functools import partial
 from typing import (Any, Callable, Coroutine, Dict, Iterable, List, Literal,
                     Optional, Tuple, TypeAlias, TypedDict, Union, cast)
@@ -15,6 +16,7 @@ from tensorrt_llm.inputs import (ConversationMessage, MultimodalData,
                                  MultimodalDataTracker,
                                  add_multimodal_placeholders, async_load_audio,
                                  async_load_image, async_load_video)
+from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.logger import logger
 
 
@@ -74,7 +76,9 @@ def _parse_chat_message_content_mm_part(
 
 
 def parse_chat_message_content_part(
-    part: ChatCompletionMessageParam, ) -> Optional[Any]:
+    part: ChatCompletionMessageParam,
+    mm_data_tracker: MultimodalDataTracker,
+) -> Optional[Any]:
     """Parse a single part of a chat message."""
     if isinstance(part, str):
         return part
@@ -96,7 +100,10 @@ def parse_chat_message_content_part(
 
         async def load_image_async():
             try:
-                return await async_load_image(str_content)
+                image_kwargs = (
+                    mm_data_tracker._multimodal_server_config.media_io_kwargs
+                    or {}).get("image", {})
+                return await async_load_image(str_content, **image_kwargs)
             except Exception as e:
                 logger.error(f"Failed to load image: {str(e)}")
                 return None
@@ -108,7 +115,10 @@ def parse_chat_message_content_part(
 
         async def load_video_async():
             try:
-                return await async_load_video(str_content, num_frames=8)
+                video_kwargs = (
+                    mm_data_tracker._multimodal_server_config.media_io_kwargs
+                    or {}).get("video", {})
+                return await async_load_video(str_content, **video_kwargs)
             except Exception as e:
                 logger.error(f"Failed to load video: {str(e)}")
                 return None
@@ -120,7 +130,10 @@ def parse_chat_message_content_part(
 
         async def load_audio_async():
             try:
-                return await async_load_audio(str_content)
+                audio_kwargs = (
+                    mm_data_tracker._multimodal_server_config.media_io_kwargs
+                    or {}).get("audio", {})
+                return await async_load_audio(str_content, **audio_kwargs)
             except Exception as e:
                 logger.error(f"Failed to load audio: {str(e)}")
                 return None
@@ -133,12 +146,13 @@ def parse_chat_message_content_part(
 def parse_chat_message_content_parts(
     role: str,
     parts: Iterable[ChatCompletionMessageParam],
+    mm_data_tracker: MultimodalDataTracker,
 ) -> ConversationMessage:
     """Parse multiple parts of a chat message."""
     text_parts = []
     media_parts = []
     for part in parts:
-        parse_res = parse_chat_message_content_part(part)
+        parse_res = parse_chat_message_content_part(part, mm_data_tracker)
         if parse_res:
             if isinstance(parse_res, str):
                 text_parts.append(parse_res)
@@ -153,7 +167,8 @@ def parse_chat_message_content_parts(
 
 
 def parse_chat_message_content(
-    message: ChatCompletionMessageParam, ) -> ConversationMessage:
+        message: ChatCompletionMessageParam,
+        mm_data_tracker: MultimodalDataTracker) -> ConversationMessage:
     """Parse the content of a chat message."""
     role = message["role"]
     content = message.get("content")
@@ -168,6 +183,7 @@ def parse_chat_message_content(
     result = parse_chat_message_content_parts(
         role,
         content,
+        mm_data_tracker,
     )
     return result
 
@@ -175,15 +191,17 @@ def parse_chat_message_content(
 def parse_chat_messages_coroutines(
     messages: List[ChatCompletionMessageParam],
     model_config: AutoConfig,
+    multimodal_server_config: Optional[MultimodalServerConfig] = None
 ) -> Tuple[List[ConversationMessage], Optional[Coroutine[
         Any, Any, Optional[Dict[str, List[Any]]]]]]:
     """Parse multiple chat messages and return conversation and coroutine."""
     conversation = []
     mm_placeholder_counts = []
-    mm_data_tracker = MultimodalDataTracker(model_config.model_type)
+    mm_data_tracker = MultimodalDataTracker(model_config.model_type,
+                                            multimodal_server_config)
 
     for msg in messages:
-        parsed_msg = parse_chat_message_content(msg)
+        parsed_msg = parse_chat_message_content(msg, mm_data_tracker)
         conversation.append(parsed_msg)
         if parsed_msg["media"]:
             for mdata in parsed_msg["media"]:
@@ -203,3 +221,11 @@ def check_multiple_response(n: int, backend: Optional[str]):
     if n > 1 and backend == "pytorch":
         raise ValueError(
             "Multiple response is not supported in PyTorch workflow")
+
+
+def make_tool_call_id(id_type: str = "random", func_name=None, idx=None):
+    if id_type == "kimi_k2":
+        return f"functions.{func_name}:{idx}"
+    else:
+        # by default return random
+        return f"chatcmpl-tool-{uuid.uuid4().hex}"

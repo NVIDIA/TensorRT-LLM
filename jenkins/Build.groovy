@@ -97,6 +97,7 @@ def BUILD_CONFIGS = [
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl",
     (TARNAME) : "TensorRT-LLM-GH200.tar.gz",
     (WHEEL_ARCHS): "90-real;100-real;103-real;120-real",
+    (BUILD_JOBS_FOR_CONFIG): "4", // TODO: Remove after fix the build OOM issue on SBSA
   ],
   (CONFIG_LINUX_AARCH64_CU12): [
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars WARNING_IS_ERROR=ON",
@@ -134,7 +135,7 @@ def globalVars = [
 BUILD_CORES_REQUEST = "8"
 BUILD_CORES_LIMIT = "8"
 BUILD_MEMORY_REQUEST = "48Gi"
-BUILD_MEMORY_LIMIT = "64Gi"
+BUILD_MEMORY_LIMIT = "96Gi"
 BUILD_JOBS = "8"
 
 TESTER_CORES = "12"
@@ -453,7 +454,7 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
         pipArgs = ""
     }
 
-    if (tarName.contains("_CU12")) {
+    if (tarName.contains("CU12")) {
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && sed -i '/^# .*<For CUDA 12\\.9>\$/ {s/^# //; n; s/^/# /}' requirements.txt && cat requirements.txt")
     }
     // install python package

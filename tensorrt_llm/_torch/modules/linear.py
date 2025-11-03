@@ -14,15 +14,20 @@ from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
+from tensorrt_llm._utils import is_device_integrated
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy)
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
 from tensorrt_llm.quantization.mode import QuantAlgo
+from tensorrt_llm.quantization.utils.fp8_utils import (
+    resmooth_to_fp8_e8m0, transform_sf_into_required_layout)
 
 from ..._utils import is_sm_100f
 from ...models.modeling_utils import QuantConfig
+from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..utils import Fp4QuantizedTensor
 
@@ -64,6 +69,15 @@ def load_weight_shard(
         tensor_parallel_mode: Optional[TensorParallelMode] = None,
         device: torch.device = torch.device('cpu'),
 ) -> torch.Tensor:
+    # Skip device transfers on integrated GPUs to conserve shared memory
+    if weight.device.type != device.type and is_device_integrated():
+        # For integrated GPU systems (e.g., DGX Spark), CPU and GPU share limited physical memory.
+        # Avoiding device transfers reduces memory consumption and unnecessary data copies,
+        # enabling support for larger models on memory-constrained systems.
+        logger.warning(
+            f"[load_weight_shard] Skipping device transfer from {weight.device} to {device} on integrated GPU to conserve shared memory."
+        )
+        device = weight.device
     if isinstance(weight, torch.Tensor):
         tensor_shape = weight.shape
 
@@ -430,16 +444,14 @@ class FP8QDQLinearMethod(LinearMethodBase):
 
         copy_weight(module.weight_scale, max(weight_scale))
 
-        q_weight = q_weight.to(module.dtype) * weight_scale[0]
-        k_weight = k_weight.to(module.dtype) * weight_scale[1]
-        v_weight = v_weight.to(module.dtype) * weight_scale[2]
+        # use in-place multiplication and division to avoid extra memory allocation
+        q_weight = q_weight.to(module.dtype).mul_(weight_scale[0])
+        k_weight = k_weight.to(module.dtype).mul_(weight_scale[1])
+        v_weight = v_weight.to(module.dtype).mul_(weight_scale[2])
 
         fused_weight = torch.cat((q_weight, k_weight, v_weight))
-        if module.weight_scale.device != fused_weight.device:
-            module.weight_scale = Parameter(
-                module.weight_scale.data.to(fused_weight.device))
-        fused_weight = (fused_weight / module.weight_scale).to(
-            torch.float8_e4m3fn)
+        fused_weight = fused_weight.div_(
+            module.weight_scale.to(fused_weight.device)).to(torch.float8_e4m3fn)
         copy_weight(module.weight, fused_weight)
 
         # Load k and v scales, used for NVFP4 KV cache
@@ -472,14 +484,12 @@ class FP8QDQLinearMethod(LinearMethodBase):
         gate_weight, up_weight = load_weights_fused_gate_up_helper(
             module, weights)
 
-        gate_weight = gate_weight.to(module.dtype) * weight_scale[0]
-        up_weight = up_weight.to(module.dtype) * weight_scale[1]
+        # use in-place multiplication and division to avoid extra memory allocation
+        gate_weight = gate_weight.to(module.dtype).mul_(weight_scale[0])
+        up_weight = up_weight.to(module.dtype).mul_(weight_scale[1])
         fused_weight = torch.cat((gate_weight, up_weight))
-        if module.weight_scale.device != fused_weight.device:
-            module.weight_scale = Parameter(
-                module.weight_scale.data.to(fused_weight.device))
-        fused_weight = (fused_weight / module.weight_scale).to(
-            torch.float8_e4m3fn)
+        fused_weight = fused_weight.div_(
+            module.weight_scale.to(fused_weight.device)).to(torch.float8_e4m3fn)
         copy_weight(module.weight, fused_weight)
 
 
@@ -715,6 +725,24 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
         copy_weight(module.weight, fused_weight)
         copy_weight(module.weight_scale, fused_scale)
 
+    def post_load_weights(self, module: Linear):
+        super().post_load_weights(module)
+        if is_sm_100f() and not (module.use_cute_dsl_blockscaling_mm
+                                 or module.disable_deep_gemm):
+            weight, weight_scale = resmooth_to_fp8_e8m0(module.weight,
+                                                        module.weight_scale)
+            transfromed_scale = transform_sf_into_required_layout(
+                weight_scale,
+                mn=weight.shape[0],
+                k=weight.shape[1],
+                recipe=(1, 128, 128),
+                is_sfa=False)
+            module.weight = nn.Parameter(weight, requires_grad=False)
+            module.weight_scale = nn.Parameter(
+                transfromed_scale,
+                requires_grad=False,
+            )
+
 
 class NVFP4LinearMethod(LinearMethodBase):
 
@@ -774,10 +802,29 @@ class NVFP4LinearMethod(LinearMethodBase):
             output = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
                 act_fp4, module.weight, act_sf, module.weight_scale,
                 module.scalar_alpha, module.dtype)
+        elif IS_CUBLASLT_AVAILABLE and module.use_cublaslt_nvfp4_blockscaling_mm:
+            output = torch.ops.trtllm.nvfp4_gemm_cublaslt(
+                act_fp4, module.weight, act_sf, module.weight_scale,
+                module.alpha, module.dtype)
         else:
-            output = torch.ops.trtllm.nvfp4_gemm(act_fp4, module.weight, act_sf,
-                                                 module.weight_scale,
-                                                 module.alpha, module.dtype)
+            if module.enable_cuda_core and act_fp4.shape[0] <= 8:
+                act_sf_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
+                    act_sf.view((act_fp4.shape[0] + 128 - 1) // 128 * 128, -1))
+                output = torch.ops.trtllm.cuda_core_nvfp4_gemm(
+                    act_fp4,
+                    module.weight,
+                    scale_a=act_sf_unswizzled,
+                    scale_b=module.weight_scale,
+                    alpha=module.alpha,
+                    bias=None,
+                    out_dtype=module.dtype or input.dtype,
+                )
+            else:
+                output = torch.ops.trtllm.nvfp4_gemm(act_fp4, module.weight,
+                                                     act_sf,
+                                                     module.weight_scale,
+                                                     module.alpha, module.dtype)
+
         if bias is not None:
             output = output + bias
         return output
@@ -1007,15 +1054,12 @@ class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
                                        tp_mode,
                                        device=device).contiguous()
                 assert ws.dtype == torch.float8_e4m3fn
-                # The kernel we use will convert nvfp4 to e4m3 before matmul,
-                # so the range of the scale factor can only be [0,448/6].
-                ws = (ws.to(torch.float32) / 6.0).to(torch.float8_e4m3fn)
                 weight_scale.append(ws.view(dtype=fp4_utils.float4_sf_dtype))
             if "weight_scale_2" in w:
                 if weight_scale_2 is None:
-                    weight_scale_2 = w["weight_scale_2"][...] * 6.0
+                    weight_scale_2 = w["weight_scale_2"][...]
                 else:
-                    assert weight_scale_2 == w["weight_scale_2"][...] * 6.0, (
+                    assert weight_scale_2 == w["weight_scale_2"][...], (
                         f"The weight_scale_2 should be same for all the weights: {weight_scale_2} vs. {w['weight_scale_2']}*6"
                     )
 
@@ -1805,6 +1849,7 @@ class Linear(nn.Module):
         force_dynamic_quantization: bool = False,
         use_cute_dsl_blockscaling_mm: bool = False,
         use_cute_dsl_nvfp4_blockscaling_mm: bool = False,
+        use_cublaslt_nvfp4_blockscaling_mm: bool = False,
         disable_deep_gemm: bool = False,
     ):
         from ..distributed import AllReduce
@@ -1824,6 +1869,7 @@ class Linear(nn.Module):
         self.force_dynamic_quantization = force_dynamic_quantization
         self.use_cute_dsl_blockscaling_mm = use_cute_dsl_blockscaling_mm
         self.use_cute_dsl_nvfp4_blockscaling_mm = use_cute_dsl_nvfp4_blockscaling_mm
+        self.use_cublaslt_nvfp4_blockscaling_mm = use_cublaslt_nvfp4_blockscaling_mm
         self.disable_deep_gemm = disable_deep_gemm
 
         local_in_features = in_features
@@ -1858,8 +1904,9 @@ class Linear(nn.Module):
         if torch.cuda.is_available():
             capability = torch.cuda.get_device_capability(
                 torch.device('cuda:0'))
-            # enable cuda core for sm89
-            self.enable_cuda_core = capability[0] == 8 and capability[1] == 9
+            # enable cuda core for sm89 and sm120
+            self.enable_cuda_core = (capability[0] == 8 and capability[1] == 9) \
+                or (capability[0] == 12 and capability[1] == 0)
 
         if not skip_create_weights_in_init:
             self.create_weights()

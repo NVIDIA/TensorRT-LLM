@@ -67,6 +67,10 @@ class SpeculativeDecodingMode(IntEnum):
         ) or self.is_ngram()
 
     def support_overlap_scheduler(self):
+        # TODO: fix accuracy issue
+        if self.is_mtp_eagle():
+            return False
+
         return self.is_mtp_one_model() or self.is_eagle3_one_model(
         ) or self.has_draft_model()
 
@@ -106,13 +110,18 @@ class SpeculativeDecodingMode(IntEnum):
     def extend_ctx(self, attention_backend: Type[AttentionBackend]):
         """
         If true, treat generation requests with draft tokens as
-        chunked context requests at the kernel level. Required for
-        any spec dec mode that uses the SpecExecutor.
+        chunked context requests at the kernel level.
         """
 
         if self.use_one_engine():
             # 1-model has separate logic for handling draft tokens
             return False
+
+        if issubclass(attention_backend,
+                      TrtllmAttention) and self.is_mtp_eagle():
+            # TRTLLM MLA does not work with the chunked context mode.
+            return False
+
         return not issubclass(attention_backend,
                               TrtllmAttention) or get_sm_version() != 100
 
@@ -122,6 +131,7 @@ class SpeculativeDecodingMode(IntEnum):
         is_draft_model: bool,
         attention_backend: Type[AttentionBackend],
         use_chain_drafter: bool,
+        is_spec_dec_tree: bool,
     ):
         """
         If true, the attention backend kernel needs to run in spec-dec mode (multi-token query mode).
@@ -145,8 +155,10 @@ class SpecMetadata:
     """
     # The max number of requests in a single batch.
     max_num_requests: int
-    # The max number of draft tokens.
+    # The number of draft layers. (Also the number of draft tokens for the linear tree.)
     max_draft_len: int
+    # The max number of draft tokens for the static tree and dynamic tree   .
+    max_total_draft_tokens: int
     # The number of gen-phase sequences in the batch.
     num_generations: int = 0
     # Whether CUDA graph is enabled.
@@ -182,9 +194,13 @@ class SpecMetadata:
     # The number of layers
     num_layers: int = 0
 
-    # if spec-dec tree is a tree or a chain (linear tree)
-    is_spec_dec_tree: bool = False
     # if spec-dec tree wouldn't be changed at all, the mask won't be computed every step.
+    # NOTE: For the linear tree, though it can be treated as a special case of static tree.
+    # NOTE: But we do not set `is_spec_dec_tree` to True for this cases.
+    # NOTE: i.e., for the linear tree, is_spec_dec_tree == False and is_spec_dec_dynamic_tree == False.
+    # whether the spec-dec mode is a tree (can be static tree or dynamic tree).
+    is_spec_dec_tree: bool = False
+    # whether the spec-dec mode is a dynamic tree.
     is_spec_dec_dynamic_tree: bool = False
 
     def __post_init__(self):

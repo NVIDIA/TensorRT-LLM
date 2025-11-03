@@ -13,13 +13,13 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
-                                                             PeftCacheConfig,
                                                              PeftCacheManager)
 from tensorrt_llm.bindings import LayerType
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.bindings.internal.batch_manager import \
     PeftTaskNotCachedException
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PeftCacheConfig
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -233,7 +233,7 @@ class TestResourceManager(unittest.TestCase):
             num_ensure_workers=mock_config.ensure_thread_count,
         )
 
-        return peft_cache_config
+        return PeftCacheConfig.from_pybind(peft_cache_config)
 
     def _create_request(self,
                         request_id,
@@ -574,11 +574,11 @@ class TestResourceManager(unittest.TestCase):
 
     @staticmethod
     def _create_kv_cache_config_for_kv_cache_manager(
-            params: dict) -> tllm.KvCacheConfig:
+            params: dict) -> KvCacheConfig:
         """
         Create a KV cache config for KVCacheManager test.
         """
-        return tllm.KvCacheConfig(**params)
+        return KvCacheConfig(**params)
 
     def test_calculate_max_num_blocks_from_cpp(self):
         # Construct a minimal mapping (single-rank, no TP/PP)
@@ -633,9 +633,8 @@ class TestResourceManager(unittest.TestCase):
                     "free_gpu_memory_fraction": free_gpu_memory_fraction,
                     "enable_block_reuse": enable_block_reuse,
                 },
-                # NOTE: use np.float32 to avoid float precision issue between python(double in most cases) and cpp binding(float)
-                expected_memory_bytes=(int(
-                    fixed_free_mem * np.float32(free_gpu_memory_fraction)), 0),
+                expected_memory_bytes=(int(fixed_free_mem *
+                                           free_gpu_memory_fraction), 0),
             ),
         ]
 

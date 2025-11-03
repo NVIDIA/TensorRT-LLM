@@ -36,6 +36,87 @@ All API schemas are:
 - Protected by unit tests in `tests/unittest/api_stability/`
 - Automatically validated to ensure consistency 
 
+## API Change Principles
+
+### 1. Knob Naming
+
+**Use Semantic Clarity**
+
+Argument names should describe what the argument represents, not how it is used internally.
+
+✅ **Good**: `max_new_tokens` (clear meaning)  
+❌ **Bad**: `num` (ambiguous)
+
+**Reflect Argument Type and Granularity**
+
+- For **boolean** knobs, prefix with verbs like `enable_` and so on.
+  Examples: `enable_cache`, `enable_flash_attention`
+
+- For **numerical threshold** knobs, suffix with `_limit`, `_size`, `_count`, `_len_` or `_ratio`  
+  Examples: `max_seq_len`, `prefill_batch_size`
+
+**Avoid Redundant Prefixes**
+
+Example (in `MoeConfig`):
+
+✅ **Good**: `backend`  
+❌ **Bad**: `moe_backend` (redundant since it's already in `MoeConfig`)
+
+**Use Specific Names for Narrow Scenarios**
+
+When adding knobs for specific use cases, make the name convey the restriction clearly via a prefix. It's acceptable to rename later when the knob becomes more generic or is moved into a dedicated config.
+
+Example (argument to the LLM class):
+
+✅ **Good**: `rope_scaling_factor` → clearly indicates it's for RoPE  
+❌ **Bad**: `scaling_factor` → too generic and prone to misuse
+
+### 2. Hierarchical Configuration
+
+Organize complex or hierarchical arguments into **dedicated configuration dataclasses** with intuitive and consistent naming.
+
+**Guidelines**
+
+- Use the `XxxConfig` suffix consistently  
+  Examples: `ModelConfig`, `ParallelConfig`, `MoeConfig`
+  
+- **Reflect conceptual hierarchy**  
+  The dataclass name should represent a coherent functional unit, not an arbitrary grouping
+  
+- **Avoid over-nesting**  
+  Use only one level of configuration hierarchy whenever possible (e.g., `LlmArgs → ParallelConfig`) to balance readability and modularity
+
+### 3. Prefer `LlmArgs` Over Environment Variables
+
+`LlmArgs` is the central place for all configuration knobs. It integrates with our infrastructure to ensure:
+
+- **API Stability**
+  - Protects committed (stable) APIs
+  - GitHub reviewer committee oversees API stability
+
+- **API Status Registration**
+  - Uncommitted (unstable) APIs must be marked as `"prototype"` or `"beta"`
+  - API statuses are displayed in the documentation
+
+- **API Documentation**
+  - Each knob uses a `Field` with a description
+  - Automatically rendered in public documentation
+
+> Managing knobs in `LlmArgs` remains **scalable and maintainable** thanks to our existing infrastructure and review processes.
+
+**Drawbacks of Environment Variables:**
+
+- Dispersed across the codebase
+- Lack documentation and discoverability
+- Pose challenges for testing and validation
+
+**Guidelines for Adding Knobs:**
+
+- ✅ Add clear, descriptive documentation for each field
+- ✅ It's fine to add temporary knobs and refine them later
+- ⚠️ Always mark temporary knobs as `"prototype"` if not stable yet
+- ✅ Refactor prototype knobs as they mature, promote them to "beta" or "stable".
+
 ## Modifying LLM Constructor Arguments
 
 The LLM class accepts numerous configuration parameters for models, runtime, and other components. These are managed through a Pydantic dataclass called `LlmArgs`.

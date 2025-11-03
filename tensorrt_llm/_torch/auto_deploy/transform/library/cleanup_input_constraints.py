@@ -29,7 +29,7 @@ class CleanupInputConstraints(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         graph: Graph = gm.graph
-        input_node = graph.find_nodes(op="placeholder")[0]
+        input_node = graph.find_nodes(op="placeholder")[1]
         sym_shape: torch.Size = input_node.meta["val"].shape
 
         # get expressions in the symbolic shape

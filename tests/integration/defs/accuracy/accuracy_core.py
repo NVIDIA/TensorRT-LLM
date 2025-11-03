@@ -186,7 +186,8 @@ class AccuracyTask:
                  extra_acc_spec: Optional[str] = None,
                  extra_evaluator_kwargs: Optional[dict] = None,
                  sampling_params: Optional[SamplingParams] = None,
-                 streaming: bool = False):
+                 streaming: bool = False,
+                 is_integration_test: bool = False):
         assert self.EVALUATOR_CLS is not None
 
         if llm.args.speculative_config is None:
@@ -199,7 +200,8 @@ class AccuracyTask:
             raise ValueError(
                 f"Not recognized speculative_config: {llm.args.speculative_config}."
             )
-        is_integration_test = os.getenv('INTEGRATION_TEST', '0') == '1'
+        is_integration_test = is_integration_test or os.getenv(
+            'INTEGRATION_TEST', '0') == '1'
 
         if is_integration_test:
             logger.info(
@@ -669,7 +671,8 @@ class CliFlowAccuracyTestHarness:
                 f"--max_tokens_in_paged_kv_cache={max_tokens_in_paged_kv_cache}"
             ])
 
-        if task.MAX_INPUT_LEN + task.MAX_OUTPUT_LEN > BuildConfig.max_num_tokens:
+        if task.MAX_INPUT_LEN + task.MAX_OUTPUT_LEN > BuildConfig.model_fields[
+                "max_num_tokens"].default:
             summarize_cmd.append("--enable_chunked_context")
 
         if self.extra_summarize_args:

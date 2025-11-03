@@ -18,11 +18,11 @@
 
 #include "KernelRunner.h"
 #include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/envUtils.h"
 #include "trtllmGen_bmm_export/BatchedGemmInterface.h"
 #include "trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
 // DO NOT include cudaUtils.h and logger.h before BatchedGemmInterface.h as it #undef TLLM_LOG_INFO and co.
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 
 namespace tensorrt_llm
@@ -35,6 +35,25 @@ using namespace batchedGemm::gemm;
 using namespace batchedGemm::trtllm::gen;
 
 static BatchedGemmInterface::ModuleCache globalTrtllmGenBatchedGemmModuleCache;
+
+constexpr bool isSMCompatible(int gpuSM, SmVersion kernelSM)
+{
+    if (gpuSM == 103)
+    {
+        return kernelSM == SmVersion::Sm100f || kernelSM == SmVersion::Sm103a;
+    }
+    else if (gpuSM == 100)
+    {
+        return kernelSM == SmVersion::Sm100f || kernelSM == SmVersion::Sm100a;
+    }
+    else if (gpuSM == 90)
+    {
+        return kernelSM == SmVersion::Sm90a;
+    }
+
+    TLLM_THROW("Unexpected gpuSM %d", gpuSM);
+    return false;
+}
 
 std::vector<int64_t> prioritizePredefinedConfigs(int m, int n, int k, std::vector<int64_t> const& sortedIndices,
     batchedGemm::batchedGemm::BatchedGemmConfig const* configs)
@@ -98,6 +117,7 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
 
     mPassingConfigIndices.clear();
 
+    int gpuSM = tensorrt_llm::common::getSMVersion();
     for (size_t i = 0; i < bmm.getNumBatchedGemmConfigs(); ++i)
     {
         auto const options = configs[i].mOptions;
@@ -108,7 +128,7 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
             && options.mTransposeMmaOutput == mOptions.transposeMmaOutput
             && (!doesRouteImplUseNoRoute(options.mRouteImpl)) == mOptions.routeAct
             && options.mFusedAct == mOptions.fusedAct && options.mIsStaticBatch == mOptions.staticBatch
-            && tileSize == mOptions.tileSize)
+            && tileSize == mOptions.tileSize && isSMCompatible(gpuSM, configs[i].mSm))
         {
             auto sm = configs[i].mSm;
             if (sm != SmVersion::Sm100f)
@@ -124,18 +144,22 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
                 }
             }
 
-            // FIXME: Disable split-k for now.
-            if (options.mClusterDimZ != 1)
-            {
-                continue;
-            }
-
             if (options.mFusedAct)
             {
                 if (options.mActType != static_cast<batchedGemm::gemmGatedAct::ActType>(mOptions.actType))
                 {
                     continue;
                 }
+            }
+
+            // FIXME: Disables a few static scheduler kernels (schedS) that appears to have issues;
+            // found after commit e257cb3533; still under investigation. Offending kernels:
+            // bmm_E2m1_E2m1E2m1_Fp32_t128x64x256_s6_et128x64_m128x64x64_cga1x1x1_16dp256b_TN_transOut_schedS_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a
+            // bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256_s3_et128x64_m128x64x32_cga1x1x1_16dp256b_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f
+            if (options.mTileScheduler == TileScheduler::Static && options.mUseTmaOobOpt == true
+                && options.mTileN == 64)
+            {
+                continue;
             }
 
             if (mOptions.transposeMmaOutput && options.mEpilogueTileM == mOptions.epilogueTileM)
@@ -145,7 +169,12 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
         }
     }
 
-    TLLM_CHECK_WITH_INFO(!mPassingConfigIndices.empty(), "No kernel found for the given options");
+    TLLM_CHECK_WITH_INFO(!mPassingConfigIndices.empty(),
+        "No kernel found for the given options: mDtypeA: %s, mDtypeB: %s, mDtypeC: %s, mUseDeepSeekFp8: %d, "
+        "mTransposeMmaOutput: %d, mRouteAct: %d, mFusedAct: %d, mIsStaticBatch: %d, mTileSize: %d",
+        tg::dtypeToString(mOptions.dtypeA).c_str(), tg::dtypeToString(mOptions.dtypeB).c_str(),
+        tg::dtypeToString(mOptions.dtypeC).c_str(), mOptions.deepSeekFp8, mOptions.transposeMmaOutput,
+        mOptions.routeAct, mOptions.fusedAct, mOptions.staticBatch, mOptions.tileSize);
 }
 
 size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(int32_t m, int32_t n, int32_t k,
@@ -257,7 +286,8 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vecto
     auto envVarVal = std::getenv("TLLM_BATCHED_GEMM_PRINT_NAME");
     if (envVarVal && std::atoi(envVarVal) == 1)
     {
-        TLLM_LOG_INFO("numBatches %d Gemm %d %d %d Kernel %s\n", numBatches, m, n, k, config.mFunctionName);
+        TLLM_LOG_INFO("NumBatches %d, MaxNumCtasInBatchDim %d, ShapeMNK %d %d %d, Kernel %s", numBatches,
+            maxNumCtasInBatchDim, m, n, k, config.mFunctionName);
     }
     // FIXME once we start using all-reduce in the epilogue of the bmm this can be moved elsewhere
     bmm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));

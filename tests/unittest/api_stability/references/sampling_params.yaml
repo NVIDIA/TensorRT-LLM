@@ -3,13 +3,17 @@ methods:
     parameters:
       # Experimental features
       additional_model_outputs:
-        annotation: Optional[List[tensorrt_llm.sampling_params.AdditionalModelOutput]]
+        annotation: Optional[List[str]]
         default: null
+        status: prototype
       return_perf_metrics:
         annotation: bool
         default: false
       beam_width_array:
         annotation: Optional[List[int]]
+        default: null
+      prompt_ignore_length:
+        annotation: Optional[int]
         default: null
     return_annotation: None
 properties: {}

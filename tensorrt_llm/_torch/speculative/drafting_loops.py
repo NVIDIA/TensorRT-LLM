@@ -107,17 +107,18 @@ def prepare_for_generation(attn_metadata: AttentionMetadata,
 
 class ChainDrafter(torch.nn.Module):
 
-    def __init__(self, max_draft_len: int, draft_model: torch.nn.Module):
+    def __init__(self, max_draft_len: int, max_total_draft_tokens: int,
+                 draft_model: torch.nn.Module):
         super().__init__()
         self.draft_model = draft_model
         self.config = self.draft_model.config
         self.model_config = self.draft_model.model_config
         self.max_draft_len = max_draft_len
+        self.max_total_draft_tokens = max_total_draft_tokens
 
     def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor,
                 attn_metadata: AttentionMetadata, spec_metadata: SpecMetadata,
-                **kwargs) -> torch.Tensor:
-
+                **kwargs) -> dict[str, torch.Tensor]:
         logits = self.draft_model.forward(input_ids=input_ids,
                                           position_ids=position_ids,
                                           attn_metadata=attn_metadata,
@@ -126,6 +127,7 @@ class ChainDrafter(torch.nn.Module):
         logits = logits[spec_metadata.gather_ids]
 
         new_draft_tokens = [self.sample(logits)]
+        draft_logits = [logits]
         with save_metadata_state(attn_metadata, spec_metadata):
             batch_size = attn_metadata.num_seqs
 
@@ -139,13 +141,17 @@ class ChainDrafter(torch.nn.Module):
                     attn_metadata=attn_metadata,
                     spec_metadata=spec_metadata)
                 new_draft_tokens.append(self.sample(logits))
+                draft_logits.append(logits)
                 new_position_ids += 1
                 attn_metadata.kv_lens_cuda[:batch_size] += 1
                 if i == 0 and isinstance(spec_metadata, Eagle3SpecMetadata):
                     spec_metadata.hidden_states_read_indices[:batch_size].copy_(
                         spec_metadata.hidden_states_write_indices[:batch_size])
 
-        return torch.stack(new_draft_tokens)
+        return {
+            "new_draft_tokens": torch.stack(new_draft_tokens),
+            "draft_logits": torch.stack(draft_logits)
+        }
 
     def sample(self, logits: torch.Tensor) -> torch.Tensor:
         # TODO: inject the sampler here so we can support non-greedy

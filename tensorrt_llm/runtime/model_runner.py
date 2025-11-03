@@ -25,9 +25,10 @@ import torch
 
 from .. import profiler
 from .._utils import mpi_comm, mpi_world_size, numpy_to_torch
-from ..bindings import KVCacheType, MpiComm
+from ..bindings import MpiComm
 from ..bindings.executor import Executor
 from ..builder import Engine, EngineConfig, get_engine_version
+from ..llmapi.kv_cache_type import KVCacheType
 from ..logger import logger
 from ..mapping import Mapping
 from ..quantization import QuantMode
@@ -86,7 +87,9 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
     dtype = builder_config['precision']
     tp_size = builder_config['tensor_parallel']
     pp_size = builder_config.get('pipeline_parallel', 1)
-    kv_cache_type = KVCacheType.from_string(builder_config.get('kv_cache_type'))
+    kv_cache_type = builder_config.get('kv_cache_type')
+    if kv_cache_type is not None:
+        kv_cache_type = KVCacheType(kv_cache_type)
     world_size = tp_size * pp_size
     assert world_size == mpi_world_size(), \
         f'Engine world size ({tp_size} * {pp_size}) != Runtime world size ({mpi_world_size()})'
@@ -611,11 +614,11 @@ class ModelRunner(ModelRunnerMixin):
             session.runtime._set_weight_streaming(gpu_weights_percent)
 
         if session.use_lora_plugin:
-            lora_manager = LoraManager()
+            lora_manager = LoraManager(mapping=runtime_mapping,
+                                       model_config=model_config)
             if lora_dir is not None:
                 lora_manager.load_from_ckpt(lora_dir,
                                             model_config=model_config,
-                                            runtime_mapping=runtime_mapping,
                                             ckpt_source=lora_ckpt_source)
         else:
             lora_manager = None
@@ -720,11 +723,11 @@ class ModelRunner(ModelRunnerMixin):
                                   debug_mode=debug_mode,
                                   stream=stream)
             if session.use_lora_plugin:
-                lora_manager = LoraManager()
+                lora_manager = LoraManager(mapping=runtime_mapping,
+                                           model_config=model_config)
                 if lora_dir is not None:
                     lora_manager.load_from_ckpt(lora_dir,
                                                 model_config=model_config,
-                                                runtime_mapping=runtime_mapping,
                                                 ckpt_source=lora_ckpt_source)
             else:
                 lora_manager = None

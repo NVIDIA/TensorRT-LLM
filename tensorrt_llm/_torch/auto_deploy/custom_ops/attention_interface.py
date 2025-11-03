@@ -11,31 +11,17 @@ and operates on a purely functional paradigm that is compatible with the torch c
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import (
-    Callable,
-    Dict,
-    List,
-    Literal,
-    Optional,
-    Protocol,
-    Sequence,
-    Set,
-    Tuple,
-    Type,
-    Union,
-)
+from typing import Dict, List, Literal, Optional, Protocol, Sequence, Set, Tuple, Type, Union
 
 import torch
 from torch._ops import OpOverloadPacket
-from torch.export import Dim
 from torch.fx import Node
 from torch.types import Number
 
 from ...._utils import nvtx_range
 from ..utils.logger import ad_logger
 
-DynamicShape = Dict[int, Dim]  # indicating the dynamic shape in tensor dimension
-DynamicShapeCallback = Callable[[], DynamicShape]
+Constant = Union[int, float, str, None]
 
 
 @dataclass
@@ -65,12 +51,6 @@ class SequenceInfo:
     ### EXTRA ARGUMENTS PROVIDED TO THE INTERFACE ##################################################
     Those are extra arguments that can be provided to the interface and they are stored as follows:
     - _extra_args: dictionary of extra arguments with currently active values.
-    - _extra_none_inputs: dictionary of none inputs to the extra arguments.
-      NOTE: we assume that extra arguments are *optional* arguments to the model. However, we
-            cannot represent them via `None` since fx graphs require a fixed input type. Instead,
-            we require a special placeholder tensor to represent the `None` input.
-    - _extra_dynamic_shapes_callbacks: dictionary of callbacks to initialize the dynamic shapes of
-      the extra arguments.
 
     ### CACHE ARGUMENTS NEEDED FOR ATTENTION OPERATORS FOR FLATTENED SEQUENCES + CACHES ############
     - seq_len: [s_0, s_1, ..., s_{b-1}] such that s_total = sum(s_i)
@@ -107,6 +87,7 @@ class SequenceInfo:
         max_batch_size: int = 1,
         page_size: int = 0,
         max_num_tokens: Optional[int] = None,
+        vocab_size_padded: Optional[int] = None,
     ):
         """Initialize the SequenceInfo object.
 
@@ -124,7 +105,7 @@ class SequenceInfo:
                 batch is min (max_batch_size, max_num_tokens // ISL). Similarly, if a batch is
                 composed of generate-only requests, then the maximum number of sequences possible in
                 the batch is min (max_batch_size, max_num_tokens).
-
+            vocab_size_padded: corresponds to the padded vocabulary size of the model.
         Returns:
             None
         """
@@ -132,6 +113,7 @@ class SequenceInfo:
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
         self.page_size = page_size if page_size > 0 else max_seq_len
+        self.vocab_size_padded = vocab_size_padded
 
         # NOTE (lucaslie): WAR to address issue when using flashinfer attention with
         # (max_batch_size, max_seq_len) input in trtllm runtime.
@@ -173,12 +155,6 @@ class SequenceInfo:
         # indicator if extra args are activated that are needed for cached attention backends
         self._is_cached_attn = False
 
-        # indicator how to handle the "None" input for extra args
-        self._use_strict_args = True
-
-        # container for dynamic shapes
-        self._dynamic_shapes: Optional[Dict[str, DynamicShape]] = None
-
         # TENSOR FIELDS ############################################################################
         self._args_device: Dict[str, torch.Tensor] = {
             # TENSOR FIELDS FOR UNCACHED ATTENTION
@@ -204,9 +180,6 @@ class SequenceInfo:
 
         # EXTRA TENSOR FIELDS ######################################################################
         self._extra_args: Dict[str, Optional[torch.Tensor]] = {}
-        self._extra_none_inputs: Dict[str, torch.Tensor] = {}
-        self._extra_dynamic_shapes: Optional[Dict[str, DynamicShape]] = None
-        self._extra_dynamic_shapes_callbacks: Dict[str, DynamicShapeCallback] = {}
         ############################################################################################
 
         # call reset once to set a consistent initial state
@@ -215,33 +188,6 @@ class SequenceInfo:
     @property
     def device(self) -> torch.device:
         return self._args_device["input_ids"].device
-
-    @property
-    def use_strict_args(self) -> bool:
-        return self._use_strict_args
-
-    @use_strict_args.setter
-    def use_strict_args(self, val: bool) -> None:
-        """Configure whether to use strict graph arguments only.
-
-        Args:
-            val: strict graph arguments only or not.
-
-        In strict arguments mode,
-            * only stock arguments (like input_ids, position_ids, etc.) or extra
-              arguments that are explicitly added via the ``add_extra_arg`` interface are allowed.
-              Other arguments that are provided in ``nest_sequences`` will be rejected and throw an
-              error.
-            * registered extra arguments that are not provided to ``nest_sequences`` will be added to
-              the argument list automatically using the registered None-like tensor.
-
-        In non-strict argument mode,
-            * all arguments including all **kwargs that are provided to ``nest_sequences`` and will
-              simply be passed to the model in the order received.
-            * registered extra arguments that are not provided to ``nest_sequences`` will be added
-              _not_ be added to the argument list.
-        """
-        self._use_strict_args = val
 
     def _shape_for_forward(self, tnsr: torch.Tensor) -> torch.Tensor:
         """Shape the tensor for the forward pass based on the current attention mode.
@@ -310,12 +256,32 @@ class SequenceInfo:
         return tuple(self.named_args.values())
 
     @property
-    def const_args_for_prepare_metadata(self) -> Tuple:
+    def args_for_prepare_metadata(self) -> Tuple[str, ...]:
+        """Return a tuple of node/tensor arguments for the prepare_metadata op.
+
+        The ``prepare_metadata`` interface expects the following arguments:
+
+        1. ``args_for_prepare_metadata`` as nodes, i.e., as input-dependent tensors.
+        2. ``const_args_for_prepare_metadata`` as constants that can directly by passed in as args
+           to the corresponding ``prepare_metadata`` node/op.
+
+        This interface handles the tensor/node arguments part and can be used by compiler passes
+        like ``insert_cached_attention`` to extract the constant arguments and add them to the
+        ``prepare_metadata`` node/op.
+        """
+        # NOTE: for now we do _not_ include input_ids since we are not guaranteed that input_ids
+        # is part of the graph, e.g., in situations where the graph is a submodule of the overall
+        # model. In such instances, the graph usually sees inputs_embeds. However, we assume for
+        # now that position_ids is always part of the graph.
+        return ("position_ids",) + self._cached_arg_names
+
+    @property
+    def const_args_for_prepare_metadata(self) -> Tuple[Constant, ...]:
         """Return a tuple of extra (const, non-tensor) arguments for the prepare_metadata op.
 
         The ``prepare_metadata`` interface expects the following arguments:
 
-        1. ``named_standard_args`` as nodes,i.e., as input-dependent tensors.
+        1. ``args_for_prepare_metadata`` as nodes, i.e., as input-dependent tensors.
         2. ``const_args_for_prepare_metadata`` as constants that can directly by passed in as args
            to the corresponding ``prepare_metadata`` node/op.
 
@@ -324,36 +290,6 @@ class SequenceInfo:
         ``prepare_metadata`` node/op.
         """
         return tuple(getattr(self, k) for k in self._cached_constants)
-
-    @property
-    def named_dynamic_shapes(self) -> Dict[str, Dict[str, Dim]]:
-        """Return dynamic shapes of sequence info tensors.
-
-        NOTE: will be lazily initialized since the Dim object is not picklable for multi-processing.
-        """
-        # lazy initialization of dynamic shapes with Dim objects
-        if self._dynamic_shapes is None:
-            # set up shape for uncached args (same for all, i.e., batch_size and seq_len)
-            bs_seq_len_shape: DynamicShape = {}
-            if self.max_batch_size > 1:
-                bs_seq_len_shape[0] = Dim("batch_size", max=self.max_batch_size)
-            bs_seq_len_shape[1] = Dim("seq_len", max=self.max_seq_len)
-            # bs_seq_len_shape[1] = Dim.AUTO
-            self._dynamic_shapes = {k: bs_seq_len_shape for k in self._uncached_arg_names}
-            # cached args are static
-            self._dynamic_shapes.update({k: {} for k in self._cached_arg_names})
-
-        for k, callback in self._extra_dynamic_shapes_callbacks.items():
-            if k not in self._dynamic_shapes:
-                self._dynamic_shapes[k] = callback()
-
-        # return dynamic shapes according to currently active named_args with consistent order
-        return {k: self._dynamic_shapes[k] for k in self.named_args.keys()}
-
-    @property
-    def dynamic_shapes(self) -> Tuple[DynamicShape, ...]:
-        """Return dynamic shapes of sequence info tensors."""
-        return tuple(self.named_dynamic_shapes.values())
 
     @property
     def seq_len(self) -> List[int]:
@@ -448,7 +384,9 @@ class SequenceInfo:
         return cache_loc_flat, pages_per_seq
 
     @classmethod
-    def _get_sanitized_seq_len(cls, input_ids: torch.Tensor, seq_len: torch.Tensor) -> torch.Tensor:
+    def _get_sanitized_seq_len(
+        cls, input_or_position_ids: torch.Tensor, seq_len: torch.Tensor
+    ) -> torch.Tensor:
         """Sanitize sequence lengths.
 
         We want to cover the following scenarios with this function:
@@ -481,22 +419,24 @@ class SequenceInfo:
             # valid cache location in the batch. This would ensure that the dummy sequences just
             # repeats valid computation...
         """
-        _, s = input_ids.shape[:2]
-        num_seq = cls._get_sanitized_num_sequences(input_ids, seq_len)
+        _, s = input_or_position_ids.shape[:2]
+        num_seq = cls._get_sanitized_num_sequences(input_or_position_ids, seq_len)
         if s > 1:
             return seq_len[:num_seq].detach().clone()
         else:
             return torch.ones(num_seq, dtype=seq_len.dtype, device=seq_len.device)
 
     @staticmethod
-    def _get_sanitized_num_sequences(input_ids: torch.Tensor, seq_len: torch.Tensor) -> int:
+    def _get_sanitized_num_sequences(
+        input_or_position_ids: torch.Tensor, seq_len: torch.Tensor
+    ) -> int:
         """Get number of sequences.
 
         We makes sure that this function is compatible with both torch graph capture and cudagraph.
         Both can be a bit temparamental when trying to extract the number of sequences from a tensor
         with max_batch_size or max_batch_size*max_seq_len.
         """
-        b, s = input_ids.shape[:2]
+        b, s = input_or_position_ids.shape[:2]
         if s > 1:
             num_seq = torch.sum(seq_len > 0)
             assert seq_len[num_seq:].sum() == 0, "seq_len should be zero-padded"
@@ -529,12 +469,11 @@ class SequenceInfo:
 
         _move_dict(self._args_device)
         _move_dict(self._extra_args)
-        _move_dict(self._extra_none_inputs)
 
     def set_example_sequence(
         self,
-        input_ids: Sequence[Sequence[int]] = None,
-        position_ids: Optional[torch.Tensor] = None,
+        input_ids: Optional[Sequence[Sequence[int]]] = None,
+        position_ids: Optional[Sequence[Sequence[int]]] = None,
         **extra_args,
     ) -> None:
         """Set an example sequence useful for testing and export purposes without cache history."""
@@ -634,22 +573,25 @@ class SequenceInfo:
                     else:
                         tnsr_like = tnsr_like[0]
                 self._extra_args[name] = tnsr_like.to(self.device, non_blocking=True)
-            elif self.use_strict_args:
-                self._extra_args[name] = self._extra_none_inputs[name]
             else:
                 self._extra_args[name] = None
 
+    @nvtx_range("ad_get_unique_value")
     def _get_unique_value(self, occupied: Set[int], max_val: int) -> int:
         """Get un unoccupied value from the range indicated by max_val.
 
         In addition, this function performs a sanity check to ensure that no value in the occupied
         set is out of bounds.
         """
-        full_range = set(range(max_val))
-        free_values = full_range - occupied
-        out_of_range = occupied - full_range
+        # Validate without materializing the full range set
+        out_of_range = [v for v in occupied if v < 0 or v >= max_val]
         assert not out_of_range, f"Out of range values: {out_of_range}"
-        return free_values.pop() if free_values else 0
+
+        # Return the smallest free value; fall back to 0 if none
+        for candidate in range(max_val):
+            if candidate not in occupied:
+                return candidate
+        return 0
 
     @nvtx_range("ad_nest_sequences")
     def nest_sequences(
@@ -718,15 +660,8 @@ class SequenceInfo:
 
         ### UPDATE EXTRA INPUTS ####################################################################
         self._extra_args = {}
-        # in strict argument mode, we only accept registered extra arguments
-        if self.use_strict_args:
-            for name in self._extra_none_inputs.keys():
-                self._store_extra_arg(name, extra_args.pop(name, None))
-            assert not extra_args, f"Extra arguments {extra_args.keys()} not found"
-        # otherwise, we simply pass in all extra arguments
-        else:
-            for key, value in extra_args.items():
-                self._store_extra_arg(key, value)
+        for key, value in extra_args.items():
+            self._store_extra_arg(key, value)
 
     @nvtx_range("ad_rescatter_input_ids")
     def rescatter_input_ids(
@@ -760,34 +695,6 @@ class SequenceInfo:
         t_squeezed = t_nested.squeeze(1) if self.is_generate else t_nested.squeeze(0)
         return list(torch.split(t_squeezed, self.seq_len))
 
-    def add_extra_arg(
-        self,
-        name: str,
-        none_input: torch.Tensor,
-        dynamic_shape_callback: Optional[DynamicShapeCallback] = None,
-    ) -> None:
-        """Add an extra argument to the sequence info object.
-
-        Args:
-            name: The name of the extra argument.
-            none_input: None input value of the extra argument.
-            dynamic_shape_callback: The callback to get the dynamic shape of the extra argument.
-
-        Note that the extra argument is expected to be a tensor.
-        """
-        assert name not in self._named_args().keys(), f"Extra argument {name} already exists"
-
-        self._extra_args[name] = none_input.to(self.device)
-        self._extra_none_inputs[name] = self._extra_args[name]
-
-        if dynamic_shape_callback is None:
-            self._extra_dynamic_shapes_callbacks[name] = lambda: {}
-        else:
-            self._extra_dynamic_shapes_callbacks[name] = dynamic_shape_callback
-
-
-Constant = Union[int, float, str, None]
-
 
 class MHACallable(Protocol):
     def __call__(
@@ -799,7 +706,6 @@ class MHACallable(Protocol):
 class PrepareMetadataCallable(Protocol):
     def __call__(
         self,
-        input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         seq_len: torch.Tensor,
         input_pos: torch.Tensor,
@@ -886,7 +792,6 @@ class AttentionDescriptor(ABC):
 
         ```
         def prepare_metadata(
-            input_ids: torch.Tensor,
             position_ids: torch.Tensor,
             seq_len: torch.Tensor,
             input_pos: torch.Tensor,

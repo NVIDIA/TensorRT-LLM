@@ -4,6 +4,7 @@ import gc
 import json
 import os
 import sys
+import time
 
 # Required for test_generate_with_seed to pass.
 # See the discussion in https://github.com/NVIDIA/TensorRT-LLM/pull/4264#issuecomment-2943269891
@@ -28,11 +29,13 @@ import transformers
 from tensorrt_llm import LLM as LLM_torch
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.bindings import executor as tllm
+from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.executor import (GenerationExecutorWorker, GenerationRequest,
                                    GenerationResult, LoRARequest,
                                    PromptAdapterRequest, RequestError)
-from tensorrt_llm.llmapi import (BuildCacheConfig, EagleDecodingConfig,
-                                 KvCacheConfig, KvCacheRetentionConfig,
+from tensorrt_llm.llmapi import (BuildCacheConfig, CacheTransceiverConfig,
+                                 EagleDecodingConfig, KvCacheConfig,
+                                 KvCacheRetentionConfig,
                                  LookaheadDecodingConfig, MedusaDecodingConfig,
                                  RequestOutput)
 from tensorrt_llm.llmapi import TrtLlmArgs as LlmArgs
@@ -199,7 +202,7 @@ def test_llm_build_config():
         # read the build_config and check if the parameters are correctly saved
         engine_config = json.load(f)
 
-        build_config1 = BuildConfig.from_dict(engine_config["build_config"])
+        build_config1 = BuildConfig(**engine_config["build_config"])
 
         # Know issue: this will be converted to None after save engine for single-gpu
         build_config1.plugin_config.nccl_plugin = 'float16'
@@ -456,21 +459,12 @@ def test_llm_generate_async():
 
 def _test_llm_generate_async(model_name=default_model_name,
                              tp_size: int = 1,
-                             use_auto_parallel: bool = False,
                              tokenizer=None):
-    if "Mixtral" in model_name and use_auto_parallel:
-        pytest.skip("Auto parallel is not supported for Mixtral models")
-
-    tp_size = tp_size if not use_auto_parallel else 1
-    world_size = tp_size if use_auto_parallel else None
-
     llm = LLM(
         model=get_model_path(model_name),
         tokenizer=tokenizer,
         kv_cache_config=global_kvcache_config,
         tensor_parallel_size=tp_size,
-        auto_parallel=use_auto_parallel,
-        auto_parallel_world_size=world_size,
         fast_build=True,
     )
 
@@ -550,6 +544,7 @@ def _test_llm_generate_async(model_name=default_model_name,
 
 @pytest.mark.parametrize("chunked", [True, False])
 @pytest.mark.part0
+@pytest.mark.mpi_ray_parity
 def test_llm_generate_async_with_stream_interval(chunked):
     model_path = get_model_path('llama-models-v2/llama-v2-7b-hf')
     max_num_tokens = 256
@@ -2572,3 +2567,61 @@ def test_llm_api_draft_target():
         prompt = output.prompt
         generated_text = output.outputs[0].text
         print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
+
+
+def test_llm_context_only_timed_out():
+    tp_size = 1
+    use_overlap = False
+    enable_iter_req_stats = False
+
+    llm_args_extra = {}
+
+    llm_args_extra.update(
+        dict(enable_iter_perf_stats=True,
+             enable_iter_req_stats=enable_iter_req_stats,
+             disable_overlap_scheduler=not use_overlap))
+    LLM_CLASS = LLM_torch
+
+    llm = LLM_CLASS(model=llama_model_path,
+                    kv_cache_config=global_kvcache_config,
+                    tensor_parallel_size=tp_size,
+                    cache_transceiver_config=CacheTransceiverConfig(
+                        backend="DEFAULT", kv_transfer_timeout_ms=1000),
+                    **llm_args_extra)
+
+    max_tokens = 1
+    sampling_params = SamplingParams(max_tokens=max_tokens)
+
+    disaggregated_params = DisaggregatedParams(request_type="context_only")
+
+    prompts0 = [
+        "What is your name?",
+    ]
+    prompts1 = [
+        "Nvidia is awesome because",
+    ]
+
+    # Send context-only request
+    for output in llm.generate(prompts1,
+                               sampling_params=sampling_params,
+                               disaggregated_params=disaggregated_params):
+        print(output)
+
+    results = llm.get_stats(2)
+    assert len(results) == 1
+    context_only_used_num_blocks = results[0]["kvCacheStats"]["usedNumBlocks"]
+    print(f"Context only used num blocks: {context_only_used_num_blocks}")
+
+    # Sleep 5 seconds to allow context only request to time out
+    time.sleep(5)
+
+    # Send regular request
+    for output in llm.generate(prompts0, sampling_params=sampling_params):
+        print(output)
+
+    # Get number of allocated blocks
+    results = llm.get_stats(2)
+    assert len(results) == 1
+    final_used_num_blocks = results[0]["kvCacheStats"]["usedNumBlocks"]
+
+    assert final_used_num_blocks == 0

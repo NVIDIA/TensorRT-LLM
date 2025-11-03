@@ -34,6 +34,7 @@
 #include "tensorrt_llm/pybind/batch_manager/llmRequest.h"
 #include "tensorrt_llm/pybind/common/tllmExceptions.h"
 #include "tensorrt_llm/pybind/executor/bindings.h"
+#include "tensorrt_llm/pybind/process_group/bindings.h"
 #include "tensorrt_llm/pybind/runtime/bindings.h"
 #include "tensorrt_llm/pybind/testing/modelSpecBinding.h"
 #include "tensorrt_llm/pybind/thop/bindings.h"
@@ -117,6 +118,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
     // Create submodule for executor bindings.
     auto mExecutor = m.def_submodule("executor", "Executor bindings");
     auto mInternal = m.def_submodule("internal", "Internal submodule of TRTLLM runtime");
+    auto mInternalProcessGroup = mInternal.def_submodule("process_group", "PyTorch ProcessGroup internal bindings");
     auto mInternalRuntime = mInternal.def_submodule("runtime", "Runtime internal bindings");
     auto mInternalTesting = mInternal.def_submodule("testing", "Testing internal bindings");
     auto mInternalBatchManager = mInternal.def_submodule("batch_manager", "Batch manager internal bindings");
@@ -359,14 +361,14 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
     auto SamplingConfigGetState = [](tr::SamplingConfig const& config) -> py::tuple
     {
         return py::make_tuple(config.beamWidth, config.temperature, config.minLength, config.repetitionPenalty,
-            config.presencePenalty, config.frequencyPenalty, config.topK, config.topP, config.randomSeed,
-            config.topPDecay, config.topPMin, config.topPResetIds, config.beamSearchDiversityRate, config.lengthPenalty,
-            config.earlyStopping, config.noRepeatNgramSize, config.numReturnSequences, config.minP,
-            config.beamWidthArray);
+            config.presencePenalty, config.frequencyPenalty, config.promptIgnoreLength, config.topK, config.topP,
+            config.randomSeed, config.topPDecay, config.topPMin, config.topPResetIds, config.beamSearchDiversityRate,
+            config.lengthPenalty, config.earlyStopping, config.noRepeatNgramSize, config.numReturnSequences,
+            config.minP, config.beamWidthArray);
     };
     auto SamplingConfigSetState = [](py::tuple t) -> tr::SamplingConfig
     {
-        if (t.size() != 19)
+        if (t.size() != 20)
         {
             throw std::runtime_error("Invalid SamplingConfig state!");
         }
@@ -378,19 +380,20 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         config.repetitionPenalty = t[3].cast<OptVec<float>>();
         config.presencePenalty = t[4].cast<OptVec<float>>();
         config.frequencyPenalty = t[5].cast<OptVec<float>>();
-        config.topK = t[6].cast<OptVec<SizeType32>>();
-        config.topP = t[7].cast<OptVec<float>>();
-        config.randomSeed = t[8].cast<OptVec<uint64_t>>();
-        config.topPDecay = t[9].cast<OptVec<float>>();
-        config.topPMin = t[10].cast<OptVec<float>>();
-        config.topPResetIds = t[11].cast<OptVec<TokenIdType>>();
-        config.beamSearchDiversityRate = t[12].cast<OptVec<float>>();
-        config.lengthPenalty = t[13].cast<OptVec<float>>();
-        config.earlyStopping = t[14].cast<OptVec<SizeType32>>();
-        config.noRepeatNgramSize = t[15].cast<OptVec<SizeType32>>();
-        config.numReturnSequences = t[16].cast<SizeType32>();
-        config.minP = t[17].cast<OptVec<float>>();
-        config.beamWidthArray = t[18].cast<OptVec<std::vector<SizeType32>>>();
+        config.promptIgnoreLength = t[6].cast<OptVec<SizeType32>>();
+        config.topK = t[7].cast<OptVec<SizeType32>>();
+        config.topP = t[8].cast<OptVec<float>>();
+        config.randomSeed = t[9].cast<OptVec<uint64_t>>();
+        config.topPDecay = t[10].cast<OptVec<float>>();
+        config.topPMin = t[11].cast<OptVec<float>>();
+        config.topPResetIds = t[12].cast<OptVec<TokenIdType>>();
+        config.beamSearchDiversityRate = t[13].cast<OptVec<float>>();
+        config.lengthPenalty = t[14].cast<OptVec<float>>();
+        config.earlyStopping = t[15].cast<OptVec<SizeType32>>();
+        config.noRepeatNgramSize = t[16].cast<OptVec<SizeType32>>();
+        config.numReturnSequences = t[17].cast<SizeType32>();
+        config.minP = t[18].cast<OptVec<float>>();
+        config.beamWidthArray = t[19].cast<OptVec<std::vector<SizeType32>>>();
 
         return config;
     };
@@ -405,6 +408,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_readwrite("repetition_penalty", &tr::SamplingConfig::repetitionPenalty)
         .def_readwrite("presence_penalty", &tr::SamplingConfig::presencePenalty)
         .def_readwrite("frequency_penalty", &tr::SamplingConfig::frequencyPenalty)
+        .def_readwrite("prompt_ignore_length", &tr::SamplingConfig::promptIgnoreLength)
         .def_readwrite("top_k", &tr::SamplingConfig::topK)
         .def_readwrite("top_p", &tr::SamplingConfig::topP)
         .def_readwrite("random_seed", &tr::SamplingConfig::randomSeed)
@@ -473,6 +477,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property_readonly("pinned", &tr::MemoryCounters::getPinned)
         .def_property_readonly("uvm", &tr::MemoryCounters::getUVM);
 
+    tensorrt_llm::pybind::process_group::initBindings(mInternalProcessGroup);
     tensorrt_llm::pybind::runtime::initBindings(mInternalRuntime);
     tensorrt_llm::pybind::testing::initBindings(mInternalTesting);
     tpb::initBindings(mInternalBatchManager);

@@ -46,6 +46,8 @@ add_library(
   convertSpecDecodingMaskToPackedMaskOp.cpp
   cutlassScaledMM.cpp
   cublasScaledMM.cpp
+  cublasFp4ScaledMM.cpp
+  cudaNvfp4MM.cpp
   cudaScaledMM.cpp
   dynamicDecodeOp.cpp
   fmhaPackMaskOp.cpp
@@ -72,6 +74,7 @@ add_library(
   moeOp.cpp
   moeUtilOp.cpp
   moeCommOp.cpp
+  moeAlltoAllOp.cpp
   moeLoadBalanceOp.cpp
   mxFp4BlockScaleMoe.cpp
   mxFp8Quantize.cpp
@@ -97,8 +100,9 @@ add_library(
   finegrained_mixed_dtype_gemm_thop.cpp
   tinygemm2.cpp)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
-target_link_libraries(th_common PRIVATE ${TORCH_LIBRARIES} th_utils
-                                        ${Python3_LIBRARIES} ${SHARED_TARGET})
+target_link_libraries(
+  th_common PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}
+                    ${SHARED_TARGET} pg_utils)
 
 if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
   target_compile_definitions(th_common
@@ -112,6 +116,11 @@ endif()
 
 if(USING_OSS_CUTLASS_MOE_GEMM)
   target_compile_definitions(th_common PUBLIC USING_OSS_CUTLASS_MOE_GEMM)
+endif()
+
+if(ENABLE_CUBLASLT_FP4_GEMM)
+  target_compile_definitions(th_common PUBLIC ENABLE_CUBLASLT_FP4_GEMM)
+  target_link_libraries(th_common PRIVATE ${CUBLASLT_LIB})
 endif()
 
 if(ENABLE_MULTI_DEVICE)

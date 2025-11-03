@@ -375,12 +375,10 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
                     )
                     state_dict[input_scale_name] = 1 / state_dict[input_scale_name]
                     weight_scale = state_dict[weight_name + "_scale"].view(float4_sf_dtype)
-                    ori_shape = weight_scale.shape
                     state_dict[weight_name + "_scale"] = (
                         torch.ops.trtllm.block_scale_interleave(
                             weight_scale.view(torch.uint8).cpu().contiguous()
                         )
-                        .reshape(ori_shape)
                         .view(float4_sf_dtype)
                         .reshape(-1)
                     )
@@ -481,7 +479,7 @@ class FP8BMMQuantizationFromConfig(Quantization):
     algo_name = "FP8"
 
     def target_op(self):
-        return torch.ops.auto_deploy.torch_quant_fp8_bmm
+        return torch.ops.auto_deploy.torch_quant_fp8_bmm.default
 
     def quantize_weight(self, w: torch.Tensor) -> torch.Tensor:
         return torch.empty_like(w, dtype=torch.float8_e4m3fn, device=w.device)

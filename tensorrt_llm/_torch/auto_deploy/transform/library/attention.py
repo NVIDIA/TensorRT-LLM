@@ -1,17 +1,17 @@
 """Pattern matching for detecting repeat_kv, eager, grouped attention patterns from Huggingface models."""
 
-from typing import Any, Callable, Dict, List, Tuple, Type
+from inspect import Parameter, Signature
+from itertools import product
+from typing import Any, Callable, Dict, List, Literal, Tuple, Type
 
 import torch
 import torch.nn.functional as F
 from pydantic import Field
 from torch.fx import GraphModule
 
-from ...custom_ops.attention_interface import AttentionDescriptor
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
-from ...utils.node_utils import is_op
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
 from ..interface import (
     BaseTransform,
@@ -270,170 +270,6 @@ def _get_sfdp_patterns() -> List[Dict[str, Any]]:
     return patterns
 
 
-def _grouped_attn_pattern_1(q, k, v, n_rep, attn_mask, dropout_p, scale):
-    k = torch.ops.auto_deploy.torch_attention_repeat_kv(k, n_rep)
-    v = torch.ops.auto_deploy.torch_attention_repeat_kv(v, n_rep)
-    return torch.ops.auto_deploy.torch_attention_sdpa.default(
-        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=False, scale=scale
-    )
-
-
-def _grouped_attn_replacement_1(q, k, v, n_rep, attn_mask, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention_grouped_sdpa.default(
-        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=False, scale=scale
-    )
-
-
-# Only expose torch_attention_grouped_sdpa after the transformation
-def _grouped_attn_pattern_2(q, k, v, attn_mask, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention_sdpa.default(
-        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=False, scale=scale
-    )
-
-
-def _grouped_attn_replacement_2(q, k, v, attn_mask, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention_grouped_sdpa.default(
-        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=False, scale=scale
-    )
-
-
-def _grouped_attn_pattern_3(q, k, v, n_rep, attn_mask, dropout_p, scale):
-    k = torch.ops.auto_deploy.torch_attention_repeat_kv(k, n_rep)
-    v = torch.ops.auto_deploy.torch_attention_repeat_kv(v, n_rep)
-    return torch.ops.auto_deploy.torch_attention_sdpa.default(
-        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=True, scale=scale
-    )
-
-
-def _grouped_attn_replacement_3(q, k, v, n_rep, attn_mask, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention_grouped_sdpa.default(
-        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=True, scale=scale
-    )
-
-
-# Only expose torch_attention_grouped_sdpa after the transformation
-def _grouped_attn_pattern_4(q, k, v, attn_mask, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention_sdpa.default(
-        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=True, scale=scale
-    )
-
-
-def _grouped_attn_replacement_4(q, k, v, attn_mask, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention_grouped_sdpa.default(
-        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=True, scale=scale
-    )
-
-
-def _grouped_attn_pattern_5(q, k, v, n_rep, attn_mask):
-    k = torch.ops.auto_deploy.torch_attention_repeat_kv(k, n_rep)
-    v = torch.ops.auto_deploy.torch_attention_repeat_kv(v, n_rep)
-    return torch.ops.auto_deploy.torch_attention_sdpa.default(q, k, v, attn_mask)
-
-
-def _grouped_attn_replacement_5(q, k, v, n_rep, attn_mask):
-    return torch.ops.auto_deploy.torch_attention_grouped_sdpa.default(q, k, v, attn_mask)
-
-
-def _grouped_attn_pattern_6(q, k, v, attn_mask, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention_sdpa.default(
-        q,
-        k,
-        v,
-        attn_mask=attn_mask,
-        dropout_p=dropout_p,
-        is_causal=False,
-        scale=scale,
-        enable_gqa=True,
-    )
-
-
-def _grouped_attn_replacement_6(q, k, v, attn_mask, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention_grouped_sdpa.default(
-        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=False, scale=scale
-    )
-
-
-def _grouped_attn_pattern_7(q, k, v, attn_mask, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention_sdpa.default(
-        q,
-        k,
-        v,
-        attn_mask=attn_mask,
-        dropout_p=dropout_p,
-        is_causal=True,
-        scale=scale,
-        enable_gqa=True,
-    )
-
-
-def _grouped_attn_replacement_7(q, k, v, attn_mask, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention_grouped_sdpa.default(
-        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=True, scale=scale
-    )
-
-
-def _grouped_attn_pattern_8(q, k, v, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention_sdpa.default(
-        q,
-        k,
-        v,
-        attn_mask=None,
-        dropout_p=dropout_p,
-        is_causal=False,
-        scale=scale,
-        enable_gqa=True,
-    )
-
-
-def _grouped_attn_replacement_8(q, k, v, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention_grouped_sdpa.default(
-        q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=False, scale=scale
-    )
-
-
-def _grouped_attn_pattern_9(q, k, v, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention_sdpa.default(
-        q,
-        k,
-        v,
-        attn_mask=None,
-        dropout_p=dropout_p,
-        is_causal=True,
-        scale=scale,
-        enable_gqa=True,
-    )
-
-
-def _grouped_attn_replacement_9(q, k, v, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention_grouped_sdpa.default(
-        q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=True, scale=scale
-    )
-
-
-def _grouped_attn_pattern_10(q, k, v, n_rep, dropout_p):
-    k = torch.ops.auto_deploy.torch_attention_repeat_kv(k, n_rep)
-    v = torch.ops.auto_deploy.torch_attention_repeat_kv(v, n_rep)
-    return torch.ops.auto_deploy.torch_attention_sdpa.default(
-        q,
-        k,
-        v,
-        attn_mask=None,
-        dropout_p=dropout_p,
-        is_causal=True,
-    )
-
-
-def _grouped_attn_replacement_10(q, k, v, n_rep, dropout_p):
-    return torch.ops.auto_deploy.torch_attention_grouped_sdpa.default(
-        q,
-        k,
-        v,
-        attn_mask=None,
-        dropout_p=dropout_p,
-        is_causal=True,
-    )
-
-
 @TransformRegistry.register("match_repeat_kv")
 class MatchRepeatKV(BaseTransform):
     """
@@ -465,9 +301,6 @@ class MatchRepeatKV(BaseTransform):
             )
 
         num_kv_patterns = _apply_pattern(gm, "Repeat KV", register_repeat_kv)
-
-        if num_kv_patterns > 0:
-            self.config.run_shape_prop = True
 
         info = TransformInfo(
             skipped=False,
@@ -508,11 +341,210 @@ class MatchEagerAttention(BaseTransform):
         return gm, info
 
 
-@TransformRegistry.register("match_grouped_attention")
-class MatchGroupedAttention(BaseTransform):
+def _attach_signature(fn: Callable, argnames: List[str]) -> Callable:
+    # Make FX "see" q,k,v[,attn_mask][,dropout_p][,scale] even though fn(*args) internally
+    params = [Parameter(n, kind=Parameter.POSITIONAL_OR_KEYWORD) for n in argnames]
+    fn.__signature__ = Signature(parameters=params)
+    return fn
+
+
+def _call_sdpa(
+    q, k, v, *, is_causal: bool, enable_gqa: bool, attn_mask=None, dropout_p=None, scale=None
+):
+    kwargs = {"is_causal": is_causal}
+    if attn_mask is not None:
+        kwargs["attn_mask"] = attn_mask
+    if dropout_p is not None:
+        kwargs["dropout_p"] = dropout_p
+    if scale is not None:
+        kwargs["scale"] = scale
+    if enable_gqa:
+        kwargs["enable_gqa"] = True
+    return torch.ops.auto_deploy.torch_attention_sdpa.default(q, k, v, **kwargs)
+
+
+def _call_attn(q, k, v, *, is_causal: bool, attn_mask=None, dropout_p=None, scale=None):
+    kwargs = {"is_causal": is_causal}
+    if attn_mask is not None:
+        kwargs["attn_mask"] = attn_mask
+    if dropout_p is not None:
+        kwargs["dropout_p"] = dropout_p
+    if scale is not None:
+        kwargs["scale"] = scale
+    return torch.ops.auto_deploy.torch_attention.default(q, k, v, **kwargs)
+
+
+def make_grouped_attn_pair(
+    *,
+    repeat_kv: bool,
+    is_causal: bool,
+    has_scale: bool,
+    enable_gqa: bool,
+    has_attn_mask: bool,
+    has_dropout: bool,
+) -> Tuple[Callable, Callable, List[str]]:
     """
-    Match and replace the grouped attention pattern with
-    torch.ops.auto_deploy.torch_attention_grouped_sdpa.
+    Returns (pattern_fn, replacement_fn, argnames) with exact positional parity.
+
+    Arg order rules:
+      Base: (q, k, v)
+      +repeat_kv -> insert n_rep after (q, k, v)
+      +attn_mask -> include attn_mask after n_rep if repeat_kv else after (q, k, v)
+      +dropout   -> include dropout_p after attn_mask or after n_rep/base if no attn_mask
+      +scale     -> include scale last
+    """
+    argnames: List[str] = ["q", "k", "v"]
+    if repeat_kv:
+        argnames.append("n_rep")
+    if has_attn_mask:
+        argnames.append("attn_mask")
+    if has_dropout:
+        argnames.append("dropout_p")
+    if has_scale:
+        argnames.append("scale")
+
+    def pattern_fn(*args):
+        if len(args) != len(argnames):
+            raise TypeError(f"Expected {len(argnames)} args {tuple(argnames)}, got {len(args)}")
+        m = dict(zip(argnames, args))
+
+        q = m["q"]
+        k = m["k"]
+        v = m["v"]
+
+        if repeat_kv:
+            n_rep = m["n_rep"]
+            k = torch.ops.auto_deploy.torch_attention_repeat_kv(k, n_rep)
+            v = torch.ops.auto_deploy.torch_attention_repeat_kv(v, n_rep)
+
+        return _call_sdpa(
+            q,
+            k,
+            v,
+            is_causal=is_causal,
+            enable_gqa=enable_gqa,
+            attn_mask=m.get("attn_mask"),
+            dropout_p=m.get("dropout_p"),
+            scale=m.get("scale"),
+        )
+
+    # Replacement: torch_attention.default mirroring the positional signature exactly.
+    # We do NOT pass enable_gqa here (it’s SDPA-only). We accept n_rep to mirror signature,
+    # but we don’t need to use it in the replacement graph.
+    def replacement_fn(*args):
+        if len(args) != len(argnames):
+            raise TypeError(f"Expected {len(argnames)} args {tuple(argnames)}, got {len(args)}")
+        m = dict(zip(argnames, args))
+        return _call_attn(
+            m["q"],
+            m["k"],
+            m["v"],
+            is_causal=is_causal,
+            attn_mask=m.get("attn_mask"),
+            dropout_p=m.get("dropout_p"),
+            scale=m.get("scale"),
+        )
+
+    # Pattern matcher needs to see explicit arg names
+    _attach_signature(pattern_fn, argnames)
+    _attach_signature(replacement_fn, argnames)
+
+    return pattern_fn, replacement_fn, argnames
+
+
+def generate_and_register_grouped_attn_patterns(
+    patterns, register_ad_pattern: Callable, only_repeat_kv: bool = None
+):
+    """
+    Auto-generate all grouped attention patterns across these axes:
+      1) repeat_kv:        [False, True]
+      2) is_causal:        [False, True]
+      3) has_scale:        [False, True]
+      4) enable_gqa:       [False, True]   (only a kwarg to SDPA side)
+      5) has_attn_mask:    [False, True]
+      6) has_dropout:      [False, True]
+
+    Args:
+        patterns: The ADPatternMatcherPass instance to register patterns to
+        register_ad_pattern: The function to call to register each pattern
+        only_repeat_kv: If True, only register patterns with repeat_kv=True.
+                        If False, only register patterns with repeat_kv=False.
+                        If None, register all patterns.
+
+    For each valid combo, we:
+      - build pattern/replacement functions with exact-arg parity
+      - build dummy args matching the signature (with CUDA fp16 tensors etc.)
+      - build scalar_workaround dict for any scalars/n_rep present
+      - call register_ad_pattern(...)
+    """
+    q = torch.randn(8, 8, 16, 64, device="cuda", dtype=torch.float16)
+    k1 = torch.randn(8, 1, 16, 64, device="cuda", dtype=torch.float16)
+    v1 = torch.randn(8, 1, 16, 64, device="cuda", dtype=torch.float16)
+    attn_mask_tensor = torch.randn(8, 1, 1, 16, device="cuda", dtype=torch.float16)
+
+    dropout_val = 0.12345
+    scale_val = 0.56789
+    n_rep_val = 7
+
+    total = 0
+    axes = ((False, True),) * 6
+    for repeat_kv, is_causal, has_scale, enable_gqa, has_attn_mask, has_dropout in product(*axes):
+        if only_repeat_kv is not None:
+            if only_repeat_kv and not repeat_kv:
+                continue  # Skip patterns without repeat_kv
+            if not only_repeat_kv and repeat_kv:
+                continue  # Skip patterns with repeat_kv
+
+        pat_fn, rep_fn, argnames = make_grouped_attn_pair(
+            repeat_kv=repeat_kv,
+            is_causal=is_causal,
+            has_scale=has_scale,
+            enable_gqa=enable_gqa,
+            has_attn_mask=has_attn_mask,
+            has_dropout=has_dropout,
+        )
+
+        # Build dummy args in the same positional order
+        value_map = {
+            "q": q,
+            "k": k1,
+            "v": v1,
+            "n_rep": n_rep_val,
+            "attn_mask": attn_mask_tensor,
+            "dropout_p": dropout_val,
+            "scale": scale_val,
+        }
+        dummy_args: List[object] = []
+        for name in argnames:
+            try:
+                dummy_args.append(value_map[name])
+            except KeyError:
+                raise RuntimeError(f"Unexpected arg name: {name}")
+
+        scalar_names = {"n_rep", "dropout_p", "scale"}
+        scalar_workaround: Dict[str, object] = {
+            n: value_map[n] for n in argnames if n in scalar_names
+        }
+        if not scalar_workaround:
+            scalar_workaround = None
+
+        register_ad_pattern(
+            search_fn=pat_fn,
+            replace_fn=rep_fn,
+            patterns=patterns,
+            dummy_args=dummy_args,
+            scalar_workaround=scalar_workaround,
+        )
+        total += 1
+    return total
+
+
+@TransformRegistry.register("match_grouped_attention_with_repeat_kv")
+class MatchGroupedAttentionWithRepeatKV(BaseTransform):
+    """
+    Match and replace grouped attention patterns WITH repeat_kv to
+    torch.ops.auto_deploy.torch_attention.
+
     """
 
     def _apply(
@@ -522,103 +554,56 @@ class MatchGroupedAttention(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        def register_grouped_attention(patterns: ADPatternMatcherPass):
-            q = torch.randn(8, 8, 16, 64, device="cuda", dtype=torch.float16)
-            k1 = torch.randn(8, 1, 16, 64, device="cuda", dtype=torch.float16)
-            v1 = torch.randn(8, 1, 16, 64, device="cuda", dtype=torch.float16)
-            attn_mask = torch.randn(8, 1, 1, 16, device="cuda", dtype=torch.float16)
-            dropout = 0.12345
-            scale = 0.56789
-            n_rep = 7
-
-            dummy_args_1 = [q, k1, v1, n_rep, attn_mask, dropout, scale]
-            dummy_args_2 = [q, k1, v1, attn_mask, dropout, scale]
-            dummy_args_3 = [q, k1, v1, n_rep, attn_mask]
-            dummy_args_4 = [q, k1, v1, dropout, scale]
-            dummy_args_5 = [q, k1, v1, n_rep, dropout]
-
-            register_ad_pattern(
-                search_fn=_grouped_attn_pattern_1,
-                replace_fn=_grouped_attn_replacement_1,
-                patterns=patterns,
-                dummy_args=dummy_args_1,
-                scalar_workaround={"scale": scale, "dropout_p": dropout, "n_rep": n_rep},
-            )
-            register_ad_pattern(
-                search_fn=_grouped_attn_pattern_2,
-                replace_fn=_grouped_attn_replacement_2,
-                patterns=patterns,
-                dummy_args=dummy_args_2,
-                scalar_workaround={
-                    "scale": scale,
-                    "dropout_p": dropout,
-                },
-            )
-            register_ad_pattern(
-                search_fn=_grouped_attn_pattern_3,
-                replace_fn=_grouped_attn_replacement_3,
-                patterns=patterns,
-                dummy_args=dummy_args_1,
-                scalar_workaround={"scale": scale, "dropout_p": dropout, "n_rep": n_rep},
-            )
-            register_ad_pattern(
-                search_fn=_grouped_attn_pattern_4,
-                replace_fn=_grouped_attn_replacement_4,
-                patterns=patterns,
-                dummy_args=dummy_args_2,
-                scalar_workaround={
-                    "scale": scale,
-                    "dropout_p": dropout,
-                },
-            )
-            register_ad_pattern(
-                search_fn=_grouped_attn_pattern_5,
-                replace_fn=_grouped_attn_replacement_5,
-                patterns=patterns,
-                dummy_args=dummy_args_3,
-                scalar_workaround={"n_rep": n_rep},
+        def register_grouped_attention_with_repeat_kv(patterns: ADPatternMatcherPass):
+            return generate_and_register_grouped_attn_patterns(
+                patterns, register_ad_pattern, only_repeat_kv=True
             )
 
-            register_ad_pattern(
-                search_fn=_grouped_attn_pattern_6,
-                replace_fn=_grouped_attn_replacement_6,
-                patterns=patterns,
-                dummy_args=dummy_args_2,
-                scalar_workaround={"scale": scale, "dropout_p": dropout},
-            )
-            register_ad_pattern(
-                search_fn=_grouped_attn_pattern_7,
-                replace_fn=_grouped_attn_replacement_7,
-                patterns=patterns,
-                dummy_args=dummy_args_2,
-                scalar_workaround={"scale": scale, "dropout_p": dropout},
-            )
-            register_ad_pattern(
-                search_fn=_grouped_attn_pattern_8,
-                replace_fn=_grouped_attn_replacement_8,
-                patterns=patterns,
-                dummy_args=dummy_args_4,
-                scalar_workaround={"scale": scale, "dropout_p": dropout},
-            )
-            register_ad_pattern(
-                search_fn=_grouped_attn_pattern_9,
-                replace_fn=_grouped_attn_replacement_9,
-                patterns=patterns,
-                dummy_args=dummy_args_4,
-                scalar_workaround={"scale": scale, "dropout_p": dropout},
-            )
-            register_ad_pattern(
-                search_fn=_grouped_attn_pattern_10,
-                replace_fn=_grouped_attn_replacement_10,
-                patterns=patterns,
-                dummy_args=dummy_args_5,
-                scalar_workaround={"dropout_p": dropout, "n_rep": n_rep},
+        num_grouped_patterns = _apply_pattern(
+            gm, "Grouped Attention (with repeat_kv)", register_grouped_attention_with_repeat_kv
+        )
+
+        info = TransformInfo(
+            skipped=False,
+            num_matches=num_grouped_patterns,
+            is_clean=False,
+            has_valid_shapes=False,
+        )
+        return gm, info
+
+
+@TransformRegistry.register("match_grouped_attention_without_repeat_kv")
+class MatchGroupedAttentionWithoutRepeatKV(BaseTransform):
+    """
+    Match and replace grouped attention patterns WITHOUT repeat_kv to
+    torch.ops.auto_deploy.torch_attention.
+
+    This transform should run AFTER match_grouped_attention_with_repeat_kv
+    to avoid incorrectly matching patterns that should have repeat_kv.
+    """
+
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        def register_grouped_attention_without_repeat_kv(patterns: ADPatternMatcherPass):
+            return generate_and_register_grouped_attn_patterns(
+                patterns, register_ad_pattern, only_repeat_kv=False
             )
 
-        num_grouped_patterns = _apply_pattern(gm, "Grouped Attention", register_grouped_attention)
+        num_grouped_patterns = _apply_pattern(
+            gm,
+            "Grouped Attention (without repeat_kv)",
+            register_grouped_attention_without_repeat_kv,
+        )
+
         if num_grouped_patterns == 0:
             ad_logger.warning(
-                "Fail to find any Group Attention Pattern, output or performance may be incorrect"
+                "Fail to find any Group Attention Pattern (without repeat_kv), "
+                "output or performance may be incorrect"
             )
 
         info = TransformInfo(
@@ -627,26 +612,159 @@ class MatchGroupedAttention(BaseTransform):
             is_clean=False,
             has_valid_shapes=False,
         )
-
         return gm, info
 
 
-class MatchAttentionLayoutConfig(TransformConfig):
-    """Configuration for the insert cached attention transform."""
+def _call_torch_attention(
+    q, k, v, *, is_causal, layout, attn_mask=None, dropout_p=None, scale=None
+):
+    kwargs = {"is_causal": is_causal, "layout": layout}
+    if attn_mask is not None:
+        kwargs["attn_mask"] = attn_mask
+    if dropout_p is not None:
+        kwargs["dropout_p"] = dropout_p
+    if scale is not None:
+        kwargs["scale"] = scale
+    return torch.ops.auto_deploy.torch_attention.default(q, k, v, **kwargs)
 
-    attention_op: Type[AttentionDescriptor] = Field(description="The attention descriptor to use.")
+
+def make_attn_bnsd_pair(
+    *,
+    has_attn_mask: bool,
+    has_dropout: bool,
+    is_causal: bool,
+    has_scale: bool,
+) -> Tuple[Callable, Callable, List[str], str, str]:
+    argnames: List[str] = ["q", "k", "v"]
+    if has_attn_mask:
+        argnames.append("attn_mask")
+    if has_dropout:
+        argnames.append("dropout_p")
+    if has_scale:
+        argnames.append("scale")
+
+    def pattern_fn(*args):
+        if len(args) != len(argnames):
+            raise TypeError(f"Expected {len(argnames)} args {tuple(argnames)}, got {len(args)}")
+        m = dict(zip(argnames, args))
+        return _call_torch_attention(
+            m["q"],
+            m["k"],
+            m["v"],
+            is_causal=is_causal,
+            layout="bnsd",
+            attn_mask=m.get("attn_mask"),
+            dropout_p=m.get("dropout_p"),
+            scale=m.get("scale"),
+        )
+
+    def replacement_fn(*args):
+        if len(args) != len(argnames):
+            raise TypeError(f"Expected {len(argnames)} args {tuple(argnames)}, got {len(args)}")
+        m = dict(zip(argnames, args))
+        q_b = torch.ops.aten.transpose.int(m["q"], 1, 2)
+        k_b = torch.ops.aten.transpose.int(m["k"], 1, 2)
+        v_b = torch.ops.aten.transpose.int(m["v"], 1, 2)
+        out_b = _call_torch_attention(
+            q_b,
+            k_b,
+            v_b,
+            is_causal=is_causal,
+            layout="bsnd",
+            attn_mask=m.get("attn_mask"),
+            dropout_p=m.get("dropout_p"),
+            scale=m.get("scale"),
+        )
+        return torch.ops.aten.transpose.int(out_b, 1, 2)
+
+    # Pattern matcher needs to see explicit arg names
+    _attach_signature(pattern_fn, argnames)
+    _attach_signature(replacement_fn, argnames)
+
+    return pattern_fn, replacement_fn, argnames
+
+
+def generate_and_register_attn_layout_patterns(patterns, register_ad_pattern: Callable):
+    """
+    Enumerate all combinations across:
+      - has_attn_mask in {False, True}
+      - has_dropout   in {False, True}
+      - is_causal     in {False, True}
+      - has_scale     in {False, True}
+    Register each pattern/replacement with appropriate dummy args and scalar workarounds.
+    """
+    # Dummy tensors in BNSD
+    bs, n_heads, s_q, head_dim = 8, 8, 16, 64
+    q = torch.randn(bs, n_heads, s_q, head_dim, device="cuda", dtype=torch.float16)
+    k = torch.randn(bs, n_heads, s_q, head_dim, device="cuda", dtype=torch.float16)
+    v = torch.randn(bs, n_heads, s_q, head_dim, device="cuda", dtype=torch.float16)
+    attn_mask = torch.randn(bs, n_heads, 1, s_q, device="cuda", dtype=torch.float16)
+
+    dropout_p = 0.12345
+    scale_val = 0.56789
+
+    total = 0
+    axes = ((False, True),) * 4
+    for has_attn_mask, has_dropout, is_causal, has_scale in product(*axes):
+        pat_fn, rep_fn, argnames = make_attn_bnsd_pair(
+            has_attn_mask=has_attn_mask,
+            has_dropout=has_dropout,
+            is_causal=is_causal,
+            has_scale=has_scale,
+        )
+
+        # Build dummy args following positional signature
+        value_map = {
+            "q": q,
+            "k": k,
+            "v": v,
+            "attn_mask": attn_mask,
+            "dropout_p": dropout_p,
+            "scale": scale_val,
+        }
+        dummy_args: List[object] = []
+        for name in argnames:
+            try:
+                dummy_args.append(value_map[name])
+            except KeyError:
+                raise RuntimeError(f"Unexpected arg name: {name}")
+
+        # Scalar workaround for present scalars only
+        scalar_names = {"dropout_p", "scale"}
+        scalar_workaround: Dict[str, object] = {
+            n: value_map[n] for n in argnames if n in scalar_names
+        }
+        if not scalar_workaround:
+            scalar_workaround = None
+
+        register_ad_pattern(
+            search_fn=pat_fn,
+            replace_fn=rep_fn,
+            patterns=patterns,
+            dummy_args=dummy_args,
+            scalar_workaround=scalar_workaround,
+        )
+        total += 1
+    return total
+
+
+def register_match_attn_layout(patterns: ADPatternMatcherPass):
+    return generate_and_register_attn_layout_patterns(patterns, register_ad_pattern)
+
+
+class MatchAttentionLayoutConfig(TransformConfig):
+    """Configuration for the match attention layout transform."""
+
+    attn_layout: Literal["bsnd", "bnsd"] = Field(
+        description="Layout expected by the attention backend."
+    )
 
 
 @TransformRegistry.register("match_attention_layout")
 class MatchAttentionLayout(BaseTransform):
     """
-    Match and transform attention operations to match the layout expected by the attention backend.
-
-    If the attention backend expects 'bnsd' layout (batch, num_heads, seq_len, head_dim), which
-    is the default for SDPA operations, we don't need to transform anything.
-
-    If the backend expects 'bsnd' layout (batch, seq_len, num_heads, head_dim), we insert
-    appropriate transposes before and after SDPA operations and replace them with bsnd_grouped_sdpa.
+    Convert unified torch_attention calls from layout='bnsd' (explicit, positional or default)
+    into layout='bsnd' + correct Q/K/V transposes, and transpose the output back to bnsd.
     """
 
     config: MatchAttentionLayoutConfig
@@ -662,82 +780,21 @@ class MatchAttentionLayout(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        # Get attention layout from attention_op
-        attention_layout = self.config.attention_op.get_attention_layout()
+        # If backend expects bnsd, nothing to do.
+        if self.config.attn_layout == "bnsd":
+            return gm, TransformInfo(
+                skipped=False, num_matches=0, is_clean=False, has_valid_shapes=False
+            )
 
-        # List of SDPA operations to look for
-        sdpa_ops = {
-            torch.ops.auto_deploy.torch_attention_grouped_sdpa,
-        }
+        num_matches = _apply_pattern(
+            gm, "MatchAttentionLayout(bnsd→bsnd)", register_match_attn_layout
+        )
 
-        graph = gm.graph
-        num_bsnd_patterns = 0
-
-        # Look for SDPA operations
-        for sdpa_node in list(graph.nodes):
-            if sdpa_node.op != "call_function" or not is_op(sdpa_node, sdpa_ops):
-                continue
-
-            ad_logger.debug(f"Found SDPA node to transform for bsnd layout: {sdpa_node}")
-
-            # Extract q, k, v inputs
-            q, k, v = sdpa_node.args[:3]
-
-            # Check if we need to transpose the inputs
-            if attention_layout == "bsnd":
-                # Add transposes before the node (from bnsd to bsnd)
-                with graph.inserting_before(sdpa_node):
-                    q_updated = graph.call_function(torch.ops.aten.transpose.int, args=(q, 1, 2))
-                    k_updated = graph.call_function(torch.ops.aten.transpose.int, args=(k, 1, 2))
-                    v_updated = graph.call_function(torch.ops.aten.transpose.int, args=(v, 1, 2))
-
-                # Preserve fake tensor in meta["val"] for the transposed inputs
-                q_updated.meta["val"] = q.meta["val"].transpose(1, 2)
-                k_updated.meta["val"] = k.meta["val"].transpose(1, 2)
-                v_updated.meta["val"] = v.meta["val"].transpose(1, 2)
-            elif attention_layout == "bnsd":
-                # we don't need to do anything...
-                q_updated = q
-                k_updated = k
-                v_updated = v
-            else:
-                raise ValueError(f"Unsupported attention layout: {attention_layout}")
-
-            # Create bsnd_grouped_sdpa node with the same args as the original node
-            # but using the transposed inputs
-            with graph.inserting_before(sdpa_node):
-                source_sdpa_node = graph.call_function(
-                    self.config.attention_op.get_source_attention_op(),
-                    args=(q_updated, k_updated, v_updated) + sdpa_node.args[3:],
-                    kwargs=sdpa_node.kwargs,
-                )
-
-            # Check if need to update the output node to match the layout
-            if attention_layout == "bsnd":
-                # Add transpose for the output (from bsnd back to bnsd)
-                with graph.inserting_after(source_sdpa_node):
-                    output_updated = graph.call_function(
-                        torch.ops.aten.transpose.int, args=(source_sdpa_node, 1, 2)
-                    )
-
-                # Preserve fake tensor in meta["val"] for the transposed inputs
-                source_sdpa_node.meta["val"] = sdpa_node.meta["val"].transpose(1, 2).contiguous()
-                output_updated.meta["val"] = source_sdpa_node.meta["val"].transpose(1, 2)
-            elif attention_layout == "bnsd":
-                output_updated = source_sdpa_node
-            else:
-                raise ValueError(f"Unsupported attention layout: {attention_layout}")
-
-            # Replace the old node with the transposed output
-            sdpa_node.replace_all_uses_with(output_updated)
-
-            num_bsnd_patterns += 1
-
+        # If we changed any attention calls, the shapes may change around the transposes; flag for shape prop.
         info = TransformInfo(
             skipped=False,
-            num_matches=num_bsnd_patterns,
+            num_matches=num_matches,
             is_clean=False,
             has_valid_shapes=False,
         )
-
         return gm, info

@@ -4,34 +4,38 @@ from pathlib import Path
 
 import pytest
 import yaml
-from _model_test_utils import _hf_model_dir_or_hub_id
+from _model_test_utils import get_small_model_config
 from click.testing import CliRunner
 from utils.cpp_paths import llm_root  # noqa: F401
 
 from tensorrt_llm.commands.bench import main
 
 
-def tiny_llama_details():
-    model_path = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
-    model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-    model_path_or_name = _hf_model_dir_or_hub_id(model_path, model_name)
-    return model_path_or_name, model_name, model_path
-
-
-def run_benchmark(model_name: str, dataset_path: str, extra_llm_api_options_path: str):
+def run_benchmark(
+    model_name: str, model_path: str, dataset_path: str, extra_llm_api_options_path: str
+):
     runner = CliRunner()
 
     args = [
         "--model",
         model_name,
-        "throughput",
-        "--backend",
-        "_autodeploy",
-        "--dataset",
-        dataset_path,
-        "--extra_llm_api_options",
-        f"{extra_llm_api_options_path}",
     ]
+
+    # Only pass --model_path if it's a local filesystem path
+    if model_path.startswith("/"):
+        args.extend(["--model_path", model_path])
+
+    args.extend(
+        [
+            "throughput",
+            "--backend",
+            "_autodeploy",
+            "--dataset",
+            dataset_path,
+            "--extra_llm_api_options",
+            f"{extra_llm_api_options_path}",
+        ]
+    )
     result = runner.invoke(main, args, catch_exceptions=False)
     assert result.exit_code == 0
 
@@ -74,20 +78,27 @@ def prepare_dataset(root_dir: str, temp_dir: str, model_path_or_name: str):
 
 
 @pytest.mark.parametrize("compile_backend", ["torch-compile", "torch-opt", "torch-cudagraph"])
-def test_trtllm_bench(llm_root, compile_backend):  # noqa: F811
-    model_path_or_name, model_name, model_path = tiny_llama_details()
+@pytest.mark.parametrize("model_name", ["TinyLlama/TinyLlama-1.1B-Chat-v1.0"])
+def test_trtllm_bench(llm_root, compile_backend, model_name):  # noqa: F811
+    config = get_small_model_config(model_name)
     with tempfile.TemporaryDirectory() as temp_dir:
         extra_llm_api_options_path = f"{temp_dir}/extra_llm_api_options.yaml"
         with open(extra_llm_api_options_path, "w") as f:
             yaml.dump(
                 {
-                    "model_kwargs": {"num_hidden_layers": 2},
-                    "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
-                    "max_batch_size": 128,
-                    "compile_backend": compile_backend,
+                    **config["args"],
+                    "transforms": {
+                        "compile_model": {
+                            "stage": "compile",
+                            "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
+                            "backend": compile_backend,
+                        }
+                    },
                 },
                 f,
             )
 
-        dataset_path = prepare_dataset(llm_root, temp_dir, model_path_or_name)
-        run_benchmark(model_name, dataset_path, extra_llm_api_options_path)
+        dataset_path = prepare_dataset(llm_root, temp_dir, config["args"]["model"])
+        run_benchmark(
+            model_name, str(config["args"]["model"]), dataset_path, extra_llm_api_options_path
+        )

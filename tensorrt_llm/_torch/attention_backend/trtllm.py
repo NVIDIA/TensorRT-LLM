@@ -2,9 +2,12 @@ import math
 import os
 import weakref
 from dataclasses import dataclass, field
-from typing import Optional, Tuple, Union
+from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import torch
+
+if TYPE_CHECKING:
+    from ..speculative.utils import SpecDecodingTensor
 
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings.internal import thop
@@ -190,6 +193,11 @@ class TrtllmAttentionWrapper:
         spec_decoding_generation_lengths: Optional[torch.Tensor] = None,
         attention_sinks: Optional[torch.Tensor] = None,
         chunked_prefill_buffer_batch_size: int = 1,
+        sparse_kv_indices: Optional[torch.Tensor] = None,
+        sparse_kv_offsets: Optional[torch.Tensor] = None,
+        sparse_attn_indices: Optional[torch.Tensor] = None,
+        sparse_attn_offsets: Optional[torch.Tensor] = None,
+        sparse_mla_topk: int = 0,
         **kwargs,
     ):
         """
@@ -229,6 +237,11 @@ class TrtllmAttentionWrapper:
             helix_position_offsets (torch.Tensor): The tensor to store the helix position offsets, with shape (num_tokens) on GPU.
             attention_sinks (torch.Tensor): The attention sinks (additional value in the denominator of the softmax) with shape of (num_heads_q) on GPU.
             chunked_prefill_buffer_batch_size (int): used for malloc buffer for k and v in fp8 context mla. the max input kv length is not max_num_tokens in this case. It is chunked_prefill_buffer_batch_size * max_num_tokens.
+            sparse_kv_indices (torch.Tensor): The sparse indices for the KV cache, with shape of (num_heads_kv, num_sparse_tokens) on GPU.
+            sparse_kv_offsets (torch.Tensor): The batch offsets for the sparse KV indices, with shape of (num_contexts + 1) on GPU.
+            sparse_attn_indices (torch.Tensor): The sparse indices for the attention layer, with shape of (num_heads_kv, num_sparse_tokens) on GPU.
+            sparse_attn_offsets (torch.Tensor): The batch offsets for the sparse attention indices, with shape of (num_generations + 1) on GPU.
+            sparse_mla_topk (int): The topk for the sparse MLA, used by DSA attention.
         """
         self.layer_idx = layer_idx
         self.tokens_per_block = tokens_per_block
@@ -266,7 +279,11 @@ class TrtllmAttentionWrapper:
         self.softmax_stats_tensor = softmax_stats_tensor
         self.helix_position_offsets = helix_position_offsets
         self.attention_sinks = attention_sinks
-
+        self.sparse_kv_indices = sparse_kv_indices
+        self.sparse_kv_offsets = sparse_kv_offsets
+        self.sparse_attn_indices = sparse_attn_indices
+        self.sparse_attn_offsets = sparse_attn_offsets
+        self.sparse_mla_topk = sparse_mla_topk
         if max_sequence_length > self.rope_params.max_positions:
             self.rope_params.max_positions = max_sequence_length
             self.rotary_inv_freq, self.rotary_cos_sin = self.rope_params.create_rope_const_params(
@@ -371,7 +388,14 @@ class TrtllmAttentionWrapper:
             else:
                 raise ValueError("Unexpected attention mask type")
         else:
-            if self.attention_input_type == AttentionInputType.context_only:
+            # For DSA, use the same qkv hidden size for context and generation phases
+            is_sparse_attn = self.sparse_attn_indices is not None and self.sparse_attn_indices.numel(
+            ) > 0
+            if self.attention_input_type == AttentionInputType.context_only and is_sparse_attn:
+                assert is_fused_qkv
+                qkv_hidden_size = self.num_heads * (self.kv_lora_rank +
+                                                    self.qk_rope_head_dim)
+            elif self.attention_input_type == AttentionInputType.context_only:
                 assert not is_fused_qkv
                 qkv_hidden_size = self.num_heads * (self.qk_nope_head_dim +
                                                     self.qk_rope_head_dim)
@@ -491,6 +515,11 @@ class TrtllmAttentionWrapper:
             self.softmax_stats_tensor,
             spec_decoding_bool_params,
             spec_decoding_tensor_params,
+            self.sparse_kv_indices,
+            self.sparse_kv_offsets,
+            self.sparse_attn_indices,
+            self.sparse_attn_offsets,
+            self.sparse_mla_topk,
         )
         # reset the planned states (especially tensors) to avoid memory leak
         self.plan()
@@ -743,6 +772,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     device='cpu',
                     pin_memory=True,
                 )
+
+    def on_update_kv_lens(self):
+        # After changing the kv_lens/kv_lens_cuda, we may need to update other metadata.
+        # Especially for the changes in the _preprocess_inputs() of model_engine.py.
+        pass
 
     def prepare(self) -> None:
         extra_attrs = get_model_extra_attrs()
@@ -1027,11 +1061,31 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.ctx_kv_indptr[:self.num_contexts + 1].copy_(
             self.host_ctx_kv_indptr[:self.num_contexts + 1], non_blocking=True)
 
-    def update_spec_dec_param(self, is_spec_decoding_enabled, is_spec_dec_tree,
-                              is_spec_dec_dynamic_tree, max_draft_tokens):
+    def update_spec_dec_param(
+        self,
+        is_spec_decoding_enabled,
+        is_spec_dec_tree,
+        is_spec_dec_dynamic_tree,
+        max_draft_tokens,
+        spec_decoding_tensor: Optional['SpecDecodingTensor'] = None,
+    ):
+
+        if spec_decoding_tensor is not None:
+            spec_decoding_position_offsets = spec_decoding_tensor.position_offsets
+            spec_decoding_packed_mask = spec_decoding_tensor.packed_mask
+            spec_decoding_generation_lengths = spec_decoding_tensor.generation_lengths
+        else:
+            spec_decoding_position_offsets = None
+            spec_decoding_packed_mask = None
+            spec_decoding_generation_lengths = None
         # spec_dec mode should only be enabled for pre-Blackwell machines and when there's a spec-dec tree.
         self.is_spec_decoding_enabled = is_spec_decoding_enabled and get_sm_version(
         ) < 100
+
+        if get_sm_version() >= 100:
+            if is_spec_dec_tree or is_spec_dec_dynamic_tree:
+                assert not is_spec_dec_tree, "Spec-dec tree is not supported on this machine. Please use a pre-Blackwell machine for a spec-dec tree."
+                assert not is_spec_dec_dynamic_tree, "Spec-dec dynamic tree is not supported on this machine. Please use a pre-Blackwell machine for a spec-dec dynamic tree."
 
         # use_spec_decoding is default to true by default, change in runtime by layers / requests
         self.use_spec_decoding = self.is_spec_decoding_enabled
@@ -1050,7 +1104,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.spec_decoding_packed_mask = torch.empty(
                 [
                     self.max_num_requests, max_draft_tokens + 1,
-                    math.ceil(max_draft_tokens / 32)
+                    math.ceil((max_draft_tokens + 1) / 32)
                 ],
                 dtype=torch.int,
                 device='cuda',
@@ -1063,7 +1117,18 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             )
 
             if self.is_spec_dec_dynamic_tree:
-                assert False, "currently dynamic tree is not supported"
+                assert spec_decoding_position_offsets is not None, "spec_decoding_position_offsets is required for dynamic tree"
+                assert spec_decoding_packed_mask is not None, "spec_decoding_packed_mask is required for dynamic tree"
+                self.spec_decoding_position_offsets.copy_(
+                    spec_decoding_position_offsets, non_blocking=True)
+                self.spec_decoding_packed_mask.copy_(spec_decoding_packed_mask,
+                                                     non_blocking=True)
+                if spec_decoding_generation_lengths is not None:
+                    self.spec_decoding_generation_lengths.copy_(
+                        spec_decoding_generation_lengths, non_blocking=True)
+                else:
+                    self.generate_spec_decoding_generation_length(
+                        max_draft_tokens=max_draft_tokens)
             else:
                 # Populate the mask that won't change during inference phase.
                 self.generate_spec_decoding_position_offsets(
@@ -1074,7 +1139,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     max_draft_tokens=max_draft_tokens)
 
     def generate_spec_decoding_position_offsets(self, max_draft_tokens):
-        assert not self.is_spec_dec_tree, "only chained/linear tree is supported now"
         position_offset = torch.arange(max_draft_tokens + 1,
                                        dtype=torch.int,
                                        device='cpu',
@@ -1085,7 +1149,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                                                   non_blocking=True)
 
     def generate_spec_decoding_packed_mask(self, max_draft_tokens):
-        assert not self.is_spec_dec_tree, "only chained/linear tree is supported now"
         dummy_idx = torch.arange(max_draft_tokens + 1)
         spec_decoding_packed_mask = torch.pow(2, dummy_idx + 1) - 1
         self.spec_decoding_packed_mask[:, :, 0].copy_(spec_decoding_packed_mask,
@@ -1239,6 +1302,14 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 use_paged_context_fmha=use_paged_context_fmha,
                 is_mla_enable=self.is_mla_enable,
             )
+
+        sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets = None, None, None, None
+        if self.sparse_attention_config is not None:
+            sparse_kv_indices, sparse_kv_offsets = self.sparse_kv_predict(
+                q, k, metadata, **kwargs)
+            sparse_attn_indices, sparse_attn_offsets = self.sparse_attn_predict(
+                q, k, metadata, **kwargs)
+
         self.wrapper.plan(
             layer_idx=self.get_local_layer_idx(metadata),
             tokens_per_block=metadata.tokens_per_block,
@@ -1287,7 +1358,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             spec_decoding_generation_lengths,
             attention_sinks=attention_sinks,
             chunked_prefill_buffer_batch_size=chunked_prefill_buffer_batch_size,
-        )
+            sparse_kv_indices=sparse_kv_indices,
+            sparse_kv_offsets=sparse_kv_offsets,
+            sparse_attn_indices=sparse_attn_indices,
+            sparse_attn_offsets=sparse_attn_offsets,
+            sparse_mla_topk=metadata.sparse_mla_topk if hasattr(
+                metadata, 'sparse_mla_topk') else 0)
         out_dtype = None
         if out_scale is not None:
             if use_nvfp4_output:
@@ -1355,6 +1431,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self,
         metadata: TrtllmAttentionMetadata,
         out_dtype: torch.dtype,
+        **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert out_dtype in [torch.float16, torch.bfloat16, torch.float32]
         assert self.is_mla_enable and self.mla_params is not None
@@ -1443,6 +1520,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         q: torch.Tensor,
         latent_cache: torch.Tensor,
         metadata: TrtllmAttentionMetadata,
+        **kwargs,
     ) -> None:
         assert self.is_mla_enable and self.mla_params is not None
         assert metadata.kv_cache_manager is not None
@@ -1500,3 +1578,27 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.num_heads,
             self.mla_params.v_head_dim,
         )
+
+    def sparse_attn_predict(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        **kwargs,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+            Predict sparse attn indices. It's implemented in the derived class.
+        """
+        raise NotImplementedError
+
+    def sparse_kv_predict(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        **kwargs,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+            Predict sparse kv indices. It's implemented in the derived class.
+        """
+        raise NotImplementedError

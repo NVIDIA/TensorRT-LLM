@@ -142,6 +142,8 @@ struct KernelParams
     int64_t mNumHiddenEltsO;
     // The total number of pages in the paged-kv memory pool.
     int32_t mNumPagesInMemPool;
+    // The number of tokens per page (used if dynamic numTokensPerPage is enabled).
+    int32_t mNumTokensPerPageLog2;
     // The output scale for FP8 quantization.
     float mOutputScale;
     // The scaling factor for softmax (multiplied by log2 to use faster exp2).
@@ -155,6 +157,10 @@ struct KernelParams
     int32_t mStartTokenIdx;
     // The sum of sequence lengths for Q and K/V.
     int32_t mSumOfSeqLensQ, mSumOfSeqLensKv;
+    // The top k value for sparse MLA.
+    int32_t mSparseMlaTopK;
+    // The flag to use block sparse attention.
+    bool mUseBlockSparseAttention;
 
     // Create the TMA shape/stride for Q.
     template <class FmhaOptions>
@@ -578,8 +584,8 @@ struct KernelParams
 
         // Check shape must be in range [1, 2^32]
         int32_t dim = shapes.size();
-        // Max five dimension and min 3 dimension.
-        TLLM_CHECK((dim <= 5) && (dim >= 3));
+        // Max five dimension and min 2 dimension.
+        TLLM_CHECK((dim <= 5) && (dim >= 2));
         // Check shape range.
         for (int32_t ii = 0; ii < dim; ++ii)
         {
@@ -697,6 +703,16 @@ struct KernelParams
         std::vector<uint32_t> tileShapeKv(shapeK.size(), 1);
         tileShapeKv[0] = numEltsInClampedHeadDimKv / numEltsDivisor;
         tileShapeKv[1] = numKeysPerTile;
+
+        // If sparse MLA is enabled, the shape and stride for K need to be updated for 2D layout (numTokensKvInPagedKv,
+        // headDimQk).
+        if (options.mSparseMla)
+        {
+            shapeK = std::vector<uint64_t>{static_cast<uint64_t>(options.mHeadDimQk), static_cast<uint64_t>(INT_MAX)};
+            strideK = std::vector<uint64_t>{1, static_cast<uint64_t>(options.mHeadDimQk)};
+            tileShapeKv[1] = 1;
+        }
+
         // Build tma descriptor for K.
         params.tmaK_ = buildNdTmaDescriptor(options, kernelMeta.mDataTypeKv, shapeK, strideK, tileShapeKv,
             const_cast<void*>(kPtr),
@@ -807,9 +823,21 @@ struct KernelParams
         params.mNumHeadsKv = options.mNumHeadsKv;
         params.mNumHeadsQPerKv = options.mNumHeadsQPerKv;
         params.mNumHiddenEltsO = options.mNumHeadsQ * options.mHeadDimQk;
+        params.mNumTokensPerPageLog2 = 0;
+        if (isPagedKv(options.mQkvLayout))
+        {
+            TLLM_CHECK_WITH_INFO((options.mNumTokensPerPage & (options.mNumTokensPerPage - 1)) == 0,
+                "NumTokensPerPage must be a power of 2");
+            params.mNumTokensPerPageLog2 = static_cast<int32_t>(std::log2(options.mNumTokensPerPage));
+        }
         params.mOutputScale = 1.f;
         params.mScaleSoftmaxLog2 = (1.f / (std::sqrt((float) (options.mHeadDimQk)) * options.mScaleQ)) * M_LOG2E;
         params.mStartTokenIdx = options.mSfStartTokenIdx;
+        // The sparseMlaTopK needs to be a multiple of 4 as we use 16B cpAsync instructions for the indices.
+        TLLM_CHECK_WITH_INFO(
+            !options.mSparseMla || (options.mSparseMlaTopK % 4) == 0, "SparseMlaTopK must be a multiple of 4");
+        params.mSparseMlaTopK = options.mSparseMlaTopK;
+        params.mUseBlockSparseAttention = options.mUseBlockSparseAttention;
 
         return params;
     }

@@ -14,7 +14,7 @@
 # limitations under the License.
 # -*- coding: utf-8 -*-
 """
-Model pytorch yaml config for trtllm-bench perf tests
+Model pytorch/TRT yaml config for trtllm-bench perf tests
 """
 
 
@@ -36,12 +36,18 @@ def get_model_yaml_config(model_label: str,
         Returns:
             dict: yaml config
         """
-    base_config = {
-        'print_iter_log': True,
-        'cuda_graph_config': {
-            'enable_padding': True,
-        },
-    }
+    if 'pytorch' in model_label:
+        # Pytorch backend config
+        base_config = {
+            'print_iter_log': True,
+            'cuda_graph_config': {
+                'enable_padding': True,
+            },
+        }
+    else:
+        # TRT backend config
+        base_config = {}
+
     if 'kv_cache_dtype' in model_label:
         base_config.update({
             'kv_cache_dtype':
@@ -221,6 +227,39 @@ def get_model_yaml_config(model_label: str,
                 'stream_interval': 10,
                 'num_postprocess_workers': 4
             }
+        },
+        # Phi-4-multimodal-instruct with chunked prefill and kv_cache_reuse
+        {
+            'patterns': [
+                'phi_4_multimodal_instruct-bench-pytorch-bfloat16-maxbs:48-maxnt:256-input_output_len:500,2000-con:250',
+                'phi_4_multimodal_instruct-bench-pytorch-bfloat16-maxbs:128-maxnt:512-input_output_len:1000,1000-con:250'
+            ],
+            'config': {
+                'enable_chunked_prefill': True,
+            }
+        },
+        # Mistral-Small-3.1-24B-Instruct-2503 with chunked prefill and kv_cache_reuse
+        {
+            'patterns': [
+                'mistral_small_v3.1_24b-bench-pytorch-bfloat16-maxbs:48-maxnt:256-input_output_len:1000,2000-reqs:500-con:200',
+                'mistral_small_v3.1_24b-bench-pytorch-bfloat16-maxbs:128-maxnt:512-input_output_len:1000,2000-reqs:500-con:200'
+            ],
+            'config': {
+                'enable_chunked_prefill': True,
+            }
+        },
+        # Llama-v3.3 models with xgrammar guided decoding
+        {
+            'patterns': [
+                "llama_v3.3_70b_instruct_fp8-bench-float8-maxbs:512-maxnt:2048-input_output_len:500,2000-reqs:400-con:200-gpus:8-extra"
+            ],
+            'config': {
+                'extended_runtime_perf_knob_config': {
+                    'cuda_graph_cache_size': 1.0,
+                    'cuda_graph_mode': True,
+                },
+                'guided_decoding_backend': 'xgrammar'
+            }
         }
     ]
 
@@ -231,7 +270,8 @@ def get_model_yaml_config(model_label: str,
             patterns = [patterns]
         for pattern in patterns:
             if pattern in model_label.lower():
-                recursive_update(base_config, pattern_config['config'])
+                if pattern_config.get('config'):
+                    recursive_update(base_config, pattern_config['config'])
                 break  # Stop checking other patterns for this config once we find a match
 
     # lora-specific change for pytorch

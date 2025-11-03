@@ -13,11 +13,13 @@ l0_dgx_h100:
       stage: pre_merge
       backend: pytorch
       auto_trigger: others
+      orchestrator: mpi
   tests:
   - unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu2"
   - unittest/_torch/multi_gpu -m "not post_merge" TIMEOUT (90)
   - unittest/_torch/auto_deploy/unit/multigpu
   - unittest/_torch/modeling/test_modeling_pixtral.py::test_tensor_parallelism
+  # ------------- Disaggregated serving tests ---------------
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_eagle3[eagle3_one_model=False-overlap_scheduler=False]
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_eagle3[eagle3_one_model=True-overlap_scheduler=True]
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_guided_decoding[xgrammar]
@@ -40,7 +42,9 @@ l0_dgx_h100:
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[True-True-False]
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[True-True-True]
   # ------------- AutoDeploy tests ---------------
-  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype
+  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[False-2]
+  # llmapi
+  - unittest/llmapi/test_mpi_session.py::test_llmapi_launch_multiple_tasks
 - condition:
     ranges:
       system_gpu_count:
@@ -54,9 +58,11 @@ l0_dgx_h100:
       stage: pre_merge
       backend: pytorch
       auto_trigger: others
+      orchestrator: mpi
   tests:
   # ------------- PyTorch tests ---------------
   - unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu4"
+  # ------------- Model specific tests ---------------
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16_4gpus[tp4-attn_backend=TRTLLM-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16_4gpus[tp2pp2-attn_backend=TRTLLM-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16_4gpus[tp2pp2-attn_backend=TRTLLM-torch_compile=True]
@@ -67,6 +73,9 @@ l0_dgx_h100:
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp2pp2-fp8kv=True-attn_backend=TRTLLM-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp2pp2-fp8kv=True-attn_backend=TRTLLM-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding_4gpus[xgrammar]
+  - test_e2e.py::test_ptp_quickstart_advanced_bs1
+  - test_e2e.py::test_ptp_quickstart_advanced_deepseek_v3_lite_4gpus_adp_balance[DeepSeek-V3-Lite-FP8-DeepSeek-V3-Lite/fp8]
+  # ------------- Disaggregated serving tests ---------------
   - disaggregated/test_disaggregated.py::test_disaggregated_multi_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_multi_gpu_with_mpirun_trt_backend[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_genpp2[TinyLlama-1.1B-Chat-v1.0]
@@ -84,8 +93,20 @@ l0_dgx_h100:
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[MMLU-gen_tp=2-ctx_pp=2]
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_multi_instance[GSM8K]
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_multi_instance[MMLU]
-  - test_e2e.py::test_ptp_quickstart_advanced_bs1
-  - test_e2e.py::test_ptp_quickstart_advanced_deepseek_v3_lite_4gpus_adp_balance[DeepSeek-V3-Lite-FP8-DeepSeek-V3-Lite/fp8]
+  - disaggregated/test_auto_scaling.py::test_service_discovery[etcd-round_robin]
+  - disaggregated/test_auto_scaling.py::test_service_discovery[etcd-load_balancing]
+  - disaggregated/test_auto_scaling.py::test_worker_restart[etcd-round_robin]
+  - disaggregated/test_auto_scaling.py::test_worker_restart[etcd-load_balancing]
+  - disaggregated/test_auto_scaling.py::test_minimal_instances[etcd-round_robin]
+  - disaggregated/test_auto_scaling.py::test_disagg_server_restart[etcd-round_robin]
+  - disaggregated/test_auto_scaling.py::test_service_discovery[http-round_robin]
+  - disaggregated/test_auto_scaling.py::test_service_discovery[http-load_balancing]
+  - disaggregated/test_auto_scaling.py::test_service_discovery[http-kv_cache_aware]
+  - disaggregated/test_auto_scaling.py::test_worker_restart[http-round_robin]
+  - disaggregated/test_auto_scaling.py::test_worker_restart[http-load_balancing]
+  - disaggregated/test_auto_scaling.py::test_worker_restart[http-kv_cache_aware]
+  - disaggregated/test_auto_scaling.py::test_minimal_instances[http-round_robin]
+  - disaggregated/test_auto_scaling.py::test_disagg_server_restart[http-round_robin]
 - condition:
     ranges:
       system_gpu_count:
@@ -99,11 +120,13 @@ l0_dgx_h100:
       stage: pre_merge
       backend: pytorch
       auto_trigger: deepseek
+      orchestrator: mpi
   tests:
   - unittest/_torch/multi_gpu_modeling/test_deepseek.py::test_deepseek_streaming[tp1-bf16-trtllm-deepseekv3_lite]
   - unittest/_torch/multi_gpu_modeling/test_deepseek.py::test_deepseek_streaming[tp4-bf16-trtllm-deepseekv3_lite]
   - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_alltoall[DeepEP]
   - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_alltoall[DeepEPLowLatency]
+  - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_alltoall[MNNVL]
   - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_w4afp8[MoEWeightLoadingMode.VANILLA-dtype0]
   - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_w4afp8[MoEWeightLoadingMode.VANILLA-dtype1]
   - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_w4afp8[MoEWeightLoadingMode.W4A8_CUSTOM-dtype0]
@@ -126,10 +149,6 @@ l0_dgx_h100:
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_mpi[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_ucx[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_nixl[DeepSeek-V3-Lite-fp8]
-  - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[DeepSeek-V3-Lite-bf16]
-  - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[llama-v3-8b-hf]
-  - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[llama-3.1-8b-instruct-hf-fp8]
-  - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one[DeepSeek-V3-Lite-fp8]
@@ -156,6 +175,7 @@ l0_dgx_h100:
       stage: pre_merge
       backend: pytorch
       auto_trigger: gpt_oss
+      orchestrator: mpi
   tests:
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[tp4-cutlass-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[tp4-triton-auto]
@@ -164,6 +184,8 @@ l0_dgx_h100:
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[dp4-cutlass-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[dp4-triton-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4a16[dp4-auto]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[cutlass]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[triton]
 - condition:
     ranges:
       system_gpu_count:
@@ -177,14 +199,14 @@ l0_dgx_h100:
       stage: pre_merge
       backend: cpp
       auto_trigger: others
+      orchestrator: mpi
   tests:
   # ------------- CPP tests ---------------
   - cpp/test_multi_gpu.py::test_mpi_utils[90]
   - cpp/test_multi_gpu.py::test_fused_gemm_allreduce[4proc-90]
-  - cpp/test_multi_gpu.py::test_cache_transceiver[2proc-mpi_kvcache-90]
-  - cpp/test_multi_gpu.py::test_cache_transceiver[2proc-ucx_kvcache-90]
-  - cpp/test_multi_gpu.py::test_cache_transceiver[8proc-mpi_kvcache-90]
-  - cpp/test_multi_gpu.py::test_cache_transceiver[8proc-ucx_kvcache-90]
+  - cpp/test_multi_gpu.py::test_cache_transceiver[2proc-ucx_kvcache-90] ISOLATION
+  - cpp/test_multi_gpu.py::test_cache_transceiver[8proc-nixl_kvcache-90] ISOLATION
+  - cpp/test_multi_gpu.py::test_cache_transceiver[8proc-ucx_kvcache-90] ISOLATION
   - cpp/test_multi_gpu.py::test_user_buffer[2proc-90]
   - cpp/test_multi_gpu.py::test_enc_dec[t5-90]
   - cpp/test_multi_gpu.py::test_llama_executor[llama-orchestrator-90]
@@ -218,3 +240,24 @@ l0_dgx_h100:
   - cpp/test_multi_gpu.py::TestDisagg::test_spawn_orchestrator[llama-ucx_kvcache-90]
   - cpp/test_multi_gpu.py::TestDisagg::test_orchestrator_params[llama-nixl_kvcache-90] TIMEOUT (90)
   - cpp/test_multi_gpu.py::TestDisagg::test_spawn_orchestrator[llama-nixl_kvcache-90]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 2
+        lte: 2
+    wildcards:
+      gpu:
+        - '*h100*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: pytorch
+      orchestrator: ray
+  tests:
+    - unittest/_torch/ray_orchestrator/multi_gpu -m "gpu2"
+    - unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu2"
+    - accuracy/test_llm_api_pytorch_ray.py::TestLlama3_1_8BInstruct::test_pp2_ray
+    - examples/test_ray.py::test_llm_inference_distributed_ray[tp2]
+    - examples/test_ray.py::test_llm_inference_distributed_ray[pp2]
+    - examples/test_ray.py::test_llm_inference_distributed_ray[tep2]
+    - examples/test_ray.py::test_ray_disaggregated_serving[tp1]
