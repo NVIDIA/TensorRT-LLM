@@ -427,6 +427,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
 
                 if (partition.clusterName == "dlcluster") {
                     dockerArgs += " -e NVIDIA_IMEX_CHANNELS=0"
+                    dockerArgs += " --device=/dev/gdrdrv:/dev/gdrdrv"
                 }
                 echo "Final dockerArgs: ${dockerArgs}"
             } else {
@@ -1048,8 +1049,7 @@ def runLLMDocBuild(pipeline, config)
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
 
     // Step 3: build doc
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get install doxygen python3-pip graphviz -y")
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y doxygen python3-pip graphviz")
 
     def containerPATH = sh(script: "echo \${PATH}", returnStdout: true).replaceAll("\\s", "")
     if (!containerPATH.contains("/usr/local/bin:")) {
@@ -1088,9 +1088,7 @@ def launchTestListCheck(pipeline)
     trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(LLM_DOCKER_IMAGE, "a10"), "trt-llm", {
         try {
             echoNodeAndGpuInfo(pipeline, stageName)
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: """apt-get update && apt-get install \
-            libffi-dev \
-            -y""")
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y libffi-dev")
             sh "nvidia-smi && nvidia-smi -q && nvidia-smi topo -m"
             // download TRT-LLM tarfile
             def tarName = BUILD_CONFIGS[VANILLA_CONFIG][TARNAME]
@@ -1511,8 +1509,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         // setup HF_HOME to cache model and datasets
         // init the huggingface cache from nfs, since the nfs is read-only, and HF_HOME needs to be writable, otherwise it will fail at creating file lock
         sh "mkdir -p ${HF_HOME} && ls -alh ${HF_HOME}"
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get install -y rsync")
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y rsync")
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "rsync -r ${MODEL_CACHE_DIR}/hugging-face-cache/ ${HF_HOME}/ && ls -lh ${HF_HOME}")
         sh "df -h"
 
@@ -2230,7 +2227,7 @@ def launchTestJobs(pipeline, testFilter)
             "B200_PCIe",
             X86_64_TRIPLE,
             false,
-            "cuda13/",
+            "dlfw/",
             DLFW_IMAGE,
             false,
         ],
@@ -2269,7 +2266,7 @@ def launchTestJobs(pipeline, testFilter)
             "GH200",
             AARCH64_TRIPLE,
             false,
-            "cuda13/",
+            "dlfw/",
             DLFW_IMAGE,
             false,
         ],
@@ -2351,8 +2348,7 @@ def launchTestJobs(pipeline, testFilter)
                         if (values[5] == DLFW_IMAGE) {
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "[ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt || true")
                         }
-                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
-                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install python3-pip git rsync curl wget")
+                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y python3-pip git rsync curl wget")
                         trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install requests")
