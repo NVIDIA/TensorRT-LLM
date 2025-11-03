@@ -529,7 +529,7 @@ public:
             gemm2_weights_scale, gemm2_bias, std::nullopt, std::nullopt, std::nullopt, num_experts, top_k, n_group,
             topk_group, intermediate_size, std::nullopt, local_expert_offset, local_num_experts, routed_scaling_factor,
             tileN, routing_method_type, mDtypeAct, *mRunners[tileN], config, topk_weights, topk_ids,
-            /*out_tensor=*/torch::nullopt); // TODO: Support user-provided output
+            /*output=*/torch::nullopt); // TODO: Support user-provided output
     }
 
 private:
@@ -591,7 +591,7 @@ public:
         std::optional<int64_t> const hidden_size_output, int64_t local_expert_offset, int64_t local_num_experts,
         std::optional<double> routed_scaling_factor, int64_t routing_method_type, std::vector<int64_t> tile_config_pair,
         torch::optional<torch::Tensor> const& topk_weights, torch::optional<torch::Tensor> const& topk_ids,
-        torch::optional<torch::Tensor> const& out_tensor)
+        torch::optional<torch::Tensor> const& output)
     {
         // tile_config_pair corresponds to pair (tileN, config)
         auto [tileN, config] = std::tie(tile_config_pair[0], tile_config_pair[1]);
@@ -614,7 +614,7 @@ public:
             gemm2_weights_scale, gemm2_bias, output1_scale_scalar, output1_scale_gate_scalar, output2_scale_scalar,
             num_experts, top_k, n_group, topk_group, intermediate_size, hidden_size_output, local_expert_offset,
             local_num_experts, routed_scaling_factor, tileN, routing_method_type, mDtypeAct, *mRunners[tileN], config,
-            topk_weights, topk_ids, out_tensor);
+            topk_weights, topk_ids, output);
     }
 
 private:

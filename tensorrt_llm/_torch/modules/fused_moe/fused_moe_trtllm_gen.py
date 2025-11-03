@@ -709,7 +709,7 @@ class TRTLLMGenFusedMoE(MoE):
                 0,  # act_type
                 token_final_scales,
                 token_selected_experts,
-                output_tensor=moe_output,
+                output=moe_output,
             )
         else:
             raise NotImplementedError(

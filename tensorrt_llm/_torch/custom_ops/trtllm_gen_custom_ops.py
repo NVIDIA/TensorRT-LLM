@@ -854,7 +854,7 @@ def mxe4m3_mxe2m1_block_scale_moe_runner(
         act_type: int,
         topk_weights: Optional[torch.Tensor] = None,
         topk_ids: Optional[torch.Tensor] = None,
-        output_tensor: Optional[torch.Tensor] = None) -> torch.Tensor:
+        output: Optional[torch.Tensor] = None) -> torch.Tensor:
 
     tuner = AutoTuner.get()
     kernel_runner = MxE4m3MxE2m1BlockScaleMoERunner(
@@ -908,7 +908,7 @@ def mxe4m3_mxe2m1_block_scale_moe_runner(
         0] = routing_logits  # replace dummy routing logits with actual routing logits
     return kernel_runner(input_tensors,
                          tactic=[-1, -1] if best_tactic == -1 else best_tactic,
-                         output=output_tensor)
+                         output=output)
 
 
 @dataclass(frozen=True)
