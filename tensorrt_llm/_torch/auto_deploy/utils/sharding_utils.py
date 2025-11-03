@@ -689,6 +689,7 @@ def _insert_tp_sharded_moe(
     - Shard weight dimensions:
       - w1/w3: [num_experts, 2*intermediate_size//world_size, hidden_size]
       - w2: [num_experts, hidden_size, intermediate_size//world_size]
+    - Registers load hooks so checkpoint loading works correctly
     """
 
     args = list(node.args)
@@ -698,41 +699,59 @@ def _insert_tp_sharded_moe(
     w2_list = args[4]  # List of w2 weight nodes for all 8 experts
     w3_list = args[5]  # List of w3 weight nodes for all 8 experts
 
-    # Track original parameter names for cleanup after sharding
-    original_param_names = set()
-
     # Apply TP sharding to each expert's weights
     def shard_weight_tensor(weight_node, dim, rank, world_size):
-        """Shard a weight tensor along specified dimension"""
-        with gm.graph.inserting_before(node):
-            # Get the actual tensor
-            weight_tensor = gm.get_parameter(weight_node.target)
+        """Shard a weight tensor along specified dimension and register load hook"""
+        # Get the actual tensor and parameter key
+        weight_key = weight_node.target
+        weight_tensor = gm.get_parameter(weight_key)
 
-            # Track original parameter name for cleanup
-            original_param_names.add(weight_node.target)
+        # Calculate shard size
+        total_size = weight_tensor.shape[dim]
+        shard_size = total_size // world_size
+        start_idx = rank * shard_size
+        # last rank gets the remainder if total_size % world_size != 0
+        end_idx = start_idx + shard_size if rank < world_size - 1 else total_size
 
-            # Calculate shard size
-            total_size = weight_tensor.shape[dim]
-            shard_size = total_size // world_size
-            start_idx = rank * shard_size
-            # last rank gets the remainder if num_experts % world_size != 0
-            end_idx = start_idx + shard_size if rank < world_size - 1 else total_size
-
-            # Create sliced tensor
+        # Define slice function for this specific weight and dimension
+        def slice_tensor(t: torch.Tensor) -> torch.Tensor:
+            """Slice tensor along the specified dimension"""
             if dim == 0:
-                sharded_tensor = weight_tensor[start_idx:end_idx, :]
+                return t[start_idx:end_idx, :]
             elif dim == 1:
-                sharded_tensor = weight_tensor[:, start_idx:end_idx]
+                return t[:, start_idx:end_idx]
             else:
                 raise ValueError(f"Unsupported sharding dimension: {dim}")
 
-            # Create new parameter (replace dots with underscores for valid param names)
-            new_name = weight_node.target.replace(".", "_")
-            new_param_name = f"{new_name}_tp_rank_{rank}"
-            new_param = torch.nn.Parameter(sharded_tensor)
-            gm.register_parameter(new_param_name, new_param)
+        # The hook will slice the checkpoint tensor during loading
+        # For now, create a correctly-shaped random tensor as placeholder
+        if dim == 0:
+            shard_shape = (end_idx - start_idx, weight_tensor.shape[1])
+        elif dim == 1:
+            shard_shape = (weight_tensor.shape[0], end_idx - start_idx)
+        else:
+            raise ValueError(f"Unsupported sharding dimension: {dim}")
 
-            return gm.graph.get_attr(new_param_name)
+        # Create placeholder with correct shape (will be overwritten by checkpoint)
+        modname, _, param_name = weight_key.rpartition(".")
+        param_new = nn.Parameter(
+            torch.empty(shard_shape, dtype=weight_tensor.dtype, device=weight_tensor.device),
+            requires_grad=False,
+        )
+        gm.get_submodule(modname).register_parameter(param_name, param_new)
+
+        # Register load state dict hook to slice checkpoint tensors during loading
+        gm._register_load_state_dict_pre_hook(
+            partial(
+                _load_hook,
+                f_split=slice_tensor,
+                param_key=weight_key,
+                param_shape=param_new.shape,
+            )
+        )
+
+        # Return the same weight_node (it now points to the sharded parameter)
+        return weight_node
 
     # Shard w1 and w3 weights along dimension 0 (intermediate_size dimension)
     w1_list_sharded = []
@@ -749,15 +768,6 @@ def _insert_tp_sharded_moe(
         w2_sharded = shard_weight_tensor(w2_node, dim=1, rank=rank, world_size=world_size)
         w2_list_sharded.append(w2_sharded)
 
-    # Delete original full-size parameters to free memory
-    # Do this before updating node args to ensure sharded weights are registered first
-    deleted_count = 0
-    for param_name in original_param_names:
-        if param_name in gm._parameters:
-            # Delete the parameter
-            del gm._parameters[param_name]
-            deleted_count += 1
-
     # Clear CUDA cache to ensure memory is freed
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -768,14 +778,52 @@ def _insert_tp_sharded_moe(
     args[5] = w3_list_sharded
 
     # Handle scales for quantized ops (apply same TP sharding)
-    for i in range(len(scale_names) * 3):  # 3 layers (w1, w2, w3) × #scale_names per layer
-        layer_idx = i % 3  # 0=w1, 1=w2, 2=w3
-        if layer_idx in [0, 2]:  # w1, w3: shard dim 0
-            pass
-        else:
-            pass
+    # Scales follow same pattern as weights: w1/w3 use dim=0, w2 uses dim=1
+    scale_names = list(scale_names)
+    if scale_names:
+        for i, scale_name in enumerate(scale_names):
+            # Each scale_name corresponds to 3 args (w1, w2, w3 scales)
+            base_idx = 6 + i * 3  # scales start at arg index 6
+
+            # w1 scales: shard dim 0
+            w1_scale_list = args[base_idx]
+            w1_scale_sharded = []
+            for scale_node in w1_scale_list:
+                sharded_scale = shard_weight_tensor(
+                    scale_node, dim=0, rank=rank, world_size=world_size
+                )
+                w1_scale_sharded.append(sharded_scale)
+            args[base_idx] = w1_scale_sharded
+
+            # w2 scales: shard dim 1
+            w2_scale_list = args[base_idx + 1]
+            w2_scale_sharded = []
+            for scale_node in w2_scale_list:
+                sharded_scale = shard_weight_tensor(
+                    scale_node, dim=1, rank=rank, world_size=world_size
+                )
+                w2_scale_sharded.append(sharded_scale)
+            args[base_idx + 1] = w2_scale_sharded
+
+            # w3 scales: shard dim 0
+            w3_scale_list = args[base_idx + 2]
+            w3_scale_sharded = []
+            for scale_node in w3_scale_list:
+                sharded_scale = shard_weight_tensor(
+                    scale_node, dim=0, rank=rank, world_size=world_size
+                )
+                w3_scale_sharded.append(sharded_scale)
+            args[base_idx + 2] = w3_scale_sharded
 
     node.args = tuple(args)
+
+    # Add all_reduce to combine partial results from TP ranks
+    with gm.graph.inserting_after(node):
+        dist_node = gm.graph.call_function(
+            torch.ops.auto_deploy.torch_dist_all_reduce.default, args=(node,)
+        )
+        node.replace_all_uses_with(dist_node)
+        dist_node.replace_input_with(dist_node, node)
 
 
 def _slice_expert_dim(gm: GraphModule, tensor_node: Node, lo: int, hi: int) -> Node:
