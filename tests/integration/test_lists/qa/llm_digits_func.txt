@@ -15,10 +15,10 @@ test_e2e.py::test_ptp_quickstart_advanced[Mixtral-8x7B-BF16-Mixtral-8x7B-Instruc
 test_e2e.py::test_ptp_quickstart_advanced[Mistral-Nemo-12b-Base-Mistral-Nemo-Base-2407]
 test_e2e.py::test_ptp_quickstart_advanced[DeepSeek-R1-Distill-Qwen-32B-DeepSeek-R1/DeepSeek-R1-Distill-Qwen-32B]
 
-test_e2e.py::test_ptp_quickstart_multimodal[NVILA-15B-FP16-NVILA-15B-image-False]
-test_e2e.py::test_ptp_quickstart_multimodal[NVILA-15B-FP16-NVILA-15B-video-False]
-
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_llm_sampler
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3[eagle3_one_model=False-overlap_scheduler=False]
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3[eagle3_one_model=True-overlap_scheduler=True]
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_ngram
+
+accuracy/test_llm_api_pytorch_multimodal.py::TestNVILA_8B::test_auto_dtype
+accuracy/test_llm_api_pytorch_multimodal.py::TestVILA1_5_3B::test_auto_dtype

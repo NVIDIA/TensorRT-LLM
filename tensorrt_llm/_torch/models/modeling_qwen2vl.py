@@ -840,7 +840,12 @@ class Qwen2VLModelBase(PreTrainedModel):
         model_config.pretrained_config.disable_fuse_rope = disabble_fuse_rope
         model_config.pretrained_config.rope_scaling['type'] = 'mrope'
         config = model_config.pretrained_config
+
+        self._supports_sdpa = True
         super().__init__(config)
+
+        if not disabble_fuse_rope:
+            self.init_mrope_embedding(model_config)
 
         self.model_config = model_config
         self.config = model_config.pretrained_config
@@ -947,14 +952,10 @@ class Qwen2VLModelBase(PreTrainedModel):
         VLM forward logic with inflight batching support.
         """
         num_context_requests, num_generation_requests = attn_metadata.num_contexts, attn_metadata.num_generations
-        logger.debug(
-            f"num_context_requests: {num_context_requests}, num_generation_requests: {num_generation_requests}"
-        )
 
         multimodal_params = kwargs.get("multimodal_params", [])
         mm_embeds = []
         mrope_config = {}
-
         if len(multimodal_params) > 0:
             if not DISAGG:
                 mm_embeds = get_multimodal_embeddings(
@@ -965,7 +966,6 @@ class Qwen2VLModelBase(PreTrainedModel):
                     "Qwen2VLModel does not support disaggregated inference yet. Please unset "
                     f"the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."
                 )
-
             mm_embeds = find_input_mm_embeds(
                 mm_embeds, multimodal_params[:num_context_requests])
             if not self.model_config.pretrained_config.disable_fuse_rope:

@@ -15,17 +15,17 @@ l0_l40s:
   tests:
   # ------------- PyTorch tests ---------------
   - unittest/_torch/modeling -k "modeling_mllama"
-  - unittest/_torch/modeling -k "modeling_vila"
   - unittest/_torch/modeling -k "modeling_siglip"
-  - unittest/_torch/modeling -k "modeling_qwen2_5vl"
+  - unittest/_torch/modeling -k "modeling_vila"
+  - unittest/_torch/modeling/test_modeling_llava_next.py::TestLlavaNext::test_all
+  - unittest/_torch/modeling/test_modeling_qwen2_5vl.py::TestQwen2_5_VL::test_all
   - test_e2e.py::test_ptp_scaffolding[DeepSeek-R1-Distill-Qwen-7B-DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B]
-  - test_e2e.py::test_ptp_quickstart_multimodal[NVILA-8B-FP16-vila/NVILA-8B-image-False]
-  - test_e2e.py::test_ptp_quickstart_multimodal[NVILA-8B-FP16-vila/NVILA-8B-video-False]
-  - test_e2e.py::test_ptp_quickstart_multimodal[llava-v1.6-mistral-7b-llava-v1.6-mistral-7b-hf-image-False]
   - test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[phi4-multimodal-instruct-multimodals/Phi-4-multimodal-instruct-audio]
   - test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[phi4-multimodal-instruct-multimodals/Phi-4-multimodal-instruct-image]
   - test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[phi4-multimodal-instruct-multimodals/Phi-4-multimodal-instruct-image_audio]
-  - accuracy/test_llm_api_pytorch.py::TestQwen2_VL_7B::test_auto_dtype
+  # MMMU sanity check
+  - accuracy/test_llm_api_pytorch_multimodal.py::TestQwen2_5_VL_7B::test_auto_dtype
+  - accuracy/test_llm_api_pytorch_multimodal.py::TestVILA1_5_3B::test_auto_dtype
 - condition:
     ranges:
       system_gpu_count:
