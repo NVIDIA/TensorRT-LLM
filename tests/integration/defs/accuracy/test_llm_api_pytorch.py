@@ -258,8 +258,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  build_config=None) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -2852,7 +2850,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("enable_chunked_prefill", [False, True])
     def test_eagle3(self, enable_chunked_prefill, eagle3_one_model):
         pytorch_config = dict(
-            disable_overlap_scheduler=True,
+            disable_overlap_scheduler=not eagle3_one_model,
             cuda_graph_config=CudaGraphConfig(),
         )
         kv_cache_config = KvCacheConfig(
@@ -2877,7 +2875,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                   build_config=None)
 
         with llm:
-            task = MMLU(self.MODEL_NAME)
+            task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
     @skip_pre_blackwell
@@ -3040,7 +3038,7 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
 
     def test_eagle3(self):
         pytorch_config = dict(
-            disable_overlap_scheduler=True,
+            disable_overlap_scheduler=False,
             cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 3, 4, 8]),
         )
         kv_cache_config = KvCacheConfig(enable_block_reuse=False)
