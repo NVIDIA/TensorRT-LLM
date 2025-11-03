@@ -203,20 +203,24 @@ for i in $(seq 0 $((num_gen_servers - 1))); do
         &> ${full_logdir}/output_gen_${i}.log &
 done
 
-# start the ctx workers
-echo "Starting ctx workers..."
-for i in $(seq 0 $((num_ctx_servers - 1))); do
-    srun -l -N ${ctx_nodes_num_in_single_server} \
-        --ntasks=$((ctx_world_size)) \
-        --ntasks-per-node=${gpus_per_node} \
-        --container-image=${container_image} \
-        --container-name=${container_name} \
-        --container-mounts=${container_mount} \
-        --mpi=pmix \
-        bash ${work_dir}/start_worker.sh \
-        "CTX" ${i} ${model_path} "8336" "${benchmark_mode}" "${concurrency_list}" "${enable_pdl}" "${numa_bind}" "${full_logdir}" "${nsys_on}" "${ctx_config_path}" \
-        &> ${full_logdir}/output_ctx_${i}.log &
-done
+# start the ctx workers (skip if TRTLLM_DISAGG_BENCHMARK_GEN_ONLY is set).
+if [ "${TRTLLM_DISAGG_BENCHMARK_GEN_ONLY:-0}" != "1" ]; then
+    echo "Starting ctx workers..."
+    for i in $(seq 0 $((num_ctx_servers - 1))); do
+        srun -l -N ${ctx_nodes_num_in_single_server} \
+            --ntasks=${ctx_tp_size} \
+            --ntasks-per-node=${gpus_per_node} \
+            --container-image=${container_image} \
+            --container-name=${container_name} \
+            --container-mounts=${container_mount} \
+            --mpi=pmix \
+            bash ${work_dir}/start_worker.sh \
+            "CTX" ${i} ${model_path} "8336" "${benchmark_mode}" "${concurrency_list}" "${enable_pdl}" "${numa_bind}" "${full_logdir}" "${nsys_on}" "${ctx_config_path}" \
+            &> ${full_logdir}/output_ctx_${i}.log &
+    done
+else
+    echo "Skipping context workers startup (TRTLLM_DISAGG_BENCHMARK_GEN_ONLY is set)"
+fi
 
 # start the server
 echo "Starting server..."

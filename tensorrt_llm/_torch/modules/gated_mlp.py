@@ -47,12 +47,15 @@ class GatedMLP(nn.Module):
             tp_size = overridden_tp_size
             # "Misuse" pp_size here to perform all-reduce within smaller groups
             pp_size = config.mapping.pp_size * config.mapping.tp_size // overridden_tp_size
+            # TODO: Figure if this change is actually needed given the repurposing of CP ranks to TP.
             mapping = Mapping(
-                world_size=tp_size * pp_size,
+                world_size=tp_size * pp_size * self.mapping.cp_size,
                 rank=self.mapping.rank,
                 gpus_per_node=self.mapping.gpus_per_node,
                 tp_size=tp_size,
                 pp_size=pp_size,
+                cp_size=self.mapping.cp_size,
+                cp_config=self.mapping.cp_config,
             )
         else:
             mapping = config.mapping

@@ -2050,7 +2050,8 @@ class PyExecutor:
     @nvtx_range("_update_request_states")
     def _update_request_states(self, scheduled_requests: ScheduledRequests):
         cp_config = self.dist.cp_config
-        if 'cp_type' in cp_config:
+        # Note: Helix Parallelism uses the same logic as tp parallelism here.
+        if 'cp_type' in cp_config and cp_config['cp_type'] != CpType.HELIX:
             cp_type = cp_config['cp_type']
             if cp_type == CpType.STAR:
                 self._update_request_states_star_attention(scheduled_requests)

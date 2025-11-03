@@ -177,6 +177,10 @@ class KVCacheManager(BaseResourceManager):
         indexer_k_cache_index_head_dim: int = 0,
         **kwargs,
     ) -> None:
+        # Couple of places where we assume tokens_per_block is 32: Let's assert here for now.
+        # 1) block assignment in merge_helix_requests
+        # 2) computation of cache_transceiver_config.max_tokens_in_buffer.
+        assert tokens_per_block == 32, "tokens_per_block must be 32 for helix benchmarking."
         self.mapping = mapping
         self.dtype = dtype
         self.kv_cache_type = kv_cache_type
@@ -438,6 +442,18 @@ class KVCacheManager(BaseResourceManager):
                                 req, block_ids)
 
             for req in generation_batch:
+                # Skip allocating KV cache at decode for inactive helix ranks.
+                ##################################################################
+                # TODO: For now, we hardcode that last rank is active.
+                if self.mapping.has_cp_helix():
+                    if self.mapping.cp_rank != self.mapping.cp_size - 1:
+                        req.py_helix_is_inactive_rank = True
+                ##################################################################
+                if req.py_helix_is_inactive_rank:
+                    print(f"[ResourceManager::prepare_resources][rank {self.mapping.rank}] Skipping KV allocation for request {req.py_request_id}.")
+                    continue
+                print(f"[ResourceManager::prepare_resources][rank {self.mapping.rank}] Adding KV allocation for request {req.py_request_id}.")
+
                 self.impl.add_token(req.py_request_id)
                 for _ in range(get_draft_token_length(req)):
                     self.impl.add_token(req.py_request_id)

@@ -341,9 +341,36 @@ class MPIDist(Distributed):
 
     def __init__(self, mapping: Mapping):
         super().__init__(mapping)
+        self.create_cp_comm()
+
+        # For helix, repurpose CP ranks to TP so that the right comms are created.
+        mapping_with_helix = None
+        if self.mapping.has_cp_helix():
+            logger.info(f"[MPIDist::__init__] Repurposing CP ranks to TP for Helix.")
+            mapping_with_helix = copy.deepcopy(self.mapping)
+            mapping_without_helix = Mapping(
+                world_size=self.mapping.world_size,
+                rank=self.mapping.rank,
+                gpus_per_node=self.mapping.gpus_per_node,
+                cp_size=1,
+                cp_config={},
+                tp_size=self.mapping.tp_size * self.mapping.cp_size,
+                pp_size=self.mapping.pp_size,
+                moe_cluster_size=self.mapping.moe_cluster_size,
+                moe_tp_size=self.mapping.moe_tp_size,
+                moe_ep_size=self.mapping.moe_ep_size,
+                attn_tp_size=self.mapping.attn_tp_size,
+                attn_cp_size=self.mapping.attn_cp_size,
+                enable_attention_dp=self.mapping.enable_attention_dp,
+                enable_lm_head_tp_in_adp=self.mapping.enable_lm_head_tp_in_adp)
+            self.mapping = mapping_without_helix
         self.create_tp_comm()
         self.create_pp_comm()
-        self.create_cp_comm()
+
+        # Restore the original mapping if it was rearranged for helix.
+        if mapping_with_helix is not None:
+            logger.info(f"[MPIDist::__init__] Restoring original mapping.")
+            self.mapping = mapping_with_helix
 
     def broadcast(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
         comm = mpi_comm()

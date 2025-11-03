@@ -213,6 +213,12 @@ void TrtllmGenGemmRunner::selectGemmConfig(int32_t m, int32_t n, int32_t k)
                 return optionsA.mNumSlicesForSplitK > optionsB.mNumSlicesForSplitK;
             }
 
+            // then by tileN, if N is large enough
+            if (gemmData.mProblemDimensions.mN > 256 && optionsA.mTileN != optionsB.mTileN)
+            {
+                return optionsA.mTileN > optionsB.mTileN;
+            }
+
             return true;
         });
 
