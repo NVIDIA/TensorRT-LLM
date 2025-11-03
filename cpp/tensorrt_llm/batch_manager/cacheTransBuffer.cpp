@@ -192,7 +192,6 @@ CacheTransBufferManager::CacheTransBufferManager(
     KVCacheManager::BaseKVCacheManager* cacheManager, std::optional<size_t> maxNumTokens, bool transferIndexerKCache)
     : mCacheManager{cacheManager}
     , mBufferManager{std::make_shared<runtime::CudaStream>()}
-    , mTransferIndexerKCache{transferIndexerKCache}
     , mMaxNumTokens{maxNumTokens}
 {
     // TODO: FP4 dataSize

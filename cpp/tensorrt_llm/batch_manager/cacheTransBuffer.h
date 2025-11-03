@@ -119,7 +119,6 @@ private:
     KVCacheManager::BaseKVCacheManager* mCacheManager;
     runtime::BufferManager mBufferManager;
     std::vector<std::unique_ptr<FabricMemory>> mFabricMemory;
-    bool mTransferIndexerKCache;
     std::optional<size_t> mMaxNumTokens;
 };
 
