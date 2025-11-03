@@ -60,12 +60,14 @@ def submit_job(config):
                               {}).get('num_nextn_predict_layers', 0)
 
     # Calculate nodes based on world sizes
-    ctx_world_size = config['worker_config']['ctx']['tensor_parallel_size'] \
-        * config['worker_config']['ctx']['pipeline_parallel_size']
+    ctx_tp_size = config['worker_config']['ctx']['tensor_parallel_size']
+    ctx_pp_size = config['worker_config']['ctx']['pipeline_parallel_size']
+    ctx_world_size = ctx_tp_size * ctx_pp_size
     ctx_nodes = calculate_nodes(ctx_world_size, ctx_num,
                                 hw_config['gpus_per_node'])
-    gen_world_size = config['worker_config']['gen']['tensor_parallel_size'] \
-        * config['worker_config']['gen']['pipeline_parallel_size']
+    gen_tp_size = config['worker_config']['gen']['tensor_parallel_size']
+    gen_pp_size = config['worker_config']['gen']['pipeline_parallel_size']
+    gen_world_size = gen_tp_size * gen_pp_size
     gen_nodes = calculate_nodes(gen_world_size, gen_num,
                                 hw_config['gpus_per_node'])
     total_nodes = ctx_nodes + gen_nodes

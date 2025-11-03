@@ -15,11 +15,11 @@ hardware:
 
 # Benchmark Mode
 benchmark:
-  mode: "gen_only"  # Options: e2e, gen_only
+  mode: "e2e"  # Options: e2e, gen_only
   use_nv_sa_benchmark: false  # Whether to use NVIDIA SA benchmark script
   multi_round: 1  # Number of benchmark rounds
   benchmark_ratio: 0.8  # Benchmark ratio
-  streaming: false  # Enable streaming mode
+  streaming: true  # Enable streaming mode
   concurrency_list: "1024"
 
 # Sequence Configuration

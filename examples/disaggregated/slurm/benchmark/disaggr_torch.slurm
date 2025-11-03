@@ -123,7 +123,7 @@ if [ -d "${trtllm_repo}" ]; then
 
     echo "Installing TensorRT-LLM..."
     if ! srun --container-name=${container_name} \
-        --container-mounts=${container_mount} \
+        --container-mounts=${container_mount} --no-container-mount-home \
         --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
         bash -c "cd ${trtllm_repo} && pip install -e ." \
         &> ${full_logdir}/install.log; then
