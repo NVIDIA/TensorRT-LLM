@@ -99,6 +99,9 @@ struct MlaParams
     float const* dequant_scale_kv;
     float host_bmm1_scale;
 
+    // Is it absorption mode?
+    bool absorption_mode = false;
+
     // For FP8 context qkv quantization
     float const* quant_scale_qkv = nullptr;
 

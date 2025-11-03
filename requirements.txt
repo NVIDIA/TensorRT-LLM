@@ -21,6 +21,8 @@ pandas
 h5py==3.12.1
 StrEnum
 sentencepiece>=0.1.99
+# WAR for tensorrt depending on the archived nvidia-cuda-runtime-cu13 package
+nvidia-cuda-runtime-cu13==0.0.0a0
 # tensorrt~=10.11.0  # <For CUDA 12.9>
 tensorrt~=10.13.0
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-08.html#rel-25-08 uses 2.8.0a0.

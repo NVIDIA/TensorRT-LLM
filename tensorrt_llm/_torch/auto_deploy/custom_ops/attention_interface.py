@@ -576,17 +576,22 @@ class SequenceInfo:
             else:
                 self._extra_args[name] = None
 
+    @nvtx_range("ad_get_unique_value")
     def _get_unique_value(self, occupied: Set[int], max_val: int) -> int:
         """Get un unoccupied value from the range indicated by max_val.
 
         In addition, this function performs a sanity check to ensure that no value in the occupied
         set is out of bounds.
         """
-        full_range = set(range(max_val))
-        free_values = full_range - occupied
-        out_of_range = occupied - full_range
+        # Validate without materializing the full range set
+        out_of_range = [v for v in occupied if v < 0 or v >= max_val]
         assert not out_of_range, f"Out of range values: {out_of_range}"
-        return free_values.pop() if free_values else 0
+
+        # Return the smallest free value; fall back to 0 if none
+        for candidate in range(max_val):
+            if candidate not in occupied:
+                return candidate
+        return 0
 
     @nvtx_range("ad_nest_sequences")
     def nest_sequences(

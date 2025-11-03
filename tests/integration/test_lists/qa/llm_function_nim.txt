@@ -157,6 +157,9 @@ accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_chunked_prefill[cutlass-au
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_chunked_prefill[trtllm-auto]
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_chunked_prefill[triton-auto]
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_chunked_prefill[trtllm-fp8]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[trtllm]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[cutlass]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[triton]
 accuracy/test_llm_api_pytorch.py::TestLlama3_3NemotronSuper49Bv1::test_fp8_prequantized_tp2
 accuracy/test_llm_api_pytorch.py::TestLlama3_1NemotronNano8Bv1::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestLlama3_1NemotronNano8Bv1::test_fp8_prequantized

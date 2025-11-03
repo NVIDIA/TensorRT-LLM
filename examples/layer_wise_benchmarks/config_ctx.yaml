@@ -1,0 +1,21 @@
+model: nvidia/DeepSeek-R1-0528-FP4-v2
+layer_indices: [5]
+run_type: CTX
+scaled_from: null
+
+# KV cache related args
+tokens_per_block: 32
+max_seq_len: 9220  # 8192 + 1024 + 4
+enable_attention_dp: true
+
+# Model init args
+max_num_tokens: 20480
+moe_backend: CUTLASS
+use_cuda_graph: false
+
+# Per iteration args
+batch_size: 1
+seq_len_q: 8193
+seq_len_kv_cache: 0
+balance_method: Balanced
+balance_ratio: null
