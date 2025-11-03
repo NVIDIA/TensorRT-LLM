@@ -454,7 +454,7 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
         pipArgs = ""
     }
 
-    if (tarName.contains("_CU12")) {
+    if (tarName.contains("CU12")) {
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && sed -i '/^# .*<For CUDA 12\\.9>\$/ {s/^# //; n; s/^/# /}' requirements.txt && cat requirements.txt")
     }
     // install python package
