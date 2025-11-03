@@ -1133,7 +1133,7 @@ class VisionArenaDataset(HuggingFaceDataset):
             if len(prompts) >= num_requests:
                 break
             prompt = parser_fn(item)
-            mm_content = process_image(item["images"][0])
+            mm_content = [process_image(item["images"][0])]
             prompt_len = len(tokenizer(prompt).input_ids)
             if enable_multimodal_chat:
                 prompt = self.apply_multimodal_chat_transformation(

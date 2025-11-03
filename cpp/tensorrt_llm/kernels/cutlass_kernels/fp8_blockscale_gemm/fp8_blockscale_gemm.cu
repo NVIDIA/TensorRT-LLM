@@ -185,10 +185,10 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::strideBatchGe
 }
 
 template <typename ElementA, typename ElementB, typename ElementD>
-void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::fp8CS1x128(
-    __nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x, int shape_y, cudaStream_t stream)
+void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::fp8CS1x128(__nv_fp8_e4m3* mat_quant, float* scales,
+    __nv_bfloat16 const* mat, int shape_x, int shape_y, cudaStream_t stream, bool use_ue8m0)
 {
-    fp8_1x128_cs(mat_quant, scales, mat, shape_x, shape_y, stream);
+    fp8_1x128_cs(mat_quant, scales, mat, shape_x, shape_y, stream, use_ue8m0);
 }
 
 template <typename ElementA, typename ElementB, typename ElementD>

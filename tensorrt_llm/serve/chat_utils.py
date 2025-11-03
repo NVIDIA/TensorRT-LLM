@@ -1,3 +1,4 @@
+import uuid
 from functools import partial
 from typing import (Any, Callable, Coroutine, Dict, Iterable, List, Literal,
                     Optional, Tuple, TypeAlias, TypedDict, Union, cast)
@@ -220,3 +221,11 @@ def check_multiple_response(n: int, backend: Optional[str]):
     if n > 1 and backend == "pytorch":
         raise ValueError(
             "Multiple response is not supported in PyTorch workflow")
+
+
+def make_tool_call_id(id_type: str = "random", func_name=None, idx=None):
+    if id_type == "kimi_k2":
+        return f"functions.{func_name}:{idx}"
+    else:
+        # by default return random
+        return f"chatcmpl-tool-{uuid.uuid4().hex}"

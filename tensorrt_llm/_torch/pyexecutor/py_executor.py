@@ -198,17 +198,21 @@ class PyExecutor:
         self.max_beam_width = max_beam_width
         self.max_draft_len = max_draft_len
         self.max_total_draft_tokens = max_total_draft_tokens
-        self.max_num_tokens = model_engine.pytorch_backend_config.max_num_tokens
-        self.print_log = model_engine.pytorch_backend_config.print_iter_log
-        self.enable_iter_perf_stats = model_engine.pytorch_backend_config.enable_iter_perf_stats
-        self.enable_iter_req_stats = model_engine.pytorch_backend_config.enable_iter_req_stats
-        self.stream_interval = model_engine.pytorch_backend_config.stream_interval
-        self.attention_dp_enable_balance = model_engine.pytorch_backend_config.attention_dp_enable_balance
-        self.attention_dp_time_out_iters = model_engine.pytorch_backend_config.attention_dp_time_out_iters
-        self.attention_dp_batching_wait_iters = model_engine.pytorch_backend_config.attention_dp_batching_wait_iters
-        self.batch_wait_timeout_ms = model_engine.pytorch_backend_config.batch_wait_timeout_ms
-        self.batch_wait_timeout_iters = model_engine.pytorch_backend_config.batch_wait_timeout_iters
-        self.batch_wait_max_tokens_ratio = model_engine.pytorch_backend_config.batch_wait_max_tokens_ratio
+        self.llm_args = self.model_engine.llm_args
+        self.max_num_tokens = self.llm_args.max_num_tokens
+        self.print_log = self.llm_args.print_iter_log
+        self.enable_iter_perf_stats = self.llm_args.enable_iter_perf_stats
+        self.enable_iter_req_stats = self.llm_args.enable_iter_req_stats
+        self.stream_interval = self.llm_args.stream_interval
+        self.attention_dp_enable_balance = (
+            self.llm_args.attention_dp_config is not None
+            and self.llm_args.attention_dp_config.enable_balance)
+        if self.attention_dp_enable_balance:
+            self.attention_dp_time_out_iters = self.llm_args.attention_dp_config.timeout_iters
+            self.attention_dp_batching_wait_iters = self.llm_args.attention_dp_config.batching_wait_iters
+        self.batch_wait_timeout_ms = self.llm_args.batch_wait_timeout_ms
+        self.batch_wait_timeout_iters = self.llm_args.batch_wait_timeout_iters
+        self.batch_wait_max_tokens_ratio = self.llm_args.batch_wait_max_tokens_ratio
         self.enable_batch_waiting = self.batch_wait_timeout_iters > 0 or self.batch_wait_max_tokens_ratio > 0
 
         self.num_fetch_requests_cur_rank = 0
@@ -893,10 +897,15 @@ class PyExecutor:
 
                     # Stage 1: Async forward (all ranks) and decoding pass (last rank only)
                     if not self.dist.is_last_pp_rank:
-                        sample_state = self._forward_step_inter_pp(
-                            scheduled_batch)
+                        with torch.cuda.nvtx.range(
+                                f"_forward_step_inter_pp pp_rank {self.dist.pp_rank}"
+                        ):
+                            sample_state = self._forward_step_inter_pp(
+                                scheduled_batch)
                     else:
-                        with torch.cuda.nvtx.range("_forward_step_last_pp"):
+                        with torch.cuda.nvtx.range(
+                                f"_forward_step_last_pp pp_rank {self.dist.pp_rank}"
+                        ):
                             # init_disagg_gen_requests must be before engine forward, where the prev_seq_slot is updated.
                             if self.guided_decoder is not None and self.kv_cache_transceiver:
                                 self.guided_decoder.add_batch(scheduled_batch)
@@ -927,10 +936,17 @@ class PyExecutor:
 
                     self.micro_batches[microbatch_id] = batch_state
 
-                # Stage 2: Communicate new tokens for previous batch between ranks
+                # sync sampler for previous microbatch to start new sample state comm chain.
+                prev_microbatch_id = (microbatch_id -
+                                      1) % self.num_micro_batches
+                previous_batch = self.micro_batches[prev_microbatch_id]
+                if previous_batch is not None:
+                    with nvtx_range("sync_previous_sampler_event"):
+                        previous_batch.sample_state.sampler_event.synchronize()
+
+                # Stage 2: Communicate sample state for previous batch between ranks
                 # send/recv chain: (pp_size - 1) -> 0 -> 1 -> ... -> (pp_size - 2)
-                # last rank: sync sampler for previous microbatch to start new tokens comm chain.
-                # other ranks: send/recv tokens for next microbatch to allow overlap
+                # intermediate ranks: send/recv sample state for next microbatch to allow overlap
                 offset = -1 if self.dist.is_last_pp_rank else 1
                 prev_microbatch_id = (microbatch_id +
                                       offset) % self.num_micro_batches
@@ -949,20 +965,20 @@ class PyExecutor:
                         )
                     else:
                         torch.cuda.nvtx.range_push("_handle_new_tokens_last_pp")
-                        sample_state.sampler_event.synchronize()
 
                     # Send tokens to next pp rank (w.r.t model forward direction)
                     # Second last rank does not need to since last rank has original decoded tokens
                     if not self.dist.is_second_last_pp_rank:
                         self.wait_on_pp_send_handles(prev_microbatch_id)
-                        self.send_handles[
-                            prev_microbatch_id] = self.dist.isend_object(
-                                sample_state.host,
-                                dest=self.dist.next_pp_rank,
-                                tag=prev_microbatch_id)
+                        with nvtx_range("send_sample_state"):
+                            self.send_handles[
+                                prev_microbatch_id] = self.dist.isend_object(
+                                    sample_state.host,
+                                    dest=self.dist.next_pp_rank,
+                                    tag=prev_microbatch_id)
                     torch.cuda.nvtx.range_pop()
 
-                # Stage 3: Finalize previous batch that finished tokens communication
+                # Stage 3: Finalize previous batch that finished sample state communication
                 # In last pp rank, stage 2 and 3 process different previous batches
                 prev_microbatch_id = (microbatch_id +
                                       1) % self.num_micro_batches
@@ -1081,6 +1097,10 @@ class PyExecutor:
 
         scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
         )
+
+        if self.drafter is not None and not self.use_spec_decode:
+            for request in scheduled_batch.all_requests():
+                request.py_disable_speculative_decoding = True
 
         if self.kv_cache_transceiver:
             # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
@@ -1257,7 +1277,7 @@ class PyExecutor:
                 req.py_last_draft_tokens = req.py_draft_tokens
                 max_total_draft_tokens = self.model_engine.spec_config.max_total_draft_tokens
 
-                if max_total_draft_tokens > 0 and self.use_spec_decode:
+                if max_total_draft_tokens > 0 and self.use_spec_decode and not req.py_disable_speculative_decoding:
                     req.py_draft_tokens = [0] * max_total_draft_tokens
                     req.py_draft_pages_allocated = max_total_draft_tokens
                 else:
@@ -1444,13 +1464,11 @@ class PyExecutor:
             self._process_iter_stats(finished_requests, self.active_requests,
                                      self.previous_batch)
 
-    @nvtx_range("_forward_step_inter_pp")
     def _forward_step_inter_pp(self, scheduled_batch) -> SampleState:
         self._forward_step(scheduled_batch)
         sampler_event = torch.cuda.Event()
         sampler_event.record()
         self._update_request_states(scheduled_batch)
-        sampler_event.synchronize()
         return self.sampler.SampleState(
             scheduled_requests=scheduled_batch,
             sampler_event=sampler_event,
@@ -2345,6 +2363,17 @@ class PyExecutor:
             else:
                 self.has_previous_draft_tokens = False
                 target_inputs, draft_outputs, draft_batch = None, None, None
+                # We are not running the draft model. Remove the draft tokens and turn off spec
+                # decode so that the requests get handled correctly.
+                # One corner case: when we have at least one context request, we have to keep spec
+                # dec on. This ensures that we capture hidden states for requests that haven't done
+                # prefill yet.
+                self.use_spec_decode = False
+                self.model_engine.enable_spec_decode = len(
+                    scheduled_batch.context_requests) > 0
+                if not self.model_engine.enable_spec_decode:
+                    for request in scheduled_batch.all_requests():
+                        request.py_draft_tokens = []
 
         return target_inputs, draft_outputs, draft_batch
 

@@ -1,4 +1,3 @@
-from transformers import AutoConfig
 from typing import Optional, Literal
 from pydantic import AliasPath, BaseModel, Field, AliasChoices, model_validator
 import huggingface_hub
@@ -13,6 +12,8 @@ from tqdm.contrib.concurrent import thread_map
 import os
 import json
 import struct
+
+from tensorrt_llm._torch.pyexecutor.config_utils import load_pretrained_config
 
 
 def parse_safetensors_file_metadata(model_path, filename):
@@ -192,9 +193,10 @@ class ModelConfig(BaseModel):
 
     @classmethod
     def from_hf(cls, model_hf_name, hf_model_path):
-        model_name_or_path = hf_model_path or model_hf_name
-        hf_config = AutoConfig.from_pretrained(
-            model_name_or_path, trust_remote_code=True).to_dict()
+        pretrained_config = load_pretrained_config(hf_model_path
+                                                   or model_hf_name,
+                                                   trust_remote_code=True)
+        hf_config = pretrained_config.to_dict()
         param_count = cls.get_param_count(model_hf_name, hf_model_path)
 
         return cls(name=model_hf_name, param_count=param_count, **hf_config)

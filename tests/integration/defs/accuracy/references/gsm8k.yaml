@@ -101,6 +101,11 @@ deepseek-ai/DeepSeek-V3.2-Exp:
   - quant_algo: FP8_BLOCK_SCALES
     spec_dec_algo: MTP
     accuracy: 95.6
+  - quant_algo: NVFP4
+    accuracy: 95.6
+  - quant_algo: NVFP4
+    spec_dec_algo: MTP
+    accuracy: 95.6
 Qwen3/Qwen3-8B:
   - accuracy: 87.1114
   - quant_algo: FP8
@@ -212,9 +217,14 @@ GPT-OSS/BF16:
   - accuracy: 90.3
   - kv_cache_quant_algo: FP8
     accuracy: 90.3
-GPT-OSS/MXFP4:
+GPT-OSS/120B-MXFP4:
   - accuracy: 90.3
+  - spec_dec_algo: Eagle
+    accuracy: 90.3
   - quant_algo: W4A8_MXFP4_MXFP8
+    accuracy: 90.3
+  - quant_algo: W4A8_MXFP4_MXFP8
+    spec_dec_algo: Eagle
     accuracy: 90.3
   - quant_algo: W4A8_MXFP4_MXFP8
     kv_cache_quant_algo: FP8
@@ -227,8 +237,23 @@ GPT-OSS/MXFP4:
   - quant_algo: W4A16_MXFP4
     accuracy: 90.3
   - quant_algo: W4A16_MXFP4
+    spec_dec_algo: Eagle
+    accuracy: 90.3
+  - quant_algo: W4A16_MXFP4
     kv_cache_quant_algo: FP8
     accuracy: 90.3
+GPT-OSS/20B-MXFP4:
+  - accuracy: 85.0
+  - quant_algo: W4A8_MXFP4_MXFP8
+    accuracy: 85.0
+  - quant_algo: W4A8_MXFP4_MXFP8
+    kv_cache_quant_algo: FP8
+    accuracy: 85.0
+  - quant_algo: W4A16_MXFP4
+    accuracy: 85.0
+  - quant_algo: W4A16_MXFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 85.0
 LGAI-EXAONE/EXAONE-4.0-32B:
   - accuracy: 88.36
 ByteDance-Seed/Seed-OSS-36B-Instruct:

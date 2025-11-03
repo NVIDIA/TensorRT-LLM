@@ -47,6 +47,7 @@ add_library(
   cutlassScaledMM.cpp
   cublasScaledMM.cpp
   cublasFp4ScaledMM.cpp
+  cudaNvfp4MM.cpp
   cudaScaledMM.cpp
   dynamicDecodeOp.cpp
   fmhaPackMaskOp.cpp
@@ -73,6 +74,7 @@ add_library(
   moeOp.cpp
   moeUtilOp.cpp
   moeCommOp.cpp
+  moeAlltoAllOp.cpp
   moeLoadBalanceOp.cpp
   mxFp4BlockScaleMoe.cpp
   mxFp8Quantize.cpp
