@@ -649,20 +649,24 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
         capture_graph = torch.cuda.is_current_stream_capturing()
 
-        self.prompt_lens_cuda = self.get_empty(buffers,
-                                               (self.max_num_sequences, ),
-                                               cache_name="prompt_lens_cuda",
-                                               dtype=torch.int,
-                                               capture_graph=capture_graph)
+        self.prompt_lens_cuda = self.get_empty(
+            buffers,
+            (self.max_num_sequences, ),
+            cache_name="prompt_lens_cuda",
+            dtype=torch.int,
+            capture_graph=capture_graph,
+        )
         self.prompt_lens_cpu = torch.empty_like(
             self.prompt_lens_cuda,
             device='cpu',
             pin_memory=True,
         )
-        self.kv_lens_cuda = self.get_empty_like(buffers,
-                                                self.prompt_lens_cuda,
-                                                cache_name="kv_lens_cuda",
-                                                capture_graph=capture_graph)
+        self.kv_lens_cuda = self.get_empty_like(
+            buffers,
+            self.prompt_lens_cuda,
+            cache_name="kv_lens_cuda",
+            capture_graph=capture_graph,
+        )
         self.kv_lens = torch.empty_like(self.kv_lens_cuda,
                                         device='cpu',
                                         pin_memory=True)
@@ -678,13 +682,15 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             )
         if self.kv_cache_manager is not None:
             self.kv_cache_block_offsets = self.get_empty(
-                buffers, [
+                buffers,
+                [
                     self.kv_cache_manager.num_pools, self.max_num_sequences, 2,
                     self.kv_cache_manager.max_blocks_per_seq
                 ],
                 cache_name="kv_cache_block_offsets",
                 dtype=torch.int32,
-                capture_graph=capture_graph)
+                capture_graph=capture_graph,
+            )
             self.host_kv_cache_block_offsets = torch.empty_like(
                 self.kv_cache_block_offsets,
                 device='cpu',
@@ -694,38 +700,46 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.kv_block_ids_per_seq = None
             if self.enable_flash_mla:
                 self.block_ids_per_seq = self.get_empty(
-                    buffers, [
+                    buffers,
+                    [
                         self.kv_cache_manager.max_batch_size,
                         self.kv_cache_manager.max_blocks_per_seq
                     ],
                     cache_name="block_ids_per_seq",
                     dtype=torch.int32,
-                    capture_graph=capture_graph)
+                    capture_graph=capture_graph,
+                )
                 self.kv_block_ids_per_seq = self.get_empty(
-                    buffers, [
+                    buffers,
+                    [
                         self.kv_cache_manager.max_batch_size,
                         self.kv_cache_manager.max_blocks_per_seq
                     ],
                     cache_name="kv_block_ids_per_seq",
                     dtype=torch.int32,
-                    capture_graph=capture_graph)
+                    capture_graph=capture_graph,
+                )
             if self.enable_context_mla_with_cached_kv:
                 # for kv cache reuse/chunked context in MLA
                 self.ctx_cached_token_indptr = self.get_empty(
-                    buffers, (self.max_num_requests + 1, ),
+                    buffers,
+                    (self.max_num_requests + 1, ),
                     cache_name="ctx_cached_token_indptr",
                     dtype=torch.int64,
-                    capture_graph=capture_graph)
+                    capture_graph=capture_graph,
+                )
                 self.host_ctx_cached_token_indptr = torch.zeros_like(
                     self.ctx_cached_token_indptr,
                     device='cpu',
                     pin_memory=True,
                 )
                 self.ctx_uncached_token_indptr = self.get_empty(
-                    buffers, (self.max_num_requests + 1, ),
+                    buffers,
+                    (self.max_num_requests + 1, ),
                     cache_name="ctx_uncached_token_indptr",
                     dtype=torch.int64,
-                    capture_graph=capture_graph)
+                    capture_graph=capture_graph,
+                )
                 self.host_ctx_uncached_token_indptr = torch.zeros_like(
                     self.ctx_uncached_token_indptr,
                     device='cpu',
@@ -733,10 +747,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 )
                 # context full seqlens include cached tokens and uncached tokens
                 self.ctx_kv_indptr = self.get_empty(
-                    buffers, (self.max_num_requests + 1, ),
+                    buffers,
+                    (self.max_num_requests + 1, ),
                     cache_name="ctx_kv_indptr",
                     dtype=torch.int64,
-                    capture_graph=capture_graph)
+                    capture_graph=capture_graph,
+                )
                 self.host_ctx_kv_indptr = torch.zeros_like(
                     self.ctx_kv_indptr,
                     device='cpu',

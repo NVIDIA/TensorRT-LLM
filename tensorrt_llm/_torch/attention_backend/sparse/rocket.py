@@ -38,13 +38,15 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
         capture_graph = torch.cuda.is_current_stream_capturing()
         self.kt_cache_block_offsets = self.get_empty(
-            self.cuda_graph_buffers, [
+            self.cuda_graph_buffers,
+            [
                 self.max_num_sequences,
                 self.kv_cache_manager.max_kt_blocks_per_seq
             ],
             dtype=torch.int32,
             cache_name="kt_cache_block_offsets",
-            capture_graph=capture_graph)
+            capture_graph=capture_graph,
+        )
 
         self.host_kt_cache_block_offsets = torch.zeros_like(
             self.kt_cache_block_offsets,

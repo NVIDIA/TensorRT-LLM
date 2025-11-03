@@ -384,11 +384,13 @@ class AttentionMetadata:
                        like_tensor: torch.Tensor,
                        cache_name: str,
                        capture_graph: bool = False) -> torch.Tensor:
-        return AttentionMetadata.get_empty(buffers,
-                                           like_tensor.shape,
-                                           dtype=like_tensor.dtype,
-                                           cache_name=cache_name,
-                                           capture_graph=capture_graph)
+        return AttentionMetadata.get_empty(
+            buffers,
+            like_tensor.shape,
+            dtype=like_tensor.dtype,
+            cache_name=cache_name,
+            capture_graph=capture_graph,
+        )
 
 
 class PositionalEmbedder(Protocol):
