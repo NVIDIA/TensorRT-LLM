@@ -179,7 +179,15 @@ public:
     PerCudaCtxPerThreadSingletonCreator(CreatorFunc creator, DeleterFunc deleter)
         : mCreator{std::move(creator)}
         , mDeleter{std::move(deleter)}
+        , mObservers{new std::unordered_map<CacheKey, std::weak_ptr<T>, hash<CacheKey>>()}
     {
+    }
+
+    ~PerCudaCtxPerThreadSingletonCreator()
+    {
+        std::lock_guard<std::mutex> lk{mMutex};
+        delete mObservers;
+        mObservers = nullptr;
     }
 
     std::shared_ptr<T> operator()()
@@ -188,7 +196,7 @@ public:
         CUcontext ctx{getCurrentCudaCtx()};
         std::thread::id thread = std::this_thread::get_id();
         auto const key = std::make_tuple(ctx, thread);
-        std::shared_ptr<T> result = mObservers[key].lock();
+        std::shared_ptr<T> result = (*mObservers)[key].lock();
         if (result == nullptr)
         {
             TLLM_LOG_TRACE("creating singleton instance for CUDA context %lu and thread %lu", ctx, thread);
@@ -202,6 +210,11 @@ public:
                     }
                     mDeleter(obj);
 
+                    if (mObservers == nullptr)
+                    {
+                        return;
+                    }
+
                     // Clears observer to avoid growth of mObservers, in case users creates/destroys cuda contexts
                     // frequently.
                     std::shared_ptr<T> observedObjHolder; // Delay destroy to avoid dead lock.
@@ -210,17 +223,18 @@ public:
                     // thread just before we lock mMutex. We can't infer that the observer is stale from the fact that
                     // obj is destroyed, because shared_ptr ref-count checking and observer removing are not in one
                     // atomic operation, and the observer may be changed to observe another instance.
-                    if (mObservers.find(key) == mObservers.end())
+                    auto it = mObservers->find(key);
+                    if (it == mObservers->end())
                     {
                         return;
                     }
-                    observedObjHolder = mObservers.at(key).lock();
+                    observedObjHolder = it->second.lock();
                     if (observedObjHolder == nullptr)
                     {
-                        mObservers.erase(key);
+                        mObservers->erase(it);
                     }
                 }};
-            mObservers.at(key) = result;
+            (*mObservers)[key] = result;
         }
         else
         {
@@ -235,7 +249,7 @@ private:
     mutable std::mutex mMutex;
     // CUDA resources are per-context and per-thread.
     using CacheKey = std::tuple<CUcontext, std::thread::id>;
-    std::unordered_map<CacheKey, std::weak_ptr<T>, hash<CacheKey>> mObservers;
+    std::unordered_map<CacheKey, std::weak_ptr<T>, hash<CacheKey>>* mObservers;
 };
 
 } // namespace
@@ -253,6 +267,7 @@ std::shared_ptr<cublasHandle_t> getCublasHandle()
         {
             TLLM_CUDA_CHECK(cublasDestroy(*handle));
             delete handle;
+            handle = nullptr;
         });
     return creator();
 }
@@ -270,6 +285,7 @@ std::shared_ptr<cublasLtHandle_t> getCublasLtHandle()
         {
             TLLM_CUDA_CHECK(cublasLtDestroy(*handle));
             delete handle;
+            handle = nullptr;
         });
     return creator();
 }
