@@ -1289,8 +1289,7 @@ def run_disaggregated_benchmark(example_dir,
                                 random_input_len=16,
                                 random_output_len=64,
                                 num_prompts=100,
-                                max_concurrency=32,
-                                skip_warmup=False):
+                                max_concurrency=32):
     """Run disaggregated test with given configuration."""
     run_env = env.copy()
     run_env["UCX_TLS"] = "^ib"
@@ -1320,7 +1319,7 @@ def run_disaggregated_benchmark(example_dir,
                       stderr=subprocess.STDOUT,
                       env=run_env,
                       cwd=cwd) as server_proc):
-            # Ensure the sever has started
+
             client_dir = f"{example_dir}/clients"
             client_cmd = [
                 'python3', f'{client_dir}/disagg_client.py', '-c',
@@ -1329,7 +1328,7 @@ def run_disaggregated_benchmark(example_dir,
                 '--server-start-timeout',
                 str(server_start_timeout)
             ]
-            # Warm up
+            # Ensure the sever has started and workers are ready
             check_call(client_cmd,
                        env=env,
                        poll_procs=[workers_proc, server_proc])
@@ -1366,9 +1365,6 @@ def run_disaggregated_benchmark(example_dir,
                 '--percentile-metrics',
                 'e2el,ttft',
             ]
-            # warm up
-            if not skip_warmup:
-                check_call(benchmark_cmd, env=env)
             output = check_output(benchmark_cmd, env=env)
             e2el_pattern = r"Median E2EL \(ms\):\s*(\d+\.?\d*)"
             ttft_pattern = r"Median TTFT \(ms\):\s*(\d+\.?\d*)"
@@ -1513,8 +1509,7 @@ def test_disaggregated_deepseek_v3_lite_bf16_empty_batch(
         num_prompts=10,
         max_concurrency=10,
         random_input_len=384,
-        random_output_len=1536,
-        skip_warmup=True)
+        random_output_len=1536)
     print(f"E2EL: {e2el} ms, TTFT: {ttft} ms")
 
     assert e2el > 0 and ttft > 0
