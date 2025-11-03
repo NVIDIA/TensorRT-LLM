@@ -1,34 +1,11 @@
 import contextlib
 import math
-from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Optional
 
 import torch
 
 from tensorrt_llm.logger import logger
-
-
-def get_smallest_key_greater_than(ordered_dict, target_value):
-    """
-    Return (k, ordered_dict[k]) where k is the smallest key with k >= target_value,
-    or (None, None) if not found.
-    """
-    min_key = min((k for k in ordered_dict.keys() if k >= target_value),
-                  default=None)
-    return (min_key, ordered_dict[min_key]) if min_key is not None else (None,
-                                                                         None)
-
-
-def get_biggest_key_smaller_than(ordered_dict, target_value):
-    """
-    Return (k, ordered_dict[k]) where k is the largest key with k < target_value,
-    or (None, None) if not found.
-    """
-    max_key = max((k for k in ordered_dict.keys() if k < target_value),
-                  default=None)
-    return (max_key, ordered_dict[max_key]) if max_key is not None else (None,
-                                                                         None)
 
 
 def get_size_in_byte(target_shape: list[int], target_dtype: torch.dtype):
@@ -57,8 +34,6 @@ class Buffers:
 
     def __init__(self):
         self.buffers: dict[str, list[BufferBlock]] = {}
-        self.managed_buffers = OrderedDict()
-        self.max_buffer_concurrency = 0
 
     @staticmethod
     def _view_as(buffer: torch.Tensor, target_shape: list[int],
@@ -74,47 +49,11 @@ class Buffers:
         return buffer[:required_memory_size].view(target_dtype).view(
             target_shape)
 
-    def _get_managed_buffer(self, required_memory_size: int):
-        size, buffer = get_smallest_key_greater_than(self.managed_buffers,
-                                                     required_memory_size)
-
-        if size is not None and buffer is not None:
-            return buffer
-
-        size_1, buffer_1 = get_biggest_key_smaller_than(self.managed_buffers,
-                                                        required_memory_size)
-        if size_1 is not None and buffer is not None:
-            del self.managed_buffers[size_1]
-
-        new_buffer_tensor = None
-        try:
-            with torch.cuda.memory.use_mem_pool(get_shared_pool()):
-                new_buffer_tensor = torch.zeros((required_memory_size, ),
-                                                device='cuda',
-                                                dtype=torch.uint8)
-        except Exception as ex:
-            # Need to check if this is an OOM exception
-            logger.debug(
-                f"Exception happened to create tensor from given memory pool: {str(ex)}"
-            )
-            # if exception happens during allocating memory from shared pool, retry
-            # to allocate from default pool
-            new_buffer_tensor = torch.zeros((required_memory_size, ),
-                                            device='cuda',
-                                            dtype=torch.uint8)
-
-        self.managed_buffers[required_memory_size] = new_buffer_tensor
-
-        return new_buffer_tensor
-
     def get_buffer(self, tensor_shape: list[int], dtype: torch.dtype,
                    buffer_name: str, reserve_buffer: bool):
 
         # all buffers are allocated with 1 byte element size
         required_memory_size = math.prod(tensor_shape) * dtype.itemsize
-
-        if buffer_name is None or len(buffer_name) == 0:
-            return _get_managed_buffer(required_memory_size)
 
         candidate_blocks = self.buffers.get(buffer_name, [])
 
