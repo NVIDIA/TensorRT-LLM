@@ -28,6 +28,10 @@ from defs.trt_test_alternative import (is_linux, is_windows, print_info,
                                        print_warning)
 
 from ..conftest import get_llm_root, llm_models_root, trt_environment
+from .open_search_db_utils import (add_id, get_history_data, get_job_info,
+                                   post_new_perf_data, prepare_baseline_data,
+                                   prepare_regressive_test_cases,
+                                   print_regressive_test_cases)
 from .pytorch_model_config import get_model_yaml_config
 from .sampler_options_config import get_sampler_options_config
 from .utils import (AbstractPerfScriptTestClass, PerfBenchScriptTestCmds,
@@ -403,6 +407,33 @@ PERF_METRIC_THRESHOLD = {
                                         50),  # Ignore TTFT regression < 50ms
 }
 
+PERF_METRIC_STRING = {
+    PerfMetricType.BUILD_TIME: "build_time",
+    PerfMetricType.INFERENCE_TIME: "mean_e2el",
+    PerfMetricType.MEDIAN_INFERENCE_TIME: "median_e2el",
+    PerfMetricType.P99_INFERENCE_TIME: "p99_e2el",
+    PerfMetricType.FIRST_TOKEN_TIME: "mean_ttft",
+    PerfMetricType.MEDIAN_FIRST_TOKEN_TIME: "median_ttft",
+    PerfMetricType.P99_FIRST_TOKEN_TIME: "p99_ttft",
+    PerfMetricType.OUTPUT_TOKEN_TIME: "mean_tpot",
+    PerfMetricType.MEDIAN_OUTPUT_TOKEN_TIME: "median_tpot",
+    PerfMetricType.P99_OUTPUT_TOKEN_TIME: "p99_tpot",
+    PerfMetricType.INTER_TOKEN_TIME: "mean_itl",
+    PerfMetricType.MEDIAN_INTER_TOKEN_TIME: "median_itl",
+    PerfMetricType.P99_INTER_TOKEN_TIME: "p99_itl",
+    PerfMetricType.SEQ_LATENCY: "seq_latency",
+    PerfMetricType.TOKEN_THROUGHPUT: "token_throughput",
+    PerfMetricType.TOTAL_TOKEN_THROUGHPUT: "total_token_throughput",
+    PerfMetricType.USER_THROUGHPUT: "user_throughput",
+    PerfMetricType.SEQ_THROUGHPUT: "seq_throughput",
+    PerfMetricType.INFERENCE_PEAK_GPU_MEMORY: "inference_peak_gpu_memory",
+    PerfMetricType.BUILD_PEAK_CPU_MEMORY: "build_peak_cpu_memory",
+    PerfMetricType.BUILD_PEAK_GPU_MEMORY: "build_peak_gpu_memory",
+    PerfMetricType.ENGINE_SIZE: "engine_size",
+    PerfMetricType.CONTEXT_GPU_MEMORY: "context_gpu_memory",
+    PerfMetricType.KV_CACHE_SIZE: "kv_cache_size",
+}
+
 BUILDER_METRICS = [
     PerfMetricType.BUILD_TIME, PerfMetricType.BUILD_PEAK_CPU_MEMORY,
     PerfMetricType.BUILD_PEAK_GPU_MEMORY, PerfMetricType.ENGINE_SIZE
@@ -476,6 +507,7 @@ class ServerConfig:
         self,
         name: str,
         model_name: str,
+        gpus: int,
         tp: int,
         ep: int,
         max_num_tokens: int,
@@ -485,7 +517,7 @@ class ServerConfig:
         enable_chunked_prefill: bool = False,
         disable_overlap_scheduler: bool = False,
         moe_backend: str = "",
-        moe_max_num_tokens: str = "",
+        moe_max_num_tokens: int = 0,
         stream_interval: int = 10,
         enable_attention_dp: bool = False,
         attention_dp_balance: bool = False,
@@ -498,6 +530,7 @@ class ServerConfig:
     ):
         self.name = name
         self.model_name = model_name
+        self.gpus = gpus
         self.tp = tp
         self.ep = ep
         self.pp = pp
@@ -531,6 +564,33 @@ class ServerConfig:
             "8000", "--backend", "pytorch", "--extra_llm_api_options",
             config_path
         ]
+
+    def to_db_data(self) -> dict:
+        """Convert ServerConfig to Database data"""
+        return {
+            "s_model_name": self.model_name.lower(),
+            "l_gpus": self.gpus,
+            "l_tp": self.tp,
+            "l_ep": self.ep,
+            "l_pp": self.pp,
+            "l_max_num_tokens": self.max_num_tokens,
+            "b_enable_chunked_prefill": self.enable_chunked_prefill,
+            "b_disable_overlap_scheduler": self.disable_overlap_scheduler,
+            "s_attention_backend": self.attention_backend,
+            "s_moe_backend": self.moe_backend,
+            "l_moe_max_num_tokens": self.moe_max_num_tokens,
+            "l_stream_interval": self.stream_interval,
+            "b_enable_attention_dp": self.enable_attention_dp,
+            "b_attention_dp_balance": self.attention_dp_balance,
+            "l_batching_wait_iters": self.batching_wait_iters,
+            "l_timeout_iters": self.timeout_iters,
+            "s_kv_cache_dtype": self.kv_cache_dtype,
+            "b_enable_block_reuse": self.enable_block_reuse,
+            "d_free_gpu_memory_fraction": self.free_gpu_memory_fraction,
+            "l_max_batch_size": self.max_batch_size,
+            "b_enable_padding": self.enable_padding,
+            "s_server_log_link": "",
+        }
 
     def generate_extra_llm_api_config(self) -> str:
         """Generate extra-llm-api-config.yml content"""
@@ -611,6 +671,17 @@ class ClientConfig:
             str(self.concurrency)
         ]
 
+    def to_db_data(self) -> dict:
+        """Convert ClientConfig to Database data"""
+        return {
+            "l_concurrency": self.concurrency,
+            "l_iterations": self.iterations,
+            "l_isl": self.isl,
+            "l_osl": self.osl,
+            "d_random_range_ratio": self.random_range_ratio,
+            "s_client_log_link": "",
+        }
+
 
 def parse_select_pattern(select_pattern: str):
     """Parse select pattern like 'r1_fp4_dep4,r1_fp4_tep4:con1_iter1_1024_1024,r1_fp4_tep4:con8_iter1_1024_1024'
@@ -687,13 +758,14 @@ def parse_config_file(config_file_path: str, select_pattern: str = None):
         server_config = ServerConfig(
             name=server_config_data['name'],
             model_name=server_config_data['model_name'],
+            gpus=server_config_data['gpus'],
             tp=server_config_data['tp'],
             ep=server_config_data['ep'],
             pp=server_config_data.get('pp', 1),
             attention_backend=server_config_data.get('attention_backend',
                                                      'TRTLLM'),
             moe_backend=server_config_data.get('moe_backend', ''),
-            moe_max_num_tokens=server_config_data.get('moe_max_num_tokens', ''),
+            moe_max_num_tokens=server_config_data.get('moe_max_num_tokens', 0),
             stream_interval=server_config_data.get('stream_interval', 10),
             enable_attention_dp=server_config_data.get('enable_attention_dp',
                                                        False),
@@ -860,7 +932,9 @@ class PerfTestConfig:
         # Used for perf sanity test
         # config_file: YAML path, select_pattern: server/client selection string
         # server_configs: list[ServerConfig], server_client_configs: dict[server_id -> list[ClientConfig]]
+        self.upload_to_db = False
         self.config_file = None
+        self.gpu_type = None
         self.config_path = None
         self.select_pattern = None
         self.server_configs = []
@@ -1069,10 +1143,12 @@ class PerfTestConfig:
         labels = test_param_labels.split("-")
 
         # Used for perf sanity test
-        if labels[0] == "perf_sanity":
+        if "perf_sanity" in labels[0]:
             assert len(labels) > 1, "perf_sanity test must have a config file!"
             self.runtime = "server-benchmark"
+            self.upload_to_db = "upload" in labels[0]
             self.config_file = labels[1]
+            self.gpu_type = labels[1].replace("l0_", "").lower()
             self.config_path = os.path.join(
                 "tests/scripts/perf-sanity", f"{labels[1]}.yaml"
                 if not labels[1].endswith(".yaml") else labels[1])
@@ -1381,6 +1457,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         # This will store the currently running metric.
         self._current_metric = None
         self.lora_dirs = []
+        # This will store each test's result
+        self._test_results = {}
 
     def get_test_name(self) -> str:
         return str(self._config)
@@ -1918,6 +1996,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             #prepare dataset first for trtllm-bench
             print_info(f"Running command for generating dataset")
             outputs = self.run_ex("prepare_dataset",
+                                  None,
                                   llm_venv,
                                   gpu_clock_lock,
                                   session_data_writer,
@@ -1958,6 +2037,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 print_info(f"Running command for {metric.metric_name}")
                 outputs = self.run_ex(
                     metric.metric_name,
+                    metric.metric_type,
                     llm_venv,
                     gpu_clock_lock,
                     session_data_writer,
@@ -1971,6 +2051,11 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 result_states[self._current_cmd_idx] = result_state
                 if result_state != "valid":
                     errors.append(self.get_error())
+                    if self._current_cmd_idx in self._test_results:
+                        del self._test_results[self._current_cmd_idx]
+
+            self.upload_test_results_to_database()
+
         finally:
             # Clean up engine dir after use.
             shutil.rmtree(self._get_engine_dir(), ignore_errors=True)
@@ -1990,6 +2075,69 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
 
             raise RuntimeError(msg)
 
+    def upload_test_results_to_database(self):
+        """
+        Upload the test results and baseline to database.
+        """
+        # Currently only server-benchmark need to store the test result.
+        if self._config.runtime == "server-benchmark":
+            job_config = get_job_info()
+            job_config["s_gpu_type"] = self._config.gpu_type
+            is_post_merge = job_config["b_is_post_merge"]
+            new_data_dict = {}
+            cmd_idx = 0
+            for server_idx, client_configs in self._config.server_client_configs.items(
+            ):
+                server_config = self._config.server_configs[server_idx]
+                server_config_dict = server_config.to_db_data()
+                for client_config in client_configs:
+                    client_config_dict = client_config.to_db_data()
+                    # If cmd_idx not in self._test_results or some metrics missing, skip this cmd_idx
+                    if cmd_idx not in self._test_results or not all(
+                            metric_type in self._test_results[cmd_idx]
+                            for metric_type in SERVER_BENCHMARK_METRICS):
+                        print_info(
+                            f"Skipped posting command {cmd_idx} 's test results since some metrics are missing in test results."
+                        )
+                        cmd_idx += 1
+                        continue
+                    new_data = {}
+                    new_data.update(job_config)
+                    new_data.update(server_config_dict)
+                    new_data.update(client_config_dict)
+                    for metric_type in SERVER_BENCHMARK_METRICS:
+                        new_data[
+                            f"d_{PERF_METRIC_STRING[metric_type]}"] = self._test_results[
+                                cmd_idx][metric_type]
+                    add_id(new_data)
+                    new_data_dict[cmd_idx] = new_data
+                    cmd_idx += 1
+
+            # Get history data for each cmd_idx
+            history_baseline_dict, history_data_dict = get_history_data(
+                new_data_dict)
+            # Prepare regressive test cases
+            regressive_data_list = prepare_regressive_test_cases(
+                history_baseline_dict, new_data_dict)
+
+            if is_post_merge:
+                # Prepare new baseline data for post-merge
+                new_baseline_data_dict = prepare_baseline_data(
+                    history_baseline_dict, history_data_dict, new_data_dict)
+            else:
+                # Pre-merge does not need to upload baseline data
+                new_baseline_data_dict = None
+
+            if self._config.upload_to_db:
+                # Upload the new perf data and baseline data to database
+                post_new_perf_data(new_baseline_data_dict, new_data_dict,
+                                   regressive_data_list)
+
+            # Print regressive test cases
+            print_regressive_test_cases(regressive_data_list)
+        else:
+            return
+
     def _get_engine_dir(self) -> str:
         """
         Get the engine directory to store the engine.
@@ -2002,7 +2150,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         """
         Generate all the metric configs for the current test.
         """
-
         metrics = []
         if self._config.runtime == "server-benchmark":
             cmd_idx = 0
