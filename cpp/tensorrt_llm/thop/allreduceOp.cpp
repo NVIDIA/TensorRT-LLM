@@ -1407,7 +1407,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "mnnvl_fusion_allreduce(Tensor input, Tensor? residual, Tensor? gamma, "
-        "float? epsilon, Tensor comm_buffer, Tensor buffer_flags, bool rmsnorm_fusion) -> "
+        "float? epsilon, Tensor(a!) comm_buffer, Tensor buffer_flags, bool rmsnorm_fusion) -> "
         "Tensor[]");
     m.def(
         "allreduce("
