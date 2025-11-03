@@ -1096,6 +1096,11 @@ class TorchSampler(Sampler):
     def return_log_probs(self, scheduled_requests: ScheduledRequests) -> bool:
         return any(req.py_return_log_probs for req in scheduled_requests.all_requests())
 
+    def _prepare_new_requests(self, requests: list[LlmRequest]) -> None:
+        for req in requests:
+            if (not req.is_finished) and req.is_context_init_state and req.is_last_context_chunk:
+                self.store.finish_reasons[:, req.py_seq_slot].fill_(FinishReason.NOT_FINISHED.value)
+
     @override
     @torch.inference_mode()
     def sample_async(
@@ -1112,6 +1117,7 @@ class TorchSampler(Sampler):
         #     tokens are sampled one-by-one.
 
         requests = scheduled_requests.all_requests()
+        self._prepare_new_requests(requests)
         new_tokens = self.store.new_tokens
         return_log_probs = self.return_log_probs(scheduled_requests)
         seq_slots_host = torch.tensor(
@@ -1512,40 +1518,12 @@ class TorchSampler(Sampler):
             if (r.py_stop_words_list is not None and len(r.py_stop_words_list[0]) > 0)
         ]
 
-    def _write_reason(
-        self,
-        finish_reasons: torch.Tensor,
-        reason: FinishReason,
-        *,
-        where: torch.Tensor,
-        seq_slots: torch.Tensor,
-    ) -> None:
-        """Avoid GPU<->CPU syncs via:
-        ### `nonzero_static` [REF-A], see: https://ianbarber.blog/2024/12/18/nonzero_static-in-pytorch/.
-        - `nonzero` syncs (frontend needs result size)
-        - `nonzero_static` pads with dummy entries (`fill_value`), written into a prealloc buffer (max_num_sequences, 2)
-        - Need to drop padding, but `buffer[buffer!=fill_value]`, `buffer[:count_nonzero]`, `buffer[:sum]` all sync
-
-        ### Hack:
-        1. Use `fill_value=0`, so padding is `[..., [0,0], [0,0]]`.
-        2. Write blindly to `finish_reasons` [REF-B]. Only `[seq_slot[0],0]` might have wrong values written to it,
-           because of the padding entries.
-        3. Save `[seq_slot[0],0]` in `before_write` [REF-C], restore if `where[0][0]` is `False` [REF-D].
-        """
-        assert seq_slots.is_cuda and where.is_cuda
-        assert seq_slots.shape[0] == where.shape[1]
-        first_slot = seq_slots[0].unsqueeze(0)
-        before_write = finish_reasons[0][:].index_select(0, first_slot).squeeze()  # REF-C
-        reason_tensor = self._reason_tensors[reason]
-        buffer = self._finish_reasons_nonzero_static_buffer
-        size = buffer.shape[0]
-        torch.nonzero_static(where, size=size, fill_value=0, out=buffer)  # REF-A
-        r, c = buffer[:, 0], buffer[:, 1]
-        finish_reasons[r, seq_slots[c], BEAM] = reason_tensor  # REF-B
-
-        correct = torch.where(~where[0, 0], before_write, reason_tensor).view(1)
-        assert correct.is_cuda
-        finish_reasons[0, first_slot, BEAM] = correct  # REF-D
+    def _request_indices_with_stop_words(self, requests: list[LlmRequest]) -> torch.Tensor:
+        return [
+            ridx
+            for ridx, r in enumerate(requests)
+            if (r.py_stop_words_list is not None and len(r.py_stop_words_list[0]) > 0)
+        ]
 
     def _write_finish_reasons(
         self,
@@ -1555,36 +1533,46 @@ class TorchSampler(Sampler):
         seq_slots: torch.Tensor,
         new_tokens: torch.Tensor,
     ) -> None:
-        """later _write_reason overwrites earlier, in reverse precedence order"""
+        """later end reason overwrites earlier, in reverse precedence order
+
+        writes the finish reasons to the finish_reasons tensor.
+        Args:
+            requests: the requests to write the finish reasons to
+            finish_reasons: the finish reasons tensor to write to. Shape: (max_tokens, max_batch_size, max_beam_width)
+            seq_slots: the sequence slots of the processed requests. Used to determine where to
+            read and write from the finish_reasons and new_tokens buffers. Shape: (len(requests),)
+            new_tokens: a buffer containing the newly generated tokens.
+            Shape: (max_tokens, max_batch_size, max_beam_width)
+        """
         tokens = new_tokens[:, seq_slots, BEAM]
-        # we need to fill with NOT_FINISHED so we can differentiate between previous requests that had the same seq slot
-        finish_reasons.index_fill_(1, seq_slots, FinishReason.NOT_FINISHED.value)
+
+        # finish reasons is set to NOT FINISHED, when a new request occupies a seq slot
+        batched_finish_reasons = finish_reasons[:, seq_slots, BEAM]
 
         if with_stop_words := self._requests_with_stop_words(requests):
             stop_seq_slots = torch.tensor(
                 [r.py_seq_slot for r in with_stop_words], pin_memory=True
             ).to("cuda", non_blocking=True)
             stop_tokens = new_tokens[:, stop_seq_slots, BEAM]
-            self._write_reason(
-                finish_reasons,
-                FinishReason.STOP_WORDS,
-                where=self._are_stop_words(with_stop_words, stop_tokens),
-                seq_slots=stop_seq_slots,
+            stop_indices = self._request_indices_with_stop_words(requests)
+            batched_finish_reasons[:, stop_indices] = torch.where(
+                self._are_stop_words(with_stop_words, stop_tokens),
+                self._reason_tensors[FinishReason.STOP_WORDS],
+                batched_finish_reasons[:, stop_indices],
             )
 
-        self._write_reason(
-            finish_reasons,
-            FinishReason.LENGTH,
-            where=self._are_max_length(requests),
-            seq_slots=seq_slots,
+        batched_finish_reasons = torch.where(
+            self._are_max_length(requests),
+            self._reason_tensors[FinishReason.LENGTH],
+            batched_finish_reasons,
+        )
+        batched_finish_reasons = torch.where(
+            self._are_end_id(requests, tokens),
+            self._reason_tensors[FinishReason.END_ID],
+            batched_finish_reasons,
         )
 
-        self._write_reason(
-            finish_reasons,
-            FinishReason.END_ID,
-            where=self._are_end_id(requests, tokens),
-            seq_slots=seq_slots,
-        )
+        finish_reasons[:, seq_slots, BEAM] = batched_finish_reasons
 
     def _are_end_id(self, requests: list[LlmRequest], tokens: torch.Tensor) -> torch.Tensor:
         end_ids_tensor = torch.tensor(
@@ -1671,11 +1659,10 @@ class TorchSampler(Sampler):
             words_device = words.to("cuda", non_blocking=True)
 
             draft_token_length = get_draft_token_length(request)
-            for step, step_seq in enumerate(new_tokens[:draft_token_length]):
+            for step, step_seq in enumerate(new_tokens[: max_len + draft_token_length + 1]):
+                size_per_step = step_seq.size(0) - draft_token_length + step
                 for word, L in zip(words_device, lens_device):
-                    truncated_seq = step_seq[
-                        -(L + draft_token_length - step) : -(draft_token_length - step)
-                    ]
+                    truncated_seq = step_seq[size_per_step - L : size_per_step]
                     if torch.equal(truncated_seq, word[:L]):
                         # We don't care about subsequent steps because we already found a stop word match
                         return step

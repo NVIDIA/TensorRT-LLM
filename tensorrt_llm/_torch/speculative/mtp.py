@@ -13,7 +13,7 @@ from ..model_config import ModelConfig
 from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
-from ..pyexecutor.sampler import (BEAM, MAX_BEAM_WIDTH, Sampler, SampleState,
+from ..pyexecutor.sampler import (BEAM, MAX_BEAM_WIDTH, SampleState,
                                   SampleStateTensors, TorchSampler, add_token,
                                   int_tensor)
 from ..pyexecutor.scheduler import ScheduledRequests
@@ -210,7 +210,7 @@ class MTPSpecMetadata(SpecMetadata):
             self.slot_ids[:num_seqs].copy_(mtp_slot_ids, non_blocking=True)
 
 
-class MTPSampler(Sampler):
+class MTPSampler(TorchSampler):
     """
     MTP sampler.
     """
@@ -224,6 +224,10 @@ class MTPSampler(Sampler):
         next_draft_tokens: torch.Tensor
         new_tokens_lens: torch.Tensor
         max_total_draft_tokens: torch.Tensor
+        finish_reasons: None = None  # Necessary to satisfy the interface of TorchSampler.Store
+
+        def __post_init__(self):
+            pass  # finish_reasons has no size to compare against new_tokens in MTPSampler
 
     def __init__(self, args: TorchSampler.Args, *, nextn: int):
         self.mapping = None
