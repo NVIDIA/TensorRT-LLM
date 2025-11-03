@@ -557,18 +557,18 @@ class TestMoEAlltoAll:
                         reason='needs at least 8 GPUs to run multi-GPU test')
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize(
-        "mpi_pool_executor,all_num_tokens,top_k,dtype",
+        "mpi_pool_executor,all_num_tokens,top_k",
         [
-            # (num_workers, all_num_tokens, top_k, dtype)
-            (4, [32, 32, 32, 32], 2, torch.float32),
-            (4, [16, 32, 64, 48], 2, torch.float32),
-            (2, [100, 50], 2, torch.float16),
-            (4, [32, 32, 32, 32], 4, torch.float32),
-            (4, [1, 1, 1, 1], 2, torch.float32),
-            (8, [640, 640, 640, 640, 640, 640, 640, 640], 4, torch.bfloat16),
+            # (num_workers, all_num_tokens, top_k)
+            (4, [32, 32, 32, 32], 2),
+            (4, [16, 32, 64, 48], 2),
+            (2, [100, 50], 2),
+            (4, [32, 32, 32, 32], 4),
+            (4, [1, 1, 1, 1], 2),
+            (8, [640, 640, 640, 640, 640, 640, 640, 640], 4),
         ],
         indirect=["mpi_pool_executor"])
-    def test_combine(self, mpi_pool_executor, all_num_tokens, top_k, dtype):
+    def test_combine(self, mpi_pool_executor, all_num_tokens, top_k):
         """Test MoE A2A combine with MNNVL across multiple GPUs"""
 
         try:
@@ -586,7 +586,6 @@ class TestMoEAlltoAll:
 
         hidden_size = 2880  # gpt-oss
         num_experts_per_rank = 8
-        max(all_num_tokens)
 
         # Large enough workspace
         workspace_size_per_rank = 512 * 1024 * 1024
@@ -597,7 +596,7 @@ class TestMoEAlltoAll:
         results = mpi_pool_executor.map(
             run_moe_a2a_dispatch_moe_combine_single_rank,
             *zip(*[(ep_size, all_num_tokens, top_k, workspace_size_per_rank,
-                    num_experts_per_rank, hidden_size, dtype,
+                    num_experts_per_rank, hidden_size,
                     invalid_token_expert_id)] * ep_size),
         )
 
@@ -622,7 +621,7 @@ class TestMoEAlltoAll:
 def run_moe_a2a_dispatch_moe_combine_single_rank(ep_size, all_num_tokens, top_k,
                                                  workspace_size_per_rank,
                                                  num_experts_per_rank,
-                                                 hidden_size, dtype,
+                                                 hidden_size,
                                                  invalid_token_expert_id):
     """Worker function for dispatch and combine test."""
     rank = tllm.mpi_rank()
