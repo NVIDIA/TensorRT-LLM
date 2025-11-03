@@ -1,0 +1,768 @@
+
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Backend性能对比报告 - DEFAULT vs UCX</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 1600px;
+            margin: 0 auto;
+            background-color: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            border-bottom: 3px solid #4CAF50;
+            padding-bottom: 10px;
+        }
+        .summary {
+            display: flex;
+            justify-content: space-around;
+            margin: 30px 0;
+        }
+        .summary-box {
+            flex: 1;
+            margin: 0 10px;
+            padding: 20px;
+            border-radius: 8px;
+            text-align: center;
+            color: white;
+        }
+        .summary-box.total {
+            background-color: #2196F3;
+        }
+        .summary-box.pass {
+            background-color: #4CAF50;
+        }
+        .summary-box.fail {
+            background-color: #f44336;
+        }
+        .summary-box h2 {
+            margin: 0;
+            font-size: 36px;
+        }
+        .summary-box p {
+            margin: 5px 0 0 0;
+            font-size: 14px;
+        }
+        .info {
+            background-color: #e3f2fd;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+        }
+        .warning-box {
+            background-color: #fff3e0;
+            border-left: 4px solid #ff9800;
+            padding: 15px;
+            margin-bottom: 20px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+            font-size: 14px;
+        }
+        th {
+            background-color: #4CAF50;
+            color: white;
+            padding: 12px;
+            text-align: left;
+            position: sticky;
+            top: 0;
+        }
+        td {
+            padding: 10px;
+            border-bottom: 1px solid #ddd;
+        }
+        tr:hover {
+            background-color: #f5f5f5;
+        }
+        .status-pass {
+            background-color: #4CAF50;
+            color: white;
+            padding: 5px 10px;
+            border-radius: 4px;
+            font-weight: bold;
+        }
+        .status-fail {
+            background-color: #f44336;
+            color: white;
+            padding: 5px 10px;
+            border-radius: 4px;
+            font-weight: bold;
+        }
+        .metric-type {
+            background-color: #2196F3;
+            color: white;
+            padding: 3px 8px;
+            border-radius: 3px;
+            font-size: 12px;
+        }
+        .regression {
+            color: #f44336;
+            font-weight: bold;
+        }
+        .improvement {
+            color: #4CAF50;
+            font-weight: bold;
+        }
+        .neutral {
+            color: #666;
+        }
+        .test-name {
+            font-family: monospace;
+            font-size: 12px;
+            word-break: break-all;
+        }
+        .footer {
+            margin-top: 30px;
+            text-align: center;
+            color: #666;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔍 Backend性能对比报告: DEFAULT (NIXL) vs UCX</h1>
+        
+        <div class="info">
+            <strong>DEFAULT Backend:</strong> NIXL
+            <br>
+            <strong>对比Backend:</strong> UCX
+            <br>
+            <strong>阈值设置:</strong> 5.0%
+            <br>
+            <strong>说明:</strong> 只关注DEFAULT比UCX慢的情况。性能退化超过阈值时标记为Fail
+        </div>
+        
+        <div class="warning-box">
+            <strong>⚠️ 注意:</strong> 
+            <ul style="margin: 5px 0;">
+                <li>✅ <strong>Pass</strong>: DEFAULT性能与UCX接近，或比UCX更好</li>
+                <li>❌ <strong>Fail</strong>: DEFAULT比UCX慢超过5.0%（性能退化）</li>
+                <li>📊 正值表示DEFAULT比UCX慢，负值表示DEFAULT比UCX快</li>
+            </ul>
+        </div>
+        
+        <div class="summary">
+            <div class="summary-box total">
+                <h2>52</h2>
+                <p>总测试数</p>
+            </div>
+            <div class="summary-box pass">
+                <h2>29</h2>
+                <p>通过</p>
+            </div>
+            <div class="summary-box fail">
+                <h2>23</h2>
+                <p>性能退化</p>
+            </div>
+        </div>
+        
+        <table>
+            <thead>
+                <tr>
+                    <th style="width: 22%;">DEFAULT (NIXL)</th>
+                    <th style="width: 22%;">UCX</th>
+                    <th style="width: 10%;">指标类型</th>
+                    <th style="width: 10%;">DEFAULT值</th>
+                    <th style="width: 10%;">UCX值</th>
+                    <th style="width: 8%;">差异(%)</th>
+                    <th style="width: 10%;">退化/提升(%)</th>
+                    <th style="width: 8%;">状态</th>
+                </tr>
+            </thead>
+            <tbody>
+                
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_dep:32_bs:32_mtp:0_ccbackend:NIXL]_con:1075</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_dep:32_bs:32_mtp:0_ccbackend:UCX]_con:1075</td>
+                    <td><span class="metric-type">DISAGG_SERVER_E2EL</span></td>
+                    <td>21084.77</td>
+                    <td>20692.44</td>
+                    <td>1.90%</td>
+                    <td class="regression">+1.90%</td>
+                    <td><span class="status-pass">Pass</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_dep:32_bs:32_mtp:0_ccbackend:NIXL]_con:1075</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_dep:32_bs:32_mtp:0_ccbackend:UCX]_con:1075</td>
+                    <td><span class="metric-type">DISAGG_SERVER_TTFT</span></td>
+                    <td>1038.87</td>
+                    <td>878.79</td>
+                    <td>18.22%</td>
+                    <td class="regression">+18.22%</td>
+                    <td><span class="status-fail">Fail</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:144</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:144</td>
+                    <td><span class="metric-type">DISAGG_SERVER_E2EL</span></td>
+                    <td>14370.38</td>
+                    <td>14253.39</td>
+                    <td>0.82%</td>
+                    <td class="regression">+0.82%</td>
+                    <td><span class="status-pass">Pass</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:144</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:144</td>
+                    <td><span class="metric-type">DISAGG_SERVER_TTFT</span></td>
+                    <td>1022.05</td>
+                    <td>1258.20</td>
+                    <td>18.77%</td>
+                    <td class="improvement">-18.77%</td>
+                    <td><span class="status-pass">Pass</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:16</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:16</td>
+                    <td><span class="metric-type">DISAGG_SERVER_E2EL</span></td>
+                    <td>8909.28</td>
+                    <td>8724.92</td>
+                    <td>2.11%</td>
+                    <td class="regression">+2.11%</td>
+                    <td><span class="status-pass">Pass</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:16</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:16</td>
+                    <td><span class="metric-type">DISAGG_SERVER_TTFT</span></td>
+                    <td>144.30</td>
+                    <td>140.83</td>
+                    <td>2.46%</td>
+                    <td class="regression">+2.46%</td>
+                    <td><span class="status-pass">Pass</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:32</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:32</td>
+                    <td><span class="metric-type">DISAGG_SERVER_E2EL</span></td>
+                    <td>10011.83</td>
+                    <td>9970.68</td>
+                    <td>0.41%</td>
+                    <td class="regression">+0.41%</td>
+                    <td><span class="status-pass">Pass</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:32</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:32</td>
+                    <td><span class="metric-type">DISAGG_SERVER_TTFT</span></td>
+                    <td>155.71</td>
+                    <td>150.72</td>
+                    <td>3.31%</td>
+                    <td class="regression">+3.31%</td>
+                    <td><span class="status-pass">Pass</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:4</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:4</td>
+                    <td><span class="metric-type">DISAGG_SERVER_E2EL</span></td>
+                    <td>7582.20</td>
+                    <td>7046.52</td>
+                    <td>7.60%</td>
+                    <td class="regression">+7.60%</td>
+                    <td><span class="status-fail">Fail</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:4</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:4</td>
+                    <td><span class="metric-type">DISAGG_SERVER_TTFT</span></td>
+                    <td>213.40</td>
+                    <td>215.67</td>
+                    <td>1.05%</td>
+                    <td class="improvement">-1.05%</td>
+                    <td><span class="status-pass">Pass</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:64</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:64</td>
+                    <td><span class="metric-type">DISAGG_SERVER_E2EL</span></td>
+                    <td>11710.77</td>
+                    <td>11793.41</td>
+                    <td>0.70%</td>
+                    <td class="improvement">-0.70%</td>
+                    <td><span class="status-pass">Pass</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:64</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:64</td>
+                    <td><span class="metric-type">DISAGG_SERVER_TTFT</span></td>
+                    <td>203.81</td>
+                    <td>192.13</td>
+                    <td>6.08%</td>
+                    <td class="regression">+6.08%</td>
+                    <td><span class="status-fail">Fail</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:8</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:8</td>
+                    <td><span class="metric-type">DISAGG_SERVER_E2EL</span></td>
+                    <td>7938.94</td>
+                    <td>7796.78</td>
+                    <td>1.82%</td>
+                    <td class="regression">+1.82%</td>
+                    <td><span class="status-pass">Pass</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:8</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:8</td>
+                    <td><span class="metric-type">DISAGG_SERVER_TTFT</span></td>
+                    <td>138.13</td>
+                    <td>136.98</td>
+                    <td>0.84%</td>
+                    <td class="regression">+0.84%</td>
+                    <td><span class="status-pass">Pass</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:NIXL]_con:144</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:UCX]_con:144</td>
+                    <td><span class="metric-type">DISAGG_SERVER_E2EL</span></td>
+                    <td>9046.48</td>
+                    <td>7186.69</td>
+                    <td>25.88%</td>
+                    <td class="regression">+25.88%</td>
+                    <td><span class="status-fail">Fail</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:NIXL]_con:144</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:UCX]_con:144</td>
+                    <td><span class="metric-type">DISAGG_SERVER_TTFT</span></td>
+                    <td>921.76</td>
+                    <td>292.46</td>
+                    <td>215.17%</td>
+                    <td class="regression">+215.17%</td>
+                    <td><span class="status-fail">Fail</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:NIXL]_con:16</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:UCX]_con:16</td>
+                    <td><span class="metric-type">DISAGG_SERVER_E2EL</span></td>
+                    <td>5501.29</td>
+                    <td>4555.57</td>
+                    <td>20.76%</td>
+                    <td class="regression">+20.76%</td>
+                    <td><span class="status-fail">Fail</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:NIXL]_con:16</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:UCX]_con:16</td>
+                    <td><span class="metric-type">DISAGG_SERVER_TTFT</span></td>
+                    <td>175.11</td>
+                    <td>186.97</td>
+                    <td>6.34%</td>
+                    <td class="improvement">-6.34%</td>
+                    <td><span class="status-pass">Pass</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:NIXL]_con:32</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:UCX]_con:32</td>
+                    <td><span class="metric-type">DISAGG_SERVER_E2EL</span></td>
+                    <td>6287.30</td>
+                    <td>5320.98</td>
+                    <td>18.16%</td>
+                    <td class="regression">+18.16%</td>
+                    <td><span class="status-fail">Fail</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:NIXL]_con:32</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:UCX]_con:32</td>
+                    <td><span class="metric-type">DISAGG_SERVER_TTFT</span></td>
+                    <td>229.80</td>
+                    <td>202.67</td>
+                    <td>13.39%</td>
+                    <td class="regression">+13.39%</td>
+                    <td><span class="status-fail">Fail</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:NIXL]_con:4</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:UCX]_con:4</td>
+                    <td><span class="metric-type">DISAGG_SERVER_E2EL</span></td>
+                    <td>4370.64</td>
+                    <td>3565.65</td>
+                    <td>22.58%</td>
+                    <td class="regression">+22.58%</td>
+                    <td><span class="status-fail">Fail</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:NIXL]_con:4</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:UCX]_con:4</td>
+                    <td><span class="metric-type">DISAGG_SERVER_TTFT</span></td>
+                    <td>230.35</td>
+                    <td>202.96</td>
+                    <td>13.50%</td>
+                    <td class="regression">+13.50%</td>
+                    <td><span class="status-fail">Fail</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:NIXL]_con:64</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:UCX]_con:64</td>
+                    <td><span class="metric-type">DISAGG_SERVER_E2EL</span></td>
+                    <td>7431.81</td>
+                    <td>6141.21</td>
+                    <td>21.02%</td>
+                    <td class="regression">+21.02%</td>
+                    <td><span class="status-fail">Fail</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:NIXL]_con:64</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:UCX]_con:64</td>
+                    <td><span class="metric-type">DISAGG_SERVER_TTFT</span></td>
+                    <td>247.94</td>
+                    <td>234.78</td>
+                    <td>5.61%</td>
+                    <td class="regression">+5.61%</td>
+                    <td><span class="status-fail">Fail</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:NIXL]_con:8</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:UCX]_con:8</td>
+                    <td><span class="metric-type">DISAGG_SERVER_E2EL</span></td>
+                    <td>4687.83</td>
+                    <td>3849.87</td>
+                    <td>21.77%</td>
+                    <td class="regression">+21.77%</td>
+                    <td><span class="status-fail">Fail</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:NIXL]_con:8</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:UCX]_con:8</td>
+                    <td><span class="metric-type">DISAGG_SERVER_TTFT</span></td>
+                    <td>167.01</td>
+                    <td>161.85</td>
+                    <td>3.19%</td>
+                    <td class="regression">+3.19%</td>
+                    <td><span class="status-pass">Pass</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_dep:16_bs:64_mtp:0_ccbackend:NIXL]_con:1075</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_dep:16_bs:64_mtp:0_ccbackend:UCX]_con:1075</td>
+                    <td><span class="metric-type">DISAGG_SERVER_E2EL</span></td>
+                    <td>28602.00</td>
+                    <td>22521.71</td>
+                    <td>27.00%</td>
+                    <td class="regression">+27.00%</td>
+                    <td><span class="status-fail">Fail</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_dep:16_bs:64_mtp:0_ccbackend:NIXL]_con:1075</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_dep:16_bs:64_mtp:0_ccbackend:UCX]_con:1075</td>
+                    <td><span class="metric-type">DISAGG_SERVER_TTFT</span></td>
+                    <td>1255.12</td>
+                    <td>1122.63</td>
+                    <td>11.80%</td>
+                    <td class="regression">+11.80%</td>
+                    <td><span class="status-fail">Fail</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_dep:32_bs:16_mtp:3_ccbackend:NIXL]_con:538</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_dep:32_bs:16_mtp:3_ccbackend:UCX]_con:538</td>
+                    <td><span class="metric-type">DISAGG_SERVER_E2EL</span></td>
+                    <td>12901.68</td>
+                    <td>12374.40</td>
+                    <td>4.26%</td>
+                    <td class="regression">+4.26%</td>
+                    <td><span class="status-pass">Pass</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_dep:32_bs:16_mtp:3_ccbackend:NIXL]_con:538</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_dep:32_bs:16_mtp:3_ccbackend:UCX]_con:538</td>
+                    <td><span class="metric-type">DISAGG_SERVER_TTFT</span></td>
+                    <td>726.00</td>
+                    <td>703.17</td>
+                    <td>3.25%</td>
+                    <td class="regression">+3.25%</td>
+                    <td><span class="status-pass">Pass</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:NIXL]_con:12</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:UCX]_con:12</td>
+                    <td><span class="metric-type">DISAGG_SERVER_E2EL</span></td>
+                    <td>5569.09</td>
+                    <td>5131.68</td>
+                    <td>8.52%</td>
+                    <td class="regression">+8.52%</td>
+                    <td><span class="status-fail">Fail</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:NIXL]_con:12</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:UCX]_con:12</td>
+                    <td><span class="metric-type">DISAGG_SERVER_TTFT</span></td>
+                    <td>483.62</td>
+                    <td>462.14</td>
+                    <td>4.65%</td>
+                    <td class="regression">+4.65%</td>
+                    <td><span class="status-pass">Pass</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:NIXL]_con:24</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:UCX]_con:24</td>
+                    <td><span class="metric-type">DISAGG_SERVER_E2EL</span></td>
+                    <td>6600.77</td>
+                    <td>6578.41</td>
+                    <td>0.34%</td>
+                    <td class="regression">+0.34%</td>
+                    <td><span class="status-pass">Pass</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:NIXL]_con:24</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:UCX]_con:24</td>
+                    <td><span class="metric-type">DISAGG_SERVER_TTFT</span></td>
+                    <td>576.99</td>
+                    <td>606.17</td>
+                    <td>4.81%</td>
+                    <td class="improvement">-4.81%</td>
+                    <td><span class="status-pass">Pass</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:NIXL]_con:3</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:UCX]_con:3</td>
+                    <td><span class="metric-type">DISAGG_SERVER_E2EL</span></td>
+                    <td>4277.14</td>
+                    <td>4120.18</td>
+                    <td>3.81%</td>
+                    <td class="regression">+3.81%</td>
+                    <td><span class="status-pass">Pass</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:NIXL]_con:3</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:UCX]_con:3</td>
+                    <td><span class="metric-type">DISAGG_SERVER_TTFT</span></td>
+                    <td>375.94</td>
+                    <td>424.60</td>
+                    <td>11.46%</td>
+                    <td class="improvement">-11.46%</td>
+                    <td><span class="status-pass">Pass</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:NIXL]_con:54</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:UCX]_con:54</td>
+                    <td><span class="metric-type">DISAGG_SERVER_E2EL</span></td>
+                    <td>8986.16</td>
+                    <td>8876.53</td>
+                    <td>1.24%</td>
+                    <td class="regression">+1.24%</td>
+                    <td><span class="status-pass">Pass</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:NIXL]_con:54</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:UCX]_con:54</td>
+                    <td><span class="metric-type">DISAGG_SERVER_TTFT</span></td>
+                    <td>1254.10</td>
+                    <td>1706.49</td>
+                    <td>26.51%</td>
+                    <td class="improvement">-26.51%</td>
+                    <td><span class="status-pass">Pass</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:NIXL]_con:6</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:UCX]_con:6</td>
+                    <td><span class="metric-type">DISAGG_SERVER_E2EL</span></td>
+                    <td>4842.67</td>
+                    <td>4440.23</td>
+                    <td>9.06%</td>
+                    <td class="regression">+9.06%</td>
+                    <td><span class="status-fail">Fail</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:NIXL]_con:6</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:UCX]_con:6</td>
+                    <td><span class="metric-type">DISAGG_SERVER_TTFT</span></td>
+                    <td>348.03</td>
+                    <td>364.96</td>
+                    <td>4.64%</td>
+                    <td class="improvement">-4.64%</td>
+                    <td><span class="status-pass">Pass</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:102</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:102</td>
+                    <td><span class="metric-type">DISAGG_SERVER_E2EL</span></td>
+                    <td>15371.44</td>
+                    <td>16031.31</td>
+                    <td>4.12%</td>
+                    <td class="improvement">-4.12%</td>
+                    <td><span class="status-pass">Pass</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:102</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:102</td>
+                    <td><span class="metric-type">DISAGG_SERVER_TTFT</span></td>
+                    <td>3109.88</td>
+                    <td>1919.50</td>
+                    <td>62.02%</td>
+                    <td class="regression">+62.02%</td>
+                    <td><span class="status-fail">Fail</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:12</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:12</td>
+                    <td><span class="metric-type">DISAGG_SERVER_E2EL</span></td>
+                    <td>8297.16</td>
+                    <td>9470.91</td>
+                    <td>12.39%</td>
+                    <td class="improvement">-12.39%</td>
+                    <td><span class="status-pass">Pass</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:12</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:12</td>
+                    <td><span class="metric-type">DISAGG_SERVER_TTFT</span></td>
+                    <td>475.85</td>
+                    <td>368.31</td>
+                    <td>29.20%</td>
+                    <td class="regression">+29.20%</td>
+                    <td><span class="status-fail">Fail</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:24</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:24</td>
+                    <td><span class="metric-type">DISAGG_SERVER_E2EL</span></td>
+                    <td>9336.38</td>
+                    <td>10601.19</td>
+                    <td>11.93%</td>
+                    <td class="improvement">-11.93%</td>
+                    <td><span class="status-pass">Pass</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:24</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:24</td>
+                    <td><span class="metric-type">DISAGG_SERVER_TTFT</span></td>
+                    <td>659.95</td>
+                    <td>483.38</td>
+                    <td>36.53%</td>
+                    <td class="regression">+36.53%</td>
+                    <td><span class="status-fail">Fail</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:3</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:3</td>
+                    <td><span class="metric-type">DISAGG_SERVER_E2EL</span></td>
+                    <td>6704.80</td>
+                    <td>7740.73</td>
+                    <td>13.38%</td>
+                    <td class="improvement">-13.38%</td>
+                    <td><span class="status-pass">Pass</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:3</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:3</td>
+                    <td><span class="metric-type">DISAGG_SERVER_TTFT</span></td>
+                    <td>587.58</td>
+                    <td>508.64</td>
+                    <td>15.52%</td>
+                    <td class="regression">+15.52%</td>
+                    <td><span class="status-fail">Fail</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:48</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:48</td>
+                    <td><span class="metric-type">DISAGG_SERVER_E2EL</span></td>
+                    <td>10951.21</td>
+                    <td>12568.55</td>
+                    <td>12.87%</td>
+                    <td class="improvement">-12.87%</td>
+                    <td><span class="status-pass">Pass</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:48</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:48</td>
+                    <td><span class="metric-type">DISAGG_SERVER_TTFT</span></td>
+                    <td>789.89</td>
+                    <td>604.49</td>
+                    <td>30.67%</td>
+                    <td class="regression">+30.67%</td>
+                    <td><span class="status-fail">Fail</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:6</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:6</td>
+                    <td><span class="metric-type">DISAGG_SERVER_E2EL</span></td>
+                    <td>7004.49</td>
+                    <td>8214.90</td>
+                    <td>14.73%</td>
+                    <td class="improvement">-14.73%</td>
+                    <td><span class="status-pass">Pass</span></td>
+                </tr>
+        
+                <tr>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:6</td>
+                    <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:6</td>
+                    <td><span class="metric-type">DISAGG_SERVER_TTFT</span></td>
+                    <td>426.57</td>
+                    <td>352.70</td>
+                    <td>20.94%</td>
+                    <td class="regression">+20.94%</td>
+                    <td><span class="status-fail">Fail</span></td>
+                </tr>
+        
+            </tbody>
+        </table>
+        
+        <div class="footer">
+            <p>生成时间: 2025-11-03 14:01:20</p>
+        </div>
+    </div>
+</body>
+</html>
