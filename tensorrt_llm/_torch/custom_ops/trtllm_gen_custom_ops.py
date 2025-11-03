@@ -1006,7 +1006,8 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
             self.n_group, self.topk_group, self.intermediate_size, None,
             self.local_expert_offset, self.local_num_experts,
             self.routed_scaling_factor, self.routing_method_type, tactic,
-            args.topk_weights, args.topk_ids)
+            args.topk_weights, args.topk_ids, None
+        )  # TODO: Currently user provided output is only supported in w4a8_mxfp4_mxfp8
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile,
