@@ -80,7 +80,7 @@ void moveIndice(int* sendCountsCumsum, int* recvCountsCumsum, int* sendIndice, i
     int* backwardIndice, int* gatherBackwardIndice, int* recvIndice, int* gatherRecvIndice, int rankId, int rankCount,
     int maxTokenCountPerRank, cudaStream_t stream);
 
-void memsetExpertIds(int* expertIds, int* recvCountsCumsum, int maxTokenCountPerRank, int topK, int slotCount,
+void memsetExpertIds(int* expertIds, int* recvCountsCumsum, int maxTokenCountPerRank, int topK, int invalidExpertId,
     int epSize, cudaStream_t stream);
 
 size_t getMoePrepareWorkspaceSize(int epSize);
