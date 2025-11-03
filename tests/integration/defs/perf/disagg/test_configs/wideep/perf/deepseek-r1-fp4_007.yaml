@@ -17,11 +17,11 @@ slurm:
   numa_bind: true
   dataset_file: datasets/deepseek-r1-8192-1024-200000-ratio-1_for_serve.json
 benchmark:
-  mode: e2e
+  mode: gen_only
   use_nv_sa_benchmark: false
   multi_round: 8
   benchmark_ratio: 0.8
-  streaming: true
+  streaming: false
   concurrency_list: '1075'
 hardware:
   gpus_per_node: 4
@@ -43,6 +43,7 @@ profiling:
 worker_config:
   eplb_num_slots: 0
   gen:
+    enable_layerwise_nvtx_marker: true
     tensor_parallel_size: 16
     moe_expert_parallel_size: 16
     enable_attention_dp: true
@@ -84,6 +85,7 @@ worker_config:
     stream_interval: 20
     num_postprocess_workers: 4
   ctx:
+    enable_layerwise_nvtx_marker: true
     max_batch_size: 1
     max_num_tokens: 8448
     max_seq_len: 8395
