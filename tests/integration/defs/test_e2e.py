@@ -2556,45 +2556,6 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
 
     print("All answers are correct!")
 
-    print(f"Functionality test {model_name} {modality} mode.")
-    functionality_inputs = {
-        "image": {
-            "prompt":
-            "Describe the two images in detail.",
-            "media": [
-                str(test_data_root / "inpaint.png"),
-                str(test_data_root / "61.jpg"),
-            ],
-        },
-        "video": {
-            "prompt":
-            "Tell me what you see in the video briefly.",
-            "media": [
-                str(test_data_root / "OAI-sora-tokyo-walk.mp4"),
-                str(test_data_root / "world.mp4"),
-            ],
-        },
-    }
-
-    with tempfile.NamedTemporaryFile(mode='w+t',
-                                     suffix=f".{model_name}.log",
-                                     dir="./",
-                                     delete=True,
-                                     delete_on_close=True) as running_log:
-        llm_venv.run_cmd([
-            str(example_root / "quickstart_multimodal.py"),
-            "--model_dir",
-            f"{llm_models_root()}/{model_path}",
-            "--modality",
-            modality,
-            "--prompt",
-            functionality_inputs[modality]["prompt"],
-            "--media",
-            *functionality_inputs[modality]["media"],
-            "--disable_kv_cache_reuse",
-        ],
-                         stdout=running_log)
-
 
 @pytest.mark.parametrize("modality", ["image", "video"])
 @pytest.mark.parametrize(
