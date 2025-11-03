@@ -1896,16 +1896,20 @@ def generateRerunReport(stageName, llmSrc) {
     def rerunBaseDir = "${WORKSPACE}/${stageName}/rerun"
     def regularRerunDir = "${rerunBaseDir}/regular"
 
-    // Check if regular rerun directory exists
-    def hasRegularReruns = sh(script: "[ -d '${regularRerunDir}' ] && echo 'true' || echo 'false'", returnStdout: true).trim() == 'true'
+    // Check if regular rerun directory has rerun_results_*.xml files
+    def hasRegularReruns = sh(script: "[ -d '${regularRerunDir}' ] && find '${regularRerunDir}' -name 'rerun_results_*.xml' | head -1 | grep -q . && echo 'true' || echo 'false'", returnStdout: true).trim() == 'true'
 
-    // Find all isolated rerun directories (isolated_0, isolated_1, etc.)
+    // Check if any isolated rerun directories have rerun_results_*.xml files
+    def hasIsolatedReruns = sh(script: "find ${rerunBaseDir} -type d -name 'isolated_*' -exec find {} -name 'rerun_results_*.xml' \\; 2>/dev/null | head -1 | grep -q . && echo 'true' || echo 'false'", returnStdout: true).trim() == 'true'
+
+    // Find all isolated rerun directories for later use (only if we have isolated reruns)
     def isolatedRerunDirs = []
-    def isolatedDirsOutput = sh(script: "find ${rerunBaseDir} -type d -name 'isolated_*' 2>/dev/null || true", returnStdout: true).trim()
-    if (isolatedDirsOutput) {
-        isolatedRerunDirs = isolatedDirsOutput.split('\n').findAll { it.trim() }
+    if (hasIsolatedReruns) {
+        def isolatedDirsOutput = sh(script: "find ${rerunBaseDir} -type d -name 'isolated_*' 2>/dev/null || true", returnStdout: true).trim()
+        if (isolatedDirsOutput) {
+            isolatedRerunDirs = isolatedDirsOutput.split('\n').findAll { it.trim() }
+        }
     }
-    def hasIsolatedReruns = isolatedRerunDirs.size() > 0
 
     echo "Found regular reruns: ${hasRegularReruns}"
     echo "Found isolated rerun directories: ${isolatedRerunDirs}"
