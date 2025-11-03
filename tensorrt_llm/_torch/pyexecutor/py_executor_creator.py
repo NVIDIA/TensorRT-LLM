@@ -279,7 +279,6 @@ def create_py_executor(
     if mm_encoder_only:
         # TODO(qijun): clean up pytorch_backend_config later
         pytorch_backend_config.mm_encoder_only = True
-        pytorch_backend_config.load_format = LoadFormat.VISION_ONLY
         # Disable overlap scheduler for multimodal encoder-only mode
         logger.warning(
             "Disabling overlap scheduler for multimodal encoder-only mode. "

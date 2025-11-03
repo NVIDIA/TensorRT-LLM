@@ -320,8 +320,8 @@ class LlavaNextVisionModel(nn.Module):
                     result[new_key] = weight
             return result
 
-        vision_model_weights = filter_weights("vision_tower.", weights)
-        self.vision_model.load_weights(vision_model_weights)
+        visual_model_weights = filter_weights("vision_tower.", weights)
+        self.vision_model.load_weights(visual_model_weights)
         mm_projector_weights = filter_weights("multi_modal_projector.", weights)
         self.mm_projector.load_state_dict(mm_projector_weights, strict=True)
         self.image_newline.data.copy_(weights["image_newline"])
@@ -439,7 +439,6 @@ class LlavaNextVisionModel(nn.Module):
             for multimodal_param in multimodal_params
         ]
         pixel_values = self._pad_for_batching(pixel_values)
-
         pixel_values = torch.cat(pixel_values, dim=0)
         image_sizes = torch.cat(image_sizes, dim=0)
 
@@ -520,25 +519,23 @@ class LlavaNextModel(PreTrainedModel):
         if isinstance(weight_mapper, LlavaNextHfWeightMapper):
             weights = weight_mapper.preprocess_weights(weights)
 
-        def divide_weights(weights: Dict):
-            language_model_weights = {}
-            vision_model_weights = {}
+        self.mm_encoder.load_weights(weights)
+
+        def filter_weights(weights: Dict):
+            transformed_weights = {}
             for key, weight in weights.items():
                 if key.startswith("language_model."):
                     if isinstance(weight_mapper, LlavaNextHfWeightMapper):
                         new_key = "model." + key[len("language_model."):]
                     else:
                         new_key = key[len("language_model."):]
-                    language_model_weights[new_key] = weight
+                    transformed_weights[new_key] = weight
                 elif key.startswith("lm_head."):
-                    language_model_weights[key] = weight
-                else:
-                    vision_model_weights[key] = weight
-            return language_model_weights, vision_model_weights
+                    transformed_weights[key] = weight
+            return transformed_weights
 
-        language_model_weights, vision_model_weights = divide_weights(weights)
-        self.mm_encoder.load_weights(vision_model_weights)
-        self.llm.load_weights(language_model_weights, weight_mapper)
+        language_model_weights = filter_weights(weights)
+        self.llm.load_weights(language_model_weights)
 
     def post_config(self):
         self.config = self.llm.config
