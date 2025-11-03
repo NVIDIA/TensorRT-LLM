@@ -23,7 +23,7 @@ def get_max_num_permuted_tokens(
 @pytest.mark.parametrize("num_tokens", [128, 515, 1024, 8192])
 def test_moe_sort(num_tokens: int, top_k: int, tile_size: int):
     num_experts = 256
-    local_num_experts = 256 // 32
+    num_local_experts = 256 // 32
 
     routing_logits = torch.randn(num_tokens, num_experts, device="cuda")
     token_final_scales, token_selected_experts = routing_logits.topk(top_k, dim=-1)
@@ -45,30 +45,33 @@ def test_moe_sort(num_tokens: int, top_k: int, tile_size: int):
         n_group=1,
         topk_group=1,
         local_expert_offset=0,
-        local_num_experts=local_num_experts,
+        local_num_experts=num_local_experts,
         routed_scaling_factor=1.0,
         tile_tokens_dim=tile_size,
         routing_method_type=RoutingMethodType.DeepSeekV3,
     )
 
-    num_tokens_per_expert = torch.bincount(token_selected_experts.flatten(), minlength=num_experts)[
-        :local_num_experts
-    ]
+    num_tokens_per_expert = torch.bincount(token_selected_experts.flatten(), minlength=num_experts)
+    num_tokens_per_expert = num_tokens_per_expert[:num_local_experts]
     num_tiles_per_expert = (num_tokens_per_expert + tile_size - 1) // tile_size
     num_tokens_per_expert = num_tokens_per_expert.cpu()
     num_tiles_per_expert = num_tiles_per_expert.cpu()
 
-    max_num_tiles = get_max_num_tiles(num_tokens, top_k, tile_size, num_experts)
+    max_num_tiles = get_max_num_tiles(num_tokens, top_k, tile_size, num_local_experts)
     num_valid_tiles = num_tiles_per_expert.sum().item()
-    max_num_permuted_tokens = get_max_num_permuted_tokens(num_tokens, top_k, tile_size, num_experts)
+    max_num_permuted_tokens = get_max_num_permuted_tokens(
+        num_tokens, top_k, tile_size, num_local_experts
+    )
     num_valid_permuted_tokens = num_tiles_per_expert.sum().item() * tile_size
+    assert num_valid_tiles <= max_num_tiles
+    assert num_valid_permuted_tokens <= max_num_permuted_tokens
 
     tile_idx_to_batch_idx = tile_idx_to_batch_idx.cpu()
     tile_idx_to_mn_limit = tile_idx_to_mn_limit.cpu()
     assert tile_idx_to_batch_idx.size() == (max_num_tiles,)
     assert tile_idx_to_mn_limit.size() == (max_num_tiles,)
     tile_idx = 0
-    for expert_idx in range(local_num_experts):
+    for expert_idx in range(num_local_experts):
         num_remaining_tokens = num_tokens_per_expert[expert_idx].item()
         for i in range(num_tiles_per_expert[expert_idx].item()):
             mn_limit = tile_idx * tile_size
@@ -93,7 +96,7 @@ def test_moe_sort(num_tokens: int, top_k: int, tile_size: int):
             expert_idx = token_selected_experts[i, k].item()
             expanded_idx = i * top_k + k
             permuted_idx = expanded_idx_to_permuted_idx[i, k].item()
-            if expert_idx >= local_num_experts:
+            if expert_idx >= num_local_experts:
                 assert permuted_idx == -1
             else:
                 assert permuted_idx >= 0
