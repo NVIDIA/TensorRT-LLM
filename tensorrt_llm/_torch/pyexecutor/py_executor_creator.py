@@ -287,7 +287,6 @@ def create_py_executor(
         pytorch_backend_config.disable_overlap_scheduler = True
 
         llm_args.mm_encoder_only = True
-        llm_args.load_format = LoadFormat.VISION_ONLY
         llm_args.disable_overlap_scheduler = True
 
     mapping = _get_mapping(llm_args.parallel_config.to_mapping())
