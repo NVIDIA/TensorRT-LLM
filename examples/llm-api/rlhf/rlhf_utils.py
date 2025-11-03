@@ -71,3 +71,13 @@ class WorkerExtension:
         except Exception as e:
             logger.error(f"Encountered an error in update_weights")
             raise e
+
+    def check_weights_updated(self):
+        """
+        Check if the weights are updated to 0.
+        """
+        weights_updated = True
+        for name, p in self.engine.model_engine.model.named_parameters():
+            weights_updated = weights_updated and torch.allclose(
+                p, torch.zeros_like(p))
+        return weights_updated
