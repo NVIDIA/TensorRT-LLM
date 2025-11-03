@@ -314,7 +314,6 @@ class TRTLLMGenFusedMoE(MoE):
     ) -> torch.Tensor:
 
         assert x.dtype == torch.bfloat16
-
         # DeepSeekV3 style routing
         if isinstance(self.routing_method, DeepSeekV3MoeRoutingMethod):
             top_k = self.routing_method.routing_impl.top_k
