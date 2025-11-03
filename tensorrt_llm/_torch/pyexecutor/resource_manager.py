@@ -172,6 +172,9 @@ class KVCacheManager(BaseResourceManager):
         max_beam_width: int = 1,
         is_draft: bool = False,
         kv_connector_manager: Optional[KvCacheConnectorManager] = None,
+        enable_indexer_k_cache: bool = False,
+        indexer_k_cache_quant_block_size: int = 128,
+        indexer_k_cache_index_head_dim: int = 0,
         **kwargs,
     ) -> None:
         self.mapping = mapping
@@ -344,6 +347,10 @@ class KVCacheManager(BaseResourceManager):
             'enable_partial_reuse': kv_cache_config.enable_partial_reuse,
             'copy_on_partial_reuse': kv_cache_config.copy_on_partial_reuse,
             'kv_connector_manager': self.kv_connector_manager,
+            'enable_indexer_k_cache': enable_indexer_k_cache,
+            'indexer_k_cache_quant_block_size':
+            indexer_k_cache_quant_block_size,
+            'indexer_k_cache_index_head_dim': indexer_k_cache_index_head_dim
         }
 
         if self.event_buffer_max_size > 0:
@@ -816,6 +823,10 @@ class KVCacheManager(BaseResourceManager):
             self.num_kv_heads_per_layer[layer_offset],
             self.head_dim,
         )
+
+    def get_indexer_k_cache_pool_data(self, layer_idx: int) -> torch.Tensor:
+        result = self.impl.get_indexer_k_cache_pool_data(layer_idx)
+        return result.view(result.shape[0], -1)
 
     def get_unique_primary_pool(self) -> torch.Tensor:
         return self.impl.get_unique_primary_pool()

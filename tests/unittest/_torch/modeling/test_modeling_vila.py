@@ -4,6 +4,7 @@ from typing import Any
 
 import torch
 from parameterized import parameterized
+from utils.llm_data import llm_models_root
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
@@ -16,7 +17,7 @@ from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
 VILA_1_5_3B_CONFIG = {
-    "_name_or_path": "Efficient-Large-Model/VILA1.5-3b",
+    "_name_or_path": f"{llm_models_root()}/vila/VILA1.5-3b",
     "architectures": ["LlavaLlamaModel"],
     "drop_path_rate": 0.0,
     "hidden_size": 2560,
@@ -263,7 +264,7 @@ VILA_1_5_3B_CONFIG = {
 
 NVILA_8B_CONFIG = {
     "_attn_implementation_autoset": True,
-    "_name_or_path": "Efficient-Large-Model/NVILA-8B",
+    "_name_or_path": f"{llm_models_root()}/vila/NVILA-8B",
     "architectures": ["LlavaLlamaModel"],
     "chat_template": None,
     "drop_path_rate": 0.0,

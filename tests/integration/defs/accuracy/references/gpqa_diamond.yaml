@@ -22,6 +22,10 @@ deepseek-ai/DeepSeek-R1:
     accuracy: 70.45
 deepseek-ai/DeepSeek-V3.2-Exp:
   - quant_algo: FP8_BLOCK_SCALES
+    kv_cache_quant_algo: FP8
+    accuracy: 80.0
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
     accuracy: 80.0
   - quant_algo: FP8_BLOCK_SCALES
     spec_dec_algo: MTP
@@ -55,3 +59,23 @@ nvidia/Llama-3_1-Nemotron-Ultra-253B-v1:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 57.07
+GPT-OSS/120B-MXFP4:
+  - accuracy: 65.0
+  - spec_dec_algo: Eagle
+    accuracy: 65.0
+  - quant_algo: W4A8_MXFP4_MXFP8
+    accuracy: 65.0
+  - quant_algo: W4A8_MXFP4_MXFP8
+    spec_dec_algo: Eagle
+    accuracy: 65.0
+  - quant_algo: W4A8_MXFP4_MXFP8
+    kv_cache_quant_algo: FP8
+    accuracy: 65.0
+  - quant_algo: W4A16_MXFP4
+    accuracy: 65.0
+  - quant_algo: W4A16_MXFP4
+    spec_dec_algo: Eagle
+    accuracy: 65.0
+  - quant_algo: W4A16_MXFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 65.0
