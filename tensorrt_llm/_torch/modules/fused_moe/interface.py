@@ -292,6 +292,12 @@ class MoE(nn.Module):
         else:
             self.allreduce = None
 
+    def _add_raw_shared_weights_for_unmap(self,
+                                          weight_tensors: List[torch.Tensor]):
+        if self.layer_load_balancer:
+            self.layer_load_balancer._add_raw_host_weight_for_unmap(
+                weight_tensors)
+
     def _supports_load_balancer(self) -> bool:
         """Check if this MoE implementation supports load balancer.
 

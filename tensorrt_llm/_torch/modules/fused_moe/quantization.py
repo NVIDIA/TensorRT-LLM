@@ -251,6 +251,8 @@ class FusedMoEMethodBase(ABC):
 
             self.load_expert_w2_weight(module, w2_weight,
                                        dst_w2_weights_tensor[expert_idx])
+            module._add_raw_shared_weights_for_unmap(
+                [w1_weight, w3_weight, w2_weight])
 
             if module.bias:
                 self.load_expert_w3_w1_weight(
@@ -259,6 +261,8 @@ class FusedMoEMethodBase(ABC):
 
                 self.load_expert_w2_weight(module, w2_bias,
                                            dst_w2_bias_tensor.data[expert_idx])
+                module._add_raw_shared_weights_for_unmap(
+                    [w1_bias, w3_bias, w2_bias])
 
     def load_weights(self, module: torch.nn.Module, weights: List[Dict],
                      weight_loading_mode: MoEWeightLoadingMode):
@@ -1682,6 +1686,8 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                     dst_w3_w1_weight_scale[expert_idx])
                 self.load_expert_w2_weight_scale_nvfp4(
                     module, w2_weight_scale, dst_w2_weight_scale[expert_idx])
+                module._add_raw_shared_weights_for_unmap(
+                    [w1_weight_scale, w3_weight_scale, w2_weight_scale])
 
             self.load_expert_fc31_alpha_nvfp4(w1_weight_scale_2,
                                               w3_weight_scale_2,
