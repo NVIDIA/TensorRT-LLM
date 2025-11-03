@@ -53,6 +53,7 @@ testCmdLines=(
     "pytest"
     "-v"
     "--timeout-method=thread"
+    "--splitting-algorithm least_duration"
     "--timeout=$pytestTestTimeout"
     "--test-list=$testListPathNode"
     "--waives-file=$waivesListPathNode"
