@@ -36,9 +36,9 @@ std::vector<torch::Tensor> moe_topk_sort_impl(torch::optional<torch::Tensor> con
         = token_selected_experts.has_value() ? token_selected_experts->size(0) : routing_logits->size(0);
     int64_t const max_num_padded_tokens
         = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::getMaxPermutedPaddedCount(
-            num_tokens, top_k, num_experts, tile_tokens_dim);
+            num_tokens, top_k, local_num_experts, tile_tokens_dim);
     int64_t const max_num_ctas = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::getMaxNumCtasInBatchDim(
-        num_tokens, top_k, num_experts, tile_tokens_dim);
+        num_tokens, top_k, local_num_experts, tile_tokens_dim);
     int64_t const size_of_expert_count_histogram = std::max(num_experts * 2, int64_t(256 * 2));
     auto const routing_bias_dtype = routing_bias.has_value() ? routing_bias->scalar_type() : torch::kBFloat16;
 

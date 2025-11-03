@@ -741,7 +741,7 @@ class DeepseekV3Gate(DeepSeekV3MoeRoutingMethod):
                                                dtype=dtype),
                                    requires_grad=False)
         self.moe_backend = moe_backend
-        if moe_backend in ("TRTLLM", "CUTEDSL"):
+        if moe_backend == 'TRTLLM':
             bias_dtype = torch.bfloat16
         else:
             bias_dtype = torch.float32
