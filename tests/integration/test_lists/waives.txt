@@ -396,6 +396,7 @@ triton_server/test_triton_llm.py::test_llava[False-1---False-True-False-0-128-en
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[throughput_tp8] SKIP (https://nvbugs/5629910)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_nvfp4_multi_gpus[baseline] SKIP (https://nvbugs/5625962)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_nvfp4_multi_gpus[baseline_mtp1] SKIP (https://nvbugs/5625962)
+test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[phi4-multimodal-instruct-fp4-multimodals/Phi-4-multimodal-instruct-FP4-image_audio] SKIP (https://nvbugs/5630274)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_fp8_blockscale[baseline] SKIP (https://nvbugs/5630345)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_fp8_blockscale[baseline_mtp1] SKIP (https://nvbugs/5630345)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_fp8_blockscale[baseline_fp8kv] SKIP (https://nvbugs/5630345,https://nvbugs/5629887)

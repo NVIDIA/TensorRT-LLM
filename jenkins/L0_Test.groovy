@@ -113,7 +113,7 @@ CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
 MODEL_CACHE_DIR="/scratch.trt_llm_data/llm-models"
 
 // GPU types that require open driver
-REQUIRED_OPEN_DRIVER_TYPES = ["b100-ts2", "rtx-5080", "rtx-5090", "rtx-pro-6000"]
+REQUIRED_OPEN_DRIVER_TYPES = ["b100-ts2", "rtx-5080", "rtx-5090", "rtx-pro-6000", "rtx-pro-6000d"]
 
 // GPU types that don't support dynamic driver flashing
 REQUIRED_NO_DRIVER_TYPES = ["dgx-h100", "dgx-h200", "gh200"]
@@ -1386,6 +1386,21 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     path: /vol/scratch1/scratch.svc_tensorrt_blossom
         """
     }
+    def llmModelVolume = """
+                - name: scratch-trt-llm-data
+                  nfs:
+                    server: 10.117.145.14
+                    path: /vol/scratch1/scratch.michaeln_blossom
+    """
+    if (type.contains("6000d")) {
+        // rtx-pro-6000d nodes are located in Austin DC, we use the FlexCache to speed up the data access.
+        llmModelVolume = """
+                - name: scratch-trt-llm-data
+                  nfs:
+                    server: 10.20.162.212
+                    path: /vol/scratch26/scratch.trt_llm_data
+        """
+    }
 
     def podConfig = [
         cloud: targetCould,
@@ -1432,10 +1447,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                 - name: dshm
                   emptyDir:
                     medium: Memory
-                - name: scratch-trt-llm-data
-                  nfs:
-                    server: 10.117.145.14
-                    path: /vol/scratch1/scratch.michaeln_blossom
+                ${llmModelVolume}
                 ${pvcVolume}
         """.stripIndent(),
     ]
@@ -2664,10 +2676,14 @@ def launchTestJobs(pipeline, testFilter)
         // "DGX_H200-4_GPUs-TensorRT-Post-Merge-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 3, 4],
         // "DGX_H200-4_GPUs-TensorRT-Post-Merge-2": ["dgx-h200-x4", "l0_dgx_h200", 2, 3, 4],
         // "DGX_H200-4_GPUs-TensorRT-Post-Merge-3": ["dgx-h200-x4", "l0_dgx_h200", 3, 3, 4],
-        // Disable RTXPro6000 stages due to nodes will be offline temporarily
+        // Disable RTXPro6000 stages due to nodes will be offline temporarily.
+        // [TODO] Split tests between RTXPro6000 and RTXPro6000D and move reasonable mount of tests to pre-merge.
         // "RTXPro6000-PyTorch-Post-Merge-1": ["rtx-pro-6000", "l0_rtx_pro_6000", 1, 1],
         // "RTXPro6000-4_GPUs-PyTorch-Post-Merge-1": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 1, 2, 4],
         // "RTXPro6000-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 2, 2, 4],
+        "RTXPro6000D-PyTorch-Post-Merge-1": ["rtx-pro-6000d", "l0_rtx_pro_6000", 1, 1],
+        "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-1": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 1, 2, 4],
+        "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 2, 2, 4],
     ]
 
     parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(key.contains("-CU12-") ? LLM_DOCKER_IMAGE_12_9 : LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("Perf")), {
