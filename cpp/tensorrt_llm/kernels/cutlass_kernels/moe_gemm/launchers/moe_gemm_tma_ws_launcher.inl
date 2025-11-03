@@ -18,7 +18,7 @@
 #include <cuda.h>
 #include <cuda_fp16.h>
 
-#include "../include/moe_gemm_kernels.h"
+#include "../../include/moe_gemm_kernels.h"
 #include "../moe_tma_warp_specialized_traits.h"
 #include "cute/tensor.hpp"
 #include "cutlass/array.h"

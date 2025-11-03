@@ -312,7 +312,7 @@ namespace tensorrt_llm
 {{
 namespace kernels
 {{
-namespace cutlass_kernels_oss
+namespace cutlass_kernels
 {{
 
 {instantiations}
