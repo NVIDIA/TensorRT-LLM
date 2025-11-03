@@ -23,7 +23,7 @@
 #include <cstdint>
 #include <type_traits>
 
-namespace tensorrt_llm::kernels::MnnvlThroughput
+namespace tensorrt_llm::kernels::mnnvl_throughput
 {
 
 #define ENABLE_DEBUG_PRINT 0
@@ -958,4 +958,4 @@ void moe_a2a_sanitize_expert_ids_launch(int32_t* expert_ids, int32_t const* recv
         expert_ids, recv_counters, ep_size, max_tokens_per_rank, top_k, invalid_id);
 }
 
-} // namespace tensorrt_llm::kernels::MnnvlThroughput
+} // namespace tensorrt_llm::kernels::mnnvl_throughput

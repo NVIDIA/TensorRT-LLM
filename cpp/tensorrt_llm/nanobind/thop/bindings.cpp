@@ -30,7 +30,7 @@ namespace tensorrt_llm::nanobind::thop
 void initBindings(nb::module_& m)
 {
     // Export MoE A2A constants
-    for (auto const& kv : torch_ext::MnnvlThroughput::getMoeA2AMetaInfoIndexPairs())
+    for (auto const& kv : torch_ext::mnnvl_throughput::getMoeA2AMetaInfoIndexPairs())
     {
         m.attr(kv.first) = kv.second;
     }

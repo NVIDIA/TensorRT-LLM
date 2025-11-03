@@ -30,7 +30,7 @@ namespace tensorrt_llm::pybind::thop
 void initBindings(pybind11::module_& m)
 {
     // Export MoE A2A constants
-    for (auto const& kv : torch_ext::MnnvlThroughput::getMoeA2AMetaInfoIndexPairs())
+    for (auto const& kv : torch_ext::mnnvl_throughput::getMoeA2AMetaInfoIndexPairs())
     {
         m.attr(kv.first) = py::int_(kv.second);
     }
