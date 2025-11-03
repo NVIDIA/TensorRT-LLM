@@ -632,7 +632,9 @@ class OpenAIDisaggServer:
 
         async def check_all_servers_ready():
             iter = 0
-            unready_servers = await get_unready_servers(ctx_servers + gen_servers)
+            # Skip context servers if TRTLLM_DISAGG_BENCHMARK_GEN_ONLY is set
+            servers_to_check = gen_servers if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1" else ctx_servers + gen_servers
+            unready_servers = await get_unready_servers(servers_to_check)
             while len(unready_servers) > 0:
                 wait_time = 3
                 logger.info(
@@ -645,7 +647,11 @@ class OpenAIDisaggServer:
             await asyncio.wait_for(check_all_servers_ready(), timeout=server_start_timeout_secs)
         except asyncio.CancelledError:
             raise TimeoutError("Timeout waiting for context and generation servers to be ready")
-        logger.info("Context and generation servers are ready")
+
+        if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":
+            logger.info("Generation servers are ready (context servers skipped)")
+        else:
+            logger.info("Context and generation servers are ready")
 
     async def is_ready(self) -> bool:
         if self.disagg_cluster_manager:

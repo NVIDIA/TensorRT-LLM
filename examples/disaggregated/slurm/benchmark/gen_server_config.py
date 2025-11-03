@@ -39,12 +39,17 @@ if __name__ == "__main__":
         time.sleep(10)
         print(f"Waiting for hostnames folder {hostnames_folder} to be found")
     hostnames = os.listdir(hostnames_folder)
-    # check length of hostnames is equal to num_ctx_servers + num_gen_servers, if not, sleep 10 seconds and check again
-    while len(hostnames) != args.num_ctx_servers + args.num_gen_servers:
+
+    # Skip context servers if TRTLLM_DISAGG_BENCHMARK_GEN_ONLY is set
+    gen_only = os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1"
+    expected_hostnames = args.num_gen_servers if gen_only else args.num_ctx_servers + args.num_gen_servers
+
+    # check length of hostnames is equal to expected count, if not, sleep 10 seconds and check again
+    while len(hostnames) != expected_hostnames:
         time.sleep(10)
         hostnames = os.listdir(hostnames_folder)
         print(
-            f"Waiting for hostnames to be found in {hostnames_folder}, current length: {len(hostnames)}, expected length: {args.num_ctx_servers + args.num_gen_servers}"
+            f"Waiting for hostnames to be found in {hostnames_folder}, current length: {len(hostnames)}, expected length: {expected_hostnames}"
         )
     print(f"All hostnames found in {hostnames_folder}")
 
@@ -69,13 +74,16 @@ if __name__ == "__main__":
     hostname = socket.gethostname()
     print(f"Current hostname: {hostname}")
 
+    # Skip context servers if TRTLLM_DISAGG_BENCHMARK_GEN_ONLY is set
+    gen_only = os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1"
+
     server_config = {
         'hostname': hostname,
         'port': args.server_port,
         'backend': 'pytorch',
         'context_servers': {
-            'num_instances': args.num_ctx_servers,
-            'urls': [f'{host}:{args.worker_port}' for host in ctx_hostnames]
+            'num_instances': 0 if gen_only else args.num_ctx_servers,
+            'urls': [] if gen_only else [f'{host}:{args.worker_port}' for host in ctx_hostnames]
         },
         'generation_servers': {
             'num_instances': args.num_gen_servers,
