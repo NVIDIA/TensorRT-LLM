@@ -228,7 +228,7 @@ moePrepareOp(torch::Tensor expertsIds, c10::optional<torch::Tensor> expertsStati
 }
 
 void memsetExpertIds(torch::Tensor expertsIds, torch::Tensor recvRankCountCumSum, int64_t maxTokenCountPerRank,
-    int64_t topK, int64_t slotCount, int64_t epSize)
+    int64_t topK, int64_t invalidExpertId, int64_t epSize)
 {
     CHECK_INPUT(expertsIds, torch::kInt32);
     TORCH_CHECK(expertsIds.dim() == 2, "expertsIds must be a 1D tensor");
@@ -243,7 +243,7 @@ void memsetExpertIds(torch::Tensor expertsIds, torch::Tensor recvRankCountCumSum
     auto stream = at::cuda::getCurrentCUDAStream();
 
     tensorrt_llm::kernels::moe_prepare::memsetExpertIds(expertsIds.data_ptr<int>(), recvRankCountCumSum.data_ptr<int>(),
-        static_cast<int>(maxTokenCountPerRank), static_cast<int>(topK), static_cast<int>(slotCount),
+        static_cast<int>(maxTokenCountPerRank), static_cast<int>(topK), static_cast<int>(invalidExpertId),
         static_cast<int>(epSize), stream);
 }
 
@@ -310,7 +310,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "memset_expert_ids(Tensor(a!) experts_ids, Tensor recv_rank_count_cumsum, int max_token_count_per_rank, int "
         "top_k, "
-        "int slot_count, int ep_size) -> ()");
+        "int invalid_expert_id, int ep_size) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

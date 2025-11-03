@@ -402,7 +402,6 @@ class FP8BlockScaleMoERunner(TunableRunner):
         local_num_experts: int,
         routed_scaling_factor: Optional[float],
         routing_method_type: int,
-        tile_tokens_dim: int,
     ):
 
         self.num_experts = num_experts
@@ -414,7 +413,6 @@ class FP8BlockScaleMoERunner(TunableRunner):
         self.local_num_experts = local_num_experts
         self.routed_scaling_factor = routed_scaling_factor
         self.routing_method_type = routing_method_type
-        self.tile_tokens_dim = tile_tokens_dim
 
         FP8BlockScaleMoERunner.tuning_config = FP8BlockScaleMoERunner.get_tuning_config(
         )
@@ -439,17 +437,16 @@ class FP8BlockScaleMoERunner(TunableRunner):
                 and self.local_num_experts == other.local_num_experts)
 
     def get_runner(self):
-        instance_key = (self.tile_tokens_dim, )
+        instance_key = ()
         if instance_key not in FP8BlockScaleMoERunner.runner_dict:
             FP8BlockScaleMoERunner.runner_dict[
-                instance_key] = torch.classes.trtllm.FP8BlockScaleMoERunner(
-                    self.tile_tokens_dim)
+                instance_key] = torch.classes.trtllm.FP8BlockScaleMoERunner()
         return FP8BlockScaleMoERunner.runner_dict[instance_key]
 
     def forward(
         self,
         inputs: List[torch.Tensor],
-        tactic: int = -1,
+        tactic: List[int] = [-1, -1],
     ) -> torch.Tensor:
 
         args = FP8BlockScaleMoEInputs(*inputs)
@@ -467,7 +464,8 @@ class FP8BlockScaleMoERunner(TunableRunner):
             args.topk_weights, args.topk_ids)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
-                          profile: OptimizationProfile, **kwargs) -> List[int]:
+                          profile: OptimizationProfile,
+                          **kwargs) -> List[List[int]]:
 
         args = FP8BlockScaleMoEInputs(*inputs)
 
@@ -566,12 +564,6 @@ def fp8_block_scale_moe_runner(
         topk_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
 
     tuner = AutoTuner.get()
-    # FIXME: temporarily disable tuning multiple runners due to kernel failure in test:
-    # python3 -m pytest tests/integration/defs/accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale[throughput_mtp_trtllm]
-    tile_tokens_dim = calculate_tile_tokens_dim(hidden_states.shape[0],
-                                                num_experts,
-                                                top_k,
-                                                max_tile_tokens_dim=64)
     kernel_runners = [
         FP8BlockScaleMoERunner(
             num_experts,
@@ -583,7 +575,6 @@ def fp8_block_scale_moe_runner(
             local_num_experts,
             routed_scaling_factor,
             routing_method_type,
-            tile_tokens_dim,
         )
     ]
 
@@ -617,7 +608,8 @@ def fp8_block_scale_moe_runner(
     input_tensors = input_tensors_for_tuner + [topk_weights, topk_ids]
     input_tensors[
         0] = routing_logits  # replace dummy routing logits with actual routing logits
-    return kernel_runner(input_tensors, tactic=best_tactic)
+    return kernel_runner(input_tensors,
+                         tactic=[-1, -1] if best_tactic == -1 else best_tactic)
 
 
 @fp8_block_scale_moe_runner.register_fake

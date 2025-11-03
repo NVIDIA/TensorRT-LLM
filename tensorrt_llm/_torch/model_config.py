@@ -12,7 +12,8 @@ import transformers
 from transformers.utils import HF_MODULES_CACHE
 
 from tensorrt_llm import logger
-from tensorrt_llm._torch.pyexecutor.config_utils import is_nemotron_hybrid
+from tensorrt_llm._torch.pyexecutor.config_utils import (is_nemotron_hybrid,
+                                                         load_pretrained_config)
 from tensorrt_llm._utils import get_sm_version, torch_dtype_to_binding
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
@@ -23,18 +24,6 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
-
-
-class LazyConfigDict(dict):
-
-    def __getitem__(self, key):
-        import tensorrt_llm._torch.configs as configs
-        return getattr(configs, super().__getitem__(key))
-
-
-_CONFIG_REGISTRY: dict[str, type[transformers.PretrainedConfig]] = LazyConfigDict(
-    deepseek_v32="DeepseekV3Config",
-)  # NOTE: HF config.json uses deepseek_v32 as model_type but with same DSV3 config class
 
 
 @dataclass
@@ -124,9 +113,9 @@ class ModelConfig(Generic[TConfig]):
     pretrained_config: Optional[TConfig] = None
     mapping: Mapping = field(default_factory=Mapping)
 
-    # quantization configs
+    # Quantization configs
     quant_config: QuantConfig = field(default_factory=QuantConfig)
-    # TODO(qijun): support per linear layer quantization
+    # Per linear layer quantization in quant_cfg.json or hf_quant_config.json
     quant_config_dict: Optional[Dict[str, QuantConfig]] = None
     # Delay weights creation to DecoderModelForCausalLM.__post_init__
     # to support mixed quantization.
@@ -289,28 +278,41 @@ class ModelConfig(Generic[TConfig]):
             'exclude_modules', None)
 
         if quant_config.quant_algo == QuantAlgo.MIXED_PRECISION:
-            mixed_quant_config_file = transformers.utils.hub.cached_file(
-                checkpoint_dir, 'quant_cfg.json')
-            with open(mixed_quant_config_file) as fm:
-                mixed_quant_configs = json.load(fm)
-                # kv_cache_quant_algo is global regardless of MIXED_PRECISION
-                kv_cache_quant_algo = mixed_quant_configs['kv_cache_quant_algo']
-                mixed_quant_configs = mixed_quant_configs['quantized_layers']
-                if kv_cache_quant_algo is not None and quant_config.kv_cache_quant_algo is not None:
-                    if kv_cache_quant_algo != quant_config.kv_cache_quant_algo:
-                        raise RuntimeError(
-                            f"The kvcache config in 'quant_cfg.json', {kv_cache_quant_algo},"
-                            f"is different from 'hf_quant_config.json', {quant_config.kv_cache_quant_algo}!"
-                        )
-                kv_cache_quant_algo = kv_cache_quant_algo or quant_config.kv_cache_quant_algo
-
-                for layer in mixed_quant_configs:
-                    config = QuantConfig()
-                    config.kv_cache_quant_algo = kv_cache_quant_algo
-                    config.quant_algo = mixed_quant_configs[layer]['quant_algo']
-                    config.group_size = mixed_quant_configs[layer].get(
-                        'group_size', None)
-                    mixed_quant_configs[layer] = config
+            json_extended_quant_configs: dict = {}
+            # See tests/unittest/llmapi/test_llm_quant.py
+            try:
+                mixed_quant_config_file = transformers.utils.hub.cached_file(
+                    checkpoint_dir, 'quant_cfg.json')
+                with open(mixed_quant_config_file) as fm:
+                    json_extended_quant_configs = json.load(fm)
+            except Exception:
+                logger.info(
+                    f"No quant_cfg.json found for layer quant info, using hf_quant_config.json."
+                )
+            json_quant_configs.update(json_extended_quant_configs)
+            # kv_cache_quant_algo is global regardless of MIXED_PRECISION
+            kv_cache_quant_algo = json_quant_configs.get(
+                'kv_cache_quant_algo', None)
+            mixed_quant_configs = json_quant_configs.get(
+                'quantized_layers', None)
+            if (kv_quant_lhs := json_extended_quant_configs.get(
+                    "kv_cache_quant_algo", None)) is not None and (
+                        kv_quant_rhs :=
+                        quant_config.kv_cache_quant_algo) is not None:
+                if kv_quant_lhs != kv_quant_rhs:
+                    raise RuntimeError(
+                        f"The kvcache config in 'quant_cfg.json', {kv_quant_lhs},"
+                        f"is different from 'hf_quant_config.json', {kv_quant_rhs}!"
+                    )
+            quant_config.kv_cache_quant_algo = json_quant_configs[
+                "kv_cache_quant_algo"]
+            for layer in mixed_quant_configs:
+                config = QuantConfig()
+                config.kv_cache_quant_algo = kv_cache_quant_algo
+                config.quant_algo = mixed_quant_configs[layer]['quant_algo']
+                config.group_size = mixed_quant_configs[layer].get(
+                    'group_size', None)
+                mixed_quant_configs[layer] = config
             layer_quant_config = mixed_quant_configs
         elif quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
             if quant_config.group_size is None:
@@ -432,51 +434,31 @@ class ModelConfig(Generic[TConfig]):
             # When handling the case where model_format is TLLM_ENGINE
             # send cyclic requests to the NONE URL.
             if checkpoint_dir is not None:
-                config_dict, _ = transformers.PretrainedConfig.get_config_dict(
+                pretrained_config = load_pretrained_config(
                     checkpoint_dir,
+                    trust_remote_code=trust_remote_code,
                     **kwargs,
                 )
-                model_type = config_dict.get("model_type")
-                if model_type in _CONFIG_REGISTRY:
-                    config_class = _CONFIG_REGISTRY[model_type]
-                    pretrained_config = config_class.from_pretrained(
-                        checkpoint_dir,
-                        **kwargs,
-                    )
-                    if model_type == "deepseek_v32":
-                        sparse_attention_config = kwargs.get(
-                            'sparse_attention_config')
-                        kwargs[
-                            'sparse_attention_config'] = DeepSeekSparseAttentionConfig(
-                                index_n_heads=(
-                                    sparse_attention_config.index_n_heads
-                                    if sparse_attention_config
-                                    and sparse_attention_config.index_n_heads
-                                    is not None else
-                                    pretrained_config.index_n_heads),
-                                index_head_dim=(
-                                    sparse_attention_config.index_head_dim
-                                    if sparse_attention_config
-                                    and sparse_attention_config.index_head_dim
-                                    is not None else
-                                    pretrained_config.index_head_dim),
-                                index_topk=(sparse_attention_config.index_topk
-                                            if sparse_attention_config and
-                                            sparse_attention_config.index_topk
-                                            is not None else
-                                            pretrained_config.index_topk),
-                                indexer_max_chunk_size=(
-                                    sparse_attention_config.
-                                    indexer_max_chunk_size
-                                    if sparse_attention_config
-                                    and sparse_attention_config.
-                                    indexer_max_chunk_size is not None else
-                                    None))
-                else:
-                    pretrained_config = transformers.AutoConfig.from_pretrained(
-                        checkpoint_dir,
-                        trust_remote_code=trust_remote_code,
-                    )
+                if pretrained_config.architectures[
+                        0] == "DeepseekV32ForCausalLM":
+                    sparse_attention_config = kwargs.get(
+                        'sparse_attention_config')
+                    if sparse_attention_config:
+                        index_n_heads = sparse_attention_config.index_n_heads or pretrained_config.index_n_heads
+                        index_head_dim = sparse_attention_config.index_head_dim or pretrained_config.index_head_dim
+                        index_topk = sparse_attention_config.index_topk or pretrained_config.index_topk
+                        indexer_max_chunk_size = sparse_attention_config.indexer_max_chunk_size
+                    else:
+                        index_n_heads = pretrained_config.index_n_heads
+                        index_head_dim = pretrained_config.index_head_dim
+                        index_topk = pretrained_config.index_topk
+                        indexer_max_chunk_size = None
+                    kwargs[
+                        'sparse_attention_config'] = DeepSeekSparseAttentionConfig(
+                            index_n_heads=index_n_heads,
+                            index_head_dim=index_head_dim,
+                            index_topk=index_topk,
+                            indexer_max_chunk_size=indexer_max_chunk_size)
             else:
                 raise ValueError(
                     "checkpoint_dir is None. Cannot load model config without a valid checkpoint directory."
@@ -490,6 +472,9 @@ class ModelConfig(Generic[TConfig]):
             except OSError:
                 return None
 
+        # Some checkpoints lack torch_dtype, populate with dtype
+        pretrained_config.torch_dtype = getattr(pretrained_config, 'dtype',
+                                                None)
         quant_config = QuantConfig()
         layer_quant_config = None
         moe_backend = kwargs.get('moe_backend', 'CUTLASS')

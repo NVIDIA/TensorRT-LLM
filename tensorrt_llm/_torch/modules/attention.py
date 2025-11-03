@@ -23,7 +23,7 @@ from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
-                     is_torch_compiling)
+                     is_piecewise_running, is_torch_compiling)
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from .multi_stream_utils import maybe_execute_in_parallel
 from .rms_norm import RMSNorm
@@ -76,13 +76,24 @@ def extract_extra_attrs(layer_idx: str, attn_type: str):
     return metadata, attn_layer
 
 
-@torch.compile
-def compiled_copy_(dst, src):
+def maybe_compile(func):
+
+    def wrapper(*args, **kwargs):
+        if is_piecewise_running():
+            # When piecewise running, we don't need to compile the function to avoid host overhead in attention op.
+            return func(*args, **kwargs)
+        return torch.compile(func)(*args, **kwargs)
+
+    return wrapper
+
+
+@maybe_compile
+def maybe_compiled_copy_(dst, src):
     dst.copy_(src)
 
 
-@torch.compile
-def compiled_cat(tensors, dim):
+@maybe_compile
+def maybe_compiled_cat(tensors, dim):
     return torch.cat(tensors, dim)
 
 
@@ -827,7 +838,7 @@ class MLA(nn.Module):
             force_dynamic_quantization=config.force_dynamic_quantization)
         # This parameter will view into self.kv_b_proj.weight after loading weights.
         # For dummy weight initialization, this parameter is initialized with empty tensor.
-        # Used in forward_generation only
+        # Used in forward_absorption only
         self.v_b_proj = nn.Parameter(
             torch.empty(
                 (self.num_heads, self.v_head_dim, self.kv_lora_rank),
@@ -1102,7 +1113,7 @@ class MLA(nn.Module):
                 assert position_ids is not None
                 k_pe_gen = self.apply_rope(q_gen, k_pe_gen, position_ids)
 
-            self.forward_generation(
+            self.forward_absorption(
                 q_gen,
                 compressed_kv_gen,
                 k_pe_gen,
@@ -1222,8 +1233,9 @@ class MLA(nn.Module):
         )
 
         k = torch.empty_like(q).view(-1, self.num_heads, self.qk_head_dim)
-        compiled_copy_(k[..., :self.qk_nope_head_dim],
-                       k_nope.view(-1, self.num_heads, self.qk_nope_head_dim))
+        maybe_compiled_copy_(
+            k[..., :self.qk_nope_head_dim],
+            k_nope.view(-1, self.num_heads, self.qk_nope_head_dim))
         if self.apply_rotary_emb:
             k[..., self.qk_nope_head_dim:] = k_pe.view(-1, 1,
                                                        self.qk_rope_head_dim)
@@ -1252,13 +1264,22 @@ class MLA(nn.Module):
         latent_cache: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # TODO: implement other paths
-        return self.forward_sparse_mla_kvcache_bf16(q,
-                                                    latent_cache,
-                                                    attn_metadata,
-                                                    output,
-                                                    topk_indices,
-                                                    is_generation=False)
+        if get_sm_version() >= 100:
+            return self.forward_absorption(q,
+                                           compressed_kv,
+                                           k_pe,
+                                           attn_metadata,
+                                           output,
+                                           latent_cache,
+                                           topk_indices,
+                                           is_generation=False)
+        else:
+            return self.forward_sparse_mla_kvcache_bf16(q,
+                                                        latent_cache,
+                                                        attn_metadata,
+                                                        output,
+                                                        topk_indices,
+                                                        is_generation=False)
 
     def forward_generation_dsa(
         self,
@@ -1270,13 +1291,17 @@ class MLA(nn.Module):
         latent_cache: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # TODO: implement other paths
-        return self.forward_sparse_mla_kvcache_bf16(q,
-                                                    latent_cache,
-                                                    attn_metadata,
-                                                    output,
-                                                    topk_indices,
-                                                    is_generation=True)
+        if get_sm_version() >= 100:
+            return self.forward_absorption(q, compressed_kv, k_pe,
+                                           attn_metadata, output, latent_cache,
+                                           topk_indices)
+        else:
+            return self.forward_sparse_mla_kvcache_bf16(q,
+                                                        latent_cache,
+                                                        attn_metadata,
+                                                        output,
+                                                        topk_indices,
+                                                        is_generation=True)
 
     def forward_context_with_cached_kv(
         self,
@@ -1317,7 +1342,7 @@ class MLA(nn.Module):
         full_k_nope = full_k_nope.view(-1, self.num_heads,
                                        self.qk_nope_head_dim)
         full_k_pe = full_k_pe.view(-1, 1, self.qk_rope_head_dim)
-        full_k = compiled_cat(
+        full_k = maybe_compiled_cat(
             (full_k_nope, full_k_pe.expand(-1, self.num_heads, -1)), dim=-1)
         full_k = full_k.view(-1, self.num_heads * self.qk_head_dim)
 
@@ -1412,7 +1437,7 @@ class MLA(nn.Module):
             chunked_k_nope = chunked_k_nope.view(-1, self.num_heads,
                                                  self.qk_nope_head_dim)
             chunked_k_pe = chunked_k_pe.view(-1, 1, self.qk_rope_head_dim)
-            chunked_k = compiled_cat(
+            chunked_k = maybe_compiled_cat(
                 (chunked_k_nope, chunked_k_pe.expand(-1, self.num_heads, -1)),
                 dim=-1)
             chunked_k = chunked_k.view(-1, self.num_heads * self.qk_head_dim)
@@ -1470,7 +1495,8 @@ class MLA(nn.Module):
 
         k_nope = k_nope.view(-1, self.num_heads, self.qk_nope_head_dim)
         k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
-        k = compiled_cat((k_nope, k_pe.expand(-1, self.num_heads, -1)), dim=-1)
+        k = maybe_compiled_cat((k_nope, k_pe.expand(-1, self.num_heads, -1)),
+                               dim=-1)
         k = k.view(-1, self.num_heads * self.qk_head_dim)
 
         # copy q_lens to replace kv_lens_runtime
@@ -1530,7 +1556,7 @@ class MLA(nn.Module):
         return self.forward_context_default(q, compressed_kv, k_pe,
                                             attn_metadata, output, latent_cache)
 
-    def forward_generation(
+    def forward_absorption(
         self,
         q: torch.Tensor,
         compressed_kv: torch.Tensor,
@@ -1538,6 +1564,8 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
         latent_cache: Optional[torch.Tensor] = None,
+        topk_indices: Optional[torch.Tensor] = None,
+        is_generation: bool = True,
     ) -> torch.Tensor:
         num_tokens = q.shape[0]
         q_nope, q_pe = q.view([-1, self.num_heads, self.qk_head_dim]).split(
@@ -1588,15 +1616,19 @@ class MLA(nn.Module):
             self.num_heads * (self.kv_lora_rank + self.qk_rope_head_dim)
         ])
 
+        # Use generation_only for generation phase and context_only for context phase in DSA attention
+        attention_input_type = AttentionInputType.generation_only if is_generation else AttentionInputType.context_only
         attn_out_latent = self.mqa.forward(
             fused_q,
             None,
             None,
             attn_metadata,
-            attention_input_type=AttentionInputType.generation_only,
+            attention_input_type=attention_input_type,
             out_scale=self.out_scale,
             latent_cache=latent_cache,  # kvcache and k_pe
             q_pe=q_pe,  # used by `invokeMLARopeGeneration`
+            topk_indices=topk_indices,  # used by DSA attention
+            is_generation=is_generation,  # used by DSA attention
         )
         fused_q = None
 
@@ -1726,7 +1758,6 @@ class MLA(nn.Module):
         topk_indices_pool, kv_cache_pool = transform_local_topk_and_prepare_pool_view(
             topk_indices,
             attn_metadata,
-            attn_metadata.kv_cache_manager,
             layer_idx=self.layer_idx,
             is_generation=is_generation,
         )
