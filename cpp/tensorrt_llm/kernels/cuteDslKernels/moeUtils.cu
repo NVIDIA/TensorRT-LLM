@@ -55,8 +55,8 @@ auto constexpr sfElemPerCopy()
 
 template <typename InputType, typename SFType, int32_t kSFVecSize, int32_t kThreadsPerBlock>
 __global__ void moePermuteKernel(InputType const* input, InputType* permuted_output, SFType const* input_sf,
-    SFType* permuted_sf, int32_t const* permuted_idx_to_expanded_idx, int32_t const* num_non_exiting_tiles,
-    int32_t const hidden_size, int32_t const top_k, int32_t const tile_size)
+    SFType* permuted_sf, int32_t const* tile_idx_to_mn_limit, int32_t const* permuted_idx_to_expanded_idx,
+    int32_t const* num_non_exiting_tiles, int32_t const hidden_size, int32_t const top_k, int32_t const tile_size)
 {
     int32_t constexpr kElemPerCopy = elemPerCopy<InputType>();
     int32_t constexpr kSFElemPerCopy = sfElemPerCopy<SFType>();
@@ -68,11 +68,12 @@ __global__ void moePermuteKernel(InputType const* input, InputType* permuted_out
     int32_t const num_tokens = num_non_exiting_tiles[0] * tile_size;
     for (int32_t permuted_idx = blockIdx.x; permuted_idx < num_tokens; permuted_idx += gridDim.x)
     {
-        int32_t const expanded_idx = permuted_idx_to_expanded_idx[permuted_idx];
-        if (expanded_idx < 0)
+        int32_t const tile_idx = permuted_idx / tile_size;
+        if (permuted_idx >= tile_idx_to_mn_limit[tile_idx])
         {
             continue;
         }
+        int32_t const expanded_idx = permuted_idx_to_expanded_idx[permuted_idx];
         int32_t const token_idx = expanded_idx / top_k;
 
         auto const* src_ptr = reinterpret_cast<ElemCopyType const*>(input) + token_idx * hidden_size / kElemPerCopy;
@@ -109,8 +110,9 @@ __global__ void moePermuteKernel(InputType const* input, InputType* permuted_out
 
 template <typename InputType, typename SFType>
 void moePermute(InputType const* input, InputType* permuted_output, SFType const* input_sf, SFType* permuted_sf,
-    int32_t const* permuted_idx_to_expanded_idx, int32_t const* num_non_exiting_tiles, int32_t const hidden_size,
-    int32_t const top_k, int32_t const tile_size, cudaStream_t stream)
+    int32_t const* tile_idx_to_mn_limit, int32_t const* permuted_idx_to_expanded_idx,
+    int32_t const* num_non_exiting_tiles, int32_t const hidden_size, int32_t const top_k, int32_t const tile_size,
+    cudaStream_t stream)
 {
     int32_t constexpr kThreadsPerBlock = 256;
     int32_t constexpr kSFVecSize = 16;
@@ -144,15 +146,15 @@ void moePermute(InputType const* input, InputType* permuted_output, SFType const
     attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
     config.numAttrs = 1;
     config.attrs = attrs;
-    cudaLaunchKernelEx(&config, kernel, input, permuted_output, input_sf, permuted_sf, permuted_idx_to_expanded_idx,
-        num_non_exiting_tiles, hidden_size, top_k, tile_size);
+    cudaLaunchKernelEx(&config, kernel, input, permuted_output, input_sf, permuted_sf, tile_idx_to_mn_limit,
+        permuted_idx_to_expanded_idx, num_non_exiting_tiles, hidden_size, top_k, tile_size);
 }
 
 #define INSTANTIATE_MOE_PERMUTE(InputType, SFType)                                                                     \
     template void moePermute<InputType, SFType>(InputType const* input, InputType* permuted_output,                    \
-        SFType const* input_sf, SFType* permuted_sf, int32_t const* permuted_idx_to_expanded_idx,                      \
-        int32_t const* num_non_exiting_tiles, int32_t const hidden_size, int32_t const top_k, int32_t const tile_size, \
-        cudaStream_t stream)
+        SFType const* input_sf, SFType* permuted_sf, int32_t const* tile_idx_to_mn_limit,                              \
+        int32_t const* permuted_idx_to_expanded_idx, int32_t const* num_non_exiting_tiles, int32_t const hidden_size,  \
+        int32_t const top_k, int32_t const tile_size, cudaStream_t stream)
 
 INSTANTIATE_MOE_PERMUTE(half, uint8_t);
 #ifdef ENABLE_BF16

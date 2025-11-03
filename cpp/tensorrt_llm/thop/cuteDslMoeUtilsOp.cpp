@@ -71,7 +71,7 @@ std::vector<torch::Tensor> moe_topk_sort_impl(torch::optional<torch::Tensor> con
 
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::Runner routing_runner(tile_tokens_dim);
     auto const& stream = at::cuda::getCurrentCUDAStream(
-        routing_logits.has_value() ? routing_logits.value().get_device() : token_selected_experts.value().get_device());
+        routing_logits.has_value() ? routing_logits->get_device() : token_selected_experts->get_device());
     routing_runner.run(routing_logits_ptr, routing_bias_ptr, num_tokens, num_experts, top_k, n_group.value_or(0),
         topk_group.value_or(0), local_expert_offset, local_num_experts, routed_scaling_factor.value_or(1.0),
         expert_indexes.data_ptr<int>(), expert_count_histogram.data_ptr<int>(), total_num_padded_tokens.data_ptr<int>(),
@@ -129,13 +129,23 @@ std::vector<torch::Tensor> moe_sort(torch::Tensor const& token_selected_experts,
 // Permute
 
 std::tuple<torch::Tensor, torch::optional<torch::Tensor>> moe_permute(torch::Tensor const& input,
-    torch::optional<torch::Tensor> const& input_sf, torch::Tensor const& permuted_idx_to_expanded_idx,
-    torch::Tensor const& num_non_exiting_tiles, int64_t const tile_tokens_dim, int64_t const top_k)
+    torch::optional<torch::Tensor> const& input_sf, torch::Tensor const& tile_idx_to_mn_limit,
+    torch::Tensor const& permuted_idx_to_expanded_idx, torch::Tensor const& num_non_exiting_tiles,
+    int64_t const tile_tokens_dim, int64_t const top_k)
 {
+    TORCH_CHECK(input.dim() == 2, "input must be 2D.");
+    int64_t const num_tokens = input.size(0);
     int64_t const hidden_size = input.scalar_type() == torch::kFloat4_e2m1fn_x2 ? input.size(1) * 2 : input.size(1);
+
+    TORCH_CHECK(tile_idx_to_mn_limit.dim() == 1, "tile_idx_to_mn_limit must be 1D.");
+    TORCH_CHECK(tile_idx_to_mn_limit.scalar_type() == torch::kInt32, "tile_idx_to_mn_limit must be int32.");
+    int64_t const num_tiles = tile_idx_to_mn_limit.size(0);
+    TORCH_CHECK(permuted_idx_to_expanded_idx.dim() == 1, "permuted_idx_to_expanded_idx must be 1D.");
     int64_t const num_permuted_tokens = permuted_idx_to_expanded_idx.size(0);
-    TORCH_CHECK(
-        num_permuted_tokens % tile_tokens_dim == 0, "num_permuted_tokens must be divisible by tile_tokens_dim.");
+    TORCH_CHECK(num_permuted_tokens == tile_tokens_dim * num_tiles,
+        "num_permuted_tokens must be equal to tile_tokens_dim * num_tiles.");
+    TORCH_CHECK(num_permuted_tokens >= num_tokens * top_k,
+        "num_permuted_tokens must be greater than or equal to num_tokens * top_k.");
 
     auto permuted_output
         = torch::empty({num_permuted_tokens, input.size(1)}, torch::dtype(input.scalar_type()).device(torch::kCUDA));
@@ -158,8 +168,9 @@ std::tuple<torch::Tensor, torch::optional<torch::Tensor>> moe_permute(torch::Ten
 #define DISPATCH_MOE_PERMUTE(InputType, SFType)                                                                        \
     tensorrt_llm::kernels::cute_dsl::moePermute<InputType, SFType>(static_cast<InputType*>(input.data_ptr()),          \
         static_cast<InputType*>(permuted_output.data_ptr()), static_cast<SFType*>(input_sf_ptr),                       \
-        static_cast<SFType*>(permuted_sf_ptr), permuted_idx_to_expanded_idx.data_ptr<int32_t>(),                       \
-        num_non_exiting_tiles.data_ptr<int32_t>(), hidden_size, top_k, tile_tokens_dim, stream)
+        static_cast<SFType*>(permuted_sf_ptr), tile_idx_to_mn_limit.data_ptr<int32_t>(),                               \
+        permuted_idx_to_expanded_idx.data_ptr<int32_t>(), num_non_exiting_tiles.data_ptr<int32_t>(), hidden_size,      \
+        top_k, tile_tokens_dim, stream)
 
     if (input.scalar_type() == torch::kHalf)
     {
@@ -248,12 +259,12 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int? topk_group, int local_expert_offset, int local_num_experts, float? routed_scaling_factor, int "
         "tile_tokens_dim, int routing_method_type) -> Tensor[]");
     m.def(
-        "moe_sort(Tensor token_final_scales, Tensor token_selected_experts, int num_experts, int top_k, int? n_group, "
+        "moe_sort(Tensor token_selected_experts, Tensor token_final_scales, int num_experts, int top_k, int? n_group, "
         "int? topk_group, int local_expert_offset, int local_num_experts, float? routed_scaling_factor, int "
         "tile_tokens_dim, int routing_method_type) -> Tensor[]");
     m.def(
-        "moe_permute(Tensor input, Tensor? input_sf, Tensor permuted_idx_to_expanded_idx, Tensor "
-        "num_non_exiting_tiles, int tile_tokens_dim, int top_k) -> (Tensor, Tensor?)");
+        "moe_permute(Tensor input, Tensor? input_sf, Tensor tile_idx_to_mn_limit, Tensor permuted_idx_to_expanded_idx, "
+        "Tensor num_non_exiting_tiles, int tile_tokens_dim, int top_k) -> (Tensor, Tensor?)");
     m.def("moe_unpermute(Tensor permuted_input, Tensor expanded_idx_to_permuted_idx, Tensor topk_scales) -> Tensor");
 }
 
