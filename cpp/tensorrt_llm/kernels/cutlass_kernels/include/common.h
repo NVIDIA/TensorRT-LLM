@@ -19,7 +19,7 @@
 namespace tensorrt_llm::kernels::cutlass_kernels
 {
 
-// Note update moe.py to match
+// Note update flashinfer/fused_moe/core.py to match
 enum class ActivationType
 {
     Gelu = 0,
@@ -28,6 +28,7 @@ enum class ActivationType
     Swiglu,
     Geglu,
     SwigluBias,
+    Relu2,
     Identity,
     InvalidType
 };
