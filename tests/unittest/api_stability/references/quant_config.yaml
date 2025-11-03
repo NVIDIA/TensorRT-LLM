@@ -31,6 +31,12 @@ methods:
       use_meta_recipe:
         annotation: bool
         default: false
+      exclude_quantization:
+        annotation: Optional[dict]
+        default: null
+      activation_scheme:
+        annotation: Optional[tensorrt_llm.quantization.mode.ActivationScheme]
+        default: null
     return_annotation: None
   from_dict:
     parameters:
