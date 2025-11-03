@@ -7,8 +7,8 @@ gpus_per_node=${1}
 numa_bind=${2}
 ctx_nodes=${3}  # Number of nodes needed for ctx workers
 gen_nodes=${4}  # Number of nodes needed for gen workers
-ctx_world_size=${5}  # Tensor parallel size for ctx workers
-gen_world_size=${6}  # Tensor parallel size for gen workers
+ctx_world_size=${5}  # World size for ctx workers
+gen_world_size=${6}  # World size for gen workers
 
 # Worker configuration
 num_ctx_servers=${7}
