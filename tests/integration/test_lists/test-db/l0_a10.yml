@@ -74,6 +74,7 @@ l0_a10:
   - unittest/executor/test_rpc.py
   # trtllm-serve CPU-only
   - unittest/llmapi/apps/test_tool_parsers.py
+  - unittest/llmapi/apps/test_harmony_channel_validation.py
 - condition:
     ranges:
       system_gpu_count:
