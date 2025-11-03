@@ -11,6 +11,7 @@ import com.nvidia.bloom.SlurmConfig
 import com.nvidia.bloom.SlurmCluster
 import com.nvidia.bloom.SlurmPartition
 import com.nvidia.bloom.Utils
+import com.nvidia.bloom.ContainerRuntime
 import org.jenkinsci.plugins.workflow.cps.CpsThread
 import org.jsoup.Jsoup
 import org.jenkinsci.plugins.pipeline.modeldefinition.Utils as jUtils
@@ -424,19 +425,21 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String jobUID){
 
         Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
 
+        Utils.exec(pipeline, script: "echo Sleeping to allow Slurm job completion; sleep 30")
+
         def slurmJobID = Utils.exec(
             pipeline,
             // Try to grab the job id from ${jobWorkspace}/slurm_job_id.txt.
             // The slurm_run.sh will add the slurm job id in that file.
             script: Utils.sshUserCmd(
                 remote,
-                "'test -f ${jobWorkspace}/slurm_job_id.txt && cat ${jobWorkspace}/slurm_job_id.txt'"
+                "\"test -f ${jobWorkspace}/slurm_job_id.txt && cat ${jobWorkspace}/slurm_job_id.txt || true\""
             ),
             returnStdout: true
         ).trim()
 
         if (!slurmJobID || !slurmJobID.isNumber()) {
-            echo "Slurm job did not submit successfully. No job ID found."
+            echo "Slurm job may not submit successfully. No job ID found."
         } else {
             Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
 
@@ -447,14 +450,15 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String jobUID){
                     "\"scancel ${slurmJobID} || true; sacct -j ${slurmJobID} --format=JobID,JobName%100,Partition%15,Account%15,State,ExitCode,NodeList%30 || true; scontrol show job ${slurmJobID} || true\""
                 )
             )
-
         }
+
+        Utils.exec(pipeline, script: "echo Sleeping to allow Slurm job termination; sleep 30")
 
         Utils.exec(
             pipeline,
             script: Utils.sshUserCmd(
                 remote,
-                "rm -rf ${jobWorkspace}"
+                "\"rm -rf ${jobWorkspace} || true\""
             )
         )
 
@@ -494,11 +498,16 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String nodeName, St
 
         Utils.exec(pipeline, script: "echo Sleeping to allow Slurm job termination; sleep 30")
 
+        def entrypoint = SlurmConfig.containerRuntimeToEntrypoint[cluster.containerRuntime]
+        def cleanupCommands = [
+            "rm -rf /home/svc_tensorrt/bloom/scripts/agent-${nodeName}.jar /home/svc_tensorrt/bloom/scripts/${nodeName}-${entrypoint} || true",
+            "rm -rf /lustre/fs1/portfolios/coreai/projects/coreai_tensorrt_ci/users/svc_tensorrt/containers/container-${slurmJobID}.sqsh || true",
+        ].join(" && ")
         Utils.exec(
             pipeline,
             script: Utils.sshUserCmd(
                 remote,
-                "\"rm -rf /home/svc_tensorrt/bloom/scripts/agent-${nodeName}.jar /home/svc_tensorrt/bloom/scripts/${nodeName}-slurm_jenkins_agent_setup.sh || true\""
+                "\"${cleanupCommands}\""
             )
         )
 
@@ -510,6 +519,8 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
 {
     SlurmPartition partition = SlurmConfig.partitionConfig[platform] as SlurmPartition
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
+
+    def entrypoint = SlurmConfig.containerRuntimeToEntrypoint[cluster.containerRuntime]
 
     // Create a unique suffix for the node name and workspace
     String customSuffix = "${env.BUILD_TAG}-${UUID.randomUUID().toString().replaceAll("-", "").substring(0, 6)}".toLowerCase()
@@ -536,22 +547,28 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
             stage('Request Node via SLURM') {
                 println("Selected Cluster: ${cluster.name}")
 
-                def jenkinsSetupPath = Utils.copyLibraryResource(pipeline, "slurm_jenkins_agent_setup.sh")
+                def jenkinsSetupPath = Utils.copyLibraryResource(pipeline, entrypoint)
 
                 Utils.exec(pipeline, script: "chmod +x ${jenkinsSetupPath}", returnStdout: true)
 
-                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${jenkinsSetupPath} ${remote.user}@${remote.host}:~/bloom/scripts/${nodeName}-slurm_jenkins_agent_setup.sh", numRetries: 3)
+                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${jenkinsSetupPath} ${remote.user}@${remote.host}:~/bloom/scripts/${nodeName}-${entrypoint}", numRetries: 3)
 
                 Utils.exec(pipeline, script: "cat ${jenkinsSetupPath}")
 
                 Utils.exec(pipeline, script: "echo Sleeping before Slurm job submission; sleep \$((RANDOM % 29 + 1))")
 
+                // Specific for OCI machines
+                def mounts = [
+                    "/lustre/fs1/portfolios/coreai/projects/coreai_tensorrt_ci:/scratch.trt_llm_data:ro",
+                    "/home/svc_tensorrt:/home/svc_tensorrt",
+                    "/home/svc_tensorrt/.cache:/root/.cache"
+                ].join(",")
                 def slurmSubmitOutput = Utils.exec(
                     pipeline,
                     timeout: false,
                     script: Utils.sshUserCmd(
                         remote,
-                        "\"${SlurmConfig.generateCommand(cluster, partition, nodeSecret, nodeName, Jenkins.instance.rootUrl)}\""
+                        "\"${SlurmConfig.generateCommand(cluster, partition, nodeSecret, nodeName, Jenkins.instance.rootUrl, LLM_DOCKER_IMAGE, mounts)}\""
                     ),
                     returnStdout: true,
                     numRetries: 3
@@ -648,6 +665,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
 
                 if (partition.clusterName == "dlcluster") {
                     dockerArgs += " -e NVIDIA_IMEX_CHANNELS=0"
+                    dockerArgs += " --device=/dev/gdrdrv:/dev/gdrdrv"
                 }
                 echo "Final dockerArgs: ${dockerArgs}"
             } else {
@@ -655,7 +673,14 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
             }
         }
 
-        slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, true)
+        slurmRunner = null
+        if (cluster.containerRuntime == ContainerRuntime.DOCKER) {
+            slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, true)
+        } else if (cluster.containerRuntime == ContainerRuntime.ENROOT) {
+            slurmRunner = runInEnrootOnNode(nodeName)
+        } else {
+            throw new Exception("Unsupported container runtime: ${cluster.containerRuntime}")
+        }
         executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner)
     } finally {
         stage("Clean up SLURM Resources") {
@@ -1458,8 +1483,7 @@ def runLLMDocBuild(pipeline, config)
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
 
     // Step 3: build doc
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get install doxygen python3-pip graphviz -y")
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y doxygen python3-pip graphviz")
 
     def containerPATH = sh(script: "echo \${PATH}", returnStdout: true).replaceAll("\\s", "")
     if (!containerPATH.contains("/usr/local/bin:")) {
@@ -1498,9 +1522,7 @@ def launchTestListCheck(pipeline)
     trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(LLM_DOCKER_IMAGE, "a10"), "trt-llm", {
         try {
             echoNodeAndGpuInfo(pipeline, stageName)
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: """apt-get update && apt-get install \
-            libffi-dev \
-            -y""")
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y libffi-dev")
             sh "nvidia-smi && nvidia-smi -q && nvidia-smi topo -m"
             // download TRT-LLM tarfile
             def tarName = BUILD_CONFIGS[VANILLA_CONFIG][TARNAME]
@@ -2018,8 +2040,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         // setup HF_HOME to cache model and datasets
         // init the huggingface cache from nfs, since the nfs is read-only, and HF_HOME needs to be writable, otherwise it will fail at creating file lock
         sh "mkdir -p ${HF_HOME} && ls -alh ${HF_HOME}"
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get install -y rsync")
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y rsync")
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "rsync -r ${MODEL_CACHE_DIR}/hugging-face-cache/ ${HF_HOME}/ && ls -lh ${HF_HOME}")
         sh "df -h"
 
@@ -2171,6 +2192,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             cat ${coverageConfigFile}
         """
         echoNodeAndGpuInfo(pipeline, stageName)
+        // Some clusters do not allow dmesg -C so we add || true
         sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C || true; fi'
         def pytestCommand = getPytestBaseCommandLine(
             llmSrc,
@@ -2506,6 +2528,17 @@ def runInDockerOnNodeMultiStage(image, label, dockerArgs, needToDeleteDir=true)
                 } else {
                     throw e // Re-throw if it's a different Exception
                 }
+            }
+        }
+    }
+}
+
+def runInEnrootOnNode(label)
+{
+    return {
+        runner -> node(label) {
+            timeout(time: SlurmConfig.DEFAULT_TIMEOUT_SHORT, unit: 'MINUTES') {
+                runner()
             }
         }
     }
@@ -2898,8 +2931,7 @@ def launchTestJobs(pipeline, testFilter)
                         if (values[5] == DLFW_IMAGE || values[5] == DLFW_IMAGE_12_9) {
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "[ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt || true")
                         }
-                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
-                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install python3-pip git rsync curl wget")
+                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y python3-pip git rsync curl wget")
                         trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install requests")
@@ -2909,11 +2941,10 @@ def launchTestJobs(pipeline, testFilter)
                             def platform = cpu_arch == X86_64_TRIPLE ? "x86_64" : "sbsa"
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget https://developer.download.nvidia.com/compute/cuda/repos/${ubuntu_version}/${platform}/cuda-keyring_1.1-1_all.deb")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "dpkg -i cuda-keyring_1.1-1_all.deb")
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
                             if (key.contains("CU12")) {
-                                trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install cuda-toolkit-12-9")
+                                trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y cuda-toolkit-12-9")
                             } else {
-                                trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install cuda-toolkit-13-0")
+                                trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y cuda-toolkit-13-0")
                             }
                         }
                         if (key.contains("CU12")) {

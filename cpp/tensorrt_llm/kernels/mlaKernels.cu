@@ -184,10 +184,10 @@ inline __device__ void dequantCopy(
 }
 
 template <typename T, int BLOCK_SIZE, int K_DIM, int ROPE_DIM, typename KVCacheBuffer>
-__global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* k_ptr, T const* fuse_buf, KVCacheBuffer kv_cache,
-    float2 const* cos_sin_cache, size_t head_num, int head_size, int c_k, int* cu_q_seqlens,
-    int32_t const* kv_cache_lengths, uint32_t max_input_seq_len, KvCacheDataType cache_type,
-    float const* quant_scale_kv)
+__global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* q_pe, T* k_ptr, T const* fuse_buf,
+    KVCacheBuffer kv_cache, int q_pe_ld, int q_pe_stride, float2 const* cos_sin_cache, size_t head_num, int head_size,
+    int c_k, int* cu_q_seqlens, int32_t const* kv_cache_lengths, uint32_t max_input_seq_len, KvCacheDataType cache_type,
+    float const* quant_scale_kv, bool absorption_mode)
 {
 
     // Constants.
@@ -209,6 +209,10 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* k_ptr, T c
     // Block/Head idx.
     size_t const batch_idx = blockIdx.y;
     size_t const head_idx = blockIdx.z;
+
+    // The nope head_size for q.
+    // Use the latent_space head size in the absorption mode.
+    int nope_head_size_q = absorption_mode ? c_k : head_size;
 
     if (head_idx < head_num)
     {
@@ -239,10 +243,17 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* k_ptr, T c
 
             VecT q, k;
             auto const src_k_global_offset = static_cast<size_t>(global_token_idx) * (c_k + ROPE_DIM) + c_k;
-            auto const src_q_global_offset = static_cast<size_t>(global_token_idx) * head_num * (head_size + ROPE_DIM)
+            auto src_q_global_offset = static_cast<size_t>(global_token_idx) * head_num * (head_size + ROPE_DIM)
                 + (head_size + ROPE_DIM) * head_idx + head_size;
+            // In the absorption mode, we load pe from q_pe instead of q_ptr.
+            T* q_pe_input = q_ptr;
+            if (absorption_mode)
+            {
+                q_pe_input = q_pe;
+                src_q_global_offset = static_cast<size_t>(global_token_idx) * q_pe_stride + q_pe_ld * head_idx;
+            }
 
-            q = *reinterpret_cast<VecT const*>(&q_ptr[src_q_global_offset + head_dim_idx]);
+            q = *reinterpret_cast<VecT const*>(&q_pe_input[src_q_global_offset + head_dim_idx]);
             k = *reinterpret_cast<VecT const*>(&fuse_buf[src_k_global_offset + head_dim_idx]);
 
             // Pack two elements into one for gptj rotary embedding.
@@ -273,12 +284,16 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* k_ptr, T c
                     else
                         reinterpret_cast<VecT*>(kDst)[inBlockIdx] = k;
                 }
-                auto const dst_q_idx = static_cast<size_t>(global_token_idx) * head_num * (head_size + ROPE_DIM)
-                    + head_idx * (head_size + ROPE_DIM) + head_size + head_dim_idx;
+                auto const dst_q_idx = static_cast<size_t>(global_token_idx) * head_num * (nope_head_size_q + ROPE_DIM)
+                    + head_idx * (nope_head_size_q + ROPE_DIM) + nope_head_size_q + head_dim_idx;
                 auto const dst_k_idx = static_cast<size_t>(global_token_idx) * head_num * (head_size + ROPE_DIM)
                     + head_idx * (head_size + ROPE_DIM) + head_size + head_dim_idx;
                 reinterpret_cast<VecT*>(q_ptr)[dst_q_idx / ELTS_PER_VEC] = q;
-                reinterpret_cast<VecT*>(k_ptr)[dst_k_idx / ELTS_PER_VEC] = k;
+                // Only write to k_pe to k_buf in the non-absorption mode.
+                if (!absorption_mode)
+                {
+                    reinterpret_cast<VecT*>(k_ptr)[dst_k_idx / ELTS_PER_VEC] = k;
+                }
             }
         }
     }
@@ -819,7 +834,7 @@ __global__ void applyMLARopeAppendPagedKVAssignQKernel(KVBlockArray kv_cache, T*
     }
 }
 
-template <typename T, int BLOCK_SIZE, int QK_NOPE_HEAD_DIM, int QK_ROPE_HEAD_DIM, int V_HEAD_DIM>
+template <typename T, int BLOCK_SIZE, int QK_NOPE_HEAD_DIM, int QK_ROPE_HEAD_DIM, int V_HEAD_DIM, bool ABSORPTION_MODE>
 __global__ void quantizeCopyInputToFp8Kernel(T const* q_buf, __nv_fp8_e4m3* quant_q_buf, T const* k_buf,
     __nv_fp8_e4m3* quant_k_buf, T const* v_buf, __nv_fp8_e4m3* quant_v_buf, int total_q_len, int total_kv_len,
     float const* quant_scale_qkv_ptr, float* bmm1_scale, float* bmm2_scale, float const* quant_scale_o,
@@ -837,7 +852,8 @@ __global__ void quantizeCopyInputToFp8Kernel(T const* q_buf, __nv_fp8_e4m3* quan
     constexpr auto QK_VECS_PER_HEAD = QK_HEAD_DIM * BYTES_PER_ELT / BYTES_PER_LOAD;
     constexpr auto V_VECS_PER_HEAD = V_HEAD_DIM * BYTES_PER_ELT / BYTES_PER_LOAD;
     static_assert(BLOCK_SIZE % QK_VECS_PER_HEAD == 0, "Kernel block should be able to handle entire heads.");
-    static_assert(BLOCK_SIZE % V_VECS_PER_HEAD == 0, "Kernel block should be able to handle entire heads.");
+    static_assert(ABSORPTION_MODE || (BLOCK_SIZE % V_VECS_PER_HEAD) == 0,
+        "Kernel block should be able to handle entire heads in non-absorption mode.");
     constexpr auto QK_TOKENS_PER_BLOCK = BLOCK_SIZE / QK_VECS_PER_HEAD;
     constexpr auto V_TOKENS_PER_BLOCK = BLOCK_SIZE / V_VECS_PER_HEAD;
 
@@ -892,31 +908,34 @@ __global__ void quantizeCopyInputToFp8Kernel(T const* q_buf, __nv_fp8_e4m3* quan
         }
     }
 
-    // Quantize K, both src and dst are contiguous
-    for (int k_token_idx = (threadIdx.x / QK_VECS_PER_HEAD) + blockIdx.x * QK_TOKENS_PER_BLOCK;
-         k_token_idx < k_len_loop_end; k_token_idx += QK_TOKENS_PER_BLOCK * gridDim.x)
+    // Only quantize K and V in non-absorption mode.
+    if constexpr (!ABSORPTION_MODE)
     {
-        if (k_token_idx < total_kv_len)
+        // Quantize K, both src and dst are contiguous
+        for (int k_token_idx = (threadIdx.x / QK_VECS_PER_HEAD) + blockIdx.x * QK_TOKENS_PER_BLOCK;
+             k_token_idx < k_len_loop_end; k_token_idx += QK_TOKENS_PER_BLOCK * gridDim.x)
         {
-            auto const src_k_idx
-                = static_cast<size_t>(k_token_idx) * QK_HEAD_DIM * head_num + head_idx * QK_HEAD_DIM + qk_head_dim_idx;
-            auto const dst_k_idx = src_k_idx;
-            quantCopy<T, ELTS_PER_VEC>(quant_k_buf + dst_k_idx, &k_buf[src_k_idx], quant_scale_qkv_val);
+            if (k_token_idx < total_kv_len)
+            {
+                auto const src_k_idx = static_cast<size_t>(k_token_idx) * QK_HEAD_DIM * head_num
+                    + head_idx * QK_HEAD_DIM + qk_head_dim_idx;
+                auto const dst_k_idx = src_k_idx;
+                quantCopy<T, ELTS_PER_VEC>(quant_k_buf + dst_k_idx, &k_buf[src_k_idx], quant_scale_qkv_val);
+            }
         }
-    }
-
-    // Quantize V, dst V is contiguous, but src V is not contiguous, so we need to calculate the stride
-    size_t const src_v_token_stride = (QK_NOPE_HEAD_DIM + V_HEAD_DIM) * head_num;
-    for (int v_token_idx = (threadIdx.x / V_VECS_PER_HEAD) + blockIdx.x * V_TOKENS_PER_BLOCK;
-         v_token_idx < v_len_loop_end; v_token_idx += V_TOKENS_PER_BLOCK * gridDim.x)
-    {
-        if (v_token_idx < total_kv_len)
+        // Quantize V, dst V is contiguous, but src V is not contiguous, so we need to calculate the stride
+        size_t const src_v_token_stride = (QK_NOPE_HEAD_DIM + V_HEAD_DIM) * head_num;
+        for (int v_token_idx = (threadIdx.x / V_VECS_PER_HEAD) + blockIdx.x * V_TOKENS_PER_BLOCK;
+             v_token_idx < v_len_loop_end; v_token_idx += V_TOKENS_PER_BLOCK * gridDim.x)
         {
-            auto const src_v_idx
-                = static_cast<size_t>(v_token_idx) * src_v_token_stride + head_idx * V_HEAD_DIM + v_head_dim_idx;
-            auto const dst_v_idx
-                = static_cast<size_t>(v_token_idx) * V_HEAD_DIM * head_num + head_idx * V_HEAD_DIM + v_head_dim_idx;
-            quantCopy<T, ELTS_PER_VEC>(quant_v_buf + dst_v_idx, &v_buf[src_v_idx], quant_scale_qkv_val);
+            if (v_token_idx < total_kv_len)
+            {
+                auto const src_v_idx
+                    = static_cast<size_t>(v_token_idx) * src_v_token_stride + head_idx * V_HEAD_DIM + v_head_dim_idx;
+                auto const dst_v_idx
+                    = static_cast<size_t>(v_token_idx) * V_HEAD_DIM * head_num + head_idx * V_HEAD_DIM + v_head_dim_idx;
+                quantCopy<T, ELTS_PER_VEC>(quant_v_buf + dst_v_idx, &v_buf[src_v_idx], quant_scale_qkv_val);
+            }
         }
     }
 }
@@ -927,9 +946,10 @@ void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, c
     dim3 grid(int(tensorrt_llm::common::divUp(params.max_input_seq_len, 32)), params.batch_size, params.head_num + 8);
     auto head_size = params.meta.qk_nope_head_dim;
     applyMLARopeAndAssignQKVKernelOptContext<T, 256, 512, 64, KVCacheBuffer><<<grid, 256, 0, stream>>>(params.q_buf,
-        params.k_buf, params.latent_cache, kv_cache_buffer, params.cos_sin_cache, params.head_num, head_size,
-        params.meta.kv_lora_rank, params.cu_q_seqlens, params.cache_seq_lens, params.max_input_seq_len,
-        params.cache_type, params.quant_scale_kv);
+        params.q_pe, params.k_buf, params.latent_cache, kv_cache_buffer, params.q_pe_ld, params.q_pe_stride,
+        params.cos_sin_cache, params.head_num, head_size, params.meta.kv_lora_rank, params.cu_q_seqlens,
+        params.cache_seq_lens, params.max_input_seq_len, params.cache_type, params.quant_scale_kv,
+        params.absorption_mode);
 }
 
 template <typename T>
@@ -937,30 +957,62 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
 {
     TLLM_CHECK_WITH_INFO(params.cache_type == KvCacheDataType::FP8, "MLA Context: cache_type must be FP8");
     TLLM_CHECK_WITH_INFO(params.q_buf != nullptr, "MLA Context: q_buf must be non-null");
-    TLLM_CHECK_WITH_INFO(params.k_buf != nullptr, "MLA Context: k_buf must be non-null");
-    TLLM_CHECK_WITH_INFO(params.v_buf != nullptr, "MLA Context: v_buf must be non-null");
+    TLLM_CHECK_WITH_INFO(params.absorption_mode || params.k_buf != nullptr,
+        "MLA Context: k_buf must be non-null in non-absorption mode");
+    TLLM_CHECK_WITH_INFO(params.absorption_mode || params.v_buf != nullptr,
+        "MLA Context: v_buf must be non-null in non-absorption mode");
     TLLM_CHECK_WITH_INFO(params.quant_q_buf != nullptr, "MLA Context: quant_q_buf must be non-null");
-    TLLM_CHECK_WITH_INFO(params.quant_k_buf != nullptr, "MLA Context: quant_k_buf must be non-null");
-    TLLM_CHECK_WITH_INFO(params.quant_v_buf != nullptr, "MLA Context: quant_v_buf must be non-null");
+    TLLM_CHECK_WITH_INFO(params.absorption_mode || params.quant_k_buf != nullptr,
+        "MLA Context: quant_k_buf must be non-null in non-absorption mode");
+    TLLM_CHECK_WITH_INFO(params.absorption_mode || params.quant_v_buf != nullptr,
+        "MLA Context: quant_v_buf must be non-null in non-absorption mode");
 
     TLLM_LOG_DEBUG("MLA RoPE Context: Quantizing separate qkv to FP8");
 
     if (params.acc_q_len > 0)
     {
-        constexpr int threads_per_block = 384;
-        dim3 grid(int(tensorrt_llm::common::divUp(total_kv_len, 48)), 1, params.head_num);
+        // The Q tensor has layout of [num_tokens, head_num, 576] in the absorption mode.
+        // Convert Q to FP8 in absorption mode.
+        if (params.absorption_mode)
+        {
+            constexpr int threads_per_block = 288;
+            constexpr int num_tokens_per_block = threads_per_block * 16 / 576 * sizeof(T);
+            dim3 grid(int(tensorrt_llm::common::divUp(total_kv_len, num_tokens_per_block)), 1, params.head_num);
 
-        TLLM_LOG_DEBUG(
-            "Launching quantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d, "
-            "total_kv_len: %d, acc_q_len: %d",
-            grid.x, grid.y, grid.z, threads_per_block, total_kv_len, params.acc_q_len);
+            TLLM_LOG_DEBUG(
+                "Launching quantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d, "
+                "total_kv_len: %d, acc_q_len: %d, absorption_mode: %d",
+                grid.x, grid.y, grid.z, threads_per_block, total_kv_len, params.acc_q_len, params.absorption_mode);
 
-        quantizeCopyInputToFp8Kernel<T, threads_per_block, 128, 64, 128>
-            <<<grid, threads_per_block, 0, stream>>>(params.q_buf, static_cast<__nv_fp8_e4m3*>(params.quant_q_buf),
-                params.k_buf, static_cast<__nv_fp8_e4m3*>(params.quant_k_buf), params.v_buf,
-                static_cast<__nv_fp8_e4m3*>(params.quant_v_buf), params.acc_q_len, total_kv_len, params.quant_scale_qkv,
-                params.bmm1_scale, params.bmm2_scale, params.quant_scale_o, params.dequant_scale_q,
-                params.dequant_scale_kv, params.host_bmm1_scale);
+            quantizeCopyInputToFp8Kernel<T, threads_per_block, 512, 64, 512, true>
+                <<<grid, threads_per_block, 0, stream>>>(params.q_buf, static_cast<__nv_fp8_e4m3*>(params.quant_q_buf),
+                    params.k_buf, static_cast<__nv_fp8_e4m3*>(params.quant_k_buf), params.v_buf,
+                    static_cast<__nv_fp8_e4m3*>(params.quant_v_buf), params.acc_q_len, total_kv_len,
+                    params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale, params.quant_scale_o,
+                    params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale);
+        }
+        else
+        {
+            // The Q or K tensor has layout of [num_tokens, head_num, 192] in the non-absorption mode.
+            // The V tensor has layout of [num_tokens, head_num, 128] in the non-absorption mode.
+            // Convert Q, K, V to FP8 in non-absorption mode.
+
+            constexpr int threads_per_block = 384;
+            constexpr int num_tokens_per_block = threads_per_block * 16 / 192 * sizeof(T);
+            dim3 grid(int(tensorrt_llm::common::divUp(total_kv_len, num_tokens_per_block)), 1, params.head_num);
+
+            TLLM_LOG_DEBUG(
+                "Launching quantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d, "
+                "total_kv_len: %d, acc_q_len: %d, absorption_mode: %d",
+                grid.x, grid.y, grid.z, threads_per_block, total_kv_len, params.acc_q_len, params.absorption_mode);
+
+            quantizeCopyInputToFp8Kernel<T, threads_per_block, 128, 64, 128, false>
+                <<<grid, threads_per_block, 0, stream>>>(params.q_buf, static_cast<__nv_fp8_e4m3*>(params.quant_q_buf),
+                    params.k_buf, static_cast<__nv_fp8_e4m3*>(params.quant_k_buf), params.v_buf,
+                    static_cast<__nv_fp8_e4m3*>(params.quant_v_buf), params.acc_q_len, total_kv_len,
+                    params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale, params.quant_scale_o,
+                    params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale);
+        }
     }
     else
     {

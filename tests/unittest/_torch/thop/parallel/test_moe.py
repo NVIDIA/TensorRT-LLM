@@ -1840,7 +1840,7 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
     reason="The kernel only supports Blackwell. Current SM is %d." %
     getSMVersion(),
 )
-@pytest.mark.parametrize("num_tokens", [1, 1024])
+@pytest.mark.parametrize("num_tokens", [1, 256, 1024])
 @pytest.mark.parametrize("hidden_size", [512])
 @pytest.mark.parametrize("intermediate_size", [512])
 @pytest.mark.parametrize(

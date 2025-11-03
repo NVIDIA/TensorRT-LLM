@@ -85,7 +85,6 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
 def transform_local_topk_and_prepare_pool_view(
     topk_indices: torch.Tensor,
     attn_metadata: "DSAtrtllmAttentionMetadata",
-    kv_cache_manager,
     layer_idx: int,
     is_generation: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -108,6 +107,7 @@ def transform_local_topk_and_prepare_pool_view(
     assert topk_indices.dtype == torch.int32
 
     # Get all layer KV cache pool: [num_blocks, num_layers, kv_factor, blockSize]
+    kv_cache_manager = attn_metadata.kv_cache_manager
     all_layer_kv_pool = kv_cache_manager.get_unique_primary_pool(
     )  # [num_blocks, num_layers, kv_factor, blockSize]
     num_blocks, num_layers, _, _ = all_layer_kv_pool.shape
@@ -287,6 +287,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     # 1. Request-level: Pack multiple small requests into one chunk (up to indexer_max_chunk_size)
     # 2. Intra-request: Split large requests into Q-blocks when seq_len > max_chunk_size
     indexer_max_chunk_size: int
+    # Topk for sparse MLA
+    sparse_mla_topk: int
 
     def __init__(self, *args, **kwargs):
         self.num_sms = tensorrt_llm.deep_gemm.get_num_sms()
@@ -295,6 +297,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.indexer_max_chunk_size = self.sparse_attention_config.indexer_max_chunk_size
         else:
             self.indexer_max_chunk_size = 32768  # Default to 32K tokens for the indexer
+        self.sparse_mla_topk = self.sparse_attention_config.index_topk
 
     def __post_init__(self):
         super().__post_init__()
@@ -1197,9 +1200,17 @@ class DSATrtllmAttention(TrtllmAttention):
         hidden_states: Optional[torch.Tensor] = None,
         qr: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
+        topk_indices: Optional[torch.Tensor] = None,
+        is_generation: bool = True,
         **kwargs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        return self.indexer(q, k, metadata, hidden_states, qr, position_ids)
+        # Transform the local topk indices to global topk indices in paged kv cache
+        topk_indices_global, _ = transform_local_topk_and_prepare_pool_view(
+            topk_indices, metadata, self.layer_idx, is_generation)
+
+        # TODO: Use sparse_attn_indexer to predict the indices for DSA attention
+        # return self.indexer(q, k, metadata, hidden_states, qr, position_ids)
+        return topk_indices_global, None
 
     def sparse_kv_predict(
         self,
