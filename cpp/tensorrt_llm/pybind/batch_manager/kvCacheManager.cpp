@@ -467,7 +467,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
         .def("get_newly_allocated_block_ids", &BaseKVCacheManager::getNewlyAllocatedBlockIds,
             py::call_guard<py::gil_scoped_release>())
         .def("flush_iteration_events", &BaseKVCacheManager::flushIterationEvents,
-            py::call_guard<py::gil_scoped_release>());
+            py::call_guard<py::gil_scoped_release>())
+        .def("refresh_blocks", &BaseKVCacheManager::refreshBlocks, py::call_guard<py::gil_scoped_release>());
 
     py::enum_<tbk::CacheType>(m, "CacheType")
         .value("SELF", tbk::CacheType::kSELF)

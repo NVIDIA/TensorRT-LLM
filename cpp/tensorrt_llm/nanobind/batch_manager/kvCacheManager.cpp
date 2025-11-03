@@ -465,7 +465,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def("get_newly_allocated_block_ids", &BaseKVCacheManager::getNewlyAllocatedBlockIds,
             nb::call_guard<nb::gil_scoped_release>())
         .def("flush_iteration_events", &BaseKVCacheManager::flushIterationEvents,
-            nb::call_guard<nb::gil_scoped_release>());
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("refresh_blocks", &BaseKVCacheManager::refreshBlocks, nb::call_guard<nb::gil_scoped_release>());
 
     nb::bind_vector<CacheBlockIds>(m, "CacheBlockIds")
         .def("__getstate__", [](CacheBlockIds const& v) { return nb::make_tuple(v); })
