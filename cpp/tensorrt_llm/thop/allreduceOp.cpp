@@ -1387,7 +1387,7 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
 
     // Threshold to switch between one-shot and two-shot allreduce kernel
     // Empirical value, MSG size * World size
-    constexpr size_t kOneShotSizeThreshold = 64 * 1024 * 8;
+    constexpr size_t kOneShotSizeThreshold = 16 * 4 * 8192;
 
     if (numTokens * hiddenDim * allreduce_params.nRanks * input.itemsize() <= kOneShotSizeThreshold)
     {
