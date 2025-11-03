@@ -142,6 +142,8 @@ struct KernelParams
     int64_t mNumHiddenEltsO;
     // The total number of pages in the paged-kv memory pool.
     int32_t mNumPagesInMemPool;
+    // The number of tokens per page (used if dynamic numTokensPerPage is enabled).
+    int32_t mNumTokensPerPageLog2;
     // The output scale for FP8 quantization.
     float mOutputScale;
     // The scaling factor for softmax (multiplied by log2 to use faster exp2).
@@ -821,13 +823,21 @@ struct KernelParams
         params.mNumHeadsKv = options.mNumHeadsKv;
         params.mNumHeadsQPerKv = options.mNumHeadsQPerKv;
         params.mNumHiddenEltsO = options.mNumHeadsQ * options.mHeadDimQk;
+        params.mNumTokensPerPageLog2 = 0;
+        if (isPagedKv(options.mQkvLayout))
+        {
+            TLLM_CHECK_WITH_INFO((options.mNumTokensPerPage & (options.mNumTokensPerPage - 1)) == 0,
+                "NumTokensPerPage must be a power of 2");
+            params.mNumTokensPerPageLog2 = static_cast<int32_t>(std::log2(options.mNumTokensPerPage));
+        }
         params.mOutputScale = 1.f;
         params.mScaleSoftmaxLog2 = (1.f / (std::sqrt((float) (options.mHeadDimQk)) * options.mScaleQ)) * M_LOG2E;
         params.mStartTokenIdx = options.mSfStartTokenIdx;
-        params.mUseBlockSparseAttention = options.mUseBlockSparseAttention;
-
-        // The top k value for sparse MLA.
+        // The sparseMlaTopK needs to be a multiple of 4 as we use 16B cpAsync instructions for the indices.
+        TLLM_CHECK_WITH_INFO(
+            !options.mSparseMla || (options.mSparseMlaTopK % 4) == 0, "SparseMlaTopK must be a multiple of 4");
         params.mSparseMlaTopK = options.mSparseMlaTopK;
+        params.mUseBlockSparseAttention = options.mUseBlockSparseAttention;
 
         return params;
     }
