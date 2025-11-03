@@ -2447,8 +2447,7 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
                  marks=pytest.mark.skip_less_device_memory(80000)),
     pytest.param("gemma-3-27b-it",
                  "gemma/gemma-3-27b-it",
-                 marks=(pytest.mark.skip_less_device_memory(80000),
-                        skip_post_blackwell)),
+                 marks=pytest.mark.skip_less_device_memory(80000)),
     pytest.param(
         "Nano-v2-VLM",
         "Nano-v2-VLM",
