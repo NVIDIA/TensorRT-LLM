@@ -143,18 +143,16 @@ class ADEngine(ModelEngine):
         """Initialize the engine with model and sequence information."""
         # NOTE (lucaslie): create a fake Namespace to satisfy PyExecutor requirements...
         # This is not correctly declared in the base ModelEngine class though...
-        self.pytorch_backend_config = SimpleNamespace()
-        self.pytorch_backend_config.print_iter_log = False
-        self.pytorch_backend_config.enable_iter_perf_stats = False
-        self.pytorch_backend_config.enable_iter_req_stats = False
-        self.pytorch_backend_config.stream_interval = 1
-        self.pytorch_backend_config.attention_dp_enable_balance = False
-        self.pytorch_backend_config.attention_dp_time_out_iters = 50
-        self.pytorch_backend_config.attention_dp_batching_wait_iters = 10
-        self.pytorch_backend_config.batch_wait_timeout_ms = 0
-        self.pytorch_backend_config.batch_wait_timeout_iters = 0
-        self.pytorch_backend_config.batch_wait_max_tokens_ratio = 0.0
-        self.pytorch_backend_config.max_num_tokens = seq_info.max_num_tokens
+        self.llm_args = SimpleNamespace()
+        self.llm_args.print_iter_log = False
+        self.llm_args.enable_iter_perf_stats = False
+        self.llm_args.enable_iter_req_stats = False
+        self.llm_args.stream_interval = 1
+        self.llm_args.attention_dp_config = None
+        self.llm_args.batch_wait_timeout_ms = 0
+        self.llm_args.batch_wait_timeout_iters = 0
+        self.llm_args.batch_wait_max_tokens_ratio = 0.0
+        self.llm_args.max_num_tokens = seq_info.max_num_tokens
         self.iter_counter = 0
 
         # NOTE (lucaslie): not a declared base member in the base class; required by PyExecutor...
