@@ -224,6 +224,9 @@ void KVCacheTransferManager::onboard(BlockPtr const& offloadBlock, BlockPtr cons
         mOnboardManager.getStream().wait(mPendingOffloads[offloadBlock->getBlockId()]);
     }
     copyBlock(offloadBlock, block, pools, false, numTokensToCopy, mode, directory);
+    tr::CudaEvent onboardEvent;
+    mOnboardManager.getStream().record(onboardEvent);
+    block->setPendingOnboardEvent(std::move(onboardEvent));
 }
 
 void KVCacheTransferManager::offload(BlockPtr const& block, BlockPtr const& offloadBlock,

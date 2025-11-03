@@ -325,6 +325,26 @@ public:
 
     size_t getHash() const;
 
+    //! \brief Set onboard event to track asynchronous block transfer completion.
+    //! \param event CUDA event to associate with this block (moved into the block)
+    void setPendingOnboardEvent(runtime::CudaEvent&& event)
+    {
+        mPendingOnboardEvent = std::move(event);
+    }
+
+    //! \brief Get the pending onboard event if one exists.
+    //! \return Pointer to the pending event, or nullptr if no event is pending
+    runtime::CudaEvent const* getPendingOnboardEvent() const
+    {
+        return mPendingOnboardEvent ? &mPendingOnboardEvent.value() : nullptr;
+    }
+
+    //! \brief Clear the pending onboard event
+    void clearPendingOnboardEvent()
+    {
+        mPendingOnboardEvent.reset();
+    }
+
 private:
     // Linear ID of block independent of pool
     IdType mBlockId;
@@ -365,6 +385,8 @@ private:
     std::optional<std::chrono::steady_clock::time_point::duration> mExpirationTime;
     // Hash for the event manager
     size_t mHash;
+    // Possible pending event to onboard the block
+    std::optional<runtime::CudaEvent> mPendingOnboardEvent;
 };
 
 class GenerationRequest

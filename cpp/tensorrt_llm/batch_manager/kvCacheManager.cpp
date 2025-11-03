@@ -1483,6 +1483,13 @@ void WindowBlockManager::addSequence(
 
 void WindowBlockManager::addBlockToBeam(BlockPtr& block, GenerationRequest& sequence, SizeType32 beamIdx)
 {
+    if (auto const* onboardEvent = block->getPendingOnboardEvent())
+    {
+        // Make sure block is onboarded before used
+        mBufferManager.getStream().wait(*onboardEvent);
+        block->clearPendingOnboardEvent();
+    }
+
     auto const requestId = sequence.getRequestId();
     block->incRefCount();
     if (sequence.getCacheBlockIds(mWindowSize).at(beamIdx).size() == 0)
