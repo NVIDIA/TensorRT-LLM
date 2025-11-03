@@ -358,6 +358,5 @@ triton_server/test_triton_llm.py::test_mistral_small_3_1_24b_pixtral[TYPE_FP16-T
 accuracy/test_cli_flow.py::TestMinitron4BBase::test_fp8 SKIP (https://nvbugs/5606233)
 examples/test_gpt.py::test_llm_minitron_fp8_with_pseudo_loras[4b] SKIP (https://nvbugs/5606233)
 accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_bf16[multi_gpus_no_cache] SKIP (https://nvbugs/5606266)
-examples/test_llm_api_with_mpi.py::test_llm_api_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/5606268)
 disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[True-False-DeepSeek-V3-Lite-fp8/fp8] SKIP (https://nvbugs/5626197)
 disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[True-True-DeepSeek-V3-Lite-fp8/fp8] SKIP (https://nvbugs/5628952)
