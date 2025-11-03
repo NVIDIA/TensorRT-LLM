@@ -945,8 +945,9 @@ class Indexer(nn.Module):
         k_fp8: torch.Tensor,
         k_scale: torch.Tensor,
         weights: torch.Tensor,
+        use_custom_topk: bool = True,
     ) -> torch.Tensor:
-
+        use_custom_topk = use_custom_topk and self.index_topk == 2048  #@TODO: Do we need to add a warning?
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
         num_ctx_tokens = metadata.num_ctx_tokens
@@ -960,7 +961,8 @@ class Indexer(nn.Module):
             (hidden_states.shape[0], self.index_topk),
             dtype=torch.int32,
             device=hidden_states.device)
-        topk_indices_buffer[:hidden_states.shape[0]] = -1
+        if not use_custom_topk:
+            topk_indices_buffer[:hidden_states.shape[0]] = -1
 
         # Store k_fp8 and k_scale into indexer k cache
         self._update_k_cache(k_fp8, k_scale, metadata)
@@ -979,22 +981,29 @@ class Indexer(nn.Module):
                         chunk.cu_seqlen_ks,
                         chunk.cu_seqlen_ke,
                     )
-                    topk_indices = logits.topk(min(self.index_topk,
-                                                   logits.shape[-1]),
-                                               dim=-1)[1]
-                    topk_indices -= chunk.cu_seqlen_ks[:, None]
+                    if use_custom_topk:
+                        torch.ops.trtllm.indexer_topk_prefill_op(
+                            logits, chunk.cu_seqlen_ks, chunk.cu_seqlen_ke,
+                            topk_indices_buffer[
+                                chunk.token_start:chunk.token_end, :])
+                    else:
+                        topk_indices = logits.topk(min(self.index_topk,
+                                                       logits.shape[-1]),
+                                                   dim=-1)[1]
+                        topk_indices -= chunk.cu_seqlen_ks[:, None]
 
-                    mask_lo = topk_indices >= 0
-                    mask_hi = topk_indices - (chunk.cu_seqlen_ke -
-                                              chunk.cu_seqlen_ks)[:, None] < 0
-                    mask = mask_lo & mask_hi
+                        mask_lo = topk_indices >= 0
+                        mask_hi = topk_indices - (chunk.cu_seqlen_ke -
+                                                  chunk.cu_seqlen_ks)[:,
+                                                                      None] < 0
+                        mask = mask_lo & mask_hi
 
-                    # local indices per sequence
-                    topk_indices = topk_indices.masked_fill(~mask, -1)
+                        # local indices per sequence
+                        topk_indices = topk_indices.masked_fill(~mask, -1)
 
-                    topk_indices_buffer[
-                        chunk.token_start:chunk.token_end, :topk_indices.
-                        shape[-1]] = topk_indices.to(dtype=torch.int32)
+                        topk_indices_buffer[
+                            chunk.token_start:chunk.token_end, :topk_indices.
+                            shape[-1]] = topk_indices.to(dtype=torch.int32)
             else:
                 # Fallback: single-pass indexer prefill (TODO: remove this once chunked prefill is fully tested)
                 cu_seqlen_ks = metadata.cu_seqlen_ks[:num_ctx_tokens]
@@ -1008,20 +1017,25 @@ class Indexer(nn.Module):
                     cu_seqlen_ks,
                     cu_seqlen_ke,
                 )
-                topk_indices = logits.topk(min(self.index_topk,
-                                               logits.shape[-1]),
-                                           dim=-1)[1]
-                topk_indices -= cu_seqlen_ks[:, None]
-                mask_lo = topk_indices >= 0
-                mask_hi = topk_indices - (cu_seqlen_ke - cu_seqlen_ks)[:,
-                                                                       None] < 0
-                mask = mask_lo & mask_hi
+                if use_custom_topk:
+                    torch.ops.trtllm.indexer_topk_prefill_op(
+                        logits, cu_seqlen_ks, cu_seqlen_ke,
+                        topk_indices_buffer[:num_ctx_tokens, :])
+                else:
+                    topk_indices = logits.topk(min(self.index_topk,
+                                                   logits.shape[-1]),
+                                               dim=-1)[1]
+                    topk_indices -= cu_seqlen_ks[:, None]
+                    mask_lo = topk_indices >= 0
+                    mask_hi = topk_indices - (cu_seqlen_ke -
+                                              cu_seqlen_ks)[:, None] < 0
+                    mask = mask_lo & mask_hi
 
-                # local indices per sequence
-                topk_indices = topk_indices.masked_fill(~mask, -1)
-                topk_indices_buffer[:num_ctx_tokens, :topk_indices.
-                                    shape[-1]] = topk_indices.to(
-                                        dtype=torch.int32)
+                    # local indices per sequence
+                    topk_indices = topk_indices.masked_fill(~mask, -1)
+                    topk_indices_buffer[:num_ctx_tokens, :topk_indices.
+                                        shape[-1]] = topk_indices.to(
+                                            dtype=torch.int32)
 
         if has_decode:
             max_seq_len = metadata.kv_cache_manager.max_seq_len
@@ -1058,40 +1072,48 @@ class Indexer(nn.Module):
                     num_generations],  # Only pass generation request block tables
                 metadata.scheduler_metadata_buffer,
                 max_seq_len)
-            # padded
-            positions = torch.arange(
-                max_seq_len,
-                device=q_decode.device).unsqueeze(0).expand(num_gen_tokens, -1)
-            row_indices = torch.arange(num_gen_tokens,
-                                       device=q_decode.device) // next_n
-            next_n_offset = torch.arange(num_gen_tokens,
-                                         device=q_decode.device) % next_n
-            index_end_pos = (
-                metadata.kv_lens_cuda_runtime[num_contexts + row_indices] -
-                next_n + next_n_offset).unsqueeze(1)
 
-            # index_end_pos: [B * N, 1]
-            mask = positions <= index_end_pos
-            # mask: [B * N, L]
-            logits_decode = logits_decode.masked_fill(~mask, float('-inf'))
-            topk_indices_decode = logits_decode.topk(
-                min(self.index_topk, logits_decode.shape[-1]),
-                dim=-1)[1].to(torch.int32)  # [B * N, K]
-            # ensure we don't set indices for the top k
-            # that is out of range(masked already)
-            # this will happen if context length is shorter than K
-            mask_decode = topk_indices_decode <= index_end_pos
+            if use_custom_topk:
+                # Kernel expects kv_lens (total cache length), not seq_lens (new tokens)
+                # This is because rowEnd = seq_len - next_n + offset + 1
+                gen_kv_lens_cuda = metadata.kv_lens_cuda_runtime[
+                    num_contexts:num_contexts + num_generations]
+                torch.ops.trtllm.indexer_topk_decode_op(
+                    logits_decode, gen_kv_lens_cuda,
+                    topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
+                                        num_gen_tokens, :], next_n)
+            else:
+                # padded
+                positions = torch.arange(
+                    max_seq_len, device=q_decode.device).unsqueeze(0).expand(
+                        num_gen_tokens, -1)
+                row_indices = torch.arange(num_gen_tokens,
+                                           device=q_decode.device) // next_n
+                next_n_offset = torch.arange(num_gen_tokens,
+                                             device=q_decode.device) % next_n
+                index_end_pos = (
+                    metadata.kv_lens_cuda_runtime[num_contexts + row_indices] -
+                    next_n + next_n_offset).unsqueeze(1)
+                # index_end_pos: [B * N, 1]
+                mask = positions <= index_end_pos
+                # mask: [B * N, L]
+                logits_decode = logits_decode.masked_fill(~mask, float('-inf'))
+                topk_indices_decode = logits_decode.topk(
+                    min(self.index_topk, logits_decode.shape[-1]),
+                    dim=-1)[1].to(torch.int32)  # [B * N, K]
+                # ensure we don't set indices for the top k
+                # that is out of range(masked already)
+                # this will happen if context length is shorter than K
+                mask_decode = topk_indices_decode <= index_end_pos
 
-            # local indices per sequence
-            topk_indices_decode = topk_indices_decode.masked_fill(
-                ~mask_decode, -1)
-
-            # Store in buffer
-            topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
-                                num_gen_tokens, :topk_indices_decode.
-                                shape[-1]] = topk_indices_decode.to(
-                                    dtype=torch.int32)
-
+                # local indices per sequence
+                topk_indices_decode = topk_indices_decode.masked_fill(
+                    ~mask_decode, -1)
+                # Store in buffer
+                topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
+                                    num_gen_tokens, :topk_indices_decode.
+                                    shape[-1]] = topk_indices_decode.to(
+                                        dtype=torch.int32)
         return topk_indices_buffer
 
     def weight_scale(self, hidden_states: torch.Tensor,
