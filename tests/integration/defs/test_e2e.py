@@ -3502,6 +3502,7 @@ def test_llmapi_generation_logits(llm_venv, model_path,
 
 @skip_pre_blackwell
 @pytest.mark.skip_less_device_memory(189000)
+@pytest.mark.timeout(28800)
 @pytest.mark.parametrize("model_name,model_path,gpu_count", [
     ("DeepSeek-R1-0528", "DeepSeek-R1/DeepSeek-R1-0528", 8),
     ("DeepSeek-R1-0528-FP4", "DeepSeek-R1/DeepSeek-R1-0528-FP4", 4),
