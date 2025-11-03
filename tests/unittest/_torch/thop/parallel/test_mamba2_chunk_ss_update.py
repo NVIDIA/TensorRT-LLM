@@ -362,6 +362,7 @@ def test_mamba2_chunk_scan_selective_state_update(dim, headdim, ngroups, dstate,
                                rtol=1e-2,
                                atol=atol[dtype])
 
+
 @pytest.mark.skip(reason="https://nvbugs/5606178")
 @pytest.mark.parametrize("mamba_chunk_size", [8, 256])
 @pytest.mark.parametrize("seqlens", [
