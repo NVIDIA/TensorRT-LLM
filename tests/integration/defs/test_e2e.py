@@ -2497,6 +2497,10 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
                  "gemma/gemma-3-27b-it",
                  marks=(pytest.mark.skip_less_device_memory(80000),
                         skip_post_blackwell)),
+    pytest.param(
+        "Nano-v2-VLM",
+        "Nano-v2-VLM",
+        marks=pytest.mark.skip(reason="Nano V2 VLM ckpt is not released yet.")),
 ])
 def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                                    modality, use_cuda_graph):
