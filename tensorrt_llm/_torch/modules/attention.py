@@ -963,8 +963,6 @@ class MLA(nn.Module):
         if not config.skip_create_weights_in_init:
             self.create_weights()
 
-        self.indexer = self.mqa.indexer if self.is_dsa else None
-
     def create_weights(self):
         # self.mha/mqa has no weights but has states that are related to quant_config,
         # which could be modified after __init__

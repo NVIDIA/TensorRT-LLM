@@ -630,22 +630,6 @@ class Indexer(nn.Module):
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
-        # Lazy compilation for weight_scale
-        self._weight_scale_compiled = None
-
-    @staticmethod
-    def load_weights_to_kv_a(fused_a: torch.Tensor, weights: dict,
-                             names: list) -> torch.Tensor:
-        prefix = '.'.join(names[:-1])
-        indexer_wk = weights[f"{prefix}.indexer.wk.weight"][:]
-        indexer_weights_proj = weights[
-            f"{prefix}.indexer.weights_proj.weight"][:]
-
-        assert fused_a.dtype == indexer_wk.dtype == indexer_weights_proj.dtype, \
-            "all weights in kv_a_proj_with_mqa module must have matching dtype"
-
-        return torch.cat([fused_a, indexer_wk, indexer_weights_proj], dim=0)
-
     @staticmethod
     def prepare_one_prefill_chunk(
         metadata: DSAtrtllmAttentionMetadata,
@@ -1121,6 +1105,7 @@ class Indexer(nn.Module):
 
         return topk_indices_buffer
 
+    @torch.compile(mode="max-autotune", dynamic=True)
     def weight_scale(self, hidden_states: torch.Tensor,
                      indexer_weights: Optional[torch.Tensor],
                      q_scale: torch.Tensor) -> torch.Tensor:
@@ -1151,12 +1136,11 @@ class Indexer(nn.Module):
         else:
             q, k = maybe_execute_in_parallel(
                 lambda: self.wq_b(qr),
-                lambda: self.wk(hidden_states),
+                lambda: self.k_norm(self.wk(hidden_states)),
                 self.ln_events[0],
                 self.ln_events[1],
                 self.aux_stream,
             )
-            k = self.k_norm(k)
 
         # q/k rope + possible fast_hadamard_transform
         q = q.view(-1, self.n_heads, self.head_dim)
@@ -1198,14 +1182,7 @@ class Indexer(nn.Module):
         q_fp8 = q_fp8.view(-1, self.n_heads, self.head_dim)
         q_scale = q_scale.view(-1, self.n_heads, 1)
 
-        # indexer weight scaling
-        # Lazy compilation on first call
-        if self._weight_scale_compiled is None:
-            self._weight_scale_compiled = torch.compile(self.weight_scale,
-                                                        mode="max-autotune",
-                                                        dynamic=True)
-        weights = self._weight_scale_compiled(hidden_states, indexer_weights,
-                                              q_scale)
+        weights = self.weight_scale(hidden_states, indexer_weights, q_scale)
 
         # Return topk indices buffer for sparse attention [num_tokens, index_topk]
         return self.sparse_attn_indexer(metadata, hidden_states, q_fp8, k_fp8,

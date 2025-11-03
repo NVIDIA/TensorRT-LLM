@@ -353,17 +353,6 @@ class DeepseekV3WeightLoader:
                             f"{'.'.join(names[:-1])}.q_a_proj.weight"][:]
                         fused_a = torch.cat([q_a_proj, fused_a], dim=0)
 
-                    attn_module = all_named_modules[parent_module_name]
-                    # For DeepseekV32, also include indexer.wk and indexer.weights_proj
-                    has_indexer = hasattr(
-                        attn_module,
-                        'indexer') and attn_module.indexer is not None
-                    if has_indexer and attn_module.fuse_a_indexer_k_weight:
-                        from tensorrt_llm._torch.attention_backend.sparse.dsa import \
-                            Indexer
-                        fused_a = Indexer.load_weights_to_kv_a(
-                            fused_a, weights, names)
-
                     if f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight_scale_inv" in weights:
                         fused_a_scale = weights[
                             f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight_scale_inv"]
@@ -394,6 +383,10 @@ class DeepseekV3WeightLoader:
                 elif names[-1] == "self_attn":
                     continue
                 elif names[-1] == "next_layer_layernorm":
+                    continue
+                elif names[-1] == "kv_a_proj_with_mqa_fused":
+                    # For DeepseekV32: skip loading for the fused module (kv_a_proj_with_mqa + indexer k/weights_proj)
+                    # it will be populated in post_load_weights instead
                     continue
                 else:
                     module_weights = filter_weights(name, weights)
@@ -594,24 +587,45 @@ class DeepseekV32Attention(MLA):
                          config=model_config,
                          aux_stream=aux_stream)
 
+        self.indexer = self.mqa.indexer
+
+        # Create fused version if needed (will be populated in post_load_weights)
         if self.fuse_a_indexer_k_weight:
-            # avoid loading indexer.wk and indexer.weights_proj twice
+            if model_config.quant_config.exclude_modules is None:
+                model_config.quant_config.exclude_modules = []
+            model_config.quant_config.exclude_modules.append(
+                "*kv_a_proj_with_mqa_fused*")
+
+            # Note: Creating extra kv_a_proj_with_mqa_fused could duplicate storage until post_load_weights,
+            # It's around ~2GB (~60 × 33MB). Might be acceptable.
+            self.kv_a_proj_with_mqa_fused = DeepseekV3Linear(
+                config.hidden_size,
+                self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim +
+                self.indexer.head_dim + self.indexer.n_heads,
+                bias=False,
+                dtype=config.torch_dtype,
+                quant_config=model_config.get_quant_config(),
+                skip_create_weights_in_init=model_config.
+                skip_create_weights_in_init,
+                use_custom_cublas_mm=True)
+
+    def post_load_weights(self):
+        if self.fuse_a_indexer_k_weight:
+            assert self.kv_a_proj_with_mqa.weight.data.dtype == self.indexer.wk.weight.data.dtype == self.indexer.weights_proj.weight.data.dtype, "all weights in kv_a_proj_with_mqa module must have matching dtype"
+            # Concatenate weights: kv_a_proj_with_mqa + indexer.wk + indexer.weights_proj
+            fused_weight = torch.cat([
+                self.kv_a_proj_with_mqa.weight.data,
+                self.indexer.wk.weight.data,
+                self.indexer.weights_proj.weight.data
+            ],
+                                     dim=0)
+
+            self.kv_a_proj_with_mqa_fused.weight.data.copy_(fused_weight)
+            self.kv_a_proj_with_mqa = self.kv_a_proj_with_mqa_fused
+            # Clean up references to avoid redundant storage
+            self.kv_a_proj_with_mqa_fused = None
             self.indexer.wk = None
             self.indexer.weights_proj = None
-
-        # For DeepseekV32, the kv_a_proj_with_mqa includes:
-        # q_a_proj + kv_a_proj_with_mqa + indexer.wk + indexer.weights_proj
-        self.kv_a_proj_with_mqa = DeepseekV3Linear(
-            config.hidden_size,
-            self.kv_lora_rank + self.qk_rope_head_dim + self.q_lora_rank +
-            (self.indexer.head_dim +
-             self.indexer.n_heads if self.fuse_a_indexer_k_weight else 0),
-            bias=False,
-            dtype=config.torch_dtype,
-            quant_config=model_config.get_quant_config(),
-            skip_create_weights_in_init=model_config.
-            skip_create_weights_in_init,
-            use_custom_cublas_mm=True)
 
 
 class Deepseekv3RoutingImpl():
