@@ -211,8 +211,17 @@ CacheTransBufferManager::CacheTransBufferManager(
     {
         TLLM_CHECK(maxNumTokens.value() % tokensPerBlock == 0);
         auto dataSize = common::getDTypeSize(mDataType);
-        auto kvCacheByteSizePerTokenPerLayer = mCacheManager->getBlockManager().getBlockSize(0) / tokensPerBlock
-            * (mCacheManager->getCacheType() == CacheType::kSELFKONLY ? 1 : 2) * dataSize;
+        SizeType32 kvCacheByteSizePerTokenPerLayer = 0;
+        if (transferIndexerKCache)
+        {
+            kvCacheByteSizePerTokenPerLayer = mCacheManager->getIndexerKCachePool()->getDimension<-1>()
+                * mCacheManager->getIndexerKCachePool()->getDimension<1>() * dataSize / tokensPerBlock;
+        }
+        else
+        {
+            kvCacheByteSizePerTokenPerLayer = mCacheManager->getBlockManager().getBlockSize(0) / tokensPerBlock
+                * (mCacheManager->getCacheType() == CacheType::kSELFKONLY ? 1 : 2);
+        }
         for (auto layerId = 0; layerId < mCacheManager->getBlockManager().getNumLayers(); layerId++)
         {
             auto poolIdx = mCacheManager->getBlockManager().getLayerPoolIdx(layerId);

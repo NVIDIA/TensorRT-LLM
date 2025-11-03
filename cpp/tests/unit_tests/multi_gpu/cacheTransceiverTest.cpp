@@ -986,7 +986,7 @@ protected:
             blockIdx = 0;
             for (auto it = indexerKCacheBlockRange.begin(); it != indexerKCacheBlockRange.end(); ++it)
             {
-                verifyBlockData(*it, blockIdx, llmRequest->getPromptLen(), windowSizes[0], true);
+                verifyBlockData(*it, llmRequest->getPromptLen(), blockIdx, windowSizes[0], true);
                 blockIdx++;
             }
         }
@@ -1089,7 +1089,7 @@ protected:
         bufferManager.getStream().synchronize();
     }
 
-    void verifyBlockData(tensorrt_llm::runtime::ITensor& blockData, int blockId, size_t initial, int windowSize = 0,
+    void verifyBlockData(tensorrt_llm::runtime::ITensor& blockData, size_t initial, int blockId, int windowSize = 0,
         bool isIndexerKCache = false)
     {
         auto const& blockManager = mManager->getBlockManager();
