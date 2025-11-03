@@ -30,10 +30,10 @@ class Eagle3Attention(Attention):
         self,
         model_config: ModelConfig[LlamaConfig],
         layer_idx: Optional[int] = None,
-        eh_proj_before_attn: bool = False,
+        next_layer_regular: bool = False,
     ):
         config = model_config.pretrained_config
-        self._eh_proj_before_attn = eh_proj_before_attn
+        self._next_layer_regular = next_layer_regular
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
@@ -54,7 +54,7 @@ class Eagle3Attention(Attention):
             tp_size = 1
         # Override the QKV projection. The number of input features
         # is twice as big for EAGLE3 draft models.
-        if not self._eh_proj_before_attn:
+        if not self._next_layer_regular:
             self.qkv_proj = Linear(
                 2 * self.hidden_size,
                 tp_size * self.q_size + 2 * tp_size * self.kv_size,
@@ -76,13 +76,14 @@ class Eagle3DecoderLayer(DecoderLayer):
         self,
         model_config: LlamaConfig,
         layer_idx: int = 0,
+        is_first_layer: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         super().__init__()
         config = model_config.pretrained_config
         eagle_config = config.eagle_config if hasattr(config, "eagle_config") else {}
         self.layer_idx = layer_idx
-        self._eh_proj_before_attn = eagle_config.get("eh_proj_before_attn", False)
-        self.self_attn = Eagle3Attention(model_config, layer_idx, self._eh_proj_before_attn)
+        self._next_layer_regular = (eagle_config.get("next_layer_regular", True) and not is_first_layer) or eagle_config.get("eh_proj_before_attn", False)
+        self.self_attn = Eagle3Attention(model_config, layer_idx, self._next_layer_regular)
 
         if config.model_type == "llama4_text":
             inter_size = config.intermediate_size_mlp
@@ -98,7 +99,7 @@ class Eagle3DecoderLayer(DecoderLayer):
             overridden_tp_size=1
             if model_config.mapping.enable_attention_dp else None,
         )
-        if not self._eh_proj_before_attn:
+        if not self._next_layer_regular:
             self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                         eps=config.rms_norm_eps,
                                         dtype=config.torch_dtype)
@@ -122,7 +123,7 @@ class Eagle3DecoderLayer(DecoderLayer):
         residual = hidden_states
 
         hidden_states = self.hidden_norm(hidden_states)
-        if not self._eh_proj_before_attn:
+        if not self._next_layer_regular:
             embeds = self.input_layernorm(embeds)
             hidden_states = torch.cat([embeds, hidden_states], dim=-1)
 
@@ -179,7 +180,7 @@ class Eagle3DraftModel(DecoderModel):
 
         if self.num_layers > 1:
             self.midlayer = nn.ModuleList([
-                Eagle3DecoderLayer(model_config, start_layer_idx + i)
+                Eagle3DecoderLayer(model_config, start_layer_idx + i, i == 0)
                 for i in range(self.num_layers)
             ])
         else:
