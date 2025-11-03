@@ -1296,10 +1296,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_fp8_kv_cache(
         ) and self.quant_config.quant_algo == QuantAlgo.W4A16_AWQ and use_paged_context_fmha:
-            logger.warning(
-                "Disabling Paged context FMHA, as it is not supported with FP8 KV cache, for W4A16 AWQ quantization"
+            raise ValueError(
+                "Paged context FMHA is not supported with FP8 KV cache, for W4A16 AWQ quantization - disable chunked perfill and kv cache reuse"
             )
-            use_paged_context_fmha = False
 
         use_nvfp4_output = False
         if enable_attn_nvfp4_output and self.has_nvfp4 and self.support_nvfp4_output(
