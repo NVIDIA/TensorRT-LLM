@@ -1,6 +1,7 @@
 """Tests for EP sharding transformation."""
 
 from functools import partial
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -10,7 +11,7 @@ from _model_test_utils import MoEOpModel
 
 import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.models.factory import ShardingConfigSource
+from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 from tensorrt_llm._torch.auto_deploy.utils.sharding_utils import (
@@ -156,67 +157,48 @@ def test_sharding_pattern_detection(world_size: int, num_experts: int):
     )
 
 
-class _MockFactoryTP:
-    """Mock factory that returns TP strategy preference (like Mixtral)."""
-
-    def get_sharding_config(self):
-        return {
-            "source": ShardingConfigSource.HUGGINGFACE,
-            "moe_sharding_strategy": "tp",
-            "head_dim": 128,
-            "tp_plan": {},
-        }
-
-
 @pytest.mark.parametrize(
-    "factory_cls,expected_strategy",
+    "model_type,expected_strategy,should_set",
     [
-        (None, "ep"),
-        (_MockFactoryTP, "tp"),
+        ("mixtral", "tp", True),
+        ("qwen", None, False),
     ],
-    ids=["default_ep", "factory_tp_override"],
+    ids=["mixtral_sets_tp", "non_mixtral_no_override"],
 )
-def test_moe_sharding_strategy(factory_cls, expected_strategy):
-    """Test MoE sharding strategy selection logic.
+def test_moe_sharding_strategy(model_type, expected_strategy, should_set):
+    """Test that HF factory sets MOE sharding strategy based on model type.
 
     Parametrized tests verify:
-    1. default_ep: Default MoE sharding strategy is EP (no factory)
-    2. factory_tp_override: Factory can override strategy (e.g., Mixtral uses TP)
+    1. mixtral_sets_tp: Mixtral models set TP strategy in factory config
+    2. non_mixtral_no_override: Non-Mixtral models don't override (use system default)
     """
-    device = "cuda"
-    hidden_size = 32
-    intermediate_size = 16
-    num_experts = 8
-    rank = 0
-    world_size = 2
+    # Create a mock PretrainedConfig for the model type
+    mock_config = MagicMock()
+    mock_config.model_type = model_type
+    mock_config.hidden_size = 32
+    mock_config.num_attention_heads = 2
+    mock_config.num_hidden_layers = 4
 
-    model = MoEOpModel(
-        hidden_size=hidden_size, num_experts=num_experts, intermediate_size=intermediate_size
-    ).to(device=device, dtype=torch.bfloat16)
-    x = model.get_input(device=device, dtype=torch.bfloat16)
+    # Create factory instance (just need a valid model path)
+    factory = AutoModelForCausalLMFactory(model="dummy_model")
 
-    # Create factory instance if provided
-    factory = factory_cls() if factory_cls else None
+    # Call _set_sharding_config with the mocked config
+    factory._set_sharding_config(mock_config)
 
-    # Build config
-    config = {
-        "detect_sharding": {
-            "stage": "sharding",
-            "use_sharding_from_factory": False,
-            "sharding_dims": ["ep"],
-        }
-    }
+    # Verify the factory's sharding config
+    sharding_config = factory.get_sharding_config()
 
-    # Create optimizer and run
-    optimizer = InferenceOptimizer(factory, config)
-    optimizer.shared_config.local_rank = rank
-    optimizer.shared_config.world_size = world_size
-    _ = optimizer(None, torch_export_to_gm(model, args=(x,), clone=True))
-
-    # Verify detected strategy
-    detected = optimizer.shared_config.sharding_config.ep_transforms
-    assert len(detected) > 0, "Should detect at least one MoE node"
-    actual_strategies = [t.strategy for t in detected]
-    assert all(s == expected_strategy for s in actual_strategies), (
-        f"Expected {expected_strategy}, got {actual_strategies}"
-    )
+    if should_set:
+        # Model should set moe_sharding_strategy in factory config
+        assert "moe_sharding_strategy" in sharding_config, (
+            f"{model_type} should set moe_sharding_strategy"
+        )
+        assert sharding_config["moe_sharding_strategy"] == expected_strategy, (
+            f"{model_type} should use {expected_strategy} strategy, "
+            f"got {sharding_config.get('moe_sharding_strategy')}"
+        )
+    else:
+        # Model should NOT set moe_sharding_strategy (will use system default)
+        assert "moe_sharding_strategy" not in sharding_config, (
+            f"{model_type} should not override moe_sharding_strategy"
+        )

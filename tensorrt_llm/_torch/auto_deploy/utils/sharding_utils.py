@@ -878,7 +878,7 @@ class EPShardingInfo(ShardingTransformInfo):
         )
         if self.strategy == "tp":
             _insert_tp_sharded_moe(gm, node, self.rank, self.world_size, [])
-        else:  # "ep"
+        else:  # "ep" or undefined
             _insert_ep_sharded_moe(gm, node, self.rank, self.world_size, [])
 
 
@@ -914,7 +914,7 @@ class FP8EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
         )
         if self.strategy == "tp":
             _insert_tp_sharded_moe(gm, node, self.rank, self.world_size, self.scale_names())
-        else:  # "ep"
+        else:  # "ep" or undefined
             _insert_ep_sharded_moe(gm, node, self.rank, self.world_size, self.scale_names())
 
 
@@ -936,7 +936,7 @@ class NVFP4EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
         )
         if self.strategy == "tp":
             _insert_tp_sharded_moe(gm, node, self.rank, self.world_size, self.scale_names())
-        else:  # "ep"
+        else:  # "ep" or undefined
             _insert_ep_sharded_moe(gm, node, self.rank, self.world_size, self.scale_names())
 
 
