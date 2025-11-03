@@ -283,7 +283,7 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::memset_expert_ids")
     def _(experts_ids: torch.Tensor, recv_rank_count_cumsum: torch.Tensor,
-          max_token_count_per_rank: int, top_k: int, slot_count: int,
+          max_token_count_per_rank: int, top_k: int, invalid_expert_id: int,
           ep_size: int):
         pass
 

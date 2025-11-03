@@ -392,6 +392,8 @@ llm_perf_nim:
   #trt backend
   - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp8-bench-float8-input_output_len:128,128-gpus:8]
   - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp8-bench-float8-input_output_len:512,32-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp8-bench-float8-maxbs:512-maxnt:2048-input_output_len:500,2000-reqs:400-con:200-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp8-bench-float8-maxbs:512-maxnt:2048-input_output_len:500,2000-reqs:400-con:200-gpus:8-extra]
   - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp8-bench-streaming-float8-maxbs:16-input_output_len:512,32-gpus:8]
   - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct-bench-bfloat16-maxbs:16-maxnt:5000-input_output_len:5000,500-quant:fp8-reqs:8-con:1-gpus:8]
   - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct-bench-bfloat16-maxbs:16-maxnt:5000-input_output_len:5000,500-quant:fp8-reqs:64-con:250-gpus:8]
