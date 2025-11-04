@@ -4,7 +4,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 
 from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
-from tensorrt_llm._utils import get_sm_version, local_mpi_size
+from tensorrt_llm._utils import is_sm_100f, local_mpi_size
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -361,7 +361,7 @@ class WideEPMoE(MoE):
             if self.quant_config.layer_quant_mode.has_fp8_qdq():
                 return FP8QDQFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_fp8_block_scales():
-                if get_sm_version() == 100:
+                if is_sm_100f():
                     return DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm()
                 else:
                     return DeepSeekFP8BlockScalesFusedMoEMethod()

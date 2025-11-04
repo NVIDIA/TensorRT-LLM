@@ -941,6 +941,7 @@ exclude = [
     "tests/integration/defs/perf/diff_tools.py",
     "tests/integration/defs/perf/gpu_clock_lock.py",
     "tests/integration/defs/perf/misc.py",
+    "tests/integration/defs/perf/open_search_db_utils.py",
     "tests/integration/defs/perf/pytorch_model_config.py",
     "tests/integration/defs/perf/sample_options_config.py",
     "tests/integration/defs/perf/sampler_options_config.py",

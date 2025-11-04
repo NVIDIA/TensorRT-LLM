@@ -7,8 +7,8 @@ gpus_per_node=${1}
 numa_bind=${2}
 ctx_nodes=${3}  # Number of nodes needed for ctx workers
 gen_nodes=${4}  # Number of nodes needed for gen workers
-ctx_tp_size=${5}  # Tensor parallel size for ctx workers
-gen_tp_size=${6}  # Tensor parallel size for gen workers
+ctx_world_size=${5}  # World size for ctx workers
+gen_world_size=${6}  # World size for gen workers
 
 # Worker configuration
 num_ctx_servers=${7}
@@ -47,8 +47,8 @@ echo "  gpus_per_node: ${gpus_per_node}"
 echo "  numa_bind: ${numa_bind}"
 echo "  ctx_nodes: ${ctx_nodes}"
 echo "  gen_nodes: ${gen_nodes}"
-echo "  ctx_tp_size: ${ctx_tp_size}"
-echo "  gen_tp_size: ${gen_tp_size}"
+echo "  ctx_world_size: ${ctx_world_size}"
+echo "  gen_world_size: ${gen_world_size}"
 echo
 echo "Worker Configuration:"
 echo "  num_ctx_servers: ${num_ctx_servers}"
@@ -123,7 +123,7 @@ if [ -d "${trtllm_repo}" ]; then
 
     echo "Installing TensorRT-LLM..."
     if ! srun --container-name=${container_name} \
-        --container-mounts=${container_mount} \
+        --container-mounts=${container_mount} --no-container-mount-home \
         --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
         bash -c "cd ${trtllm_repo} && pip install -e ." \
         &> ${full_logdir}/install.log; then
@@ -167,7 +167,7 @@ echo "ctx_nodes_num_in_single_server: ${ctx_nodes_num_in_single_server}"
 echo "Starting gen workers..."
 for i in $(seq 0 $((num_gen_servers - 1))); do
     srun -l -N ${gen_nodes_num_in_single_server} \
-        --ntasks=${gen_tp_size} \
+        --ntasks=$((gen_world_size)) \
         --ntasks-per-node=${gpus_per_node} \
         --container-image=${container_image} \
         --container-name=${container_name} \
@@ -182,7 +182,7 @@ done
 echo "Starting ctx workers..."
 for i in $(seq 0 $((num_ctx_servers - 1))); do
     srun -l -N ${ctx_nodes_num_in_single_server} \
-        --ntasks=${ctx_tp_size} \
+        --ntasks=$((ctx_world_size)) \
         --ntasks-per-node=${gpus_per_node} \
         --container-image=${container_image} \
         --container-name=${container_name} \

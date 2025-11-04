@@ -266,7 +266,6 @@ def create_py_executor(
 
     if mm_encoder_only:
         llm_args.mm_encoder_only = True
-        llm_args.load_format = LoadFormat.VISION_ONLY
         llm_args.disable_overlap_scheduler = True
 
         # Disable overlap scheduler for multimodal encoder-only mode
