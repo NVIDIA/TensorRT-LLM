@@ -283,8 +283,6 @@ def test_moe_unpermute(dtype: str, num_tokens: int, top_k: int, tile_size: int):
 @pytest.mark.parametrize("top_k", [1, 2, 8])
 @pytest.mark.parametrize("num_tokens", [128, 515, 1024, 8192])
 def test_nvfp4_grouped_gemm_blackwell(num_tokens: int, top_k: int, ep_size: int, tile_size: int):
-    torch.manual_seed(516)
-
     sf_vec_size = 16
     hidden_size = 4096
     inter_size = 8192
@@ -308,8 +306,8 @@ def test_nvfp4_grouped_gemm_blackwell(num_tokens: int, top_k: int, ep_size: int,
 
     num_non_exiting_tiles = torch.tensor([num_valid_tiles], dtype=torch.int32, device="cuda")
     tile_idx_to_group_idx = torch.empty(max_num_tiles, dtype=torch.int32)
-    # TODO: Fix this.
-    tile_idx_to_group_idx.fill_(0)
+    # Note: Fill -2e9 for invalid tiles.
+    tile_idx_to_group_idx.fill_(-2e9)
     tile_idx = 0
     for expert_idx in range(num_local_experts):
         for i in range(num_tiles_per_expert[expert_idx].item()):
