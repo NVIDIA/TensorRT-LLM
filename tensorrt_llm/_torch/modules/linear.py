@@ -29,7 +29,7 @@ from ..._utils import is_sm_100f
 from ...models.modeling_utils import QuantConfig
 from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-from ..utils import Fp4QuantizedTensor
+from ..utils import Fp4QuantizedTensor, unswizzle_sf
 
 
 class WeightMode(str, enum.Enum):
@@ -746,49 +746,6 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
 
 class NVFP4LinearMethod(LinearMethodBase):
 
-    def weight_and_scale_maybe_pad(self,
-                                   module: Linear,
-                                   weight_scale: torch.Tensor,
-                                   row_alignment: int = 32,
-                                   col_alignment: int = 16) -> torch.Tensor:
-        """
-        Pad weight and weight_scale tensors to meet torch trtllm NVFP4 GEMM alignment requirements.
-
-        Args:
-            module: Linear module whose weight will be padded in-place
-            weight_scale: Weight scaling factors to pad
-            row_alignment: Required row alignment (default: 32)
-            col_alignment: Required column alignment (default: 16)
-
-        Returns:
-            Padded weight_scale tensor
-
-        Side effects:
-            Modifies module.weight Parameter in-place
-        """
-        # Pad weight to meet NVFP4 GEMM kernel alignment requirements
-        row_pad_size = (row_alignment - module.weight.size(0)) % row_alignment
-        col_pad_size = (col_alignment - module.weight.size(1)) % col_alignment
-        module.weight = Parameter(F.pad(module.weight,
-                                        (0, col_pad_size, 0, row_pad_size),
-                                        mode='constant',
-                                        value=0),
-                                  requires_grad=False)
-        weight_col_size = module.weight.size(1)
-        assert (
-            weight_col_size * 2
-        ) % module.scaling_vector_size == 0, f"weight column size after padding {weight_col_size} must be divisible by scaling_vector_size {module.scaling_vector_size}"
-        # Pad weight_scale to match padded weight dimensions
-        # Factor of 2 accounts for NVFP4 packing (2 FP4 values per byte)
-        if row_pad_size != 0 or col_pad_size != 0:
-            weight_scale = F.pad(weight_scale,
-                                 (0, (col_pad_size * 2) //
-                                  module.scaling_vector_size, 0, row_pad_size),
-                                 mode='constant',
-                                 value=0)
-
-        return weight_scale
-
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
         module.scaling_vector_size = 16
@@ -937,7 +894,6 @@ class NVFP4LinearMethod(LinearMethodBase):
 
         assert len(weights) == 1
         weight_scale = weight_scale[0]
-        weight_scale = self.weight_and_scale_maybe_pad(module, weight_scale)
         # Swizzle weight scale
         weight_scale = torch.ops.trtllm.block_scale_interleave(weight_scale)
 
@@ -952,8 +908,6 @@ class NVFP4LinearMethod(LinearMethodBase):
                                       weights: List[Dict]) -> None:
         q_weight, k_weight, v_weight = load_weights_fused_qkv_helper(
             module, weights)
-        fused_weight = torch.cat((q_weight, k_weight, v_weight))
-        copy_weight(module.weight, fused_weight)
 
         input_scale, weight_scales, alpha = self.load_weight_scales(
             weights,
@@ -962,12 +916,13 @@ class NVFP4LinearMethod(LinearMethodBase):
             tp_mode=module.tp_mode)
         # Swizzle weight scales after concatenation
         weight_scale = torch.cat(weight_scales, 0)
-        weight_scale = self.weight_and_scale_maybe_pad(module, weight_scale)
         weight_scale = torch.ops.trtllm.block_scale_interleave(weight_scale)
         copy_weight(module.input_scale, input_scale)
         copy_weight(module.weight_scale, weight_scale)
         copy_weight(module.alpha, alpha)
         module.scalar_alpha = alpha.item()
+        fused_weight = torch.cat((q_weight, k_weight, v_weight))
+        copy_weight(module.weight, fused_weight)
 
         # Load k and v scales, used for NVFP4 KV cache
         k_scale, v_scale = self.load_kv_scales(weights)
@@ -999,12 +954,53 @@ class NVFP4LinearMethod(LinearMethodBase):
             tp_mode=module.tp_mode)
         # Swizzle weight scales after concatenation
         weight_scale = torch.cat(weight_scales, 0)
-        weight_scale = self.weight_and_scale_maybe_pad(module, weight_scale)
         weight_scale = torch.ops.trtllm.block_scale_interleave(weight_scale)
         copy_weight(module.input_scale, input_scale)
         copy_weight(module.weight_scale, weight_scale)
         copy_weight(module.alpha, alpha)
         module.scalar_alpha = alpha.item()
+
+    def post_load_weights(self, module: Linear):
+        super().post_load_weights(module)
+        """
+        Pad weight and weight_scale tensors to meet torch trtllm NVFP4 GEMM alignment requirements.
+
+        Args:
+            row_alignment: Required row alignment (default: 32)
+            col_alignment: Required column alignment (default: 16)
+        """
+        row_alignment, col_alignment = 32, 16
+        row_pad_size = (row_alignment - module.weight.size(0)) % row_alignment
+        col_pad_size = (col_alignment - module.weight.size(1)) % col_alignment
+        if row_pad_size != 0 or col_pad_size != 0:
+            # Pad weight to meet NVFP4 GEMM kernel alignment requirements
+            module.weight = Parameter(F.pad(module.weight,
+                                            (0, col_pad_size, 0, row_pad_size),
+                                            mode='constant',
+                                            value=0),
+                                      requires_grad=False)
+            weight_col_size = module.weight.size(1)
+            assert (
+                weight_col_size * 2
+            ) % module.scaling_vector_size == 0, f"weight column size after padding {weight_col_size} must be divisible by scaling_vector_size {module.scaling_vector_size}"
+            # Pad weight_scale to match padded weight dimensions
+            # Padding should be performed on unswizzled weight_scale tensor
+            scale_rows = fp4_utils.pad_up(module.out_features, 128)
+            scale_cols = fp4_utils.pad_up(
+                module.in_features // module.scaling_vector_size, 4)
+            weight_scale_unswizzle = unswizzle_sf(module.weight_scale.data,
+                                                  scale_rows, scale_cols,
+                                                  module.scaling_vector_size)
+            weight_scale_unswizzle_pad = F.pad(
+                weight_scale_unswizzle,
+                (0, (col_pad_size * 2) // module.scaling_vector_size, 0,
+                 row_pad_size),
+                mode='constant',
+                value=0)
+            module.weight_scale = Parameter(
+                torch.ops.trtllm.block_scale_interleave(
+                    weight_scale_unswizzle_pad),
+                requires_grad=False)
 
 
 class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
