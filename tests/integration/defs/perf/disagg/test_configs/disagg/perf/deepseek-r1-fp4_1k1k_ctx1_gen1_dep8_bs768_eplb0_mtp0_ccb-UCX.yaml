@@ -6,8 +6,8 @@ metadata:
   - GB200
   - GB300
   script_file: disaggr_torch.slurm
-  benchmark_type: 8k1k
-  config_index: 8
+  benchmark_type: 1k1k
+  config_index: -1
 slurm:
   script_file: disaggr_torch.slurm
   partition: <partition>
@@ -22,14 +22,14 @@ benchmark:
   multi_round: 8
   benchmark_ratio: 0.8
   streaming: true
-  concurrency_list: 1 2 4 8 18
-  input_length: 8192
+  concurrency_list: '6144'
+  input_length: 1024
   output_length: 1024
   dataset_file: <dataset_file>
 hardware:
   gpus_per_node: 4
   num_ctx_servers: 1
-  num_gen_servers: 3
+  num_gen_servers: 1
 environment:
   container_mount: <container_mount>
   container_image: <container_image>
@@ -50,11 +50,13 @@ worker_config:
   gen:
     tensor_parallel_size: 8
     moe_expert_parallel_size: 8
-    enable_attention_dp: false
+    enable_attention_dp: true
+    enable_lm_head_tp_in_adp: true
     pipeline_parallel_size: 1
-    max_batch_size: 16
-    max_num_tokens: 64
-    max_seq_len: 9419
+    context_parallel_size: 1
+    max_batch_size: 768
+    max_num_tokens: 768
+    max_seq_len: 2068
     cuda_graph_config:
       enable_padding: true
       batch_sizes:
@@ -69,29 +71,25 @@ worker_config:
       - 256
       - 512
       - 768
-      - 1024
-      - 2048
     print_iter_log: true
     kv_cache_config:
       enable_block_reuse: false
-      free_gpu_memory_fraction: 0.7
+      free_gpu_memory_fraction: 0.8
       dtype: fp8
     moe_config:
-      backend: TRTLLM
+      backend: CUTLASS
+      use_low_precision_moe_combine: true
     cache_transceiver_config:
-      max_tokens_in_buffer: 8448
-      backend: NIXL
-    stream_interval: 20
+      max_tokens_in_buffer: 16384
+      backend: UCX
+    stream_interval: 100
     num_postprocess_workers: 4
-    speculative_config:
-      decoding_type: MTP
-      num_nextn_predict_layers: 3
-    allreduce_strategy: MNNVL
   ctx:
-    max_batch_size: 1
-    max_num_tokens: 8448
-    max_seq_len: 9419
+    max_batch_size: 16
+    max_num_tokens: 16896
+    max_seq_len: 2044
     tensor_parallel_size: 4
+    context_parallel_size: 1
     moe_expert_parallel_size: 4
     enable_attention_dp: true
     pipeline_parallel_size: 1
@@ -103,8 +101,5 @@ worker_config:
       free_gpu_memory_fraction: 0.75
       dtype: fp8
     cache_transceiver_config:
-      max_tokens_in_buffer: 8448
-      backend: NIXL
-    speculative_config:
-      decoding_type: MTP
-      num_nextn_predict_layers: 3
+      max_tokens_in_buffer: 16384
+      backend: UCX

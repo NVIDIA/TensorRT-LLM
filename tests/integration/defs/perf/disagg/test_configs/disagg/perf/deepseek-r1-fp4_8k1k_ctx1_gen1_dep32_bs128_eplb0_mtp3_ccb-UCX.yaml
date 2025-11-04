@@ -6,8 +6,8 @@ metadata:
   - GB200
   - GB300
   script_file: disaggr_torch.slurm
-  benchmark_type: 8k1k
-  config_index: 8
+  benchmark_type: 1k1k
+  config_index: -1
 slurm:
   script_file: disaggr_torch.slurm
   partition: <partition>
@@ -17,19 +17,19 @@ slurm:
   extra_args: "--gres=gpu:4"
   numa_bind: true
 benchmark:
-  mode: e2e
+  mode: gen_only
   use_nv_sa_benchmark: true
-  multi_round: 8
+  multi_round: 1
   benchmark_ratio: 0.8
   streaming: true
-  concurrency_list: 1 2 4 8 18
+  concurrency_list: '1024'
   input_length: 8192
   output_length: 1024
   dataset_file: <dataset_file>
 hardware:
   gpus_per_node: 4
   num_ctx_servers: 1
-  num_gen_servers: 3
+  num_gen_servers: 1
 environment:
   container_mount: <container_mount>
   container_image: <container_image>
@@ -48,13 +48,15 @@ accuracy:
   model_args_extra: num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=1200,max_gen_toks=256,max_length=4096
 worker_config:
   gen:
-    tensor_parallel_size: 8
-    moe_expert_parallel_size: 8
-    enable_attention_dp: false
+    tensor_parallel_size: 32
+    moe_expert_parallel_size: 32
+    context_parallel_size: 1
+    enable_attention_dp: true
+    enable_lm_head_tp_in_adp: true
     pipeline_parallel_size: 1
-    max_batch_size: 16
-    max_num_tokens: 64
-    max_seq_len: 9419
+    max_batch_size: 128
+    max_num_tokens: 512
+    max_seq_len: 9256
     cuda_graph_config:
       enable_padding: true
       batch_sizes:
@@ -63,35 +65,45 @@ worker_config:
       - 4
       - 8
       - 16
+      - 24
       - 32
+      - 40
+      - 48
+      - 56
       - 64
+      - 72
+      - 80
+      - 88
+      - 96
+      - 104
+      - 112
+      - 120
       - 128
-      - 256
-      - 512
-      - 768
-      - 1024
-      - 2048
     print_iter_log: true
     kv_cache_config:
       enable_block_reuse: false
-      free_gpu_memory_fraction: 0.7
+      free_gpu_memory_fraction: 0.75
       dtype: fp8
     moe_config:
-      backend: TRTLLM
+      backend: CUTEDSL
+      use_low_precision_moe_combine: true
+      load_balancer:
+        num_slots: 288
+        layer_updates_per_iter: 1
     cache_transceiver_config:
-      max_tokens_in_buffer: 8448
-      backend: NIXL
-    stream_interval: 20
+      max_tokens_in_buffer: 16384
+      backend: UCX
+    stream_interval: 100
     num_postprocess_workers: 4
     speculative_config:
       decoding_type: MTP
       num_nextn_predict_layers: 3
-    allreduce_strategy: MNNVL
   ctx:
-    max_batch_size: 1
-    max_num_tokens: 8448
-    max_seq_len: 9419
+    max_batch_size: 2
+    max_num_tokens: 16896
+    max_seq_len: 9256
     tensor_parallel_size: 4
+    context_parallel_size: 1
     moe_expert_parallel_size: 4
     enable_attention_dp: true
     pipeline_parallel_size: 1
@@ -103,8 +115,8 @@ worker_config:
       free_gpu_memory_fraction: 0.75
       dtype: fp8
     cache_transceiver_config:
-      max_tokens_in_buffer: 8448
-      backend: NIXL
+      max_tokens_in_buffer: 16384
+      backend: UCX
     speculative_config:
       decoding_type: MTP
       num_nextn_predict_layers: 3

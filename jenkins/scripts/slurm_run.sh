@@ -39,26 +39,11 @@ if [ $SLURM_PROCID -eq 0 ]; then
     fi
 fi
 
-if [ $SLURM_LOCALID -eq 0 ]; then
-    wget -nv $llmTarfile
-    tar -zxf $tarName
-    which python3
-    python3 --version
-    apt-get install -y libffi-dev
-    nvidia-smi && nvidia-smi -q && nvidia-smi topo -m
-    if [[ $pytestCommand == *--run-ray* ]]; then
-        pip3 install --retries 10 ray[default]
-    fi
-    cd $llmSrcNode && pip3 install --retries 10 -r requirements-dev.txt
-    cd $resourcePathNode &&  pip3 install --retries 10 --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl
-    gpuUuids=$(nvidia-smi -q | grep "GPU UUID" | awk '{print $4}' | tr '\n' ',' || true)
-    hostNodeName="${HOST_NODE_NAME:-$(hostname -f || hostname)}"
-    echo "HOST_NODE_NAME = $hostNodeName ; GPU_UUIDS = $gpuUuids ; STAGE_NAME = $stageName"
-    touch install_lock.lock
-else
-    while [ ! -f install_lock.lock ]; do
-        sleep 5
-    done
+# Aggregated mode will run install together with pytest in slurm_run.sh
+# Disaggregated mode will run install separately in slurm_install.sh
+if [[ "$stageName" != *Disagg* ]]; then
+    source "$(dirname "${BASH_SOURCE[0]}")/slurm_install.sh"
+    slurm_install_setup
 fi
 
 if [[ "$stageName" == *GB200* ]]; then
@@ -130,4 +115,10 @@ if [ $SLURM_PROCID -eq 0 ] && [ "$perfMode" = "true" ] && [[ "$stageName" != *Pe
         --output_path $stageName/report.pdf \
         --files $stageName/perf_script_test_results.csv \
         $basePerfPath
+fi
+
+if [ $SLURM_PROCID -eq 0 ] && [ "$perfMode" = "true" ] && [[ "$stageName" == *Perf-Sanity* ]]; then
+    echo "Check Perf-Sanity Result"
+    python3 $llmSrcNode/tests/integration/defs/perf/perf_regression_check.py \
+        $jobWorkspace
 fi
