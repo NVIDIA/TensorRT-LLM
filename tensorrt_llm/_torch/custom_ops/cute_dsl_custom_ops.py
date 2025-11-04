@@ -1,4 +1,4 @@
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -46,7 +46,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             if get_sm_version() != 100:
                 raise ValueError(
-                    f"SM version {get_sm_version()} is not supported for CuteDSLNVFP4BlackwellLinear, it only supports SM 100"
+                    f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100"
                 )
 
         # rewrite the hash function because the value of self.alpha doesn't affect the tactic.
@@ -337,6 +337,191 @@ if IS_CUTLASS_DSL_AVAILABLE:
         ret = mat_a.new_empty(shape, dtype=torch.bfloat16)
         return ret
 
+    class Sm100BlockScaledPersistentGroupedGemmRunner(TunableRunner):
+        kernel_dict = dict()
+        tuning_config = TuningConfig(
+            dynamic_tensor_specs=(DynamicTensorSpec(
+                0, 0, get_last_power_of_2_num_tokens_buckets,
+                last_positive_power_of_2), ),
+            constraint_specs=(ConstraintSpec(2, 0, fp4_scale_infer_shape), ),
+        )
+
+        def __init__(self,
+                     output_dtype: torch.dtype,
+                     tile_size: int = 128,
+                     scaling_vector_size: int = 16):
+            super().__init__()
+            self.output_dtype = output_dtype
+            self.tile_size = tile_size
+            self.scaling_vector_size = scaling_vector_size
+            assert output_dtype == torch.bfloat16
+
+            if get_sm_version() != 100:
+                raise ValueError(
+                    f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100"
+                )
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+            **kwargs,
+        ) -> List[Tuple[int, int]]:
+            input, weight = inputs[:2]
+            m, k = input.size(0), input.size(1) * 2
+            l, n = weight.size(0), weight.size(1)
+
+            # TODO: Add full shmoo
+            mma_tiler_mn_candidates = [(128, 128)]
+            cluster_shape_mn_candidates = [(1, 1)]
+
+            valid_tactics = []
+            for mma_tiler_mn in mma_tiler_mn_candidates:
+                for cluster_shape_mn in cluster_shape_mn_candidates:
+                    if Sm100BlockScaledPersistentGroupedGemmKernel.can_implement(
+                            ab_dtype=cutlass.Float4E2M1FN,
+                            sf_dtype=cutlass.Float8E4M3FN,
+                            sf_vec_size=self.scaling_vector_size,
+                            acc_dtype=cutlass.Float32,
+                            c_dtype=cutlass.BFloat16,
+                            use_2cta_instrs=False,
+                            mma_tiler_mn=mma_tiler_mn,
+                            cluster_shape_mn=cluster_shape_mn,
+                            m=m,
+                            n=n,
+                            k=k,
+                            l=l,
+                            a_major="k",
+                            b_major="k",
+                            c_major="n",
+                            m_aligned=self.tile_size,
+                    ):
+                        valid_tactics.append((mma_tiler_mn, cluster_shape_mn))
+
+            assert len(valid_tactics) > 0
+            return valid_tactics
+
+        def forward(self, inputs: List[torch.Tensor],
+                    tactic: Optional[tuple]) -> torch.Tensor:
+            if isinstance(tactic, tuple):
+                mma_tiler_mn, cluster_shape_mn = tactic
+            else:
+                mma_tiler_mn, cluster_shape_mn = [(128, 128), (1, 1)]
+
+            a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, num_non_exiting_tiles = inputs
+            assert a.dtype == torch.float4_e2m1fn_x2
+            assert a.dim() == 2
+            assert b.dtype == torch.float4_e2m1fn_x2
+            assert b.dim() == 3
+            assert a_sf.dtype == torch.uint8
+            assert a_sf.dim() == 1
+            assert b_sf.dtype == torch.uint8
+            assert b_sf.dim() == 3
+            assert alpha.dtype == torch.float32
+            assert alpha.dim() == 1
+
+            m, k = a.size(0), a.size(1) * 2
+            l, n = b.size(0), b.size(1)
+            scale_k = k // self.scaling_vector_size
+            num_tiles = m // self.tile_size
+            assert b.size(2) * 2 == k
+            assert m % self.tile_size == 0
+            assert k % (self.scaling_vector_size * 4) == 0
+            assert a_sf.size(0) == m * scale_k
+            assert b_sf.size(0) == l
+            assert b_sf.size(1) == n
+            assert b_sf.size(2) == scale_k
+            assert alpha.size(0) == l
+
+            assert tile_idx_to_group_idx.dtype == torch.int32
+            assert tile_idx_to_group_idx.size() == (num_tiles, )
+            assert num_non_exiting_tiles.dtype == torch.int32
+            assert num_non_exiting_tiles.size() == (1, )
+
+            c = torch.empty(m, n, dtype=self.output_dtype, device=a.device)
+
+            a_ptr = make_ptr(cutlass.Float4E2M1FN,
+                             a.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=32)
+            b_ptr = make_ptr(cutlass.Float4E2M1FN,
+                             b.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=32)
+            a_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                a_sf.data_ptr(),
+                                cute.AddressSpace.gmem,
+                                assumed_align=16)
+            b_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                b_sf.data_ptr(),
+                                cute.AddressSpace.gmem,
+                                assumed_align=16)
+            alpha_ptr = make_ptr(cutlass.Float32, alpha.data_ptr(),
+                                 cute.AddressSpace.gmem)
+            tile_idx_to_group_idx_ptr = make_ptr(
+                cutlass.Int32, tile_idx_to_group_idx.data_ptr(),
+                cute.AddressSpace.gmem)
+            num_non_exiting_tiles_ptr = make_ptr(
+                cutlass.Int32, num_non_exiting_tiles.data_ptr(),
+                cute.AddressSpace.gmem)
+            c_ptr = make_ptr(cutlass.BFloat16,
+                             c.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=16)
+
+            torch_stream = torch.cuda.current_stream()
+            stream = cuda.CUstream(torch_stream.cuda_stream)
+
+            cache_key = (self.tile_size, self.scaling_vector_size, mma_tiler_mn,
+                         cluster_shape_mn)
+            if cache_key not in self.__class__.kernel_dict:
+                gemm = Sm100BlockScaledPersistentGroupedGemmKernel(
+                    sf_vec_size=self.scaling_vector_size,
+                    acc_dtype=cutlass.Float32,
+                    use_2cta_instrs=False,
+                    mma_tiler_mn=mma_tiler_mn,
+                    cluster_shape_mn=cluster_shape_mn,
+                )
+
+                compiled_gemm = cute.compile(
+                    gemm.wrapper,
+                    a_ptr,
+                    b_ptr,
+                    a_sf_ptr,
+                    b_sf_ptr,
+                    c_ptr,
+                    alpha_ptr,
+                    tile_idx_to_group_idx_ptr,
+                    num_non_exiting_tiles_ptr,
+                    m,
+                    n,
+                    k,
+                    l,
+                    tile_size=self.tile_size,
+                    scaling_vector_size=self.scaling_vector_size,
+                    max_active_clusters=16,
+                    stream=stream,
+                )
+                self.__class__.kernel_dict[cache_key] = compiled_gemm
+            else:
+                compiled_gemm = self.__class__.kernel_dict[cache_key]
+
+            compiled_gemm(
+                a_ptr,
+                b_ptr,
+                a_sf_ptr,
+                b_sf_ptr,
+                c_ptr,
+                alpha_ptr,
+                tile_idx_to_group_idx_ptr,
+                num_non_exiting_tiles_ptr,
+                m,
+                n,
+                k,
+                stream=stream,
+            )
+            return c
+
     @torch.library.custom_op("trtllm::cute_dsl_nvfp4_grouped_gemm_blackwell",
                              mutates_args=(),
                              device_types="cuda")
@@ -352,113 +537,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
         tile_size: int = 128,
         scaling_vector_size: int = 16,
     ) -> torch.Tensor:
-        assert input.dtype == torch.float4_e2m1fn_x2
-        assert input.dim() == 2
-        assert weight.dtype == torch.float4_e2m1fn_x2
-        assert weight.dim() == 3
-        assert input_scale.dtype == torch.uint8
-        assert input_scale.dim() == 1
-        assert weight_scale.dtype == torch.uint8
-        assert weight_scale.dim() == 3
-        assert alpha.dtype == torch.float32
-        assert alpha.dim() == 1
+        tuner = AutoTuner.get()
 
-        m, k = input.size(0), input.size(1) * 2
-        l, n = weight.size(0), weight.size(1)
-        scale_k = k // scaling_vector_size
-        num_tiles = m // tile_size
-        assert weight.size(2) * 2 == k
-        assert m % tile_size == 0
-        assert k % (scaling_vector_size * 4) == 0
-        assert input_scale.size(0) == m * scale_k
-        assert weight_scale.size(0) == l
-        assert weight_scale.size(1) == n
-        assert weight_scale.size(2) == scale_k
-        assert alpha.size(0) == l
+        runner = Sm100BlockScaledPersistentGroupedGemmRunner(
+            output_dtype, tile_size, scaling_vector_size)
+        inputs = [
+            input, weight, input_scale, weight_scale, alpha,
+            tile_idx_to_group_idx, num_non_exiting_tiles
+        ]
 
-        assert tile_idx_to_group_idx.dtype == torch.int32
-        assert tile_idx_to_group_idx.size() == (num_tiles, )
-        assert num_non_exiting_tiles.dtype == torch.int32
-        assert num_non_exiting_tiles.size() == (1, )
-
-        assert output_dtype == torch.bfloat16
-        output = torch.empty(m, n, dtype=output_dtype, device=input.device)
-
-        a_ptr = make_ptr(cutlass.Float4E2M1FN,
-                         input.data_ptr(),
-                         cute.AddressSpace.gmem,
-                         assumed_align=32)
-        b_ptr = make_ptr(cutlass.Float4E2M1FN,
-                         weight.data_ptr(),
-                         cute.AddressSpace.gmem,
-                         assumed_align=32)
-        a_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
-                            input_scale.data_ptr(),
-                            cute.AddressSpace.gmem,
-                            assumed_align=16)
-        b_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
-                            weight_scale.data_ptr(),
-                            cute.AddressSpace.gmem,
-                            assumed_align=16)
-        alpha_ptr = make_ptr(cutlass.Float32, alpha.data_ptr(),
-                             cute.AddressSpace.gmem)
-        tile_idx_to_group_idx_ptr = make_ptr(cutlass.Int32,
-                                             tile_idx_to_group_idx.data_ptr(),
-                                             cute.AddressSpace.gmem)
-        num_non_exiting_tiles_ptr = make_ptr(cutlass.Int32,
-                                             num_non_exiting_tiles.data_ptr(),
-                                             cute.AddressSpace.gmem)
-        c_ptr = make_ptr(cutlass.BFloat16,
-                         output.data_ptr(),
-                         cute.AddressSpace.gmem,
-                         assumed_align=16)
-
-        # TODO: Add cache and autotuner
-        gemm = Sm100BlockScaledPersistentGroupedGemmKernel(
-            sf_vec_size=scaling_vector_size,
-            acc_dtype=cutlass.Float32,
-            use_2cta_instrs=False,
-            mma_tiler_mn=(128, 128),
-            cluster_shape_mn=(1, 1),
+        _, best_tactic = tuner.choose_one(
+            "trtllm::cute_dsl_nvfp4_grouped_gemm_blackwell",
+            [runner],
+            runner.__class__.tuning_config,
+            inputs,
         )
-
-        torch_stream = torch.cuda.current_stream()
-        stream = cuda.CUstream(torch_stream.cuda_stream)
-
-        compiled_gemm = cute.compile(
-            gemm.wrapper,
-            a_ptr,
-            b_ptr,
-            a_sf_ptr,
-            b_sf_ptr,
-            c_ptr,
-            alpha_ptr,
-            tile_idx_to_group_idx_ptr,
-            num_non_exiting_tiles_ptr,
-            m,
-            n,
-            k,
-            l,
-            tile_size=tile_size,
-            scaling_vector_size=scaling_vector_size,
-            max_active_clusters=16,
-            stream=stream,
-        )
-
-        compiled_gemm(
-            a_ptr,
-            b_ptr,
-            a_sf_ptr,
-            b_sf_ptr,
-            c_ptr,
-            alpha_ptr,
-            tile_idx_to_group_idx_ptr,
-            num_non_exiting_tiles_ptr,
-            m,
-            n,
-            k,
-            stream=stream,
-        )
+        output = runner(inputs, tactic=best_tactic)
         return output
 
     @torch.library.register_fake(
