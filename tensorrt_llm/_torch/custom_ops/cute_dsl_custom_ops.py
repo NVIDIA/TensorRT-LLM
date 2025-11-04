@@ -1,11 +1,9 @@
 from typing import List, Tuple
 
 import torch
-import triton  # type: ignore[import]
 
-from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.math_utils import pad_up
-
+from ..._utils import get_sm_version
+from ...math_utils import pad_up
 from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                          OptimizationProfile, TunableRunner, TuningConfig)
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
@@ -13,20 +11,22 @@ from ..utils import (fp4_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
                      last_positive_power_of_2)
 
+try:
+    from cuda.bindings import driver as cuda
+except ImportError:
+    from cuda import cuda
+
 if IS_CUTLASS_DSL_AVAILABLE:
 
     import cutlass
     import cutlass.cute as cute
 
-    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.dense_blockscaled_gemm_persistent import (
+    from ..cute_dsl_kernels.blackwell.dense_blockscaled_gemm_persistent import (
         Sm100BlockScaledPersistentDenseGemmKernel,
         Sm100BlockScaledPersistentDenseGemmKernelWrapper)
-    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.utils import make_ptr
-
-    try:
-        from cuda.bindings import driver as cuda
-    except ImportError:
-        from cuda import cuda
+    from ..cute_dsl_kernels.blackwell.grouped_blockscaled_gemm_persistent import \
+        Sm100BlockScaledPersistentGroupedGemmKernel
+    from ..cute_dsl_kernels.blackwell.utils import make_ptr
 
     class CuteDSLNVFP4BlackwellLinear(TunableRunner):
         kernel_dict = dict()
@@ -209,7 +209,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             torch_stream = torch.cuda.current_stream()
             stream = cuda.CUstream(torch_stream.cuda_stream)
 
-            gemm_wrapper_func = Sm100BlockScaledPersistentDenseGemmKernelWrapper
             CACHE_KEY = (
                 sf_vec_size,
                 mma_tiler_mn,
@@ -236,7 +235,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 kernel_sf_n = sf_n
 
             if CACHE_KEY not in CuteDSLNVFP4BlackwellLinear.kernel_dict:
-                gemm = gemm_wrapper_func(
+                gemm = Sm100BlockScaledPersistentDenseGemmKernelWrapper(
                     sf_vec_size,
                     mma_tiler_mn,
                     cluster_shape_mn,
@@ -337,3 +336,145 @@ if IS_CUTLASS_DSL_AVAILABLE:
         # output is fixed as bf16
         ret = mat_a.new_empty(shape, dtype=torch.bfloat16)
         return ret
+
+    @torch.library.custom_op("trtllm::cute_dsl_nvfp4_grouped_gemm_blackwell",
+                             mutates_args=(),
+                             device_types="cuda")
+    def cute_dsl_nvfp4_grouped_gemm_blackwell(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        tile_idx_to_group_idx: torch.Tensor,
+        num_non_exiting_tiles: torch.Tensor,
+        output_dtype: torch.dtype,
+        tile_size: int = 128,
+        scaling_vector_size: int = 16,
+    ) -> torch.Tensor:
+        assert input.dtype == torch.float4_e2m1fn_x2
+        assert input.dim() == 2
+        assert weight.dtype == torch.float4_e2m1fn_x2
+        assert weight.dim() == 3
+        assert input_scale.dtype == torch.uint8
+        assert input_scale.dim() == 1
+        assert weight_scale.dtype == torch.uint8
+        assert weight_scale.dim() == 3
+        assert alpha.dtype == torch.float32
+        assert alpha.dim() == 1
+
+        m, k = input.size(0), input.size(1) * 2
+        l, n = weight.size(0), weight.size(1)
+        scale_k = k // scaling_vector_size
+        num_tiles = m // tile_size
+        assert weight.size(2) * 2 == k
+        assert m % tile_size == 0
+        assert k % (scaling_vector_size * 4) == 0
+        assert input_scale.size(0) == m * scale_k
+        assert weight_scale.size(0) == l
+        assert weight_scale.size(1) == n
+        assert weight_scale.size(2) == scale_k
+        assert alpha.size(0) == l
+
+        assert tile_idx_to_group_idx.dtype == torch.int32
+        assert tile_idx_to_group_idx.size() == (num_tiles, )
+        assert num_non_exiting_tiles.dtype == torch.int32
+        assert num_non_exiting_tiles.size() == (1, )
+
+        assert output_dtype == torch.bfloat16
+        output = torch.empty(m, n, dtype=output_dtype, device=input.device)
+
+        a_ptr = make_ptr(cutlass.Float4E2M1FN,
+                         input.data_ptr(),
+                         cute.AddressSpace.gmem,
+                         assumed_align=32)
+        b_ptr = make_ptr(cutlass.Float4E2M1FN,
+                         weight.data_ptr(),
+                         cute.AddressSpace.gmem,
+                         assumed_align=32)
+        a_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                            input_scale.data_ptr(),
+                            cute.AddressSpace.gmem,
+                            assumed_align=16)
+        b_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                            weight_scale.data_ptr(),
+                            cute.AddressSpace.gmem,
+                            assumed_align=16)
+        alpha_ptr = make_ptr(cutlass.Float32, alpha.data_ptr(),
+                             cute.AddressSpace.gmem)
+        tile_idx_to_group_idx_ptr = make_ptr(cutlass.Int32,
+                                             tile_idx_to_group_idx.data_ptr(),
+                                             cute.AddressSpace.gmem)
+        num_non_exiting_tiles_ptr = make_ptr(cutlass.Int32,
+                                             num_non_exiting_tiles.data_ptr(),
+                                             cute.AddressSpace.gmem)
+        c_ptr = make_ptr(cutlass.BFloat16,
+                         output.data_ptr(),
+                         cute.AddressSpace.gmem,
+                         assumed_align=16)
+
+        # TODO: Add cache and autotuner
+        gemm = Sm100BlockScaledPersistentGroupedGemmKernel(
+            sf_vec_size=scaling_vector_size,
+            acc_dtype=cutlass.Float32,
+            use_2cta_instrs=False,
+            mma_tiler_mn=(128, 128),
+            cluster_shape_mn=(1, 1),
+        )
+
+        torch_stream = torch.cuda.current_stream()
+        stream = cuda.CUstream(torch_stream.cuda_stream)
+
+        compiled_gemm = cute.compile(
+            gemm.wrapper,
+            a_ptr,
+            b_ptr,
+            a_sf_ptr,
+            b_sf_ptr,
+            c_ptr,
+            alpha_ptr,
+            tile_idx_to_group_idx_ptr,
+            num_non_exiting_tiles_ptr,
+            m,
+            n,
+            k,
+            l,
+            tile_size=tile_size,
+            scaling_vector_size=scaling_vector_size,
+            max_active_clusters=16,
+            stream=stream,
+        )
+
+        compiled_gemm(
+            a_ptr,
+            b_ptr,
+            a_sf_ptr,
+            b_sf_ptr,
+            c_ptr,
+            alpha_ptr,
+            tile_idx_to_group_idx_ptr,
+            num_non_exiting_tiles_ptr,
+            m,
+            n,
+            k,
+            stream=stream,
+        )
+        return output
+
+    @torch.library.register_fake(
+        "trtllm::cute_dsl_nvfp4_grouped_gemm_blackwell")
+    def _(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        tile_idx_to_group_idx: torch.Tensor,
+        num_non_exiting_tiles: torch.Tensor,
+        output_dtype: torch.dtype,
+        tile_size: int = 128,
+        scaling_vector_size: int = 16,
+    ):
+        m = input.size(0)
+        n = weight.size(1)
+        return torch.empty(m, n, dtype=output_dtype, device=input.device)
