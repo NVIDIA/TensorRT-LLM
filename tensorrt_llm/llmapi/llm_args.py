@@ -8,7 +8,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum, EnumMeta
 from pathlib import Path
-from typing import (TYPE_CHECKING, Annotated, Any, ClassVar, Dict, List, Literal,
+from typing import (TYPE_CHECKING, Annotated, Any, Dict, List, Literal,
                     Optional, Set, Tuple, Type, TypeAlias, TypeVar, Union,
                     get_args, get_origin)
 
@@ -113,22 +113,13 @@ class CudaGraphConfig(StrictBaseModel):
         description="List of batch sizes to create CUDA graphs for.")
 
     max_batch_size: int = Field(
-        default=0, description="Maximum batch size for CUDA graphs.")
+        default=0, ge=0, description="Maximum batch size for CUDA graphs.")
 
     enable_padding: bool = Field(
         default=False,
         description=
         "If true, batches are rounded up to the nearest cuda_graph_batch_size. This is usually a net win for performance."
     )
-
-    @field_validator('max_batch_size')
-    @classmethod
-    def validate_cuda_graph_max_batch_size(cls, v):
-        """Validate cuda_graph_config.max_batch_size is non-negative."""
-        if v < 0:
-            raise ValueError(
-                "cuda_graph_config.max_batch_size must be non-negative")
-        return v
 
     @staticmethod
     def _generate_cuda_graph_batch_sizes(max_batch_size: int,
@@ -188,31 +179,6 @@ class BaseSparseAttentionConfig(StrictBaseModel):
     Configuration for sparse attention.
     """
 
-    # TODO
-    @classmethod
-    def from_dict(cls, data: dict):
-        # dispatch to the correct sparse attention config
-        config_classes = {
-            "rocket": RocketSparseAttentionConfig,
-            "dsa": DeepSeekSparseAttentionConfig,
-        }
-
-        algorithm = data.get("algorithm", None)
-        if algorithm is None:
-            raise ValueError(f"Sparse attention algorithm is required")
-
-        config_class = config_classes.get(algorithm.lower())
-        if config_class is None:
-            raise ValueError(f"Invalid algorithm: {algorithm}")
-
-        # Remove 'algorithm' before passing to subclass constructor
-        # It's a ClassVar in subclasses, and used for dispatching to the correct subclass
-        data = {k: v for k, v in data.items() if k != 'algorithm'}
-        return config_class(**data)
-
-    def _check_fields(self):
-        pass
-
     def supports_backend(self, backend: str) -> bool:
         """
         Override if the speculation algorithm does not support
@@ -225,8 +191,7 @@ class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
     """
     Configuration for RocketKV sparse attention.
     """
-    # TODO
-    algorithm: ClassVar[str] = "rocket"
+    algorithm: Literal["rocket"] = "rocket"
     window_size: Optional[int] = Field(
         default=None, description="The window size for snap KV.")
     kernel_size: Optional[int] = Field(
@@ -237,10 +202,6 @@ class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
                                          description="Prompt budget")
     page_size: Optional[int] = Field(default=3, description="Page size")
 
-    @classmethod
-    def from_dict(cls, data: dict):
-        return cls(**data)
-
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
 
@@ -249,8 +210,7 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
     """
     Configuration for DeepSeek Sparse Attention.
     """
-    # TODO
-    algorithm: ClassVar[str] = "dsa"
+    algorithm: Literal["dsa"] = "dsa"
     index_n_heads: Optional[int] = Field(
         default=None, description="The number of heads for the indexer.")
     index_head_dim: Optional[int] = Field(
@@ -260,12 +220,17 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
     indexer_max_chunk_size: Optional[int] = Field(
         default=None, description="The maximum chunk size for the indexer.")
 
-    @classmethod
-    def from_dict(cls, data: dict):
-        return cls(**data)
-
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
+
+
+SparseAttentionConfig: TypeAlias = Annotated[
+    Union[
+        RocketSparseAttentionConfig,
+        DeepSeekSparseAttentionConfig,
+    ],
+    Field(discriminator="algorithm"),
+]
 
 
 class MoeConfig(StrictBaseModel):
@@ -405,26 +370,6 @@ class CalibConfig(StrictBaseModel):
         description=
         "The maximum sequence length to initialize tokenizer for calibration.")
 
-    @classmethod
-    def from_dict(cls, config: dict) -> 'CalibConfig':
-        """Create a CalibConfig instance from a dict.
-
-        Args:
-            config (dict): The dict used to create CalibConfig.
-
-        Returns:
-            tensorrt_llm.llmapi.CalibConfig: The CalibConfig created from dict.
-        """
-        return cls(**config)
-
-    def to_dict(self) -> dict:
-        """Dump a CalibConfig instance to a dict.
-
-        Returns:
-            dict: The dict dumped from CalibConfig.
-        """
-        return self.model_dump()
-
 
 class _ModelFormatKind(Enum):
     HF = 0
@@ -433,52 +378,45 @@ class _ModelFormatKind(Enum):
 
 
 class DecodingBaseConfig(StrictBaseModel):
-    # The number of the drafter layers.
-    max_draft_len: Optional[int] = None
-    # The number of draft tokens in the draft tokens tree.
-    # If it's a linear tree, each draft layer will only generate one draft token.
-    # In this case, max_draft_len == max_total_draft_tokens.
-    # If it's a static or dynamic tree, each draft layer may generate more than one draft token.
-    # In this case, max_total_draft_tokens >= max_draft_len.
-    max_total_draft_tokens: Optional[int] = None
-    speculative_model_dir: Optional[Union[str, Path]] = None
+    max_draft_len: Optional[int] = Field(
+        default=None, ge=0, description="The number of drafter layers.")
 
-    # PyTorch only.
-    # When specified, speculation will be disabled at batch sizes above
-    # this value. Otherwise, speculation will always be on.
-    max_concurrency: Optional[int] = None
+    max_total_draft_tokens: Optional[int] = Field(
+        default=None,
+        description=
+        "The number of draft tokens in the draft tokens tree. If it's a linear tree, each draft layer will "
+        "only generate one draft token. In this case, max_draft_len == max_total_draft_tokens. If it's a static or "
+        "dynamic tree, each draft layer may generate more than one draft token. In this case, "
+        "max_total_draft_tokens >= max_draft_len.")
 
-    load_format: Optional[str] = None
-    # PyTorch only.
-    # Rolling average window size (N) for acceptance length across completed requests.
-    # If not set or set to 0, the feature is disabled.
-    acceptance_window: Optional[int] = None
-    # PyTorch only.
-    # Threshold for average acceptance length; speculation will be disabled
-    # permanently once the rolling average over the last N completed requests
-    # (N = acceptance_window) drops below this value.
-    acceptance_length_threshold: Optional[float] = None
+    speculative_model_dir: Optional[Union[str, Path]] = Field(
+        default=None, description="The path to the speculative model.")
 
-    # Validate acceptance controls at field level so they run on model creation
-    @field_validator('acceptance_window')
-    @classmethod
-    def _validate_acceptance_window(cls, v: Optional[int]):
-        if v is None:
-            return v
-        if v < 0:
-            raise ValueError(
-                f"acceptance_window must be >= 0 (0 disables), got {v}")
-        return v
+    max_concurrency: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description=
+        "When specified, speculation will be disabled at batch sizes above this value. Otherwise, "
+        "speculation will always be on. PyTorch backend only.")
 
-    @field_validator('acceptance_length_threshold')
-    @classmethod
-    def _validate_acceptance_length_threshold(cls, v: Optional[float]):
-        if v is None:
-            return v
-        if v < 0:
-            raise ValueError(
-                f"acceptance_length_threshold must be >= 0, got {v}")
-        return v
+    load_format: Optional[str] = Field(
+        default=None, description="The load format of the speculative model.")
+
+    acceptance_window: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description=
+        "The rolling average window size (N) for acceptance length across completed requests. "
+        "If not set or set to 0, the feature is disabled. PyTorch backend only."
+    )
+
+    acceptance_length_threshold: Optional[float] = Field(
+        default=None,
+        ge=0,
+        description=
+        "The threshold for average acceptance length; speculation will be disabled permanently once the "
+        "rolling average over the last N completed requests (N = acceptance_window) drops below this value. "
+        "PyTorch backend only.")
 
     # If set, drafting is allowed to use chain drafter.
     _allow_chain_drafter: bool = PrivateAttr(True)
@@ -491,11 +429,6 @@ class DecodingBaseConfig(StrictBaseModel):
         a subset of the possible backends.
         """
         return True
-
-    def validate(self) -> None:
-        """
-        Do any additional error checking here.
-        """
 
     @functools.cached_property
     def spec_dec_mode(self):
@@ -524,24 +457,21 @@ class KvCacheConnectorConfig(StrictBaseModel):
 
 
 class MedusaDecodingConfig(DecodingBaseConfig):
+    decoding_type: Literal["Medusa"] = "Medusa"
     medusa_choices: Optional[List[List[int]]] = None
     num_medusa_heads: Optional[int] = None
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.max_total_draft_tokens = self.max_draft_len  # Current Medusa only support linear tree
-
-    @classmethod
-    def from_dict(cls, data: dict):
-        return cls(**data)
-
-    decoding_type: Literal["Medusa"] = "Medusa"
+    @model_validator(mode="after")
+    def set_max_total_draft_tokens(self):
+        self.max_total_draft_tokens = self.max_draft_len  # Current Medusa only supports linear tree
+        return self
 
     def supports_backend(self, backend: str) -> bool:
         return backend not in ("pytorch", "_autodeploy")
 
 
 class EagleDecodingConfig(DecodingBaseConfig):
+    decoding_type: Literal["Eagle"] = "Eagle"
     eagle_choices: Optional[List[List[int]]] = None
     greedy_sampling: Optional[bool] = True
     posterior_threshold: Optional[float] = None
@@ -556,37 +486,41 @@ class EagleDecodingConfig(DecodingBaseConfig):
     eagle3_one_model: Optional[bool] = True
     eagle3_layers_to_capture: Optional[Set[int]] = None
 
-    decoding_type: Literal["Eagle"] = "Eagle"
+    @field_validator("eagle_choices", mode="before")
+    @classmethod
+    def validate_eagle_choices(cls, v):
+        if v is not None:
+            logger.warning(
+                "NOTE: The Draft token tree is still under development, PLEASE DO NOT USE IT !!!"
+            )
+            if not isinstance(v, list):
+                if isinstance(v, str):
+                    return ast.literal_eval(v.replace(" ", ""))
+                else:
+                    raise ValueError(
+                        "Wrong eagle choices type. Eagle choices should be a List[List[int]] or a string like [[0], [1], [2], [0, 0], [0, 1]]."
+                    )
+        return v
 
-    def __init__(self, **kwargs):
-        super().__init__()
-        for attr_name, attr_value in kwargs.items():
-            if attr_name == 'max_draft_len':
-                self.num_eagle_layers = attr_value
-                self.max_total_draft_tokens = attr_value  # If using linear-tree, the max_total_draft_tokens is the same as max_draft_len
-            # Convert the data type of Eagle choice from str to List[List[int]]
-            if attr_name == 'eagle_choices' and attr_value is not None:
-                logger.warning(
-                    "NOTE: The Draft token tree is still under development, PLEASE DO NOT USE IT !!!"
-                )
-                if not isinstance(attr_value, list):
-                    if isinstance(attr_value, str):
-                        attr_value = ast.literal_eval(
-                            attr_value.replace(" ", ""))
-                    else:
-                        raise ValueError(
-                            "Wrong eagle choices type. Eagle choices should be a List[List[int]] or a string like [[0], [1], [2], [0, 0], [0, 1]]."
-                        )
-            setattr(self, attr_name, attr_value)
+    @model_validator(mode="after")
+    def validate_eagle_config(self):
+        if self.max_draft_len is None:
+            raise ValueError("max_draft_len is required for Eagle")
 
-        assert self.max_draft_len is not None, "max_draft_len is required for Eagle"
+        # Set initial values for num_eagle_layers and max_total_draft_tokens from max_draft_len
+        if self.num_eagle_layers is None:
+            self.num_eagle_layers = self.max_draft_len
+        if self.max_total_draft_tokens is None:
+            self.max_total_draft_tokens = self.max_draft_len
 
         # Static tree logic
         # Checks whether the input eagle choices is valid
         # and reset the max_draft_len and num_eagle_layers if necessary
         if self.eagle_choices is not None:
-            # If eagle_choices is provided, use_dynamic_tree should not be used
-            assert not self.use_dynamic_tree, "If eagle_choices is provided, use_dynamic_tree need to be False"
+            if self.use_dynamic_tree:
+                raise ValueError(
+                    "If eagle_choices is provided, use_dynamic_tree need to be False"
+                )
 
             # Get num_eagle_layers from eagle_choices
             num_eagle_layers_from_choices = self.check_eagle_choices()
@@ -603,14 +537,29 @@ class EagleDecodingConfig(DecodingBaseConfig):
 
         # Dynamic tree logic
         if self.use_dynamic_tree:
-            assert self.eagle_choices is None, "If use_dynamic_tree is True, eagle_choices should be None"
-            assert self.max_draft_len is not None and self.max_draft_len > 0, "max_draft_len should be provided, which indicates the number of drafter layers"
-            assert self.dynamic_tree_max_topK is not None and self.dynamic_tree_max_topK > 0, "dynamic_tree_max_topK should be provided, which indicates the number of nodes to expand each time"
-            assert self.max_total_draft_tokens is not None and self.max_total_draft_tokens > 0, "max_total_draft_tokens should be provided, which indicates the total nodes of the final draft tree. (exclude the root node)"
+            if self.eagle_choices is not None:
+                raise ValueError(
+                    "If use_dynamic_tree is True, eagle_choices should be None")
+            if self.max_draft_len is None or self.max_draft_len <= 0:
+                raise ValueError(
+                    "max_draft_len should be provided, which indicates the number of drafter layers"
+                )
+            if self.dynamic_tree_max_topK is None or self.dynamic_tree_max_topK <= 0:
+                raise ValueError(
+                    "dynamic_tree_max_topK should be provided, which indicates the number of nodes to expand each time"
+                )
+            if self.max_total_draft_tokens is None or self.max_total_draft_tokens <= 0:
+                raise ValueError(
+                    "max_total_draft_tokens should be provided, which indicates the total nodes of the final draft tree. (exclude the root node)"
+                )
 
-    def validate(self) -> None:
+        return self
+
+    @model_validator(mode="after")
+    def validate_speculative_model_dir(self) -> None:
         if self.speculative_model_dir is None:
             raise ValueError("Draft model must be provided for EAGLE")
+        return self
 
     def check_eagle_choices(self):
         # 1) Check connectivity
@@ -658,28 +607,23 @@ class EagleDecodingConfig(DecodingBaseConfig):
 
 
 class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
+    decoding_type: Literal["SaveState"] = "SaveState"
     output_directory: str
     write_interval: int = 20
     file_prefix: str = "data"
-    eagle3_layers_to_capture: Optional[Set[int]] = None
+    eagle3_layers_to_capture: Set[int] = Field(..., min_length=1)
 
     max_total_draft_tokens: Optional[int] = Field(default=1, init=False)
     eagle_choices: Optional[List[List[int]]] = Field(default=None, init=False)
 
-    decoding_type: Literal["SaveState"] = "SaveState"
+    _last_hidden_in_save: bool = PrivateAttr(default=True)
 
-    def model_post_init(self, __context):
+    @model_validator(mode="after")
+    def set_last_hidden_in_save(self):
         self._last_hidden_in_save = True
-        if self.eagle3_layers_to_capture is None:
-            self._last_hidden_in_save = False
-        elif -1 not in self.eagle3_layers_to_capture:
+        if -1 not in self.eagle3_layers_to_capture:
             self._last_hidden_in_save = False
             self.eagle3_layers_to_capture.add(-1)
-
-    def validate(self) -> None:
-        if self.output_directory is None or not self.eagle3_layers_to_capture:
-            raise ValueError(
-                "Save directory and layers to capture must be provided")
 
     @functools.cached_property
     def spec_dec_mode(self):
@@ -700,68 +644,65 @@ class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
 
 
 class UserProvidedDecodingConfig(DecodingBaseConfig):
+    decoding_type: Literal["User_Provided"] = "User_Provided"
     # Cannot use real type annotations due to circular imports
     drafter: object  # Type is Drafter
     resource_manager: object = None  # Type is Optional[ResourceManager]
 
-    # TODO
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.max_total_draft_tokens = self.max_draft_len  # Current UserProvided only support linear tree
-
-    decoding_type: Literal["User_Provided"] = "User_Provided"
+    @model_validator(mode="after")
+    def set_max_total_draft_tokens(self):
+        self.max_total_draft_tokens = self.max_draft_len  # Current UserProvided only supports linear tree
+        return self
 
 
 class NGramDecodingConfig(DecodingBaseConfig):
     """
     Configuration for NGram drafter speculative decoding.
-
-    Arguments:
-        max_draft_len: int
-                The length maximum of draft tokens (can be understood as length maximum of output draft tokens).
-
-        max_matching_ngram_size: int
-            The length maximum of searching tokens (can be understood as length maximum of input tokens to search).
-
-        is_keep_all: bool = True
-            Whether to keep all candidate pattern-matches pairs, only one match is kept for each pattern if False.
-
-        is_use_oldest: bool = True
-            Whether to provide the oldest match when pattern is hit, the newest one is provided if False.
-
-        is_public_pool: bool = True
-            Whether to use a common pool for all requests, or the pool is private for each request if False.
     """
-    max_matching_ngram_size: int = 0
-    is_keep_all: bool = True
-    is_use_oldest: bool = True
-    is_public_pool: bool = True
-
-    # TODO
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.max_total_draft_tokens = self.max_draft_len  # Current NGram only support linear tree
-
     decoding_type: Literal["NGram"] = "NGram"
+    max_matching_ngram_size: int = Field(
+        default=0,
+        ge=0,
+        description=
+        "The length maximum of searching tokens (can be understood as length maximum of input tokens "
+        "to search).")
+    is_keep_all: bool = Field(
+        default=True,
+        description=
+        "Whether to keep all candidate pattern-matches pairs, only one "
+        "match is kept for each pattern if False.")
+    is_use_oldest: bool = Field(
+        default=True,
+        description="Whether to provide the oldest match when pattern is hit, "
+        "the newest one is provided if False.")
+    is_public_pool: bool = Field(
+        default=True,
+        description="Whether to use a common pool for all requests, or the pool "
+        "is private for each request if False.")
+
+    @model_validator(mode="after")
+    def set_max_total_draft_tokens(self):
+        self.max_total_draft_tokens = self.max_draft_len  # Current NGram only supports linear tree
+        return self
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
 
 
 class DraftTargetDecodingConfig(DecodingBaseConfig):
-
-    # TODO
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.max_total_draft_tokens = self.max_draft_len  # Current DraftTarget only support linear tree
-
     decoding_type: Literal["Draft_Target"] = "Draft_Target"
+
+    @model_validator(mode="after")
+    def set_max_total_draft_tokens(self):
+        self.max_total_draft_tokens = self.max_draft_len  # Current DraftTarget only supports linear tree
+        return self
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
 
 
 class MTPDecodingConfig(DecodingBaseConfig):
+    decoding_type: Literal["MTP"] = "MTP"
     num_nextn_predict_layers: int = 1
     use_relaxed_acceptance_for_thinking: bool = False
     relaxed_topk: int = 1
@@ -780,26 +721,10 @@ class MTPDecodingConfig(DecodingBaseConfig):
     BEGIN_THINKING_PHASE_TOKEN: int = 128798
     END_THINKING_PHASE_TOKEN: int = 128799
 
-    decoding_type: Literal["MTP"] = "MTP"
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        if 'num_nextn_predict_layers' in kwargs:
-            self.max_draft_len = kwargs['num_nextn_predict_layers']
-            self.max_total_draft_tokens = kwargs[
-                'num_nextn_predict_layers']  # Current MTP only support linear tree
-
-    # TODO: remove
-    @classmethod
-    def from_dict(cls, data: dict):
-        out = cls(**data)
-        out.max_draft_len = out.num_nextn_predict_layers
-        out.max_total_draft_tokens = out.num_nextn_predict_layers  # Current MTP only support linear tree
-        return out
-
     @model_validator(mode="after")
-    def set_max_draft_len(self):
+    def set_max_total_draft_tokens(self):
         self.max_draft_len = self.num_nextn_predict_layers
+        self.max_total_draft_tokens = self.num_nextn_predict_layers  # Current MTP only supports linear tree
         return self
 
     def supports_backend(self, backend: str) -> bool:
@@ -832,15 +757,12 @@ class AutoDecodingConfig(DecodingBaseConfig):
     Attributes that are inherited from the base class are ignored.
     """
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.max_total_draft_tokens = self.max_draft_len  # Current Auto only support linear tree
-
-    @classmethod
-    def from_dict(cls, data: dict):
-        return cls(**data)
-
     decoding_type: Literal["AUTO"] = "AUTO"
+
+    @model_validator(mode="after")
+    def set_max_total_draft_tokens(self):
+        self.max_total_draft_tokens = self.max_draft_len  # Current Auto only supports linear tree
+        return self
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
@@ -1159,6 +1081,7 @@ class LookaheadDecodingConfig(DecodingBaseConfig, PybindMirror):
     Configuration for lookahead speculative decoding.
     """
 
+    decoding_type: Literal["Lookahead"] = "Lookahead"
     max_window_size: int = Field(
         default=_LookaheadDecodingConfig.get_default_lookahead_decoding_window(
         ),
@@ -1174,11 +1097,10 @@ class LookaheadDecodingConfig(DecodingBaseConfig, PybindMirror):
         gt=0,
         description="Number of NGrams in verification branch per step.")
 
-    # TODO
-    def __init__(self, **data):
-        super().__init__(**data)
-        self.max_total_draft_tokens = self.max_draft_len  # Current Lookahead only support linear tree
-        self._check_fields()
+    @model_validator(mode="after")
+    def set_max_total_draft_tokens(self):
+        self.max_total_draft_tokens = self.max_draft_len  # Current Lookahead only supports linear tree
+        return self
 
     def calculate_speculative_resource(self):
         return _LookaheadDecodingConfig.calculate_speculative_resource_tuple(
@@ -1193,10 +1115,8 @@ class LookaheadDecodingConfig(DecodingBaseConfig, PybindMirror):
     def supports_backend(self, backend: str) -> bool:
         return backend not in ("pytorch", "_autodeploy")
 
-    decoding_type: Literal["Lookahead"] = "Lookahead"
 
-
-SpeculativeConfig: TypeAlias = Optional[Annotated[
+SpeculativeConfig: TypeAlias = Annotated[
     Union[
         DraftTargetDecodingConfig,
         EagleDecodingConfig,
@@ -1209,11 +1129,6 @@ SpeculativeConfig: TypeAlias = Optional[Annotated[
         AutoDecodingConfig,
     ],
     Field(discriminator="decoding_type"),
-]]
-
-SparseAttentionConfig: TypeAlias = Union[
-    RocketSparseAttentionConfig,
-    DeepSeekSparseAttentionConfig,
 ]
 
 
@@ -1578,7 +1493,7 @@ class BaseLlmArgs(StrictBaseModel):
         status="prototype")
 
     # Speculative decoding parameters
-    speculative_config: SpeculativeConfig = Field(
+    speculative_config: Optional[SpeculativeConfig] = Field(
         default=None, description="Speculative decoding config.")
 
     max_batch_size: Optional[int] = Field(default=None,
@@ -1929,7 +1844,6 @@ class BaseLlmArgs(StrictBaseModel):
                     f"Speculation type {self.speculative_config.decoding_type} does not "
                     f"support backend {self.backend}")
 
-            # TODO this seems terrible
             # Below, we only need to set speculative_decoding_mode/decoding_config for speculation
             # on the TRT backend.
             if isinstance(self.speculative_config, LookaheadDecodingConfig):
@@ -2256,7 +2170,7 @@ class TorchCompileConfig(StrictBaseModel):
         default=False,
         description="Enable piecewise CUDA graph in torch.compile.")
 
-    capture_num_tokens: Optional[List[int]] = Field(
+    capture_num_tokens: Optional[List[PositiveInt]] = Field(
         default=None,
         description=
         "List of num of tokens to capture the piecewise CUDA graph for. If not provided, the number of tokens will be the same as cuda_graph_config.batch_sizes."
@@ -2267,8 +2181,6 @@ class TorchCompileConfig(StrictBaseModel):
     def validate_capture_num_tokens(cls, v):
         if v is None:
             return v
-        if any(t <= 0 for t in v):
-            raise ValueError("capture_num_tokens must contain positive ints.")
         return sorted(set(v), reverse=True)
 
     enable_userbuffers: bool = Field(
@@ -2278,17 +2190,9 @@ class TorchCompileConfig(StrictBaseModel):
 
     max_num_streams: int = Field(
         default=1,
+        ge=1,
         description=
         "The maximum number of CUDA streams to use for torch.compile.")
-
-    @field_validator('max_num_streams')
-    @classmethod
-    def validate_torch_compile_max_num_streams(cls, v):
-        """Validate torch_compile_config.max_num_streams >= 1."""
-        if v < 1:
-            raise ValueError(
-                "torch_compile_config.max_num_streams must be >= 1")
-        return v
 
     @staticmethod
     def _generate_capture_num_tokens() -> List[int]:
@@ -2314,7 +2218,7 @@ class TorchLlmArgs(BaseLlmArgs):
 
     cuda_graph_config: Optional[CudaGraphConfig] = Field(
         default_factory=CudaGraphConfig,
-        description="CUDA graph config.If true, use CUDA graphs for decoding. \
+        description="CUDA graph config. If true, use CUDA graphs for decoding. \
         CUDA graphs are only created for the batch sizes in cuda_graph_config.batch_sizes, \
         and are enabled for batches that consist of decoding requests *only* \
         (the reason is that it's hard to capture a single graph with prefill requests \
@@ -2493,6 +2397,7 @@ class TorchLlmArgs(BaseLlmArgs):
     def quant_config(self, value: QuantConfig):
         self._quant_config = value
 
+    # TODO: use as literal?
     # TODO: remove backend later
     @field_validator('backend', mode='before')
     def init_backend(cls, v):
