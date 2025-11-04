@@ -11,6 +11,7 @@ from .lora_test_utils import (
     check_llama_7b_multi_lora_from_request_test_harness,
     check_phi3_lora_fused_modules_output_tp2_identical_to_tp1)
 from .test_llm import (_test_llm_capture_request_error, llama_model_path,
+                       llm_return_logprobs_test_harness,
                        tinyllama_logits_processor_test_harness)
 from .test_llm_pytorch import llama_7b_lora_from_dir_test_harness
 
@@ -104,3 +105,23 @@ async def test_llm_rpc_streaming_tp2():
                                                sampling_params=SamplingParams(
                                                    max_tokens=10, end_id=-1)):
             print(f"get result: {output}")
+
+
+@skip_ray
+@pytest.mark.gpu2
+@pytest.mark.parametrize(
+    "prompt_logprobs, logprobs, return_context_logits, return_generation_logits",
+    [
+        (None, 1, False,
+         False),  # generation logprobs only (top-1, PyTorch limit)
+    ])
+def test_llm_return_logprobs_streaming_tp2(prompt_logprobs, logprobs,
+                                           return_context_logits,
+                                           return_generation_logits):
+    llm_return_logprobs_test_harness(prompt_logprobs,
+                                     logprobs,
+                                     return_context_logits,
+                                     return_generation_logits,
+                                     streaming=True,
+                                     backend="pytorch",
+                                     tp_size=2)
