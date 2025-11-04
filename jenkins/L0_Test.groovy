@@ -3800,7 +3800,7 @@ def publishJunitTestResults(pipeline, stageName, stageIsInterrupted, postTag="")
                 }
                 throw e
             }
-            sh "tar -xzvf results-${stageName}.tar.gz"
+            sh "tar -xzvf results-${stageName}${postTag}.tar.gz"
             sh "cd ${stageName} && ls -alh"
             junit(allowEmptyResults: true, testResults: "${stageName}/results*.xml")
             // Clean up the workspace
