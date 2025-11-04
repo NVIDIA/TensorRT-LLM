@@ -10,6 +10,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
                                                         SamplingConfig)
 from tensorrt_llm._torch.pyexecutor.sampler import TorchSampler
 from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
+from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.llmapi import EagleDecodingConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -44,12 +45,16 @@ def run_test(eagle_model_dir, max_seq_len, beam_width, use_dynamic_tree,
             max_num_sequences=max_batch_size,
             max_beam_width=beam_width,
         ))
-
+    # fill with NOT_FINISHED to ensure that all finish reasons are NOT_FINISHED
+    torch_sampler.store.finish_reasons.fill_(FinishReason.NOT_FINISHED.value)
+    finish_reasons_list = torch_sampler.store.finish_reasons[..., 0].to(
+        device="cpu").T.tolist()
     input_new_tokens_list = input_new_tokens.tolist()
     num_accepted_draft_tokens = torch_sampler._process_draft_tokens_tree(
         request=input_request,
         new_tokens_tensor=input_new_tokens,
         new_tokens_list=input_new_tokens_list,
+        finish_reasons=finish_reasons_list,
         spec_tree_manager=spec_tree_manager)
 
     print(f"num_accepted_draft_tokens: {num_accepted_draft_tokens}")

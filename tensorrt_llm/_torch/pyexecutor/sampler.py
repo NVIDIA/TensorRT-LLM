@@ -626,9 +626,6 @@ class TorchSampler(Sampler):
                 ),
             )
             # Helper tensors for finish_reasons:
-            self._finish_reasons_nonzero_static_buffer = torch.empty(
-                (self.max_tokens * self.max_num_sequences, 2), device="cuda", dtype=torch.int64
-            )
             """Preallocate buffer needed for torch.nonzero_static(..., out=finish_reasons_nonzero_static_buffer).
             See `def _write_reason`."""
             self._reason_tensors = {
@@ -1096,11 +1093,6 @@ class TorchSampler(Sampler):
     def return_log_probs(self, scheduled_requests: ScheduledRequests) -> bool:
         return any(req.py_return_log_probs for req in scheduled_requests.all_requests())
 
-    def _prepare_new_requests(self, requests: list[LlmRequest]) -> None:
-        for req in requests:
-            if (not req.is_finished) and req.is_context_init_state and req.is_last_context_chunk:
-                self.store.finish_reasons[:, req.py_seq_slot].fill_(FinishReason.NOT_FINISHED.value)
-
     @override
     @torch.inference_mode()
     def sample_async(
@@ -1117,7 +1109,6 @@ class TorchSampler(Sampler):
         #     tokens are sampled one-by-one.
 
         requests = scheduled_requests.all_requests()
-        self._prepare_new_requests(requests)
         new_tokens = self.store.new_tokens
         return_log_probs = self.return_log_probs(scheduled_requests)
         seq_slots_host = torch.tensor(
@@ -1546,7 +1537,8 @@ class TorchSampler(Sampler):
         """
         tokens = new_tokens[:, seq_slots, BEAM]
 
-        # finish reasons is set to NOT FINISHED, when a new request occupies a seq slot
+        # we need to fill with NOT_FINISHED so we can differentiate between previous requests that had the same seq slot
+        finish_reasons.index_fill_(1, seq_slots, FinishReason.NOT_FINISHED.value)
         batched_finish_reasons = finish_reasons[:, seq_slots, BEAM]
 
         if with_stop_words := self._requests_with_stop_words(requests):
