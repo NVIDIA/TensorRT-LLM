@@ -376,9 +376,8 @@ class PyTorchModelEngine(ModelEngine):
 
         # Create config and runner
         cuda_graph_runner_config = CUDAGraphRunnerConfig(
-            use_cuda_graph=pytorch_backend_config.use_cuda_graph,
-            cuda_graph_padding_enabled=pytorch_backend_config.
-            cuda_graph_padding_enabled,
+            use_cuda_graph=self.cuda_graph_config is not None,
+            cuda_graph_padding_enabled=self._cuda_graph_padding_enabled,
             cuda_graph_batch_sizes=self._cuda_graph_batch_sizes,
             max_cuda_graph_batch_size=self._max_cuda_graph_batch_size,
             max_beam_width=self.max_beam_width,
