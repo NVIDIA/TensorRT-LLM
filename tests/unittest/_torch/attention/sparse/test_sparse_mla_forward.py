@@ -187,10 +187,10 @@ def calculate_reference_output_prefill_only(q_c, kv_c, k_pe, W_UK, W_UV,
 
 
 def calculate_reference_output_generation(q_c, kv_c, k_pe, W_UK, W_UV,
-                                          kv_cache_lens, num_heads,
-                                          kv_lora_rank, qk_nope_head_dim,
-                                          qk_rope_head_dim, v_head_dim,
-                                          softmax_scale, device):
+                                          rope_cos_sin, kv_cache_lens,
+                                          num_heads, kv_lora_rank,
+                                          qk_nope_head_dim, qk_rope_head_dim,
+                                          v_head_dim, softmax_scale, device):
     """Reference for generation (rotated inputs, no RoPE application)."""
     results, kv_offset = [], 0
     for kv_len in kv_cache_lens:
@@ -200,12 +200,22 @@ def calculate_reference_output_generation(q_c, kv_c, k_pe, W_UK, W_UV,
         k_pe_seq = k_pe[kv_offset:kv_offset + kv_len]
 
         q_nope, q_pe = q_seq.split([qk_nope_head_dim, qk_rope_head_dim], dim=-1)
+        # SM90: apply RoPE to q_pe, k_pe_seq
+        # SM100+: use unrotated q_pe, k_pe_seq
+        if get_sm_version() >= 100:
+            cos_sin_q = rope_cos_sin[kv_len - q_seq.shape[0]:kv_len]
+            cos_sin_pe = rope_cos_sin[:kv_len]
+            q_pe = apply_rotary_embedding(q_pe, cos_sin_q)
+            k_pe_rot = apply_rotary_embedding(k_pe_seq, cos_sin_pe)
+        else:
+            k_pe_rot = k_pe_seq
+
         ql_nope = torch.einsum("qnh,lnh->qnl", q_nope, W_UK)
         q_mqa = torch.cat([ql_nope, q_pe], dim=-1)
 
         k_mqa = torch.cat([
             kv_seq.unsqueeze(1).expand(-1, num_heads, -1),
-            k_pe_seq.unsqueeze(1).expand(-1, num_heads, -1)
+            k_pe_rot.unsqueeze(1).expand(-1, num_heads, -1)
         ],
                           dim=-1)
         v_mqa = kv_seq.unsqueeze(1).expand(-1, num_heads, -1)
@@ -264,9 +274,10 @@ def calculate_reference_output_mixed(q_ctx, q_gen, kv_c_all, k_pe_all, W_UK,
         kv_c, k_pe = extract_kv_slices(gen_indices,
                                        sum(seq_lens[i] for i in ctx_indices))
         gen_results = calculate_reference_output_generation(
-            q_gen, kv_c, k_pe, W_UK, W_UV, [seq_lens[i] for i in gen_indices],
-            num_heads, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim,
-            v_head_dim, softmax_scale, device)
+            q_gen, kv_c, k_pe, W_UK, W_UV, rope_cos_sin,
+            [seq_lens[i]
+             for i in gen_indices], num_heads, kv_lora_rank, qk_nope_head_dim,
+            qk_rope_head_dim, v_head_dim, softmax_scale, device)
         for idx, req_idx in enumerate(gen_indices):
             ref_results[req_idx] = gen_results[idx:idx + 1]
 
@@ -277,10 +288,15 @@ def calculate_reference_output_mixed(q_ctx, q_gen, kv_c_all, k_pe_all, W_UK,
 @pytest.mark.skipif(get_sm_version() < 90,
                     reason="FlashMLA requires SM90 (Hopper) or later")
 @pytest.mark.parametrize("batch_name", list(BATCH_SPECS.keys()))
-@pytest.mark.parametrize("kv_cache_dtype", ["auto"])  # TODO: Add "fp8" support
-def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype):
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str):
     """Test sparse MLA attention for pure prefill, pure decode, and mixed batches."""
-    print(f"\n{'='*80}\nTesting: {batch_name}\n{'='*80}")
+    print(
+        f"\n{'='*80}\nTesting: {batch_name} kv_cache_dtype: {kv_cache_dtype}\n{'='*80}"
+    )
+    if kv_cache_dtype == "fp8" and get_sm_version() < 100:
+        pytest.skip(
+            "FP8 kv cache is not supported on pre-Blackwell architectures")
 
     device = torch.device('cuda')
     dtype = torch.bfloat16
@@ -387,8 +403,6 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype):
     if kv_cache_dtype == "auto":
         cache_dtype = dtype
     elif kv_cache_dtype == "fp8":
-        # TODO: Implement FP8 quantization for MLA cache
-        pytest.skip("fp8 cache dtype not yet supported with FlashMLA backend")
         cache_dtype = torch.float8_e4m3fn
     else:
         cache_dtype = dtype
@@ -497,6 +511,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype):
     # Allocate and pre-populate KV cache in batch order [context...][generation...]
     all_cached_compressed_kv = {}
     all_cached_k_pe_rotated = {}
+    all_cached_k_pe_original = {}
 
     print(f"  Allocating and pre-populating cache...")
 
@@ -573,6 +588,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype):
                               num_heads * qk_head_dim,
                               dtype=dtype,
                               device=device)
+        batched_latent_original = batched_latent.clone()
         mla.mqa.mla_rope_append_paged_kv_assign_q(dummy_q, batched_latent,
                                                   cached_metadata)
 
@@ -581,6 +597,8 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype):
         for req_idx in gen_with_cache:
             cached_len = cached_lens[req_idx]
             all_cached_k_pe_rotated[req_idx] = batched_latent[
+                offset:offset + cached_len, kv_lora_rank:].clone()
+            all_cached_k_pe_original[req_idx] = batched_latent_original[
                 offset:offset + cached_len, kv_lora_rank:].clone()
             offset += cached_len
             print(
@@ -762,18 +780,28 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype):
             kv_c_list.append(latent_cache[batch_start:batch_end, :kv_lora_rank])
             k_pe_list.append(k_pe_original_for_ref[batch_start:batch_end])
         else:
-            # Generation: use rotated q, combine cached + new KV from latent_cache
-            q_req = q[batch_start:batch_end]
+            # Generation:
+            # SM90: use rotated q, combine rotated k_pe and new KV from latent_cache
+            # SM100+: use unrotated q, combine unrotated k_pe and new KV from latent_cache
             cached_len = cached_lens[orig_req_idx]
+            if get_sm_version() >= 100:
+                q_req = q_original_for_ref[batch_start:batch_end]
+                k_pe_list.append(
+                    torch.cat([
+                        all_cached_k_pe_original[orig_req_idx][:cached_len],
+                        latent_cache[batch_start:batch_end, kv_lora_rank:]
+                    ]))
+            else:
+                q_req = q[batch_start:batch_end]
+                k_pe_list.append(
+                    torch.cat([
+                        all_cached_k_pe_rotated[orig_req_idx][:cached_len],
+                        latent_cache[batch_start:batch_end, kv_lora_rank:]
+                    ]))
             kv_c_list.append(
                 torch.cat([
                     all_cached_compressed_kv[orig_req_idx][:cached_len],
                     latent_cache[batch_start:batch_end, :kv_lora_rank]
-                ]))
-            k_pe_list.append(
-                torch.cat([
-                    all_cached_k_pe_rotated[orig_req_idx][:cached_len],
-                    latent_cache[batch_start:batch_end, kv_lora_rank:]
                 ]))
 
         q_for_ref_list.append(q_req.view(-1, num_heads, qk_head_dim))
@@ -861,13 +889,19 @@ if __name__ == "__main__":
     # Test pure prefill
     test_forward_sparse_mla_unified(batch_name="small_prefill",
                                     kv_cache_dtype="auto")
+    test_forward_sparse_mla_unified(batch_name="small_prefill",
+                                    kv_cache_dtype="fp8")
 
     # Test pure decode
     test_forward_sparse_mla_unified(batch_name="small_decode",
                                     kv_cache_dtype="auto")
+    test_forward_sparse_mla_unified(batch_name="small_decode",
+                                    kv_cache_dtype="fp8")
 
     # TODO: Mixed batch test - generation reference needs sparse attention masking
     test_forward_sparse_mla_unified(batch_name="small_mixed",
                                     kv_cache_dtype="auto")
+    test_forward_sparse_mla_unified(batch_name="small_mixed",
+                                    kv_cache_dtype="fp8")
 
     print("All tests passed!")
