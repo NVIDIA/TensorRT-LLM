@@ -9,13 +9,14 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict
 
 
-def compute_max_num_tokens(conc: int, isl: int) -> int:
-    """Compute MAX_NUM_TOKENS using the formula from InferenceMax scripts.
+def compute_max_num_tokens(conc: int, isl: int, osl: int) -> int:
+    """Compute MAX_NUM_TOKENS to cover full request lifetime.
 
-    Formula: ((CONC + ISL + 64 + 63) / 64) * 64
-    This rounds up to the nearest multiple of 64.
+    Formula: ((CONC * (ISL + OSL) + 63) / 64) * 64
+    This accounts for the total tokens needed across all concurrent requests
+    during their full lifetime (input + output), rounded to multiple of 64.
     """
-    return ((conc + isl + 64 + 63) // 64) * 64
+    return ((conc * (isl + osl) + 63) // 64) * 64
 
 
 class ProfileBase(ABC):
@@ -140,7 +141,7 @@ class DSR1FP4Profile(ProfileBase):
             "cli_args": {
                 "ep_size": ep_size,
                 "tp_size": tp,
-                "max_num_tokens": compute_max_num_tokens(conc, isl),
+                "max_num_tokens": compute_max_num_tokens(conc, isl, osl),
             },
         }
 
@@ -212,7 +213,7 @@ class DSR1FP8Profile(ProfileBase):
             "cli_args": {
                 "ep_size": ep_size,
                 "tp_size": tp,
-                "max_num_tokens": compute_max_num_tokens(conc, isl),
+                "max_num_tokens": compute_max_num_tokens(conc, isl, osl),
             },
         }
 
@@ -246,8 +247,9 @@ class GPTOSSFP4Profile(ProfileBase):
         - DP_ATTENTION: true if CONC >= 256
         - Special: max_batch_size = CONC
         """
+        isl = scenario["target_isl"]
+        osl = scenario["target_osl"]
         conc = scenario["target_concurrency"]
-        scenario["target_isl"]
         tp = self._get_tp_size(scenario)
 
         # Simple concurrency-based logic
@@ -284,7 +286,7 @@ class GPTOSSFP4Profile(ProfileBase):
             "cli_args": {
                 "ep_size": ep_size,
                 "tp_size": tp,
-                "max_num_tokens": 20000,  # Fixed value from the script
+                "max_num_tokens": compute_max_num_tokens(conc, isl, osl),
                 "max_batch_size": 512,  # Fixed value from the script
             },
         }

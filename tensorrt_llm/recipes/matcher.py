@@ -132,7 +132,7 @@ def compute_from_scenario(
 
     Args:
         scenario: Dictionary containing scenario parameters
-        profile: Profile name to use (if None, will auto-detect)
+        profile: Profile name to use (if None, will check scenario['profile'] then auto-detect)
 
     Returns:
         Dictionary with 'config', 'env', and 'cli_args' keys
@@ -140,13 +140,17 @@ def compute_from_scenario(
     Raises:
         ValueError: If profile cannot be determined or is invalid
     """
-    # Auto-detect profile if not specified
+    # Use profile from arguments, then scenario dict, then auto-detect
+    if profile is None:
+        profile = scenario.get("profile")
+
     if profile is None:
         profile = detect_profile(scenario.get("model", ""))
         if profile is None:
             raise ValueError(
                 f"Could not auto-detect profile from model '{scenario.get('model')}'. "
-                f"Please specify --profile explicitly. Available profiles: {', '.join(PROFILE_REGISTRY.keys())}"
+                f"Please specify --profile explicitly or set 'profile' in the scenario. "
+                f"Available profiles: {', '.join(PROFILE_REGISTRY.keys())}"
             )
 
     # Get profile instance and compute configuration

@@ -1156,7 +1156,40 @@ class PerfTestConfig:
             self.runtime = "bench"
             # Reconstruct full recipe filename (everything after "recipe-")
             self.recipe_file = "-".join(labels[1:])
-            # Recipe provides all config, no further parsing needed
+
+            # Parse recipe file to extract model_name and backend for proper test setup
+            from pathlib import Path
+
+            import yaml
+            recipe_path = Path(
+                __file__
+            ).parent.parent.parent.parent.parent / "tensorrt_llm" / "recipes" / "db" / f"{self.recipe_file}.yaml"
+
+            if recipe_path.exists():
+                with open(recipe_path, 'r') as f:
+                    recipe_data = yaml.safe_load(f)
+                    scenario = recipe_data.get('scenario', {})
+
+                    # Extract model name for tokenizer and model directory lookup
+                    model_str = scenario.get('model', '')
+                    # Convert model path to model_name format (e.g., "nvidia/DeepSeek-R1-0528-FP4" -> "deepseek-r1")
+                    if 'deepseek' in model_str.lower(
+                    ) and 'r1' in model_str.lower():
+                        self.model_name = "deepseek-r1"
+                    elif 'gpt-oss' in model_str.lower(
+                    ) or 'gptoss' in model_str.lower():
+                        self.model_name = "gpt-oss-120b"
+                    else:
+                        # Fallback: use last part of model path
+                        self.model_name = model_str.split('/')[-1].lower()
+
+                    # Set backend to trtllm for recipe tests
+                    self.backend = "trtllm"
+            else:
+                # Recipe file not found, use defaults to avoid skip
+                self.model_name = "gpt-oss-120b"
+                self.backend = "trtllm"
+
             return
 
         # Used for perf sanity test

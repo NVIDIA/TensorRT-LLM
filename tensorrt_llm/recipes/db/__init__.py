@@ -1,1 +1,1 @@
-"""Example recipe configurations for common inference scenarios."""
+"""Curated recipe database for common inference scenarios."""

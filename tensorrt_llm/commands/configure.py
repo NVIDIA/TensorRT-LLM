@@ -1,6 +1,6 @@
 """TensorRT-LLM configuration generator CLI.
 
-This CLI tool generates optimized TensorRT-LLM configurations from high-level
+This CLI tool generates optimized TensorRT-LLM recipe files from high-level
 inference scenario constraints.
 """
 
@@ -18,7 +18,7 @@ from tensorrt_llm.recipes import (
     validate_config,
     validate_scenario,
 )
-from tensorrt_llm.recipes.matcher import load_recipe_file, merge_overrides
+from tensorrt_llm.recipes.matcher import merge_overrides
 from tensorrt_llm.recipes.profiles import PROFILE_REGISTRY
 
 
@@ -36,59 +36,22 @@ def format_env_vars(env: Dict[str, str]) -> str:
     return " ".join(f"{k}={v}" for k, v in env.items())
 
 
-def generate_serve_command(
-    scenario: Dict[str, Any], cli_args: Dict[str, Any], env: Dict[str, str], config_path: str
-) -> str:
-    """Generate the trtllm-serve command line.
+def generate_bench_command(recipe_path: str) -> str:
+    """Generate the trtllm-bench command line.
 
     Args:
-        scenario: Scenario parameters
-        cli_args: CLI arguments computed from profile
-        env: Environment variables
-        config_path: Path to the config YAML file
+        recipe_path: Path to the recipe YAML file
 
     Returns:
-        Formatted trtllm-serve command
+        Formatted trtllm-bench command
     """
-    model = scenario.get("model", "MODEL_PATH")
-    tp_size = cli_args.get("tp_size", 1)
-    ep_size = cli_args.get("ep_size", 1)
-    max_num_tokens = cli_args.get("max_num_tokens")
-    max_batch_size = cli_args.get("max_batch_size")
-
-    # Build command parts
-    parts = []
-
-    # Environment variables
-    env_str = format_env_vars(env)
-    if env_str:
-        parts.append(env_str)
-
-    # Base command
-    parts.append("trtllm-serve")
-    parts.append(model)
-
-    # CLI arguments
-    parts.append(f"--tp_size {tp_size}")
-    if ep_size > 1:
-        parts.append(f"--ep_size {ep_size}")
-
-    if max_num_tokens is not None:
-        parts.append(f"--max_num_tokens {max_num_tokens}")
-
-    if max_batch_size is not None:
-        parts.append(f"--max_batch_size {max_batch_size}")
-
-    parts.append(f"--extra_llm_api_options {config_path}")
-
-    return " \\\n    ".join(parts)
+    return f"trtllm-bench --recipe {recipe_path}"
 
 
 def print_result(
     scenario: Dict[str, Any],
     config: Dict[str, Any],
     env: Dict[str, str],
-    cli_args: Dict[str, Any],
     output_path: str,
     profile_name: str,
 ) -> None:
@@ -98,16 +61,22 @@ def print_result(
         scenario: Scenario parameters
         config: Generated configuration
         env: Environment variables
-        cli_args: CLI arguments
-        output_path: Path where config was written
+        output_path: Path where recipe was written
         profile_name: Name of the profile used
     """
     click.echo(
         click.style(
-            "\nFound optimized configuration for the specified scenario:", fg="green", bold=True
+            "\nGenerated optimized recipe for the specified scenario:", fg="green", bold=True
         )
     )
     click.echo(f"Profile: {profile_name}\n")
+
+    # Print scenario
+    click.echo(click.style("scenario:", fg="cyan", bold=True))
+    scenario_yaml = yaml.dump(scenario, default_flow_style=False, sort_keys=False)
+    for line in scenario_yaml.splitlines():
+        click.echo(f"  {line}")
+    click.echo()
 
     # Print environment variables if any
     if env:
@@ -124,21 +93,15 @@ def print_result(
     click.echo()
 
     # Print file write confirmation
-    click.echo(click.style(f"Wrote config to {output_path}.", fg="green"))
+    click.echo(click.style(f"Wrote recipe to {output_path}.", fg="green"))
     click.echo()
 
-    # Print serve command
-    click.echo(
-        click.style(
-            "To serve the model with optimized settings, run the following command:",
-            fg="yellow",
-            bold=True,
-        )
-    )
+    # Print bench command
+    click.echo(click.style("To run benchmarks with this recipe, use:", fg="yellow", bold=True))
     click.echo()
 
-    serve_cmd = generate_serve_command(scenario, cli_args, env, output_path)
-    click.echo(serve_cmd)
+    bench_cmd = generate_bench_command(output_path)
+    click.echo(bench_cmd)
     click.echo()
 
 
@@ -146,17 +109,17 @@ def print_result(
 @click.option(
     "--model",
     type=str,
-    default=None,
+    required=True,
     help="Model name or HuggingFace path (e.g., 'nvidia/DeepSeek-R1-0528-FP4')",
 )
 @click.option("--gpu", type=str, default=None, help="GPU type (e.g., 'H100_SXM', 'B200')")
 @click.option("--num-gpus", type=int, default=None, help="Number of GPUs to use")
-@click.option("--target-isl", type=int, default=None, help="Target input sequence length")
-@click.option("--target-osl", type=int, default=None, help="Target output sequence length")
+@click.option("--target-isl", type=int, required=True, help="Target input sequence length")
+@click.option("--target-osl", type=int, required=True, help="Target output sequence length")
 @click.option(
     "--target-concurrency",
     type=int,
-    default=None,
+    required=True,
     help="Target concurrency (number of concurrent requests)",
 )
 @click.option(
@@ -178,44 +141,37 @@ def print_result(
     help="Profile to use (auto-detected from model name if not specified)",
 )
 @click.option(
-    "--recipe",
-    type=click.Path(exists=True),
-    default=None,
-    help="Path to a recipe YAML file to load",
-)
-@click.option(
     "-o",
     "--output",
     type=click.Path(),
     required=True,
-    help="Output path for the generated config YAML file",
+    help="Output path for the generated recipe YAML file",
 )
 @click.option(
     "--no-validate", is_flag=True, default=False, help="Skip validation of scenario constraints"
 )
 def configure(
-    model: Optional[str],
+    model: str,
     gpu: Optional[str],
     num_gpus: Optional[int],
-    target_isl: Optional[int],
-    target_osl: Optional[int],
-    target_concurrency: Optional[int],
+    target_isl: int,
+    target_osl: int,
+    target_concurrency: int,
     tp_size: Optional[int],
     ep_size: Optional[int],
     profile: Optional[str],
-    recipe: Optional[str],
     output: str,
     no_validate: bool,
 ):
-    r"""Generate optimized TensorRT-LLM configuration from scenario constraints.
+    r"""Generate optimized TensorRT-LLM recipe from scenario constraints.
 
-    This tool takes high-level inference scenario parameters and generates an
-    optimized configuration file that can be used with trtllm-serve's
-    --extra_llm_api_options flag.
+    This tool takes high-level inference scenario parameters and generates a
+    complete recipe YAML file (scenario + config + env) that can be used with
+    trtllm-bench's --recipe flag.
 
     Examples:
     \b
-    # Generate config from scenario parameters
+    # Generate recipe from scenario parameters
     trtllm-configure \\
         --model nvidia/DeepSeek-R1-0528-FP4 \\
         --gpu B200 \\
@@ -223,113 +179,50 @@ def configure(
         --target-isl 8192 \\
         --target-osl 1024 \\
         --target-concurrency 256 \\
-        --output config.yaml
+        --output my-recipe.yaml
 
     \b
-    # Load from an existing recipe file
+    # Override TP/EP sizes
     trtllm-configure \\
-        --recipe tensorrt_llm/recipes/db/gptoss-fp4-h100-throughput.yaml \\
-        --output config.yaml
+        --model openai/gpt-oss-120b \\
+        --target-isl 8000 \\
+        --target-osl 1000 \\
+        --target-concurrency 256 \\
+        --tp-size 4 \\
+        --output recipe.yaml
     """
     try:
-        # Load from recipe file if provided
-        if recipe:
-            recipe_data = load_recipe_file(recipe)
-            scenario = recipe_data.get("scenario", {})
-            env_from_recipe = recipe_data.get("env", {})
-            config_from_recipe = recipe_data.get("config", {})
-            overrides = recipe_data.get("overrides", {})
+        # Build scenario from CLI arguments
+        scenario = {
+            "model": model,
+            "target_isl": target_isl,
+            "target_osl": target_osl,
+            "target_concurrency": target_concurrency,
+        }
 
-            # Use recipe data as base, but allow CLI overrides
-            if model:
-                scenario["model"] = model
-            if gpu:
-                scenario["gpu"] = gpu
-            if num_gpus is not None:
-                scenario["num_gpus"] = num_gpus
-            if target_isl is not None:
-                scenario["target_isl"] = target_isl
-            if target_osl is not None:
-                scenario["target_osl"] = target_osl
-            if target_concurrency is not None:
-                scenario["target_concurrency"] = target_concurrency
-            if tp_size is not None:
-                scenario["tp_size"] = tp_size
-            if ep_size is not None:
-                scenario["ep_size"] = ep_size
+        if gpu:
+            scenario["gpu"] = gpu
+        if num_gpus is not None:
+            scenario["num_gpus"] = num_gpus
+        if tp_size is not None:
+            scenario["tp_size"] = tp_size
+        if ep_size is not None:
+            scenario["ep_size"] = ep_size
 
-            # If recipe already has config, use it
-            if config_from_recipe:
-                config = config_from_recipe
-                env = env_from_recipe
-                # Compute CLI args from scenario for the serve command
-                profile_name = (
-                    profile or scenario.get("profile") or detect_profile(scenario.get("model", ""))
-                )
-                if profile_name:
-                    result = compute_from_scenario(scenario, profile_name)
-                    cli_args = result.get("cli_args", {})
-                else:
-                    cli_args = {}
-            else:
-                # Recipe only has scenario, compute config
-                result = compute_from_scenario(scenario, profile)
-                config = result["config"]
-                env = result.get("env", {})
-                cli_args = result.get("cli_args", {})
-
-            # Apply overrides
+        # Try to match against existing recipes first
+        matched_recipe = match_recipe(scenario)
+        if matched_recipe:
+            click.echo(click.style("Found matching recipe in database!", fg="green"))
+            config = matched_recipe.get("config", {})
+            env = matched_recipe.get("env", {})
+            overrides = matched_recipe.get("overrides", {})
             if overrides:
                 config = merge_overrides(config, overrides)
         else:
-            # Build scenario from CLI arguments
-            if not all([model, target_isl, target_osl, target_concurrency]):
-                click.echo(
-                    click.style(
-                        "Error: When not using --recipe, you must specify: "
-                        "--model, --target-isl, --target-osl, --target-concurrency",
-                        fg="red",
-                    ),
-                    err=True,
-                )
-                sys.exit(1)
-
-            scenario = {
-                "model": model,
-                "target_isl": target_isl,
-                "target_osl": target_osl,
-                "target_concurrency": target_concurrency,
-            }
-
-            if gpu:
-                scenario["gpu"] = gpu
-            if num_gpus is not None:
-                scenario["num_gpus"] = num_gpus
-            if tp_size is not None:
-                scenario["tp_size"] = tp_size
-            if ep_size is not None:
-                scenario["ep_size"] = ep_size
-
-            # Try to match against existing recipes first
-            matched_recipe = match_recipe(scenario)
-            if matched_recipe:
-                click.echo(click.style("Found matching recipe!", fg="green"))
-                config = matched_recipe.get("config", {})
-                env = matched_recipe.get("env", {})
-                overrides = matched_recipe.get("overrides", {})
-                if overrides:
-                    config = merge_overrides(config, overrides)
-
-                # Compute CLI args
-                profile_name = profile or detect_profile(model)
-                result = compute_from_scenario(scenario, profile_name)
-                cli_args = result.get("cli_args", {})
-            else:
-                # Compute from scenario
-                result = compute_from_scenario(scenario, profile)
-                config = result["config"]
-                env = result.get("env", {})
-                cli_args = result.get("cli_args", {})
+            # Compute from scenario using profile
+            result = compute_from_scenario(scenario, profile)
+            config = result["config"]
+            env = result.get("env", {})
 
         # Validate scenario unless disabled
         if not no_validate:
@@ -342,26 +235,25 @@ def configure(
             for warning in config_warnings:
                 click.echo(click.style(str(warning), fg="yellow"), err=True)
 
-        # Apply CLI overrides to cli_args
-        if tp_size is not None:
-            cli_args["tp_size"] = tp_size
-        if ep_size is not None:
-            cli_args["ep_size"] = ep_size
+        # Build complete recipe structure
+        recipe_data = {
+            "scenario": scenario,
+            "env": env,
+            "config": config,
+        }
 
-        # Write config to file
+        # Write recipe to file
         output_path = Path(output)
         with open(output_path, "w") as f:
-            yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+            yaml.dump(recipe_data, f, default_flow_style=False, sort_keys=False)
 
         # Determine which profile was used
-        profile_name = (
-            profile or scenario.get("profile") or detect_profile(scenario.get("model", ""))
-        )
+        profile_name = profile or scenario.get("profile") or detect_profile(model)
         if not profile_name:
             profile_name = "custom"
 
         # Print result
-        print_result(scenario, config, env, cli_args, str(output_path), profile_name)
+        print_result(scenario, config, env, str(output_path), profile_name)
 
     except Exception as e:
         click.echo(click.style(f"Error: {str(e)}", fg="red"), err=True)
