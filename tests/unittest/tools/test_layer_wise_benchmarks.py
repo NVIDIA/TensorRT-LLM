@@ -1,23 +1,22 @@
 import os
+from subprocess import check_call
 
 import pytest
 import torch
-from defs.conftest import deepseek_r1_model_root  # noqa: F401
-from defs.conftest import deepseek_v3_model_root  # noqa: F401
-from defs.trt_test_alternative import check_call
 from utils.cpp_paths import llm_root  # noqa: F401
+from utils.llm_data import llm_models_root
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
-@pytest.mark.parametrize("deepseek_r1_model_root", ["DeepSeek-R1-0528-FP4-v2"],
-                         indirect=True)
-def test_deepseek_r1_ctx_tep(llm_root, deepseek_r1_model_root):
+def test_deepseek_r1_ctx_tep(llm_root):
+    model_root = llm_models_root(check=True)
     check_call([
         "./mpi_launch.sh",
         "./run_single.sh",
         "config_ctx.yaml",
-        "--model=" + deepseek_r1_model_root,
+        "--model",
+        model_root / "DeepSeek-R1" / "DeepSeek-R1-0528-FP4-v2",
         "--no-enable-attention-dp",
         "--moe-backend=TRTLLM",
     ],
@@ -31,14 +30,14 @@ def test_deepseek_r1_ctx_tep(llm_root, deepseek_r1_model_root):
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
-@pytest.mark.parametrize("deepseek_v3_model_root", ["DeepSeek-V3.2-Exp"],
-                         indirect=True)
-def test_deepseek_v32_ctx_dep(llm_root, deepseek_v3_model_root):
+def test_deepseek_v32_ctx_dep(llm_root):
+    model_root = llm_models_root(check=True)
     check_call([
         "./mpi_launch.sh",
         "./run_single.sh",
         "config_ctx.yaml",
-        "--model=" + deepseek_v3_model_root,
+        "--model",
+        model_root / "DeepSeek-V3.2-Exp-hf",
         "--tokens-per-block=64",
         "--moe-backend=DEEPGEMM",
     ],
@@ -51,14 +50,14 @@ def test_deepseek_v32_ctx_dep(llm_root, deepseek_v3_model_root):
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
-@pytest.mark.parametrize("deepseek_r1_model_root", ["DeepSeek-R1-0528-FP4-v2"],
-                         indirect=True)
-def test_deepseek_r1_gen_scaled_from_16_dep(llm_root, deepseek_r1_model_root):
+def test_deepseek_r1_gen_scaled_from_16_dep(llm_root):
+    model_root = llm_models_root(check=True)
     check_call([
         "./mpi_launch.sh",
         "./run_single.sh",
         "config_gen.yaml",
-        "--model=" + deepseek_r1_model_root,
+        "--model",
+        model_root / "DeepSeek-R1" / "DeepSeek-R1-0528-FP4-v2",
         "--layer-indices=5,6",
         "--scaled-from=16",
         "--moe-backend=WIDEEP",

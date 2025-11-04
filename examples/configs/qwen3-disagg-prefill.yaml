@@ -1,0 +1,8 @@
+max_batch_size: 161
+max_num_tokens: 1160
+kv_cache_free_gpu_memory_fraction: 0.8
+tensor_parallel_size: 1
+moe_expert_parallel_size: 1
+trust_remote_code: true
+print_iter_log: true
+enable_attention_dp: true

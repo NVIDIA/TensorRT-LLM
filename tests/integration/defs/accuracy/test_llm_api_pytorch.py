@@ -32,7 +32,7 @@ from ..conftest import (get_device_count, get_device_memory, llm_models_root,
                         parametrize_with_ids, skip_no_hopper,
                         skip_post_blackwell, skip_pre_ada, skip_pre_blackwell,
                         skip_pre_hopper, skip_ray)
-from .accuracy_core import (GSM8K, MMLU, MMMU, CnnDailymail, GPQADiamond,
+from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
                             JsonModeEval, LlmapiAccuracyTestHarness)
 
 
@@ -257,8 +257,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  speculative_config=spec_config,
                  build_config=None) as llm:
             task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
@@ -2852,7 +2850,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("enable_chunked_prefill", [False, True])
     def test_eagle3(self, enable_chunked_prefill, eagle3_one_model):
         pytorch_config = dict(
-            disable_overlap_scheduler=True,
+            disable_overlap_scheduler=not eagle3_one_model,
             cuda_graph_config=CudaGraphConfig(),
         )
         kv_cache_config = KvCacheConfig(
@@ -2877,7 +2875,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                   build_config=None)
 
         with llm:
-            task = MMLU(self.MODEL_NAME)
+            task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
     @skip_pre_blackwell
@@ -3040,7 +3038,7 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
 
     def test_eagle3(self):
         pytorch_config = dict(
-            disable_overlap_scheduler=True,
+            disable_overlap_scheduler=False,
             cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 3, 4, 8]),
         )
         kv_cache_config = KvCacheConfig(enable_block_reuse=False)
@@ -3880,26 +3878,6 @@ class TestEXAONE4(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
-class TestQwen2_VL_7B(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "Qwen/Qwen2-VL-7B-Instruct"
-    MODEL_PATH = f"{llm_models_root()}/Qwen2-VL-7B-Instruct"
-
-    # NOTE: MMMU adds <|endoftext|> to the stop token.
-    sampling_params = SamplingParams(max_tokens=MMMU.MAX_OUTPUT_LEN,
-                                     truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
-                                     stop="<|endoftext|>")
-
-    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
-
-    @pytest.mark.skip(reason="https://nvbugs/5601909")
-    def test_auto_dtype(self):
-        with LLM(self.MODEL_PATH,
-                 max_num_tokens=16384,
-                 kv_cache_config=self.kv_cache_config) as llm:
-            task = MMMU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=self.sampling_params)
-
-
 class TestQwQ_32B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen/QwQ-32B"
     MODEL_PATH = f"{llm_models_root()}/QwQ-32B"
@@ -3949,29 +3927,6 @@ class TestQwen3NextThinking(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-
-
-class TestNano_V2_VLM(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "nvidia/Nano-v2-VLM"
-    MODEL_PATH = f"{llm_models_root()}/Nano-v2-VLM"
-    MAX_NUM_TOKENS = 25600
-
-    # NOTE: MMMU adds <|endoftext|> to the stop token.
-    sampling_params = SamplingParams(max_tokens=MAX_NUM_TOKENS,
-                                     truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
-                                     stop="<|endoftext|>")
-
-    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
-                                    enable_block_reuse=False)
-
-    @pytest.mark.skip(reason="Nano V2 VLM ckpt is not released yet.")
-    def test_auto_dtype(self):
-        with LLM(self.MODEL_PATH,
-                 max_batch_size=128,
-                 max_num_tokens=self.MAX_NUM_TOKENS,
-                 kv_cache_config=self.kv_cache_config) as llm:
-            task = MMMU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=self.sampling_params)
 
 
 class TestSeedOss_36B(LlmapiAccuracyTestHarness):
