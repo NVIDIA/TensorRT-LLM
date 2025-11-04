@@ -137,8 +137,8 @@ bool FabricMemory::supportFbaricMemory()
 
         CUresult ret1 = cuDeviceGetAttribute(&gpu_direct_rdma_with_cuda_vmm_supported,
             CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED, deviceIdx);
-        TLLM_LOG_DEBUG("FabricMemory::supportFbaricMemory fabric_handle_supported:%d", fabric_handle_supported);
-        TLLM_LOG_DEBUG("FabricMemory::supportFbaricMemory gpu_direct_rdma_with_cuda_vmm_supported:%d",
+        TLLM_LOG_DEBUG("FabricMemory::supportFabricMemory fabric_handle_supported:%d", fabric_handle_supported);
+        TLLM_LOG_DEBUG("FabricMemory::supportFabricMemory gpu_direct_rdma_with_cuda_vmm_supported:%d",
             gpu_direct_rdma_with_cuda_vmm_supported);
         if (ret0 != CUresult::CUDA_SUCCESS || ret1 != CUresult::CUDA_SUCCESS || fabric_handle_supported == 0
             || gpu_direct_rdma_with_cuda_vmm_supported == 0)
@@ -213,8 +213,9 @@ CacheTransBufferManager::CacheTransBufferManager(
         }
         else
         {
-            kvCacheByteSizePerTokenPerLayer = mCacheManager->getBlockManager().getBlockSize(0) / tokensPerBlock
-                * (mCacheManager->getCacheType() == CacheType::kSELFKONLY ? 1 : 2);
+            auto primaryPool = mCacheManager->getPrimaryPool(0);
+            kvCacheByteSizePerTokenPerLayer
+                = primaryPool->getDimension<-1>() * primaryPool->getDimension<2>() * dataSize / tokensPerBlock;
         }
         for (auto layerId = 0; layerId < mCacheManager->getBlockManager().getNumLayers(); layerId++)
         {
@@ -267,10 +268,10 @@ size_t CacheTransBufferManager::preAllocBufferSize(
         return 0;
     }
     auto maxNumTokens = cacheTransceiverConfig->getMaxTokensInBuffer();
-    size_t TransferBufferSize = common::getEnvMemSizeForKVCacheTransferBuffer();
+    size_t transferBufferSize = common::getEnvMemSizeForKVCacheTransferBuffer();
     if (maxNumTokens.has_value())
     {
-        TransferBufferSize = 0;
+        transferBufferSize = 0;
         for (auto const& [windowSize, cacheSizeBytesPerToken] : cacheSizeBytesPerTokenPerWindow)
         {
             auto alignedWindowSize = (windowSize + tokensPerBlock - 1) / tokensPerBlock * tokensPerBlock;
@@ -282,19 +283,19 @@ size_t CacheTransBufferManager::preAllocBufferSize(
                 validTokenNum = maxNumTokens.value();
             }
             validTokenNum += tokensPerBlock; // add one more block
-            TransferBufferSize += validTokenNum * cacheSizeBytesPerToken;
+            transferBufferSize += validTokenNum * cacheSizeBytesPerToken;
         }
     }
     bool useFabricMemory = FabricMemory::supportFbaricMemory()
         && (!(common::getEnvKVCacheTransferUseSyncBuffer() || common::getEnvKVCacheTransferUseAsyncBuffer()));
     if (useFabricMemory)
     {
-        TransferBufferSize = FabricMemory::getAlignedSize(TransferBufferSize);
+        transferBufferSize = FabricMemory::getAlignedSize(transferBufferSize);
     }
-    size_t RecvBufferCount = common::getEnvRequestKVCacheConcurrent() ? common::getEnvKVCacheRecvBufferCount() : 1;
-    size_t SendBufferCount = common::getEnvKVCacheSendMaxConcurrenceNum();
-    size_t PreAllocBufferSize = TransferBufferSize * (RecvBufferCount + SendBufferCount);
-    return PreAllocBufferSize;
+    size_t recvBufferCount = common::getEnvRequestKVCacheConcurrent() ? common::getEnvKVCacheRecvBufferCount() : 1;
+    size_t sendBufferCount = common::getEnvKVCacheSendMaxConcurrenceNum();
+    size_t preAllocBufferSize = transferBufferSize * (recvBufferCount + sendBufferCount);
+    return preAllocBufferSize;
 }
 
 std::optional<int> CacheTransBufferManager::assignBufferIndexForSend()
