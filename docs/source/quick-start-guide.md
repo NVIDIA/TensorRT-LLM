@@ -88,7 +88,7 @@ Here is a simple example to show how to use the LLM API with TinyLlama.
 ```
 
 You can also directly load pre-quantized models [quantized checkpoints on Hugging Face](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4) in the LLM constructor.
-To learn more about the LLM API, check out the [](llm-api/index) and [](examples/llm_api_examples).
+To learn more about the LLM API, check out the [docs](llm-api/index) and [examples](examples/llm_api_examples).
 
 ## Next Steps
 
