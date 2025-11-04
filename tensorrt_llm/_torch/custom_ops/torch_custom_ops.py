@@ -24,6 +24,22 @@ def bmm_out(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
     torch.bmm(a, b, out=out)
 
 
+from enum import IntEnum
+
+
+# Copied from csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/common.hExpand commentComment on line R76Code has comments. Press enter to view.
+class ActivationType(IntEnum):
+    Gelu = 0
+    Relu = 1
+    Silu = 2
+    Swiglu = 3
+    Geglu = 4
+    SwigluBias = 5
+    Relu2 = 6
+    Identity = 7
+    InvalidType = 8
+
+
 class MoERunner(TunableRunner):
     # avoid overhead of creating a new runner in forward pass
     runner_dict = dict()
@@ -52,6 +68,7 @@ class MoERunner(TunableRunner):
         use_mxfp8_act_scaling: bool,
         min_latency_mode: bool,
         use_fused_finalize: bool,
+        activation_type: ActivationType,
         unpadded_hidden_size: Optional[int] = None,
     ):
         self.x_dtype = x_dtype
@@ -72,6 +89,7 @@ class MoERunner(TunableRunner):
         self.use_mxfp8_act_scaling = use_mxfp8_act_scaling
         self.min_latency_mode = min_latency_mode
         self.use_fused_finalize = use_fused_finalize
+        self.activation_type = activation_type
         self.unpadded_hidden_size = unpadded_hidden_size if unpadded_hidden_size is not None else 0
 
         instance_key = (x_dtype, weight_dtype, output_dtype,
@@ -84,7 +102,7 @@ class MoERunner(TunableRunner):
                     x_dtype, weight_dtype, output_dtype,
                     use_deepseek_fp8_block_scale, use_w4_group_scaling,
                     use_int8_woq_per_channel, use_mxfp8_act_scaling,
-                    use_fused_finalize)
+                    use_fused_finalize)  # , activation_type)
         self.fused_moe_runner = MoERunner.runner_dict[instance_key]
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
@@ -117,6 +135,7 @@ class MoERunner(TunableRunner):
             gemm_idx,
             tactic,
             do_preparation,
+            self.activation_type,
             self.unpadded_hidden_size,
         )
 
@@ -153,6 +172,7 @@ def fused_moe(
     tune_max_num_tokens: int = 8192,
     tuner_num_tokens: Optional[int] = None,
     tuner_top_k: Optional[int] = None,
+    activation_type: ActivationType = ActivationType.Swiglu,
     unpadded_hidden_size: Optional[int] = None,
     out_tensor: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
@@ -189,6 +209,7 @@ def fused_moe(
         use_mxfp8_act_scaling=use_mxfp8_act_scaling,
         min_latency_mode=min_latency_mode,
         use_fused_finalize=use_fused_finalize,
+        activation_type=activation_type,
         unpadded_hidden_size=unpadded_hidden_size,
     )
 
@@ -223,8 +244,8 @@ def fused_moe(
                      swizzled_input_sf, swiglu_alpha, swiglu_beta, swiglu_limit,
                      tp_size, tp_rank, ep_size, ep_rank, cluster_size,
                      cluster_rank, enable_alltoall, min_latency_mode,
-                     [gemm_tactic_1, gemm_tactic_2], unpadded_hidden_size,
-                     tuner_num_tokens, out_tensor)
+                     [gemm_tactic_1, gemm_tactic_2], activation_type,
+                     unpadded_hidden_size, tuner_num_tokens, out_tensor)
 
     return output if min_latency_mode else [output]
 
@@ -260,6 +281,7 @@ def _(input: torch.Tensor,
       tune_max_num_tokens: int = 8192,
       tuner_num_tokens: Optional[int] = None,
       tuner_top_k: Optional[int] = None,
+      activation_type: ActivationType = ActivationType.Swiglu,
       unpadded_hidden_size: Optional[int] = None,
       out_tensor: Optional[torch.Tensor] = None):
     seq_len = input.shape[0]
