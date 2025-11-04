@@ -24,8 +24,13 @@ function mpi_world_size {
 }
 
 function export_free_tcp_addr_for_spawn_proxy_process {
-    # find free port starting from 10012
-    local free_port=$(python -c 'import socket; s=socket.socket();
+    if [ -n "$TLLM_SPAWN_PROXY_PROCESS_IPC_PORT" ]; then
+        # Use the port provided by the environment variable
+        local free_port=$TLLM_SPAWN_PROXY_PROCESS_IPC_PORT
+        log_stderr "Using port from TLLM_SPAWN_PROXY_PROCESS_IPC_PORT: $free_port"
+    else
+        # Find free port starting from 10012
+        local free_port=$(python -c 'import socket; s=socket.socket();
 port = 10012
 while True:
     try:
@@ -34,6 +39,7 @@ while True:
     except OSError:
         port += 1
 print(port); s.close()')
+    fi
     export TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR="tcp://127.0.0.1:${free_port}"
     log_stderr "TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR: $TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR"
 
