@@ -3501,7 +3501,7 @@ def test_llmapi_generation_logits(llm_venv, model_path,
 
 
 @skip_pre_blackwell
-@pytest.mark.skip_less_device_memory(189000)
+@pytest.mark.skip_less_device_memory(183000)
 @pytest.mark.timeout(28800)
 @pytest.mark.parametrize("model_name,model_path,gpu_count", [
     ("DeepSeek-R1-0528", "DeepSeek-R1/DeepSeek-R1-0528", 8),
@@ -3616,6 +3616,7 @@ def test_longbench_v2_multigpus(llm_venv, model_name, model_path, gpu_count):
             "--kv_cache_free_gpu_memory_fraction=0.8",
             f"--extra_llm_api_options={extra_config_file.name}",
             "longbench_v2",
+            f"--dataset_path={llm_models_root()}/zai-org/LongBench-v2",
             "--length=medium",
             "--max_len=1280000",
             "--max_input_length=1280000",
