@@ -3,6 +3,7 @@ import torch
 
 from tensorrt_llm._torch.modules.fused_moe.routing import RoutingMethodType
 from tensorrt_llm._torch.utils import unswizzle_sf
+from tensorrt_llm._utils import get_sm_version
 
 
 def get_max_num_tiles(num_tokens: int, top_k: int, tile_size: int, num_local_experts: int) -> int:
@@ -18,12 +19,75 @@ def get_max_num_permuted_tokens(
     return get_max_num_tiles(num_tokens, top_k, tile_size, num_local_experts) * tile_size
 
 
+def cute_dsl_nvfp4_grouped_gemm_ref(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_sf: torch.Tensor,
+    b_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    tile_idx_to_group_idx: torch.Tensor,
+    num_non_exiting_tiles: torch.Tensor,
+    output_dtype: torch.dtype,
+    tile_size: int = 128,
+    scaling_vector_size: int = 16,
+):
+    assert a.dtype == torch.float4_e2m1fn_x2
+    assert a.dim() == 2
+    assert b.dtype == torch.float4_e2m1fn_x2
+    assert b.dim() == 3
+    assert a_sf.dtype == torch.uint8
+    assert a_sf.dim() == 1
+    assert b_sf.dtype == torch.uint8
+    assert b_sf.dim() == 3
+    assert alpha.dtype == torch.float32
+    assert alpha.dim() == 1
+
+    m, k = a.size(0), a.size(1) * 2
+    l, n = b.size(0), b.size(1)  # noqa: E741
+    assert b.size(2) * 2 == k
+    assert m % tile_size == 0
+    assert k % (scaling_vector_size * 4) == 0
+    assert a_sf.size(0) == m * k // scaling_vector_size
+    assert b_sf.size(0) == l
+    assert b_sf.size(1) == n
+    assert b_sf.size(2) == k // scaling_vector_size
+    assert alpha.size(0) == l
+
+    num_tiles_per_expert = torch.bincount(
+        tile_idx_to_group_idx[: num_non_exiting_tiles[0].item()], minlength=l
+    )
+    offsets = [0] + num_tiles_per_expert.cumsum(dim=0).tolist()
+
+    ref = torch.empty(m, n, dtype=output_dtype, device="cuda")
+    for i, (start, end) in enumerate(zip(offsets[:-1], offsets[1:])):
+        if end <= start:
+            continue
+        a_sliced = a[start * tile_size : end * tile_size]
+        a_sf_sliced = a_sf[
+            start * tile_size * k // scaling_vector_size : end
+            * tile_size
+            * k
+            // scaling_vector_size
+        ]
+        ref[start * tile_size : end * tile_size] = torch.ops.trtllm.nvfp4_gemm(
+            a_sliced.view(torch.uint8),
+            b[i].view(torch.uint8),
+            a_sf_sliced,
+            b_sf[i],
+            alpha[i],
+            output_dtype,
+        )
+
+    return ref
+
+
 @pytest.mark.parametrize("tile_size", [128, 256])
+@pytest.mark.parametrize("ep_size", [1, 8, 32])
 @pytest.mark.parametrize("top_k", [1, 2, 8])
 @pytest.mark.parametrize("num_tokens", [128, 515, 1024, 8192])
-def test_moe_sort(num_tokens: int, top_k: int, tile_size: int):
+def test_moe_sort(num_tokens: int, top_k: int, ep_size: int, tile_size: int):
     num_experts = 256
-    num_local_experts = 256 // 32
+    num_local_experts = num_experts // ep_size
 
     routing_logits = torch.randn(num_tokens, num_experts, device="cuda")
     token_final_scales, token_selected_experts = routing_logits.topk(top_k, dim=-1)
@@ -31,7 +95,7 @@ def test_moe_sort(num_tokens: int, top_k: int, tile_size: int):
     token_final_scales = token_final_scales.softmax(dim=-1).to(torch.bfloat16)
 
     (
-        tile_idx_to_batch_idx,
+        tile_idx_to_group_idx,
         tile_idx_to_mn_limit,
         expanded_idx_to_permuted_idx,
         permuted_idx_to_expanded_idx,
@@ -58,17 +122,17 @@ def test_moe_sort(num_tokens: int, top_k: int, tile_size: int):
     num_tiles_per_expert = num_tiles_per_expert.cpu()
 
     max_num_tiles = get_max_num_tiles(num_tokens, top_k, tile_size, num_local_experts)
-    num_valid_tiles = num_tiles_per_expert.sum().item()
     max_num_permuted_tokens = get_max_num_permuted_tokens(
         num_tokens, top_k, tile_size, num_local_experts
     )
-    num_valid_permuted_tokens = num_tiles_per_expert.sum().item() * tile_size
-    assert num_valid_tiles <= max_num_tiles
-    assert num_valid_permuted_tokens <= max_num_permuted_tokens
+    num_valid_tiles = num_tiles_per_expert.sum().item()
+    num_valid_permuted_tokens = num_valid_tiles * tile_size
+    assert 0 <= num_valid_tiles <= max_num_tiles
+    assert 0 <= num_valid_permuted_tokens <= max_num_permuted_tokens
 
-    tile_idx_to_batch_idx = tile_idx_to_batch_idx.cpu()
+    tile_idx_to_group_idx = tile_idx_to_group_idx.cpu()
     tile_idx_to_mn_limit = tile_idx_to_mn_limit.cpu()
-    assert tile_idx_to_batch_idx.size() == (max_num_tiles,)
+    assert tile_idx_to_group_idx.size() == (max_num_tiles,)
     assert tile_idx_to_mn_limit.size() == (max_num_tiles,)
     tile_idx = 0
     for expert_idx in range(num_local_experts):
@@ -82,7 +146,7 @@ def test_moe_sort(num_tokens: int, top_k: int, tile_size: int):
             else:
                 assert 0 < num_remaining_tokens <= tile_size
                 mn_limit += num_remaining_tokens
-            assert tile_idx_to_batch_idx[tile_idx].item() == expert_idx
+            assert tile_idx_to_group_idx[tile_idx].item() == expert_idx
             assert tile_idx_to_mn_limit[tile_idx].item() == mn_limit
             tile_idx += 1
 
@@ -102,7 +166,7 @@ def test_moe_sort(num_tokens: int, top_k: int, tile_size: int):
                 assert permuted_idx >= 0
                 assert permuted_idx_to_expanded_idx[permuted_idx].item() == expanded_idx
                 tile_idx = permuted_idx // tile_size
-                assert tile_idx_to_batch_idx[tile_idx].item() == expert_idx
+                assert tile_idx_to_group_idx[tile_idx].item() == expert_idx
 
     for i in range(num_valid_permuted_tokens):
         tile_idx = i // tile_size
@@ -130,17 +194,10 @@ def test_moe_permute(dtype: str, num_tokens: int, top_k: int, tile_size: int):
     x_sf = None
     if dtype == "float4":
         x = x[:, : hidden_size // 2].to(torch.int8).view(torch.float4_e2m1fn_x2)
-        x_sf = (
-            torch.randint(
-                -100,
-                100,
-                (num_tokens, hidden_size // sf_vec_size),
-                dtype=torch.int32,
-                device="cuda",
-            )
-            .to(torch.float8_e4m3fn)
-            .view(torch.uint8)
+        x_sf = torch.randint(
+            -100, 100, (num_tokens, hidden_size // sf_vec_size), dtype=torch.int32, device="cuda"
         )
+        x_sf = x_sf.to(torch.float8_e4m3fn).view(torch.uint8)
     elif dtype == "float8":
         x = x.to(torch.float8_e4m3fn)
     else:
@@ -216,3 +273,104 @@ def test_moe_unpermute(dtype: str, num_tokens: int, top_k: int, tile_size: int):
         (permuted_x[expanded_idx_to_permuted_idx] * topk_scales.unsqueeze(-1)).sum(dim=1).to(dtype)
     )
     torch.testing.assert_close(x, x_ref)
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 100, reason="This test is only supported in Blackwell architecture"
+)
+@pytest.mark.parametrize("tile_size", [128])
+@pytest.mark.parametrize("ep_size", [1, 8, 32])
+@pytest.mark.parametrize("top_k", [1, 2, 8])
+@pytest.mark.parametrize("num_tokens", [128, 515, 1024, 8192])
+def test_nvfp4_grouped_gemm_blackwell(num_tokens: int, top_k: int, ep_size: int, tile_size: int):
+    torch.manual_seed(516)
+
+    sf_vec_size = 16
+    hidden_size = 4096
+    inter_size = 8192
+    num_experts = 256
+    num_local_experts = num_experts // ep_size
+
+    max_num_tiles = get_max_num_tiles(num_tokens, top_k, tile_size, num_local_experts)
+    max_num_permuted_tokens = get_max_num_permuted_tokens(
+        num_tokens, top_k, tile_size, num_local_experts
+    )
+    routing_logits = torch.randn(num_tokens, num_experts, device="cuda")
+    _, token_selected_experts = routing_logits.topk(top_k, dim=-1)
+    token_selected_experts = token_selected_experts.to(torch.int32)
+    num_tokens_per_expert = torch.bincount(token_selected_experts.flatten(), minlength=num_experts)
+    num_tokens_per_expert = num_tokens_per_expert[:num_local_experts]
+    num_tiles_per_expert = (num_tokens_per_expert + tile_size - 1) // tile_size
+    num_tokens_per_expert = num_tokens_per_expert.cpu()
+    num_tiles_per_expert = num_tiles_per_expert.cpu()
+    num_valid_tiles = num_tiles_per_expert.sum().item()
+    assert 0 <= num_valid_tiles <= max_num_tiles
+
+    num_non_exiting_tiles = torch.tensor([num_valid_tiles], dtype=torch.int32, device="cuda")
+    tile_idx_to_group_idx = torch.empty(max_num_tiles, dtype=torch.int32)
+    # TODO: Fix this.
+    tile_idx_to_group_idx.fill_(0)
+    tile_idx = 0
+    for expert_idx in range(num_local_experts):
+        for i in range(num_tiles_per_expert[expert_idx].item()):
+            tile_idx_to_group_idx[tile_idx] = expert_idx
+            tile_idx += 1
+    tile_idx_to_group_idx = tile_idx_to_group_idx.cuda()
+
+    a = torch.randint(
+        -100, 100, (max_num_permuted_tokens, hidden_size // 2), dtype=torch.int32, device="cuda"
+    )
+    a = a.to(torch.int8).view(torch.float4_e2m1fn_x2)
+    a_sf = torch.randint(
+        -100,
+        100,
+        (max_num_permuted_tokens, hidden_size // sf_vec_size),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    a_sf = a_sf.to(torch.float8_e4m3fn).view(torch.uint8).flatten()
+    b = torch.randint(
+        -100,
+        100,
+        (num_local_experts, inter_size, hidden_size // 2),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    b = b.to(torch.int8).view(torch.float4_e2m1fn_x2)
+    b_sf = torch.randint(
+        -100,
+        100,
+        (num_local_experts, inter_size, hidden_size // sf_vec_size),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    b_sf = b_sf.to(torch.float8_e4m3fn).view(torch.uint8)
+    alpha = torch.ones(num_local_experts, dtype=torch.float32, device="cuda")
+
+    c = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_blackwell(
+        a,
+        b,
+        a_sf,
+        b_sf,
+        alpha,
+        tile_idx_to_group_idx,
+        num_non_exiting_tiles,
+        torch.bfloat16,
+        tile_size,
+        sf_vec_size,
+    )
+    c_ref = cute_dsl_nvfp4_grouped_gemm_ref(
+        a,
+        b,
+        a_sf,
+        b_sf,
+        alpha,
+        tile_idx_to_group_idx,
+        num_non_exiting_tiles,
+        torch.bfloat16,
+        tile_size,
+        sf_vec_size,
+    )
+    torch.testing.assert_close(
+        c[: num_valid_tiles * tile_size], c_ref[: num_valid_tiles * tile_size]
+    )
