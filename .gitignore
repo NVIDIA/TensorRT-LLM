@@ -6,6 +6,8 @@ __pycache__/
 *.cache
 *.nsys-rep
 *.npy
+*.so
+*.whl
 .VSCodeCounter
 cpp/build*
 cpp/Release
