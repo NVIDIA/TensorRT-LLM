@@ -3757,7 +3757,22 @@ def launchTestJobs(pipeline, testFilter)
                     })
                 }
             } else {
-                values()
+                def stageIsInterrupted = false
+                try {
+                    trtllm_utils.llmStageWithRetry(pipeline, stageName, {
+                        GlobalState.stageAttemptTimes[stageName] = GlobalState.stageAttemptTimes.getOrDefault(stageName, 0) + 1
+                        echo "${stageName} attempt times: ${GlobalState.stageAttemptTimes[stageName]}"
+                        values()
+                    })
+                } catch (InterruptedException e) {
+                    stageIsInterrupted = true
+                    throw e
+                } finally {
+                    def image = "urm.nvidia.com/docker/golang:1.22"
+                    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "package"), "trt-llm", {
+                        publishJunitTestResults(pipeline, stageName, stageIsInterrupted, "-SubJob-RunTest")
+                    })
+                }
             }
         }
     }]}
@@ -3766,13 +3781,12 @@ def launchTestJobs(pipeline, testFilter)
 }
 
 
-def publishJunitTestResults(pipeline, stageName, stageIsInterrupted) {
+def publishJunitTestResults(pipeline, stageName, stageIsInterrupted, postTag="") {
     stage("Publish the junit test results") {
         if (stageIsInterrupted) {
             echo "Stage is interrupted, skip to upload test result."
         } else {
-            def resultsTar = "results-${stageName}.tar.gz"
-            def remoteResultsPath = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/${resultsTar}"
+            def remoteResultsPath = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/results-${stageName}${postTag}.tar.gz"
             sh "echo 'Attempting to download: ${remoteResultsPath}'"
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install wget")
@@ -3786,7 +3800,7 @@ def publishJunitTestResults(pipeline, stageName, stageIsInterrupted) {
                 }
                 throw e
             }
-            sh "tar -xzvf ${resultsTar}"
+            sh "tar -xzvf results-${stageName}.tar.gz"
             sh "cd ${stageName} && ls -alh"
             junit(allowEmptyResults: true, testResults: "${stageName}/results*.xml")
             // Clean up the workspace
