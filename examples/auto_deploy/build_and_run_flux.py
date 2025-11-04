@@ -235,6 +235,12 @@ def main():
     # Apply inference optimizer fusions
     ad_logger.info("Applying inference optimizer fusions (FP8 and FP4)...")
     optimizer_config = {
+        "quantize_fp8_from_graph": {
+            "stage": "pattern_matcher",
+        },
+        "quantize_nvfp4_from_graph": {
+            "stage": "pattern_matcher",
+        },
         "fuse_fp8_linear": {
             "stage": "post_load_fusion",
             "backend": "torch",
@@ -242,6 +248,12 @@ def main():
         "fuse_nvfp4_linear": {
             "stage": "post_load_fusion",
             "backend": "trtllm",
+        },
+        "fuse_fp8_gemms": {
+            "stage": "post_load_fusion",
+        },
+        "fuse_fp4_gemms": {
+            "stage": "post_load_fusion",
         },
     }
     optimizer = InferenceOptimizer(factory=None, config=optimizer_config)
