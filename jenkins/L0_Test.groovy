@@ -2302,13 +2302,15 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
 
     // Generate rerun test lists
     def failSignaturesList = trtllm_utils.getFailSignaturesList().join(",")
-    sh """
+    sh(script: """
+        set +x  # Disable debug mode
         python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
         generate_rerun_tests_list \
         --output-dir=${rerunDir}/ \
         --input-file=${WORKSPACE}/${stageName}/${resultFileName} \
         --fail-signatures="${failSignaturesList}"
-    """
+        set -x  # Enable debug mode
+    """)
 
     // If there are some failed tests that cannot be rerun (e.g. test duration > 10 min and no known failure signatures),
     // fail the stage immediately without attempting any reruns
@@ -3740,7 +3742,7 @@ def launchTestJobs(pipeline, testFilter)
                 try {
                     trtllm_utils.llmStageWithRetry(pipeline, stageName, {
                         GlobalState.stageAttemptTimes[stageName] = GlobalState.stageAttemptTimes.getOrDefault(stageName, 0) + 1
-                        echo "GlobalState.stageAttemptTimes[${stageName}]: ${GlobalState.stageAttemptTimes[stageName]}"
+                        echo "${stageName} attempt times: ${GlobalState.stageAttemptTimes[stageName]}"
                         trtllm_utils.launchKubernetesPod(pipeline, values[0], "trt-llm", {
                             values[1]()
                         })
@@ -3779,7 +3781,7 @@ def publishJunitTestResults(pipeline, stageName, stageIsInterrupted) {
             } catch (Exception e) {
                 // wget returns exit code 8 for server errors (404, 500, etc.)
                 if (e.message.contains("exit code 8") || e.message.contains("404")) {
-                    echo "Test result not found (HTTP error), skip to upload test result."
+                    echo "Test result not found, skip to upload test result."
                     return
                 }
                 throw e
