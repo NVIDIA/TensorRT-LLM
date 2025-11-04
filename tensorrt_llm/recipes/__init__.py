@@ -5,7 +5,7 @@ allowing users to generate optimized configurations for specific inference
 scenarios.
 """
 
-from .matcher import compute_from_scenario, detect_profile, match_recipe
+from .matcher import compute_from_scenario, detect_profile, find_all_matching_recipes, match_recipe
 from .profiles import PROFILE_REGISTRY, ProfileBase, get_profile, register_profile
 from .validator import validate_config, validate_scenario
 
@@ -16,6 +16,7 @@ __all__ = [
     "register_profile",
     "detect_profile",
     "match_recipe",
+    "find_all_matching_recipes",
     "compute_from_scenario",
     "validate_scenario",
     "validate_config",

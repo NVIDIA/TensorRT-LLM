@@ -401,12 +401,15 @@ def serve(
         with open(extra_llm_api_options, 'r') as f:
             loaded_data = yaml.safe_load(f)
 
-            # Detect recipe format (has 'scenario' and 'config' keys)
+            # Detect recipe format (has 'scenario' and 'llm_api_config' keys)
             if isinstance(
                     loaded_data, dict
-            ) and 'scenario' in loaded_data and 'config' in loaded_data:
-                # Recipe format - extract config section for LLM args
-                llm_args_extra_dict = loaded_data['config']
+            ) and 'scenario' in loaded_data and 'llm_api_config' in loaded_data:
+                # Recipe format - extract llm_api_config section for LLM args
+                llm_args_extra_dict = loaded_data['llm_api_config']
+
+                # TODO: Add llm_api_config validation once PR #8331 merges
+                # (standardizes LlmArgs with Pydantic - validation will happen automatically)
 
                 # Set environment variables from 'env' section (if not already set)
                 env_vars = loaded_data.get('env', {})

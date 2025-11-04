@@ -210,3 +210,47 @@ def validate_config(config: Dict[str, Any]) -> List[ValidationWarning]:
                 )
 
     return warnings
+
+
+# TODO: Re-enable llm_api_config validation once PR #8331 merges
+# (https://github.com/NVIDIA/TensorRT-LLM/pull/8331)
+#
+# PR #8331 standardizes LlmArgs with Pydantic models, after which validation
+# will happen automatically when LlmArgs(**kwargs) is instantiated.
+#
+# The current implementation below is incorrect because it tries to validate
+# raw YAML dicts against BaseLlmArgs, which expects converted Pydantic objects.
+# Once the PR merges, validation will be handled by Pydantic's built-in
+# mechanisms when serve/bench instantiate LlmArgs.
+#
+# def validate_llm_api_config(llm_api_config: Dict[str, Any]) -> None:
+#     """Validate llm_api_config against BaseLlmArgs schema using Pydantic.
+#
+#     This enforces that the llm_api_config section of a recipe YAML adheres to
+#     the exact schema required by LlmArgs (same as extra-llm-api-options.yml).
+#
+#     Args:
+#         llm_api_config: Dictionary containing LLM API configuration
+#
+#     Raises:
+#         ValidationError: If the configuration doesn't match BaseLlmArgs schema
+#     """
+#     try:
+#         from tensorrt_llm.llmapi.llm_args import BaseLlmArgs
+#     except ImportError as e:
+#         raise ValidationError(
+#             f"Failed to import BaseLlmArgs for validation: {e}")
+#
+#     try:
+#         # Validate against BaseLlmArgs Pydantic model
+#         # This will check types, required fields, and reject unknown fields
+#         BaseLlmArgs.model_validate(llm_api_config)
+#     except PydanticValidationError as e:
+#         # Convert Pydantic validation error to our ValidationError with clear message
+#         error_lines = ["Invalid llm_api_config - schema validation failed:"]
+#         for error in e.errors():
+#             field_path = '.'.join(str(loc) for loc in error['loc'])
+#             error_lines.append(
+#                 f"  - Field '{field_path}': {error['msg']} (type: {error['type']})"
+#             )
+#         raise ValidationError('\n'.join(error_lines))

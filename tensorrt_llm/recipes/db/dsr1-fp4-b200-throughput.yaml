@@ -16,7 +16,7 @@ scenario:
 
 env: {}
 
-config:
+llm_api_config:
   cuda_graph_config:
     enable_padding: true
     max_batch_size: 512

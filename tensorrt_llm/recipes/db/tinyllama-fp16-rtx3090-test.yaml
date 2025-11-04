@@ -17,7 +17,7 @@ scenario:
 
 env: {}
 
-config:
+llm_api_config:
   # Conservative batch size for 24GB VRAM
   cuda_graph_config:
     enable_padding: true

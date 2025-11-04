@@ -87,16 +87,17 @@ def find_recipe_files() -> list[Path]:
     return recipe_files
 
 
-def match_recipe(scenario: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Try to match scenario against existing recipe files.
+def find_all_matching_recipes(scenario: Dict[str, Any]) -> list[tuple[Path, Dict[str, Any]]]:
+    """Find all recipes that exactly match the scenario parameters.
 
     Args:
         scenario: Dictionary containing scenario parameters
 
     Returns:
-        Matched recipe dictionary if found, None otherwise
+        List of tuples (recipe_path, recipe_dict) for all matching recipes
     """
     recipe_files = find_recipe_files()
+    matches = []
 
     for recipe_path in recipe_files:
         try:
@@ -108,21 +109,37 @@ def match_recipe(scenario: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
             recipe_scenario = recipe["scenario"]
 
-            # Try to match key parameters
+            # Try to match key parameters (exact match required)
             match_keys = ["model", "target_isl", "target_osl", "target_concurrency"]
             if all(
                 scenario.get(key) == recipe_scenario.get(key)
                 for key in match_keys
                 if key in scenario
             ):
-                # Found a match
-                return recipe
+                # Found a match - add to list
+                matches.append((recipe_path, recipe))
 
         except Exception:
             # Skip invalid recipe files
             continue
 
-    return None
+    return matches
+
+
+def match_recipe(scenario: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Try to match scenario against existing recipe files.
+
+    Args:
+        scenario: Dictionary containing scenario parameters
+
+    Returns:
+        Matched recipe dictionary if found, None otherwise
+
+    Note: This function returns the first match. Use find_all_matching_recipes()
+    to get all matches and detect ambiguous scenarios.
+    """
+    matches = find_all_matching_recipes(scenario)
+    return matches[0][1] if matches else None
 
 
 def compute_from_scenario(

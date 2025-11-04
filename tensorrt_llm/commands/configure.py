@@ -11,15 +11,8 @@ from typing import Any, Dict, Optional
 import click
 import yaml
 
-from tensorrt_llm.recipes import (
-    compute_from_scenario,
-    detect_profile,
-    match_recipe,
-    validate_config,
-    validate_scenario,
-)
+from tensorrt_llm.recipes import find_all_matching_recipes, validate_config, validate_scenario
 from tensorrt_llm.recipes.matcher import merge_overrides
-from tensorrt_llm.recipes.profiles import PROFILE_REGISTRY
 
 
 def format_env_vars(env: Dict[str, str]) -> str:
@@ -86,7 +79,7 @@ def print_result(
         click.echo()
 
     # Print configuration
-    click.echo(click.style("config:", fg="cyan", bold=True))
+    click.echo(click.style("llm_api_config:", fg="cyan", bold=True))
     config_yaml = yaml.dump(config, default_flow_style=False, sort_keys=False)
     for line in config_yaml.splitlines():
         click.echo(f"  {line}")
@@ -126,19 +119,13 @@ def print_result(
     "--tp-size",
     type=int,
     default=None,
-    help="Tensor parallelism size (overrides auto-computed value)",
+    help="Tensor parallelism size (for matching existing recipes)",
 )
 @click.option(
     "--ep-size",
     type=int,
     default=None,
-    help="Expert parallelism size (overrides auto-computed value)",
-)
-@click.option(
-    "--profile",
-    type=click.Choice(list(PROFILE_REGISTRY.keys())),
-    default=None,
-    help="Profile to use (auto-detected from model name if not specified)",
+    help="Expert parallelism size (for matching existing recipes)",
 )
 @click.option(
     "-o",
@@ -159,36 +146,35 @@ def configure(
     target_concurrency: int,
     tp_size: Optional[int],
     ep_size: Optional[int],
-    profile: Optional[str],
     output: str,
     no_validate: bool,
 ):
-    r"""Generate optimized TensorRT-LLM recipe from scenario constraints.
+    r"""Retrieve an exact matching recipe from the database.
 
-    This tool takes high-level inference scenario parameters and generates a
-    complete recipe YAML file (scenario + config + env) that can be used with
-    trtllm-bench's --recipe flag.
+    This tool searches for an exact match in tensorrt_llm/recipes/db/ based on
+    the provided scenario parameters and outputs the matching recipe to a file.
+
+    The tool performs exact matching on: model, target_isl, target_osl, and
+    target_concurrency. If no exact match is found, or if multiple matches are
+    found, an error is returned.
 
     Examples:
     \b
-    # Generate recipe from scenario parameters
+    # Find and retrieve recipe for DeepSeek-R1 FP4 on B200
     trtllm-configure \\
         --model nvidia/DeepSeek-R1-0528-FP4 \\
-        --gpu B200 \\
-        --num-gpus 8 \\
         --target-isl 8192 \\
         --target-osl 1024 \\
         --target-concurrency 256 \\
         --output my-recipe.yaml
 
     \b
-    # Override TP/EP sizes
+    # Find recipe for GPT-OSS on H100
     trtllm-configure \\
         --model openai/gpt-oss-120b \\
         --target-isl 8000 \\
         --target-osl 1000 \\
         --target-concurrency 256 \\
-        --tp-size 4 \\
         --output recipe.yaml
     """
     try:
@@ -209,37 +195,68 @@ def configure(
         if ep_size is not None:
             scenario["ep_size"] = ep_size
 
-        # Try to match against existing recipes first
-        matched_recipe = match_recipe(scenario)
-        if matched_recipe:
-            click.echo(click.style("Found matching recipe in database!", fg="green"))
-            config = matched_recipe.get("config", {})
-            env = matched_recipe.get("env", {})
-            overrides = matched_recipe.get("overrides", {})
-            if overrides:
-                config = merge_overrides(config, overrides)
-        else:
-            # Compute from scenario using profile
-            result = compute_from_scenario(scenario, profile)
-            config = result["config"]
-            env = result.get("env", {})
+        # Find all matching recipes in the database
+        matches = find_all_matching_recipes(scenario)
 
-        # Validate scenario unless disabled
+        if len(matches) == 0:
+            # No exact match found
+            error_msg = (
+                f"No matching recipe found in database for scenario:\n"
+                f"  model: {model}\n"
+                f"  target_isl: {target_isl}\n"
+                f"  target_osl: {target_osl}\n"
+                f"  target_concurrency: {target_concurrency}\n\n"
+                f"Please ensure an exact matching recipe exists in tensorrt_llm/recipes/db/"
+            )
+            raise ValueError(error_msg)
+
+        elif len(matches) > 1:
+            # Multiple matches found - ambiguous
+            recipe_names = [match[0].name for match in matches]
+            error_msg = (
+                f"Multiple matching recipes found for scenario:\n"
+                f"  model: {model}\n"
+                f"  target_isl: {target_isl}\n"
+                f"  target_osl: {target_osl}\n"
+                f"  target_concurrency: {target_concurrency}\n\n"
+                f"Matching recipes:\n"
+                + "\n".join(f"  - {name}" for name in recipe_names)
+                + "\n\nPlease refine your scenario to match exactly one recipe."
+            )
+            raise ValueError(error_msg)
+
+        # Exactly one match - use it
+        recipe_path, matched_recipe = matches[0]
+        click.echo(click.style(f"Found matching recipe: {recipe_path.name}", fg="green"))
+
+        config = matched_recipe.get("llm_api_config", {})
+        env = matched_recipe.get("env", {})
+        overrides = matched_recipe.get("overrides", {})
+        if overrides:
+            config = merge_overrides(config, overrides)
+
+        # Use the matched recipe's scenario (preserves all fields)
+        matched_scenario = matched_recipe.get("scenario", {})
+
+        # Validate matched recipe unless disabled
         if not no_validate:
-            warnings = validate_scenario(scenario, strict=True)
+            warnings = validate_scenario(matched_scenario, strict=True)
             for warning in warnings:
                 click.echo(click.style(str(warning), fg="yellow"), err=True)
 
-            # Validate generated config
+            # Validate config from recipe
             config_warnings = validate_config(config)
             for warning in config_warnings:
                 click.echo(click.style(str(warning), fg="yellow"), err=True)
 
-        # Build complete recipe structure
+            # TODO: Add llm_api_config validation once PR #8331 merges
+            # (standardizes LlmArgs with Pydantic - validation will happen automatically)
+
+        # Build complete recipe structure (use matched scenario to preserve all fields)
         recipe_data = {
-            "scenario": scenario,
+            "scenario": matched_scenario,
             "env": env,
-            "config": config,
+            "llm_api_config": config,
         }
 
         # Write recipe to file
@@ -247,13 +264,11 @@ def configure(
         with open(output_path, "w") as f:
             yaml.dump(recipe_data, f, default_flow_style=False, sort_keys=False)
 
-        # Determine which profile was used
-        profile_name = profile or scenario.get("profile") or detect_profile(model)
-        if not profile_name:
-            profile_name = "custom"
+        # Get profile name from matched recipe scenario (if present)
+        profile_name = matched_scenario.get("profile", "N/A")
 
         # Print result
-        print_result(scenario, config, env, str(output_path), profile_name)
+        print_result(matched_scenario, config, env, str(output_path), profile_name)
 
     except Exception as e:
         click.echo(click.style(f"Error: {str(e)}", fg="red"), err=True)

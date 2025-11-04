@@ -6,45 +6,26 @@ The TensorRT-LLM recipe system provides optimized configurations for common infe
 
 The recipe system helps you:
 
-- **Generate optimized recipe files** from high-level scenario constraints (model, GPU, ISL/OSL/concurrency)
+- **Retrieve validated recipe files** from the database based on exact scenario matching
 - **Avoid manual tuning** of low-level parameters like EP_SIZE, MOE_BACKEND, DP_ATTENTION
-- **Ensure validated configurations** through CI-tested recipes
+- **Ensure validated configurations** through CI-tested recipes in `tensorrt_llm/recipes/db/`
 
-**Note:** A recipe file is a comprehensive YAML containing `scenario`, `env`, and `config` sections. It serves as a complete deployment descriptor that can be used directly with `trtllm-bench` and `trtllm-serve`.
+**Note:** A recipe file is a comprehensive YAML containing `scenario`, `env`, and `llm_api_config` sections. It serves as a complete deployment descriptor that can be used directly with `trtllm-bench` and `trtllm-serve`.
 
 ## Quick Start
 
-### Generate recipe from scenario parameters:
+### Retrieve an exact matching recipe from the database:
 
 ```bash
 trtllm-configure \
     --model nvidia/DeepSeek-R1-0528-FP4 \
-    --gpu B200 \
-    --num-gpus 8 \
     --target-isl 8192 \
     --target-osl 1024 \
     --target-concurrency 256 \
     --output recipe.yaml
 ```
 
-## Profiles
-
-The system includes three built-in profiles:
-
-### 1. **dsr1-fp4** - DeepSeek-R1 FP4
-- Complex EP_SIZE logic based on TP, ISL, OSL, CONC
-- MOE_BACKEND: TRTLLM or CUTLASS (depends on concurrency)
-- Optimized for high-throughput scenarios
-
-### 2. **dsr1-fp8** - DeepSeek-R1 FP8
-- EP_SIZE always equals TP
-- MOE_BACKEND: DEEPGEMM
-- Simpler configuration rules
-
-### 3. **gptoss-fp4** - GPT-OSS FP4
-- Simple concurrency-based rules
-- Requires TRTLLM_ENABLE_PDL=1 environment variable
-- Optimized for 120B parameter models
+**Note:** `trtllm-configure` performs exact matching on model, target_isl, target_osl, and target_concurrency. It searches `tensorrt_llm/recipes/db/` for matching recipes and returns an error if no exact match or multiple matches are found.
 
 ## Recipe Format
 
@@ -58,13 +39,13 @@ scenario:
   target_isl: 8000
   target_osl: 1000
   target_concurrency: 256
-  profile: gptoss-fp4  # optional, auto-detected
+  profile: gptoss-fp4
 
 env:
   TRTLLM_ENABLE_PDL: 1
   NCCL_GRAPH_REGISTER: 0
 
-config:
+llm_api_config:
   cuda_graph_config:
     enable_padding: true
     max_batch_size: 256
@@ -90,24 +71,7 @@ overrides:
 See the `db/` directory for validated recipes:
 - `gptoss-fp4-h100-throughput.yaml` - GPT-OSS 120B on H100 GPUs
 - `dsr1-fp4-b200-throughput.yaml` - DeepSeek-R1 FP4 on B200 GPUs
-
-## Adding Custom Profiles
-
-For advanced users, custom profiles can be registered:
-
-```python
-from tensorrt_llm.recipes import ProfileBase, register_profile
-
-class MyCustomProfile(ProfileBase):
-    def compute_config(self, scenario):
-        # Your logic here
-        return {'config': {...}, 'env': {...}, 'cli_args': {...}}
-
-    def get_defaults(self):
-        return {...}
-
-register_profile('my-profile', MyCustomProfile)
-```
+- `tinyllama-fp16-rtx3090-test.yaml` - TinyLlama 1.1B on RTX 3090
 
 ## Validation
 
@@ -122,16 +86,14 @@ Use `--no-validate` to skip validation if needed.
 
 ## Integration with trtllm-serve and trtllm-bench
 
-### Option 1: Generate Recipe with trtllm-configure, then use with trtllm-bench
+### Option 1: Retrieve Recipe with trtllm-configure, then use with trtllm-bench
 
-Generate a recipe file from scenario parameters, then benchmark with it:
+Retrieve an exact matching recipe from the database, then benchmark with it:
 
 ```bash
-# Generate recipe from scenario
+# Retrieve recipe from database (exact match required)
 trtllm-configure \
     --model nvidia/DeepSeek-R1-0528-FP4 \
-    --gpu B200 \
-    --num-gpus 8 \
     --target-isl 8192 \
     --target-osl 1024 \
     --target-concurrency 256 \
@@ -155,15 +117,15 @@ trtllm-serve --tp_size 4 \
 ```
 
 **Benefits of using recipe YAMLs directly:**
-- ✅ Single file describes entire deployment (config + env vars + metadata)
+- ✅ Single file describes entire deployment (llm_api_config + env vars + metadata)
 - ✅ No need to manually set environment variables
 - ✅ Self-documenting (scenario section describes the use case)
 - ✅ CLI flags can still override any setting
 - ✅ Backward compatible (simple config YAMLs still work)
 
 **How it works:**
-1. `trtllm-serve` and `trtllm-bench` detect recipe format (has `scenario` and `config` keys)
-2. Automatically extracts `config:` section for LLM API parameters
+1. `trtllm-serve` and `trtllm-bench` detect recipe format (has `scenario` and `llm_api_config` keys)
+2. Automatically extracts `llm_api_config:` section for LLM API parameters
 3. Automatically sets environment variables from `env:` section (if not already set)
 4. CLI flags take precedence over recipe values
 
@@ -172,7 +134,7 @@ trtllm-serve --tp_size 4 \
 When using recipe YAMLs with serve/bench:
 
 1. **CLI flags** (highest priority) - `--tp_size 4` overrides everything
-2. **Recipe values** - `scenario:` and `config:` sections
+2. **Recipe values** - `scenario:` and `llm_api_config:` sections
 3. **Built-in defaults** (lowest priority)
 
 ## Contributing

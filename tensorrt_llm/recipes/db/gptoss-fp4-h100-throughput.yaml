@@ -18,7 +18,7 @@ env:
   TRTLLM_ENABLE_PDL: 1
   NCCL_GRAPH_REGISTER: 0
 
-config:
+llm_api_config:
   cuda_graph_config:
     enable_padding: true
     max_batch_size: 256
