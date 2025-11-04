@@ -4,10 +4,12 @@ from queue import Queue
 from threading import Event
 from typing import AsyncGenerator, Optional, Union
 
+import nvtx
+
 from tensorrt_llm._utils import mpi_comm
 from tensorrt_llm.llmapi.utils import enable_llm_debug, logger_debug
 
-from .._utils import mpi_rank
+from .._utils import mpi_rank, nvtx_range_debug
 from ..bindings import executor as tllm
 from ..builder import Engine
 from ..llmapi.llm_args import BaseLlmArgs
@@ -57,6 +59,7 @@ class RpcWorker(BaseWorker):
             hf_model_dir=hf_model_dir,
             tokenizer=tokenizer,
         )
+
         # Extract garbage_collection_gen0_threshold from llm_args if available
         self.garbage_collection_gen0_threshold = (
             llm_args.garbage_collection_gen0_threshold if llm_args is not None
@@ -69,14 +72,20 @@ class RpcWorker(BaseWorker):
 
     def submit(self, request: GenerationRequest):
         """ Submits a request to the worker. """
-        super().submit(request)
+        with nvtx_range_debug("RpcWorker.submit",
+                              color="blue",
+                              category="Worker"):
+            super().submit(request)
 
     def fetch_responses(self, timeout: Optional[float] = None) -> list:
         logger_debug(f"RpcWorker {mpi_rank()} is fetching responses",
                      color="yellow")
-        # NOTE: This is a blocking call, it will wait for the responses to be available.
-        responses = super().await_responses(timeout)
-        self._await_response_helper.responses_handler(responses)
+        with nvtx_range_debug("RpcWorker.fetch_responses",
+                              color="orange",
+                              category="Worker"):
+            # NOTE: This is a blocking call, it will wait for the responses to be available.
+            responses = super().await_responses(timeout)
+            self._await_response_helper.responses_handler(responses)
 
         qsize = self._response_queue.qsize()
         logger_debug(f"RpcWorker returning {qsize} responses", color="yellow")
@@ -198,6 +207,8 @@ class RpcWorker(BaseWorker):
         tokenizer: Optional[TokenizerBase] = None,
         **kwargs,
     ) -> None:
+        nvtx.push_range(f"RpcWorker.main_task_{mpi_rank()}", color="pink")
+
         if enable_llm_debug():
             set_level("debug")
 
