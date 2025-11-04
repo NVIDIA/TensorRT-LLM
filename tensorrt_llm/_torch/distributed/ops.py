@@ -7,6 +7,8 @@ from typing import List, Optional, Tuple, Union
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.distributed.symm_mem_allreduce import \
+    SymmetricMemoryAllReduce
 from tensorrt_llm._utils import mpi_comm, mpi_disabled
 from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
@@ -566,13 +568,19 @@ class AllReduce(nn.Module):
             strategy (AllReduceStrategy):
                 The following all-reduce strategies are supported:
 
+                - SYMM_MEM: Uses PyTorch's symmetric memory with MULTIMEM hardware instructions (H100+).
+                  Provides 3x faster performance on supported configurations (4/6/8 GPUs on H100).
+                  Currently only supports plain allreduce (NONE fusion op). Falls back automatically
+                  if not supported.
+
                 - UB: AllReduce uses user-buffer based all-reduce kernel.
 
                 - NCCL: Use NCCL allreduce.
 
                 - MIN_LATENCY: AllReduce uses MIN_LATENCY mode kernel.
 
-                - AUTO: AUTO chooses between NCCL and MIN_LATENCY mode based on a heuristic policy.
+                - AUTO: AUTO chooses the best available strategy. Will try SYMM_MEM first (if available),
+                  then MNNVL, then choose between NCCL and MIN_LATENCY based on a heuristic policy.
 
                 - LOWPRECISION: AllReduce quantizes data to lower precision for transmission.
                   Should only be used on topologies with PCIe switches and without NVLink.
@@ -601,6 +609,7 @@ class AllReduce(nn.Module):
         self.workspace = None
         self.strategy = strategy
         self.mnnvl_allreduce = None
+        self.symm_mem_allreduce = None
         self._disable_mpi = mpi_disabled()
 
         self.all_reduce_op = torch.ops.trtllm.allreduce_pg if self._disable_mpi else torch.ops.trtllm.allreduce
@@ -611,6 +620,29 @@ class AllReduce(nn.Module):
                 if self.strategy == AllReduceStrategy.LOWPRECISION:
                     allocate_low_presicion_allreduce_workspace(self.mapping)
                 self.workspace = get_allreduce_workspace(self.mapping)
+
+            # Initialize Symmetric Memory AllReduce if needed (H100+ hardware acceleration)
+            if self.strategy in (AllReduceStrategy.AUTO,
+                                 AllReduceStrategy.SYMM_MEM):
+                try:
+                    symm_mem = SymmetricMemoryAllReduce(
+                        self.mapping,
+                        dtype=dtype if dtype else torch.bfloat16,
+                    )
+                    if not symm_mem.disabled:
+                        self.symm_mem_allreduce = symm_mem
+                        logger.info(
+                            f"SymmetricMemoryAllReduce (MULTIMEM) is enabled for world_size={self.mapping.tp_size}"
+                        )
+                    else:
+                        logger.debug(
+                            f"SymmetricMemoryAllReduce is disabled (not supported or unavailable)"
+                        )
+                except Exception as e:
+                    logger.debug(
+                        f"Symmetric Memory AllReduce can't be enabled due to {e}."
+                    )
+                    self.symm_mem_allreduce = None
 
             # Initialize MNNVL AllReduce if needed
             if self.strategy in (AllReduceStrategy.AUTO,
@@ -670,16 +702,27 @@ class AllReduce(nn.Module):
         if all_reduce_params is None:
             all_reduce_params = AllReduceParams()
 
-        # Try MNNVL AllReduce first if available
+        # Try Symmetric Memory AllReduce first if available (H100+ hardware acceleration)
+        # Note: Currently only supports NONE fusion op (plain allreduce)
+        if self.symm_mem_allreduce and all_reduce_params.fusion_op == AllReduceFusionOp.NONE:
+            symm_mem_output = self.symm_mem_allreduce(input)
+            if symm_mem_output is not None:
+                logger.debug(
+                    f"Using SymmetricMemoryAllReduce (MULTIMEM) for input shape {input.shape}"
+                )
+                return symm_mem_output
+
+        # Try MNNVL AllReduce if symm_mem didn't handle it
         if self.mnnvl_allreduce:
             mnnvl_output = self.mnnvl_allreduce(
                 input, all_reduce_params=all_reduce_params)
             if mnnvl_output is not None:
                 return mnnvl_output
 
-        # Fall back to regular AllReduce if MNNVL is not available or not applicable
-        # Make sure the strategy is AUTO since allreduceOp does not have the branch for MNNVL
-        if allreduce_strategy == AllReduceStrategy.MNNVL:
+        # Fall back to regular AllReduce if specialized methods are not available or not applicable
+        # Make sure the strategy is AUTO since allreduceOp does not have the branch for MNNVL/SYMM_MEM
+        if allreduce_strategy in (AllReduceStrategy.MNNVL,
+                                  AllReduceStrategy.SYMM_MEM):
             allreduce_strategy = AllReduceStrategy.AUTO
 
         additional_args = {}
