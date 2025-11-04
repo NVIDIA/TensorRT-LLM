@@ -42,6 +42,9 @@ class InputProcessor(Protocol):
     config: any
     tokenizer: any
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
     def __call__(
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
