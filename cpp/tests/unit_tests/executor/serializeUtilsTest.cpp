@@ -1236,3 +1236,50 @@ TEST(SerializeUtilsTest, NotificationInfo)
         EXPECT_EQ(readyInfo.mIsReady, deserializedReadyInfo.mIsReady);
     }
 }
+
+TEST(SerializeUtilsTest, CacheStateIndexerKCache)
+{
+    using texec::kv_cache::CacheState;
+    // Minimal realistic model/parallel config
+    std::vector<texec::SizeType32> nbKvHeadsPerLayer{8, 8};
+    texec::SizeType32 sizePerHead = 128;
+    texec::SizeType32 tokensPerBlock = 16;
+    texec::SizeType32 tp = 1;
+    texec::SizeType32 pp = 1;
+    texec::SizeType32 cp = 1;
+    std::vector<texec::SizeType32> attentionLayerNumPerPP{static_cast<texec::SizeType32>(nbKvHeadsPerLayer.size())};
+    auto dataType = nvinfer1::DataType::kFLOAT;
+    auto attentionType = CacheState::AttentionType::kDEFAULT;
+    int kvFactor = 2;
+    bool enableAttentionDP = false;
+    int dpRank = 0;
+    int dpSize = 1;
+    bool enableBlockReuse = true;
+    bool hasIndexerKCache = true;
+    texec::SizeType32 indexerDimPerHead = 96;
+    texec::SizeType32 indexerKCacheQuantBlockSize = 128;
+
+    CacheState state{nbKvHeadsPerLayer, sizePerHead, tokensPerBlock, tp, pp, cp, attentionLayerNumPerPP, dataType,
+        attentionType, kvFactor, enableAttentionDP, dpRank, dpSize, enableBlockReuse, hasIndexerKCache,
+        indexerDimPerHead, indexerKCacheQuantBlockSize};
+
+    std::ostringstream oss;
+    texec::Serialization::serialize(state, oss);
+    std::istringstream iss(oss.str());
+    auto state2 = texec::Serialization::deserializeCacheState(iss);
+
+    EXPECT_EQ(state.getModelConfig().mNbKvHeadsPerLayer, state2.getModelConfig().mNbKvHeadsPerLayer);
+    EXPECT_EQ(state.getModelConfig().mSizePerHead, state2.getModelConfig().mSizePerHead);
+    EXPECT_EQ(state.getModelConfig().mTokensPerBlock, state2.getModelConfig().mTokensPerBlock);
+    EXPECT_EQ(state.getParallelConfig().mTensorParallelism, state2.getParallelConfig().mTensorParallelism);
+    EXPECT_EQ(state.getParallelConfig().mPipelineParallelism, state2.getParallelConfig().mPipelineParallelism);
+    EXPECT_EQ(state.getParallelConfig().mContextParallelism, state2.getParallelConfig().mContextParallelism);
+    EXPECT_EQ(state.getParallelConfig().mAttentionLayerNumPerPP, state2.getParallelConfig().mAttentionLayerNumPerPP);
+    EXPECT_EQ(state.getDataType(), state2.getDataType());
+    EXPECT_EQ(state.getAttentionConfig().mAttentionType, state2.getAttentionConfig().mAttentionType);
+    EXPECT_EQ(state.getAttentionConfig().mKvFactor, state2.getAttentionConfig().mKvFactor);
+    EXPECT_EQ(state.getEnableBlockReuse(), state2.getEnableBlockReuse());
+    EXPECT_EQ(state.getHasIndexerKCache(), state2.getHasIndexerKCache());
+    EXPECT_EQ(state.getIndexerDimPerHead(), state2.getIndexerDimPerHead());
+    EXPECT_EQ(state.getIndexerKCacheQuantBlockSize(), state2.getIndexerKCacheQuantBlockSize());
+}

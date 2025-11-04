@@ -1038,17 +1038,17 @@ public:
 
     [[nodiscard]] bool isEnableIndexerKCache() const
     {
-        return mWindowBlockManagers.begin()->second.isEnableIndexerKCache();
+        return mIsEnableIndexerKCache;
     }
 
     [[nodiscard]] SizeType32 getIndexerKCacheQuantBlockSize() const
     {
-        return mWindowBlockManagers.begin()->second.getIndexerKCacheQuantBlockSize();
+        return mIndexerKCacheQuantBlockSize;
     }
 
     [[nodiscard]] SizeType32 getIndexerKCacheIndexHeadDim() const
     {
-        return mWindowBlockManagers.begin()->second.getIndexerKCacheIndexHeadDim();
+        return mIndexerKCacheIndexHeadDim;
     }
 
     BlockManager(BlockManager const&) = delete;
@@ -1428,6 +1428,10 @@ private:
     std::vector<SizeType32> mAbsolutePoolToRelativePoolIndex;
     // Record what sequences are currently managed by the block manager
     std::set<LlmRequest::RequestIdType> mManagedSequences;
+
+    bool mIsEnableIndexerKCache{false};
+    SizeType32 mIndexerKCacheQuantBlockSize{0};
+    SizeType32 mIndexerKCacheIndexHeadDim{0};
 };
 
 struct OffsetTableDimensions

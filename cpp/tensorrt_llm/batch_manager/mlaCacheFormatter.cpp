@@ -147,6 +147,8 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
         }
         else
         {
+            std::cout << "transferIndexerKCache" << std::endl;
+
             auto blockRangeForWindow = blockRange.getBlockRangeForWindow(windowSizes.at(0), true);
             for (auto it = blockRangeForWindow.begin(); it != blockRangeForWindow.end(); ++it)
             {

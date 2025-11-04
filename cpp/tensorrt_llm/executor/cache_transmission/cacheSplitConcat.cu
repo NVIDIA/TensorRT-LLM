@@ -46,6 +46,17 @@ inline bool isPowerOfTwo(int n)
 }
 } // namespace
 
+static inline int computeDimsPerHead(kv_cache::CacheState const& cacheState, bool isIndexerKCache)
+{
+    if (!isIndexerKCache)
+    {
+        return cacheState.getModelConfig().mSizePerHead;
+    }
+    auto const dim = cacheState.getIndexerDimPerHead();
+    auto const q = cacheState.getIndexerKCacheQuantBlockSize();
+    return dim + dim / q * 4;
+}
+
 int getBlockNumAccountingForCP(int cpRank, int cpSize, int numTotalBlocks)
 {
     TLLM_CHECK(cpRank >= 0 && cpRank < cpSize);
@@ -1235,7 +1246,6 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
 
     dim3 gridDim{gridDimx, gridDimy};
 
-    int sizePerHead = selfModelConfig.mSizePerHead;
     T const** inputBlockPtrsDev = static_cast<T const**>(PtrsDeviceBuffer->data());
     T** outputCachePtrsDev = static_cast<T**>(PtrsDeviceBuffer->data()) + inputBlockNumSum;
     uint64_t* prefixLayerNumDevPtr
@@ -1248,13 +1258,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
     int const numLayers = selfParallelConfig.mAttentionLayerNumPerPP.at(selfPPRank);
     int const headNum = selfModelConfig.mNbKvHeadsPerLayer[0];
 
-    int dimsPerHead = selfModelConfig.mSizePerHead;
-    if (isIndexerKCache)
-    {
-        dimsPerHead = selfCacheState.getIndexerDimPerHead()
-            + selfCacheState.getIndexerDimPerHead() / selfCacheState.getIndexerKCacheQuantBlockSize() * 4;
-        sizePerHead = dimsPerHead;
-    }
+    int const dimsPerHead = computeDimsPerHead(selfCacheState, isIndexerKCache);
     int const domainPPSize = targetRankInfo.mDomainPPSize;
     int const domainTPSize = targetRankInfo.mDomainTPSize;
     int const domainCPSize = targetRankInfo.mDomainCPSize;
@@ -1269,7 +1273,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
         "headsPerDomainTP: %d",
         numLayers, headNum, domainPPSize, domainTPSize, headNumDomainTP);
 
-    int const remainder = sizePerHead * sizeof(T) % 16;
+    int const remainder = dimsPerHead * sizeof(T) % 16;
     switch (remainder)
     {
     case 0:
@@ -1426,15 +1430,10 @@ void splitKVCacheDispatch(std::map<SizeType32, std::vector<runtime::ITensor::Sha
     kv_cache::CacheState const& oCacheState, int selfIdx, runtime::BufferManager const& bufferManager,
     bool isIndexerKCache)
 {
-    auto dataType = nvinfer1::DataType::kINT64;
-    if (isIndexerKCache)
-    {
-        dataType = nvinfer1::DataType::kUINT8;
-    }
-    else
-    {
-        dataType = kVCacheBlocksPerWindow.begin()->second.front()->getDataType();
-    }
+    TLLM_CHECK(!kVCacheBlocksPerWindow.empty());
+    auto dataType
+        = isIndexerKCache ? nvinfer1::DataType::kUINT8 : kVCacheBlocksPerWindow.begin()->second.front()->getDataType();
+
     auto dataSize = tensorrt_llm::common::getDTypeSize(dataType);
     switch (dataSize)
     {
@@ -1581,7 +1580,6 @@ void concatKVCache(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlo
         layersPerWindowDevPtr = static_cast<int const*>(windowInfoDeviceBuffer->data()) + windowSizes.size();
     }
     dim3 gridDim{gridDimx, gridDimy};
-    int sizePerHead = selfModelConfig.mSizePerHead;
     int const endLayerId = selfModelConfig.mNbKvHeadsPerLayer.size() / oPPNum;
     T** ouptutBlockPtrsDev = static_cast<T**>(PtrsDeviceBuffer->data());
     T const** inputSplitBlockPtrsDev = static_cast<T const**>(PtrsDeviceBuffer->data()) + outputBlockNumSum;
@@ -1592,13 +1590,7 @@ void concatKVCache(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlo
     int const numLayers = selfParallelConfig.mAttentionLayerNumPerPP.at(selfPPRank);
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "concatKVCache numLayers:%d", numLayers);
     int const headNum = selfModelConfig.mNbKvHeadsPerLayer[0];
-    int dimsPerHead = selfModelConfig.mSizePerHead;
-    if (isIndexerKCache)
-    {
-        dimsPerHead = selfCacheState.getIndexerDimPerHead()
-            + selfCacheState.getIndexerDimPerHead() / selfCacheState.getIndexerKCacheQuantBlockSize() * 4;
-        sizePerHead = dimsPerHead;
-    }
+    int const dimsPerHead = computeDimsPerHead(selfCacheState, isIndexerKCache);
 
     int const domainPPSize = targetRankInfo.mDomainPPSize;
     int const domainTPSize = targetRankInfo.mDomainTPSize;
@@ -1613,7 +1605,7 @@ void concatKVCache(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlo
         "headsPerDomainTP: %d",
         numLayers, headNum, domainPPSize, domainTPSize, headNumDomainTP);
 
-    int const remainder = sizePerHead * sizeof(T) % 16;
+    int const remainder = dimsPerHead * sizeof(T) % 16;
 
     int const mlaSubWarpSize = 16;
     switch (remainder)

@@ -70,11 +70,11 @@ public:
     void freeBufferIndexForRecv(std::optional<int> bufferId);
 
     std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> getOrAllocateSendBuffers(
-        std::optional<int> bufferId, int targetNum, std::vector<size_t> const& targetBufferEleSizes,
+        std::optional<int> bufferId, int targetNum, std::vector<size_t> const& requestedNumberOfElements,
         runtime::BufferManager const& bufferManagerToUse);
 
     std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> getOrAllocateRecvBuffers(
-        std::optional<int> bufferId, int targetNum, std::vector<size_t> const& targetBufferEleSizes,
+        std::optional<int> bufferId, int targetNum, std::vector<size_t> const& requestedNumberOfElements,
         runtime::BufferManager const& bufferManagerToUse);
 
     runtime::ITensor::SharedPtr getSendBuffer(std::optional<int> bufferId);
@@ -98,7 +98,7 @@ private:
     };
 
     std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> getOrAllocateBuffers(std::optional<int> bufferId,
-        int targetNum, std::vector<size_t> const& targetBufferEleSizes,
+        int targetNum, std::vector<size_t> const& requestedNumberOfElements,
         runtime::BufferManager const& bufferManagerToUse, ConcurrenceResource& concurrenceResource);
 
     void allocateBuffer();
@@ -112,7 +112,7 @@ private:
     size_t mTransferBufferSize;
     bool mOnlyUseDynamicBuffer;
     bool mUseFabricMemory;
-    size_t mBufferEleSize;
+    size_t mNumberOfElements;
     nvinfer1::DataType mDataType;
     ConcurrenceResource mConcurrenceSendResource;
     ConcurrenceResource mConcurrenceRecvResource;

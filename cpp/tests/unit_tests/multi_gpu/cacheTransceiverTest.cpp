@@ -1035,15 +1035,11 @@ protected:
         {
             sizePerHead = mCacheState->getModelConfig().mSizePerHead;
         }
-        TLLM_LOG_INFO("fillBlockData sizePerHead: %d", sizePerHead);
         std::string shape;
         for (int i = 0; i < blockData.getShape().nbDims; i++)
         {
             shape += std::to_string(blockData.getShape().d[i]) + " ";
         }
-
-        TLLM_LOG_INFO("block shape is %s", shape.c_str());
-        TLLM_LOG_INFO("is indexerKCache: %d", isIndexerKCache);
 
         auto dataTypeSize = tensorrt_llm::common::getDTypeSize(blockData.getDataType());
         for (int layerId = 0; layerId < layerSizeThisRank; layerId++)
@@ -1154,7 +1150,12 @@ protected:
                             {
                                 using ValueType = decltype(generateValue);
                                 auto* dataPtr = static_cast<ValueType*>(hostTensor->data(keyIndex));
-                                EXPECT_EQ(*dataPtr, generateValue);
+                                std::string message = "keyIndex: " + std::to_string(keyIndex)
+                                    + ", layerId: " + std::to_string(layerId) + ", headId: " + std::to_string(headId)
+                                    + ", tokenId: " + std::to_string(tokenId) + ", hiddenId: "
+                                    + std::to_string(hiddenId) + ", isIndexerKCache: " + std::to_string(isIndexerKCache)
+                                    + ", blockId: " + std::to_string(blockId) + " initial: " + std::to_string(initial);
+                                EXPECT_EQ(*dataPtr, generateValue) << message;
                             },
                             generateExpectedValue(initial, windowSize, tokenId + startTokenId, layerId + startLayerId,
                                 headId + startHeadId, hiddenId, true, blockData.getDataType()));
@@ -1193,11 +1194,6 @@ protected:
         generator.seed(seed);
         std::uniform_real_distribution<double> dis(-100.0f, 100.0f);
         double value = dis(generator);
-        // Treat kUINT8 explicitly to avoid signedness mismatches
-        if (dataType == nvinfer1::DataType::kUINT8)
-        {
-            return static_cast<uint8_t>(static_cast<int>(value));
-        }
         auto dataTypeSize = tensorrt_llm::common::getDTypeSize(dataType);
         switch (dataTypeSize)
         {
@@ -1302,6 +1298,7 @@ TEST_P(AsymmetricalCacheTest, TestCase)
             isIndexerKCache, indexerDimPerHead, indexerKCacheQuantBlockSize);
         setUpCacheTransceiver();
         std::vector<std::shared_ptr<WrappedLlmRequest>> requests;
+        auto windowSize = mManager->getBlockManager().getPoolWindowSize(0);
 
         // the second loop is for cache reuse
         for (int i = 0; i < 2; i++)
