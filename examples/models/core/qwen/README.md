@@ -878,15 +878,6 @@ mpirun -n 1 --allow-run-as-root --oversubscribe python3 examples/llm-api/quickst
 
 ```
 
-## Notes and Troubleshooting
-
-- **Model Directory:** Update `<YOUR_MODEL_DIR>` with the actual path where the model weights reside.
-- **GPU Memory:** Adjust `--max_batch_size` and `--max_num_tokens` if you encounter out-of-memory errors.
-- **Configuration Files:** Verify that the configuration files are correctly formatted to avoid runtime issues.
-
-## Credits
-This Qwen model example exists thanks to Tlntin (TlntinDeng01@gmail.com) and zhaohb (zhaohbcloud@126.com).
-
 ### NVFP4 quantization
 
 TRTLLM supports NVFP4 precision with blocksize=16 for both activations and GEMM weights.
@@ -895,3 +886,12 @@ To run the Qwen3-Next model on NVFP4 precision, use the following command
 mpirun -n 1 --allow-run-as-root --oversubscribe python3 examples/llm-api/quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --kv_cache_fraction 0.6 --disable_kv_cache_reuse --max_batch_size 1 --tp_size 2 --trust_remote_code
 
 ```
+
+## Notes and Troubleshooting
+
+- **Model Directory:** Update `<YOUR_MODEL_DIR>` with the actual path where the model weights reside.
+- **GPU Memory:** Adjust `--max_batch_size` and `--max_num_tokens` if you encounter out-of-memory errors.
+- **Configuration Files:** Verify that the configuration files are correctly formatted to avoid runtime issues.
+
+## Credits
+This Qwen model example exists thanks to Tlntin (TlntinDeng01@gmail.com) and zhaohb (zhaohbcloud@126.com).
