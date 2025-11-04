@@ -164,6 +164,7 @@ class KVCacheManager(BaseResourceManager):
         max_beam_width: int = 1,
         is_draft: bool = False,
         kv_connector_manager: Optional[KvCacheConnectorManager] = None,
+        enforce_memory_limit: bool = False,
     ) -> None:
         self.mapping = mapping
         self.dtype = dtype
@@ -283,6 +284,7 @@ class KVCacheManager(BaseResourceManager):
                 mapping=mapping,
                 dtype=dtype,
                 kv_factor=self.kv_factor,
+                enforce_memory_limit=enforce_memory_limit,
             )
             blocks_per_window = {
                 self.max_attention_window_vec[0]:
@@ -563,7 +565,8 @@ class KVCacheManager(BaseResourceManager):
                                  tokens_per_block: int,
                                  mapping: Mapping,
                                  dtype: DataType,
-                                 kv_factor: int = 2):
+                                 kv_factor: int = 2,
+                                 enforce_memory_limit: bool = False):
         free_mem_fraction = (kv_cache_config.free_gpu_memory_fraction
                              if kv_cache_config.free_gpu_memory_fraction
                              is not None else 0.9)
@@ -591,7 +594,7 @@ class KVCacheManager(BaseResourceManager):
         # If user specified a number of tokens
         if kv_cache_config.max_tokens is not None:
             # If user also specified a free gpu memory fraction, take the min
-            if kv_cache_config.free_gpu_memory_fraction is not None:
+            if kv_cache_config.free_gpu_memory_fraction is not None or enforce_memory_limit:
                 max_tokens = min(kv_cache_config.max_tokens, max_tokens)
                 logger.warning(
                     f'Both free_gpu_memory_fraction and max_tokens are set (to {free_mem_fraction} and {max_tokens} with free memory {free_mem / (1 << 32)} of total memory {total_mem / (1<<32)}, respectively). The smaller value will be used.'
