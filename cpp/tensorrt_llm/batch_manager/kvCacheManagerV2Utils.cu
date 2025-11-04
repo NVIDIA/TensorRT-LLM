@@ -18,15 +18,20 @@
 #include "kvCacheManagerV2Utils.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/common/memoryUtils.h"
 #include <algorithm>
 #include <array>
 #include <cassert>
 #include <cuda_runtime.h>
+#include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 using Grain = uint4;
 constexpr uint32_t ctaSize = 128;
+constexpr uint32_t copyBlockCtaSize = 128;
+constexpr uint32_t copyBlocknbBufs = 2;
 constexpr uint32_t nbBufs = 4;
 constexpr uint32_t grainBytes = sizeof(Grain);
 
@@ -177,6 +182,124 @@ CUresult copyDeviceToHost(std::vector<MMTask> const& tasks, ssize_t numBytes, CU
 CUresult copyDeviceToDevice(std::vector<MMTask> const& tasks, ssize_t numBytes, CUstream stream) noexcept
 {
     return launchBatchedCopy(false, tasks, numBytes, stream);
+}
+
+// dst_tensor[:, :num_seqs, 0] = src_tensor[:, copy_idx]
+// dst_tensor[:, :num_seqs, 1] = dst_tensor[:, :num_seqs, 0] + 1
+template <bool COPY_V_IDX = true>
+__global__ void copyBatchBlockOffsetsToDeviceKernel(SizeType32 const* __restrict__ srcPtr,
+    SizeType32* __restrict__ dstPtr, SizeType32 const srcMaxNumSequences, SizeType32 const dstMaxNumSequences,
+    SizeType32 numBlocksPerSeq, SizeType32 const* __restrict__ copyIndex)
+{
+    constexpr uint32_t kvFactor = 2;
+    constexpr auto elemPerAccess = sizeof(PackedInt) / sizeof(SizeType32);
+
+    __shared__ PackedInt data[copyBlocknbBufs][copyBlockCtaSize];
+
+    auto const iterPerSeq = divUp(numBlocksPerSeq * sizeof(SizeType32), sizeof(PackedInt) * copyBlockCtaSize);
+    auto const tid = threadIdx.x;
+    auto const poolIdx = blockIdx.x;
+    auto const seqIdx = blockIdx.y;
+    auto const seqDimStride = kvFactor * numBlocksPerSeq;
+    uint32_t const srcIdxBeg = tid * elemPerAccess + (poolIdx * srcMaxNumSequences + copyIndex[seqIdx]) * seqDimStride;
+    uint32_t const dstIdxKBeg = tid * elemPerAccess + (poolIdx * dstMaxNumSequences + seqIdx) * seqDimStride;
+    uint32_t const dstIdxVBeg = dstIdxKBeg + numBlocksPerSeq;
+
+    uint32_t const srcIdxEnd = (poolIdx * srcMaxNumSequences + copyIndex[seqIdx]) * seqDimStride + numBlocksPerSeq;
+
+    for (uint32_t i = 0; i < iterPerSeq + copyBlocknbBufs; i++)
+    {
+        uint32_t const idxBuf = i % copyBlocknbBufs;
+        if (i >= copyBlocknbBufs)
+        {
+            uint32_t const stIter = i - copyBlocknbBufs;
+            assert(idxBuf == (stIter % copyBlocknbBufs));
+            auto const offset = copyBlockCtaSize * stIter * elemPerAccess;
+            SizeType32 const srcIdx = srcIdxBeg + offset;
+            SizeType32 const dstIdxK = dstIdxKBeg + offset;
+            SizeType32 const dstIdxV = dstIdxVBeg + offset;
+            PackedInt const& src = data[idxBuf][tid];
+            PackedInt& dstK = *reinterpret_cast<PackedInt*>(dstPtr + dstIdxK);
+            PackedInt& dstV = *reinterpret_cast<PackedInt*>(dstPtr + dstIdxV);
+            asm volatile("cp.async.wait_group %0;\n" ::"n"(copyBlocknbBufs - 1) : "memory");
+            if (srcIdx < srcIdxEnd)
+            {
+                dstK = src;
+                if (COPY_V_IDX)
+                {
+                    dstV = src;
+                }
+                else
+                {
+#pragma unroll
+                    for (uint32_t j = 0; j < elemPerAccess; j++)
+                    {
+                        auto const val = src.unpacked[j];
+                        dstV.unpacked[j] = (val == BAD_PAGE_INDEX) ? val : (val + 1);
+                    }
+                }
+            }
+        }
+        uint32_t const ldIter = i;
+        PackedInt* const dst = &data[idxBuf][tid];
+        uint32_t const srcIdx = srcIdxBeg + copyBlockCtaSize * ldIter * elemPerAccess;
+        PackedInt const* const src = reinterpret_cast<PackedInt const*>(srcPtr + srcIdx);
+        if (srcIdx < srcIdxEnd)
+        {
+            uint32_t const size = sizeof(PackedInt);
+            asm volatile("cp.async.cg.shared.global [%0], [%1], %2, %3;\n" ::"l"(__cvta_generic_to_shared(dst)),
+                         "l"(src), "n"(size), "r"(size)
+                         : "memory");
+        }
+        asm volatile("cp.async.commit_group;\n" : : : "memory");
+    }
+}
+
+// Host-side launcher
+void copyBatchBlockOffsetsToDevice(
+    ITensor const& input, ITensor& output, ITensor const& copyIndex, bool copyVIdx, CUstream stream) noexcept
+{
+    using namespace tensorrt_llm::runtime;
+
+    auto const* srcPtr = bufferCast<tk::KVCacheIndex::UnderlyingType const>(input);
+    auto* dstPtr = bufferCast<tk::KVCacheIndex::UnderlyingType>(
+        output); // [numPools, maxNumSequences, kvFactor, numBlocksPerSeq]
+    auto const* copyIndexPtr = bufferCast<SizeType32 const>(copyIndex);
+    auto const& srcShape = input.getShape();
+    auto const& dstShape = output.getShape();
+    auto const& copyIndexShape = copyIndex.getShape();
+
+    TLLM_CHECK(srcShape.nbDims == 4); // [numPools, srcMaxNumSequences, kvFactor, numBlocksPerSeq]
+    TLLM_CHECK(dstShape.nbDims == 4); // [numPools, dstMaxNumSequences, kvFactor, numBlocksPerSeq]
+
+    SizeType32 numPools = srcShape.d[0];
+    SizeType32 srcMaxNumSequences = srcShape.d[1];
+    SizeType32 dstMaxNumSequences = dstShape.d[1];
+    SizeType32 numBlocksPerSeq = srcShape.d[3];
+    SizeType32 numSeqs = copyIndexShape.d[0];
+
+    if (numSeqs == 0)
+    {
+        return;
+    }
+
+    TLLM_CHECK_WITH_INFO((numBlocksPerSeq * sizeof(SizeType32)) % sizeof(PackedInt) == 0,
+        "Not implemented case: numBlocksPerSeq * sizeof(SizeType32) = %zu must be a multiple of %zu.",
+        static_cast<size_t>(numBlocksPerSeq * sizeof(SizeType32)), static_cast<size_t>(sizeof(PackedInt)));
+
+    dim3 gridDim(numPools, numSeqs, 1);
+    dim3 blockDim(copyBlockCtaSize);
+
+    if (copyVIdx)
+    {
+        copyBatchBlockOffsetsToDeviceKernel<true><<<gridDim, blockDim, 0, stream>>>(
+            srcPtr, dstPtr, srcMaxNumSequences, dstMaxNumSequences, numBlocksPerSeq, copyIndexPtr);
+    }
+    else
+    {
+        copyBatchBlockOffsetsToDeviceKernel<false><<<gridDim, blockDim, 0, stream>>>(
+            srcPtr, dstPtr, srcMaxNumSequences, dstMaxNumSequences, numBlocksPerSeq, copyIndexPtr);
+    }
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

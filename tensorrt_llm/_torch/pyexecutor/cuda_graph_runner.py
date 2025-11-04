@@ -434,17 +434,17 @@ class CUDAGraphRunner:
         # This is not strictly required, but we should probably
         # respect the requirement just in case that changes in the future.
         if self.padding_dummy_request is None:
-            available_blocks = kv_cache_manager.get_num_free_blocks()
-            # No padding if not enough KV cache space
-            if available_blocks < 1:
-                return 0
 
             self.padding_dummy_request = kv_cache_manager.add_dummy_requests(
                 [CUDA_GRAPH_DUMMY_REQUEST_ID],
                 is_gen=True,
                 max_num_draft_tokens=runtime_draft_len,
                 use_mrope=self.config.use_mrope,
-                max_beam_width=self.config.max_beam_width)[0]
+                max_beam_width=self.config.max_beam_width)
+            if self.padding_dummy_request is None:
+                return 0
+            else:
+                self.padding_dummy_request = self.padding_dummy_request[0]
             self.padding_dummy_request.is_cuda_graph_dummy = True
             spec_res_mgr = resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
