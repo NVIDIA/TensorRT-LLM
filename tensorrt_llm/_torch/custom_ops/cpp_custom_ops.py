@@ -560,6 +560,10 @@ def _register_fake():
             for i in range(0, len(input_list), num_ranks)
         ]
 
+    @torch.library.register_fake("trtllm::helix_post_process")
+    def _(gathered_o, gathered_stats, scale):
+        return gathered_o.new_empty(*gathered_o.shape[1:])
+
     @torch.library.register_fake("trtllm::tinygemm2")
     def _(input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
         # input [M, K], weight [N, K], bias [N]
