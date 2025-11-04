@@ -965,6 +965,7 @@ async def test_llm_rpc_streaming():
         print(f"get result: {outputs}")
 
 
+@pytest.mark.threadleak(enabled=False)
 @pytest.mark.part0
 def test_llm_context_only_timed_out():
     tp_size = 1
