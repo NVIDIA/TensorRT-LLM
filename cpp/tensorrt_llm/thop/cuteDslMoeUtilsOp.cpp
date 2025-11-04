@@ -65,7 +65,7 @@ std::vector<torch::Tensor> moe_topk_sort_impl(torch::optional<torch::Tensor> con
     auto permuted_idx_to_expanded_idx
         = torch::empty({max_num_padded_tokens}, torch::dtype(torch::kInt32).device(torch::kCUDA));
     auto num_tokens_per_expert = torch::empty({num_experts}, torch::dtype(torch::kInt32).device(torch::kCUDA));
-    auto tile_idx_to_batch_idx = torch::empty({max_num_ctas}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+    auto tile_idx_to_expert_idx = torch::empty({max_num_ctas}, torch::dtype(torch::kInt32).device(torch::kCUDA));
     auto tile_idx_to_mn_limit = torch::empty({max_num_ctas}, torch::dtype(torch::kInt32).device(torch::kCUDA));
     auto num_non_exiting_tiles = torch::empty({1}, torch::dtype(torch::kInt32).device(torch::kCUDA));
 
@@ -77,12 +77,12 @@ std::vector<torch::Tensor> moe_topk_sort_impl(torch::optional<torch::Tensor> con
         expert_indexes.data_ptr<int>(), expert_count_histogram.data_ptr<int>(), total_num_padded_tokens.data_ptr<int>(),
         expanded_idx_to_permuted_idx.data_ptr<int>(), permuted_idx_to_expanded_idx.data_ptr<int>(),
         nullptr /*permuted_idx_to_token_idx.data_ptr<int>()*/, token_final_scales_ptr, token_selected_experts_ptr,
-        num_tokens_per_expert.data_ptr<int>(), tile_idx_to_batch_idx.data_ptr<int>(),
+        num_tokens_per_expert.data_ptr<int>(), tile_idx_to_expert_idx.data_ptr<int>(),
         tile_idx_to_mn_limit.data_ptr<int>(), num_non_exiting_tiles.data_ptr<int>(),
         batchedGemm::trtllm::gen::Dtype::Void /* dtypeElt */, false /* use_routing_scales_on_input */,
         false /* use_deep_seek_fp8 */, static_cast<RoutingMethodType>(routing_method_type), stream);
 
-    std::vector<torch::Tensor> results{tile_idx_to_batch_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx,
+    std::vector<torch::Tensor> results{tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx,
         permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_tiles};
     if (new_token_final_scales.has_value())
     {

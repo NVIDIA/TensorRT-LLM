@@ -537,7 +537,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         tile_size: int = 128,
         scaling_vector_size: int = 16,
     ) -> torch.Tensor:
-        tuner = AutoTuner.get()
+        # tuner = AutoTuner.get()
 
         runner = Sm100BlockScaledPersistentGroupedGemmRunner(
             output_dtype, tile_size, scaling_vector_size)
@@ -546,12 +546,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tile_idx_to_group_idx, num_non_exiting_tiles
         ]
 
-        _, best_tactic = tuner.choose_one(
-            "trtllm::cute_dsl_nvfp4_grouped_gemm_blackwell",
-            [runner],
-            runner.__class__.tuning_config,
-            inputs,
-        )
+        # TODO: Need careful input preparation for grouped GEMM
+        # _, best_tactic = tuner.choose_one(
+        #     "trtllm::cute_dsl_nvfp4_grouped_gemm_blackwell",
+        #     [runner],
+        #     runner.__class__.tuning_config,
+        #     inputs,
+        # )
+        best_tactic = None
         output = runner(inputs, tactic=best_tactic)
         return output
 

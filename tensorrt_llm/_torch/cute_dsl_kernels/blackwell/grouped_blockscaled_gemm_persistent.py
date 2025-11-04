@@ -950,44 +950,44 @@ class Sm100BlockScaledPersistentGroupedGemmKernel:
             )
 
             while work_tile.is_valid_tile:
+                cur_tile_coord = work_tile.tile_idx
+                if cur_tile_coord[0] < num_non_exiting_tiles[0]:
+                    tile_info_pipeline.producer_acquire(tile_info_producer_state)
+                    cur_tile_coord = work_tile.tile_idx
+                    group_idx = tile_idx_to_group_idx[cur_tile_coord[0]]
+                    with cute.arch.elect_one():
+                        sInfo[(0, tile_info_producer_state.index)] = cur_tile_coord[0]
+                        sInfo[(1, tile_info_producer_state.index)] = cur_tile_coord[1]
+                        sInfo[(2, tile_info_producer_state.index)] = group_idx
+                        sInfo[(3, tile_info_producer_state.index)] = cutlass.Int32(
+                            work_tile.is_valid_tile
+                        )
+                        # fence view async shared
+                    cute.arch.fence_proxy(
+                        cute.arch.ProxyKind.async_shared,
+                        space=cute.arch.SharedSpace.shared_cta,
+                    )
+
+                    self.sched_sync_barrier.arrive_and_wait()
+                    tile_info_pipeline.producer_commit(tile_info_producer_state)
+                    tile_info_producer_state.advance()
+
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
 
-                # get the tile coord
-                cur_tile_coord = work_tile.tile_idx
-
-                while cur_tile_coord[0] >= num_non_exiting_tiles[0] and work_tile.is_valid_tile:
-                    tile_sched.advance_to_next_work()
-                    work_tile = tile_sched.get_current_work()
-
-                    cur_tile_coord = work_tile.tile_idx
-
-                # acquire tile info pipeline
-                tile_info_pipeline.producer_acquire(tile_info_producer_state)
-
-                # get the group info
-                group_idx = tile_idx_to_group_idx[cur_tile_coord[0]]
-
-                with cute.arch.elect_one():
-                    sInfo[(0, tile_info_producer_state.index)] = cur_tile_coord[0]
-                    sInfo[(1, tile_info_producer_state.index)] = cur_tile_coord[1]
-                    sInfo[(2, tile_info_producer_state.index)] = group_idx
-                    sInfo[(3, tile_info_producer_state.index)] = cutlass.Int32(
-                        work_tile.is_valid_tile
-                    )
-
-                # fence view async shared
-                cute.arch.fence_proxy(
-                    cute.arch.ProxyKind.async_shared,
-                    space=cute.arch.SharedSpace.shared_cta,
-                )
-                self.sched_sync_barrier.arrive_and_wait()
-                # commit tile info pipeline
-                tile_info_pipeline.producer_commit(tile_info_producer_state)
-
-                # advance to next tile
-                tile_info_producer_state.advance()
-
+            tile_info_pipeline.producer_acquire(tile_info_producer_state)
+            with cute.arch.elect_one():
+                sInfo[(0, tile_info_producer_state.index)] = work_tile.tile_idx[0]
+                sInfo[(1, tile_info_producer_state.index)] = work_tile.tile_idx[1]
+                sInfo[(2, tile_info_producer_state.index)] = -1
+                sInfo[(3, tile_info_producer_state.index)] = cutlass.Int32(0)
+            cute.arch.fence_proxy(
+                cute.arch.ProxyKind.async_shared,
+                space=cute.arch.SharedSpace.shared_cta,
+            )
+            self.sched_sync_barrier.arrive_and_wait()
+            tile_info_pipeline.producer_commit(tile_info_producer_state)
+            tile_info_producer_state.advance()
             tile_info_pipeline.producer_tail(tile_info_producer_state)
 
         #
@@ -1014,18 +1014,16 @@ class Sm100BlockScaledPersistentGroupedGemmKernel:
 
             # Get the first tile info
             tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
-            # Get tile coord from tile scheduler
-            cur_tile_coord = work_tile.tile_idx
-
-            group_idx = tile_idx_to_group_idx[cur_tile_coord[0]]
-            # initialize the tile info
-            tile_info[0] = cur_tile_coord[0]
-            tile_info[1] = cur_tile_coord[1]
-            tile_info[2] = group_idx
-            tile_info[3] = work_tile.is_valid_tile
-
-            is_valid_tile = cutlass.Boolean(1)
+            tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+            for idx in cutlass.range(4, unroll_full=True):
+                tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
+            cute.arch.fence_proxy(
+                cute.arch.ProxyKind.async_shared,
+                space=cute.arch.SharedSpace.shared_cta,
+            )
+            tile_info_pipeline.consumer_release(tile_info_consumer_state)
+            tile_info_consumer_state.advance()
 
             while is_valid_tile:
                 mma_tile_coord_mnl = (
@@ -1208,23 +1206,17 @@ class Sm100BlockScaledPersistentGroupedGemmKernel:
             )
 
             # Get the first tile info from pipeline (scheduler has filtered out tiles >= num_non_exiting_tiles)
-            # Important: We read from pipeline but do NOT advance before the loop
-            # Advance only happens at the end of loop after processing each tile
             tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
-            # Get tile coord from tile scheduler
-            cur_tile_coord = work_tile.tile_idx
-            # MMA warp don't care about group_idx
-            group_idx = 0
-            if work_tile.is_valid_tile:
-                group_idx = tile_idx_to_group_idx[cur_tile_coord[0]]
-            # initialize the tile info
-            tile_info[0] = cur_tile_coord[0]
-            tile_info[1] = cur_tile_coord[1]
-            tile_info[2] = group_idx
-            tile_info[3] = work_tile.is_valid_tile
-
-            is_valid_tile = cutlass.Boolean(1)
+            tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+            for idx in cutlass.range(4, unroll_full=True):
+                tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
+            cute.arch.fence_proxy(
+                cute.arch.ProxyKind.async_shared,
+                space=cute.arch.SharedSpace.shared_cta,
+            )
+            tile_info_pipeline.consumer_release(tile_info_consumer_state)
+            tile_info_consumer_state.advance()
 
             while is_valid_tile:
                 # Peek (try_wait) AB buffer full for k_tile = 0
@@ -1468,20 +1460,17 @@ class Sm100BlockScaledPersistentGroupedGemmKernel:
 
             # Get the first tile info
             tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
-            # Get tile coord from tile scheduler
-            cur_tile_coord = work_tile.tile_idx
 
-            group_idx = 0
-            if work_tile.is_valid_tile:
-                group_idx = tile_idx_to_group_idx[cur_tile_coord[0]]
-            # initialize the tile info
-            tile_info[0] = cur_tile_coord[0]
-            tile_info[1] = cur_tile_coord[1]
-            tile_info[2] = group_idx
-            tile_info[3] = work_tile.is_valid_tile
-
-            is_valid_tile = cutlass.Boolean(1)
+            tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+            for idx in cutlass.range(4, unroll_full=True):
+                tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
+            cute.arch.fence_proxy(
+                cute.arch.ProxyKind.async_shared,
+                space=cute.arch.SharedSpace.shared_cta,
+            )
+            tile_info_pipeline.consumer_release(tile_info_consumer_state)
+            tile_info_consumer_state.advance()
 
             while is_valid_tile:
                 mma_tile_coord_mnl = (
@@ -1873,13 +1862,6 @@ class Sm100BlockScaledPersistentGroupedGemmKernel:
             - occupancy * (mbar_helpers_bytes + c_bytes)
         ) // (occupancy * c_bytes_per_stage)
 
-        cute.printf(
-            "num_acc_stage: {}, num_ab_stage: {}, num_c_stage: {}, num_tile_stage: {}",
-            num_acc_stage,
-            num_ab_stage,
-            num_c_stage,
-            num_tile_stage,
-        )
         return num_acc_stage, num_ab_stage, num_c_stage, num_tile_stage
 
     @staticmethod

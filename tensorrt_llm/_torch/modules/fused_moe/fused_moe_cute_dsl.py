@@ -95,11 +95,11 @@ def cute_dsl_nvfp4_group_gemm_ref(
     a_sf: torch.Tensor,
     b_sf: torch.Tensor,
     alpha: torch.Tensor,
-    tile_idx_to_batch_idx: torch.Tensor,
+    tile_idx_to_group_idx: torch.Tensor,
     num_non_exiting_tiles: torch.Tensor,
     output_dtype: torch.dtype,
-    scaling_vector_size: int = 16,
     tile_size: int = 128,
+    scaling_vector_size: int = 16,
 ):
     assert a.dtype == torch.float4_e2m1fn_x2
     assert a.dim() == 2
@@ -124,7 +124,7 @@ def cute_dsl_nvfp4_group_gemm_ref(
     assert alpha.size(0) == l
 
     num_tiles_per_expert = torch.bincount(
-        tile_idx_to_batch_idx[:num_non_exiting_tiles[0].item()], minlength=l)
+        tile_idx_to_group_idx[:num_non_exiting_tiles[0].item()], minlength=l)
     offsets = [0] + num_tiles_per_expert.cumsum(dim=0).tolist()
 
     ref = torch.empty(m, n, dtype=output_dtype, device="cuda")
@@ -266,7 +266,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             routed_scaling_factor = None
 
         tile_size = 128
-        tile_idx_to_batch_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_tiles = torch.ops.trtllm.moe_sort(
+        tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_tiles = torch.ops.trtllm.moe_sort(
             token_selected_experts=token_selected_experts,
             token_final_scales=token_final_scales,
             num_experts=self.num_slots,
@@ -289,13 +289,13 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             tile_tokens_dim=tile_size,
             top_k=top_k,
         )
-        h1 = cute_dsl_nvfp4_group_gemm_ref(
-            a=permuted_x.view(torch.float4_e2m1fn_x2),
-            b=self.w3_w1_weight.view(torch.float4_e2m1fn_x2),
-            a_sf=permuted_sf.view(torch.uint8),
-            b_sf=self.quant_scales.fc1_weight_block.view(torch.uint8),
+        h1 = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_blackwell(
+            input=permuted_x.view(torch.float4_e2m1fn_x2),
+            weight=self.w3_w1_weight.view(torch.float4_e2m1fn_x2),
+            input_scale=permuted_sf.view(torch.uint8),
+            weight_scale=self.quant_scales.fc1_weight_block.view(torch.uint8),
             alpha=self.quant_scales.fc1_global,
-            tile_idx_to_batch_idx=tile_idx_to_batch_idx,
+            tile_idx_to_group_idx=tile_idx_to_expert_idx,
             num_non_exiting_tiles=num_non_exiting_tiles,
             output_dtype=output_dtype,
             tile_size=tile_size,
@@ -303,13 +303,13 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         h2 = swiglu_fused_moe(h1)
         permuted_x, permuted_sf = torch.ops.trtllm.fp4_quantize(
             h2, self.fc2_input_scale, self.scaling_vector_size, False, True)
-        h3 = cute_dsl_nvfp4_group_gemm_ref(
-            a=permuted_x.view(torch.float4_e2m1fn_x2),
-            b=self.w2_weight.view(torch.float4_e2m1fn_x2),
-            a_sf=permuted_sf.view(torch.uint8),
-            b_sf=self.quant_scales.fc2_weight_block.view(torch.uint8),
+        h3 = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_blackwell(
+            input=permuted_x.view(torch.float4_e2m1fn_x2),
+            weight=self.w2_weight.view(torch.float4_e2m1fn_x2),
+            input_scale=permuted_sf.view(torch.uint8),
+            weight_scale=self.quant_scales.fc2_weight_block.view(torch.uint8),
             alpha=self.quant_scales.fc2_global,
-            tile_idx_to_batch_idx=tile_idx_to_batch_idx,
+            tile_idx_to_group_idx=tile_idx_to_expert_idx,
             num_non_exiting_tiles=num_non_exiting_tiles,
             output_dtype=output_dtype,
             tile_size=tile_size,
