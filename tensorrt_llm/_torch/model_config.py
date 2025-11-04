@@ -356,7 +356,7 @@ class ModelConfig(Generic[TConfig]):
         json_exclude_quantization = json_quant_configs.get(
             'exclude_quantization', None)
         if json_exclude_quantization:
-            quant_config.exclude_quant_config = {
+            quant_config.exclude_quantization = {
                 "quant_algo":
                 QuantAlgo(
                     json_exclude_quantization.get('quant_algo', None).upper())
@@ -456,11 +456,11 @@ class ModelConfig(Generic[TConfig]):
         else:
             quant_config.exclude_modules = hf_quant_config.get("ignored_layers")
 
-        # set exclude_quant_config
+        # set exclude_quantization
         hf_ignored_quantization_config = hf_quant_config.get(
             "ignored_quantization_config")
         if hf_ignored_quantization_config:
-            quant_config.exclude_quant_config = {
+            quant_config.exclude_quantization = {
                 "kv_cache_quant_algo":
                 QuantAlgo(
                     hf_ignored_quantization_config.get(

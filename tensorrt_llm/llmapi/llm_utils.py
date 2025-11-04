@@ -457,11 +457,11 @@ class ModelLoader:
                 else:
                     quant_config.exclude_modules = hf_quant_config.get(
                         "ignored_modules")
-                # set exclude_quant_config
+                # set exclude_quantization
                 hf_ignored_quantization_config = hf_quant_config.get(
                     "ignored_quantization_config")
                 if hf_ignored_quantization_config:
-                    quant_config.exclude_quant_config = {
+                    quant_config.exclude_quantization = {
                         "quant_algo":
                         QuantAlgo(
                             hf_ignored_quantization_config.get(
