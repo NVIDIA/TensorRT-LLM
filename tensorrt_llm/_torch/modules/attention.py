@@ -648,7 +648,7 @@ def fp8_block_scaling_bmm_out(
     mat2_dequant: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     sm_version = get_sm_version()
-    if sm_version == 90 or sm_version == 89:
+    if sm_version == 90 or sm_version == 89 or sm_version == 120:
         mat1_fp8, mat1_scale = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
             mat1)
 
