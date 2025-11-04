@@ -75,7 +75,8 @@ def launch_disaggregated_llm(
         tensor_parallel_size: int = 1,
         ctx_model: str = None,
         gen_model: str = None,
-        server_waiting_timeout: int = DEFAULT_SERVER_WAITING_TIMEOUT):
+        server_waiting_timeout: int = DEFAULT_SERVER_WAITING_TIMEOUT,
+        max_workers: int = 16):
     temp_dir = tempfile.TemporaryDirectory()
     disaggregated_serving_config_path = os.path.join(
         temp_dir.name, "disaggregated_serving_config.yaml")
@@ -202,9 +203,9 @@ def launch_disaggregated_llm(
     server_cmd = [
         trtllm_serve_path, "disaggregated", "-c",
         disaggregated_serving_config_path, "--server_start_timeout",
-        str(server_waiting_timeout)
+        str(server_waiting_timeout), "-r", "360000"
     ]
-    with (MyThreadPoolExecutor(max_workers=16) as
+    with (MyThreadPoolExecutor(max_workers=max_workers) as
           thread_pool, temp_dir, multi_popen(ctx_servers + gen_servers) as
           worker_processes, popen(server_cmd) as server_process):
         start_time = time.time()
@@ -224,7 +225,8 @@ def launch_disaggregated_llm(
                 continue
 
         client = openai.OpenAI(api_key="1234567890",
-                               base_url=f"http://localhost:8000/v1")
+                               base_url=f"http://localhost:8000/v1",
+                               timeout=1800000)
 
         def send_request(prompt: str, sampling_params: SamplingParams,
                          streaming: bool):
@@ -925,6 +927,77 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             task = GSM8K(model_name)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
+
+
+@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
+class TestDeepSeekV32Exp(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "deepseek-ai/DeepSeek-V3.2-Exp"
+    MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3.2-Exp-FP4-v2"
+
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.parametrize("overlap_scheduler", [False])
+    def test_auto_dtype(self, overlap_scheduler):
+        ctx_server_config = {"disable_overlap_scheduler": True}
+        gen_server_config = {"disable_overlap_scheduler": overlap_scheduler}
+        ctx_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
+        gen_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
+        ctx_server_config["kv_cache_config"] = {
+            "enable_block_reuse": False,
+            "free_gpu_memory_fraction": 0.7,
+            "tokens_per_block": 64,
+            "dtype": "fp8"
+        }
+        ctx_server_config["moe_config"] = {
+            "backend": "TRTLLM",
+            "max_num_tokens": 16384
+        }
+        ctx_server_config["tensor_parallel_size"] = 4
+        ctx_server_config["pipeline_parallel_size"] = 1
+        ctx_server_config["moe_expert_parallel_size"] = 4
+        ctx_server_config["max_batch_size"] = 24
+        ctx_server_config["cuda_graph_config"] = None
+        ctx_server_config["enable_attention_dp"] = True
+        ctx_server_config["enable_autotuner"] = False
+        gen_server_config["kv_cache_config"] = {
+            "enable_block_reuse": False,
+            "tokens_per_block": 64,
+            "free_gpu_memory_fraction": 0.7,
+            "dtype": "fp8"
+        }
+        gen_server_config["moe_config"] = {
+            "backend": "TRTLLM",
+            "max_num_tokens": 16384
+        }
+        gen_server_config["max_batch_size"] = 128
+        gen_server_config["max_num_tokens"] = 128
+        gen_server_config["cuda_graph_config"] = None
+        gen_server_config["tensor_parallel_size"] = 4
+        gen_server_config["pipeline_parallel_size"] = 1
+        gen_server_config["moe_expert_parallel_size"] = 4
+        gen_server_config["enable_attention_dp"] = True
+        gen_server_config["enable_autotuner"] = False
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "port": 8000,
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8001"]
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"]
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config,
+                                      gen_server_config,
+                                      self.MODEL_PATH,
+                                      max_workers=128) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
 
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)

@@ -1136,15 +1136,8 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
     std::vector<SizeType32> layersInWindow;
     size_t cacheBlockSizeSum = 0;
     size_t inputBlockLayerNumSum = 0;
-    nvinfer1::DataType cacheDataType = nvinfer1::DataType::kINT64;
-    if (isIndexerKCache)
-    {
-        cacheDataType = nvinfer1::DataType::kUINT8;
-    }
-    else
-    {
-        cacheDataType = kVCacheBlocksPerWindow.begin()->second.front()->getDataType();
-    }
+    auto cacheDataType
+        = isIndexerKCache ? nvinfer1::DataType::kUINT8 : kVCacheBlocksPerWindow.begin()->second.front()->getDataType();
 
     for (auto const& [window, blocks] : kVCacheBlocksPerWindow)
     {
