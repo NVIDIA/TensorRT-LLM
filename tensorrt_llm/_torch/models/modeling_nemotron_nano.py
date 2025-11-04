@@ -258,15 +258,16 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
         return mm_embedding, num_tokens_in_videos
 
 
-class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInputsBuilder):
-    def __init__(
-        self,
-        model_path: str,
-        config: transformers.PretrainedConfig,
-        tokenizer: transformers.AutoTokenizer,
-        trust_remote_code: bool = True,
-    ):
-        super().__init__()
+class NanoV2VLInputProcessor(BaseMultimodalInputProcessor,
+                             BaseMultimodalDummyInputsBuilder):
+
+    def __init__(self,
+                 model_path: str,
+                 config: transformers.PretrainedConfig,
+                 tokenizer: transformers.AutoTokenizer,
+                 trust_remote_code: bool = True,
+                 **kwargs):
+        super().__init__(**kwargs)
         if not trust_remote_code:
             raise ValueError("trust_remote_code must be True for Phi4MM")
 

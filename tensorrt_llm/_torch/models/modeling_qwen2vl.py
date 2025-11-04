@@ -95,9 +95,9 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                  model_path: str,
                  config: PretrainedConfig,
                  tokenizer: AutoTokenizer,
-                 trust_remote_code: bool = True):
-
-        super().__init__()
+                 trust_remote_code: bool = True,
+                 **kwargs):
+        super().__init__(**kwargs)
         self._config = config
         self._dtype = self._config.torch_dtype
         self._tokenizer = tokenizer if tokenizer is not None else AutoTokenizer.from_pretrained(
