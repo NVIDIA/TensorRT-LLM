@@ -56,11 +56,18 @@ def compare_backends(csv_path, threshold=5.0, default_backend='NIXL'):
     """
     # 读取CSV
     df = pd.read_csv(csv_path)
-    
+
+    if len(df) == 0:
+        print(f"No data found in CSV file: {csv_path}")
+        sys.exit(0)
+
     # 过滤只保留disagg_perf相关的测试
     # 从test_name字段判断
     df = df[df['test_name'].str.contains('disagg_perf_file:', na=False)]
-    
+    if len(df) == 0:
+        print(f"No disagg_perf tests found in CSV file: {csv_path}")
+        sys.exit(0)
+
     # 提取backend和标准化的case名称
     df['backend'] = df['test_name'].apply(extract_backend)
     df['base_case_name'] = df['test_name'].apply(extract_base_case_name)
@@ -460,11 +467,8 @@ def main():
     print(f"总计: {total}")
     print(f"通过: {passed} (DEFAULT性能正常)")
     print(f"失败: {failed} (DEFAULT比UCX慢超过{args.threshold}%)")
-    print(f"===================================\n")
-    
-    # 如果有失败的用例，返回非0退出码
+    print(f"===================================\n")    
     sys.exit(1 if failed > 0 else 0)
-
 
 if __name__ == '__main__':
     main()
