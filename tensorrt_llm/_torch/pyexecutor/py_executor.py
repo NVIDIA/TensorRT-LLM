@@ -1,13 +1,11 @@
 import dataclasses
 import datetime
 import functools
-import gc
 import os
 import pickle  # nosec B403
 import threading
 import time
 import traceback
-import weakref
 from contextlib import contextmanager
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 
@@ -59,10 +57,6 @@ from .scheduler import RequestScheduler, ScheduledRequests
 # Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
 PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
 
-# Environment variable to enable garbage collection profiling.
-# Set to "1" to enable recording of garbage collection events during profiling.
-PROFILE_RECORD_GC_ENV_VAR_NAME = "TLLM_PROFILE_RECORD_GC"
-
 # Environment variable to enable PyTorch profiler tracing.
 # Set to a path to save detailed tracing of PyTorch operations.
 PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
@@ -95,40 +89,6 @@ def _load_iteration_indexes(env_var: str):
                 ) from None
 
     return frozenset(starts), frozenset(stops)
-
-
-class _GCNvtxHandle:
-    pass
-
-
-def _gc_nvtx_watcher():
-    enabled = os.environ.get(PROFILE_RECORD_GC_ENV_VAR_NAME, None)
-    if not enabled:
-        return None
-
-    range_id: Optional[int] = None
-
-    def gc_callback(phase, _):
-        nonlocal range_id
-        if phase == "start":
-            assert range_id is None, "Unexpected state in GC callback: another GC while last GC not finished?"
-            range_id = torch.cuda.nvtx.range_start("Python GC")
-        elif phase == "stop":
-            assert range_id is not None, "Unexpected state in GC callback: no active GC but got GC finished?"
-            torch.cuda.nvtx.range_end(range_id)
-            range_id = None
-
-    gc.callbacks.append(gc_callback)
-
-    def gc_cleanup(callback):
-        try:
-            gc.callbacks.remove(callback)
-        except ValueError:
-            pass
-
-    handle = _GCNvtxHandle()
-    weakref.finalize(handle, gc_cleanup, gc_callback)
-    return handle
 
 
 @dataclasses.dataclass
@@ -178,7 +138,6 @@ class PyExecutor:
         # profile config
         self.profile_start_iters, self.profile_stop_iters = _load_iteration_indexes(
             PROFILE_START_STOP_ENV_VAR_NAME)
-        self.gc_nvtx_watcher_handle = _gc_nvtx_watcher()
 
         # related modules
         self.resource_manager = resource_manager
@@ -862,12 +821,7 @@ class PyExecutor:
                     f'{len(scheduled_batch.generation_requests)} generation requests'
                 )
 
-                if self.enable_attention_dp:
-                    tp_batch_sizes = self.dist.tp_allgather(
-                        scheduled_batch.batch_size)
-                    can_queue = 0 not in tp_batch_sizes
-                else:
-                    can_queue = scheduled_batch.batch_size > 0
+                can_queue = self._can_queue(scheduled_batch)
 
                 if not can_queue:
                     self.micro_batches[microbatch_id] = None
@@ -1045,6 +999,16 @@ class PyExecutor:
             self.send_handles[microbatch_id].wait()
             self.send_handles[microbatch_id] = None
 
+    def _can_queue(self, scheduled_batch):
+
+        if self.enable_attention_dp:
+            tp_batch_sizes = self.dist.tp_allgather(scheduled_batch.batch_size)
+            can_queue = 0 not in tp_batch_sizes
+        else:
+            can_queue = scheduled_batch.batch_size > 0
+
+        return can_queue
+
     def _prepare_and_schedule_batch(self):
         new_requests = self._fetch_and_activate_new_requests()
         if self.should_stop_processing:
@@ -1167,8 +1131,8 @@ class PyExecutor:
 
                 finished_requests = []
 
-                if scheduled_batch.batch_size > 0 or (
-                        self.enable_attention_dp and self.dist.tp_size > 1):
+                can_queue = self._can_queue(scheduled_batch)
+                if can_queue:
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
                         self._prepare_disagg_gen_transmission_complete(
@@ -1180,8 +1144,11 @@ class PyExecutor:
 
                     self._kv_connector_start_batch(scheduled_batch)
 
-                if scheduled_batch.batch_size > 0 or (
-                        self.enable_attention_dp and self.dist.tp_size > 1):
+                # if using a kv connector, we need to call can_queue again since scheduled_batch might have changed
+                if self.kv_connector_manager:
+                    can_queue = self._can_queue(scheduled_batch)
+
+                if can_queue:
                     # init_disagg_gen_requests must be before drafter loop, otherwise draft requests do not have initialized matchers.
                     # init_disagg_gen_requests must be before engine forward, where the prev_seq_slot is updated.
                     if self.guided_decoder is not None:
@@ -1339,7 +1306,8 @@ class PyExecutor:
 
                 self._pause_requests(scheduled_batch.paused_requests)
 
-                if scheduled_batch.batch_size > 0:
+                can_queue = self._can_queue(scheduled_batch)
+                if can_queue:
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
                         self._prepare_disagg_gen_transmission_complete(
@@ -1348,7 +1316,11 @@ class PyExecutor:
 
                     self._kv_connector_start_batch(scheduled_batch)
 
-                if scheduled_batch.batch_size > 0:
+                # if using a kv connector, we need to call can_queue again since scheduled_batch might have changed
+                if self.kv_connector_manager:
+                    can_queue = self._can_queue(scheduled_batch)
+
+                if can_queue:
 
                     # The generation requests that are do not have batch_idx,
                     # needs to be in front of the batch due to the assumptions
