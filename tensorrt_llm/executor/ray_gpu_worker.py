@@ -2,10 +2,15 @@ import importlib
 import os
 from pathlib import Path
 from queue import Queue
-from typing import Any, Optional, Type, Union
+from typing import Any, List, Optional, Type, Union
 
 import ray
 import torch
+
+from tensorrt_llm._ray_utils import control_action_decorator
+from tensorrt_llm._torch.virtual_memory import (materialize_with_tag,
+                                                release_with_tag,
+                                                verify_sleep_wakeup_tags)
 
 from ..bindings import executor as tllm
 from ..builder import Engine
@@ -229,6 +234,38 @@ class RayGPUWorker(BaseWorker):
         self._handle_background_error()
 
         logger.debug(f"Worker {self.rank} shutdown done.")
+
+    @control_action_decorator
+    def sleep(self, sleep_tags: List[str]):
+        if not self.llm_args.enable_sleep:
+            raise ValueError(
+                "Sleep feature is not enabled, please set enable_sleep=True in the LLM arguments."
+            )
+        try:
+            tags = verify_sleep_wakeup_tags(sleep_tags)
+            logger.info(f"Sleep: {tags}")
+            torch.cuda.synchronize()
+            release_with_tag(*tags)
+            torch.cuda.synchronize()
+        except Exception as e:
+            logger.error(f"Encountered an error in sleep: {e}")
+            raise e
+
+    @control_action_decorator
+    def wakeup(self, wakeup_tags: List[str]):
+        if not self.llm_args.enable_sleep:
+            raise ValueError(
+                "Sleep feature is not enabled, please set enable_sleep=True in the LLM arguments."
+            )
+        try:
+            tags = verify_sleep_wakeup_tags(wakeup_tags)
+            logger.info(f"Wakeup: {tags}")
+            torch.cuda.synchronize()
+            materialize_with_tag(*tags)
+            torch.cuda.synchronize()
+        except Exception as e:
+            logger.error(f"Encountered an error in wakeup")
+            raise e
 
     def __enter__(self):
         return self
