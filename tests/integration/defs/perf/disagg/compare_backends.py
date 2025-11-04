@@ -75,10 +75,11 @@ def compare_backends(csv_path, threshold=5.0, default_backend='NIXL'):
         default_data = group[group['backend'] == default_backend]
         ucx_data = group[group['backend'] == 'UCX']
         
-        # 如果没有同时包含DEFAULT和UCX，跳过
-        if len(default_data) == 0 or len(ucx_data) == 0:
+        # 如果两者都没有数据，跳过（这个case可能不存在）
+        if len(default_data) == 0 and len(ucx_data) == 0:
             continue
         
+        # 提取数值
         default_value = default_data['perf_metric'].values[0] if len(default_data) > 0 else None
         ucx_value = ucx_data['perf_metric'].values[0] if len(ucx_data) > 0 else None
         
@@ -87,7 +88,7 @@ def compare_backends(csv_path, threshold=5.0, default_backend='NIXL'):
         diff_pct = None
         regression_pct = None
         
-        # 如果一方有值另一方没有，标记为Fail
+        # 如果一方有值另一方没有，标记为Fail（测试运行失败）
         if default_value is None or ucx_value is None:
             status = 'Fail'
         elif ucx_value != 0:
