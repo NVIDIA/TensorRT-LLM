@@ -11,8 +11,9 @@ from PIL import Image
 from tensorrt_llm._torch.models.checkpoints import NemotronHHfWeightMapper
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
-from ...inputs import (BaseMultimodalInputProcessor, ExtraProcessedInputs,
-                       InputProcessor, MultimodalPlaceholderMetadata,
+from ...inputs import (BaseMultimodalDummyInputsBuilder,
+                       BaseMultimodalInputProcessor, ExtraProcessedInputs,
+                       MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        compute_retained_tokens_count, compute_retention_mask,
                        register_input_processor)
@@ -254,49 +255,70 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
         return mm_embedding, num_tokens_in_videos
 
 
-class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
+class NanoV2VLInputProcessor(BaseMultimodalInputProcessor,
+                             BaseMultimodalDummyInputsBuilder):
 
     def __init__(self,
                  model_path: str,
-                 model_config: transformers.PretrainedConfig,
+                 config: transformers.PretrainedConfig,
                  tokenizer: transformers.AutoTokenizer,
                  trust_remote_code: bool = True):
+        super().__init__()
         if not trust_remote_code:
-            raise ValueError("trust_remote_code must be True for NanoV2VL")
+            raise ValueError("trust_remote_code must be True for Phi4MM")
 
-        self.model_config = model_config
-        self.image_size = model_config.force_image_size
-        self.patch_size = model_config.patch_size
-        self.downsample_ratio = model_config.downsample_ratio
+        self._config = config
+        self._tokenizer = tokenizer if tokenizer is not None else transformers.AutoTokenizer.from_pretrained(
+            model_path,
+            trust_remote_code=trust_remote_code,
+            use_fast=self.use_fast)
+        self._processor = transformers.AutoProcessor.from_pretrained(
+            model_path,
+            trust_remote_code=trust_remote_code,
+            use_fast=self.use_fast)
+        self._model_path = model_path
+        self._dtype = self.config.torch_dtype
+        self.device = 'cpu'
+
+        self.image_size = self.config.force_image_size
+        self.patch_size = self.config.patch_size
+        self.downsample_ratio = self.config.downsample_ratio
         self.spatial_merge_size = int(self.patch_size / self.downsample_ratio)
-        self.img_context_token_id = model_config.img_context_token_id
+        self.img_context_token_id = self.config.img_context_token_id
         self.num_image_token = int((self.image_size // self.patch_size)**2 *
                                    (self.downsample_ratio**2))
         self.video_pruning_ratio = VIDEO_PRUNING_RATIO
-
-        self.device = 'cpu'
-
-        self.tokenizer = tokenizer
-        self.use_fast = True
-        if self.tokenizer is None:
-            self.tokenizer = transformers.AutoTokenizer.from_pretrained(
-                model_path, trust_remote_code=True, use_fast=self.use_fast)
-
-        self.processor = transformers.AutoImageProcessor.from_pretrained(
-            model_path, trust_remote_code=True, use_fast=self.use_fast)
-
-        self.img_context_token = model_config.img_context_token
-        self.video_context_token = model_config.video_context_token
-        self.img_start_token = model_config.img_start_token
-        self.img_end_token = model_config.img_end_token
-        self.dtype = model_config.torch_dtype
+        self.img_context_token = self.config.img_context_token
+        self.video_context_token = self.config.video_context_token
+        self.img_start_token = self.config.img_start_token
+        self.img_end_token = self.config.img_end_token
         self.image_start_token_id = self.tokenizer.encode(
             self.img_start_token, add_special_tokens=False)[0]
         self.image_end_token_id = self.tokenizer.encode(
             self.img_end_token, add_special_tokens=False)[0]
 
+    @property
+    def config(self) -> transformers.PretrainedConfig:
+        return self._config
+
+    @property
+    def tokenizer(self) -> transformers.AutoTokenizer:
+        return self._tokenizer
+
+    @property
+    def model_path(self) -> str:
+        return self._model_path
+
+    @property
+    def processor(self) -> transformers.AutoProcessor:
+        return self._processor
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._dtype
+
     def get_vocab_size(self):
-        return self.model_config.llm_config.vocab_size
+        return self.config.llm_config.vocab_size
 
     def get_mm_special_token_ids(self) -> torch.Tensor:
         " Return multimodal special token ids for NanoV2VL. "
