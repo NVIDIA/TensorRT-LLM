@@ -14,7 +14,7 @@ from ...custom_ops.quant import (
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.node_utils import (
-    extract_param_names_from_lin_node,
+    extract_param_names_from_node,
     get_quantization_params_from_linear_node,
     is_bmm_op,
     is_linear_op,
@@ -136,7 +136,7 @@ class Quantization(BaseTransform):
 
         The state_dict is also updated to contain the sharded weights.
         """
-        param_name, _ = extract_param_names_from_lin_node(node)
+        param_name, _ = extract_param_names_from_node(node)
         original_weight = gm.get_parameter(param_name)
         new_param = nn.Parameter(self.quantize_weight(original_weight), requires_grad=False)
         modname, _, attrname = param_name.rpartition(".")
