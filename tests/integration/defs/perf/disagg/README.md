@@ -1,49 +1,44 @@
-# Solution 4: 基于 YAML 配置的测试方案
+# Solution 4: YAML Configuration-Based Testing Framework
 
-## 设计理念
+## Design Philosophy
 
-**使用目录+YAML文件组织测试配置，简单直观，易于维护**
+**Use directories + YAML files to organize test configurations - simple, intuitive, and easy to maintain**
 
-核心原则：
-1. ✅ **按测试类型和类别分目录**：test_type → perf/accuracy → 配置文件
-2. ✅ **YAML 配置文件**：每个测试一个独立的 YAML 文件
-3. ✅ **文件名即元数据**：从文件名解析模型和benchmark类型，无需YAML metadata
-4. ✅ **默认 + 覆盖模式**：提供默认 metrics 配置，按需覆盖
-5. ✅ **复用现有工具**：使用 `disagg/slurm/benchmark/submit.py` 提交作业
-6. ✅ **最小改动**：保留 pytest 框架，只改配置读取方式
+Core Principles:
+1. ✅ **Organize by test type and category**: test_type → perf → configuration files
+2. ✅ **YAML configuration files**: Each test has its own independent YAML file
+3. ✅ **Filename as metadata**: Parse model and benchmark type from filename, no YAML metadata needed
+4. ✅ **Default + Override mode**: Provide default metrics configuration, override as needed
+5. ✅ **Reuse existing tools**: Use `disagg/slurm/benchmark/submit.py` to submit jobs
+6. ✅ **Minimal changes**: Keep pytest framework, only change configuration loading method
 
 ---
 
-## 目录结构
+## Directory Structure
 
 ```
 test_configs/
-├── disagg/                                    # 测试类型（disaggregated）
-│   ├── perf/                                  # 性能测试
+├── disagg/                                    # Test type (disaggregated)
+│   ├── perf/                                  # Performance tests
 │   │   ├── deepseek-r1-fp8_1k1k_tep8_bs32_mtp3_nixl.yaml
 │   │   ├── deepseek-r1-fp8_1k1k_tep8_bs32_nixl.yaml
 │   │   ├── deepseek-r1-fp8_1k1k_dep16_bs128_nixl.yaml
 │   │   ├── deepseek-r1-fp8_8k1k_tep8_bs16_nixl.yaml
 │   │   ├── llama-70b_1k1k_tep8_bs256_nixl.yaml
-│   │   └── special-model_1k1k_custom_metrics.yaml  # 自定义 metrics
-│   └── accuracy/                              # 精度测试
-│       ├── deepseek-r1-fp8_1k1k_gsm8k.yaml
-│       └── llama-70b_1k1k_mmlu.yaml
-├── widep/                                     # 另一种测试类型（可选）
-│   ├── perf/
-│   └── accuracy/
-└── templates/                                 # 模板文件（可选）
-    ├── disagg_perf_template.yaml
-    └── disagg_accuracy_template.yaml
+│   │   └── special-model_1k1k_custom_metrics.yaml  # Custom metrics
+├── widep/                                     # Another test type (optional)
+│   └── perf/
+└── templates/                                 # Template files (optional)
+    └── disagg_perf_template.yaml
 ```
 
 ---
 
-## GPU 硬件支持机制
+## GPU Hardware Support
 
-### 支持的 GPU 类型
+### Supported GPU Types
 
-系统支持多种 GPU 硬件类型，每个配置可以指定其支持的 GPU 列表：
+The system supports multiple GPU hardware types. Each configuration can specify which GPUs it supports:
 
 - **GB200**: NVIDIA GB200 GPU
 - **GB300**: NVIDIA GB300 GPU  
@@ -51,84 +46,79 @@ test_configs/
 - **B200**: NVIDIA B200 GPU
 - **B300**: NVIDIA B300 GPU
 
-### 配置方式
+### Configuration Method
 
-在 YAML 文件的 `hardware` 节点下指定 `supported_gpus` 字段：
+Specify `supported_gpus` field under the `hardware` section in YAML files:
 
 ```yaml
 hardware:
   gpus_per_node: 4
   num_ctx_servers: 1
   num_gen_servers: 4
-  supported_gpus: ["GB200", "GB300"]  # 此配置支持 GB200 和 GB300
+  supported_gpus: ["GB200", "GB300"]  # This config supports GB200 and GB300
 ```
 
-### GPU 过滤机制
+### GPU Filtering Mechanism
 
-1. **环境变量**: 系统通过 `GPU_TYPE` 环境变量获取当前 GPU 类型
-2. **自动过滤**: `ConfigLoader` 会自动过滤掉不支持当前 GPU 的配置
-3. **pytest 参数化**: 只有支持当前 GPU 的配置会被加载到测试用例中
+1. **Environment Variable**: The system gets the current GPU type through the `GPU_TYPE` environment variable
+2. **Automatic Filtering**: `ConfigLoader` automatically filters out configurations that don't support the current GPU
+3. **pytest Parameterization**: Only configurations that support the current GPU are loaded into test cases
 
-### 使用场景
+### Usage Scenarios
 
-#### 场景 1: 大模型配置（仅支持高端 GPU）
+#### Scenario 1: Large Model Configuration (High-end GPUs Only)
 ```yaml
 hardware:
-  supported_gpus: ["GB200", "GB300"]  # 仅在 GB200/GB300 上运行
+  supported_gpus: ["GB200", "GB300"]  # Run only on GB200/GB300
 ```
 
-#### 场景 2: 小模型配置（支持多种 GPU）
+#### Scenario 2: Small Model Configuration (Multiple GPUs Supported)
 ```yaml
 hardware:
-  supported_gpus: ["H100", "B200", "B300"]  # 可在 H100/B200/B300 上运行
+  supported_gpus: ["H100", "B200", "B300"]  # Can run on H100/B200/B300
 ```
 
-#### 场景 3: 通用配置（支持所有 GPU）
+#### Scenario 3: Universal Configuration (All GPUs Supported)
 ```yaml
 hardware:
-  supported_gpus: ["GB200", "GB300", "H100", "B200", "B300"]  # 支持所有 GPU
+  supported_gpus: ["GB200", "GB300", "H100", "B200", "B300"]  # Supports all GPUs
 ```
 
 ---
 
-## Metrics 配置说明
+## Metrics Configuration
 
-### 默认配置机制
+### Default Configuration Mechanism
 
-系统为不同测试类别提供了**默认的 metrics 配置**，大多数测试无需在 YAML 中配置 metrics。
+The system provides **default metrics configuration** for different test categories. Most tests don't need to configure metrics in YAML.
 
-#### 性能测试 (perf) 默认配置
-- **日志文件**: `benchmark_result.log`
-- **提取指标**: TTFT (Time To First Token), E2EL (End-to-End Latency)
-- **正则表达式**: 预定义的 TTFT/E2EL 提取模式
+#### Performance Test (perf) Default Configuration
+- **Log file**: `benchmark_result.log`
+- **Metrics extracted**: TTFT (Time To First Token), E2EL (End-to-End Latency)
+- **Regular expression**: Predefined TTFT/E2EL extraction pattern
 
-#### 精度测试 (accuracy) 默认配置
-- **日志文件**: `accuracy_result.json`
-- **提取指标**: Accuracy
-- **正则表达式**: 预定义的准确率提取模式
+### Usage Scenarios
 
-### 使用场景
-
-#### ✅ 场景 1：使用默认配置（推荐，90% 的情况）
+#### ✅ Scenario 1: Use Default Configuration (Recommended, 90% of cases)
 ```yaml
-# 不需要配置 metrics，自动使用默认配置
+# No need to configure metrics, default configuration is used automatically
 benchmark:
   mode: "e2e"
   multi_round: 8
   concurrency_list: "1 2 4 8 16 36"
-  # metrics 自动使用 perf 默认配置
+  # metrics automatically uses perf default configuration
 ```
 
-#### ✅ 场景 2：部分覆盖（只修改个别字段）
+#### ✅ Scenario 2: Partial Override (Modify only specific fields)
 ```yaml
 benchmark:
   mode: "e2e"
   metrics:
-    # 只覆盖 log_file，pattern 和 metric_names 继承默认
+    # Only override log_file, pattern and metric_names inherit defaults
     log_file: "custom_benchmark.log"
 ```
 
-#### ✅ 场景 3：完全自定义（特殊需求）
+#### ✅ Scenario 3: Fully Custom (Special Requirements)
 ```yaml
 benchmark:
   mode: "e2e"
@@ -140,20 +130,20 @@ benchmark:
 
 ---
 
-## YAML 配置文件格式
+## YAML Configuration File Format
 
-### 性能测试配置示例
+### Performance Test Configuration Examples
 
-#### 示例 1：标准配置（使用默认 metrics）
+#### Example 1: Standard Configuration (Using Default Metrics)
 
 `test_configs/disagg/perf/deepseek-r1-fp8_1k1k_tep8_bs32_mtp3_nixl.yaml`
 
 ```yaml
-# Metadata - 测试元数据（用于识别和过滤）
+# Metadata - Test metadata (for identification and filtering)
 metadata:
   model_name: "deepseek-r1-fp4"
   precision: "fp4"
-  supported_gpus: ["GB200", "GB300"]  # 支持的 GPU 类型列表
+  supported_gpus: ["GB200", "GB300"]  # List of supported GPU types
 
 # SLURM Configuration
 slurm:
@@ -172,17 +162,17 @@ benchmark:
   benchmark_ratio: 0.8
   streaming: true
   concurrency_list: "1 2 4 8 16 36"
-  # ⚠️ 注意：没有 metrics 配置，将自动使用 perf 默认 metrics
+  # ⚠️ Note: No metrics configuration, will automatically use perf default metrics
   #   - log_file: benchmark_result.log
   #   - metric_names: [DISAGG_SERVER_TTFT, DISAGG_SERVER_E2EL]
-  #   - extractor_pattern: 预定义的 TTFT/E2EL 提取模式
+  #   - extractor_pattern: Predefined TTFT/E2EL extraction pattern
 
 # Hardware Configuration
 hardware:
   gpus_per_node: 4
   num_ctx_servers: 1
   num_gen_servers: 4
-  supported_gpus: ["GB200", "GB300"]  # 支持的 GPU 类型列表
+  supported_gpus: ["GB200", "GB300"]  # List of supported GPU types
 
 # Sequence Configuration
 sequence:
@@ -256,36 +246,36 @@ worker_config:
       backend: NIXL
 ```
 
-#### 示例 2：自定义日志文件（部分覆盖）
+#### Example 2: Custom Log File (Partial Override)
 
 `test_configs/disagg/perf/special-model_1k1k_custom_log.yaml`
 
 ```yaml
-# 大部分配置与示例1相同...
+# Most configuration same as Example 1...
 
 benchmark:
   mode: "e2e"
   multi_round: 8
   concurrency_list: "1 2 4 8 16 36"
   
-  # 只覆盖 log_file，其他使用默认
+  # Only override log_file, others use defaults
   metrics:
     log_file: "custom_benchmark_result.log"
-    # extractor_pattern 和 metric_names 继承默认值
+    # extractor_pattern and metric_names inherit default values
 ```
 
-#### 示例 3：完全自定义 metrics
+#### Example 3: Fully Custom Metrics
 
 `test_configs/disagg/perf/special-model_1k1k_full_custom.yaml`
 
 ```yaml
-# 大部分配置与示例1相同...
+# Most configuration same as Example 1...
 
 benchmark:
   mode: "e2e"
   multi_round: 8
   
-  # 完全自定义 metrics 配置
+  # Fully custom metrics configuration
   metrics:
     log_file: "throughput_log.txt"
     extractor_pattern: |
@@ -296,118 +286,11 @@ benchmark:
       - "AVERAGE_LATENCY_MS"
 ```
 
-### 精度测试配置示例
-
-#### 示例 1：标准精度测试（使用默认 metrics）
-
-`test_configs/disagg/accuracy/deepseek-r1-fp8_1k1k_gsm8k.yaml`
-
-```yaml
-# SLURM Configuration
-slurm:
-  script_file: "disaggr_torch.slurm"
-  partition: "batch"
-  account: "coreai_comparch_trtllm"
-  job_time: "02:00:00"
-  job_name: "deepseek-r1-fp8-1k1k-accuracy"
-  numa_bind: true
-
-# Benchmark Mode - Accuracy specific
-benchmark:
-  mode: "accuracy"
-  use_nv_sa_benchmark: false
-  multi_round: 1
-  benchmark_ratio: 1.0
-  streaming: false
-  concurrency_list: "1"
-  
-  # 精度验证参数
-  expected_accuracy: 85.5
-  relative_error_threshold: 1.0  # 相对误差阈值 (%)
-  absolute_error_threshold: 0.5  # 绝对误差阈值 (%)
-  
-  # ⚠️ 注意：没有 metrics 配置，将自动使用 accuracy 默认 metrics
-  #   - log_file: accuracy_result.json
-  #   - metric_names: [ACCURACY]
-  #   - extractor_pattern: 预定义的准确率提取模式
-
-# Hardware Configuration
-hardware:
-  gpus_per_node: 4
-  num_ctx_servers: 1
-  num_gen_servers: 4
-
-# Sequence Configuration
-sequence:
-  input_length: 1024
-  output_length: 1024
-
-# Environment Configuration
-environment:
-  container_mount: "/lustre:/lustre"
-  container_image: "/lustre/fsw/portfolios/coreai/users/deemon/trtllm.sqsh"
-  model_path: "/lustre/fsw/portfolios/coreai/users/xqiao/DeepSeek-R1-0528-FP4-V2"
-  trtllm_repo: "/lustre/fs1/portfolios/coreai/projects/trtllm"
-  build_wheel: false
-  dataset_file: "/lustre/fs1/portfolios/coreai/datasets/gsm8k.json"
-  work_dir: "/lustre/fs1/portfolios/coreai/perf_test"
-
-profiling:
-  nsys_on: false
-
-worker_config:
-  eplb_num_slots: 0
-  gen:
-    tensor_parallel_size: 8
-    moe_expert_parallel_size: 8
-    enable_attention_dp: false
-    max_batch_size: 1
-    max_num_tokens: 128
-    max_seq_len: 2251
-    kv_cache_config:
-      free_gpu_memory_fraction: 0.9
-      dtype: fp8
-    cache_transceiver_config:
-      max_tokens_in_buffer: 4608
-      backend: NIXL
-  ctx:
-    max_batch_size: 1
-    max_num_tokens: 4608
-    max_seq_len: 1227
-    tensor_parallel_size: 4
-    moe_expert_parallel_size: 4
-    enable_attention_dp: true
-    kv_cache_config:
-      free_gpu_memory_fraction: 0.85
-      dtype: fp8
-    cache_transceiver_config:
-      max_tokens_in_buffer: 4608
-      backend: NIXL
-```
-
-#### 示例 2：自定义 accuracy metrics（MMLU 数据集）
-
-`test_configs/disagg/accuracy/deepseek-r1-fp8_1k1k_mmlu.yaml`
-
-```yaml
-# 大部分配置与示例1相同...
-
-benchmark:
-  mode: "accuracy"
-  expected_accuracy: 90.0
-  
-  # 自定义 metrics（MMLU 有不同的输出格式）
-  metrics:
-    log_file: "mmlu_results.json"
-    extractor_pattern: "MMLU Score:\s+([0-9.]+)"
-    metric_names: ["MMLU_SCORE"]
-```
-
 ---
 
-## 核心实现代码
+## Core Implementation Code
 
-### 文件 1: `config_loader.py` - 配置加载器（含默认 metrics）
+### File 1: `config_loader.py` - Configuration Loader (with Default Metrics)
 
 ```python
 """
@@ -423,9 +306,9 @@ from dataclasses import dataclass
 @dataclass
 class MetricsConfig:
     """Metrics configuration"""
-    log_file: str                          # 日志文件名
-    extractor_pattern: str                 # 正则表达式
-    metric_names: List[str]                # 指标名称列表
+    log_file: str                          # Log file name
+    extractor_pattern: str                 # Regular expression pattern
+    metric_names: List[str]                # List of metric names
     
     def merge(self, override: Optional[Dict]) -> 'MetricsConfig':
         """
@@ -448,11 +331,11 @@ class MetricsConfig:
 
 
 # ============================================================================
-# 默认 Metrics 配置
+# Default Metrics Configuration
 # ============================================================================
 
 DEFAULT_METRICS_CONFIG = {
-    # 性能测试默认配置
+    # Performance test default configuration
     "perf": MetricsConfig(
         log_file="benchmark_result.log",
         extractor_pattern=r"""
@@ -463,13 +346,6 @@ DEFAULT_METRICS_CONFIG = {
             ^.*?Benchmark\ with\ concurrency\ (\d+)\ done
         """,
         metric_names=["DISAGG_SERVER_TTFT", "DISAGG_SERVER_E2EL"]
-    ),
-    
-    # 精度测试默认配置
-    "accuracy": MetricsConfig(
-        log_file="accuracy_result.json",
-        extractor_pattern=r"Accuracy:\s+([0-9.]+)%",
-        metric_names=["ACCURACY"]
     )
 }
 
@@ -480,12 +356,12 @@ class TestConfig:
     config_path: str        # YAML file path
     test_id: str            # Auto-generated test ID
     test_type: str          # disagg, widep, etc.
-    model_name: str         # Model name (从文件名解析)
-    test_category: str      # perf or accuracy
-    benchmark_type: str     # 1k1k, 8k1k, etc. (从文件名解析)
+    model_name: str         # Model name (parsed from filename)
+    test_category: str      # perf category
+    benchmark_type: str     # 1k1k, 8k1k, etc. (parsed from filename)
     config_data: dict       # Full YAML content
-    metrics_config: MetricsConfig  # Metrics 配置（默认或覆盖后的）
-    supported_gpus: List[str]  # 支持的 GPU 类型列表
+    metrics_config: MetricsConfig  # Metrics configuration (default or overridden)
+    supported_gpus: List[str]  # List of supported GPU types
     
     @property
     def display_name(self) -> str:
@@ -514,7 +390,7 @@ class ConfigLoader:
         
         Args:
             test_type: Filter by test type (disagg, widep, etc.)
-            test_category: Filter by category (perf, accuracy)
+            test_category: Filter by category (perf)
             model_name: Filter by model name
             gpu_type: Filter by GPU type (GB200, H100, etc.). If None, uses EnvManager.get_gpu_type()
         
@@ -543,7 +419,7 @@ class ConfigLoader:
             if test_type and current_test_type != test_type:
                 continue
             
-            # Traverse category (perf/accuracy)
+            # Traverse category (perf)
             for category_dir in test_type_dir.iterdir():
                 if not category_dir.is_dir():
                     continue
@@ -642,16 +518,16 @@ class ConfigLoader:
         Get metrics config: use default or merge with override
         
         Args:
-            test_category: 'perf' or 'accuracy'
+            test_category: 'perf'
             config_data: Full YAML config data
         
         Returns:
             MetricsConfig (default or merged with overrides)
         """
-        # 获取默认配置
+        # Get default configuration
         default_config = DEFAULT_METRICS_CONFIG.get(test_category)
         if not default_config:
-            # 如果没有默认配置，使用空配置
+            # If no default config, use empty config
             print(f"   ⚠️  No default metrics config for category: {test_category}")
             default_config = MetricsConfig(
                 log_file="",
@@ -659,16 +535,16 @@ class ConfigLoader:
                 metric_names=[]
             )
         
-        # 检查 YAML 中是否有 metrics 覆盖
+        # Check if YAML has metrics override
         benchmark_config = config_data.get('benchmark', {})
         metrics_override = benchmark_config.get('metrics')
         
         if metrics_override:
-            # 有覆盖配置，合并
+            # Has override config, merge
             print(f"   ⚙️  Using custom metrics config (overriding defaults)")
             return default_config.merge(metrics_override)
         else:
-            # 没有覆盖配置，使用默认
+            # No override config, use default
             print(f"   ⚙️  Using default metrics config for {test_category}")
             return default_config
     
@@ -701,7 +577,7 @@ class ConfigLoader:
                       if d.is_dir() and d.name != 'templates'])
 ```
 
-### 文件 2: `test_disagg_yaml.py` - pytest 测试文件
+### File 2: `test_disagg_yaml.py` - pytest Test File
 
 ```python
 """
@@ -921,18 +797,18 @@ if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 ```
 
-### 文件 3: 修改 `disagg_executor.py` 的 `check_job_result` 方法
+### File 3: Modify `disagg_executor.py` - `check_job_result` Method
 
-需要修改签名，接受 `metrics_config` 参数：
+Need to modify the signature to accept `metrics_config` parameter:
 
 ```python
-# 在 disagg_executor.py 中修改
+# Modify in disagg_executor.py
 
-from config_loader import MetricsConfig  # 新增 import
+from config_loader import MetricsConfig  # Add import
 
 @staticmethod
 def check_job_result(job_id: str, benchmark_type: str, config: dict,
-                    metrics_config: MetricsConfig,  # 新增参数
+                    metrics_config: MetricsConfig,  # New parameter
                     model_name: str, log_dir_name: str, context_dir: str, 
                     timestamps: Optional[Dict[str, str]] = None, 
                     test_name: Optional[str] = None) -> Dict[str, Any]:
@@ -986,22 +862,22 @@ def check_job_result(job_id: str, benchmark_type: str, config: dict,
     return result
 ```
 
-### 文件 4: 修改 `disagg_report.py` 的 `LogParser`
+### File 4: Modify `disagg_report.py` - `LogParser`
 
 ```python
-# 在 disagg_report.py 中修改
+# Modify in disagg_report.py
 
-from config_loader import MetricsConfig  # 新增 import
+from config_loader import MetricsConfig  # Add import
 
 class LogParser:
     """Log parser with metrics config support"""
     
     def __init__(self, benchmark_type: str, config: dict,
-                 metrics_config: MetricsConfig,  # 新增参数
+                 metrics_config: MetricsConfig,  # New parameter
                  log_dir_name: str, context_dir: str):
         self.benchmark_type = benchmark_type
         self.config = config
-        self.metrics_config = metrics_config  # 保存 metrics 配置
+        self.metrics_config = metrics_config  # Save metrics config
         self.log_dir_name = log_dir_name
         self.context_dir = context_dir
     
@@ -1053,7 +929,7 @@ class LogParser:
         pass
 ```
 
-### 文件 5: `list_configs.py` - 配置查看工具
+### File 5: `list_configs.py` - Configuration Viewing Tool
 
 ```python
 """
@@ -1068,7 +944,7 @@ def main():
     parser = argparse.ArgumentParser(description="List test configurations")
     parser.add_argument("--base-dir", default="test_configs", help="Base config directory")
     parser.add_argument("--test-type", help="Filter by test type (disagg, widep, etc.)")
-    parser.add_argument("--category", help="Filter by category (perf, accuracy)")
+    parser.add_argument("--category", help="Filter by category (perf)")
     parser.add_argument("--model", help="Filter by model name")
     parser.add_argument("--gpu-type", help="Filter by GPU type (GB200, H100, etc.). Default: from GPU_TYPE env var")
     parser.add_argument("--verbose", "-v", action="store_true", help="Show detailed info")
@@ -1153,126 +1029,112 @@ if __name__ == "__main__":
 
 ---
 
-## 配置文件命名规范
+## Configuration File Naming Convention
 
-### 文件名格式
+### Filename Format
 
-**推荐格式：`{model}_{benchmark_type}_{config_details}.yaml`**
+**Recommended format: `{model}_{benchmark_type}_{config_details}.yaml`**
 
-- 使用下划线 `_` 分隔各部分，便于人类阅读
-- 第1部分：模型名（内部可用连字符 `-`）
-- 第2部分：benchmark类型（如 1k1k, 8k1k）
-- 之后：配置细节（如 tep8_bs32_mtp3_nixl）
+- Use underscores `_` to separate parts for human readability
+- Part 1: Model name (can use hyphens `-` internally)
+- Part 2: Benchmark type (like 1k1k, 8k1k)
+- After that: Configuration details (like tep8_bs32_mtp3_nixl)
 
-**⚠️ 注意**：文件名仅用于人类可读性，实际的 `model_name`、`benchmark_type`、`precision`、`supported_gpus` 等信息均从 YAML 文件内的 `metadata` 和 `sequence` 字段读取。
+**⚠️ Note**: Filenames are only for human readability. The actual `model_name`, `benchmark_type`, `precision`, `supported_gpus`, etc. are all read from the `metadata` and `sequence` fields inside the YAML file.
 
-### benchmark_type 自动生成
+### benchmark_type Auto-Generation
 
-`benchmark_type` 会根据 YAML 文件中的 `sequence` 配置自动生成：
+`benchmark_type` is automatically generated from the `sequence` configuration in the YAML file:
 - `input_length: 1024, output_length: 1024` → `1k1k`
 - `input_length: 8192, output_length: 1024` → `8k1k`
 - `input_length: 16384, output_length: 2048` → `16k2k`
 
-### 性能测试命名示例
+### Performance Test Naming Examples
 
 - `deepseek-r1-fp4_1k1k_tep8_bs32_mtp3_nixl.yaml`
-  - 文件名辅助识别：deepseek-r1-fp4, 1k1k配置, TEP8架构
-  - 实际数据从 YAML 的 `metadata` 和 `sequence` 读取
+  - Filename helps identify: deepseek-r1-fp4, 1k1k config, TEP8 architecture
+  - Actual data read from YAML's `metadata` and `sequence`
 
 - `llama-70b_1k1k_dep16_bs128_nixl.yaml`
-  - 文件名辅助识别：llama-70b, 1k1k配置, DEP16架构
-
-### 精度测试命名示例
-
-- `deepseek-r1-fp4_1k1k_gsm8k.yaml`
-  - 文件名辅助识别：deepseek-r1-fp4, 1k1k配置, GSM8K数据集
+  - Filename helps identify: llama-70b, 1k1k config, DEP16 architecture
 
 ---
 
-## 使用方式
+## How to Use
 
-### 1. 创建测试配置
+### 1. Create Test Configurations
 
 ```bash
-# 创建目录结构
+# Create directory structure
 mkdir -p test_configs/disagg/perf
-mkdir -p test_configs/disagg/accuracy
 
-# 创建性能测试配置（使用默认 metrics）
+# Create performance test config (uses default metrics)
 vim test_configs/disagg/perf/deepseek-r1-fp8_1k1k_tep8_bs32.yaml
-# 不需要配置 metrics，自动使用默认
-
-# 创建精度测试配置（使用默认 metrics）
-vim test_configs/disagg/accuracy/deepseek-r1-fp8_1k1k_gsm8k.yaml
-# 不需要配置 metrics，自动使用默认
+# No need to configure metrics, defaults are used automatically
 ```
 
-### 2. 查看所有配置
+### 2. View All Configurations
 
 ```bash
-# 列出所有配置（自动过滤当前 GPU 类型）
+# List all configurations (automatically filtered by current GPU type)
 python list_configs.py
 
-# 查看所有配置，包括不支持当前 GPU 的
+# View all configurations, including those not supported by current GPU
 python list_configs.py --show-all-gpus -v
 
-# 查看特定 GPU 类型的配置
+# View configurations for a specific GPU type
 python list_configs.py --gpu-type GB200
 
-# 查看配置并显示 metrics 信息
+# View configurations and display metrics info
 python list_configs.py --show-metrics
 
-# 查看特定类别
+# View specific category
 python list_configs.py --category perf -v
 
-# 查看特定模型
+# View specific model
 python list_configs.py --model deepseek-r1-fp4 --show-metrics
 
-# 查看特定模型在 H100 上的配置
+# View specific model on H100
 python list_configs.py --model deepseek-v3-lite-fp8 --gpu-type H100 -v
 ```
 
-### 3. 运行测试
+### 3. Run Tests
 
 ```bash
-# 运行所有测试
+# Run all tests
 pytest test_disagg_yaml.py -v
 
-# 只运行性能测试
+# Run only performance tests
 pytest test_disagg_yaml.py -k "perf" -v
 
-# 只运行精度测试
-pytest test_disagg_yaml.py -k "accuracy" -v
-
-# 运行特定模型
+# Run specific model
 pytest test_disagg_yaml.py -k "deepseek-r1-fp8" -v
 
-# 查看详细输出
+# View detailed output
 pytest test_disagg_yaml.py -s -vv
 ```
 
 ---
 
-## 关键改进说明
+## Key Improvements
 
-### 1. 默认 Metrics 配置
+### 1. Default Metrics Configuration
 
-**改进前**：每个 YAML 文件都要配置 metrics，大量重复
+**Before**: Every YAML file needed to configure metrics, lots of duplication
 
-**改进后**：定义默认配置，90% 的文件不需要配置
+**After**: Define default configuration, 90% of files don't need to configure metrics
 
 ```python
 DEFAULT_METRICS_CONFIG = {
     "perf": MetricsConfig(
         log_file="benchmark_result.log",
-        extractor_pattern=r"...",  # 预定义的 TTFT/E2EL 模式
+        extractor_pattern=r"...",  # Predefined TTFT/E2EL pattern
         metric_names=["DISAGG_SERVER_TTFT", "DISAGG_SERVER_E2EL"]
-    ),
-    "accuracy": MetricsConfig(...)
+    )
 }
 ```
 
-### 2. 智能合并机制
+### 2. Smart Merge Mechanism
 
 ```python
 def _get_metrics_config(self, test_category: str, config_data: dict):
@@ -1280,27 +1142,27 @@ def _get_metrics_config(self, test_category: str, config_data: dict):
     metrics_override = config_data.get('benchmark', {}).get('metrics')
     
     if metrics_override:
-        # 部分覆盖：只覆盖指定的字段
+        # Partial override: only override specified fields
         return default_config.merge(metrics_override)
     else:
-        # 使用默认
+        # Use default
         return default_config
 ```
 
-### 3. 灵活的覆盖方式
+### 3. Flexible Override Options
 
 ```yaml
-# 完全使用默认
+# Use defaults completely
 benchmark:
   mode: "e2e"
-  # 不配置 metrics
+  # Don't configure metrics
 
-# 部分覆盖
+# Partial override
 benchmark:
   metrics:
-    log_file: "custom.log"  # 只改这个
+    log_file: "custom.log"  # Only change this
 
-# 完全自定义
+# Fully custom
 benchmark:
   metrics:
     log_file: "custom.log"
@@ -1310,94 +1172,94 @@ benchmark:
 
 ---
 
-## 需要修改的现有代码总结
+## Summary of Code Changes Needed
 
 ### 1. `disagg_executor.py`
 
 ```python
-# 修改方法签名
+# Modify method signature
 def check_job_result(..., metrics_config: MetricsConfig, ...):
-    # 使用 metrics_config.log_file
-    # 传递 metrics_config 给 LogParser
+    # Use metrics_config.log_file
+    # Pass metrics_config to LogParser
 ```
 
 ### 2. `disagg_report.py`
 
 ```python
-# 修改 LogParser 构造函数
+# Modify LogParser constructor
 class LogParser:
     def __init__(..., metrics_config: MetricsConfig, ...):
         self.metrics_config = metrics_config
     
     def parse(...):
-        # 使用 self.metrics_config.log_file
-        # 使用 self.metrics_config.extractor_pattern
-        # 使用 self.metrics_config.metric_names
+        # Use self.metrics_config.log_file
+        # Use self.metrics_config.extractor_pattern
+        # Use self.metrics_config.metric_names
 ```
 
 ---
 
-## 总结
+## Summary
 
-### 核心改进
+### Core Improvements
 
-1. ✅ **默认配置 + 可选覆盖**：减少 90% 的重复配置
-2. ✅ **简化配置文件**：大多数 YAML 不需要 metrics 节点
-3. ✅ **灵活覆盖**：支持部分覆盖和完全自定义
-4. ✅ **代码集中管理**：在 ConfigLoader 中统一管理默认配置
-5. ✅ **易于扩展**：添加新的测试类别只需在 DEFAULT_METRICS_CONFIG 中定义
-6. ✅ **Metadata 字段**：集中管理 `model_name`、`precision`、`supported_gpus` 等元数据
-7. ✅ **动态 benchmark_type**：从 `sequence` 配置自动生成，避免文件名与内容不一致
-8. ✅ **GPU 类型过滤**：自动根据当前 GPU 类型过滤配置，支持多 GPU 环境
+1. ✅ **Default config + Optional override**: Reduce 90% of duplicate configuration
+2. ✅ **Simplified config files**: Most YAMLs don't need metrics section
+3. ✅ **Flexible override**: Support partial override and full customization
+4. ✅ **Centralized code management**: Manage default configs in ConfigLoader
+5. ✅ **Easy to extend**: Add new test categories by defining them in DEFAULT_METRICS_CONFIG
+6. ✅ **Metadata fields**: Centrally manage `model_name`, `precision`, `supported_gpus`, etc.
+7. ✅ **Dynamic benchmark_type**: Auto-generated from `sequence` config, avoids filename/content mismatch
+8. ✅ **GPU type filtering**: Automatically filter configs by current GPU type, supports multi-GPU environments
 
-### Metrics 配置决策树
+### Metrics Configuration Decision Tree
 
 ```
-是否需要自定义 metrics？
-├─ 否（90% 情况）
-│  └─ 不配置 metrics 节点，使用默认
+Do you need custom metrics?
+├─ No (90% of cases)
+│  └─ Don't configure metrics section, use defaults
 │
-├─ 是（少数情况）
-│  ├─ 只需修改日志文件？
-│  │  └─ 只配置 log_file
+├─ Yes (rare cases)
+│  ├─ Only need to change log file?
+│  │  └─ Only configure log_file
 │  │
-│  └─ 需要完全自定义？
-│     └─ 配置完整的 metrics 节点
+│  └─ Need full customization?
+│     └─ Configure complete metrics section
 ```
 
-### 优势总结
+### Benefits Summary
 
-- **简洁**：大多数配置文件更简单
-- **灵活**：支持按需覆盖
-- **可维护**：默认配置集中管理
-- **可扩展**：易于添加新的 metrics 类型
-- **可靠**：配置文件是唯一真实来源（Single Source of Truth）
-- **智能**：自动根据 GPU 类型过滤配置
+- **Simple**: Most config files are simpler
+- **Flexible**: Support override as needed
+- **Maintainable**: Default configs centrally managed
+- **Extensible**: Easy to add new metrics types
+- **Reliable**: Config file is the single source of truth
+- **Smart**: Automatically filter configs by GPU type
 
-### 设计理念
+### Design Philosophy
 
-**配置即数据（Configuration as Data）**
+**Configuration as Data**
 
-所有关键信息（`model_name`、`precision`、`benchmark_type`、`supported_gpus`）都从 YAML 文件内容读取，而不是从文件名解析。这确保了：
+All key information (`model_name`, `precision`, `benchmark_type`, `supported_gpus`) is read from YAML file content, not parsed from filenames. This ensures:
 
-1. **唯一真实来源**：YAML 文件内容是权威数据源
-2. **灵活重构**：可以修改配置内容而无需重命名文件
-3. **程序友好**：便于程序化生成和修改配置
-4. **人类可读**：文件名仍然保留可读性，便于浏览和识别
+1. **Single source of truth**: YAML file content is the authoritative data source
+2. **Flexible refactoring**: Can modify config content without renaming files
+3. **Program friendly**: Easy to generate and modify configs programmatically
+4. **Human readable**: Filenames still maintain readability for browsing and identification
 
-**元数据扩展性（Metadata Extensibility）**
+**Metadata Extensibility**
 
-通过 `metadata` 字段，可以轻松添加新的元数据：
+Through the `metadata` field, you can easily add new metadata:
 
 ```yaml
 metadata:
   model_name: "deepseek-r1-fp4"
   precision: "fp4"
   supported_gpus: ["GB200", "GB300"]
-  # 未来可扩展
+  # Future extensibility
   author: "team-name"
   created_date: "2025-01-15"
   tags: ["production", "high-priority"]
 ```
 
-就是这么简单！🎉
+That's it! Simple and powerful! 🎉
