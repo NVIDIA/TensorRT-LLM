@@ -17,6 +17,7 @@ from tensorrt_llm.functional import (PositionEmbeddingType, RopeEmbeddingUtils,
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ..memory_buffer_utils import Buffers
 from ..metadata import KVCacheParams
 from ..pyexecutor.resource_manager import KVCacheManager
 from ..utils import get_model_extra_attrs
@@ -350,7 +351,7 @@ class AttentionMetadata:
         """
 
     @staticmethod
-    def get_empty(buffers,
+    def get_empty(buffers: Buffers,
                   tensor_shape: list[int],
                   dtype: torch.dtype,
                   cache_name: str,
