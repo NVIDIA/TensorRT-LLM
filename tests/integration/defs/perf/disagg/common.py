@@ -115,27 +115,9 @@ CONFIG_BASE_DIR = os.path.join(EnvManager.get_work_dir(), "test_configs")
 
 def extract_config_fields(config_data: dict) -> dict:
     """
-    从配置数据中提取关键字段，用于生成测试ID和日志目录
-    
-    Args:
-        config_data: YAML配置数据字典
-    
-    Returns:
-        包含以下字段的字典:
-        - isl: 输入序列长度 (input sequence length)
-        - osl: 输出序列长度 (output sequence length)
-        - ctx_num: context服务器数量
-        - gen_num: generation服务器数量
-        - gen_tp_size: generation的tensor parallel size
-        - gen_batch_size: generation的max batch size
-        - gen_enable_dp: generation是否启用attention DP
-        - eplb_slots: EPLB slots数量
-        - mtp_size: MTP (Multi-Token Prediction) size
-        - dep_flag: "dep" (enable DP) 或 "tep" (不启用DP)
-        - log_base: 日志基础名称，格式: "{isl}-{osl}"
-        - context_dir: 完整的日志目录名称
+    Extract critical fields from configuration data to generate test ID and log directory
     """
-    # 提取基础字段
+    # Extract basic fields
     isl = config_data['sequence']['input_length']
     osl = config_data['sequence']['output_length']
     ctx_num = config_data['hardware']['num_ctx_servers']
@@ -146,13 +128,13 @@ def extract_config_fields(config_data: dict) -> dict:
     cache_transceiver_backend = config_data['worker_config']['gen']['cache_transceiver_config']['backend']
     eplb_slots = config_data['worker_config'].get('eplb_num_slots', 0)
     
-    # 获取 MTP size
+    # Get MTP size
     gen_config = config_data['worker_config']['gen']
     mtp_size = 0
     if 'speculative_config' in gen_config:
         mtp_size = gen_config['speculative_config'].get('num_nextn_predict_layers', 0)
     
-    # 生成派生字段
+    # Generate derived fields
     dep_flag = "dep" if gen_enable_dp else "tep"
     log_base = f"{isl}-{osl}"
     context_dir = (

@@ -12,6 +12,14 @@ export OUTPUT_PATH=/mnt/c/code/TensorRT-LLM/tests/integration/defs/perf/disagg/o
 poetry run pytest --disagg --collect-only -q &> testlist_h100.txt
 
 
+# run compare_backends.py to generate backend comparison report
+poetry run python compare_backends.py \
+    --csv-path "$CSV_PATH" \
+    --threshold 5.0 \
+    --default-backend NIXL \
+    --output backend_comparison.csv \
+    --html backend_comparison.html
+
 # run with test list file
 poetry run pytest --disagg test_disagg.py -s -vv --test-list=./testlist/testlist_gb200_debug.txt
 

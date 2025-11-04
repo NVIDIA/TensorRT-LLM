@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-比较不同backend(UCX vs NIXL)的性能测试结果
+Compare performance test results between different backends (UCX vs NIXL)
 """
 
 import pandas as pd
@@ -11,30 +11,30 @@ import sys
 
 def normalize_test_name(test_name):
     """
-    去掉test_name中的序号数字（如_001, _015等）
-    例如: deepseek-r1-fp4_015_8k1k -> deepseek-r1-fp4_8k1k
+    Remove number suffixes (e.g., _001, _015) from test_name
+    Example: deepseek-r1-fp4_015_8k1k -> deepseek-r1-fp4_8k1k
     """
-    # 匹配 model_XXX_ 格式，去掉XXX数字
+    # Match model_XXX_ format, remove XXX number
     pattern = r'(_\d{3}_)'
     normalized = re.sub(pattern, '_', test_name)
     return normalized
 
 
 def extract_backend(test_name):
-    """从test_name中提取backend类型"""
+    """Extract backend type from test_name"""
     match = re.search(r'ccbackend:(\w+)', test_name)
     return match.group(1) if match else None
 
 
 def extract_base_case_name(test_name):
     """
-    提取标准化的case名称（去除backend信息和序号）
+    Extract standardized case name (remove backend information and number suffix)
     """
-    # 先标准化去掉序号
+    # Standardize by removing number suffix first
     normalized = normalize_test_name(test_name)
     
-    # 去掉ccbackend部分，保留其他参数
-    # 替换 ccbackend:XXX 为 ccbackend:BACKEND
+    # Remove ccbackend part, keep other parameters
+    # Replace ccbackend:XXX with ccbackend:BACKEND
     pattern = r'ccbackend:\w+'
     base_case = re.sub(pattern, 'ccbackend:BACKEND', normalized)
     
@@ -43,80 +43,80 @@ def extract_base_case_name(test_name):
 
 def compare_backends(csv_path, threshold=5.0, default_backend='NIXL'):
     """
-    比较DEFAULT backend和UCX的性能指标
-    只关注DEFAULT比UCX慢的情况
+    Compare performance metrics between DEFAULT backend and UCX
+    Only focus on cases where DEFAULT is slower than UCX
     
     Args:
-        csv_path: CSV文件路径
-        threshold: 性能差异阈值（百分比）
-        default_backend: DEFAULT backend名称（当前为NIXL，将来可能切换）
+        csv_path: CSV file path
+        threshold: Performance difference threshold (percentage)
+        default_backend: DEFAULT backend name (currently NIXL, may switch in the future)
     
     Returns:
-        DataFrame: 比较结果
+        DataFrame: Comparison results
     """
-    # 读取CSV
+    # Read CSV file
     df = pd.read_csv(csv_path)
 
     if len(df) == 0:
         print(f"No data found in CSV file: {csv_path}")
         sys.exit(0)
 
-    # 过滤只保留disagg_perf相关的测试
-    # 从test_name字段判断
+    # Filter only keep tests related to disagg_perf
+    # Determine from test_name field
     df = df[df['test_name'].str.contains('disagg_perf_file:', na=False)]
     if len(df) == 0:
         print(f"No disagg_perf tests found in CSV file: {csv_path}")
         sys.exit(0)
 
-    # 提取backend和标准化的case名称
+    # Extract backend and standardized case name
     df['backend'] = df['test_name'].apply(extract_backend)
     df['base_case_name'] = df['test_name'].apply(extract_base_case_name)
     
-    # 按base_case_name和metric_type分组
+    # Group by base_case_name and metric_type
     grouped = df.groupby(['base_case_name', 'metric_type'])
     
     results = []
     
     for (base_case, metric_type), group in grouped:
-        # 获取DEFAULT backend和UCX的数据
+        # Get DEFAULT backend and UCX data
         default_data = group[group['backend'] == default_backend]
         ucx_data = group[group['backend'] == 'UCX']
         
-        # 如果两者都没有数据，跳过（这个case可能不存在）
+        # If both have no data, skip (this case may not exist)
         if len(default_data) == 0 and len(ucx_data) == 0:
             continue
         
-        # 提取数值
+        # Extract values
         default_value = default_data['perf_metric'].values[0] if len(default_data) > 0 else None
         ucx_value = ucx_data['perf_metric'].values[0] if len(ucx_data) > 0 else None
         
-        # 判断状态
+        # Determine status
         status = 'Pass'
         diff_pct = None
         regression_pct = None
         
-        # 如果一方有值另一方没有，标记为Fail（测试运行失败）
+        # If one has value and the other has no value, mark as Fail (test run failed)
         if default_value is None or ucx_value is None:
             status = 'Fail'
         elif ucx_value != 0:
-            # 计算性能差异百分比
-            # 对于TTFT和E2EL这种指标，数值越小越好
-            # regression_pct > 0 表示DEFAULT比UCX慢（性能退化）
-            # regression_pct < 0 表示DEFAULT比UCX快（性能提升）
+            # Calculate performance difference percentage
+            # For TTFT and E2EL metrics, smaller is better
+            # regression_pct > 0 means DEFAULT is slower than UCX (performance degradation)
+            # regression_pct < 0 means DEFAULT is faster than UCX (performance improvement)
             regression_pct = ((default_value - ucx_value) / ucx_value) * 100
             diff_pct = abs(regression_pct)
             
-            # 只在DEFAULT比UCX慢且超过阈值时才Fail
+            # Only fail if DEFAULT is slower than UCX and exceeds threshold
             if regression_pct > threshold:
                 status = 'Fail'
             else:
                 status = 'Pass'
         else:
-            # UCX值为0是异常情况
+            # UCX value is 0 is an abnormal case
             if default_value != 0:
                 status = 'Fail'
         
-        # 构建输出行
+        # Build output row
         test_case_name_default = base_case.replace('ccbackend:BACKEND', f'ccbackend:{default_backend}')
         test_case_name_ucx = base_case.replace('ccbackend:BACKEND', f'ccbackend:UCX')
         
@@ -131,28 +131,28 @@ def compare_backends(csv_path, threshold=5.0, default_backend='NIXL'):
             'status': status
         })
     
-    # 转换为DataFrame
+    # Convert to DataFrame
     result_df = pd.DataFrame(results)
     
     return result_df
 
 
 def generate_html_report(result_df, threshold, default_backend, output_path):
-    """生成HTML格式的比较报告"""
+    """Generate HTML format comparison report"""
     
-    # 统计信息
+    # Statistics
     total = len(result_df)
     failed = len(result_df[result_df['status'] == 'Fail'])
     passed = total - failed
     
-    # HTML模板
+    # HTML template
     html_template = """
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Backend性能对比报告 - DEFAULT vs UCX</title>
+    <title>Backend Comparison Report - DEFAULT vs UCX</title>
     <style>
         body {{
             font-family: Arial, sans-serif;
@@ -282,39 +282,39 @@ def generate_html_report(result_df, threshold, default_backend, output_path):
 </head>
 <body>
     <div class="container">
-        <h1>🔍 Backend性能对比报告: DEFAULT ({default_backend}) vs UCX</h1>
+        <h1>🔍 Backend Comparison Report: DEFAULT ({default_backend}) vs UCX</h1>
         
         <div class="info">
             <strong>DEFAULT Backend:</strong> {default_backend}
             <br>
-            <strong>对比Backend:</strong> UCX
+            <strong>Comparison Backend:</strong> UCX
             <br>
-            <strong>阈值设置:</strong> {threshold}%
+            <strong>Threshold:</strong> {threshold}%
             <br>
-            <strong>说明:</strong> 只关注DEFAULT比UCX慢的情况。性能退化超过阈值时标记为Fail
+            <strong>Description:</strong> Only focus on cases where DEFAULT is slower than UCX. Mark as Fail if performance degradation exceeds threshold
         </div>
         
         <div class="warning-box">
-            <strong>⚠️ 注意:</strong> 
+            <strong>⚠️ Attention:</strong> 
             <ul style="margin: 5px 0;">
-                <li>✅ <strong>Pass</strong>: DEFAULT性能与UCX接近，或比UCX更好</li>
-                <li>❌ <strong>Fail</strong>: DEFAULT比UCX慢超过{threshold}%（性能退化）</li>
-                <li>📊 正值表示DEFAULT比UCX慢，负值表示DEFAULT比UCX快</li>
+                <li>✅ <strong>Pass</strong>: DEFAULT is similar to or better than UCX</li>
+                <li>❌ <strong>Fail</strong>: DEFAULT is slower than UCX{threshold}%（Preformance degradation）</li>
+                <li>📊 Positive value means DEFAULT is slower than UCX, negative value means DEFAULT is faster than UCX</li>
             </ul>
         </div>
         
         <div class="summary">
             <div class="summary-box total">
                 <h2>{total}</h2>
-                <p>总测试数</p>
+                <p>Total tests</p>
             </div>
             <div class="summary-box pass">
                 <h2>{passed}</h2>
-                <p>通过</p>
+                <p>Pass</p>
             </div>
             <div class="summary-box fail">
                 <h2>{failed}</h2>
-                <p>性能退化</p>
+                <p>Performance degradation</p>
             </div>
         </div>
         
@@ -323,12 +323,12 @@ def generate_html_report(result_df, threshold, default_backend, output_path):
                 <tr>
                     <th style="width: 22%;">DEFAULT ({default_backend})</th>
                     <th style="width: 22%;">UCX</th>
-                    <th style="width: 10%;">指标类型</th>
-                    <th style="width: 10%;">DEFAULT值</th>
-                    <th style="width: 10%;">UCX值</th>
-                    <th style="width: 8%;">差异(%)</th>
-                    <th style="width: 10%;">退化/提升(%)</th>
-                    <th style="width: 8%;">状态</th>
+                    <th style="width: 10%;">Metric type</th>
+                    <th style="width: 10%;">DEFAULT value</th>
+                    <th style="width: 10%;">UCX value</th>
+                    <th style="width: 8%;">Difference (%)</th>
+                    <th style="width: 10%;">Regression/Improvement (%)</th>
+                    <th style="width: 8%;">Status</th>
                 </tr>
             </thead>
             <tbody>
@@ -337,39 +337,39 @@ def generate_html_report(result_df, threshold, default_backend, output_path):
         </table>
         
         <div class="footer">
-            <p>生成时间: {timestamp}</p>
+            <p>Generated time: {timestamp}</p>
         </div>
     </div>
 </body>
 </html>
 """
     
-    # 生成表格行
+    # Generate table rows
     table_rows = []
     for _, row in result_df.iterrows():
         status_class = 'status-pass' if row['status'] == 'Pass' else 'status-fail'
         
-        # 格式化差异百分比
+        # Format difference percentage
         if pd.notna(row['diff_pct']):
             diff_str = f"{row['diff_pct']:.2f}%"
         else:
             diff_str = 'N/A'
         
-        # 格式化退化/提升百分比
+        # Format regression/improvement percentage
         if pd.notna(row['regression_pct']):
             if row['regression_pct'] > 0:
-                # 正值：DEFAULT比UCX慢（退化）
+                # Positive value: DEFAULT is slower than UCX (regression)
                 regression_str = f"+{row['regression_pct']:.2f}%"
                 regression_class = 'regression'
             else:
-                # 负值：DEFAULT比UCX快（提升）
+                # Negative value: DEFAULT is faster than UCX (improvement)
                 regression_str = f"{row['regression_pct']:.2f}%"
                 regression_class = 'improvement'
         else:
             regression_str = 'N/A'
             regression_class = 'neutral'
         
-        # 格式化数值
+        # Format values
         default_val = f"{row['default_value']:.2f}" if pd.notna(row['default_value']) else 'N/A'
         ucx_val = f"{row['ucx_value']:.2f}" if pd.notna(row['ucx_value']) else 'N/A'
         
@@ -387,7 +387,7 @@ def generate_html_report(result_df, threshold, default_backend, output_path):
         """
         table_rows.append(row_html)
     
-    # 填充模板
+    # Fill template
     from datetime import datetime
     html_content = html_template.format(
         default_backend=default_backend,
@@ -399,74 +399,74 @@ def generate_html_report(result_df, threshold, default_backend, output_path):
         timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     )
     
-    # 写入文件
+    # Write to file
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write(html_content)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='比较DEFAULT backend和UCX的性能测试结果，只关注DEFAULT比UCX慢的情况'
+        description='Compare performance test results between DEFAULT backend and UCX, only focus on cases where DEFAULT is slower than UCX'
     )
     parser.add_argument(
         '--csv-path',
         type=str,
         required=True,
-        help='性能测试结果CSV文件路径'
+        help='Performance test results CSV file path'
     )
     parser.add_argument(
         '--threshold',
         type=float,
         default=5.0,
-        help='性能差异阈值（百分比），默认5.0%%. 只在DEFAULT比UCX慢超过此阈值时标记为Fail'
+        help='Performance difference threshold (percentage), default 5.0%. Only mark as Fail if DEFAULT is slower than UCX exceeds this threshold'
     )
     parser.add_argument(
         '--default-backend',
         type=str,
         default='NIXL',
-        help='DEFAULT backend名称（默认NIXL，将来可能切换为其他backend）'
+        help='DEFAULT backend name (default NIXL, may switch to other backend in the future)'
     )
     parser.add_argument(
         '--output',
         type=str,
-        help='输出CSV文件路径（可选，默认打印到stdout）'
+        help='Output CSV file path (optional, default print to stdout)'
     )
     parser.add_argument(
         '--html',
         type=str,
-        help='输出HTML报告文件路径（可选）'
+        help='Output HTML report file path (optional)'
     )
     
     args = parser.parse_args()
     
-    # 执行比较
+    # Execute comparison
     result_df = compare_backends(args.csv_path, args.threshold, args.default_backend)
     
-    # 输出CSV结果
+    # Output CSV results
     if args.output:
         result_df.to_csv(args.output, index=False)
-        print(f"CSV结果已保存到: {args.output}")
+        print(f"CSV results saved to: {args.output}")
     else:
         print(result_df.to_string(index=False))
     
-    # 输出HTML报告
+    # Output HTML report
     if args.html:
         generate_html_report(result_df, args.threshold, args.default_backend, args.html)
-        print(f"HTML报告已保存到: {args.html}")
+        print(f"HTML report saved to: {args.html}")
     
-    # 统计信息
+    # Statistics
     total = len(result_df)
     failed = len(result_df[result_df['status'] == 'Fail'])
     passed = total - failed
     
-    print(f"\n============= 统计信息 =============")
+    print(f"\n============= Statistics =============")
     print(f"DEFAULT Backend: {args.default_backend}")
-    print(f"对比Backend: UCX")
-    print(f"阈值: {args.threshold}%")
+    print(f"Comparison Backend: UCX")
+    print(f"Threshold: {args.threshold}%")
     print(f"-----------------------------------")
-    print(f"总计: {total}")
-    print(f"通过: {passed} (DEFAULT性能正常)")
-    print(f"失败: {failed} (DEFAULT比UCX慢超过{args.threshold}%)")
+    print(f"Total: {total}")
+    print(f"Pass: {passed} (DEFAULT performance normal)")
+    print(f"Fail: {failed} (DEFAULT is slower than UCX exceeds {args.threshold}%)")
     print(f"===================================\n")    
     sys.exit(1 if failed > 0 else 0)
 

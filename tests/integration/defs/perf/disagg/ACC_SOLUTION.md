@@ -1,30 +1,30 @@
-# 精度测试支持设计方案（简化版）
+# Accuracy Test Support Design (Simplified)
 
-## 核心设计原则
+## Core Design Principles
 
-- 精度测试不存CSV，只判断pass/fail
-- 性能测试继续存CSV（现有逻辑不变）
-- 使用test_category区分两种测试类型
-- 精度配置放在YAML的metadata部分
-- **所有输出统一在 benchmark.log 中**
-- **通过正则表达式和关键字匹配提取不同数据集的accuracy值**
-- 支持多数据集（gsm8k、mmlu、humaneval等）
+- Accuracy tests don't save to CSV, only pass/fail judgment
+- Performance tests continue to save CSV (existing logic unchanged)
+- Use test_category to distinguish between two test types
+- Accuracy configuration in YAML metadata section
+- **All outputs unified in benchmark.log**
+- **Extract accuracy values for different datasets via regex and keyword matching**
+- Support multiple datasets (gsm8k, mmlu, humaneval, etc.)
 
-## 1. 数据结构扩展 (config_loader.py)
+## 1. Data Structure Extension (config_loader.py)
 
-### 1.1 添加DatasetThreshold类
+### 1.1 Add DatasetThreshold Class
 
 ```python
 @dataclass
 class DatasetThreshold:
-    """单个数据集的精度阈值配置"""
-    dataset_name: str              # 数据集名称：gsm8k, mmlu, humaneval等
-    expected_value: float          # 期望值
-    threshold: float               # 阈值
-    threshold_type: str            # "relative" 或 "absolute"
+    """Accuracy threshold configuration for a single dataset"""
+    dataset_name: str              # Dataset name: gsm8k, mmlu, humaneval, etc.
+    expected_value: float          # Expected value
+    threshold: float               # Threshold
+    threshold_type: str            # "relative" or "absolute"
     
     def validate(self, actual_value: float) -> tuple[bool, str]:
-        """验证精度是否通过"""
+        """Validate if accuracy passes"""
         if self.threshold_type == "relative":
             error = abs(actual_value - self.expected_value) / self.expected_value
             passed = error < self.threshold
@@ -37,36 +37,36 @@ class DatasetThreshold:
         return passed, msg
 ```
 
-### 1.2 添加AccuracyConfig类
+### 1.2 Add AccuracyConfig Class
 
-存储多个数据集的阈值配置：
+Store threshold configurations for multiple datasets:
 
 ```python
 @dataclass
 class AccuracyConfig:
-    """精度测试配置（支持多数据集）"""
-    datasets: List[DatasetThreshold]  # 数据集阈值列表
+    """Accuracy test configuration (supports multiple datasets)"""
+    datasets: List[DatasetThreshold]  # List of dataset thresholds
     
     def get_dataset_config(self, dataset_name: str) -> Optional[DatasetThreshold]:
-        """根据数据集名称获取配置"""
+        """Get configuration by dataset name"""
         for ds in self.datasets:
             if ds.dataset_name == dataset_name:
                 return ds
         return None
 ```
 
-### 1.3 修改_load_config_file方法
+### 1.3 Modify _load_config_file Method
 
-从YAML的metadata读取精度配置：
+Read accuracy configuration from YAML metadata:
 
 ```python
-# 在metadata中读取accuracy配置
+# Read accuracy config from metadata
 accuracy_config = None
 if test_category == "accuracy":
     acc_meta = metadata.get('accuracy', {})
     if acc_meta:
         datasets = []
-        # 支持datasets列表配置
+        # Support datasets list configuration
         for ds_config in acc_meta.get('datasets', []):
             datasets.append(DatasetThreshold(
                 dataset_name=ds_config.get('name', 'gsm8k'),
@@ -78,20 +78,20 @@ if test_category == "accuracy":
         accuracy_config = AccuracyConfig(datasets=datasets)
 ```
 
-### 1.4 更新DEFAULT_METRICS_CONFIG
+### 1.4 Update DEFAULT_METRICS_CONFIG
 
-使用元组key方案，accuracy也使用benchmark.log：
+Use tuple key approach, accuracy also uses benchmark.log:
 
 ```python
 _COMMON_ACCURACY_CONFIG = MetricsConfig(
-    log_file="benchmark.log",  # 统一使用benchmark.log
-    # 正则提取格式: "gsm8k: acc=0.85" 或 "|gsm8k|acc|0.85|"
+    log_file="benchmark.log",  # Unified use of benchmark.log
+    # Regex extraction format: "gsm8k: acc=0.85" or "|gsm8k|acc|0.85|"
     extractor_pattern=r'(\w+)[\s|:]+acc[\s|=:]+([0-9.]+)',
     metric_names=["ACCURACY"]
 )
 
 DEFAULT_METRICS_CONFIG = {
-    # Disagg 性能测试
+    # Disagg performance test
     ("disagg", "perf"): MetricsConfig(
         log_file="benchmark.log",
         extractor_pattern=r"""
@@ -104,7 +104,7 @@ DEFAULT_METRICS_CONFIG = {
         metric_names=["DISAGG_SERVER_TTFT", "DISAGG_SERVER_E2EL"]
     ),
     
-    # Widep 性能测试
+    # Widep performance test
     ("widep", "perf"): MetricsConfig(
         log_file="benchmark.log",
         extractor_pattern=r"""
@@ -117,21 +117,21 @@ DEFAULT_METRICS_CONFIG = {
         metric_names=["WIDEP_SERVER_TTFT", "WIDEP_SERVER_E2EL"]
     ),
     
-    # 精度测试：复用通用配置
+    # Accuracy test: reuse common config
     ("disagg", "accuracy"): _COMMON_ACCURACY_CONFIG,
     ("widep", "accuracy"): _COMMON_ACCURACY_CONFIG,
 }
 ```
 
-## 2. 日志解析扩展 (report.py)
+## 2. Log Parsing Extension (report.py)
 
-### 2.1 添加AccuracyParser类
+### 2.1 Add AccuracyParser Class
 
-从benchmark.log解析多个数据集的accuracy：
+Parse accuracy from benchmark.log for multiple datasets:
 
 ```python
 class AccuracyParser:
-    """精度测试解析器（从benchmark.log提取）"""
+    """Accuracy test parser (extract from benchmark.log)"""
     
     def __init__(self, metrics_config: MetricsConfig, accuracy_config: AccuracyConfig, result_dir: str):
         self.metrics_config = metrics_config
@@ -139,37 +139,37 @@ class AccuracyParser:
         self.result_dir = result_dir
     
     def parse_and_validate(self) -> Dict[str, Any]:
-        """解析benchmark.log并验证所有数据集的精度"""
+        """Parse benchmark.log and validate accuracy for all datasets"""
         log_file = os.path.join(self.result_dir, self.metrics_config.log_file)
         
         if not os.path.exists(log_file):
             return {"success": False, "error": f"Log file not found: {log_file}"}
         
-        # 读取日志
+        # Read log file
         with open(log_file, 'r', encoding='utf-8', errors='replace') as f:
             log_content = f.read()
         
-        # 使用正则提取所有数据集的accuracy
-        # 格式示例：
+        # Extract accuracy for all datasets using regex
+        # Format examples:
         #   gsm8k: acc=0.85
         #   mmlu: acc=0.75
-        #   或：|gsm8k|acc|0.85|
+        #   Or: |gsm8k|acc|0.85|
         pattern = re.compile(self.metrics_config.extractor_pattern, re.IGNORECASE)
         matches = pattern.findall(log_content)
         
         if not matches:
             return {"success": False, "error": "No accuracy values found in log"}
         
-        # 解析为字典：{dataset_name: accuracy_value}
+        # Parse to dictionary: {dataset_name: accuracy_value}
         parsed_results = {}
         for match in matches:
-            dataset_name = match[0].lower()  # 数据集名称（小写）
-            acc_value = float(match[1])      # accuracy值
+            dataset_name = match[0].lower()  # Dataset name (lowercase)
+            acc_value = float(match[1])      # Accuracy value
             parsed_results[dataset_name] = acc_value
         
         print(f"   📊 Parsed accuracy results: {parsed_results}")
         
-        # 验证每个配置的数据集
+        # Validate each configured dataset
         validation_results = []
         all_passed = True
         
@@ -208,24 +208,24 @@ class AccuracyParser:
         }
 ```
 
-## 3. 执行器修改 (executor.py)
+## 3. Executor Modifications (executor.py)
 
-### 3.1 修改JobManager.check_result方法
+### 3.1 Modify JobManager.check_result Method
 
-添加test_category和accuracy_config参数：
+Add test_category and accuracy_config parameters:
 
 ```python
 @staticmethod
 def check_result(job_id: str, test_config, timestamps, test_name) -> Dict[str, Any]:
-    # ... 现有代码 ...
+    # ... existing code ...
     
     return JobManager._check_job_result(
         job_id=job_id,
-        test_category=test_config.test_category,  # 新增
+        test_category=test_config.test_category,  # New
         benchmark_type=test_config.benchmark_type,
         config=config_data,
         metrics_config=test_config.metrics_config,
-        accuracy_config=test_config.accuracy_config,  # 新增
+        accuracy_config=test_config.accuracy_config,  # New
         model_name=test_config.model_name,
         result_dir=result_dir,
         timestamps=timestamps,
@@ -233,9 +233,9 @@ def check_result(job_id: str, test_config, timestamps, test_name) -> Dict[str, A
     )
 ```
 
-### 3.2 修改_check_job_result方法签名
+### 3.2 Modify _check_job_result Method Signature
 
-添加test_category和accuracy_config参数：
+Add test_category and accuracy_config parameters:
 
 ```python
 @staticmethod
@@ -246,18 +246,18 @@ def _check_job_result(job_id: str, test_category: str, benchmark_type: str,
                      test_name: Optional[str] = None) -> Dict[str, Any]:
 ```
 
-### 3.3 在_check_job_result中添加分流逻辑
+### 3.3 Add Routing Logic in _check_job_result
 
 ```python
-# ... 打印日志的共通逻辑 ...
+# ... Common logging logic ...
 
-# 根据test_category分流
+# Route based on test_category
 if test_category == "accuracy":
-    # 精度测试：不存CSV，只验证pass/fail
+    # Accuracy test: don't save to CSV, only validate pass/fail
     if not accuracy_config:
         return {"success": False, "error": "Accuracy config not found"}
     
-    # 解析并验证
+    # Parse and validate
     accuracy_parser = AccuracyParser(metrics_config, accuracy_config, result_dir)
     validation_result = accuracy_parser.parse_and_validate()
     
@@ -265,7 +265,7 @@ if test_category == "accuracy":
         result["error"] = validation_result.get("error", "Validation failed")
         return result
     
-    # 打印验证结果
+    # Print validation results
     print(f"   📊 Accuracy Validation Results:")
     all_passed = validation_result["all_passed"]
     
@@ -293,13 +293,13 @@ if test_category == "accuracy":
     return result
 
 else:  # perf
-    # 性能测试：解析并存CSV（现有逻辑不变）
-    # ... 现有的perf处理逻辑 ...
+    # Performance test: parse and save to CSV (existing logic unchanged)
+    # ... existing perf handling logic ...
 ```
 
-## 4. TestConfig扩展 (config_loader.py)
+## 4. TestConfig Extension (config_loader.py)
 
-在TestConfig添加accuracy_config字段：
+Add accuracy_config field to TestConfig:
 
 ```python
 @dataclass
@@ -312,13 +312,13 @@ class TestConfig:
     benchmark_type: str
     config_data: dict
     metrics_config: MetricsConfig
-    accuracy_config: Optional[AccuracyConfig] = None  # 新增
+    accuracy_config: Optional[AccuracyConfig] = None  # New
     supported_gpus: List[str]
 ```
 
-## 5. YAML配置示例
+## 5. YAML Configuration Examples
 
-### 5.1 单数据集精度测试
+### 5.1 Single Dataset Accuracy Test
 
 ```yaml
 metadata:
@@ -326,7 +326,7 @@ metadata:
   precision: "fp4"
   supported_gpus: ["GB200", "GB300"]
   
-  # 精度测试配置
+  # Accuracy test configuration
   accuracy:
     datasets:
       - name: "gsm8k"
@@ -335,7 +335,7 @@ metadata:
         threshold_type: "relative"
 ```
 
-### 5.2 多数据集精度测试
+### 5.2 Multi-Dataset Accuracy Test
 
 ```yaml
 metadata:
@@ -343,7 +343,7 @@ metadata:
   precision: "fp4"
   supported_gpus: ["GB200", "GB300"]
   
-  # 精度测试配置（多数据集）
+  # Accuracy test configuration (multiple datasets)
   accuracy:
     datasets:
       - name: "gsm8k"
@@ -362,40 +362,40 @@ metadata:
         threshold_type: "absolute"
 ```
 
-### 5.3 自定义正则表达式（可选）
+### 5.3 Custom Regex Pattern (Optional)
 
-如果lm_eval输出格式特殊，可以覆盖默认的正则：
+If lm_eval output format is special, you can override the default regex:
 
 ```yaml
 benchmark:
   mode: "accuracy"
-  # 可选：覆盖默认的正则表达式
+  # Optional: override default regex pattern
   metrics:
-    extractor_pattern: r'\|(\w+)\|acc\|([0-9.]+)\|'  # 匹配表格格式
+    extractor_pattern: r'\|(\w+)\|acc\|([0-9.]+)\|'  # Match table format
 ```
 
-## 修改文件清单
+## File Modification Checklist
 
-1. `config_loader.py` - 添加DatasetThreshold和AccuracyConfig类，扩展TestConfig，修改_load_config_file和_get_metrics_config方法
-2. `report.py` - 添加AccuracyParser类（简化版，只解析benchmark.log）
-3. `executor.py` - 修改check_result和_check_job_result方法，添加分流逻辑
+1. `config_loader.py` - Add DatasetThreshold and AccuracyConfig classes, extend TestConfig, modify _load_config_file and _get_metrics_config methods
+2. `report.py` - Add AccuracyParser class (simplified version, only parses benchmark.log)
+3. `executor.py` - Modify check_result and _check_job_result methods, add routing logic
 
-## 设计要点
+## Design Key Points
 
-1. **统一日志文件**：所有输出都在benchmark.log中，简化文件管理
-2. **正则表达式灵活**：支持多种格式（`gsm8k: acc=0.85` 或 `|gsm8k|acc|0.85|`）
-3. **多数据集支持**：一次解析提取所有数据集的accuracy，按配置验证
-4. **关键字匹配**：通过数据集名称（gsm8k、mmlu等）匹配对应的阈值配置
-5. **清晰的输出**：每个数据集的验证结果独立显示，便于调试
+1. **Unified log file**: All outputs in benchmark.log, simplifying file management
+2. **Flexible regex**: Supports multiple formats (`gsm8k: acc=0.85` or `|gsm8k|acc|0.85|`)
+3. **Multi-dataset support**: Parse and extract all dataset accuracy in one pass, validate by configuration
+4. **Keyword matching**: Match corresponding threshold config by dataset name (gsm8k, mmlu, etc.)
+5. **Clear output**: Validation results for each dataset displayed independently for easy debugging
 
-## 实施待办
+## Implementation TODO
 
-- [ ] 在config_loader.py添加DatasetThreshold数据类
-- [ ] 在config_loader.py添加AccuracyConfig数据类（支持多数据集）
-- [ ] 更新DEFAULT_METRICS_CONFIG使用元组key方案，accuracy使用benchmark.log
-- [ ] 扩展TestConfig添加accuracy_config字段
-- [ ] 修改_load_config_file和_get_metrics_config方法，支持从YAML读取多数据集accuracy配置
-- [ ] 在report.py添加AccuracyParser类（从benchmark.log解析和验证）
-- [ ] 修改executor.py的check_result方法传递test_category和accuracy_config
-- [ ] 修改_check_job_result方法添加test_category分流逻辑，集成AccuracyParser
+- [ ] Add DatasetThreshold dataclass in config_loader.py
+- [ ] Add AccuracyConfig dataclass in config_loader.py (supporting multiple datasets)
+- [ ] Update DEFAULT_METRICS_CONFIG to use tuple key approach, accuracy uses benchmark.log
+- [ ] Extend TestConfig to add accuracy_config field
+- [ ] Modify _load_config_file and _get_metrics_config methods to support reading multi-dataset accuracy config from YAML
+- [ ] Add AccuracyParser class in report.py (parse and validate from benchmark.log)
+- [ ] Modify check_result method in executor.py to pass test_category and accuracy_config
+- [ ] Modify _check_job_result method to add test_category routing logic and integrate AccuracyParser
 

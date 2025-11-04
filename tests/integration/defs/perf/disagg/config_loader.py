@@ -13,9 +13,9 @@ from common import EnvManager, extract_config_fields
 @dataclass
 class MetricsConfig:
     """Metrics configuration"""
-    log_file: str                          # 日志文件名
-    extractor_pattern: str                 # 正则表达式
-    metric_names: List[str]                # 指标名称列表
+    log_file: str                          # Log file name
+    extractor_pattern: str                 # Regular expression
+    metric_names: List[str]                # Metric names list
     
     def merge(self, override: Optional[Dict]) -> 'MetricsConfig':
         """
@@ -38,7 +38,7 @@ class MetricsConfig:
 
 
 # ============================================================================
-# 默认 Metrics 配置
+# Default Metrics configuration
 # ============================================================================
 
 
@@ -50,7 +50,7 @@ COMMON_ACCURACY_METRICS_CONFIG = MetricsConfig(
 )
 
 DEFAULT_METRICS_CONFIG = {
-    # 性能测试默认配置
+    # Performance test default configuration
     ("disagg", "perf"): MetricsConfig(
         log_file="bench.log",
         extractor_pattern=r"""
@@ -85,7 +85,7 @@ DEFAULT_METRICS_CONFIG = {
         """,
         metric_names=[
             "WIDEEP_SERVER_MEAN_TTFT",
-            "WIDEEP_SERVER_TTFT",          # Median TTFT (保持和disagg一致的命名)
+            "WIDEEP_SERVER_TTFT",          # Median TTFT (keep the same name as disagg)
             "WIDEEP_SERVER_P99_TTFT",
             "WIDEEP_SERVER_MEAN_TPOT",
             "WIDEEP_SERVER_MEDIAN_TPOT",
@@ -94,11 +94,11 @@ DEFAULT_METRICS_CONFIG = {
             "WIDEEP_SERVER_MEDIAN_ITL",
             "WIDEEP_SERVER_P99_ITL",
             "WIDEEP_SERVER_MEAN_E2EL",
-            "WIDEEP_SERVER_E2EL",          # Median E2EL (保持和disagg一致的命名)
+            "WIDEEP_SERVER_E2EL",          # Median E2EL (keep the same name as disagg)
             "WIDEEP_SERVER_P99_E2EL"
         ]
     ),
-    # 精度测试默认配置
+    # Accuracy test default configuration
     ("disagg", "accuracy"): COMMON_ACCURACY_METRICS_CONFIG,
     ("widep", "accuracy"): COMMON_ACCURACY_METRICS_CONFIG,
 }
@@ -110,12 +110,12 @@ class TestConfig:
     config_path: str        # YAML file path
     test_id: str            # Auto-generated test ID
     test_type: str          # disagg, widep, etc.
-    model_name: str         # Model name (从 metadata 读取)
+    model_name: str         # Model name (read from metadata)
     test_category: str      # perf or accuracy
-    benchmark_type: str     # 1k1k, 8k1k, etc. (从 sequence 动态生成)
+    benchmark_type: str     # 1k1k, 8k1k, etc. (generated from sequence)
     config_data: dict       # Full YAML content
-    metrics_config: MetricsConfig  # Metrics 配置（默认或覆盖后的）
-    supported_gpus: List[str]  # 支持的 GPU 类型列表
+    metrics_config: MetricsConfig  # Metrics configuration (default or overridden)
+    supported_gpus: List[str]  # Supported GPU types list
     
     @property
     def display_name(self) -> str:
@@ -207,9 +207,9 @@ class ConfigLoader:
                     except Exception as e:
                         print(f"Warning: Failed to load {yaml_file}: {e}")
         
-        # 检查是否扫描到配置文件
+        # Check if any configuration files are found
         if len(configs) == 0:
-            # 构建详细的错误信息
+            # Build detailed error information
             filter_info = []
             if test_type:
                 filter_info.append(f"test_type='{test_type}'")
@@ -236,28 +236,28 @@ class ConfigLoader:
     
     def _make_test_id(self, test_type: str, test_category: str, test_file_name: str, config_data: dict) -> str:
         """
-        根据测试类型、测试类别、测试文件名和配置数据生成测试ID
+        Generate test ID based on test type, test category, test file name and configuration data
         
-        格式: {test_type}_{test_category}_{model_name}_{isl}k{osl}k_{dep_flag}{gen_tp_size}_bs{gen_batch_size}_mtp{mtp_size}
-        例如: disagg_perf_deepseek-r1-fp4_1k1k_dep32_bs32_mtp3
+        Format: {test_type}_{test_category}_{model_name}_{isl}k{osl}k_{dep_flag}{gen_tp_size}_bs{gen_batch_size}_mtp{mtp_size}
+        Example: disagg_perf_deepseek-r1-fp4_1k1k_dep32_bs32_mtp3
         
         Args:
-            test_type: 测试类型 (disagg, widep等)
-            test_category: 测试类别 (perf, accuracy)
-            test_file_name: 测试文件名（不含扩展名）
-            config_data: YAML配置数据
+            test_type: Test type (disagg, widep, etc.)
+            test_category: Test category (perf, accuracy)
+            test_file_name: Test file name (without extension)
+            config_data: YAML configuration data
         
         Returns:
-            生成的测试ID字符串
+            Generated test ID string
         """
-        # 提取配置字段
+        # Extract configuration fields
         fields = extract_config_fields(config_data)      
-        # 生成benchmark类型 (如 1k1k, 8k1k)
+        # Generate benchmark type (e.g., 1k1k, 8k1k)
         isl_k = fields['isl'] // 1024
         osl_k = fields['osl'] // 1024
         benchmark_type = f"{isl_k}k{osl_k}k"
         
-        # 生成测试ID
+        # Generate test ID
         test_id = (
             f"{test_type}_{test_category}_file:{test_file_name}_{benchmark_type}_"
             f"{fields['dep_flag']}:{fields['gen_tp_size']}_bs:{fields['gen_batch_size']}_"
@@ -344,24 +344,24 @@ class ConfigLoader:
         Returns:
             MetricsConfig (default or merged with overrides)
         """
-        # 获取默认配置
+        # Get default configuration
         config_key = (test_type, test_category)
         default_config = DEFAULT_METRICS_CONFIG.get(config_key)
         if not default_config:
-            # 如果没有默认配置，触发异常
+            # If no default configuration, trigger exception
             print(f"   ⚠️  No default metrics config for config_key: {config_key}")
             raise ValueError(f"No default metrics config for config_key: {config_key}")
         
-        # 检查 YAML 中是否有 metrics 覆盖
+        # Check if there are metrics overrides in YAML
         benchmark_config = config_data.get('benchmark', {})
         metrics_override = benchmark_config.get('metrics')
         
         if metrics_override:
-            # 有覆盖配置，合并
+            # There are metrics overrides, merge them
             print(f"   ⚙️  Using custom metrics config (overriding defaults)")
             return default_config.merge(metrics_override)
         else:
-            # 没有覆盖配置，使用默认
+            # No metrics overrides, use default
             print(f"   ⚙️  Using default metrics config for {test_category}")
             return default_config
     
