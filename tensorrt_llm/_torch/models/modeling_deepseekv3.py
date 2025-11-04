@@ -363,7 +363,8 @@ class DeepseekV3WeightLoader:
                                 [q_a_proj_scale, fused_a_scale], dim=0)
 
                         module.weight_scale.data.copy_(fused_a_scale)
-
+                    # For DeepseekV32 with fuse_a_indexer_k_weight=True: kv_a_proj_with_mqa is oversized
+                    # to include indexer weights, which is filled in post_load_weights.
                     module.weight.data[0:fused_a.shape[0]].copy_(fused_a)
                 elif names[-1] in params_map:
                     module_weights = []
@@ -383,10 +384,6 @@ class DeepseekV3WeightLoader:
                 elif names[-1] == "self_attn":
                     continue
                 elif names[-1] == "next_layer_layernorm":
-                    continue
-                elif names[-1] == "kv_a_proj_with_mqa_fused":
-                    # For DeepseekV32: skip loading for the fused module (kv_a_proj_with_mqa + indexer k/weights_proj)
-                    # it will be populated in post_load_weights instead
                     continue
                 else:
                     module_weights = filter_weights(name, weights)
