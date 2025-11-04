@@ -1,4 +1,19 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 #!/usr/bin/env python
+
+# yapf: disable
 import asyncio
 import signal
 import traceback
@@ -10,7 +25,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from prometheus_client import CollectorRegistry, make_asgi_app
+from prometheus_client import make_asgi_app
 
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
@@ -49,14 +64,18 @@ class RawRequestResponseHooks(ResponseHooks):
 
     def on_ctx_resp(self, ctx_server: str, response: UCompletionResponse):
         self.ctx_server = ctx_server
+        logger.debug(f"Received context response from {ctx_server} for request {response.choices[0].disaggregated_params.ctx_request_id}")
 
     def on_first_token(self, gen_server: str, request: UCompletionRequest, response: UCompletionResponse = None):
         self.gen_server = gen_server
         self.server_first_token_time = get_steady_clock_now_in_seconds()
+        logger.debug(f"Received first token from {gen_server} for request {request.disaggregated_params.ctx_request_id}")
 
     def on_resp_done(self, gen_server: str, request: UCompletionRequest, response: UCompletionResponse = None):
-        ctx_req_id = request.disaggregated_params.ctx_request_id
-        asyncio.create_task(self.perf_metrics_collector.add_per_request_metrics(self.ctx_server, gen_server, ctx_req_id, self.raw_req.state.server_arrival_time, self.server_first_token_time))
+        if request.disaggregated_params:
+            ctx_req_id = request.disaggregated_params.ctx_request_id
+            asyncio.create_task(self.perf_metrics_collector.add_per_request_metrics(self.ctx_server, gen_server, ctx_req_id, self.raw_req.state.server_arrival_time, self.server_first_token_time))
+            logger.debug(f"Request {ctx_req_id} completed")
 
 
 class OpenAIDisaggServer:
@@ -81,7 +100,14 @@ class OpenAIDisaggServer:
 
         self._disagg_cluster_storage = create_cluster_storage(config.disagg_cluster_config.cluster_uri, config.disagg_cluster_config.cluster_name) if config.disagg_cluster_config else None
 
-        self._service = OpenAIDisaggregatedService(self._config, self._ctx_router, self._gen_router, self._create_client, self._metadata_server, self._req_timeout_secs, self._server_start_timeout_secs, self._perf_metrics_collector, self._disagg_cluster_storage)
+        self._service = OpenAIDisaggregatedService(
+            self._config, self._ctx_router, self._gen_router, self._create_client,
+            metadata_server=self._metadata_server,
+            metadata_config=self._metadata_server_cfg,
+            req_timeout_secs=self._req_timeout_secs,
+            server_start_timeout_secs=self._server_start_timeout_secs,
+            perf_metrics_collector=self._perf_metrics_collector,
+            disagg_cluster_storage=self._disagg_cluster_storage)
 
         try:
             otlp_cfg = config.otlp_config
@@ -123,9 +149,7 @@ class OpenAIDisaggServer:
         self.app.add_api_route("/cluster_info", self.cluster_info, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
         self.app.add_api_route("/perf_metrics", self._perf_metrics_collector.get_perf_metrics, methods=["GET"])
-        registry = CollectorRegistry()
-        metrics_app = make_asgi_app(registry=registry)
-        self.app.mount("/prometheus/metrics", metrics_app)
+        self.app.mount("/prometheus/metrics", make_asgi_app())
         if self._disagg_cluster_storage and isinstance(self._disagg_cluster_storage, HttpClusterStorageServer):
             self._disagg_cluster_storage.add_routes(self.app)
 

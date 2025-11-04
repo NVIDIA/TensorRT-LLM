@@ -1,7 +1,22 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # yapf: disable
 import asyncio
+import traceback
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Type
 
 import aiohttp
 
@@ -16,8 +31,8 @@ from tensorrt_llm.serve.openai_protocol import (
 )
 from tensorrt_llm.serve.perf_metrics import ClientMetricsCollector, DisaggPerfMetricsCollector
 from tensorrt_llm.serve.responses_utils import (
-    CompletionResponseGenerator,
     ResponseHooks,
+    UCompletionResponseOrGenerator,
     get_steady_clock_now_in_seconds,
 )
 from tensorrt_llm.serve.router import Router
@@ -28,7 +43,7 @@ from tensorrt_llm.serve.router import Router
 class OpenAIClient(ABC):
     async def send_request(
         self, server: str, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
-    ) -> Union[UCompletionResponse, CompletionResponseGenerator]:
+    ) -> UCompletionResponseOrGenerator:
         if isinstance(request, CompletionRequest):
             return await self._send_request(
                 server, "v1/completions", request, CompletionResponse, hooks
@@ -48,8 +63,9 @@ class OpenAIClient(ABC):
         request: UCompletionRequest,
         response_type: Type[UCompletionResponse],
         hooks: Optional[ResponseHooks] = None,
-    ) -> Union[UCompletionResponse, CompletionResponseGenerator]:
-        """Send a request to the server and return the response and the body iterator.
+    ) -> UCompletionResponseOrGenerator:
+        """Send a request to the server and return the response and the body generator.
+
         The request is finished (in routers) when the generator is exhausted or there is an error.
         """
         ...
@@ -59,7 +75,7 @@ class OpenAIClient(ABC):
 
     @abstractmethod
     async def check_ready(self) -> Tuple[List[str], List[str]]:
-        """Return the list of ready servers and the list of unready servers"""
+        """Return the list of ready servers and the list of unready servers."""
         ...
 
     async def shutdown(self) -> None: ...
@@ -97,10 +113,13 @@ class OpenAIHttpClient(OpenAIClient):
         request: UCompletionRequest,
         response_type: Type[UCompletionResponse],
         hooks: Optional[ResponseHooks] = None,
-    ) -> Union[UCompletionResponse, CompletionResponseGenerator]:
+    ) -> UCompletionResponseOrGenerator:
         if len(server) == 0:
             server, _ = await self._router.get_next_server(request)
         url = f"http://{server}/{endpoint}"
+        logger.debug(
+            f"Sending {self._client_type} request {request.disaggregated_params.ctx_request_id} to {url}"
+        )
         try:
             self._metrics_collector.inc("total_requests")
             resp_generator = self._post_with_retry(server, url, request, hooks)
@@ -108,17 +127,18 @@ class OpenAIHttpClient(OpenAIClient):
                 return resp_generator
             else:
                 # consume the generator to get the response and return it directly when it's not streaming
-                resp_json = await anext(resp_generator)
-                response = response_type(**resp_json)
-                if hooks:
-                    if self._client_type == "ctx":
-                        hooks.on_ctx_resp(server, response)
-                    hooks.on_first_token(server, request)
-                    hooks.on_resp_done(server, request, response)
+                response = None
+                async for resp_json in resp_generator:
+                    response = response_type(**resp_json)
+                    if hooks:
+                        if self._client_type == "ctx":
+                            hooks.on_ctx_resp(server, response)
+                        else:
+                            hooks.on_first_token(server, request)
+                            hooks.on_resp_done(server, request, response)
                 return response
         except Exception:
             self._metrics_collector.inc("error_requests")
-            await self._finish_request(request)
             raise
 
     async def _post_with_retry(
@@ -127,7 +147,7 @@ class OpenAIHttpClient(OpenAIClient):
         url: str,
         request: UCompletionRequest,
         hooks: Optional[ResponseHooks] = None,
-    ) -> Tuple[aiohttp.ClientResponse, Dict[str, Any]]:
+    ) -> AsyncGenerator[Any, None]:
         json_data = request.model_dump(exclude_unset=True)
         is_stream = request.stream
         for attempt in range(self._max_retries + 1):
@@ -149,22 +169,31 @@ class OpenAIHttpClient(OpenAIClient):
                     else:
                         http_response.raise_for_status()
                         response_dict = await http_response.json()
-                        # do yield here until python allows return statements in async generators
+                        # yield here since python forbids return statements in async generators
                         yield response_dict
+                break  # break and skip retries if the whole response is processed without exception
             except (aiohttp.ClientError, OSError) as e:
                 if attempt == self._max_retries:
+                    logger.error(
+                        f"{self._client_type} client error to {url}: {e} - last retry {attempt} of {self._max_retries}"
+                        "failed",
+                        traceback.format_exc(),
+                    )
                     raise
-                import traceback
 
                 logger.error(
-                    f"Client error: {e} - retry {attempt} of {self._max_retries}",
+                    f"{self._client_type} client error to {url}: {e} - retry {attempt} of {self._max_retries}",
                     traceback.format_exc(),
                 )
                 await asyncio.sleep(self._retry_interval)
                 self._metrics_collector.inc("retry_requests")
             except Exception as e:
-                logger.error(f"Error encountered while processing request to {url}: {e}")
+                logger.error(
+                    f"Unexpected error while processing {self._client_type} request to {url}: {e}"
+                )
                 raise
+            finally:
+                await self._finish_request(request)
 
     async def _response_generator(
         self,
@@ -173,7 +202,7 @@ class OpenAIHttpClient(OpenAIClient):
         start_time: float,
         hooks: Optional[ResponseHooks] = None,
         server: str = "",
-    ) -> CompletionResponseGenerator:
+    ) -> AsyncGenerator[Any, None]:
         assert request.stream, "Request is not streaming"
         assert "text/event-stream" in http_response.headers.get("Content-Type", ""), (
             "Response is not streaming"

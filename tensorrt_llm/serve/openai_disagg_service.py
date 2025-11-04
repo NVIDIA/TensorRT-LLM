@@ -1,12 +1,27 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import copy
 import os
-from typing import Any, Callable, Dict, Optional, Union
+from typing import Any, Callable, Dict, Optional
 
 from tensorrt_llm.llmapi.disagg_utils import (
     ConditionalDisaggConfig,
     DisaggClusterConfig,
     DisaggServerConfig,
+    MetadataServerConfig,
     ServerRole,
 )
 from tensorrt_llm.logger import logger
@@ -24,8 +39,8 @@ from tensorrt_llm.serve.openai_protocol import (
 from tensorrt_llm.serve.openai_service import OpenAIService
 from tensorrt_llm.serve.perf_metrics import DisaggPerfMetricsCollector
 from tensorrt_llm.serve.responses_utils import (
-    CompletionResponseGenerator,
     ResponseHooks,
+    UCompletionResponseOrGenerator,
     done_generator,
 )
 from tensorrt_llm.serve.router import KvCacheAwareRouter, Router
@@ -37,8 +52,9 @@ class OpenAIDisaggregatedService(OpenAIService):
         config: DisaggServerConfig,
         ctx_router: Router,
         gen_router: Router,
-        client_factory: Callable[[Router, str], OpenAIClient] = None,
+        client_factory: Callable[[Router, str], OpenAIClient],
         metadata_server: Optional[JsonDictionary] = None,
+        metadata_config: Optional[MetadataServerConfig] = None,
         req_timeout_secs: int = 180,
         server_start_timeout_secs: int = 180,
         perf_metrics_collector: Optional[DisaggPerfMetricsCollector] = None,
@@ -49,6 +65,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         self._gen_router = gen_router
         self._client_factory = client_factory
         self._metadata_server = metadata_server
+        self._metadata_config = metadata_config
         self._req_timeout_secs = req_timeout_secs
         self._server_start_timeout_secs = server_start_timeout_secs
         self._perf_metrics_collector = perf_metrics_collector
@@ -60,7 +77,7 @@ class OpenAIDisaggregatedService(OpenAIService):
 
     async def openai_completion(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
-    ) -> Union[UCompletionResponse, CompletionResponseGenerator]:
+    ) -> UCompletionResponseOrGenerator:
         if not await self.is_ready():
             raise RuntimeError("Cluster is not ready")
         if not isinstance(request.prompt, str):
@@ -78,19 +95,14 @@ class OpenAIDisaggregatedService(OpenAIService):
 
     async def openai_chat_completion(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
-    ) -> Union[UCompletionResponse, CompletionResponseGenerator]:
+    ) -> UCompletionResponseOrGenerator:
         if not await self.is_ready():
             raise RuntimeError("Cluster is not ready")
         return await self._send_disagg_request(request, hooks)
 
     async def _send_disagg_request(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
-    ) -> Union[UCompletionResponse, CompletionResponseGenerator]:
-        """This is the main disaggregated serving logic:
-        1. send context request to the context server if ctx is needed, return the context response if gen is not needed
-        2. build a generation request based on the context response and send it to the generation server if gen is needed,
-         return the generation response
-        """
+    ) -> UCompletionResponseOrGenerator:
         if hooks:
             hooks.on_req_begin(request)
         # empty server means client decides which server to use
@@ -104,7 +116,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         if need_ctx:
             ctx_req = self._get_ctx_request(request)
             # ctx generator is empty
-            ctx_response = await self._ctx_client.send_request(ctx_server, ctx_req)
+            ctx_response = await self._ctx_client.send_request(ctx_server, ctx_req, hooks)
             await self._verify_ctx_response(ctx_response)
             gen_req = self._get_gen_request(request, ctx_response)
         if ctx_response is None or self._need_gen(ctx_response):
@@ -206,13 +218,13 @@ class OpenAIDisaggregatedService(OpenAIService):
             await self._disagg_cluster_manager.watch_workers(on_event=self._on_worker_event)
             logger.info("Disagg cluster manager started")
         else:
-            if self._metadata_server:
+            if self._metadata_server and self._metadata_config:
                 logger.info("Starting server monitoring via metadata service")
                 await self._ctx_router.start_server_monitoring(
-                    self.metadata_server.refresh_interval
+                    self._metadata_config.refresh_interval
                 )
                 await self._gen_router.start_server_monitoring(
-                    self.metadata_server.refresh_interval
+                    self._metadata_config.refresh_interval
                 )
             await self._wait_for_servers_ready()
 
@@ -274,11 +286,15 @@ class OpenAIDisaggregatedService(OpenAIService):
 # FIXME: This is a demo to show the basic idea of disagg-service with pre-allocating generation
 class OpenAIDisaggregatedPreAllocService(OpenAIDisaggregatedService):
     def _need_gen(self, request: UCompletionRequest) -> bool:
-        return request.max_tokens > 1
+        if isinstance(request, CompletionRequest) and request.max_tokens is not None:
+            return request.max_tokens > 1
+        if isinstance(request, ChatCompletionRequest) and request.max_completion_tokens is not None:
+            return request.max_completion_tokens > 1
+        return False
 
     async def _send_disagg_request(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
-    ) -> Union[UCompletionResponse, CompletionResponseGenerator]:
+    ) -> UCompletionResponseOrGenerator:
         if hooks:
             hooks.on_req_begin(request)
         # empty server means client decides which server to use
@@ -290,23 +306,24 @@ class OpenAIDisaggregatedPreAllocService(OpenAIDisaggregatedService):
         need_gen = self._need_gen(request)
         # send ctx and gen requests in parallel
         assert need_gen or need_ctx, "Neither generation nor context is required"
-        with asyncio.TaskGroup() as tg:
-            if need_ctx:
+        gen_task = None
+        ctx_task = None
+        tasks = []
 
-                async def _run_ctx_task():
-                    # send ctx request and gen request in parallel
-                    ctx_req = self._get_ctx_request(request)
-                    ctx_response = await self._ctx_client.send_completion_request(
-                        ctx_server, ctx_req
-                    )
-                    return ctx_response
+        async def _run_ctx_task():
+            # send ctx request and gen request in parallel
+            ctx_req = self._get_ctx_request(request)
+            ctx_response = await self._ctx_client.send_request(ctx_server, ctx_req, hooks)
+            return ctx_response
 
-                ctx_task = tg.create_task(_run_ctx_task())
-            if need_gen:
-                gen_task = tg.create_task(
-                    self._gen_client.send_completion_request(gen_server, request, hooks)
-                )
+        if need_ctx:
+            ctx_task = asyncio.create_task(_run_ctx_task())
+        if need_gen:
+            gen_task = asyncio.create_task(
+                self._gen_client.send_request(gen_server, request, hooks)
+            )
+            tasks.append(gen_task)
+        await asyncio.gather(*tasks)
         if need_gen:
             return gen_task.result()
-        else:
-            return ctx_task.result()
+        return ctx_task.result()
