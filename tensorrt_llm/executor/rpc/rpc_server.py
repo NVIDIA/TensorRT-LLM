@@ -1,15 +1,12 @@
 import asyncio
 import inspect
-import queue
 import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from typing import List, Optional
 
-import zmq
-
-from ...llmapi.utils import ManagedThread, logger_debug
+from ...llmapi.utils import logger_debug
 from ...logger import logger
 from ..ipc import ZeroMqQueue
 from .rpc_common import (RPCCancelled, RPCError, RPCRequest, RPCResponse,
@@ -46,7 +43,14 @@ class RPCServer:
         self._timeout = timeout
         self._client_socket = None
 
-        # set the stop event to True, and all the workers will exit
+        # Asyncio components
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._main_task: Optional[asyncio.Task] = None
+        self._worker_tasks: List[asyncio.Task] = []
+        self._shutdown_event: Optional[asyncio.Event] = None
+        self._server_thread: Optional[threading.Thread] = None
+
+        # Threading stop event for compatibility
         self._stop_event = threading.Event()
 
         self._num_pending_requests = 0
@@ -55,7 +59,7 @@ class RPCServer:
             "_rpc_shutdown": lambda: self.shutdown(is_remote_call=True),
             "_rpc_get_attr": lambda name: self.get_attr(name),
         }
-        self._dispatcher_thread: Optional[ManagedThread] = None
+
         if async_run_task:
             # Increase thread pool size to avoid exhaustion with concurrent operations
             # Use 2x num_workers to handle both request processing and response handling
@@ -64,8 +68,6 @@ class RPCServer:
                 thread_name_prefix="rpc_server_worker")
         else:
             self._executor = None
-
-        self._queue = None
 
         # Automatically register the instance
         self.register_instance(instance)
@@ -124,33 +126,35 @@ class RPCServer:
             f"RPC Server shutdown: {self._num_pending_requests} pending requests will be cancelled"
         )
 
-        # Clear the queue and send cancelled errors for all pending requests
-        if self._queue is not None:
-            self._cancel_pending_queue_requests()
+        # Signal asyncio shutdown event if available
+        if self._shutdown_event and self._loop:
+            self._loop.call_soon_threadsafe(self._shutdown_event.set)
 
         if not is_remote_call:
             # Block the thread until shutdown is finished
 
-            # 1. Wait for the dispatcher thread to exit, so that no new requests are accepted
-            logger_debug(f"RPC Server dispatcher thread joining")
-            if self._dispatcher_thread:
-                self._dispatcher_thread.join()
-                self._dispatcher_thread = None
-            logger_debug(f"RPC Server dispatcher thread joined")
+            # 1. Stop the event loop which will cancel all tasks
+            if self._loop and self._loop.is_running():
+                self._loop.call_soon_threadsafe(self._loop.stop)
 
-            # 2. Shutdown the executor immediately without waiting for tasks
+            # 2. Wait for the server thread to exit
+            if self._server_thread and self._server_thread.is_alive():
+                logger_debug("RPC Server waiting for server thread to exit")
+                self._server_thread.join()
+                self._server_thread = None
+            logger_debug("RPC Server thread joined")
+
+            # 3. Shutdown the executor immediately without waiting for tasks
             if self._executor:
                 self._executor.shutdown(wait=False)
                 self._executor = None
 
-            # 3. (Optionally) Close the client socket, this doesn't affect
-            # anything since zmq client will not timeout even if the target is not available
+            # 4. Close the client socket
             if self._client_socket:
                 self._client_socket.close()
         else:
             # if the shutdown is called by a remote call, this method itself will
-            # be executed in a executor thread, so we cannot join the dispatcher thread as
-            # the dispatcher thread is awaiting for the shutdown result.
+            # be executed in a executor thread, so we cannot join the server thread
             logger_debug(
                 f"RPC Server shutdown initiated: {self._num_pending_requests} pending requests will be cancelled"
             )
@@ -179,69 +183,66 @@ class RPCServer:
         This is mainly used for testing. """
         return getattr(self, name)
 
-    def _cancel_pending_queue_requests(self):
-        """Cancel all pending requests in the queue."""
+    async def _drain_pending_requests(self):
+        """Drain any remaining requests from the socket and send cancellation responses."""
+        if self._client_socket is None:
+            return
 
-        async def cancel_requests():
-            cancelled_count = 0
-            while not self._queue.empty():
-                try:
-                    req: RPCRequest = self._queue.get_nowait()
-                    cancelled_count += 1
-                    await self._send_error_response(
-                        req,
-                        RPCCancelled(
-                            "Server is shutting down, request cancelled"))
-                except asyncio.QueueEmpty:
-                    break
-                except Exception as e:
-                    logger.error(f"Error cancelling pending request: {e}")
+        logger_debug("Draining pending requests after shutdown")
+        drained_count = 0
 
-            if cancelled_count > 0:
-                logger_debug(
-                    f"Cancelled {cancelled_count} pending requests in queue")
+        # Give a short window to drain any in-flight requests
+        end_time = asyncio.get_event_loop().time() + 2
 
-        # Run the cancellation in the event loop if available
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # Schedule the coroutine to run in the existing event loop
-                asyncio.create_task(cancel_requests())
-            else:
-                # Create a new event loop to run the coroutine
-                asyncio.run(cancel_requests())
-        except RuntimeError:
-            # Event loop might not be available in some shutdown scenarios
-            pass
-
-    async def _dispatcher_routine(self, stop_event: threading.Event):
-        assert self._client_socket is not None, "Client socket is not bound"
-        assert self._queue is not None, "RPC queue is not initialized"
-
-        # Once shutdown, the dispatcher will exit first, and the workers will
-        # continue to process the pending requests.
-        while not stop_event.is_set():
+        while asyncio.get_event_loop().time() < end_time:
             try:
-                req: RPCRequest = await self._client_socket.get_async_noblock(
-                    timeout=0.5)
-                logger_debug(f"RPC dispatcher got request: {req}")
+                req: RPCRequest = await asyncio.wait_for(
+                    self._client_socket.get_async_noblock(), timeout=0.1)
+                drained_count += 1
+                logger_debug(f"Draining request after shutdown: {req}")
+
+                # Send cancellation response
+                await self._send_error_response(
+                    req,
+                    RPCCancelled("Server is shutting down, request cancelled"))
+
             except asyncio.TimeoutError:
-                await asyncio.sleep(0)
-                continue
+                # No more requests to drain
+                break
             except Exception as e:
-                logger.error(f"RPC dispatcher caught an exception: {e}")
-                logger.error(traceback.format_exc())
-                continue
+                logger.debug(f"Error draining request: {e}")
+                break
 
-            await self._queue.put(req)  # type: ignore
+        if drained_count > 0:
+            logger_debug(f"Drained {drained_count} requests after shutdown")
 
-            # shutdown methods depend on _num_pending_requests, so
-            # they should not be counted
-            if req.method_name not in ["_rpc_shutdown", "shutdown"]:
-                self._num_pending_requests += 1
-                logger_debug(
-                    f"Dispatcher received request {req}, pending: {self._num_pending_requests}"
-                )
+    async def _run_server(self):
+        """Main server loop that handles incoming requests directly."""
+        assert self._client_socket is not None, "Client socket is not bound"
+
+        logger_debug("RPC Server main loop started")
+
+        # Create worker tasks
+        for i in range(self._num_workers):
+            task = asyncio.create_task(self._process_requests())
+            self._worker_tasks.append(task)
+
+        try:
+            # Wait for all worker tasks to complete
+            await asyncio.gather(*self._worker_tasks)
+        except asyncio.CancelledError:
+            logger_debug("RPC Server main loop cancelled")
+            # Cancel all worker tasks
+            for task in self._worker_tasks:
+                if not task.done():
+                    task.cancel()
+            # Wait for all tasks to finish cancellation
+            await asyncio.gather(*self._worker_tasks, return_exceptions=True)
+        except Exception as e:
+            logger.error(f"RPC Server main loop error: {e}")
+            logger.error(traceback.format_exc())
+        finally:
+            logger_debug("RPC Server main loop exiting")
 
     # TODO optimization: resolve the sequential scheduling for the remote calls
     # Suppose tons of submit remote call block the FIFO queue, and the later get_stats remote calls may be blocked
@@ -272,7 +273,7 @@ class RPCServer:
 
     async def _handle_shutdown_request(self, req: RPCRequest) -> bool:
         """Handle a request during shutdown. Returns True if handled."""
-        if not self._stop_event.is_set():
+        if not self._shutdown_event.is_set():
             return False
 
         # Allow shutdown methods to proceed
@@ -287,19 +288,35 @@ class RPCServer:
         self._num_pending_requests -= 1
         return True
 
-    async def _worker_routine(self, stop_event: threading.Event):
-        """The routine executed by each worker thread."""
+    async def _process_requests(self):
+        """Process incoming requests directly from the socket."""
         assert self._client_socket is not None, "Client socket is not bound"
-        assert self._queue is not None, "RPC queue is not initialized"
 
-        while not stop_event.is_set():
+        while not self._shutdown_event.is_set():
             try:
+                # Read request directly from socket with timeout
                 req: RPCRequest = await asyncio.wait_for(
-                    self._queue.get(),  # type: ignore
-                    timeout=self._timeout)
+                    self._client_socket.get_async_noblock(), timeout=0.5)
+                logger_debug(f"RPC worker got request: {req}")
             except asyncio.TimeoutError:
-                await asyncio.sleep(0)
                 continue
+            except asyncio.CancelledError:
+                logger_debug("RPC worker cancelled")
+                break
+            except Exception as e:
+                if self._shutdown_event.is_set():
+                    break
+                logger.error(f"RPC worker caught an exception: {e}")
+                logger.error(traceback.format_exc())
+                continue
+
+            # shutdown methods depend on _num_pending_requests, so
+            # they should not be counted
+            if req.method_name not in ["_rpc_shutdown", "shutdown"]:
+                self._num_pending_requests += 1
+                logger_debug(
+                    f"Worker received request {req}, pending: {self._num_pending_requests}"
+                )
 
             # Check if we should cancel due to shutdown
             if await self._handle_shutdown_request(req):
@@ -464,7 +481,7 @@ class RPCServer:
                     nonlocal sequence_number
                     async for result in func(*req.args, **req.kwargs):
                         # Check if shutdown was triggered
-                        if self._stop_event.is_set():
+                        if self._shutdown_event.is_set():
                             raise RPCCancelled(
                                 "Server is shutting down, streaming cancelled")
 
@@ -485,7 +502,7 @@ class RPCServer:
                 # No timeout specified, stream normally
                 async for result in func(*req.args, **req.kwargs):
                     # Check if shutdown was triggered
-                    if self._stop_event.is_set():
+                    if self._shutdown_event.is_set():
                         raise RPCCancelled(
                             "Server is shutting down, streaming cancelled")
 
@@ -571,24 +588,60 @@ class RPCServer:
         self._client_socket.setup_lazily()
         logger.info(f"RPC Server started and listening on {self._address}")
 
-        async def tasks():
-            self._queue = asyncio.Queue()
-            await asyncio.gather(
-                self._dispatcher_routine(self._stop_event), *[
-                    self._worker_routine(self._stop_event)
-                    for i in range(self._num_workers)
-                ])
+        # Create and configure the event loop
+        self._loop = asyncio.new_event_loop()
 
-        def loop() -> bool:
-            asyncio.run(tasks())
-            return True  # ManagedThread
+        # Initialize the shutdown event in the new loop
+        self._shutdown_event = asyncio.Event()
 
-        error_queue = queue.Queue()
-        self._dispatcher_thread = ManagedThread(task=loop,
-                                                stop_event=self._stop_event,
-                                                name="rpc_dispatcher_thread",
-                                                error_queue=error_queue)
-        self._dispatcher_thread.start()
+        async def run_server():
+            """Run the server until shutdown."""
+            try:
+                await self._run_server()
+            except asyncio.CancelledError:
+                logger_debug("Server task cancelled")
+            except Exception as e:
+                logger.error(f"Server error: {e}")
+                logger.error(traceback.format_exc())
+            finally:
+                # Cancel all worker tasks
+                for task in self._worker_tasks:
+                    if not task.done():
+                        task.cancel()
+                # Wait for all tasks to complete
+                if self._worker_tasks:
+                    await asyncio.gather(*self._worker_tasks,
+                                         return_exceptions=True)
+
+                # Drain any remaining requests and send cancellation responses
+                await self._drain_pending_requests()
+
+                logger_debug("All server tasks completed")
+
+        # Create the main server task
+        self._main_task = self._loop.create_task(run_server())
+
+        # Run the event loop in a separate thread
+        def run_loop():
+            asyncio.set_event_loop(self._loop)
+            try:
+                self._loop.run_until_complete(self._main_task)
+            except Exception as e:
+                logger.error(f"Event loop error: {e}")
+            finally:
+                # Clean up any remaining tasks
+                pending = asyncio.all_tasks(self._loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    self._loop.run_until_complete(
+                        asyncio.gather(*pending, return_exceptions=True))
+                self._loop.close()
+
+        self._server_thread = threading.Thread(target=run_loop,
+                                               name="rpc_server_thread",
+                                               daemon=True)
+        self._server_thread.start()
 
         logger.info("RPC Server has started.")
 
