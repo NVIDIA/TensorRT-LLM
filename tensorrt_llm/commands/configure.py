@@ -29,16 +29,24 @@ def format_env_vars(env: Dict[str, str]) -> str:
     return " ".join(f"{k}={v}" for k, v in env.items())
 
 
-def generate_bench_command(recipe_path: str) -> str:
+def generate_bench_command(recipe_path: str, model: str) -> str:
     """Generate the trtllm-bench command line.
 
     Args:
         recipe_path: Path to the recipe YAML file
+        model: Model name from the scenario
 
     Returns:
-        Formatted trtllm-bench command
+        Formatted trtllm-bench command template
     """
-    return f"trtllm-bench --recipe {recipe_path}"
+    return (
+        f"# For throughput benchmarking:\n"
+        f"trtllm-bench --model {model} throughput --extra_llm_api_options {recipe_path}\n\n"
+        f"# For latency benchmarking:\n"
+        f"trtllm-bench --model {model} latency --extra_llm_api_options {recipe_path}\n\n"
+        f"# For building only:\n"
+        f"trtllm-bench --model {model} build --extra_llm_api_options {recipe_path}"
+    )
 
 
 def print_result(
@@ -93,7 +101,7 @@ def print_result(
     click.echo(click.style("To run benchmarks with this recipe, use:", fg="yellow", bold=True))
     click.echo()
 
-    bench_cmd = generate_bench_command(output_path)
+    bench_cmd = generate_bench_command(output_path, scenario.get("model", "<model>"))
     click.echo(bench_cmd)
     click.echo()
 

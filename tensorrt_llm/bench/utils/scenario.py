@@ -15,8 +15,7 @@ import yaml
 from tensorrt_llm.logger import logger
 
 
-def extract_scenario_from_recipe(
-        recipe_path: Optional[str]) -> Optional[Dict[str, Any]]:
+def extract_scenario_from_recipe(recipe_path: Optional[str]) -> Optional[Dict[str, Any]]:
     """Extract scenario section from a recipe YAML file.
 
     Args:
@@ -28,21 +27,23 @@ def extract_scenario_from_recipe(
 
     Example:
         >>> scenario = extract_scenario_from_recipe("recipe.yaml")
-        >>> print(scenario['target_isl'])
+        >>> print(scenario["target_isl"])
         8192
     """
     if recipe_path is None:
         return None
 
     try:
-        with open(recipe_path, 'r') as f:
+        with open(recipe_path, "r") as f:
             loaded_data = yaml.safe_load(f)
 
         # Check if this is a recipe format (has 'scenario' and 'llm_api_config' keys)
-        if isinstance(
-                loaded_data, dict
-        ) and 'scenario' in loaded_data and 'llm_api_config' in loaded_data:
-            return loaded_data['scenario']
+        if (
+            isinstance(loaded_data, dict)
+            and "scenario" in loaded_data
+            and "llm_api_config" in loaded_data
+        ):
+            return loaded_data["scenario"]
 
         return None
     except (FileNotFoundError, yaml.YAMLError, KeyError):
@@ -50,9 +51,10 @@ def extract_scenario_from_recipe(
 
 
 def merge_params_with_priority(
-        cli_params: Dict[str, Any],
-        scenario: Optional[Dict[str, Any]],
-        cli_defaults: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    cli_params: Dict[str, Any],
+    scenario: Optional[Dict[str, Any]],
+    cli_defaults: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """Merge CLI parameters with scenario values, with CLI taking precedence.
 
     Priority order (highest to lowest):
@@ -69,14 +71,14 @@ def merge_params_with_priority(
         Merged parameter dictionary
 
     Example:
-        >>> cli = {'concurrency': 128, 'model': None}
-        >>> scenario = {'target_concurrency': 256, 'model': 'gpt-3'}
-        >>> defaults = {'concurrency': -1, 'model': None}
+        >>> cli = {"concurrency": 128, "tp": 1}
+        >>> scenario = {"target_concurrency": 256, "tp_size": 4}
+        >>> defaults = {"concurrency": -1, "tp": 1}
         >>> merged = merge_params_with_priority(cli, scenario, defaults)
-        >>> print(merged['concurrency'])  # CLI explicitly set
+        >>> print(merged["concurrency"])  # CLI explicitly set
         128
-        >>> print(merged['model'])  # From scenario
-        'gpt-3'
+        >>> print(merged["tp"])  # From scenario (tp_size -> tp)
+        4
     """
     if scenario is None:
         return cli_params.copy()
@@ -86,14 +88,14 @@ def merge_params_with_priority(
     # Mapping from scenario keys to CLI parameter keys
     # Note: 'model' is excluded because it's a required top-level trtllm-bench parameter
     param_mapping = {
-        'target_concurrency': 'concurrency',
-        'target_isl': 'target_input_len',
-        'target_osl': 'target_output_len',
-        'num_requests': 'num_requests',
-        'tp_size': 'tp',
-        'ep_size': 'ep',
-        'pp_size': 'pp',
-        'streaming': 'streaming',
+        "target_concurrency": "concurrency",
+        "target_isl": "target_input_len",
+        "target_osl": "target_output_len",
+        "num_requests": "num_requests",
+        "tp_size": "tp",
+        "ep_size": "ep",
+        "pp_size": "pp",
+        "streaming": "streaming",
     }
 
     for scenario_key, cli_key in param_mapping.items():
@@ -107,8 +109,7 @@ def merge_params_with_priority(
             # Use scenario value if:
             # 1. CLI value is None/not set, OR
             # 2. CLI value equals the default (not explicitly set by user)
-            if cli_value is None or (default_value is not None
-                                     and cli_value == default_value):
+            if cli_value is None or (default_value is not None and cli_value == default_value):
                 merged[cli_key] = scenario_value
 
     return merged
@@ -123,9 +124,7 @@ def validate_scenario_params(scenario: Dict[str, Any]) -> None:
     Raises:
         ValueError: If scenario parameters are invalid
     """
-    required_fields = [
-        'model', 'target_isl', 'target_osl', 'target_concurrency'
-    ]
+    required_fields = ["target_isl", "target_osl", "target_concurrency"]
 
     # Check required fields
     for field in required_fields:
@@ -133,41 +132,35 @@ def validate_scenario_params(scenario: Dict[str, Any]) -> None:
             raise ValueError(f"Scenario missing required field: {field}")
 
     # Validate numeric fields
-    if scenario['target_isl'] <= 0:
-        raise ValueError(
-            f"target_isl must be positive, got: {scenario['target_isl']}")
+    if scenario["target_isl"] <= 0:
+        raise ValueError(f"target_isl must be positive, got: {scenario['target_isl']}")
 
-    if scenario['target_osl'] <= 0:
-        raise ValueError(
-            f"target_osl must be positive, got: {scenario['target_osl']}")
+    if scenario["target_osl"] <= 0:
+        raise ValueError(f"target_osl must be positive, got: {scenario['target_osl']}")
 
-    if scenario['target_concurrency'] <= 0:
+    if scenario["target_concurrency"] <= 0:
         raise ValueError(
             f"target_concurrency must be positive, got: {scenario['target_concurrency']}"
         )
 
     # Validate optional stdev fields
-    if 'isl_stdev' in scenario:
-        if scenario['isl_stdev'] < 0:
-            raise ValueError(
-                f"isl_stdev must be non-negative, got: {scenario['isl_stdev']}")
+    if "isl_stdev" in scenario:
+        if scenario["isl_stdev"] < 0:
+            raise ValueError(f"isl_stdev must be non-negative, got: {scenario['isl_stdev']}")
 
-    if 'osl_stdev' in scenario:
-        if scenario['osl_stdev'] < 0:
-            raise ValueError(
-                f"osl_stdev must be non-negative, got: {scenario['osl_stdev']}")
+    if "osl_stdev" in scenario:
+        if scenario["osl_stdev"] < 0:
+            raise ValueError(f"osl_stdev must be non-negative, got: {scenario['osl_stdev']}")
 
     # Validate num_requests
-    if 'num_requests' in scenario:
-        if scenario['num_requests'] <= 0:
-            raise ValueError(
-                f"num_requests must be positive, got: {scenario['num_requests']}"
-            )
+    if "num_requests" in scenario:
+        if scenario["num_requests"] <= 0:
+            raise ValueError(f"num_requests must be positive, got: {scenario['num_requests']}")
 
 
 def prepare_llm_api_config_for_recipe(
-        extra_llm_api_options_path: Optional[str],
-        scenario: Optional[Dict[str, Any]]) -> Optional[str]:
+    extra_llm_api_options_path: Optional[str], scenario: Optional[Dict[str, Any]]
+) -> Optional[str]:
     """Prepare llm_api_config for LLM constructor when using recipe format.
 
     When a recipe format is detected (scenario is not None), this function extracts
@@ -196,25 +189,21 @@ def prepare_llm_api_config_for_recipe(
         return extra_llm_api_options_path
 
     # Recipe format detected - extract llm_api_config only
-    logger.info(
-        "Recipe format detected - extracting llm_api_config for LLM constructor"
-    )
+    logger.info("Recipe format detected - extracting llm_api_config for LLM constructor")
 
     try:
-        with open(extra_llm_api_options_path, 'r') as f:
+        with open(extra_llm_api_options_path, "r") as f:
             full_recipe = yaml.safe_load(f)
 
         # Extract only the llm_api_config section
-        llm_api_config_only = full_recipe.get('llm_api_config', {})
+        llm_api_config_only = full_recipe.get("llm_api_config", {})
 
         # Create temporary file with only llm_api_config
-        temp_fd, temp_path = tempfile.mkstemp(suffix='.yaml', text=True)
-        with os.fdopen(temp_fd, 'w') as f:
+        temp_fd, temp_path = tempfile.mkstemp(suffix=".yaml", text=True)
+        with os.fdopen(temp_fd, "w") as f:
             yaml.safe_dump(llm_api_config_only, f)
 
-        logger.info(
-            f"Created temporary config file with llm_api_config at: {temp_path}"
-        )
+        logger.info(f"Created temporary config file with llm_api_config at: {temp_path}")
         return temp_path
 
     except (FileNotFoundError, yaml.YAMLError, KeyError) as e:
@@ -223,10 +212,11 @@ def prepare_llm_api_config_for_recipe(
 
 
 def auto_generate_dataset(
-        scenario: Dict[str, Any],
-        workspace: Path,
-        tokenizer: str,
-        output_filename: str = "auto_generated_dataset.json") -> Path:
+    scenario: Dict[str, Any],
+    workspace: Path,
+    tokenizer: str,
+    output_filename: str = "auto_generated_dataset.json",
+) -> Path:
     """Generate a synthetic dataset from scenario parameters.
 
     Args:
@@ -246,11 +236,11 @@ def auto_generate_dataset(
     dataset_path = workspace / output_filename
 
     # Extract parameters
-    target_isl = scenario['target_isl']
-    target_osl = scenario['target_osl']
-    num_requests = scenario.get('num_requests', 512)
-    isl_stdev = scenario.get('isl_stdev', 0)
-    osl_stdev = scenario.get('osl_stdev', 0)
+    target_isl = scenario["target_isl"]
+    target_osl = scenario["target_osl"]
+    num_requests = scenario.get("num_requests", 512)
+    isl_stdev = scenario.get("isl_stdev", 0)
+    osl_stdev = scenario.get("osl_stdev", 0)
 
     # Generate synthetic dataset using prepare_dataset.py logic
     # For now, create a simple JSON format that benchmarks can consume
@@ -287,8 +277,8 @@ def auto_generate_dataset(
     # Write to JSON Lines file (one JSON object per line)
     # This is the format expected by trtllm-bench
     workspace.mkdir(parents=True, exist_ok=True)
-    with open(dataset_path, 'w') as f:
+    with open(dataset_path, "w") as f:
         for request in requests:
-            f.write(json.dumps(request) + '\n')
+            f.write(json.dumps(request) + "\n")
 
     return dataset_path

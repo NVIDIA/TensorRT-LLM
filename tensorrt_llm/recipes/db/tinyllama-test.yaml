@@ -1,0 +1,26 @@
+# TinyLlama 1.1B FP16 Recipe (Test Configuration)
+#
+
+scenario:
+  model: tinyllama
+  num_gpus: 1
+  target_isl: 1024
+  target_osl: 256
+  target_concurrency: 32
+  # Optional: Dataset generation parameters.
+  # This is useful for trtllm-bench to auto-generate dataset, so one can just specify this recipe
+  # to trtllm-bench without prior steps.
+  isl_stdev: 0       # Input sequence length standard deviation (0 = exact)
+  osl_stdev: 0       # Output sequence length standard deviation (0 = exact)
+  num_requests: 128  # Number of requests for auto-generated dataset
+
+env:
+  TLLM_WORKER_USE_SINGLE_PROCESS: 1
+
+llm_api_config:
+  tensor_parallel_size: 1
+  max_batch_size: 256
+  max_num_tokens: 4096
+  kv_cache_config:
+    enable_block_reuse: false
+    free_gpu_memory_fraction: 0.7

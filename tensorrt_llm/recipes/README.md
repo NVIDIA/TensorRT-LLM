@@ -100,7 +100,7 @@ trtllm-configure \
     --output my-recipe.yaml
 
 # Use with trtllm-bench (recommended)
-trtllm-bench --recipe my-recipe.yaml
+trtllm-bench --model nvidia/DeepSeek-R1-0528-FP4 throughput --extra_llm_api_options my-recipe.yaml
 ```
 
 ### Option 2: Use Existing Recipe YAML Directly (Comprehensive)
