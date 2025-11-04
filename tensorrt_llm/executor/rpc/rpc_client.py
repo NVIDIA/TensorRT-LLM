@@ -1,17 +1,10 @@
 import asyncio
 import concurrent.futures
 import threading
-import time
 import uuid
-from typing import Any, AsyncIterator, Dict, Optional
+from typing import Any, AsyncIterator, Optional
 
-import zmq
-
-from tensorrt_llm._utils import (customized_gc_thresholds, nvtx_mark_debug,
-                                 nvtx_range_debug)
-
-from ...llmapi.utils import (AsyncQueue, _SyncQueue, enable_llmapi_debug,
-                             logger_debug)
+from ...llmapi.utils import logger_debug
 from ...logger import logger
 from ..ipc import ZeroMqQueue
 from .rpc_common import (RPCCancelled, RPCParams, RPCRequest, RPCResponse,
@@ -50,27 +43,58 @@ class RemoteCall:
     def remote(self,
                timeout: Optional[float] = None,
                need_response: bool = True) -> Any:
-        """Synchronous remote call with optional RPC parameters."""
+        """Synchronous remote call with optional RPC parameters.
+
+        Args:
+            timeout: Timeout for the RPC call
+            need_response: Whether a response is expected
+
+        Returns:
+            The result of the client method call
+        """
         return self._prepare_and_call(timeout, need_response, "sync",
                                       "_call_sync")
 
     def remote_async(self,
                      timeout: Optional[float] = None,
                      need_response: bool = True):
-        """Asynchronous remote call that returns a coroutine."""
+        """Asynchronous remote call that returns a coroutine.
+
+        Args:
+            timeout: Timeout for the RPC call
+            need_response: Whether a response is expected
+
+        Returns:
+            A coroutine that will yield the result of the client method call
+        """
         return self._prepare_and_call(timeout, need_response, "async",
                                       "_call_async")
 
     def remote_future(self,
                       timeout: Optional[float] = None,
                       need_response: bool = True) -> concurrent.futures.Future:
-        """Remote call that returns a Future object."""
+        """Remote call that returns a Future object.
+
+        Args:
+            timeout: Timeout for the RPC call
+            need_response: Whether a response is expected
+
+        Returns:
+            A Future object that can be used to retrieve the result of the client method call
+        """
         return self._prepare_and_call(timeout, need_response, "future",
                                       "_call_future")
 
     def remote_streaming(self,
                          timeout: Optional[float] = None) -> AsyncIterator[Any]:
-        """Remote call for streaming results."""
+        """Remote call for streaming results.
+
+        Args:
+            timeout: Timeout for the RPC call
+
+        Returns:
+            An AsyncIterator that will yield the result of the client method call
+        """
         # Streaming always needs a response
         return self._prepare_and_call(timeout, True, "async", "_call_streaming")
 
@@ -97,20 +121,19 @@ class RPCClient:
         self._client_socket = ZeroMqQueue(address=(address, hmac_key),
                                           is_server=False,
                                           is_async=True,
-                                          use_hmac_encryption=False,
-                                          socket_type=zmq.DEALER)
-        self._pending_futures = {}
-        # map request_id to the queue for streaming responses
-        self._streaming_queues: Dict[str, AsyncQueue] = {}
-        self._reader_task = None
+                                          use_hmac_encryption=False)
+        # Store futures directly without loop references
+        self._pending_futures: dict[str, asyncio.Future] = {}
+        # Use asyncio.Queue for streaming responses
+        self._streaming_queues: dict[str, asyncio.Queue] = {}
+        self._reader_task: Optional[asyncio.Task] = None
+        # Keep executor for remote_future()
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=num_workers, thread_name_prefix="rpc_client_worker")
 
         self._server_stopped = False
         self._closed = False
-        self._loop = None
-        self._loop_thread = None
-        self._reader_asyncio_task = None  # Track the asyncio task for proper cancellation
+        self._reader_lock = threading.Lock()
 
         logger_debug(f"RPC Client initialized. Connected to {self._address}")
 
@@ -125,40 +148,24 @@ class RPCClient:
 
     def close(self):
         """Gracefully close the client, cleaning up background tasks."""
-
         if self._closed:
             return
         self._closed = True
 
         logger_debug("RPC Client closing")
 
-        # Cancel the reader task first to avoid socket closure errors
+        # Cancel the reader task if it exists
         if self._reader_task and not self._reader_task.done():
-            if self._loop and self._loop.is_running(
-            ) and self._reader_asyncio_task:
-                try:
-                    # Cancel the asyncio task in its event loop
-                    async def cancel_reader_task():
-                        if self._reader_asyncio_task and not self._reader_asyncio_task.done(
-                        ):
-                            self._reader_asyncio_task.cancel()
-                            try:
-                                await self._reader_asyncio_task
-                            except asyncio.CancelledError:
-                                pass  # Expected
+            self._reader_task.cancel()
+            # Don't wait for the task here as it might be in a different event loop
+            # The task will clean itself up when cancelled
 
-                    cancel_future = asyncio.run_coroutine_threadsafe(
-                        cancel_reader_task(), self._loop)
-                    cancel_future.result(timeout=2.0)
-                    logger_debug("Reader task cancelled successfully")
-                except concurrent.futures.TimeoutError:
-                    logger.warning("Reader task did not exit gracefully")
-                except Exception as e:
-                    logger_debug(f"Reader task cleanup: {e}")
-            self._reader_task = None
-            self._reader_asyncio_task = None
+        # Clean up the executor
+        if self._executor:
+            self._executor.shutdown(wait=True)
+            self._executor = None
 
-        # Now close the socket after reader has stopped
+        # Close the socket
         if self._client_socket:
             self._client_socket.close()
             self._client_socket = None
@@ -285,66 +292,84 @@ class RPCClient:
         logger_debug("Response reader started")
 
         try:
-            with customized_gc_thresholds(10000):
-                while True:
-                    with nvtx_range_debug("response_reader",
-                                          color="cyan",
-                                          category="RPC"):
-                        try:
-                            response = await self._wait_for_response()
+            while not self._closed:
+                try:
+                    response: RPCResponse = await self._client_socket.get_async(
+                    )
 
-                            nvtx_mark_debug(
-                                f"RPC.response.{'streaming' if response.is_streaming else 'sync'}",
-                                color="black",
-                                category="RPC")
+                    logger_debug(f"RPC Client received response: {response}")
+                    logger_debug(
+                        f"Response request_id: {response.request_id}, is_streaming: {response.is_streaming}"
+                    )
 
-                            # Optimize: Check debug flag before expensive string operations
-                            # This avoids holding GIL for f-string evaluation when debug is disabled
-                            if enable_llmapi_debug() or logger.level == 'debug':
+                    # Handle streaming responses
+                    if response.is_streaming:
+                        assert response.stream_status in [
+                            'start', 'data', 'end', 'error'
+                        ], f"Invalid stream status: {response.stream_status}"
+
+                        queue = self._streaming_queues.get(response.request_id)
+                        if queue:
+                            await queue.put(response)
+                            # Clean up if stream ended
+                            if response.stream_status in ['end', 'error']:
+                                self._streaming_queues.pop(
+                                    response.request_id, None)
+                    else:
+                        # Handle regular responses
+                        logger_debug(
+                            f"Handling regular response for request_id: {response.request_id}"
+                        )
+                        future = self._pending_futures.pop(
+                            response.request_id, None)
+                        if future and not future.done():
+                            if response.error is None:
                                 logger_debug(
                                     f"RPC Client received response: request_id={response.request_id}, "
                                     f"is_streaming={response.is_streaming}, "
                                     f"pending_futures={len(self._pending_futures)}"
                                 )
+                                future.set_result(response.result)
+                            else:
+                                logger_debug(
+                                    f"Setting exception for request_id: {response.request_id}, error: {response.error}"
+                                )
+                                future.set_exception(response.error)
 
-                            with nvtx_range_debug("handle_response",
-                                                  color="purple",
-                                                  category="RPC"):
-                                if response.is_streaming:
-                                    self._handle_streaming_response(response)
-                                else:
-                                    self._handle_regular_response(response)
+                except asyncio.CancelledError:
+                    logger_debug("Response reader cancelled")
+                    break
+                except Exception as e:
+                    if self._closed:
+                        break
+                    logger.error(f"Exception in RPC response reader: {e}")
+                    # Propagate exception to all pending futures
+                    for future in list(self._pending_futures.values()):
+                        if not future.done():
+                            future.set_exception(e)
+                    # Also signal error to streaming queues
+                    for queue in list(self._streaming_queues.values()):
+                        try:
+                            await queue.put(
+                                RPCResponse("", None, e, False, 0, 'error'))
+                        except Exception:
+                            pass
+                    break
 
-                        except Exception as e:
-                            await self._handle_reader_exception(e)
-                            break
-
-        except asyncio.CancelledError:
-            logger_debug("Response reader cancelled")
         finally:
             logger_debug("Response reader exiting gracefully")
-            self._reader_task = None
-            self._reader_asyncio_task = None
 
-    def _start_response_reader_lazily(self):
-        if self._reader_task is None or self._reader_task.done():
-            try:
-                # Ensure we have a persistent background loop
-                self._ensure_event_loop()
-                # Ensure the loop is running before creating tasks
-                if self._loop and self._loop.is_running():
-                    # Always create the reader task on the persistent loop
-                    future = asyncio.run_coroutine_threadsafe(
-                        self._response_reader(), self._loop)
-                    # Store the concurrent.futures.Future
-                    self._reader_task = future
-                else:
-                    logger_debug(
-                        "Event loop not running yet, deferring reader start")
-            except Exception as e:
-                logger_debug(f"Error starting response reader: {e}")
-                # Don't raise here, let it retry on next call
-                self._reader_task = None
+    def _ensure_reader_task(self):
+        """Ensure the response reader task is running."""
+        with self._reader_lock:
+            if self._reader_task is None or self._reader_task.done():
+                try:
+                    loop = asyncio.get_running_loop()
+                    self._reader_task = loop.create_task(
+                        self._response_reader())
+                except RuntimeError:
+                    # No running event loop, will be started when needed
+                    pass
 
     async def _call_async(self, method_name, *args, **kwargs):
         """Async version of RPC call.
@@ -365,77 +390,71 @@ class RPCClient:
         if self._server_stopped:
             raise RPCCancelled("Server is shutting down, request cancelled")
 
-        self._start_response_reader_lazily()
+        # Ensure reader task is running
+        self._ensure_reader_task()
+
         rpc_params = kwargs.pop("__rpc_params", RPCParams())
         need_response = rpc_params.need_response
         timeout = rpc_params.timeout if rpc_params.timeout is not None else self._timeout
 
         request_id = uuid.uuid4().hex
         request = RPCRequest(request_id,
-                             method_name,
-                             args,
-                             kwargs,
-                             need_response,
+                             method_name=method_name,
+                             args=args,
+                             kwargs=kwargs,
+                             need_response=need_response,
                              timeout=timeout)
         await self._client_socket.put_async(request)
 
+        # Early return without waiting for response
         if not need_response:
             return None
 
+        # Create future in the current event loop
         loop = asyncio.get_running_loop()
         future = loop.create_future()
-        self._pending_futures[request_id] = (future, loop)
+        self._pending_futures[request_id] = future
+
+        logger_debug(
+            f"RPC Client _call_async: Created future for request_id: {request_id}"
+        )
 
         try:
-            # If timeout, the remote call should return a timeout error timely,
-            # so we add 1 second to the timeout to ensure the client can get
-            # that result.
             if timeout is None:
                 res = await future
             else:
-                # Add 1 second to the timeout to ensure the client can get
                 res = await asyncio.wait_for(future, timeout)
             return res
         except RPCCancelled:
             self._server_stopped = True
             raise
         except asyncio.TimeoutError:
+            self._pending_futures.pop(request_id, None)
             raise RPCTimeout(
                 f"Request '{method_name}' timed out after {timeout}s")
-        except Exception as e:
-            raise e
-        finally:
-            self._pending_futures.pop(request_id, None)
-
-    def _ensure_event_loop(self):
-        """Ensure we have a running event loop in a background thread."""
-        if self._loop is None or not self._loop.is_running():
-            self._loop = asyncio.new_event_loop()
-
-            def run_loop():
-                asyncio.set_event_loop(self._loop)
-                self._loop.run_forever()
-
-            self._loop_thread = threading.Thread(target=run_loop,
-                                                 daemon=True,
-                                                 name="rpc_client_loop")
-            self._loop_thread.start()
-
-            # Give the loop a moment to start
-            time.sleep(0.2)
+        except Exception:
+            raise
 
     def _call_sync(self, method_name, *args, **kwargs):
         """Synchronous version of RPC call."""
-        if enable_llmapi_debug() or logger.level == 'debug':
-            logger_debug(f"RPC Client calling method: {method_name}")
-        nvtx_mark_debug(f"RPC.sync.{method_name}",
-                        color="green",
-                        category="RPC")
-        self._ensure_event_loop()
-        future = asyncio.run_coroutine_threadsafe(
-            self._call_async(method_name, *args, **kwargs), self._loop)
-        result = future.result()
-        return result
+        logger_debug(
+            f"RPC Client calling method: {method_name} with args: {args} and kwargs: {kwargs}"
+        )
+
+        # Check if we're in an event loop
+        try:
+            asyncio.get_running_loop()
+
+            # We're inside an event loop, we need to run in a thread to avoid deadlock
+            def run_in_thread():
+                return asyncio.run(
+                    self._call_async(method_name, *args, **kwargs))
+
+            future = self._executor.submit(run_in_thread)
+            return future.result()
+        except RuntimeError:
+            # No running event loop, we can use asyncio.run
+            return asyncio.run(self._call_async(method_name, *args, **kwargs))
 
     def _call_future(self, name: str, *args,
                      **kwargs) -> concurrent.futures.Future:
@@ -450,15 +469,28 @@ class RPCClient:
         Returns:
             A Future object that can be used to retrieve the result
         """
-        nvtx_mark_debug(f"RPC.future.{name}", color="blue", category="RPC")
+        # Create a thread-safe future to bridge between asyncio and concurrent.futures
+        thread_future = concurrent.futures.Future()
 
-        def _async_to_sync():
-            self._ensure_event_loop()
-            future = asyncio.run_coroutine_threadsafe(
-                self._call_async(name, *args, **kwargs), self._loop)
-            return future.result()
+        async def _async_wrapper():
+            try:
+                result = await self._call_async(name, *args, **kwargs)
+                thread_future.set_result(result)
+            except Exception as e:
+                thread_future.set_exception(e)
 
-        return self._executor.submit(_async_to_sync)
+        try:
+            # In an event loop, create the task
+            asyncio.get_running_loop()
+            asyncio.create_task(_async_wrapper())
+        except RuntimeError:
+            # No event loop, run in executor
+            def _run_async_call():
+                return asyncio.run(self._call_async(name, *args, **kwargs))
+
+            return self._executor.submit(_run_async_call)
+
+        return thread_future
 
     async def _call_streaming(self, name: str, *args,
                               **kwargs) -> AsyncIterator[Any]:
@@ -478,16 +510,15 @@ class RPCClient:
         if self._server_stopped:
             raise RPCCancelled("Server is shutting down, request cancelled")
 
-        self._start_response_reader_lazily()
+        # Ensure reader task is running
+        self._ensure_reader_task()
+
         rpc_params = kwargs.pop("__rpc_params", RPCParams())
         timeout = rpc_params.timeout if rpc_params.timeout is not None else self._timeout
 
         request_id = uuid.uuid4().hex
-        # Use AsyncQueue to ensure proper cross-thread communication
-        queue = AsyncQueue()
-        # Recreate sync_q with the current running loop for proper cross-thread communication
-        # This ensures the background _response_reader thread can properly notify this event loop
-        queue._sync_q = _SyncQueue(queue, asyncio.get_running_loop())
+        # Use asyncio.Queue for streaming
+        queue: asyncio.Queue = asyncio.Queue()
         self._streaming_queues[request_id] = queue
 
         try:
@@ -509,10 +540,9 @@ class RPCClient:
                     response = await asyncio.wait_for(queue.get(),
                                                       timeout=timeout)
 
-                if enable_llmapi_debug() or logger.level == 'debug':
-                    logger_debug(
-                        f"RPC Client _call_streaming received [{response.stream_status}] response",
-                        color="green")
+                logger_debug(
+                    f"RPC Client _call_streaming received [{response.stream_status}] response: {response}",
+                    color="green")
 
                 if response.stream_status == 'start':
                     # Start of stream

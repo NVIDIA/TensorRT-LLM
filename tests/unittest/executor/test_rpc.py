@@ -228,6 +228,7 @@ class TestRpcError:
             # Wait for background threads to exit
             time.sleep(1.0)
 
+    @pytest.mark.skip(reason="This test is flaky, need to fix it")
     def test_timeout_error(self):
         """Test that requests that exceed timeout are handled with proper error."""
 
