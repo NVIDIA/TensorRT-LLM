@@ -124,14 +124,22 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        self._post_init_with_buffers(self.cuda_graph_buffers)
+
+    def _post_init_with_buffers(self, buffers) -> None:
+        capture_graph = torch.cuda.is_current_stream_capturing()
 
         if self.workspace_buffer is None:
             # Note: even though flashinfer only recommends 128 MB, we have to push it
             # a bit higher to cover all possible CUDA graph cases. If it's too small,
             # warmup will crash.
-            self.workspace_buffer = torch.empty(320 * 1024 * 1024,
-                                                dtype=torch.uint8,
-                                                device="cuda")
+            self.workspace_buffer = self.get_empty(
+                buffers,
+                (320 * 1024 * 1024, ),
+                dtype=torch.uint8,
+                cache_name="workspace_buffer",
+                capture_graph=capture_graph,
+            )
 
         self.paged_kv_indptr_decode = torch.empty((self.max_num_requests + 1, ),
                                                   device='cuda',
@@ -163,9 +171,13 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
         if self.kv_cache_manager is not None:
             max_num_pages = self.kv_cache_manager.blocks_in_primary_pool
-            self._paged_kv_indices = torch.empty((max_num_pages, ),
-                                                 device='cuda',
-                                                 dtype=torch.int)
+            self._paged_kv_indices = self.get_empty(
+                buffers,
+                (max_num_pages, ),
+                dtype=torch.int,
+                cache_name="_paged_kv_indices",
+                capture_graph=capture_graph,
+            )
 
     def create_cuda_graph_metadata(self,
                                    max_batch_size: int,

@@ -14,9 +14,9 @@ from strenum import StrEnum
 import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._utils import get_sm_version, mpi_disabled
-from tensorrt_llm.bindings.executor import GuidedDecodingConfig
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
-                                          ContextChunkingPolicy, LoadFormat,
+                                          ContextChunkingPolicy,
+                                          GuidedDecodingConfig, LoadFormat,
                                           TorchLlmArgs)
 from tensorrt_llm.llmapi.tokenizer import (TokenizerBase,
                                            _llguidance_tokenizer_info,
@@ -271,17 +271,23 @@ def create_py_executor(
             logger.warning(
                 f"Disable overlap scheduler for speculation mode {spec_config.spec_dec_mode.name}"
             )
+            # TODO(qijun): clean up pytorch_backend_config later
             pytorch_backend_config.disable_overlap_scheduler = True
 
+            llm_args.disable_overlap_scheduler = True
+
     if mm_encoder_only:
+        # TODO(qijun): clean up pytorch_backend_config later
         pytorch_backend_config.mm_encoder_only = True
-        pytorch_backend_config.load_format = LoadFormat.VISION_ONLY
         # Disable overlap scheduler for multimodal encoder-only mode
         logger.warning(
             "Disabling overlap scheduler for multimodal encoder-only mode. "
             "The overlap scheduler is designed for generation models and is not needed "
             "when only processing vision encoder inputs.")
         pytorch_backend_config.disable_overlap_scheduler = True
+
+        llm_args.mm_encoder_only = True
+        llm_args.disable_overlap_scheduler = True
 
     mapping = _get_mapping(llm_args.parallel_config.to_mapping())
     if mpi_disabled():
@@ -311,12 +317,11 @@ def create_py_executor(
             _ExecutorCreationStage.MODEL_ENGINE_MAIN):
         model_engine = PyTorchModelEngine(
             model_path=checkpoint_dir,
-            pytorch_backend_config=pytorch_backend_config,
+            llm_args=llm_args,
             mapping=mapping,
             attn_runtime_features=attn_runtime_features,
             dist=dist,
             spec_config=spec_config,
-            llm_args=llm_args,
         )
 
     validate_feature_combination(llm_args, model_engine,
@@ -346,20 +351,22 @@ def create_py_executor(
             else:
                 drafting_loop_wrapper = None
 
+            # TODO(qijun): clean up pytorch_backend_config later
             draft_pytorch_backend_config = copy.copy(pytorch_backend_config)
+            draft_llm_args = copy.copy(llm_args)
             if spec_config.load_format == "dummy":
                 draft_pytorch_backend_config.load_format = LoadFormat.DUMMY
+                draft_llm_args.load_format = LoadFormat.DUMMY
 
             draft_model_engine = PyTorchModelEngine(
                 model_path=spec_config.speculative_model_dir,
-                pytorch_backend_config=draft_pytorch_backend_config,
+                llm_args=draft_llm_args,
                 mapping=mapping,
                 attn_runtime_features=attn_runtime_features,
                 dist=dist,
                 spec_config=draft_spec_config,
                 is_draft_model=True,
                 drafting_loop_wrapper=drafting_loop_wrapper,
-                llm_args=llm_args,
             )
             # For DeepseekV3 MTP, we need to set the num_hidden_layers to 1 for the draft model
             if spec_config.spec_dec_mode.is_mtp_eagle():

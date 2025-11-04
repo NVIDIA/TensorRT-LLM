@@ -5,7 +5,7 @@ slurm:
   account: "<account>"
   job_time: "02:00:00"
   job_name: "<job_name>"
-  numa_bind: true
+  numa_bind: true # Only enable for GB200 NVL72
 
 # Benchmark Mode
 benchmark:
@@ -42,7 +42,6 @@ profiling:
   nsys_on: false  # Set to true to enable profiling
 
 worker_config:
-  eplb_num_slots: 0  # Number of slots for EPLB
   gen:
     tensor_parallel_size: 8
     moe_expert_parallel_size: 8
@@ -77,6 +76,8 @@ worker_config:
     moe_config:
       backend: CUTLASS
       use_low_precision_moe_combine: true
+      load_balancer:
+        num_slots: 0
     cache_transceiver_config:
       max_tokens_in_buffer: 4608
       backend: DEFAULT

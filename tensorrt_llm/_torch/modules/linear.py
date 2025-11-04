@@ -444,16 +444,14 @@ class FP8QDQLinearMethod(LinearMethodBase):
 
         copy_weight(module.weight_scale, max(weight_scale))
 
-        q_weight = q_weight.to(module.dtype) * weight_scale[0]
-        k_weight = k_weight.to(module.dtype) * weight_scale[1]
-        v_weight = v_weight.to(module.dtype) * weight_scale[2]
+        # use in-place multiplication and division to avoid extra memory allocation
+        q_weight = q_weight.to(module.dtype).mul_(weight_scale[0])
+        k_weight = k_weight.to(module.dtype).mul_(weight_scale[1])
+        v_weight = v_weight.to(module.dtype).mul_(weight_scale[2])
 
         fused_weight = torch.cat((q_weight, k_weight, v_weight))
-        if module.weight_scale.device != fused_weight.device:
-            module.weight_scale = Parameter(
-                module.weight_scale.data.to(fused_weight.device))
-        fused_weight = (fused_weight / module.weight_scale).to(
-            torch.float8_e4m3fn)
+        fused_weight = fused_weight.div_(
+            module.weight_scale.to(fused_weight.device)).to(torch.float8_e4m3fn)
         copy_weight(module.weight, fused_weight)
 
         # Load k and v scales, used for NVFP4 KV cache
@@ -486,14 +484,12 @@ class FP8QDQLinearMethod(LinearMethodBase):
         gate_weight, up_weight = load_weights_fused_gate_up_helper(
             module, weights)
 
-        gate_weight = gate_weight.to(module.dtype) * weight_scale[0]
-        up_weight = up_weight.to(module.dtype) * weight_scale[1]
+        # use in-place multiplication and division to avoid extra memory allocation
+        gate_weight = gate_weight.to(module.dtype).mul_(weight_scale[0])
+        up_weight = up_weight.to(module.dtype).mul_(weight_scale[1])
         fused_weight = torch.cat((gate_weight, up_weight))
-        if module.weight_scale.device != fused_weight.device:
-            module.weight_scale = Parameter(
-                module.weight_scale.data.to(fused_weight.device))
-        fused_weight = (fused_weight / module.weight_scale).to(
-            torch.float8_e4m3fn)
+        fused_weight = fused_weight.div_(
+            module.weight_scale.to(fused_weight.device)).to(torch.float8_e4m3fn)
         copy_weight(module.weight, fused_weight)
 
 
@@ -811,9 +807,23 @@ class NVFP4LinearMethod(LinearMethodBase):
                 act_fp4, module.weight, act_sf, module.weight_scale,
                 module.alpha, module.dtype)
         else:
-            output = torch.ops.trtllm.nvfp4_gemm(act_fp4, module.weight, act_sf,
-                                                 module.weight_scale,
-                                                 module.alpha, module.dtype)
+            if module.enable_cuda_core and act_fp4.shape[0] <= 8:
+                act_sf_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
+                    act_sf.view((act_fp4.shape[0] + 128 - 1) // 128 * 128, -1))
+                output = torch.ops.trtllm.cuda_core_nvfp4_gemm(
+                    act_fp4,
+                    module.weight,
+                    scale_a=act_sf_unswizzled,
+                    scale_b=module.weight_scale,
+                    alpha=module.alpha,
+                    bias=None,
+                    out_dtype=module.dtype or input.dtype,
+                )
+            else:
+                output = torch.ops.trtllm.nvfp4_gemm(act_fp4, module.weight,
+                                                     act_sf,
+                                                     module.weight_scale,
+                                                     module.alpha, module.dtype)
 
         if bias is not None:
             output = output + bias
@@ -1383,7 +1393,7 @@ class W4A16_AWQ_LinearMethod(LinearMethodBase):
         group_size = module.quant_config.group_size
         if in_features % group_size != 0:
             raise ValueError(
-                f"in_features ({self.in_features}) must be divisible by group_size ({group_size}) "
+                f"in_features ({in_features}) must be divisible by group_size ({group_size}) "
                 f"for INT4 per-group quantization scale dimensions.")
 
         module.weight_scale = Parameter(torch.empty(
@@ -1482,7 +1492,8 @@ class W4A16_AWQ_LinearMethod(LinearMethodBase):
 
         copy_weight(module.weight, fused_weight)
 
-        weight_scales = self.load_weight_scales(weights)
+        weight_scales = self.load_weight_scales(weights, module.tp_size,
+                                                module.tp_rank, module.tp_mode)
 
         # Create concatenated weight scale tensor
         cat_weight_scale = torch.cat(weight_scales, dim=0).T.contiguous()
@@ -1894,8 +1905,9 @@ class Linear(nn.Module):
         if torch.cuda.is_available():
             capability = torch.cuda.get_device_capability(
                 torch.device('cuda:0'))
-            # enable cuda core for sm89
-            self.enable_cuda_core = capability[0] == 8 and capability[1] == 9
+            # enable cuda core for sm89 and sm120
+            self.enable_cuda_core = (capability[0] == 8 and capability[1] == 9) \
+                or (capability[0] == 12 and capability[1] == 0)
 
         if not skip_create_weights_in_init:
             self.create_weights()

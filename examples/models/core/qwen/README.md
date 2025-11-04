@@ -740,40 +740,22 @@ python3 benchmarks/cpp/prepare_dataset.py \
 ```
 
 ### Serving
+
+#### Recommended Performance Settings
+
+We maintain YAML configuration files with recommended performance settings in the [`examples/configs`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/configs) directory. These config files are present in the TensorRT LLM container at the path `/app/tensorrt_llm/examples/configs`. You can use these out-of-the-box, or adjust them to your specific use case.
+
+```shell
+TRTLLM_DIR=/app/tensorrt_llm # change as needed to match your environment
+EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/qwen3.yaml
+```
+
 #### trtllm-serve
 
 To serve the model using `trtllm-serve`:
 
 ```bash
-cat >./extra-llm-api-config.yml <<EOF
-cuda_graph_config:
-  enable_padding: true
-  batch_sizes:
-  - 1
-  - 2
-  - 4
-  - 8
-  - 16
-  - 32
-  - 64
-  - 128
-  - 256
-  - 384
-print_iter_log: true
-enable_attention_dp: true
-EOF
-
-trtllm-serve \
-  Qwen3-30B-A3B/ \
-  --host localhost \
-  --port 8000 \
-  --max_batch_size 161 \
-  --max_num_tokens 1160 \
-  --tp_size 1 \
-  --ep_size 1 \
-  --pp_size 1 \
-  --kv_cache_free_gpu_memory_fraction 0.8 \
-  --extra_llm_api_options ./extra-llm-api-config.yml
+trtllm-serve Qwen3-30B-A3B/ --port 8000 --extra_llm_api_options ${EXTRA_LLM_API_FILE}
 ```
 
 To query the server, you can start with a `curl` command:
@@ -795,61 +777,21 @@ For example, you can launch a single context server on port 8001 with:
 
 ```bash
 export TRTLLM_USE_UCX_KVCACHE=1
+export TRTLLM_DIR=/app/tensorrt_llm
+export EXTRA_LLM_API_FILE="${TRTLLM_DIR}/examples/configs/qwen3-disagg-prefill.yaml"
 
-cat >./ctx-extra-llm-api-config.yml <<EOF
-print_iter_log: true
-enable_attention_dp: true
-EOF
-
-trtllm-serve \
-  Qwen3-30B-A3B/ \
-  --host localhost \
-  --port 8001 \
-  --max_batch_size 161 \
-  --max_num_tokens 1160 \
-  --tp_size 1 \
-  --ep_size 1 \
-  --pp_size 1 \
-  --kv_cache_free_gpu_memory_fraction 0.8 \
-  --extra_llm_api_options ./ctx-extra-llm-api-config.yml &> output_ctx &
+trtllm-serve Qwen3-30B-A3B/ --port 8001 --extra_llm_api_options ${EXTRA_LLM_API_FILE} &> output_ctx &
 ```
 
 And you can launch two generation servers on port 8002 and 8003 with:
 
 ```bash
 export TRTLLM_USE_UCX_KVCACHE=1
-
-cat >./gen-extra-llm-api-config.yml <<EOF
-cuda_graph_config:
-  enable_padding: true
-  batch_sizes:
-    - 1
-    - 2
-    - 4
-    - 8
-    - 16
-    - 32
-    - 64
-    - 128
-    - 256
-    - 384
-print_iter_log: true
-enable_attention_dp: true
-EOF
+export TRTLLM_DIR=/app/tensorrt_llm
+export EXTRA_LLM_API_FILE="${TRTLLM_DIR}/examples/configs/qwen3.yaml"
 
 for port in {8002..8003}; do \
-trtllm-serve \
-  Qwen3-30B-A3B/ \
-  --host localhost \
-  --port ${port} \
-  --max_batch_size 161 \
-  --max_num_tokens 1160 \
-  --tp_size 1 \
-  --ep_size 1 \
-  --pp_size 1 \
-  --kv_cache_free_gpu_memory_fraction 0.8 \
-  --extra_llm_api_options ./gen-extra-llm-api-config.yml \
-  &> output_gen_${port} & \
+trtllm-serve Qwen3-30B-A3B/ --port ${port} --extra_llm_api_options ${EXTRA_LLM_API_FILE} &> output_gen_${port} & \
 done
 ```
 

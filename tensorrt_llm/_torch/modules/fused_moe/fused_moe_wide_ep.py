@@ -4,7 +4,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 
 from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
-from tensorrt_llm._utils import get_sm_version, local_mpi_size
+from tensorrt_llm._utils import is_sm_100f, local_mpi_size
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -361,7 +361,7 @@ class WideEPMoE(MoE):
             if self.quant_config.layer_quant_mode.has_fp8_qdq():
                 return FP8QDQFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_fp8_block_scales():
-                if get_sm_version() == 100:
+                if is_sm_100f():
                     return DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm()
                 else:
                     return DeepSeekFP8BlockScalesFusedMoEMethod()
@@ -579,25 +579,23 @@ class WideEPMoE(MoE):
                 x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
                     x, self.fc31_input_dequant)
             elif self.has_nvfp4:
-                if use_allgather or use_postquant_alltoall:
-                    if isinstance(x, Fp4QuantizedTensor):
-                        if use_allgather:
-                            assert not x.is_sf_swizzled, "Fp4QuantizedTensor should not be swizzled before allgather"
-                        x, x_sf = x.fp4_tensor, x.scaling_factor
-                        x_row = x.shape[0]
-                        # note: we use uint8 to store 2 fp4 values
-                        x_col = x.shape[1] * 2
-                    else:
-                        # for both postquant alltoall and allgather, we need non swizzle layout
-                        x_row = x.shape[0]
-                        x_col = x.shape[1]
-                        x, x_sf = torch.ops.trtllm.fp4_quantize(
-                            x,
-                            self.fc31_input_scale,
-                            self.scaling_vector_size,
-                            sfUseUE8M0=False,
-                            isSfSwizzledLayout=False)
-                    x_sf = x_sf.view((x_row, -1))
+                if isinstance(x, Fp4QuantizedTensor):
+                    assert not x.is_sf_swizzled, "Fp4QuantizedTensor should not be swizzled before allgather or postquant alltoall"
+                    x, x_sf = x.fp4_tensor, x.scaling_factor
+                    x_row = x.shape[0]
+                    # note: we use uint8 to store 2 fp4 values
+                    x_col = x.shape[1] * 2
+                else:
+                    # for both postquant alltoall and allgather, we need non swizzle layout
+                    x_row = x.shape[0]
+                    x_col = x.shape[1]
+                    x, x_sf = torch.ops.trtllm.fp4_quantize(
+                        x,
+                        self.fc31_input_scale,
+                        self.scaling_vector_size,
+                        sfUseUE8M0=False,
+                        isSfSwizzledLayout=False)
+                x_sf = x_sf.view((x_row, -1))
 
             elif self.has_deepseek_fp8_block_scales:
                 pass

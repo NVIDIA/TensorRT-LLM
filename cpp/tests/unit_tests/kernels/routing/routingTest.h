@@ -245,6 +245,7 @@ struct RoutingKernelTestParam
 
     // Check the input parameters
     bool useTopKAsInput{false};
+    bool hasInvalidTopKInput{false};
 
     // Special for renormalize routing method
     bool doSoftmaxBeforeTopK{false};
@@ -270,8 +271,8 @@ struct RoutingKernelTestParam
     RoutingKernelTestParam(RoutingMethodType routingMethod, int32_t numTokens, int32_t numExperts, uint32_t topK,
         int32_t expertParallelization = 1, int32_t expertParallelizationId = 0, int32_t tileTokensDim = 1,
         int32_t paddingLog2 = 3, int32_t localExpertsStrideLog2 = 0, bool usePdl = true, bool getExpWeights = true,
-        bool useTopKAsInput = false, int32_t nGroup = 1, int32_t topkGroup = 1, float routedScalingFactor = 1.0f,
-        int requiredComputeCapability = 9)
+        bool useTopKAsInput = false, bool hasInvalidTopKInput = false, int32_t nGroup = 1, int32_t topkGroup = 1,
+        float routedScalingFactor = 1.0f, int requiredComputeCapability = 9)
         : routingMethod(routingMethod)
         , numTokens(numTokens)
         , numExperts(numExperts)
@@ -282,6 +283,7 @@ struct RoutingKernelTestParam
         , usePdl(usePdl)
         , getExpWeights(getExpWeights)
         , useTopKAsInput(useTopKAsInput)
+        , hasInvalidTopKInput(hasInvalidTopKInput)
         , nGroup(nGroup)
         , topkGroup(topkGroup)
         , routedScalingFactor(routedScalingFactor)
@@ -319,6 +321,11 @@ struct RoutingKernelTestParam
         {
             singleClusterTokenNum = 256;
         }
+
+        if (hasInvalidTopKInput && !useTopKAsInput)
+        {
+            throw std::invalid_argument("hasInvalidTopKInput is only supported when useTopKAsInput is true");
+        }
     }
 
     // Copy constructor
@@ -340,9 +347,10 @@ struct RoutingKernelTestParam
     {
         return tensorrt_llm::common::fmtstr(
             "RoutingKernelTestParam[num_tokens=%d, num_experts=%d, topK=%u, doSoftmaxBeforeTopK=%d, normTopkProb=%d, "
-            "localExpertsStartIdx=%d, localExpertsStrideLog2=%d, numLocalExperts=%d, usePdl=%d]",
+            "localExpertsStartIdx=%d, localExpertsStrideLog2=%d, numLocalExperts=%d, usePdl=%d, useTopKAsInput=%d, "
+            "hasInvalidTopKInput=%d]",
             numTokens, numExperts, topK, doSoftmaxBeforeTopK, normTopkProb, localExpertsStartIdx,
-            localExpertsStrideLog2, numLocalExperts, usePdl);
+            localExpertsStrideLog2, numLocalExperts, usePdl, useTopKAsInput, hasInvalidTopKInput);
     }
 };
 

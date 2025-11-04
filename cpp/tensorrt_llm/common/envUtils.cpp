@@ -278,6 +278,12 @@ bool getEnvUseNixlKvCache()
     return useNixlKvCache;
 }
 
+bool getEnvUseRoundRobinBlockDistForCP()
+{
+    static bool const useRoundRobinBlockDistForCP = getBoolEnv("TRTLLM_USE_ROUND_ROBIN_BLOCK_DIST_FOR_CP");
+    return useRoundRobinBlockDistForCP;
+}
+
 std::string getEnvUCXInterface()
 {
     static std::once_flag flag;
@@ -493,6 +499,11 @@ int getEnvMoeA2ACombineBlockSize()
 {
     static int const kBlock = sanitizeBlockSize(getIntEnv("TLLM_MOE_A2A_COMBINE_BLOCK_SIZE"));
     return kBlock;
+}
+
+bool getEnvEplbForceGdrcopy()
+{
+    return getBoolEnv("TRTLLM_EPLB_FORCE_GDRCOPY");
 }
 
 } // namespace tensorrt_llm::common
