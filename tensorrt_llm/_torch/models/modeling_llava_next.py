@@ -17,8 +17,9 @@ from tensorrt_llm._torch.models.checkpoints.hf.llava_next_weight_mapper import \
     LlavaNextHfWeightMapper
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
-from ...inputs import (BaseMultimodalInputProcessor, ExtraProcessedInputs,
-                       InputProcessor, MultimodalPlaceholderMetadata,
+from ...inputs import (BaseMultimodalDummyInputsBuilder,
+                       BaseMultimodalInputProcessor, ExtraProcessedInputs,
+                       MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor,
                        support_multimodal_disaggregated)
@@ -35,38 +36,58 @@ from .modeling_utils import register_auto_model, register_vision_encoder
 DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
 
 
-class LlavaNextInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
+class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
+                              BaseMultimodalDummyInputsBuilder):
 
     def __init__(self,
                  model_path: str,
-                 model_config: PretrainedConfig,
+                 config: PretrainedConfig,
                  tokenizer: AutoTokenizer,
                  trust_remote_code: bool = True):
-        self.tokenizer = tokenizer
-        self.use_fast = True
-        if self.tokenizer is None:
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                model_path,
-                trust_remote_code=trust_remote_code,
-                use_fast=self.use_fast)
-        self.processor = AutoProcessor.from_pretrained(
+        super().__init__()
+        self._config = config
+        self._tokenizer = tokenizer if tokenizer is not None else AutoTokenizer.from_pretrained(
             model_path,
             trust_remote_code=trust_remote_code,
             use_fast=self.use_fast)
-        self.model_config = model_config
+        self._processor = AutoProcessor.from_pretrained(
+            model_path,
+            trust_remote_code=trust_remote_code,
+            use_fast=self.use_fast)
+        self._model_path = model_path
+        self._dtype = self.config.text_config.torch_dtype
 
-        self.image_token_index = model_config.image_token_index
-        self.vocab_size = model_config.vocab_size
-        self.config = model_config.vision_config
+        self.image_token_index = config.image_token_index
+        self.vocab_size = config.vocab_size
+
+    @property
+    def config(self) -> PretrainedConfig:
+        return self._config
+
+    @property
+    def tokenizer(self) -> AutoTokenizer:
+        return self._tokenizer
+
+    @property
+    def model_path(self) -> str:
+        return self._model_path
+
+    @property
+    def processor(self) -> AutoProcessor:
+        return self._processor
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._dtype
 
     def _postprocess(
         self, input_ids: torch.Tensor, mm_features: Union[torch.Tensor,
                                                           List[torch.Tensor]]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Define model specific variables here before shared logic
-        mm_tokens = torch.tensor([self.model_config.image_token_index
+        mm_tokens = torch.tensor([self.config.image_token_index
                                   ]).to(input_ids.device)
-        model_hidden_size = self.model_config.text_config.hidden_size
+        model_hidden_size = self.config.text_config.hidden_size
         start_len = end_len = 0  # for llava, need not append start/end token around each image token
         # End model specific variables
 
@@ -171,12 +192,12 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
             raise NotImplementedError(
                 "Only one mm_handle is supported for LlavaNext for now")
         hidden_size = mm_handles[0]['tensor_size'][1]
-        assert hidden_size == self.model_config.text_config.hidden_size, "Multimodal embedding hidden size must match model hidden size"
+        assert hidden_size == self.config.text_config.hidden_size, "Multimodal embedding hidden size must match model hidden size"
         input_ids = self.tokenizer(text_prompt,
                                    return_tensors="pt").input_ids[0]
 
-        vocab_size = self.model_config.text_config.vocab_size
-        image_token_index = self.model_config.image_token_index
+        vocab_size = self.config.text_config.vocab_size
+        image_token_index = self.config.image_token_index
 
         image_mask = input_ids == image_token_index
         image_positions = torch.where(image_mask)[0]

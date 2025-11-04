@@ -32,8 +32,9 @@ from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 from ...executor.request import LoRARequest
-from ...inputs import (BaseMultimodalInputProcessor, ExtraProcessedInputs,
-                       InputProcessor, MultimodalPlaceholderMetadata,
+from ...inputs import (BaseMultimodalDummyInputsBuilder,
+                       BaseMultimodalInputProcessor, ExtraProcessedInputs,
+                       MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...logger import logger
@@ -755,31 +756,29 @@ class HFPhi4MultimodalEncoder(transformers.PreTrainedModel):
         return self._encoding_batch_request(multimodal_params, mm_token_ids)
 
 
-class Phi4MMInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
+class Phi4MMInputProcessor(BaseMultimodalInputProcessor,
+                           BaseMultimodalDummyInputsBuilder):
 
     def __init__(self,
                  model_path: str,
-                 model_config: transformers.PretrainedConfig,
+                 config: transformers.PretrainedConfig,
                  tokenizer: transformers.AutoTokenizer,
                  trust_remote_code: bool = True):
+        super().__init__()
         if not trust_remote_code:
             raise ValueError("trust_remote_code must be True for Phi4MM")
 
-        self.model_config = model_config
-        self.device = 'cpu'
-
-        self.tokenizer = tokenizer
-        self.use_fast = True
-        if self.tokenizer is None:
-            self.tokenizer = transformers.AutoTokenizer.from_pretrained(
-                model_path,
-                trust_remote_code=trust_remote_code,
-                use_fast=self.use_fast)
-
-        self.processor = transformers.AutoProcessor.from_pretrained(
+        self._config = config
+        self._tokenizer = tokenizer if tokenizer is not None else transformers.AutoTokenizer.from_pretrained(
             model_path,
             trust_remote_code=trust_remote_code,
             use_fast=self.use_fast)
+        self._processor = transformers.AutoProcessor.from_pretrained(
+            model_path,
+            trust_remote_code=trust_remote_code,
+            use_fast=self.use_fast)
+        self._model_path = model_path
+        self._dtype = self.config.torch_dtype
         # Bind the optimized methods to the image processor instance
         self.processor.image_processor.dynamic_preprocess = MethodType(
             dynamic_preprocess,
@@ -789,8 +788,27 @@ class Phi4MMInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
             image_preprocess,
             self.processor.image_processor,
         )
+        self.device = 'cpu'
 
-        self.dtype = model_config.torch_dtype
+    @property
+    def config(self) -> transformers.PretrainedConfig:
+        return self._config
+
+    @property
+    def tokenizer(self) -> transformers.AutoTokenizer:
+        return self._tokenizer
+
+    @property
+    def model_path(self) -> str:
+        return self._model_path
+
+    @property
+    def processor(self) -> transformers.AutoProcessor:
+        return self._processor
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._dtype
 
     def get_mm_token_ids(self) -> Optional[torch.Tensor]:
         return torch.tensor([_IMAGE_SPECIAL_TOKEN_ID, _AUDIO_SPECIAL_TOKEN_ID],
