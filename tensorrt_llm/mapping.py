@@ -63,6 +63,11 @@ class MappingBase:
 
         cp_type = CpType.ULYSSES if cp_config is None else cp_config.get(
             "cp_type", CpType.ULYSSES)
+        #################################################################
+        # TODO: Remove this hardcoding.
+        if cp_size > 1:
+            assert cp_type == CpType.HELIX
+        #################################################################
         moe_world_size = tp_size if cp_type == CpType.ULYSSES else tp_size * cp_size
 
         if moe_tp_size == -1 and moe_ep_size == -1:

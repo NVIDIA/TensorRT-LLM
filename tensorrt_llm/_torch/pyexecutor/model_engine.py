@@ -517,9 +517,9 @@ class PyTorchModelEngine(ModelEngine):
         # TODO: current warmup_request is not suitable for context parallelism.
         cp_type = self.mapping.cp_config.get('cp_type', None)
         if cp_type is not None:
-            logger.info("[ModelEngine::warmup] Skipping warmup for cp_type: ",
-                        cp_type.name)
-            return
+            if cp_type in [CpType.ULYSSES, CpType.STAR]:
+                logger.info("[ModelEngine::warmup] Early return since cp_type is ", cp_type)
+                return
 
         self._run_torch_compile_warmup(resource_manager)
         self._run_autotuner_warmup(resource_manager)
@@ -992,10 +992,15 @@ class PyTorchModelEngine(ModelEngine):
             # NOTE: py_executor_creator makes sure that the executor uses this
             # smaller value as its max_seq_len too.
             logger.warning(
-                f"Specified {self.max_seq_len=} is larger than what the model can support "
-                f"({inferred_max_seq_len}). Setting max_seq_len to {inferred_max_seq_len}. "
+                f"\n*******************************************************\n"
+                f"Specified {self.max_seq_len=} is larger than what the model can support\n"
+                f"({inferred_max_seq_len}). NOT Setting max_seq_len to {inferred_max_seq_len}. "
+                f"ARE YOU SURE ABOUT THIS?\n"
+                f"*******************************************************\n"
             )
-            self.max_seq_len = inferred_max_seq_len
+            # TODO: Undo this change before merging.
+            # self.max_seq_len = inferred_max_seq_len
+            pass
 
     def _infer_max_seq_len_from_config(self) -> int:
 
@@ -1450,6 +1455,7 @@ class PyTorchModelEngine(ModelEngine):
             # update batch index
             request.py_batch_idx = request.py_seq_slot
 
+        helix_is_inactive_rank = [] if self.mapping.cp_size > 1 else None
         for request in generation_requests:
             request_ids.append(request.py_request_id)
             beam_width = request.sampling_config.beam_width
@@ -1474,12 +1480,19 @@ class PyTorchModelEngine(ModelEngine):
                     past_seen_token_num = request.max_beam_num_tokens
                 position_id = past_seen_token_num
                 if self.mapping.has_cp_helix():
-                    # Do an allgather among CP ranks to get the complete sequence length seen by all CP ranks.
-                    past_seen_token_nums = self.dist.cp_allgather(
-                        past_seen_token_num)
-                    position_id = sum(past_seen_token_nums)
+                    # Warmup doesn't have `total_input_len_cp` set because merge_helix_requests is not called.
+                    if not self.is_warmup and not request.is_cuda_graph_dummy:
+                        position_id = request.total_input_len_cp + request.py_decoding_iter - 1
+                    # Assuming last CP rank is the active rank.
+                    if self.mapping.cp_rank == self.mapping.cp_size - 1:
+                        past_seen_token_num = request.orig_prompt_len + request.py_decoding_iter - 1
+                    else:
+                        # past_seen_token_num doesn't grow on inactive ranks.
+                        past_seen_token_num = request.orig_prompt_len
                 position_ids.append(position_id)
                 num_cached_tokens_per_seq.append(past_seen_token_num)
+                if self.mapping.has_cp_helix():
+                    helix_is_inactive_rank.append(request.py_helix_is_inactive_rank)
                 request.cached_tokens = num_cached_tokens_per_seq[-1]
                 prompt_lengths.append(request.py_prompt_len)
                 draft_lens.append(0)
@@ -1680,6 +1693,7 @@ class PyTorchModelEngine(ModelEngine):
 
         attn_metadata.request_ids = request_ids
         attn_metadata.prompt_lens = prompt_lengths
+        attn_metadata.helix_is_inactive_rank = helix_is_inactive_rank
         attn_metadata.num_contexts = len(scheduled_requests.context_requests)
         # Use num_chunked_ctx_requests to record the number of extend context requests,
         # so that we can update the kv_lens_cuda correctly in _preprocess_inputs.
