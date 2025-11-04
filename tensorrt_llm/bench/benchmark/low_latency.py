@@ -30,8 +30,7 @@ from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer,
                                            update_metadata_for_multimodal)
 from tensorrt_llm.bench.utils.scenario import (
-    auto_generate_dataset, extract_scenario_from_recipe,
-    merge_params_with_priority, prepare_llm_api_config_for_recipe)
+    prepare_llm_api_config_for_recipe, process_recipe_scenario)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -199,45 +198,18 @@ def latency_command(
     # Model, experiment, and engine params
     options = get_general_cli_options(params, bench_env)
 
-    # Scenario-based parameter detection and merging
-    extra_llm_api_options_path = params.get("extra_llm_api_options")
-    scenario = extract_scenario_from_recipe(extra_llm_api_options_path)
-
-    if scenario:
-        logger.info("Detected recipe format with scenario parameters")
-
-        # Define CLI defaults for merge priority detection
-        # Note: 'model' is excluded - it's a required top-level trtllm-bench parameter
-        cli_defaults = {
-            'concurrency': 1,  # Latency default is 1 (not -1 like throughput)
-            'target_input_len': None,
-            'target_output_len': None,
-            'num_requests': 0,
-            'tp': 1,
-            'pp': 1,
-            'ep': None,
-        }
-
-        # Merge CLI params with scenario (CLI explicitly set takes precedence)
-        merged_params = merge_params_with_priority(params, scenario,
-                                                   cli_defaults)
-
-        # Update params with merged values
-        params.update(merged_params)
-
-        # Auto-generate dataset if not provided
-        if params.get("dataset") is None and scenario.get(
-                'target_isl') and scenario.get('target_osl'):
-            logger.info(
-                "No dataset provided, auto-generating from scenario parameters")
-            workspace = Path.cwd() / ".trtllm_bench_workspace"
-            auto_dataset_path = auto_generate_dataset(
-                scenario, workspace, tokenizer=str(options.checkpoint_path))
-            params["dataset"] = auto_dataset_path
-            logger.info(f"Generated dataset at {auto_dataset_path}")
-
-            # Update options with auto-generated dataset
-            options = get_general_cli_options(params, bench_env)
+    # Process recipe scenario if present
+    cli_defaults = {
+        'concurrency': 1,  # Latency default is 1 (not -1 like throughput)
+        'target_input_len': None,
+        'target_output_len': None,
+        'num_requests': 0,
+        'tp': 1,
+        'pp': 1,
+        'ep': None,
+    }
+    params, options, scenario = process_recipe_scenario(params, options,
+                                                        bench_env, cli_defaults)
 
     # Speculative Decode Options
     medusa_choices = params.get("medusa_choices")

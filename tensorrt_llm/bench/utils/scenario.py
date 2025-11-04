@@ -8,11 +8,15 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 import yaml
 
 from tensorrt_llm.logger import logger
+
+if TYPE_CHECKING:
+    from tensorrt_llm.bench.benchmark import GeneralExecSettings
+    from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 
 
 def extract_scenario_from_recipe(recipe_path: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -282,3 +286,67 @@ def auto_generate_dataset(
             f.write(json.dumps(request) + "\n")
 
     return dataset_path
+
+
+def process_recipe_scenario(
+    params: Dict[str, Any],
+    options: "GeneralExecSettings",
+    bench_env: "BenchmarkEnvironment",
+    cli_defaults: Dict[str, Any],
+) -> Tuple[Dict[str, Any], "GeneralExecSettings", Optional[Dict[str, Any]]]:
+    """Process recipe scenario: extract, merge params, and auto-generate dataset.
+
+    This is a unified helper for throughput and low_latency benchmarks to handle
+    recipe-based configuration. It:
+    1. Extracts scenario from recipe file (if present)
+    2. Merges CLI params with scenario (CLI takes precedence)
+    3. Auto-generates dataset if needed based on scenario ISL/OSL
+
+    Args:
+        params: CLI parameters dictionary (will be modified in-place)
+        options: General execution settings from get_general_cli_options
+        bench_env: Benchmark environment object
+        cli_defaults: Default values for CLI args (used to detect explicit values)
+                     Should vary by benchmark type (e.g., concurrency differs)
+
+    Returns:
+        Tuple of (updated_params, updated_options, scenario)
+        - updated_params: params dict with merged scenario values
+        - updated_options: regenerated options if dataset was auto-generated
+        - scenario: extracted scenario dict (or None if not recipe format)
+    """
+    # Import here to avoid circular dependency
+    from tensorrt_llm.bench.benchmark import get_general_cli_options
+
+    # Extract scenario from recipe
+    extra_llm_api_options_path = params.get("extra_llm_api_options")
+    scenario = extract_scenario_from_recipe(extra_llm_api_options_path)
+
+    if not scenario:
+        return params, options, None
+
+    logger.info("Detected recipe format with scenario parameters")
+
+    # Merge CLI params with scenario (CLI explicitly set takes precedence)
+    merged_params = merge_params_with_priority(params, scenario, cli_defaults)
+
+    # Update params with merged values
+    params.update(merged_params)
+
+    # Auto-generate dataset if not provided
+    if params.get("dataset") is None and scenario.get(
+            'target_isl') and scenario.get('target_osl'):
+        logger.info(
+            "No dataset provided, auto-generating from scenario parameters")
+        workspace = Path.cwd() / ".trtllm_bench_workspace"
+        auto_dataset_path = auto_generate_dataset(scenario,
+                                                  workspace,
+                                                  tokenizer=str(
+                                                      options.checkpoint_path))
+        params["dataset"] = auto_dataset_path
+        logger.info(f"Generated dataset at {auto_dataset_path}")
+
+        # Update options with auto-generated dataset
+        options = get_general_cli_options(params, bench_env)
+
+    return params, options, scenario
