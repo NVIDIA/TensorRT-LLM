@@ -241,16 +241,17 @@ class PerfServerClientBenchmarkCmds(NamedTuple):
     names: List[str]
     working_dir: str
 
-    def wait_for_endpoint_ready(self, url: str, timeout: int = 5400):
+    def wait_for_endpoint_ready(self, url: str, timeout: int = 7200):
         start = time.monotonic()
         while time.monotonic() - start < timeout:
             try:
-                time.sleep(10)
+                time.sleep(1)
                 if requests.get(url).status_code == 200:
-                    print(f"endpoint {url} is ready")
+                    print_info(f"endpoint {url} is ready")
                     return
             except Exception as err:
-                print(f"endpoint {url} is not ready, with exception: {err}")
+                print_info(
+                    f"endpoint {url} is not ready, with exception: {err}")
         print_error(
             f"Endpoint {url} did not become ready within {timeout} seconds")
 
@@ -269,10 +270,10 @@ class PerfServerClientBenchmarkCmds(NamedTuple):
                           env=venv._new_env,
                           shell=True) as server_proc):
                 self.wait_for_endpoint_ready(
-                    "http://localhost:8000/v1/models",
+                    f"http://localhost:8000/health",
                     timeout=7200)  # 120 minutes for large models
-                output += subprocess.check_output(self.client_cmds[cmd_idx],
-                                                  env=venv._new_env).decode()
+                output += check_output(self.client_cmds[cmd_idx],
+                                       env=venv._new_env)
                 # Write output to client file path
                 with open(client_file_path, 'w') as client_ctx:
                     client_ctx.write(output)
@@ -453,6 +454,8 @@ class AbstractPerfScriptTestClass(abc.ABC):
         is_prepare_dataset_cmd = 'prepare_dataset' in commands.get_cmd_str(
             cmd_idx)
 
+        is_perf_sanity_test = "perf_sanity" in full_test_name
+
         # Start the timer.
         self._start_timestamp = datetime.utcnow()
         try:
@@ -460,7 +463,8 @@ class AbstractPerfScriptTestClass(abc.ABC):
                 # Capture the stdout from _gpu_clock_lock because the pipeline JUnit update script tries to parse
                 # the log to find the GPU clocks.
                 with io.StringIO() as buf:
-                    if self._gpu_clock_lock:
+                    # Perf-sanity test doesn't lock gpu clock
+                    if self._gpu_clock_lock and not is_perf_sanity_test:
                         # Lock GPU clock and start monitoring.
                         with contextlib.redirect_stdout(
                                 buf), self._gpu_clock_lock, tmpDir:

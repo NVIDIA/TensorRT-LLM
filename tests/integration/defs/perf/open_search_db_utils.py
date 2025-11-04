@@ -20,6 +20,7 @@ import os
 import re
 import sys
 import time
+from datetime import datetime
 
 from defs.trt_test_alternative import print_info
 
@@ -31,40 +32,6 @@ from jenkins.scripts.open_search_db import OpenSearchDB
 
 PROJECT_ROOT = "sandbox-temp-trtllm-ci-perf-v1"  # "sandbox-trtllm-ci-perf"
 TEST_INFO_PROJECT_NAME = f"{PROJECT_ROOT}-test_info"
-
-# Server config fields to compare
-SERVER_FIELDS = [
-    "s_model_name",
-    "l_gpus",
-    "l_tp",
-    "l_ep",
-    "l_pp",
-    "l_max_num_tokens",
-    "b_enable_chunked_prefill",
-    "b_disable_overlap_scheduler",
-    "s_attention_backend",
-    "s_moe_backend",
-    "l_moe_max_num_tokens",
-    "l_stream_interval",
-    "b_enable_attention_dp",
-    "b_attention_dp_balance",
-    "l_batching_wait_iters",
-    "l_timeout_iters",
-    "s_kv_cache_dtype",
-    "b_enable_block_reuse",
-    "d_free_gpu_memory_fraction",
-    "l_max_batch_size",
-    "b_enable_padding",
-]
-
-# Client config fields to compare
-CLIENT_FIELDS = [
-    "l_concurrency",
-    "l_iterations",
-    "l_isl",
-    "l_osl",
-    "d_random_range_ratio",
-]
 
 # Metrics where larger is better
 MAXIMIZE_METRICS = [
@@ -189,7 +156,7 @@ def get_job_info():
     }
 
 
-def query_history_data():
+def query_history_data(gpu_type):
     """
     Query post-merge data with specific gpu type and model name
     """
@@ -207,6 +174,16 @@ def query_history_data():
                     {
                         "term": {
                             "b_is_post_merge": True
+                        }
+                    },
+                    {
+                        "term": {
+                            "b_is_regression": False
+                        }
+                    },
+                    {
+                        "term": {
+                            "s_gpu_type": gpu_type
                         }
                     },
                     {
@@ -267,17 +244,32 @@ def match(history_data, new_data):
     """
     Check if the server and client config of history data matches the new data
     """
-    # Combine all fields to compare (excluding log links)
-    fields_to_compare = SERVER_FIELDS + CLIENT_FIELDS
 
     def is_empty(value):
         """Check if a value is empty (None, empty string, etc.)"""
         return value is None or value == ""
 
-    # Compare each field
-    for field in fields_to_compare:
-        history_value = history_data.get(field)
-        new_value = new_data.get(field)
+    def should_skip_field(field):
+        """Check if a field should be skipped in comparison"""
+        # Skip fields starting with @, _, ts_
+        if field.startswith('@') or field.startswith('_') or field.startswith(
+                'ts_'):
+            return True
+        # Skip log links and speculative_model_dir
+        if field in [
+                's_speculative_model_dir', 's_server_log_link',
+                's_client_log_link'
+        ]:
+            return True
+        return False
+
+    # Compare each field in new_data
+    for field, new_value in new_data.items():
+        # Skip excluded fields
+        if should_skip_field(field):
+            continue
+
+        history_value = history_data.get(field, None)
 
         # If both are empty, consider them equal
         if is_empty(history_value) and is_empty(new_value):
@@ -339,27 +331,44 @@ def calculate_best_perf_result(history_data_list, new_data):
     return best_metrics
 
 
-def get_history_data(new_data_dict):
+def get_history_data(new_data_dict, gpu_type):
     """
     Query history post-merge data for each cmd_idx
     """
+
+    def get_latest_data(data_list):
+        if not data_list:
+            return None
+        time_format = "%b %d, %Y @ %H:%M:%S.%f"
+        # Find the item with the maximum ts_created value
+        latest_data = max(
+            data_list,
+            key=lambda x: datetime.strptime(x["ts_created"], time_format))
+        return latest_data
+
     history_baseline_dict = {}
     history_data_dict = {}
     cmd_idxs = new_data_dict.keys()
     for cmd_idx in cmd_idxs:
         history_data_dict[cmd_idx] = []
-        history_baseline_dict[cmd_idx] = None
-    history_data_list = query_history_data()
+        history_baseline_dict[cmd_idx] = []
+    history_data_list = []
+    if cmd_idxs:
+        history_data_list = query_history_data(gpu_type)
     if history_data_list:
         for history_data in history_data_list:
             for cmd_idx in cmd_idxs:
                 if match(history_data, new_data_dict[cmd_idx]):
                     if history_data.get("b_is_baseline") and history_data.get(
                             "b_is_baseline") == True:
-                        history_baseline_dict[cmd_idx] = history_data
+                        history_baseline_dict[cmd_idx].append(history_data)
                     else:
                         history_data_dict[cmd_idx].append(history_data)
                     break
+    # Sometime database has several baselines and we only use the latest baseline one
+    for cmd_idx, baseline_list in history_baseline_dict.items():
+        latest_baseline = get_latest_data(baseline_list)
+        history_baseline_dict[cmd_idx] = latest_baseline
     return history_baseline_dict, history_data_dict
 
 
@@ -477,6 +486,8 @@ def post_new_perf_data(new_baseline_data_dict, new_data_dict,
     # Only post regressive test cases when post-merge.
     if new_baseline_data_dict:
         data_list.extend(regressive_data_list)
+    if not data_list:
+        return
     try:
         print_info(
             f"Ready to post {len(data_list)} data to {TEST_INFO_PROJECT_NAME}")
