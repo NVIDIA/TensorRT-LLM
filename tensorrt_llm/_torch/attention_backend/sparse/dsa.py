@@ -629,6 +629,7 @@ class Indexer(nn.Module):
         self.scale_fmt = "ue8m0"
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+        self.weight_scale_factor = self.softmax_scale * self.n_heads**-0.5
 
     @staticmethod
     def prepare_one_prefill_chunk(
@@ -1105,15 +1106,14 @@ class Indexer(nn.Module):
 
         return topk_indices_buffer
 
-    @torch.compile(mode="max-autotune", dynamic=True)
     def weight_scale(self, hidden_states: torch.Tensor,
                      indexer_weights: Optional[torch.Tensor],
                      q_scale: torch.Tensor) -> torch.Tensor:
         weights = indexer_weights if indexer_weights is not None else self.weights_proj(
             hidden_states)
-        weights = weights.unsqueeze(
-            -1) * q_scale * self.softmax_scale * self.n_heads**-0.5
-        weights = weights.squeeze(-1).to(torch.float32)
+        weights = weights.unsqueeze(-1) * q_scale * self.weight_scale_factor
+        # output weights is guaranteed to be float32 due to type promotion from q_scale (float32)
+        weights = weights.squeeze(-1)
         return weights
 
     @torch.inference_mode()
@@ -1183,7 +1183,6 @@ class Indexer(nn.Module):
         q_scale = q_scale.view(-1, self.n_heads, 1)
 
         weights = self.weight_scale(hidden_states, indexer_weights, q_scale)
-
         # Return topk indices buffer for sparse attention [num_tokens, index_topk]
         return self.sparse_attn_indexer(metadata, hidden_states, q_fp8, k_fp8,
                                         k_scale, weights)
