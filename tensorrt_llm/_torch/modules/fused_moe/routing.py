@@ -155,6 +155,18 @@ class RoutingMethodType(IntEnum):
     Unspecified = 5.
 
 
+class ActivationType(IntEnum):
+    Gelu = 0
+    Relu = 1
+    Silu = 2
+    Swiglu = 3
+    Geglu = 4
+    SwigluBias = 5
+    Relu2 = 6
+    Identity = 7
+    InvalidType = 8
+
+
 class BaseMoeRoutingMethod(nn.Module):
 
     def apply(self, _router_logits) -> (torch.Tensor, torch.Tensor):
