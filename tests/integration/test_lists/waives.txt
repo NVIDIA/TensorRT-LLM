@@ -388,3 +388,4 @@ accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_fp8_blockscale[baseline_
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_fp8_blockscale[baseline_fp8kv] SKIP (https://nvbugs/5630345,https://nvbugs/5629887)
 test_e2e.py::test_openai_chat_harmony SKIP (https://nvbugs/5596382)
 test_e2e.py::test_ptp_quickstart_multimodal_multiturn[phi4-multimodal-instruct-fp8-multimodals/Phi-4-multimodal-instruct-FP8] SKIP (https://nvbugs/5568836)
+disaggregated/test_auto_scaling.py::test_disagg_server_restart[etcd-round_robin] SKIP (https://nvbugs/5633340)
