@@ -178,13 +178,16 @@ class GuaranteedNoEvictScheduler(CapacityScheduler):
         self, active_requests: RequestList
     ) -> tuple[list[LlmRequest], list[LlmRequest]]:
         scheduled_requests = []
+        scheduled_disagg_gen_init_requests = []
         pending_requests = []
         reserved_blocks = 0
         max_blocks = self.kv_cache_manager.get_max_resource_count()
         for request in active_requests:
             req_state = request.state
             # if request cannot be scheduled yet or request should no longer be scheduled, skip
-            if req_state.value < self.no_schedule_until_state.value or req_state.value >= self.no_schedule_after_state.value:
+            if not req_state == LlmRequestState.DISAGG_GENERATION_INIT and (
+                    req_state.value < self.no_schedule_until_state.value
+                    or req_state.value >= self.no_schedule_after_state.value):
                 continue
 
             if len(scheduled_requests
@@ -192,6 +195,10 @@ class GuaranteedNoEvictScheduler(CapacityScheduler):
                 break
             elif req_state == LlmRequestState.GENERATION_IN_PROGRESS or req_state == LlmRequestState.GENERATION_TO_COMPLETE:
                 scheduled_requests.append(request)
+                reserved_blocks += self.kv_cache_manager.get_needed_resource_to_completion(
+                    request)
+            elif req_state == LlmRequestState.DISAGG_GENERATION_INIT:
+                scheduled_disagg_gen_init_requests.append(request)
                 reserved_blocks += self.kv_cache_manager.get_needed_resource_to_completion(
                     request)
             else:
@@ -212,10 +219,11 @@ class GuaranteedNoEvictScheduler(CapacityScheduler):
                     # If one requests fails to be scheduled, break
                     break
 
-        assert len(scheduled_requests) > 0, (
-            "no pending request can get enough resource to complete, "
-            "please increase KV cache pool size.")
-        return scheduled_requests, []
+        assert len(scheduled_requests) + len(
+            scheduled_disagg_gen_init_requests) > 0, (
+                "no pending request can get enough resource to complete, "
+                "please increase KV cache pool size.")
+        return scheduled_requests, scheduled_disagg_gen_init_requests, []
 
 
 class MicroBatchScheduler(ABC):

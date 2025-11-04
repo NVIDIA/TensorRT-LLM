@@ -542,6 +542,7 @@ class _KVCache:
         try:
             locks = batched_lock_to_gpu(self, tasks)
         except OutOfPagesError:
+            print("OutOfPagesError")
             return False
         for (ordinal, beam_idx, lc_idx), lock in zip(self._active_pages(), locks):
             beam_block = self._block(ordinal, beam_idx)

@@ -1705,6 +1705,15 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     tokens_per_block: int = Field(default=32,
                                   description="The number of tokens per block.")
 
+    use_kv_cache_manager_v2: bool = Field(
+        default=False, description="Whether to use the v2 KV cache.")
+
+    max_util_for_resume: float = Field(
+        default=0.9,
+        description=
+        "The maximum utilization of the KV cache for resume. Default is 90%. Only used when using KV cache manager v2."
+    )
+
     def _to_pybind(self):
         return _KvCacheConfig(
             enable_block_reuse=self.enable_block_reuse,

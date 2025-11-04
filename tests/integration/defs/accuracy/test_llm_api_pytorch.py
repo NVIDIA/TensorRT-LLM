@@ -4102,7 +4102,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         "apply_chat_template": True,
     }
 
-    MODEL_PATH = f"{llm_models_root()}/gpt_oss/gpt-oss-120b"
+    MODEL_PATH = f"openai/gpt-oss-120b"
 
     @pytest.mark.parametrize(
         "kv_cache_dtype",
@@ -4115,8 +4115,10 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("cuda_graph,overlap_scheduler", [
         (True, True),
     ])
+    @pytest.mark.parametrize("v2_kv_cache", [True, False],
+                             ids=["v2_kv_cache", "v1_kv_cache"])
     def test_w4_1gpu(self, kv_cache_dtype, moe_backend, cuda_graph,
-                     overlap_scheduler, mocker):
+                     overlap_scheduler, mocker, v2_kv_cache):
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})
@@ -4128,7 +4130,8 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
-                                        dtype=kv_cache_dtype)
+                                        dtype=kv_cache_dtype,
+                                        use_kv_cache_manager_v2=v2_kv_cache)
 
         llm = LLM(self.MODEL_PATH,
                   tensor_parallel_size=1,
@@ -4173,9 +4176,11 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("enable_configurable_moe", [0, 1],
                              ids=lambda x: ""
                              if x == 0 else "enable_configurable_moe")
+    @pytest.mark.parametrize("v2_kv_cache", [True, False],
+                             ids=["v2_kv_cache", "v1_kv_cache"])
     def test_w4_4gpus(self, kv_cache_dtype, moe_backend, tp_size, pp_size,
                       ep_size, attention_dp, cuda_graph, overlap_scheduler,
-                      enable_configurable_moe, mocker):
+                      enable_configurable_moe, mocker, v2_kv_cache):
         # Handle ENABLE_CONFIGURABLE_MOE environment variable
         if enable_configurable_moe == 1 and moe_backend not in [
                 "TRTLLM", "CUTLASS"
@@ -4211,7 +4216,8 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             moe_config=MoeConfig(backend=moe_backend))
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
-                                        dtype=kv_cache_dtype)
+                                        dtype=kv_cache_dtype,
+                                        use_kv_cache_manager_v2=v2_kv_cache)
 
         max_seq_len = MAX_INPUT_LEN + MAX_OUTPUT_LEN
         llm = LLM(self.MODEL_PATH,

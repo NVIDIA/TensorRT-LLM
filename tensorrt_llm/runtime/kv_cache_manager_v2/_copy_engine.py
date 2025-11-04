@@ -18,6 +18,7 @@ from ._utils import CachedCudaEvent, HomoTuple, HostMem, _unwrap, div_up, stream
 
 if "tensorrt_llm" in sys.modules:
     from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (  # noqa # type: ignore
+        BlockIndices,
         DiskAddress,
         DiskToDiskTask,
         DiskToHostTask,
@@ -37,6 +38,7 @@ else:
     assert spec is not None and spec.origin is not None
     with DynamicPathManager(str(Path(spec.origin).parent.parent.parent)):
         from bindings.internal.batch_manager.kv_cache_manager_v2_utils import (  # noqa
+            BlockIndices,
             DiskAddress,
             DiskToDiskTask,
             DiskToHostTask,

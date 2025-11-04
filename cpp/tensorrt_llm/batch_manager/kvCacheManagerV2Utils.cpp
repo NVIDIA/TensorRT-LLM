@@ -1,11 +1,15 @@
 #include "tensorrt_llm/batch_manager/kvCacheManagerV2Utils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/memoryUtils.h"
 #include <cassert>
 #include <cstdio>
 #include <cuda.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <vector>
+
+namespace tc = tensorrt_llm::common;
+using namespace tensorrt_llm::runtime;
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -140,6 +144,54 @@ CUresult copyHostToHost(
 {
     auto const data = new UserData<MemAddress, MemAddress>{std::move(tasks), numBytes};
     return cuLaunchHostFunc(stream, hostFnHostToHostCopy, data);
+}
+
+SizeType32 IndexMapper::addNewSequence(LlmRequest::RequestIdType requestId)
+{
+    TLLM_CHECK(indexMap_.find(requestId) == indexMap_.end());
+    auto iter = freeIndices_.begin();
+    TLLM_CHECK_WITH_INFO(iter != freeIndices_.end(), "No free index found");
+    auto index = *iter;
+    freeIndices_.erase(iter);
+    indexMap_[requestId] = index;
+    return index;
+}
+
+SizeType32 IndexMapper::getIndex(LlmRequest::RequestIdType requestId)
+{
+    return indexMap_[requestId];
+}
+
+void IndexMapper::removeSequence(LlmRequest::RequestIdType requestId)
+{
+    auto iter = indexMap_.find(requestId);
+    TLLM_CHECK(iter != indexMap_.end());
+    auto index = iter->second;
+    freeIndices_.insert(index);
+    indexMap_.erase(iter);
+}
+
+at::Tensor IndexMapper::getCopyIndex(
+    std::vector<LlmRequest::RequestIdType> const& requestIds, SizeType32 numContext, SizeType32 beamWidth)
+{
+    int numSeqs = numContext + beamWidth * (requestIds.size() - numContext);
+    for (uint32_t i = 0, idx = 0; i < requestIds.size(); i++)
+    {
+        if (i < numContext)
+        {
+            copyIndex_[idx++] = indexMap_[requestIds[i]] * maxBeamWidth_;
+        }
+        else
+        {
+            for (uint32_t j = 0; j < beamWidth; j++)
+            {
+                copyIndex_[idx++] = indexMap_[requestIds[i]] * maxBeamWidth_ + j;
+            }
+        }
+    }
+
+    auto options = at::TensorOptions().dtype(at::ScalarType::Int).pinned_memory(true);
+    return at::from_blob(copyIndex_, numSeqs, options);
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

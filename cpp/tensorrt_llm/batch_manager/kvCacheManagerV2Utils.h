@@ -17,9 +17,19 @@
 
 #pragma once
 
+#include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/kernels/kvCacheIndex.h"
+#include "tensorrt_llm/runtime/iBuffer.h"
+#include "tensorrt_llm/runtime/iTensor.h"
+#include <ATen/ATen.h>
 #include <cstdint>
 #include <cuda.h>
+#include <set>
 #include <vector>
+
+namespace tk = tensorrt_llm::kernels;
+using SizeType32 = tensorrt_llm::runtime::SizeType32;
+using ITensor = tensorrt_llm::runtime::ITensor;
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -38,6 +48,43 @@ struct Task
     SrcAddr src;
 };
 
+struct BlockIndices
+{
+    MemAddress addr;
+    SizeType32 length;
+};
+
+using PackedInt = union
+{
+    int4 packed;
+    SizeType32 unpacked[4];
+};
+
+class IndexMapper
+{
+public:
+    IndexMapper(SizeType32 maxBatchSize, SizeType32 maxBeamWidth);
+
+    ~IndexMapper();
+
+    SizeType32 addNewSequence(LlmRequest::RequestIdType requestId);
+
+    SizeType32 getIndex(LlmRequest::RequestIdType requestId);
+
+    void removeSequence(LlmRequest::RequestIdType requestId);
+
+    at::Tensor getCopyIndex(
+        std::vector<LlmRequest::RequestIdType> const& requestIds, SizeType32 numContext, SizeType32 beamWidth);
+
+private:
+    std::unordered_map<LlmRequest::RequestIdType, SizeType32> indexMap_;
+    std::set<SizeType32> freeIndices_;
+    SizeType32* copyIndex_;
+    SizeType32 currentIndex_;
+    SizeType32 maxBatchSize_;
+    SizeType32 maxBeamWidth_;
+};
+
 CUresult copyDiskToDisk(
     std::vector<Task<DiskAddress, DiskAddress>> const& tasks, ssize_t numBytes, CUstream stream) noexcept;
 CUresult copyDiskToHost(
@@ -52,4 +99,8 @@ CUresult copyDeviceToHost(
     std::vector<Task<MemAddress, MemAddress>> const& tasks, ssize_t numBytes, CUstream stream) noexcept;
 CUresult copyDeviceToDevice(
     std::vector<Task<MemAddress, MemAddress>> const& tasks, ssize_t numBytes, CUstream stream) noexcept;
+
+void copyBatchBlockOffsetsToDevice(
+    ITensor const& input, ITensor& output, ITensor const& copyIndex, bool copyVIdx, CUstream stream) noexcept;
+
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

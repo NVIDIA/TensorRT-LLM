@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/nanobind/common/customCasters.h"
 #include <nanobind/nanobind.h>
 
 namespace nb = nanobind;
