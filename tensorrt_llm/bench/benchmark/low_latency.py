@@ -29,6 +29,9 @@ from tensorrt_llm.bench.benchmark.utils.general import (
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer,
                                            update_metadata_for_multimodal)
+from tensorrt_llm.bench.utils.scenario import (
+    auto_generate_dataset, extract_scenario_from_recipe,
+    merge_params_with_priority, prepare_llm_api_config_for_recipe)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -196,6 +199,46 @@ def latency_command(
     # Model, experiment, and engine params
     options = get_general_cli_options(params, bench_env)
 
+    # Scenario-based parameter detection and merging
+    extra_llm_api_options_path = params.get("extra_llm_api_options")
+    scenario = extract_scenario_from_recipe(extra_llm_api_options_path)
+
+    if scenario:
+        logger.info("Detected recipe format with scenario parameters")
+
+        # Define CLI defaults for merge priority detection
+        # Note: 'model' is excluded - it's a required top-level trtllm-bench parameter
+        cli_defaults = {
+            'concurrency': 1,  # Latency default is 1 (not -1 like throughput)
+            'target_input_len': None,
+            'target_output_len': None,
+            'num_requests': 0,
+            'tp': 1,
+            'pp': 1,
+            'ep': None,
+        }
+
+        # Merge CLI params with scenario (CLI explicitly set takes precedence)
+        merged_params = merge_params_with_priority(params, scenario,
+                                                   cli_defaults)
+
+        # Update params with merged values
+        params.update(merged_params)
+
+        # Auto-generate dataset if not provided
+        if params.get("dataset") is None and scenario.get(
+                'target_isl') and scenario.get('target_osl'):
+            logger.info(
+                "No dataset provided, auto-generating from scenario parameters")
+            workspace = Path.cwd() / ".trtllm_bench_workspace"
+            auto_dataset_path = auto_generate_dataset(
+                scenario, workspace, tokenizer=str(options.checkpoint_path))
+            params["dataset"] = auto_dataset_path
+            logger.info(f"Generated dataset at {auto_dataset_path}")
+
+            # Update options with auto-generated dataset
+            options = get_general_cli_options(params, bench_env)
+
     # Speculative Decode Options
     medusa_choices = params.get("medusa_choices")
     # Initialize the HF tokenizer for the specified model.
@@ -274,7 +317,10 @@ def latency_command(
     exec_settings["performance_options"]["cuda_graphs"] = True
     exec_settings["performance_options"]["multi_block_mode"] = True
 
-    exec_settings["extra_llm_api_options"] = params.get("extra_llm_api_options")
+    # Process recipe format if detected - extract llm_api_config only
+    extra_llm_api_options_path = params.get("extra_llm_api_options")
+    exec_settings["extra_llm_api_options"] = prepare_llm_api_config_for_recipe(
+        extra_llm_api_options_path, scenario)
 
     # Decoding Options
     if medusa_choices is not None:

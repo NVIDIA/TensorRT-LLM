@@ -5,10 +5,14 @@ files and merge them with CLI parameters for trtllm-bench commands.
 """
 
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 import yaml
+
+from tensorrt_llm.logger import logger
 
 
 def extract_scenario_from_recipe(
@@ -159,6 +163,63 @@ def validate_scenario_params(scenario: Dict[str, Any]) -> None:
             raise ValueError(
                 f"num_requests must be positive, got: {scenario['num_requests']}"
             )
+
+
+def prepare_llm_api_config_for_recipe(
+        extra_llm_api_options_path: Optional[str],
+        scenario: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Prepare llm_api_config for LLM constructor when using recipe format.
+
+    When a recipe format is detected (scenario is not None), this function extracts
+    only the llm_api_config section and writes it to a temporary file. This prevents
+    the scenario section from being passed to the LLM constructor, which would cause
+    an "invalid argument" error.
+
+    Args:
+        extra_llm_api_options_path: Path to recipe/config YAML file
+        scenario: Scenario dict from recipe (None if not recipe format)
+
+    Returns:
+        Path to temporary file with llm_api_config (if recipe format), or
+        original path (if not recipe format), or None (if no path provided)
+
+    Example:
+        >>> scenario = extract_scenario_from_recipe("recipe.yaml")
+        >>> config_path = prepare_llm_api_config_for_recipe("recipe.yaml", scenario)
+        # config_path now points to temp file with only llm_api_config section
+    """
+    if extra_llm_api_options_path is None:
+        return None
+
+    # If not a recipe format, return original path
+    if scenario is None:
+        return extra_llm_api_options_path
+
+    # Recipe format detected - extract llm_api_config only
+    logger.info(
+        "Recipe format detected - extracting llm_api_config for LLM constructor"
+    )
+
+    try:
+        with open(extra_llm_api_options_path, 'r') as f:
+            full_recipe = yaml.safe_load(f)
+
+        # Extract only the llm_api_config section
+        llm_api_config_only = full_recipe.get('llm_api_config', {})
+
+        # Create temporary file with only llm_api_config
+        temp_fd, temp_path = tempfile.mkstemp(suffix='.yaml', text=True)
+        with os.fdopen(temp_fd, 'w') as f:
+            yaml.safe_dump(llm_api_config_only, f)
+
+        logger.info(
+            f"Created temporary config file with llm_api_config at: {temp_path}"
+        )
+        return temp_path
+
+    except (FileNotFoundError, yaml.YAMLError, KeyError) as e:
+        logger.warning(f"Failed to process recipe file for llm_api_config: {e}")
+        return extra_llm_api_options_path
 
 
 def auto_generate_dataset(

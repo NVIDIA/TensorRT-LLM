@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import sys
 from functools import partial
 from pathlib import Path
 
 import click
-import yaml
 from click_option_group import (MutuallyExclusiveOptionGroup, OptionGroup,
                                 optgroup)
 from huggingface_hub import snapshot_download
@@ -30,9 +28,9 @@ from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer,
                                            update_metadata_for_multimodal)
-from tensorrt_llm.bench.utils.scenario import (auto_generate_dataset,
-                                               extract_scenario_from_recipe,
-                                               merge_params_with_priority)
+from tensorrt_llm.bench.utils.scenario import (
+    auto_generate_dataset, extract_scenario_from_recipe,
+    merge_params_with_priority, prepare_llm_api_config_for_recipe)
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
@@ -443,24 +441,10 @@ def throughput_command(
     exec_settings["settings_config"]["dynamic_max_batch_size"] = True
 
     # LlmArgs
-    # If extra_llm_api_options is a recipe format, extract only llm_api_config section
+    # Process recipe format if detected - extract llm_api_config only
     extra_llm_api_options_path = params.pop("extra_llm_api_options")
-    if extra_llm_api_options_path and scenario:
-        # Recipe format detected - create temp file with only llm_api_config
-        import tempfile
-        with open(extra_llm_api_options_path, 'r') as f:
-            full_recipe = yaml.safe_load(f)
-
-        llm_api_config_only = full_recipe.get('llm_api_config', {})
-
-        # Write llm_api_config to a temporary file
-        temp_fd, temp_path = tempfile.mkstemp(suffix='.yaml', text=True)
-        with os.fdopen(temp_fd, 'w') as f:
-            yaml.safe_dump(llm_api_config_only, f)
-
-        exec_settings["extra_llm_api_options"] = temp_path
-    else:
-        exec_settings["extra_llm_api_options"] = extra_llm_api_options_path
+    exec_settings["extra_llm_api_options"] = prepare_llm_api_config_for_recipe(
+        extra_llm_api_options_path, scenario)
 
     exec_settings["iteration_log"] = options.iteration_log
 
