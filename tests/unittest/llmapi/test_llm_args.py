@@ -54,20 +54,16 @@ class TestYaml:
             dict_content = yaml.safe_load(f)
         return dict_content
 
-    # TODO
-    def test_update_llm_args_with_extra_dict_with_speculative_config(self):
+    def test_llm_args_yaml_with_speculative_config(self):
         yaml_content = """
 speculative_config:
     decoding_type: Lookahead
     max_window_size: 4
     max_ngram_size: 3
     """
-        dict_content = self._yaml_to_dict(yaml_content)
+        llm_args_dict = self._yaml_to_dict(yaml_content)
 
-        llm_args = TrtLlmArgs(model=llama_model_path)
-        llm_args_dict = update_llm_args_with_extra_dict(llm_args.model_dump(),
-                                                        dict_content)
-        llm_args = TrtLlmArgs(**llm_args_dict)
+        llm_args = TrtLlmArgs(model=llama_model_path, **llm_args_dict)
         assert llm_args.speculative_config.max_window_size == 4
         assert llm_args.speculative_config.max_ngram_size == 3
         assert llm_args.speculative_config.max_verification_set_size == 4
@@ -78,28 +74,21 @@ pytorch_backend_config: # this is deprecated
     max_num_tokens: 1
     max_seq_len: 1
 """
-        dict_content = self._yaml_to_dict(yaml_content)
+        llm_args_dict = self._yaml_to_dict(yaml_content)
 
-        llm_args = TrtLlmArgs(model=llama_model_path)
-        llm_args_dict = update_llm_args_with_extra_dict(llm_args.model_dump(),
-                                                        dict_content)
         with pytest.raises(ValueError):
-            llm_args = TrtLlmArgs(**llm_args_dict)
+            llm_args = TrtLlmArgs(model=llama_model_path, **llm_args_dict)
 
     def test_llm_args_with_build_config(self):
-        # build_config isn't a Pydantic
         yaml_content = """
 build_config:
     max_beam_width: 4
     max_batch_size: 8
     max_num_tokens: 256
     """
-        dict_content = self._yaml_to_dict(yaml_content)
+        llm_args_dict = self._yaml_to_dict(yaml_content)
 
-        llm_args = TrtLlmArgs(model=llama_model_path)
-        llm_args_dict = update_llm_args_with_extra_dict(llm_args.model_dump(),
-                                                        dict_content)
-        llm_args = TrtLlmArgs(**llm_args_dict)
+        llm_args = TrtLlmArgs(model=llama_model_path, **llm_args_dict)
         assert llm_args.build_config.max_beam_width == 4
         assert llm_args.build_config.max_batch_size == 8
         assert llm_args.build_config.max_num_tokens == 256
@@ -111,31 +100,24 @@ kv_cache_config:
     max_tokens: 1024
     max_attention_window: [1024, 1024, 1024]
     """
-        dict_content = self._yaml_to_dict(yaml_content)
+        llm_args_dict = self._yaml_to_dict(yaml_content)
 
-        llm_args = TrtLlmArgs(model=llama_model_path)
-        llm_args_dict = update_llm_args_with_extra_dict(llm_args.model_dump(),
-                                                        dict_content)
-        llm_args = TrtLlmArgs(**llm_args_dict)
+        llm_args = TrtLlmArgs(model=llama_model_path, **llm_args_dict)
         assert llm_args.kv_cache_config.enable_block_reuse == True
         assert llm_args.kv_cache_config.max_tokens == 1024
         assert llm_args.kv_cache_config.max_attention_window == [
             1024, 1024, 1024
         ]
 
-    # TODO
     def test_llm_args_with_pydantic_options(self):
         yaml_content = """
 max_batch_size: 16
 max_num_tokens: 256
 max_seq_len: 128
     """
-        dict_content = self._yaml_to_dict(yaml_content)
+        llm_args_dict = self._yaml_to_dict(yaml_content)
 
-        llm_args = TrtLlmArgs(model=llama_model_path)
-        llm_args_dict = update_llm_args_with_extra_dict(llm_args.model_dump(),
-                                                        dict_content)
-        llm_args = TrtLlmArgs(**llm_args_dict)
+        llm_args = TrtLlmArgs(model=llama_model_path, **llm_args_dict)
         assert llm_args.max_batch_size == 16
         assert llm_args.max_num_tokens == 256
         assert llm_args.max_seq_len == 128
@@ -524,36 +506,6 @@ class TestTrtLlmArgs:
 
         assert args.max_num_tokens == 16
         assert args.max_batch_size == 4
-
-    def test_model_dump_does_not_mutate_original(self):
-        """Test that model_dump() and update_llm_args_with_extra_dict don't mutate the original."""
-        # Create args with specific build_config values
-        build_config = BuildConfig(
-            max_batch_size=8,
-            max_num_tokens=256,
-        )
-        args = TrtLlmArgs(model=llama_model_path, build_config=build_config)
-
-        # Store original values
-        original_max_batch_size = args.build_config.max_batch_size
-        original_max_num_tokens = args.build_config.max_num_tokens
-
-        # Convert to dict and pass through update_llm_args_with_extra_dict with overrides
-        args_dict = args.model_dump()
-        extra_dict = {
-            "max_batch_size": 128,
-            "max_num_tokens": 1024,
-        }
-        updated_dict = update_llm_args_with_extra_dict(args_dict, extra_dict)
-
-        # Verify original args was NOT mutated
-        assert args.build_config.max_batch_size == original_max_batch_size
-        assert args.build_config.max_num_tokens == original_max_num_tokens
-
-        # Verify updated dict has new values
-        new_args = TrtLlmArgs(**updated_dict)
-        assert new_args.build_config.max_batch_size == 128
-        assert new_args.build_config.max_num_tokens == 1024
 
 
 class TestStrictBaseModelArbitraryArgs:

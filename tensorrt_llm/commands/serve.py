@@ -20,9 +20,7 @@ from tensorrt_llm._torch.auto_deploy.llm import LLM as AutoDeployLLM
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.executor.utils import LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
-from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
-                                 DynamicBatchConfig, KvCacheConfig,
-                                 SchedulerConfig)
+from tensorrt_llm.llmapi import BuildConfig
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole,
                                               extract_disagg_cluster_config,
@@ -74,76 +72,6 @@ def _signal_handler_cleanup_child(signum, frame):
     # Standard exit code for signal termination
     sys.exit(128 + signum)
 
-# TODO
-def get_llm_args(
-        model: str,
-        tokenizer: Optional[str] = None,
-        backend: str = "pytorch",
-        max_beam_width: int = BuildConfig.model_fields["max_beam_width"].
-    default,
-        max_batch_size: int = BuildConfig.model_fields["max_batch_size"].
-    default,
-        max_num_tokens: int = BuildConfig.model_fields["max_num_tokens"].
-    default,
-        max_seq_len: int = BuildConfig.model_fields["max_seq_len"].default,
-        tensor_parallel_size: int = 1,
-        pipeline_parallel_size: int = 1,
-        moe_expert_parallel_size: Optional[int] = None,
-        gpus_per_node: Optional[int] = None,
-        free_gpu_memory_fraction: float = 0.9,
-        num_postprocess_workers: int = 0,
-        trust_remote_code: bool = False,
-        reasoning_parser: Optional[str] = None,
-        fail_fast_on_attention_window_too_large: bool = False,
-        otlp_traces_endpoint: Optional[str] = None,
-        enable_chunked_prefill: bool = False,
-        **llm_args_extra_dict: Any):
-
-    if gpus_per_node is None:
-        gpus_per_node = device_count()
-        if gpus_per_node == 0:
-            raise ValueError("No GPU devices found on the node")
-    build_config = BuildConfig(max_batch_size=max_batch_size,
-                               max_num_tokens=max_num_tokens,
-                               max_beam_width=max_beam_width,
-                               max_seq_len=max_seq_len)
-    kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=free_gpu_memory_fraction, )
-
-    dynamic_batch_config = DynamicBatchConfig(
-        enable_batch_size_tuning=True,
-        enable_max_num_tokens_tuning=False,
-        dynamic_batch_moving_average_window=128)
-    scheduler_config = SchedulerConfig(
-        capacity_scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
-        dynamic_batch_config=dynamic_batch_config,
-    )
-    llm_args = {
-        "model": model,
-        "scheduler_config": scheduler_config,
-        "tokenizer": tokenizer,
-        "tensor_parallel_size": tensor_parallel_size,
-        "pipeline_parallel_size": pipeline_parallel_size,
-        "moe_expert_parallel_size": moe_expert_parallel_size,
-        "gpus_per_node": gpus_per_node,
-        "trust_remote_code": trust_remote_code,
-        "build_config": build_config,
-        "max_batch_size": max_batch_size,
-        "max_num_tokens": max_num_tokens,
-        "max_beam_width": max_beam_width,
-        "max_seq_len": max_seq_len,
-        "kv_cache_config": kv_cache_config,
-        "backend": backend,
-        "num_postprocess_workers": num_postprocess_workers,
-        "postprocess_tokenizer_dir": tokenizer or model,
-        "reasoning_parser": reasoning_parser,
-        "fail_fast_on_attention_window_too_large":
-        fail_fast_on_attention_window_too_large,
-        "otlp_traces_endpoint": otlp_traces_endpoint,
-        "enable_chunked_prefill": enable_chunked_prefill,
-    }
-
-    return llm_args, llm_args_extra_dict
 
 # TODO: this expects a dict!
 def launch_server(

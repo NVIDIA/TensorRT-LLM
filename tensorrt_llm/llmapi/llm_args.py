@@ -992,8 +992,9 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
     context_chunking_policy: Optional[ContextChunkingPolicy] = Field(
         default=None, description="The context chunking policy to use")
 
-    dynamic_batch_config: Optional[DynamicBatchConfig] = Field(
-        default=None, description="The dynamic batch config to use")
+    dynamic_batch_config: DynamicBatchConfig = Field(
+        default_factory=DynamicBatchConfig,
+        description="The dynamic batch config to use")
 
     def _to_pybind(self):
         return _SchedulerConfig(

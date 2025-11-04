@@ -406,6 +406,7 @@ def throughput_command(
 
     try:
         logger.info("Setting up throughput benchmark.")
+        # TODO this might need changes after updating get_llm_args below
         kwargs = kwargs | runtime_config.get_llm_args()
         kwargs['skip_tokenizer_init'] = not no_skip_tokenizer_init
         kwargs['backend'] = options.backend

@@ -286,6 +286,7 @@ def latency_command(
     runtime_config = RuntimeConfig(**exec_settings)
 
     llm = None
+    # TODO this might need changes after updating get_llm_args below
     kwargs = kwargs | runtime_config.get_llm_args()
     kwargs['backend'] = options.backend
 
