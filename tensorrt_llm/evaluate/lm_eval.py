@@ -236,7 +236,7 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
         output = trtllm_apply_chat_template(
             model_type=self.model_type,
             tokenizer=self.llm.tokenizer,
-            processor=self.llm.input_processor.processor,
+            processor=getattr(self.llm.input_processor, 'processor', None),
             conversation=chat_history,
             add_generation_prompt=add_generation_prompt,
             mm_placeholder_counts=mm_placeholder_counts,

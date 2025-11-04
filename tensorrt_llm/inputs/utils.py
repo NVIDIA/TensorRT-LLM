@@ -545,7 +545,7 @@ def apply_chat_template(
     processor: ProcessorMixin,
     conversation: list[ConversationMessage],
     add_generation_prompt: bool,
-    mm_placeholder_counts: dict[str, int],
+    mm_placeholder_counts: list[dict[str, int]],
     tools: Optional[list[dict[str, Any]]] = None,
     documents: Optional[list[dict[str, str]]] = None,
     chat_template: Optional[str] = None,
@@ -567,7 +567,7 @@ def apply_chat_template(
     if model_type in PLACEHOLDER_EXCEPTIONS:
         # flattened content do not work for these models, so go back to other formats as needed
         conversation = handle_placeholder_exceptions(model_type, conversation,
-                                                     [mm_placeholder_counts])
+                                                     mm_placeholder_counts)
 
     return tokenizer.apply_chat_template(
         conversation=conversation,
@@ -732,7 +732,7 @@ def default_multimodal_input_loader(
             processor=processor,
             conversation=[conv],
             add_generation_prompt=True,
-            mm_placeholder_counts=mm_placeholder_counts)
+            mm_placeholder_counts=[mm_placeholder_counts])
         input = {"prompt": prompt}
         if mm_placeholder_counts:
             if mm_embeddings is not None:
