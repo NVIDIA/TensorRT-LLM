@@ -1189,7 +1189,12 @@ TORCH_PYBIND11_ABI = None
 def torch_pybind11_abi() -> str:
     global TORCH_PYBIND11_ABI
     if TORCH_PYBIND11_ABI is None:
-        TORCH_PYBIND11_ABI = f"{torch._C._PYBIND11_COMPILER_TYPE}{torch._C._PYBIND11_STDLIB}{torch._C._PYBIND11_BUILD_ABI}"
+        if hasattr(torch._C, '_PYBIND11_COMPILER_TYPE'):
+            # Old pybind11 abi string before torch 2.9.0
+            TORCH_PYBIND11_ABI = f"{torch._C._PYBIND11_COMPILER_TYPE}{torch._C._PYBIND11_STDLIB}{torch._C._PYBIND11_BUILD_ABI}"
+        else:
+            # New pybind11 abi string since torch 2.9.0
+            TORCH_PYBIND11_ABI = f"system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_{int(torch.compiled_with_cxx11_abi())}"
     return TORCH_PYBIND11_ABI
 
 
