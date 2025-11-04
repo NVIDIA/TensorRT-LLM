@@ -1,8 +1,5 @@
 """
-AdapterSlotManager for CUDA Graph + multi LoRA support.
-
-This module manages adapter slots to enable CUDA Graph compatibility with multi-LoRA
-by maintaining a fixed number of slots for different LoRA adapters (task_ids).
+AdapterSlotManager for managing slots that stores LoRA indices.
 """
 
 from collections import OrderedDict
@@ -33,8 +30,7 @@ class AdapterSlotManager:
 
         # Slot management
         self.slot2task: List[Optional[int]] = [None] * max_lora_size
-        self.task2slot: OrderedDict[int,
-                                    int] = OrderedDict()  # represent LRU order
+        self.task2slot: OrderedDict[int, int] = OrderedDict()  # represent LRU order
 
         # State tracking
         self.slots_changed = False
@@ -49,7 +45,7 @@ class AdapterSlotManager:
         """
         Remove a task_id from slots. Return its slot_id if present otherwise return None.
         """
-        slot_id = self.task2slot.pop(task_id, default=None)
+        slot_id = self.task2slot.pop(task_id, None)
         if slot_id is not None:
             self.slots_changed = True
             self.slot2task[slot_id] = None
@@ -63,19 +59,16 @@ class AdapterSlotManager:
         """
         evicted_task = None
         if task_id in self.task2slot:
-            # logger.info(f"Task {task_id} already in slot {self.task2slot[task_id]}")
             self.task2slot.move_to_end(task_id)
         else:
             self.slots_changed = True
             if len(self.task2slot) < self.max_lora_size:
-                # logger.info(f"Task {task_id} assigned to new slot {len(self.task2slot)}")
                 free_slot = self.find_free_slot()
                 self.slot2task[free_slot] = task_id
                 self.task2slot[task_id] = free_slot
             else:
                 # evict lru
                 evicted_task, evicted_slot = self.task2slot.popitem(last=False)
-                # logger.info(f"Task {task_id} assigned to slot {evicted_slot} and evicted task {evicted_task}")
                 self.slot2task[evicted_slot] = task_id
                 self.task2slot[task_id] = evicted_slot
         return self.task2slot[task_id], evicted_task
@@ -89,8 +82,9 @@ class AdapterSlotManager:
                 if not peft_cache_manager.is_task_cached_device(task_id):
                     self.remove_task(task_id)
 
-    def update_slots(self, requests: RequestList,
-                     peft_cache_manager: PeftCacheManager) -> list[int]:
+    def update_slots(
+        self, requests: RequestList, peft_cache_manager: PeftCacheManager
+    ) -> list[int]:
         """
         Get slot mapping for all requests in a scheduled batch.
 
@@ -106,9 +100,9 @@ class AdapterSlotManager:
         # check if total number of unique tasks in the requests is not larger than max_lora_size
         tasks = [request.lora_task_id for request in requests]
         unique_tasks = {t for t in tasks if t is not None}
-        assert len(
-            unique_tasks
-        ) <= self.max_lora_size, "Currently do not support batch with more LoRA task ID than loRA slot size!"
+        assert len(unique_tasks) <= self.max_lora_size, (
+            "Currently do not support batch with more LoRA task ID than loRA slot size!"
+        )
 
         # assign slots to tasks
         for i, task in enumerate(tasks):

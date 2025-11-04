@@ -11,7 +11,7 @@ import zmq
 
 from tensorrt_llm.logger import logger
 
-from .._utils import mpi_comm, mpi_rank, nvtx_pytorch_emit
+from .._utils import mpi_comm, mpi_rank
 from ..bindings import executor as tllm
 from ..builder import Engine
 from ..llmapi.llm_args import BaseLlmArgs
@@ -224,7 +224,6 @@ class GenerationExecutorWorker(BaseWorker):
                 self.engine.wait_shutdown()
 
 
-@nvtx_pytorch_emit()
 @print_traceback_on_error
 def worker_main(
     engine: Path | Engine,

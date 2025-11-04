@@ -195,39 +195,20 @@ void lora_grouped_gemm_cuda_graph(th::Tensor const& lora_in_sizes, // [layer_mod
 
     sync_check_cuda_error(stream);
 
-    // Create reordered input buffer using gather operation with sorted_ids
-    // This replaces the physical reordering with efficient gather/scatter
-
-    // Create output tensor with same shape as output_buffer (not input!)
-    // This is necessary because LoRA output dimensions can differ from input dimensions
-    // (e.g., attention layers: input=hidden_dim, output=3*hidden_dim for q,k,v)
-
-    // Convert flattened pointer tensors to GPU pointer arrays for CUDA Graph compatible access (remove const for
-    // CUTLASS)
     auto* a_ptrs_gpu = reinterpret_cast<void**>(const_cast<void*>(a_offsets.data_ptr()));
     auto* d_ptrs_gpu = reinterpret_cast<void**>(const_cast<void*>(d_offsets.data_ptr()));
     auto* a_prime_ptrs_gpu = reinterpret_cast<void**>(const_cast<void*>(d_offsets.data_ptr()));
     auto* d_prime_ptrs_gpu = reinterpret_cast<void**>(const_cast<void*>(d_prime_offsets.data_ptr()));
 
-    // Step 3: Prepare GEMM problem sizes using CUDA Graph compatible operations
-    // The lora_in_sizes and lora_out_sizes tensors are already in cutlass::gemm::GemmCoord format
-    // (3 int32 values: m, n, k) and can be cast directly to the required pointer type
-
-    // Get GPU pointers to problem sizes tensors - these are stored in the correct format
     auto* problem_sizes_1_ptr = reinterpret_cast<cutlass::gemm::GemmCoord*>(lora_in_sizes.data_ptr());
     auto* problem_sizes_2_ptr = reinterpret_cast<cutlass::gemm::GemmCoord*>(lora_out_sizes.data_ptr());
 
     auto* host_max_in_sizes_ptr = reinterpret_cast<cutlass::gemm::GemmCoord*>(host_max_in_sizes.data_ptr());
     auto* host_max_out_sizes_ptr = reinterpret_cast<cutlass::gemm::GemmCoord*>(host_max_out_sizes.data_ptr());
 
-    // Step 4: Get weight pointers using CUDA Graph compatible operations
-    // The b_ptrs and b_prime_ptrs tensors already contain pointer values as int64
-    // Cast them directly to void* arrays for the GEMM kernels (remove const for CUTLASS compatibility)
-
     auto* b_ptrs_gpu = reinterpret_cast<void**>(const_cast<void*>(b_ptrs.data_ptr()));
     auto* b_prime_ptrs_gpu = reinterpret_cast<void**>(const_cast<void*>(b_prime_ptrs.data_ptr()));
 
-    // Step 4.5: Get precomputed leading dimension pointers for GEMM operations (remove const for CUTLASS compatibility)
     auto* lda_gpu = reinterpret_cast<int64_t*>(const_cast<void*>(lda.data_ptr()));
     auto* ldb_gpu = reinterpret_cast<int64_t*>(const_cast<void*>(ldb.data_ptr()));
     auto* ldd_gpu = reinterpret_cast<int64_t*>(const_cast<void*>(ldd.data_ptr()));
@@ -235,9 +216,6 @@ void lora_grouped_gemm_cuda_graph(th::Tensor const& lora_in_sizes, // [layer_mod
     auto* ldd_prime_gpu = reinterpret_cast<int64_t*>(const_cast<void*>(ldd_prime.data_ptr()));
 
     auto* splitk_offsets_gpu = reinterpret_cast<int64_t*>(const_cast<void*>(splitk_offsets.data_ptr()));
-
-    // Step 5: Direct CUTLASS grouped GEMM setup (no CuBLAS wrapper needed)
-    // The new CUDA Graph compatible implementation uses CUTLASS directly
 
     // Get data type
     nvinfer1::DataType loraRuntimeDataType;
@@ -250,8 +228,7 @@ void lora_grouped_gemm_cuda_graph(th::Tensor const& lora_in_sizes, // [layer_mod
 
     int const minKnInt = std::max(1, static_cast<int>(minKN));
 
-    // Step 6: Call CUDA Graph compatible grouped GEMM for lora_in (split-K)
-    // No parameter workspace needed - tensors are already on GPU
+    // Call CUDA Graph compatible grouped GEMM for lora_in (split-K)
     if (problem_count > 0)
     {
         TLLM_LOG_TRACE("Start Grouped GEMM for LoRA in.");
@@ -267,7 +244,7 @@ void lora_grouped_gemm_cuda_graph(th::Tensor const& lora_in_sizes, // [layer_mod
         sync_check_cuda_error(stream);
     }
 
-    // Step 7: Call CUDA Graph compatible grouped GEMM for lora_out
+    // Call CUDA Graph compatible grouped GEMM for lora_out
     if (problem_count > 0)
     {
         TLLM_LOG_TRACE("Start Grouped GEMM for LoRA out.");
@@ -338,7 +315,6 @@ void lora_group_gemm_param_fill_row_reorder_fusion(th::Tensor const& in_sizes, /
     int64_t const d_base_ptr = reinterpret_cast<int64_t>(intermediate_buffer.data_ptr());
     int64_t const d_prime_base_ptr = reinterpret_cast<int64_t>(output_buffer.data_ptr());
 
-    // Call the fused kernel
     tk::launchLoraGroupGEMMParamFillRowReorderFusion(reinterpret_cast<int32_t*>(const_cast<void*>(in_sizes.data_ptr())),
         reinterpret_cast<int32_t*>(const_cast<void*>(out_sizes.data_ptr())),
         reinterpret_cast<int64_t*>(const_cast<void*>(a_ptrs.data_ptr())),

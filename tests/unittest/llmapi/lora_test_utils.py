@@ -1,9 +1,9 @@
 import json
 import tarfile
 import tempfile
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import List, OrderedDict, Type
+from typing import List, Optional, OrderedDict, Tuple, Type, Union
 
 import pytest
 import torch
@@ -14,8 +14,8 @@ from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch.peft.lora.cuda_graph_lora_params import \
     CudaGraphLoraParams
 from tensorrt_llm._torch.peft.lora.layer import (GroupedGemmParamsInput,
-                                                 LoraLayer,
-                                                 compare_grouped_gemm_params)
+                                                 GroupedGemmParamsOutput,
+                                                 LoraLayer)
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.llmapi.llm import BaseLLM
 from tensorrt_llm.llmapi.llm_args import CudaGraphConfig
@@ -296,12 +296,12 @@ def create_mock_nemo_lora_checkpoint(
 
 @dataclass
 class CUDAGraphLoRATestParams:
-    batch_slot_ids: list[int]
+    batch_slot_ids: List[int]
     input_hidden_size: int
-    slot_ranks: list[int]
+    slot_ranks: List[int]
     max_lora_rank: int
-    output_hidden_sizes: list[int]
-    layer_module_mask: torch.Tensor | None | bool
+    output_hidden_sizes: List[int]
+    layer_module_mask: Optional[Union[torch.Tensor, bool]]
     dtype: torch.dtype
     seed: int
 
@@ -337,17 +337,19 @@ class CUDAGraphLoRATestParams:
 
 
 def create_grouped_gemm_params_filler_input(
-    test_params: CUDAGraphLoRATestParams = CUDAGraphLoRATestParams(
-        batch_slot_ids=[0, 3, 3, 4, 5, 8],
-        input_hidden_size=4096,
-        slot_ranks=[8, 12, 4, 3] * 2,
-        max_lora_rank=64,
-        output_hidden_sizes=[4096, 4096],
-        layer_module_mask=None,
-        dtype=torch.bfloat16,
-        seed=42,
-    ),
-) -> tuple[GroupedGemmParamsInput, LoraLayer]:
+    test_params: Optional[CUDAGraphLoRATestParams] = None
+) -> Tuple[GroupedGemmParamsInput, LoraLayer]:
+    if test_params is None:
+        test_params = CUDAGraphLoRATestParams(
+            batch_slot_ids=[0, 3, 3, 4, 5, 8],
+            input_hidden_size=4096,
+            slot_ranks=[8, 12, 4, 3] * 2,
+            max_lora_rank=64,
+            output_hidden_sizes=[4096, 4096],
+            layer_module_mask=None,
+            dtype=torch.bfloat16,
+            seed=42,
+        )
 
     with torch.random.fork_rng():
         torch.manual_seed(test_params.seed)
@@ -424,6 +426,109 @@ def create_grouped_gemm_params_filler_input(
         return inputs, layer
 
 
+class DelayedAssert:
+
+    def __init__(self, store_stack: bool = False):
+        self.assertions = []
+        self.store_stack = store_stack
+
+    def add(self, result: bool, msg: str):
+        import traceback
+        self.assertions.append(
+            (bool(result), str(msg), traceback.format_stack()))
+
+    def get_msg(self):
+        ret = ['Some assertions failed:']
+        for result, msg, stack in self.assertions:
+            ret.append('\n'.join([
+                f'Assert result: {result}', msg,
+                ''.join(stack) if self.store_stack else ''
+            ]))
+        ret = '\n-----------------------------------------\n'.join(ret)
+        ret = 'Some assertions failed:\n' + ret
+        return ret
+
+    def clear(self):
+        self.assertions.clear()
+
+    def assert_all(self):
+        assert all(ret[0] for ret in self.assertions), self.get_msg()
+        self.clear()
+
+
+def compare_grouped_gemm_params(
+    params: GroupedGemmParamsOutput,
+    ref: GroupedGemmParamsOutput,
+    params_input: GroupedGemmParamsInput,
+    params_to_store_msg: List[str] | None = ['splitk_offsets'],
+    params_exclude_msg: List[str] | None = None,
+):
+    assert not (params_to_store_msg and params_exclude_msg)
+
+    bs, input_hidden_size = params.reordered_input.shape
+    asserter = DelayedAssert()
+    params_dict = asdict(params)
+    ref_dict = asdict(ref)
+
+    if not params_to_store_msg:
+        params_to_store_msg = set(params_dict.keys())
+    if params_exclude_msg:
+        for name in params_exclude_msg:
+            params_to_store_msg.discard(name)
+
+    def get_msg(name: str, v: torch.Tensor, ref_v: torch.Tensor):
+        is_get_msg = any(p in name or name in p for p in params_to_store_msg)
+        header = f"\n\n{name=}\n"
+        return f"{header} {v=}\n {ref_v=}\n diff:\n{v - ref_v}" if is_get_msg else header
+
+    for name in params_dict.keys():
+        v = params_dict[name]
+        ref_v = ref_dict[name]
+        if name not in ("reordered_input", "a_offset"):
+            asserter.add(
+                v.allclose(ref_v),
+                get_msg(name, v, ref_v),
+            )
+
+    # Test a_offset separately
+    offset = params.a_offset - params.reordered_input.data_ptr()
+    ref_offset = ref.a_offset - ref.reordered_input.data_ptr()
+    asserter.add(
+        (offset == ref_offset).all(),
+        # 'a_offset_fused',
+        get_msg("a_offset", offset, ref_offset))
+
+    # Test reordered_input separately
+    valid_row = params_input.slot_offsets_full[-1].cpu().item()
+    valid_rows = params.reordered_input[:valid_row]
+    ref_valid_rows = ref.reordered_input[:valid_row]
+    asserter.add(
+        valid_rows.allclose(ref_valid_rows),
+        get_msg(f"valid part({valid_row=}, {bs=}) of reordered_input",
+                valid_rows, ref_valid_rows))
+
+    # check intermediate buffer and output buffer are all zeros
+    asserter.add(
+        torch.all(params_input.intermediate_buffer == 0),
+        get_msg("intermediate buffer", params_input.intermediate_buffer, 0))
+    asserter.add(torch.all(params_input.output_buffer == 0),
+                 get_msg("output buffer", params_input.output_buffer, 0))
+
+    if valid_row < bs:
+        invalid_rows = params.reordered_input[valid_row:]
+        ref_invalid_rows = ref.reordered_input[valid_row:]
+        asserter.add(
+            torch.all(invalid_rows == 0),
+            get_msg("invalid part of reordered_input", invalid_rows,
+                    ref_invalid_rows))
+    else:
+        asserter.add(
+            True,
+            f"valid_row is full {valid_row=} v. bs: {params_dict['reordered_input'].shape[0]=}"
+        )
+    asserter.assert_all()
+
+
 def compare_cuda_graph_lora_params_filler(test_params: CUDAGraphLoRATestParams):
     grouped_gemm_params_filler_input, layer = create_grouped_gemm_params_filler_input(
         test_params)
@@ -432,7 +537,7 @@ def compare_cuda_graph_lora_params_filler(test_params: CUDAGraphLoRATestParams):
 
     assert torch.all(
         grouped_gemm_params_filler_input.intermediate_buffer == 0
-    ), f"intermediate_buffer is not all zeros: {grouped_gemm_params_filler_input.intermediate_buffer}; non zero / zeros: {(grouped_gemm_params_filler_input.output_buffer != 0).sum()} / {grouped_gemm_params_filler_input.output_buffer.numel()}"
+    ), f"intermediate_buffer is not all zeros: {grouped_gemm_params_filler_input.intermediate_buffer}; non zero / zeros: {(grouped_gemm_params_filler_input.intermediate_buffer != 0).sum()} / {grouped_gemm_params_filler_input.intermediate_buffer.numel()}"
     assert torch.all(
         grouped_gemm_params_filler_input.output_buffer == 0
     ), f"output_buffer is not all zeros: {grouped_gemm_params_filler_input.output_buffer}; non zero / zeros: {(grouped_gemm_params_filler_input.output_buffer != 0).sum()} / {grouped_gemm_params_filler_input.output_buffer.numel()}"

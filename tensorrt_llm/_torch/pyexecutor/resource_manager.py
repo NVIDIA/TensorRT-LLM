@@ -329,9 +329,6 @@ class KVCacheManager(BaseResourceManager):
         # Note that this stream is unused for now. Will be used for copying to host
         # when that feature is enabled.
         self._stream = torch.cuda.Stream()
-        print(
-            f'kv cache manager stream: {self._stream}: {self._stream.cuda_stream}'
-        )
         kwargs = {
             'num_kv_heads_per_layer': self.num_kv_heads_per_layer,
             'size_per_head': head_dim,
