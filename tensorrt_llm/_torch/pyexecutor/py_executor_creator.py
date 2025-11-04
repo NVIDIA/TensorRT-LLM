@@ -1,5 +1,6 @@
 import copy
 import enum
+import gc
 import importlib
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -600,6 +601,8 @@ def create_py_executor(
     with mem_monitor.observe_creation_stage(
             _ExecutorCreationStage.INIT_EXTRA_RESOURCES
             if estimating_kv_cache else _ExecutorCreationStage.EXTRA_RESOURCES):
+        # run gc.collect() to free memory of the previous py_executor, avoid cudaFree overlap with cuda graph capture
+        gc.collect()
         py_executor = create_py_executor_instance(
             dist=dist,
             resources=resources,
