@@ -1,11 +1,15 @@
 import bisect
 import contextlib
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
 
+from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
+from tensorrt_llm.mapping import Mapping
+
 from ...inputs.multimodal import MultimodalParams
+from ..distributed import MPIDist
 from ..expert_statistic import ExpertStatistic
 from ..memory_buffer_utils import get_memory_buffers
 from ..modules.multi_stream_utils import with_multi_stream
@@ -14,11 +18,6 @@ from ..utils import make_weak_ref, piecewise_cuda_graph
 from .resource_manager import (BaseResourceManager, ResourceManager,
                                ResourceManagerType)
 from .scheduler import ScheduledRequests
-
-if TYPE_CHECKING:
-    from ..distributed import MPIDist
-    from ..mapping import Mapping
-    from ..speculative import DecodingBaseConfig
 
 # A large prime number used for dummy request IDs to avoid collisions
 CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 64) - 1
@@ -33,7 +32,7 @@ class CUDAGraphRunnerConfig:
     max_cuda_graph_batch_size: int
     max_beam_width: int
     max_num_tokens: int
-    spec_config: Optional["DecodingBaseConfig"]
+    spec_config: Optional[DecodingBaseConfig]
     cuda_graph_mem_pool: Any
     use_mrope: bool
     original_max_draft_len: int
@@ -41,8 +40,8 @@ class CUDAGraphRunnerConfig:
     is_draft_model: bool
     enable_attention_dp: bool
     batch_size: int
-    mapping: Optional["Mapping"]
-    dist: Optional["MPIDist"]
+    mapping: Optional[Mapping]
+    dist: Optional[MPIDist]
     kv_cache_manager_key: Any
 
 
@@ -135,14 +134,16 @@ class CUDAGraphRunner:
         self.clear()
 
     def maybe_get_cuda_graph(
-            self,
-            batch: ScheduledRequests,
-            iter_counter: int,
-            enable_spec_decode: bool,
-            attn_metadata: Any,
-            spec_metadata: Optional[Any],
-            draft_tokens_cuda: torch.Tensor,
-            spec_resource_manager: Optional[BaseResourceManager] = None):
+        self,
+        batch: ScheduledRequests,
+        iter_counter: int,
+        enable_spec_decode: bool,
+        attn_metadata: Any,
+        spec_metadata: Optional[Any] = None,
+        draft_tokens_cuda: Optional[torch.Tensor] = None,
+        spec_resource_manager: Optional[BaseResourceManager] = None,
+    ) -> Tuple[bool, Optional[Any], Optional[Any], Optional[Tuple[int, int,
+                                                                  bool]]]:
         """
         Determines if the current batch can be run with a CUDA graph.
 
