@@ -568,10 +568,8 @@ class AllReduce(nn.Module):
             strategy (AllReduceStrategy):
                 The following all-reduce strategies are supported:
 
-                - SYMM_MEM: Uses PyTorch's symmetric memory with MULTIMEM hardware instructions (H100+).
-                  Provides 3x faster performance on supported configurations (4/6/8 GPUs on H100).
-                  Currently only supports plain allreduce (NONE fusion op). Falls back automatically
-                  if not supported.
+                - SYMM_MEM: Uses PyTorch's symmetric memory with MULTIMEM hardware instructions.
+                  Falls back automatically if not supported.
 
                 - UB: AllReduce uses user-buffer based all-reduce kernel.
 
@@ -621,7 +619,7 @@ class AllReduce(nn.Module):
                     allocate_low_presicion_allreduce_workspace(self.mapping)
                 self.workspace = get_allreduce_workspace(self.mapping)
 
-            # Initialize Symmetric Memory AllReduce if needed (H100+ hardware acceleration)
+            # Initialize Symmetric Memory AllReduce if needed
             if self.strategy in (AllReduceStrategy.AUTO,
                                  AllReduceStrategy.SYMM_MEM):
                 try:
@@ -702,7 +700,7 @@ class AllReduce(nn.Module):
         if all_reduce_params is None:
             all_reduce_params = AllReduceParams()
 
-        # Try Symmetric Memory AllReduce first if available (H100+ hardware acceleration)
+        # Try Symmetric Memory AllReduce first if available
         # Note: Currently only supports NONE fusion op (plain allreduce)
         if self.symm_mem_allreduce and all_reduce_params.fusion_op == AllReduceFusionOp.NONE:
             symm_mem_output = self.symm_mem_allreduce(input)

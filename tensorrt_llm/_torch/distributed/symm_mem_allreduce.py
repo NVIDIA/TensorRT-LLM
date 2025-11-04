@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """
-Symmetric Memory AllReduce for H100+ GPUs
+Symmetric Memory AllReduce
 
 This module provides PyTorch Symmetric Memory-based allreduce operations,
-leveraging H100's MULTIMEM hardware instructions for 3x faster performance
-compared to custom CUDA kernels on supported configurations.
+leveraging MULTIMEM hardware instructions.
 """
 
 from typing import Optional
@@ -19,6 +18,7 @@ from tensorrt_llm.mapping import Mapping
 
 try:
     import torch.distributed._symmetric_memory as torch_symm_mem
+
     SYMM_MEM_AVAILABLE = True
 except ImportError:
     SYMM_MEM_AVAILABLE = False
@@ -30,21 +30,18 @@ except ImportError:
 class SymmetricMemoryAllReduce(nn.Module):
     """
     AllReduce implementation using PyTorch's symmetric memory operations.
-
-    This leverages H100's MULTIMEM hardware instructions for significantly faster
-    allreduce operations compared to software implementations.
+    This leverages MULTIMEM hardware instructions for faster allreduce operations.
 
     Supported configurations (world_size):
-    - SM 9.0 (H100): 4, 6, 8 GPUs
-    - SM 10.0 (future): 6, 8 GPUs
+    - SM 9.0: 4, 6, 8 GPUs
+    - SM 10.0: 6, 8 GPUs
 
-    Based on vLLM's implementation but integrated into TensorRT-LLM.
     """
 
     # World sizes that support MULTIMEM instructions
     _WORLD_SIZES_MULTIMEM = {
-        "9.0": [4, 6, 8],  # H100
-        "10.0": [6, 8],  # Future architectures
+        "9.0": [4, 6, 8],
+        "10.0": [6, 8],
     }
 
     # Maximum buffer sizes for symmetric memory (bytes)
@@ -57,7 +54,7 @@ class SymmetricMemoryAllReduce(nn.Module):
         "10.0": {
             6: 8 * 1024 * 1024,
             8: 6 * 1024 * 1024,
-        }
+        },
     }
 
     def __init__(
@@ -74,8 +71,7 @@ class SymmetricMemoryAllReduce(nn.Module):
         self.world_size = mapping.tp_size
 
         if not SYMM_MEM_AVAILABLE:
-            logger.warning(
-                "SymmetricMemoryAllReduce: PyTorch symm_mem not available")
+            logger.warning("SymmetricMemoryAllReduce: PyTorch symm_mem not available")
             return
 
         if not torch.cuda.is_available():
@@ -97,7 +93,8 @@ class SymmetricMemoryAllReduce(nn.Module):
         if self.world_size not in self._MAX_SIZES[self.device_capability]:
             logger.info(
                 f"SymmetricMemoryAllReduce: World size {self.world_size} not supported "
-                f"for SM {self.device_capability}")
+                f"for SM {self.device_capability}"
+            )
             return
 
         # Get max buffer size for this configuration
@@ -109,17 +106,13 @@ class SymmetricMemoryAllReduce(nn.Module):
             # For TP parallelism, we need ranks [0, 1, 2, ..., tp_size-1] globally
             # NOT starting from tp_rank!
             if not dist.is_initialized():
-                logger.warning(
-                    "SymmetricMemoryAllReduce: torch.distributed not initialized"
-                )
+                logger.warning("SymmetricMemoryAllReduce: torch.distributed not initialized")
                 self.disabled = True
                 return
 
-            # Assume contiguous TP ranks for now
-            # TODO: Get actual TP group from mapping if available
-            tp_group_ranks = list(range(mapping.tp_size))
-            self.group = dist.new_group(tp_group_ranks) if len(
-                tp_group_ranks) > 1 else None
+            # Get actual TP group ranks from mapping
+            tp_group_ranks = mapping.tp_group()
+            self.group = dist.new_group(tp_group_ranks) if len(tp_group_ranks) > 1 else None
         else:
             self.group = group
 
@@ -136,8 +129,7 @@ class SymmetricMemoryAllReduce(nn.Module):
                 dtype=self.dtype,
             )
             # Pass group_name (string) not the group object
-            handle = torch_symm_mem.rendezvous(self.buffer,
-                                               self.group.group_name)
+            handle = torch_symm_mem.rendezvous(self.buffer, self.group.group_name)
 
             if handle.multicast_ptr == 0:
                 logger.warning(
@@ -145,21 +137,30 @@ class SymmetricMemoryAllReduce(nn.Module):
                 )
                 return
 
-            # Determine which algorithm to use
-            self.use_multimem = (self.world_size
-                                 in self._WORLD_SIZES_MULTIMEM.get(
-                                     self.device_capability, []))
+            # Only enable if MULTIMEM is supported
+            # Otherwise, no benefit over existing TensorRT-LLM strategies
+            use_multimem = self.world_size in self._WORLD_SIZES_MULTIMEM.get(
+                self.device_capability, []
+            )
+
+            if not use_multimem:
+                logger.info(
+                    f"SymmetricMemoryAllReduce: MULTIMEM not supported for "
+                    f"world_size={self.world_size}, SM={self.device_capability}. "
+                    f"Falling back to standard allreduce strategies."
+                )
+                return
 
             self.disabled = False
-            logger.info(f"SymmetricMemoryAllReduce initialized: "
-                        f"world_size={self.world_size}, "
-                        f"max_size={self.max_size}, "
-                        f"SM={self.device_capability}, "
-                        f"use_multimem={self.use_multimem}")
+            logger.info(
+                f"SymmetricMemoryAllReduce (MULTIMEM) initialized: "
+                f"world_size={self.world_size}, "
+                f"max_size={self.max_size}, "
+                f"SM={self.device_capability}"
+            )
 
         except Exception as e:
-            logger.warning(
-                f"SymmetricMemoryAllReduce initialization failed: {e}")
+            logger.warning(f"SymmetricMemoryAllReduce initialization failed: {e}")
             return
 
     def should_use_symm_mem(self, inp: torch.Tensor) -> bool:
@@ -197,25 +198,16 @@ class SymmetricMemoryAllReduce(nn.Module):
             out = torch.empty_like(inp)
 
         # Copy input to symmetric memory buffer
-        self.buffer[:inp.numel()].copy_(inp.view(-1))
+        self.buffer[: inp.numel()].copy_(inp.view(-1))
 
-        # Perform allreduce using appropriate algorithm
-        if self.use_multimem:
-            # Use MULTIMEM hardware instructions (faster)
-            torch.ops.symm_mem.multimem_all_reduce_(
-                self.buffer[:inp.numel()],
-                "sum",
-                self.group.group_name,
-            )
-        else:
-            # Use two-shot algorithm (fallback)
-            torch.ops.symm_mem.two_shot_all_reduce_(
-                self.buffer[:inp.numel()],
-                "sum",
-                self.group.group_name,
-            )
+        # Perform MULTIMEM allreduce
+        torch.ops.symm_mem.multimem_all_reduce_(
+            self.buffer[: inp.numel()],
+            "sum",
+            self.group.group_name,
+        )
 
         # Copy result back
-        out.copy_(self.buffer[:inp.numel()].view(out.shape))
+        out.copy_(self.buffer[: inp.numel()].view(out.shape))
 
         return out
