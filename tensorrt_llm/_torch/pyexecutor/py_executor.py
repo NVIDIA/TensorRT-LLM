@@ -1696,7 +1696,7 @@ class PyExecutor:
                 )
                 req.py_kv_transfer_timed_out = True
 
-        for req, _ in self.ctx_in_transmission_requests:
+        for req, _, _ in self.ctx_in_transmission_requests.values():
             flag_if_kv_transfer_timed_out(req, "context")
 
         for req in self.active_requests:
