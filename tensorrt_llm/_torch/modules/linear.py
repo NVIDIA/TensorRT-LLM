@@ -745,27 +745,49 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
 
 
 class NVFP4LinearMethod(LinearMethodBase):
+
     def weight_and_scale_maybe_pad(self,
                                    module: Linear,
                                    weight_scale: torch.Tensor,
                                    row_alignment: int = 32,
                                    col_alignment: int = 16) -> torch.Tensor:
-        # Weight may need padding because of the alignment requirement from torch.ops.trtllm.nvfp4_gemm
-        # Weight_scale should also need padding together with weight, and this padding should happen 
-        # before itself's padding.
+        """
+        Pad weight and weight_scale tensors to meet torch trtllm NVFP4 GEMM alignment requirements.
+
+        Args:
+            module: Linear module whose weight will be padded in-place
+            weight_scale: Weight scaling factors to pad
+            row_alignment: Required row alignment (default: 32)
+            col_alignment: Required column alignment (default: 16)
+
+        Returns:
+            Padded weight_scale tensor
+
+        Side effects:
+            Modifies module.weight Parameter in-place
+        """
+        # Pad weight to meet NVFP4 GEMM kernel alignment requirements
         row_pad_size = (row_alignment - module.weight.size(0)) % row_alignment
         col_pad_size = (col_alignment - module.weight.size(1)) % col_alignment
-        module.weight = Parameter(F.pad(module.weight, (0, col_pad_size, 0, row_pad_size), 
-                                  mode='constant', value=0),
+        module.weight = Parameter(F.pad(module.weight,
+                                        (0, col_pad_size, 0, row_pad_size),
+                                        mode='constant',
+                                        value=0),
                                   requires_grad=False)
         weight_col_size = module.weight.size(1)
-        assert (weight_col_size * 2) % module.scaling_vector_size == 0, f"weight column size after padding {weight_col_size} must be divisible by scaling_vector_size {module.scaling_vector_size}"
+        assert (
+            weight_col_size * 2
+        ) % module.scaling_vector_size == 0, f"weight column size after padding {weight_col_size} must be divisible by scaling_vector_size {module.scaling_vector_size}"
+        # Pad weight_scale to match padded weight dimensions
+        # Factor of 2 accounts for NVFP4 packing (2 FP4 values per byte)
         if row_pad_size != 0 or col_pad_size != 0:
-            weight_scale = F.pad(weight_scale, (0, (col_pad_size * 2) // module.scaling_vector_size, 0, row_pad_size),
-                                 mode='constant', value=0)
+            weight_scale = F.pad(weight_scale,
+                                 (0, (col_pad_size * 2) //
+                                  module.scaling_vector_size, 0, row_pad_size),
+                                 mode='constant',
+                                 value=0)
 
         return weight_scale
-
 
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
