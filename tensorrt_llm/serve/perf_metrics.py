@@ -1,3 +1,17 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 from collections import defaultdict, deque
 from typing import Any, Dict, List
@@ -63,7 +77,7 @@ class ClientMetricsCollector:
 class DisaggPerfMetricsCollector:
     def __init__(self, max_requests: int):
         self._max_requests = max_requests
-        self._keys = deque(maxlen=max_requests)
+        self._request_meteics = deque(maxlen=max_requests)
         self._server_metrics = defaultdict(dict)
         self._lock = asyncio.Lock()
         self._clients = []
@@ -80,7 +94,7 @@ class DisaggPerfMetricsCollector:
         server_first_token_time: float,
     ):
         async with self._lock:
-            self._keys.append(
+            self._request_meteics.append(
                 (
                     ctx_server,
                     gen_server,
@@ -98,7 +112,7 @@ class DisaggPerfMetricsCollector:
 
         return_metrics = []
         async with self._lock:
-            for server, metrics_data in perf_metrics:
+            for server, metrics_data in perf_metrics.items():
                 server_metrics = self._server_metrics[server]
                 # avoid metrics map inflation by limiting the number of requests to add
                 available_req_num = min(
@@ -118,7 +132,7 @@ class DisaggPerfMetricsCollector:
                 ctx_request_id,
                 server_arrival_time,
                 server_first_token_time,
-            ) in self.perf_metrics_keys:
+            ) in self._request_meteics:
                 gen_perf_metrics = self._server_metrics[gen_server].pop(ctx_request_id, None)
                 if gen_perf_metrics is None:
                     # generation not finished
@@ -144,11 +158,5 @@ class DisaggPerfMetricsCollector:
                         "gen_perf_metrics": gen_perf_metrics,
                     }
                 )
-            self.perf_metrics_keys = deque(remain_keys, maxlen=self.perf_metrics_max_requests)
+            self._request_meteics = deque(remain_keys, maxlen=self._max_requests)
         return return_metrics
-
-    def inc(self, metric: str, amount: int = 1):
-        self._counter_metrics[metric].inc(amount)
-
-    def observe(self, metric: str, value: float):
-        self._histogram_metrics[metric].observe(value)

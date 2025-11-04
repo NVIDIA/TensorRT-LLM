@@ -10,7 +10,7 @@ import uuid
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator
 from copy import copy
-from typing import Literal, Optional, OrderedDict, Union
+from typing import Any, Literal, Optional, OrderedDict, Union
 
 from openai.types.responses import (ResponseCompletedEvent,
                                     ResponseContentPartAddedEvent,
@@ -923,4 +923,5 @@ async def done_generator() -> AsyncGenerator[bytes, None]:
     yield "data: [DONE]\n\n".encode('utf-8')
 
 
-CompletionResponseGenerator = AsyncGenerator[bytes, None]
+UCompletionResponseOrGenerator = Union[UCompletionResponse,
+                                       AsyncGenerator[Any, None]]
