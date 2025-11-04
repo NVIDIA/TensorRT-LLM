@@ -29,32 +29,6 @@ set_value_in_command() {
     echo "$result"
 }
 
-if [ $SLURM_LOCALID -eq 0 ]; then
-    # save job ID in $jobWorkspace/slurm_job_id.txt for later job to retrieve
-    echo $SLURM_JOB_ID > $jobWorkspace/slurm_job_id.txt
-
-    wget -nv $llmTarfile
-    tar -zxf $tarName
-    which python3
-    python3 --version
-    apt-get install -y libffi-dev
-    nvidia-smi && nvidia-smi -q && nvidia-smi topo -m
-    if [[ $pytestCommand == *--run-ray* ]]; then
-        pip3 install ray[default]
-    fi
-    cd $llmSrcNode && pip3 install --retries 1 -r requirements-dev.txt
-    cd $resourcePathNode &&  pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl
-    git config --global --add safe.directory "*"
-    gpuUuids=$(nvidia-smi -q | grep "GPU UUID" | awk '{print $4}' | tr '\n' ',' || true)
-    hostNodeName="${HOST_NODE_NAME:-$(hostname -f || hostname)}"
-    echo "HOST_NODE_NAME = $hostNodeName ; GPU_UUIDS = $gpuUuids ; STAGE_NAME = $stageName"
-    touch install_lock.lock
-else
-    while [ ! -f install_lock.lock ]; do
-        sleep 5
-    done
-fi
-
 
 llmapiLaunchScript="$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"
 chmod +x $llmapiLaunchScript
@@ -97,7 +71,11 @@ echo "Full Command: $pytestCommand"
     done
  fi
 
-eval $pytestCommand
+if [ "$DISAGG_SERVER_IDX" = "DISAGG" ]; then
+    eval $pytestWithoutLLMAPILaunchCommand
+else
+    eval $pytestCommand
+fi
 echo "Rank${SLURM_PROCID} Pytest finished execution"
 
 if [ "$perfMode" = "true" ] && [[ "$stageName" != *Perf-Sanity* ]]; then

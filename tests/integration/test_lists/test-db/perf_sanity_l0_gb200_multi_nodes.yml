@@ -1,0 +1,33 @@
+version: 0.0.1
+perf_sanity_l0_gb200_multi_nodes:
+- condition:
+    ranges:
+      # 2 nodes with each node has 4 GPUs
+      system_gpu_count:
+        gte: 8
+        lte: 8
+    wildcards:
+      gpu:
+      - '*gb200*'
+    terms:
+      stage: pre_merge
+      backend: pytorch
+  tests:
+  - perf/test_perf.py::test_perf[perf_sanity_upload-l0_gb200_multi_nodes-r1_fp4_v2_dep8_mtp1]
+  - perf/test_perf.py::test_perf[perf_sanity_upload-l0_gb200_multi_nodes_disagg-r1_fp4_v2_dep8_mtp1]
+
+- condition:
+    ranges:
+      # 2 nodes with each node has 4 GPUs
+      system_gpu_count:
+        gte: 8
+        lte: 8
+    wildcards:
+      gpu:
+      - '*gb200*'
+    terms:
+      stage: post_merge
+      backend: pytorch
+  tests:
+  - perf/test_perf.py::test_perf[perf_sanity_upload-l0_gb200_multi_nodes-r1_fp4_v2_dep8_mtp1]
+  - perf/test_perf.py::test_perf[perf_sanity_upload-l0_gb200_multi_nodes_disagg-r1_fp4_v2_dep8_mtp1]
