@@ -6,13 +6,15 @@ The TensorRT-LLM recipe system provides optimized configurations for common infe
 
 The recipe system helps you:
 
-- **Generate optimized configurations** from high-level scenario constraints (model, GPU, ISL/OSL/concurrency)
+- **Generate optimized recipe files** from high-level scenario constraints (model, GPU, ISL/OSL/concurrency)
 - **Avoid manual tuning** of low-level parameters like EP_SIZE, MOE_BACKEND, DP_ATTENTION
 - **Ensure validated configurations** through CI-tested recipes
 
+**Note:** A recipe file is a comprehensive YAML containing `scenario`, `env`, and `config` sections. It serves as a complete deployment descriptor that can be used directly with `trtllm-bench` and `trtllm-serve`.
+
 ## Quick Start
 
-### Generate config from scenario parameters:
+### Generate recipe from scenario parameters:
 
 ```bash
 trtllm-configure \
@@ -22,15 +24,7 @@ trtllm-configure \
     --target-isl 8192 \
     --target-osl 1024 \
     --target-concurrency 256 \
-    --output config.yaml
-```
-
-### Use an existing recipe:
-
-```bash
-trtllm-configure \
-    --recipe tensorrt_llm/recipes/db/gptoss-fp4-h100-throughput.yaml \
-    --output config.yaml
+    --output recipe.yaml
 ```
 
 ## Profiles
@@ -128,25 +122,26 @@ Use `--no-validate` to skip validation if needed.
 
 ## Integration with trtllm-serve and trtllm-bench
 
-### Option 1: Use trtllm-configure to generate config (Traditional)
+### Option 1: Generate Recipe with trtllm-configure, then use with trtllm-bench
 
-Generate a config file, then use it with trtllm-serve:
+Generate a recipe file from scenario parameters, then benchmark with it:
 
 ```bash
-# Generate config
+# Generate recipe from scenario
 trtllm-configure \
-    --recipe tensorrt_llm/recipes/db/gptoss-fp4-h100-throughput.yaml \
-    --output config.yaml
+    --model nvidia/DeepSeek-R1-0528-FP4 \
+    --gpu B200 \
+    --num-gpus 8 \
+    --target-isl 8192 \
+    --target-osl 1024 \
+    --target-concurrency 256 \
+    --output my-recipe.yaml
 
-# Use with serve (set env vars manually)
-TRTLLM_ENABLE_PDL=1 NCCL_GRAPH_REGISTER=0 \
-    trtllm-serve openai/gpt-oss-120b \
-    --tp_size 8 --ep_size 8 \
-    --max_num_tokens 20000 \
-    --extra_llm_api_options config.yaml
+# Use with trtllm-bench (recommended)
+trtllm-bench --recipe my-recipe.yaml
 ```
 
-### Option 2: Use Recipe YAML Directly (New - Comprehensive)
+### Option 2: Use Existing Recipe YAML Directly (Comprehensive)
 
 **Recipe YAMLs can now be used directly** with `trtllm-serve` and `trtllm-bench` via `--extra_llm_api_options`:
 
