@@ -1065,5 +1065,3 @@ LLM.__doc__ = \
 
     Parameters:
 """ + TORCH_LLM_DOCSTRING
-
-# evidence: https://github.com/NVIDIA/TensorRT-LLM/issues/8223
