@@ -443,6 +443,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str):
             dtype=dtype,
             config=model_config,
         ).to(device)
+        mla.indexer = mla.mqa.indexer.to(device)
         mla_layers.append(mla)
 
     # Use the test layer
