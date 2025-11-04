@@ -1,0 +1,233 @@
+"""Utilities for extracting and processing recipe scenario parameters.
+
+This module provides functions to extract scenario information from recipe YAML
+files and merge them with CLI parameters for trtllm-bench commands.
+"""
+
+import json
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+import yaml
+
+
+def extract_scenario_from_recipe(
+        recipe_path: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Extract scenario section from a recipe YAML file.
+
+    Args:
+        recipe_path: Path to recipe YAML file, or None
+
+    Returns:
+        Dictionary containing scenario parameters, or None if not a recipe format
+        or if recipe_path is None
+
+    Example:
+        >>> scenario = extract_scenario_from_recipe("recipe.yaml")
+        >>> print(scenario['target_isl'])
+        8192
+    """
+    if recipe_path is None:
+        return None
+
+    try:
+        with open(recipe_path, 'r') as f:
+            loaded_data = yaml.safe_load(f)
+
+        # Check if this is a recipe format (has 'scenario' and 'llm_api_config' keys)
+        if isinstance(
+                loaded_data, dict
+        ) and 'scenario' in loaded_data and 'llm_api_config' in loaded_data:
+            return loaded_data['scenario']
+
+        return None
+    except (FileNotFoundError, yaml.YAMLError, KeyError):
+        return None
+
+
+def merge_params_with_priority(
+        cli_params: Dict[str, Any],
+        scenario: Optional[Dict[str, Any]],
+        cli_defaults: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Merge CLI parameters with scenario values, with CLI taking precedence.
+
+    Priority order (highest to lowest):
+    1. Explicitly set CLI parameters (different from default)
+    2. Scenario values from recipe
+    3. CLI default values
+
+    Args:
+        cli_params: Parameters from CLI arguments
+        scenario: Scenario dict from recipe (or None)
+        cli_defaults: Default values for CLI args (used to detect explicit values)
+
+    Returns:
+        Merged parameter dictionary
+
+    Example:
+        >>> cli = {'concurrency': 128, 'model': None}
+        >>> scenario = {'target_concurrency': 256, 'model': 'gpt-3'}
+        >>> defaults = {'concurrency': -1, 'model': None}
+        >>> merged = merge_params_with_priority(cli, scenario, defaults)
+        >>> print(merged['concurrency'])  # CLI explicitly set
+        128
+        >>> print(merged['model'])  # From scenario
+        'gpt-3'
+    """
+    if scenario is None:
+        return cli_params.copy()
+
+    merged = cli_params.copy()
+
+    # Mapping from scenario keys to CLI parameter keys
+    # Note: 'model' is excluded because it's a required top-level trtllm-bench parameter
+    param_mapping = {
+        'target_concurrency': 'concurrency',
+        'target_isl': 'target_input_len',
+        'target_osl': 'target_output_len',
+        'num_requests': 'num_requests',
+        'tp_size': 'tp',
+        'ep_size': 'ep',
+        'pp_size': 'pp',
+        'streaming': 'streaming',
+    }
+
+    for scenario_key, cli_key in param_mapping.items():
+        if scenario_key in scenario:
+            scenario_value = scenario[scenario_key]
+
+            # Check if CLI value was explicitly set (differs from default)
+            cli_value = cli_params.get(cli_key)
+            default_value = cli_defaults.get(cli_key) if cli_defaults else None
+
+            # Use scenario value if:
+            # 1. CLI value is None/not set, OR
+            # 2. CLI value equals the default (not explicitly set by user)
+            if cli_value is None or (default_value is not None
+                                     and cli_value == default_value):
+                merged[cli_key] = scenario_value
+
+    return merged
+
+
+def validate_scenario_params(scenario: Dict[str, Any]) -> None:
+    """Validate scenario parameters.
+
+    Args:
+        scenario: Scenario dictionary to validate
+
+    Raises:
+        ValueError: If scenario parameters are invalid
+    """
+    required_fields = [
+        'model', 'target_isl', 'target_osl', 'target_concurrency'
+    ]
+
+    # Check required fields
+    for field in required_fields:
+        if field not in scenario:
+            raise ValueError(f"Scenario missing required field: {field}")
+
+    # Validate numeric fields
+    if scenario['target_isl'] <= 0:
+        raise ValueError(
+            f"target_isl must be positive, got: {scenario['target_isl']}")
+
+    if scenario['target_osl'] <= 0:
+        raise ValueError(
+            f"target_osl must be positive, got: {scenario['target_osl']}")
+
+    if scenario['target_concurrency'] <= 0:
+        raise ValueError(
+            f"target_concurrency must be positive, got: {scenario['target_concurrency']}"
+        )
+
+    # Validate optional stdev fields
+    if 'isl_stdev' in scenario:
+        if scenario['isl_stdev'] < 0:
+            raise ValueError(
+                f"isl_stdev must be non-negative, got: {scenario['isl_stdev']}")
+
+    if 'osl_stdev' in scenario:
+        if scenario['osl_stdev'] < 0:
+            raise ValueError(
+                f"osl_stdev must be non-negative, got: {scenario['osl_stdev']}")
+
+    # Validate num_requests
+    if 'num_requests' in scenario:
+        if scenario['num_requests'] <= 0:
+            raise ValueError(
+                f"num_requests must be positive, got: {scenario['num_requests']}"
+            )
+
+
+def auto_generate_dataset(
+        scenario: Dict[str, Any],
+        workspace: Path,
+        tokenizer: str,
+        output_filename: str = "auto_generated_dataset.json") -> Path:
+    """Generate a synthetic dataset from scenario parameters.
+
+    Args:
+        scenario: Scenario dictionary with ISL/OSL/concurrency parameters
+        workspace: Workspace directory to write dataset
+        tokenizer: Tokenizer name or path for dataset generation
+        output_filename: Name of output dataset file
+
+    Returns:
+        Path to generated dataset file
+
+    Raises:
+        ValueError: If required scenario parameters are missing
+    """
+    validate_scenario_params(scenario)
+
+    dataset_path = workspace / output_filename
+
+    # Extract parameters
+    target_isl = scenario['target_isl']
+    target_osl = scenario['target_osl']
+    num_requests = scenario.get('num_requests', 512)
+    isl_stdev = scenario.get('isl_stdev', 0)
+    osl_stdev = scenario.get('osl_stdev', 0)
+
+    # Generate synthetic dataset using prepare_dataset.py logic
+    # For now, create a simple JSON format that benchmarks can consume
+    #
+    # TODO: This is a simplified implementation. In production, should either:
+    # 1. Call prepare_dataset.py as a subprocess
+    # 2. Import and use prepare_dataset.py's generation logic
+    # 3. Use the dataset generation utilities from benchmarks/cpp/
+
+    import numpy as np
+
+    requests = []
+    for i in range(num_requests):
+        # Generate input/output lengths with normal distribution
+        if isl_stdev > 0:
+            input_len = int(max(1, np.random.normal(target_isl, isl_stdev)))
+        else:
+            input_len = target_isl
+
+        if osl_stdev > 0:
+            output_len = int(max(1, np.random.normal(target_osl, osl_stdev)))
+        else:
+            output_len = target_osl
+
+        # Create request in format expected by benchmarks
+        request = {
+            "task_id": i,
+            "prompt": " ".join(["word"] * input_len),  # Placeholder tokens
+            "output_tokens": output_len,
+            "input_len": input_len,
+        }
+        requests.append(request)
+
+    # Write to JSON Lines file (one JSON object per line)
+    # This is the format expected by trtllm-bench
+    workspace.mkdir(parents=True, exist_ok=True)
+    with open(dataset_path, 'w') as f:
+        for request in requests:
+            f.write(json.dumps(request) + '\n')
+
+    return dataset_path

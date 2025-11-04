@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from functools import partial
 from pathlib import Path
 
 import click
+import yaml
 from click_option_group import (MutuallyExclusiveOptionGroup, OptionGroup,
                                 optgroup)
 from huggingface_hub import snapshot_download
@@ -28,6 +30,9 @@ from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer,
                                            update_metadata_for_multimodal)
+from tensorrt_llm.bench.utils.scenario import (auto_generate_dataset,
+                                               extract_scenario_from_recipe,
+                                               merge_params_with_priority)
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
@@ -302,6 +307,47 @@ def throughput_command(
     options: GeneralExecSettings = get_general_cli_options(params, bench_env)
     tokenizer = initialize_tokenizer(options.checkpoint_path)
 
+    # Scenario-based parameter detection and merging
+    extra_llm_api_options_path = params.get("extra_llm_api_options")
+    scenario = extract_scenario_from_recipe(extra_llm_api_options_path)
+
+    if scenario:
+        logger.info("Detected recipe format with scenario parameters")
+
+        # Define CLI defaults for merge priority detection
+        # Note: 'model' is excluded - it's a required top-level trtllm-bench parameter
+        cli_defaults = {
+            'concurrency': -1,
+            'target_input_len': None,
+            'target_output_len': None,
+            'num_requests': 0,
+            'tp': 1,
+            'pp': 1,
+            'ep': None,
+            'streaming': False,
+        }
+
+        # Merge CLI params with scenario (CLI explicitly set takes precedence)
+        merged_params = merge_params_with_priority(params, scenario,
+                                                   cli_defaults)
+
+        # Update params with merged values
+        params.update(merged_params)
+
+        # Auto-generate dataset if not provided
+        if params.get("dataset") is None and scenario.get(
+                'target_isl') and scenario.get('target_osl'):
+            logger.info(
+                "No dataset provided, auto-generating from scenario parameters")
+            workspace = Path.cwd() / ".trtllm_bench_workspace"
+            auto_dataset_path = auto_generate_dataset(
+                scenario, workspace, tokenizer=str(options.checkpoint_path))
+            params["dataset"] = auto_dataset_path
+            logger.info(f"Generated dataset at {auto_dataset_path}")
+
+            # Update options with auto-generated dataset
+            options = get_general_cli_options(params, bench_env)
+
     # Extract throughput-specific options not handled by GeneralExecSettings
     max_batch_size = params.get("max_batch_size")
     max_num_tokens = params.get("max_num_tokens")
@@ -397,7 +443,25 @@ def throughput_command(
     exec_settings["settings_config"]["dynamic_max_batch_size"] = True
 
     # LlmArgs
-    exec_settings["extra_llm_api_options"] = params.pop("extra_llm_api_options")
+    # If extra_llm_api_options is a recipe format, extract only llm_api_config section
+    extra_llm_api_options_path = params.pop("extra_llm_api_options")
+    if extra_llm_api_options_path and scenario:
+        # Recipe format detected - create temp file with only llm_api_config
+        import tempfile
+        with open(extra_llm_api_options_path, 'r') as f:
+            full_recipe = yaml.safe_load(f)
+
+        llm_api_config_only = full_recipe.get('llm_api_config', {})
+
+        # Write llm_api_config to a temporary file
+        temp_fd, temp_path = tempfile.mkstemp(suffix='.yaml', text=True)
+        with os.fdopen(temp_fd, 'w') as f:
+            yaml.safe_dump(llm_api_config_only, f)
+
+        exec_settings["extra_llm_api_options"] = temp_path
+    else:
+        exec_settings["extra_llm_api_options"] = extra_llm_api_options_path
+
     exec_settings["iteration_log"] = options.iteration_log
 
     # Construct the runtime configuration dataclass.

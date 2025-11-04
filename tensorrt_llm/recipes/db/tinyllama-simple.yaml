@@ -1,0 +1,32 @@
+# TinyLlama 1.1B FP16 Recipe - Simple Test Configuration
+#
+# This recipe provides minimal test settings for TinyLlama-1.1B
+# on RTX 3090 GPUs for quick validation.
+#
+# Based on perf sanity test configs with reduced parameters for stability.
+
+scenario:
+  model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+  num_gpus: 1
+  target_isl: 128
+  target_osl: 128
+  target_concurrency: 4
+  # Optional: Dataset generation parameters
+  isl_stdev: 0       # Input sequence length standard deviation (0 = exact)
+  osl_stdev: 0       # Output sequence length standard deviation (0 = exact)
+  num_requests: 32   # Number of requests for auto-generated dataset
+
+env:
+  TLLM_WORKER_USE_SINGLE_PROCESS: 1
+
+llm_api_config:
+  tensor_parallel_size: 1
+  max_batch_size: 64
+  max_num_tokens: 1024
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 32
+
+  kv_cache_config:
+    enable_block_reuse: false
+    free_gpu_memory_fraction: 0.7
