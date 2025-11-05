@@ -777,43 +777,72 @@ def _insert_tp_sharded_moe(
     args[4] = w2_list_sharded
     args[5] = w3_list_sharded
 
-    # Handle scales for quantized ops (apply same TP sharding)
-    # Scales follow same pattern as weights: w1/w3 use dim=0, w2 uses dim=1
-    scale_names = list(scale_names)
-    if scale_names:
-        for i, scale_name in enumerate(scale_names):
-            # Each scale_name corresponds to 3 args (w1, w2, w3 scales)
-            base_idx = 6 + i * 3  # scales start at arg index 6
+    # Handle quantization scales
+    # For FP8: input_scale, weight_scale are all scalars - no sharding needed
+    # For FP4: input_scale and alpha are scalars, but weight_scale is a 1D block-wise tensor
+    def shard_weight_scale_list(scale_list, weight_list, dim, args_idx):
+        """Shard a list of weight scales and update args"""
 
-            # w1 scales: shard dim 0
-            w1_scale_list = args[base_idx]
-            w1_scale_sharded = []
-            for scale_node in w1_scale_list:
-                sharded_scale = shard_weight_tensor(
-                    scale_node, dim=0, rank=rank, world_size=world_size
-                )
-                w1_scale_sharded.append(sharded_scale)
-            args[base_idx] = w1_scale_sharded
+        def shard_scale_buffer(scale_node, dim, rank, world_size, weight_shape):
+            """Shard a weight scale buffer and register load hook"""
+            scale_key = scale_node.target
+            scale_tensor = gm.get_buffer(scale_key)
 
-            # w2 scales: shard dim 1
-            w2_scale_list = args[base_idx + 1]
-            w2_scale_sharded = []
-            for scale_node in w2_scale_list:
-                sharded_scale = shard_weight_tensor(
-                    scale_node, dim=1, rank=rank, world_size=world_size
-                )
-                w2_scale_sharded.append(sharded_scale)
-            args[base_idx + 1] = w2_scale_sharded
+            # Shard the scale using block-wise quantization logic
+            sharded_scale = _shard_fp4_weight_scale(
+                scale_tensor, weight_shape, dim, rank, world_size
+            )
 
-            # w3 scales: shard dim 0
-            w3_scale_list = args[base_idx + 2]
-            w3_scale_sharded = []
-            for scale_node in w3_scale_list:
-                sharded_scale = shard_weight_tensor(
-                    scale_node, dim=0, rank=rank, world_size=world_size
+            # Update the buffer with sharded scale
+            modname, _, buffer_name = scale_key.rpartition(".")
+            gm.get_submodule(modname).register_buffer(buffer_name, sharded_scale)
+
+            # Register load hook for checkpoint loading
+            def load_hook(state_dict, prefix, *hook_args):
+                full_key = prefix + scale_key
+                if full_key in state_dict:
+                    state_dict[full_key] = _shard_fp4_weight_scale(
+                        state_dict[full_key], weight_shape, dim, rank, world_size
+                    )
+
+            gm._register_load_state_dict_pre_hook(load_hook)
+
+            return scale_node
+
+        if len(args) > args_idx and scale_list:
+            sharded = []
+            for scale_node, weight_node in zip(scale_list, weight_list):
+                weight_tensor = gm.get_parameter(weight_node.target)
+                sharded_scale = shard_scale_buffer(
+                    scale_node,
+                    dim=dim,
+                    rank=rank,
+                    world_size=world_size,
+                    weight_shape=weight_tensor.shape,
                 )
-                w3_scale_sharded.append(sharded_scale)
-            args[base_idx + 2] = w3_scale_sharded
+                sharded.append(sharded_scale)
+            args[args_idx] = sharded
+
+    scale_names_list = list(scale_names)
+    if scale_names_list:
+        # Check if this is FP4 (has 3 scale types: input_scale, weight_scale, alpha)
+        # or FP8 (has 2 scale types: input_scale, weight_scale)
+        is_fp4 = len(scale_names_list) == 3
+
+        if is_fp4:
+            # FP4 MoE has scales at indices 6-14:
+            # 6-8: w1, w2, w3 input_scale (scalars - skip)
+            # 9-11: w1, w2, w3 weight_scale (1D tensors - shard these)
+            # 12-14: w1, w2, w3 alpha (scalars - skip)
+            shard_weight_scale_list(args[9] if len(args) > 9 else None, w1_list, dim=0, args_idx=9)
+            shard_weight_scale_list(
+                args[10] if len(args) > 10 else None, w2_list, dim=1, args_idx=10
+            )
+            shard_weight_scale_list(
+                args[11] if len(args) > 11 else None, w3_list, dim=0, args_idx=11
+            )
+
+        # For FP8, all scales are scalars - no sharding needed
 
     node.args = tuple(args)
 
