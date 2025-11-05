@@ -303,7 +303,7 @@ std::shared_ptr<cublasHandle_t> getCublasHandle()
             logMemoryUsage("Creating cublas handle", ctx);
 
             auto handle = std::make_unique<cublasHandle_t>();
-            cublasStatus_t status = cublasCreate(handle.get());
+            auto status = cublasCreate(handle.get());
 
             if (status != CUBLAS_STATUS_SUCCESS)
             {
@@ -314,7 +314,7 @@ std::shared_ptr<cublasHandle_t> getCublasHandle()
         },
         [](cublasHandle_t* handle)
         {
-            cublasStatus_t status = cublasDestroy(*handle);
+            auto status = cublasDestroy(*handle);
             if (status != CUBLAS_STATUS_SUCCESS)
             {
                 TLLM_LOG_WARNING("Failed to destroy cublas handle. Status: %d", status);
@@ -334,7 +334,7 @@ std::shared_ptr<cublasLtHandle_t> getCublasLtHandle()
             logMemoryUsage("Creating cublasLt handle", ctx);
 
             auto handle = std::make_unique<cublasLtHandle_t>();
-            cublasStatus_t status = cublasLtCreate(handle.get());
+            auto status = cublasLtCreate(handle.get());
 
             if (status != CUBLAS_STATUS_SUCCESS)
             {
@@ -345,7 +345,7 @@ std::shared_ptr<cublasLtHandle_t> getCublasLtHandle()
         },
         [](cublasLtHandle_t* handle)
         {
-            cublasStatus_t status = cublasLtDestroy(*handle);
+            auto status = cublasLtDestroy(*handle);
             if (status != CUBLAS_STATUS_SUCCESS)
             {
                 TLLM_LOG_WARNING("Failed to destroy cublasLt handle. Status: %d", status);
