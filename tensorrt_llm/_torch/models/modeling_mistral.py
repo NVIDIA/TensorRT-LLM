@@ -226,7 +226,11 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
         trust_remote_code: bool = False,
         **kwargs,
     ):
-        super().__init__(**kwargs)
+        super().__init__(model_path=model_path,
+                         config=config,
+                         tokenizer=tokenizer,
+                         trust_remote_code=trust_remote_code,
+                         **kwargs)
         self._config = config
         self._dtype = self._config.torch_dtype
         self._tokenizer = tokenizer if tokenizer is not None else AutoTokenizer.from_pretrained(
