@@ -233,6 +233,12 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         if hasattr(model_config, "num_hidden_layers"):
             self._sharding_config["num_hidden_layers"] = model_config.num_hidden_layers
 
+        # Set MOE sharding strategy based on model architecture
+        # Mixtral uses TP for better performance; other models default to EP
+        if hasattr(model_config, "model_type") and model_config.model_type == "mixtral":
+            self._sharding_config["moe_sharding_strategy"] = "tp"
+            ad_logger.info("Detected Mixtral model: using TP sharding strategy for MoE")
+
     def get_quant_config(self) -> Dict:
         """Returns the quantization config for this model or an empty dict if not quantized."""
         if self._quant_config_reader is not None:

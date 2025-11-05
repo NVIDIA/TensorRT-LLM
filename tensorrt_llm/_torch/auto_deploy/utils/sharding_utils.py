@@ -585,17 +585,21 @@ class BMMShardingInfo(ShardingTransformInfo):
             gather_node.replace_input_with(gather_node, node)
 
 
-def _insert_sharded_moe(
+def _insert_ep_sharded_moe(
     gm: GraphModule,
     node: Node,
     rank: int,
     world_size: int,
     scale_names: Sequence[str] = (),
 ):
-    """Update the torch_moe node with sharded weight lists,
-    sharded `selected_experts` and `final_scales(router_logics)`.
-    Add an all_reduce node after the moe node.
+    """Update the torch_moe node with EP-sharded weight lists.
+
+    Expert Parallelism (EP): Partition experts across devices.
+    - Modifies selected_experts and final_scales for routing
+    - Each device gets a subset of experts (e.g., device 0: experts 0-3, device 1: experts 4-7)
+    - Adds all_reduce collective to combine results
     """
+
     scale_names = list(scale_names)
 
     num_experts = len(node.args[3])
@@ -664,6 +668,156 @@ def _insert_sharded_moe(
     node.args = tuple(args)
 
     # -- add an all_reduce node --
+    with gm.graph.inserting_after(node):
+        dist_node = gm.graph.call_function(
+            torch.ops.auto_deploy.torch_dist_all_reduce.default, args=(node,)
+        )
+        node.replace_all_uses_with(dist_node)
+        dist_node.replace_input_with(dist_node, node)
+
+
+def _insert_tp_sharded_moe(
+    gm: GraphModule,
+    node: Node,
+    rank: int,
+    world_size: int,
+    scale_names: Sequence[str] = (),
+):
+    """Apply TP-style sharding to MoE weights instead of EP expert partitioning
+
+    - Keep all experts on each device
+    - Shard weight dimensions:
+      - w1/w3: [num_experts, 2*intermediate_size//world_size, hidden_size]
+      - w2: [num_experts, hidden_size, intermediate_size//world_size]
+    - Registers load hooks so checkpoint loading works correctly
+    """
+
+    args = list(node.args)
+
+    # Get weight lists
+    w1_list = args[3]  # List of w1 weight nodes for all 8 experts
+    w2_list = args[4]  # List of w2 weight nodes for all 8 experts
+    w3_list = args[5]  # List of w3 weight nodes for all 8 experts
+
+    # Apply TP sharding to each expert's weights
+    def shard_weight_tensor(weight_node, dim, rank, world_size):
+        """Shard a weight tensor along specified dimension and register load hook"""
+        # Get the actual tensor and parameter key
+        weight_key = weight_node.target
+        weight_tensor = gm.get_parameter(weight_key)
+
+        # Calculate shard size
+        total_size = weight_tensor.shape[dim]
+        shard_size = total_size // world_size
+        start_idx = rank * shard_size
+        # last rank gets the remainder if total_size % world_size != 0
+        end_idx = start_idx + shard_size if rank < world_size - 1 else total_size
+
+        # Define slice function for this specific weight and dimension
+        def slice_tensor(t: torch.Tensor) -> torch.Tensor:
+            """Slice tensor along the specified dimension"""
+            if dim == 0:
+                return t[start_idx:end_idx, :]
+            elif dim == 1:
+                return t[:, start_idx:end_idx]
+            else:
+                raise ValueError(f"Unsupported sharding dimension: {dim}")
+
+        # The hook will slice the checkpoint tensor during loading
+        # For now, create a correctly-shaped random tensor as placeholder
+        if dim == 0:
+            shard_shape = (end_idx - start_idx, weight_tensor.shape[1])
+        elif dim == 1:
+            shard_shape = (weight_tensor.shape[0], end_idx - start_idx)
+        else:
+            raise ValueError(f"Unsupported sharding dimension: {dim}")
+
+        # Create placeholder with correct shape (will be overwritten by checkpoint)
+        modname, _, param_name = weight_key.rpartition(".")
+        param_new = nn.Parameter(
+            torch.empty(shard_shape, dtype=weight_tensor.dtype, device=weight_tensor.device),
+            requires_grad=False,
+        )
+        gm.get_submodule(modname).register_parameter(param_name, param_new)
+
+        # Register load state dict hook to slice checkpoint tensors during loading
+        gm._register_load_state_dict_pre_hook(
+            partial(
+                _load_hook,
+                f_split=slice_tensor,
+                param_key=weight_key,
+                param_shape=param_new.shape,
+            )
+        )
+
+        # Return the same weight_node (it now points to the sharded parameter)
+        return weight_node
+
+    # Shard w1 and w3 weights along dimension 0 (intermediate_size dimension)
+    w1_list_sharded = []
+    w3_list_sharded = []
+    for w1_node, w3_node in zip(w1_list, w3_list):
+        w1_sharded = shard_weight_tensor(w1_node, dim=0, rank=rank, world_size=world_size)
+        w3_sharded = shard_weight_tensor(w3_node, dim=0, rank=rank, world_size=world_size)
+        w1_list_sharded.append(w1_sharded)
+        w3_list_sharded.append(w3_sharded)
+
+    # Shard w2 weights along dimension 1 (intermediate_size dimension)
+    w2_list_sharded = []
+    for w2_node in w2_list:
+        w2_sharded = shard_weight_tensor(w2_node, dim=1, rank=rank, world_size=world_size)
+        w2_list_sharded.append(w2_sharded)
+
+    # Clear CUDA cache to ensure memory is freed
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # Update args with TP-sharded weights (keep all experts)
+    args[3] = w1_list_sharded
+    args[4] = w2_list_sharded
+    args[5] = w3_list_sharded
+
+    # Handle scales for quantized ops (apply same TP sharding)
+    # Scales follow same pattern as weights: w1/w3 use dim=0, w2 uses dim=1
+    scale_names = list(scale_names)
+    if scale_names:
+        for i, scale_name in enumerate(scale_names):
+            # Each scale_name corresponds to 3 args (w1, w2, w3 scales)
+            base_idx = 6 + i * 3  # scales start at arg index 6
+
+            # w1 scales: shard dim 0
+            w1_scale_list = args[base_idx]
+            w1_scale_sharded = []
+            for scale_node in w1_scale_list:
+                sharded_scale = shard_weight_tensor(
+                    scale_node, dim=0, rank=rank, world_size=world_size
+                )
+                w1_scale_sharded.append(sharded_scale)
+            args[base_idx] = w1_scale_sharded
+
+            # w2 scales: shard dim 1
+            w2_scale_list = args[base_idx + 1]
+            w2_scale_sharded = []
+            for scale_node in w2_scale_list:
+                sharded_scale = shard_weight_tensor(
+                    scale_node, dim=1, rank=rank, world_size=world_size
+                )
+                w2_scale_sharded.append(sharded_scale)
+            args[base_idx + 1] = w2_scale_sharded
+
+            # w3 scales: shard dim 0
+            w3_scale_list = args[base_idx + 2]
+            w3_scale_sharded = []
+            for scale_node in w3_scale_list:
+                sharded_scale = shard_weight_tensor(
+                    scale_node, dim=0, rank=rank, world_size=world_size
+                )
+                w3_scale_sharded.append(sharded_scale)
+            args[base_idx + 2] = w3_scale_sharded
+
+    node.args = tuple(args)
+
+    # Add all_reduce to combine partial results from TP ranks
     with gm.graph.inserting_after(node):
         dist_node = gm.graph.call_function(
             torch.ops.auto_deploy.torch_dist_all_reduce.default, args=(node,)
@@ -748,6 +902,7 @@ class EPShardingInfo(ShardingTransformInfo):
 
     rank: int
     world_size: int
+    strategy: Literal["tp", "ep"] = "ep"
 
     @classmethod
     def from_node(cls, node: Node, **kwargs) -> "EPShardingInfo":
@@ -765,8 +920,14 @@ class EPShardingInfo(ShardingTransformInfo):
         return True
 
     def apply(self, gm: GraphModule, node: Node) -> None:
-        """Apply EP sharding transformation to the graph module."""
-        _insert_sharded_moe(gm, node, self.rank, self.world_size, [])
+        """Apply EP/TP sharding transformation to the graph module based on strategy."""
+        ad_logger.info(
+            f"Applying {self.strategy.upper()} sharding strategy to MoE node '{node.name}'"
+        )
+        if self.strategy == "tp":
+            _insert_tp_sharded_moe(gm, node, self.rank, self.world_size, [])
+        else:  # "ep" or undefined
+            _insert_ep_sharded_moe(gm, node, self.rank, self.world_size, [])
 
 
 class MXFP4EPShardingInfo(EPShardingInfo):
@@ -796,7 +957,13 @@ class FP8EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
         return ["input_scale", "weight_scale"]
 
     def apply(self, gm: GraphModule, node: Node) -> None:
-        _insert_sharded_moe(gm, node, self.rank, self.world_size, self.scale_names())
+        ad_logger.info(
+            f"Applying {self.strategy.upper()} sharding strategy to FP8 MoE node '{node.name}'"
+        )
+        if self.strategy == "tp":
+            _insert_tp_sharded_moe(gm, node, self.rank, self.world_size, self.scale_names())
+        else:  # "ep" or undefined
+            _insert_ep_sharded_moe(gm, node, self.rank, self.world_size, self.scale_names())
 
 
 class NVFP4EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
@@ -812,7 +979,13 @@ class NVFP4EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
         return ["input_scale", "weight_scale", "alpha"]
 
     def apply(self, gm: GraphModule, node: Node) -> None:
-        _insert_sharded_moe(gm, node, self.rank, self.world_size, self.scale_names())
+        ad_logger.info(
+            f"Applying {self.strategy.upper()} sharding strategy to NVFP4 MoE node '{node.name}'"
+        )
+        if self.strategy == "tp":
+            _insert_tp_sharded_moe(gm, node, self.rank, self.world_size, self.scale_names())
+        else:  # "ep" or undefined
+            _insert_ep_sharded_moe(gm, node, self.rank, self.world_size, self.scale_names())
 
 
 EP_SHARDING_RULES = [
@@ -845,6 +1018,7 @@ class ShardingConfig(BaseModel):
     use_sharding_from_factory: bool = False
     support_partial_config: bool = False
     sharding_dims: List[str] = Field(default_factory=list)
+    moe_sharding_strategy: Literal["tp", "ep"] = Field(default="ep")
     tp_transforms: List[TPShardingInfo] = Field(default_factory=list)
     bmm_transforms: List[BMMShardingInfo] = Field(default_factory=list)
     ep_transforms: List[EPShardingInfo] = Field(default_factory=list)

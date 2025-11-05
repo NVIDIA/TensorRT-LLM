@@ -6,6 +6,7 @@ from torch.fx import GraphModule, Node
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
+from ...utils._graph import prune_unused_parameters_and_buffers
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
 from ...utils.node_utils import bfs, extract_op_args, identify_regions_between_residuals, is_op
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
@@ -85,6 +86,7 @@ def _insert_fused_moe_ops(gm: GraphModule) -> int:
         # during the transformation itself.
         gm.graph.eliminate_dead_code()
         gm.delete_all_unused_submodules()
+        prune_unused_parameters_and_buffers(gm)
 
     return fused_key_counter
 
