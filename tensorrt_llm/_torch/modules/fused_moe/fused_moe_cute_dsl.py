@@ -90,7 +90,7 @@ def cute_dsl_fp8_group_blockwise_gemm_ref(
     return ref
 
 
-def cute_dsl_nvfp4_group_gemm_ref(
+def cute_dsl_nvfp4_grouped_gemm_ref(
     a: torch.Tensor,
     b: torch.Tensor,
     a_sf: torch.Tensor,
