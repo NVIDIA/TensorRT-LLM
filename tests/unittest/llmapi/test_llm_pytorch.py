@@ -1004,7 +1004,16 @@ def test_llm_context_only_timed_out():
                                disaggregated_params=disaggregated_params):
         print(output)
 
-    results = llm.get_stats(2)
+    max_retries = 10
+    for _ in range(max_retries):
+        results = llm.get_stats(2)
+        if len(results) == 1:
+            break
+        time.sleep(1)
+    else:
+        pytest.fail(
+            f"Failed to get stats with len==1 after {max_retries} retries")
+
     assert len(results) == 1
     context_only_used_num_blocks = results[0]["kvCacheStats"]["usedNumBlocks"]
     print(f"Context only used num blocks: {context_only_used_num_blocks}")
