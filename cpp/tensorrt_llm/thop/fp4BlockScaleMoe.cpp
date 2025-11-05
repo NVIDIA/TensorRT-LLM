@@ -32,14 +32,15 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     torch::optional<torch::Tensor> const& routing_bias, torch::Tensor const& hidden_states,
     torch::optional<torch::Tensor> const& hidden_states_scale, torch::Tensor const& gemm1_weights,
     torch::Tensor const& gemm1_weights_scale, std::optional<torch::Tensor> const& gemm1_alpha,
-    torch::Tensor const& gemm2_weights, torch::Tensor const& gemm2_weights_scale,
-    torch::Tensor const& output1_scales_scalar, torch::Tensor const& output1_scales_gate_scalar,
-    torch::Tensor const& output2_scales_scalar, int64_t const num_experts, int64_t const top_k,
-    std::optional<int64_t> const n_group, std::optional<int64_t> const topk_group, int64_t const intermediate_size,
-    int64_t const local_expert_offset, int64_t const local_num_experts,
-    std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim, int64_t const routing_method_type,
-    bool const do_finalize, btg::Dtype const dtype, MoeRunnerType& moe_runner, int64_t const moeConfigIndex,
-    torch::optional<torch::Tensor> const& topk_weights, torch::optional<torch::Tensor> const& topk_ids)
+    std::optional<torch::Tensor> const& gemm1_beta, torch::Tensor const& gemm2_weights,
+    torch::Tensor const& gemm2_weights_scale, torch::Tensor const& output1_scales_scalar,
+    torch::Tensor const& output1_scales_gate_scalar, torch::Tensor const& output2_scales_scalar,
+    int64_t const num_experts, int64_t const top_k, std::optional<int64_t> const n_group,
+    std::optional<int64_t> const topk_group, int64_t const intermediate_size, int64_t const local_expert_offset,
+    int64_t const local_num_experts, std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim,
+    int64_t const routing_method_type, bool const do_finalize, btg::Dtype const dtype, MoeRunnerType& moe_runner,
+    int64_t const moeConfigIndex, torch::optional<torch::Tensor> const& topk_weights,
+    torch::optional<torch::Tensor> const& topk_ids)
 {
     TORCH_CHECK(dtype == btg::Dtype::E4m3 || dtype == btg::Dtype::E2m1, "dtype can only be e4m3 or e2m1.");
     TORCH_CHECK(tensorrt_llm::common::isSM100Family(), "Only SM100f is supported by FP4 block scale MOE");
@@ -159,6 +160,7 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     args.gemm1_weights = gemm1_weights.data_ptr();
     args.gemm1_weights_scale = gemm1_weights_scale.data_ptr();
     args.gemm1_alpha = gemm1_alpha.has_value() ? gemm1_alpha.value().data_ptr<float>() : nullptr;
+    args.gemm1_beta = gemm1_beta.has_value() ? gemm1_beta.value().data_ptr<float>() : nullptr;
     args.gemm2_weights = gemm2_weights.data_ptr();
     args.gemm2_weights_scale = gemm2_weights_scale.data_ptr();
     args.num_tokens = hidden_states.sizes()[0];
@@ -318,6 +320,13 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
         TORCH_CHECK(gemm1_alpha.value().dim() == 1, "gemm1_alpha must be 1D.");
         TORCH_CHECK(gemm1_alpha.value().sizes()[0] == local_num_experts, "gemm1_alpha has incorrect dim 0.");
     }
+    if (gemm1_beta.has_value())
+    {
+        TORCH_CHECK(gemm1_beta.value().scalar_type() == at::ScalarType::Float, "gemm1_beta must be float, got %s.",
+            c10::toString(gemm1_beta.value().scalar_type()));
+        TORCH_CHECK(gemm1_beta.value().dim() == 1, "gemm1_beta must be 1D.");
+        TORCH_CHECK(gemm1_beta.value().sizes()[0] == local_num_experts, "gemm1_beta has incorrect dim 0.");
+    }
 
     TORCH_CHECK(gemm2_weights.scalar_type() == FLOAT4_E2M1X2, "gemm2_weights must be byte.");
 
@@ -396,6 +405,32 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     workspace.bmm1_workspace = workspace_fc1.data_ptr();
     workspace.bmm2_workspace = workspace_fc2.data_ptr();
     auto const& moe_stream = at::cuda::getCurrentCUDAStream(hidden_states.get_device());
+
+    // check alpha and beta print
+    std::vector<float> alpha_vals, beta_vals;
+    if (gemm1_alpha.has_value())
+    {
+        auto alpha_cpu = gemm1_alpha.value().cpu().contiguous();
+        float* alpha_ptr = alpha_cpu.data_ptr<float>();
+        std::cout << "[FP4BlockScaleMoe] gemm1 alpha: ";
+        for (int i = 0; i < local_num_experts; ++i)
+        {
+            std::cout << alpha_ptr[i] << " ";
+        }
+        std::cout << std::endl;
+    }
+    if (gemm1_beta.has_value())
+    {
+        auto beta_cpu = gemm1_beta.value().cpu().contiguous();
+        float* beta_ptr = beta_cpu.data_ptr<float>();
+        std::cout << "[FP4BlockScaleMoe] gemm1 beta: ";
+        for (int i = 0; i < local_num_experts; ++i)
+        {
+            std::cout << beta_ptr[i] << " ";
+        }
+        std::cout << std::endl;
+    }
+
     moe_runner.run(args, workspace, hidden_states.get_device(), moe_stream, moeConfigIndex);
 
     if (!do_finalize)
@@ -442,14 +477,14 @@ public:
         torch::optional<torch::Tensor> const& routing_bias, torch::Tensor const& hidden_states,
         torch::Tensor const& hidden_states_scale, torch::Tensor const& gemm1_weights,
         torch::Tensor const& gemm1_weights_scale, std::optional<torch::Tensor> const& gemm1_alpha,
-        torch::Tensor const& gemm2_weights, torch::Tensor const& gemm2_weights_scale,
-        torch::Tensor const& output1_scales_scalar, torch::Tensor const& output1_scales_gate_scalar,
-        torch::Tensor const& output2_scales_scalar, int64_t const num_experts, int64_t const top_k,
-        std::optional<int64_t> const n_group, std::optional<int64_t> const topk_group, int64_t const intermediate_size,
-        int64_t const local_expert_offset, int64_t const local_num_experts,
-        std::optional<double> const routed_scaling_factor, int64_t const routing_method_type, bool const do_finalize,
-        std::vector<int64_t> moeConfigIndex, torch::optional<torch::Tensor> const& topk_weights,
-        torch::optional<torch::Tensor> const& topk_ids)
+        std::optional<torch::Tensor> const& gemm1_beta, torch::Tensor const& gemm2_weights,
+        torch::Tensor const& gemm2_weights_scale, torch::Tensor const& output1_scales_scalar,
+        torch::Tensor const& output1_scales_gate_scalar, torch::Tensor const& output2_scales_scalar,
+        int64_t const num_experts, int64_t const top_k, std::optional<int64_t> const n_group,
+        std::optional<int64_t> const topk_group, int64_t const intermediate_size, int64_t const local_expert_offset,
+        int64_t const local_num_experts, std::optional<double> const routed_scaling_factor,
+        int64_t const routing_method_type, bool const do_finalize, std::vector<int64_t> moeConfigIndex,
+        torch::optional<torch::Tensor> const& topk_weights, torch::optional<torch::Tensor> const& topk_ids)
     {
         // moeConfigIndex corresponds to pair (tileN, config)
         auto [tileN, config] = std::tie(moeConfigIndex[0], moeConfigIndex[1]);
@@ -470,9 +505,9 @@ public:
         }
 
         return run_fp4_block_scale_moe_runner(routing_logits, routing_bias, hidden_states, hidden_states_scale,
-            gemm1_weights, gemm1_weights_scale, gemm1_alpha, gemm2_weights, gemm2_weights_scale, output1_scales_scalar,
-            output1_scales_gate_scalar, output2_scales_scalar, num_experts, top_k, n_group, topk_group,
-            intermediate_size, local_expert_offset, local_num_experts, routed_scaling_factor, tileN,
+            gemm1_weights, gemm1_weights_scale, gemm1_alpha, gemm1_beta, gemm2_weights, gemm2_weights_scale,
+            output1_scales_scalar, output1_scales_gate_scalar, output2_scales_scalar, num_experts, top_k, n_group,
+            topk_group, intermediate_size, local_expert_offset, local_num_experts, routed_scaling_factor, tileN,
             routing_method_type, do_finalize, mDtypeElt, *mRunners[tileN], config, topk_weights, topk_ids);
     }
 
@@ -550,11 +585,11 @@ public:
         }
 
         return run_fp4_block_scale_moe_runner(routing_logits, routing_bias, hidden_states,
-            std::nullopt /*hidden_states_scale*/, gemm1_weights, gemm1_weights_scale, std::nullopt, gemm2_weights,
-            gemm2_weights_scale, output1_scales_scalar, output1_scales_gate_scalar, output2_scales_scalar, num_experts,
-            top_k, n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
-            routed_scaling_factor, tileN, routing_method_type, do_finalize, mDtypeAct, *mRunners[tileN], config,
-            topk_weights, topk_ids);
+            std::nullopt /*hidden_states_scale*/, gemm1_weights, gemm1_weights_scale, std::nullopt, std::nullopt,
+            gemm2_weights, gemm2_weights_scale, output1_scales_scalar, output1_scales_gate_scalar,
+            output2_scales_scalar, num_experts, top_k, n_group, topk_group, intermediate_size, local_expert_offset,
+            local_num_experts, routed_scaling_factor, tileN, routing_method_type, do_finalize, mDtypeAct,
+            *mRunners[tileN], config, topk_weights, topk_ids);
     }
 
 private:
