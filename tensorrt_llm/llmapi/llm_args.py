@@ -2583,6 +2583,13 @@ class TorchLlmArgs(BaseLlmArgs):
         "Allows users to extend the functions of the RayGPUWorker class.",
         status="prototype")
 
+    enable_sleep: bool = Field(
+        default=False,
+        description=
+        "Enable LLM sleep feature. Sleep feature requires extra setup that may slowdown model loading."
+        "Only enable it if you intend to use this feature.",
+        status="prototype")
+
     # PrivateVars
     _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
 

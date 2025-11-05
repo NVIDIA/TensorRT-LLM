@@ -1,5 +1,4 @@
 import copy
-import enum
 import importlib
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -29,6 +28,8 @@ from ..attention_backend.interface import AttentionRuntimeFeatures
 from ..distributed import MPIDist, TorchDist
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
+from ..virtual_memory import ExecutorMemoryType, RestoreMode
+from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
                     validate_feature_combination)
@@ -39,25 +40,12 @@ from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
 
 
-class _ExecutorCreationStage(enum.Enum):
-    SAMPLER = "Sampler"
-    DRAFTER = "Drafter"
-    GUIDED_DECODER = "Guided decoder"
-    INIT_KV_CACHE = "Initial KV cache (temporary for KV cache size estimation)"
-    INIT_EXTRA_RESOURCES = "Additional executor resources (temporary for KV cache size estimation)"
-    MODEL_EXTRA = "Model resources created during usage"
-    EXTRA_RESOURCES = "Additional executor resources"
-    KV_CACHE = "KV cache"
-    MODEL_ENGINE_MAIN = "Model"
-    MODEL_ENGINE_DRAFT = "Draft model for speculative decoding"
-
-
-class _ExecutorMemoryMonitor():
+class _ExecutorMemoryMonitor:
     """Currently this focuses on tracking memory usage and related errors."""
 
     @dataclass(frozen=True)
     class _GpuMemoryUsageSample:
-        creation_stage: _ExecutorCreationStage
+        creation_stage: ExecutorMemoryType
         free_gpu_memory_bytes_pre: int
         free_gpu_memory_bytes_post: int
 
@@ -69,47 +57,74 @@ class _ExecutorMemoryMonitor():
     def _bytes_to_gib(bytes: int) -> float:
         return bytes / (1024)**3
 
+    memory_type_friendly_names = {
+        ExecutorMemoryType.SAMPLER:
+        "Sampler",
+        ExecutorMemoryType.DRAFTER:
+        "Drafter",
+        ExecutorMemoryType.GUIDED_DECODER:
+        "Guided Decoder",
+        ExecutorMemoryType.SPEC_RESOURCES:
+        "Speculative decoding resources",
+        ExecutorMemoryType.INIT_KV_CACHE:
+        "Initial KV Cache (temporary for KV cache size estimation)",
+        ExecutorMemoryType.INIT_EXTRA_RESOURCES:
+        "Additional executor resources (temporary for KV cache size estimation)",
+        ExecutorMemoryType.MODEL_EXTRA:
+        "Model resources created during usage",
+        ExecutorMemoryType.EXTRA_RESOURCES:
+        "Additional executor resources",
+        ExecutorMemoryType.KV_CACHE:
+        "KV cache",
+        ExecutorMemoryType.MODEL_ENGINE_MAIN:
+        "Model",
+        ExecutorMemoryType.MODEL_ENGINE_DRAFT:
+        "Draft model for speculative decoding",
+    }
+
+    # Suggestion to reduce component memory usage
+    memory_type_tuning_suggestion = {
+        ExecutorMemoryType.SAMPLER:
+        "reduce max_seq_len and/or max_attention_window_size",
+        ExecutorMemoryType.DRAFTER:
+        "reduce max_seq_len and/or max_draft_len",
+        ExecutorMemoryType.SPEC_RESOURCES:
+        "reduce max_seq_len and/or max_batch_size",
+        ExecutorMemoryType.KV_CACHE:
+        "reduce free_gpu_memory_fraction",
+        ExecutorMemoryType.INIT_KV_CACHE:
+        "reduce max_num_tokens",
+        ExecutorMemoryType.MODEL_ENGINE_MAIN:
+        ("reduce max_num_tokens and/or shard the model weights across GPUs by enabling "
+         "pipeline and/or tensor parallelism"),
+        ExecutorMemoryType.MODEL_ENGINE_DRAFT:
+        ("reduce max_num_tokens and/or shard the model weights across GPUs by enabling "
+         "pipeline and/or tensor parallelism"),
+        ExecutorMemoryType.INIT_EXTRA_RESOURCES:
+        "reduce max_num_tokens",
+        ExecutorMemoryType.EXTRA_RESOURCES:
+        "reduce max_num_tokens",
+        ExecutorMemoryType.MODEL_EXTRA:
+        "reduce max_num_tokens",
+    }
+
     def _maybe_explain_if_oom(self, e: Exception, *,
-                              current_stage: _ExecutorCreationStage,
+                              current_stage: ExecutorMemoryType,
                               free_gpu_memory_bytes_pre: int) -> Optional[str]:
         if isinstance(e, torch.OutOfMemoryError) or "out of memory" in str(e):
             msg = "Executor creation failed due to insufficient GPU memory."
         elif (isinstance(e, RuntimeError) and "Failed, NCCL error" in str(e)
               and "unhandled cuda error (run with NCCL_DEBUG=INFO for details)"
               in str(e)):
-            msg = (f"Executor creation failed with NCCL error: {str(e)}")
+            msg = f"Executor creation failed with NCCL error: {str(e)}"
             return msg
         else:
             return None
 
-        # how to reduce component memory usage
-        tuning_knobs = {
-            _ExecutorCreationStage.SAMPLER:
-            "reduce max_seq_len and/or max_attention_window_size",
-            _ExecutorCreationStage.DRAFTER:
-            "reduce max_seq_len and/or max_draft_len",
-            _ExecutorCreationStage.KV_CACHE:
-            "reduce free_gpu_memory_fraction",
-            _ExecutorCreationStage.INIT_KV_CACHE:
-            "reduce max_num_tokens",
-            _ExecutorCreationStage.MODEL_ENGINE_MAIN:
-            ("reduce max_num_tokens and/or shard the model weights across GPUs by enabling "
-             "pipeline and/or tensor parallelism"),
-            _ExecutorCreationStage.MODEL_ENGINE_DRAFT:
-            ("reduce max_num_tokens and/or shard the model weights across GPUs by enabling "
-             "pipeline and/or tensor parallelism"),
-            _ExecutorCreationStage.INIT_EXTRA_RESOURCES:
-            "reduce max_num_tokens",
-            _ExecutorCreationStage.EXTRA_RESOURCES:
-            "reduce max_num_tokens",
-            _ExecutorCreationStage.MODEL_EXTRA:
-            "reduce max_num_tokens",
-        }
-
         msg = "\n".join([
             msg,
             "",
-            f"The following component could not be created: {current_stage.value}",
+            f"The following component could not be created: {self.memory_type_friendly_names[current_stage]}",
             f"Total GPU memory (GiB): {self._bytes_to_gib(self._total_gpu_memory_bytes):.2f}",
             f"Free GPU memory before component creation attempt (GiB): {self._bytes_to_gib(free_gpu_memory_bytes_pre):.2f}",
             "",
@@ -121,15 +136,15 @@ class _ExecutorMemoryMonitor():
             ("Please refer to the TensorRT LLM documentation for information on how "
              "to control the memory usage through TensorRT LLM configuration options. "
              "Possible options include:"),
-            *(f"  {stage.value}: {tuning_knobs[stage]}"
+            *(f"  {stage.value}: {self.memory_type_tuning_suggestion[stage]}"
               for stage in chain((sample.creation_stage
                                   for sample in self._samples), [current_stage])
-              if stage in tuning_knobs),
+              if stage in self.memory_type_tuning_suggestion),
         ])
         return msg
 
     @contextmanager
-    def observe_creation_stage(self, current_stage: _ExecutorCreationStage):
+    def observe_creation_stage(self, current_stage: ExecutorMemoryType):
         """Catches OOM and prints instructive message."""
 
         free_gpu_memory_bytes_pre = torch.cuda.mem_get_info()[0]
@@ -280,6 +295,9 @@ def create_py_executor(
     else:
         dist = MPIDist(mapping=mapping)
 
+    vm_pools = {}
+    enable_sleep = llm_args.enable_sleep
+
     cache_transceiver_config = llm_args.cache_transceiver_config
 
     has_draft_model_engine = False
@@ -298,8 +316,23 @@ def create_py_executor(
     logger.info("ATTENTION RUNTIME FEATURES: ", attn_runtime_features)
 
     mem_monitor = _ExecutorMemoryMonitor()
-    with mem_monitor.observe_creation_stage(
-            _ExecutorCreationStage.MODEL_ENGINE_MAIN):
+
+    @contextmanager
+    def allocation_scope(current_stage: ExecutorMemoryType,
+                         restore_mode: RestoreMode):
+        with mem_monitor.observe_creation_stage(current_stage):
+            stage = current_stage.value
+            if not enable_sleep or stage.startswith("_no_capture"):
+                yield
+            else:
+                with virtual_memory_scope(stage, restore_mode) as memory_pool:
+                    if stage in vm_pools:
+                        del vm_pools[stage]
+                    vm_pools[stage] = memory_pool
+                    yield
+
+    with allocation_scope(ExecutorMemoryType.MODEL_ENGINE_MAIN,
+                          RestoreMode.PINNED):
         model_engine = PyTorchModelEngine(
             model_path=checkpoint_dir,
             llm_args=llm_args,
@@ -312,8 +345,8 @@ def create_py_executor(
     validate_feature_combination(llm_args, model_engine, llm_args.sampler_type)
 
     if has_draft_model_engine:
-        with mem_monitor.observe_creation_stage(
-                _ExecutorCreationStage.MODEL_ENGINE_DRAFT):
+        with allocation_scope(ExecutorMemoryType.MODEL_ENGINE_DRAFT,
+                              RestoreMode.PINNED):
             draft_spec_config = copy.copy(spec_config)
 
             use_chain_drafter = (guided_decoding_config is None
@@ -427,10 +460,10 @@ def create_py_executor(
     else:
         ctx_chunk_config = None
 
-    with mem_monitor.observe_creation_stage(
-            _ExecutorCreationStage.GUIDED_DECODER):
-        guided_decoder: Optional[GuidedDecoder] = None
-        if guided_decoding_config is not None:
+    guided_decoder: Optional[GuidedDecoder] = None
+    if guided_decoding_config is not None:
+        with allocation_scope(ExecutorMemoryType.GUIDED_DECODER,
+                              RestoreMode.PINNED):
             if mapping.is_last_pp_rank():
                 kwargs = {
                     "guided_decoding_config": guided_decoding_config,
@@ -459,7 +492,7 @@ def create_py_executor(
                         f"Guided decoding is not supported for speculative decoding mode: {spec_config.spec_dec_mode.name}."
                     )
 
-    with mem_monitor.observe_creation_stage(_ExecutorCreationStage.SAMPLER):
+    with allocation_scope(ExecutorMemoryType.SAMPLER, RestoreMode.PINNED):
         sampler = instantiate_sampler(model_engine,
                                       llm_args,
                                       mapping,
@@ -545,9 +578,9 @@ def create_py_executor(
             sparse_attention_config=sparse_attention_config,
         )
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
-        with mem_monitor.observe_creation_stage(
-                _ExecutorCreationStage.INIT_KV_CACHE
-                if estimating_kv_cache else _ExecutorCreationStage.KV_CACHE):
+        with allocation_scope(
+                ExecutorMemoryType.INIT_KV_CACHE if estimating_kv_cache else
+                ExecutorMemoryType.KV_CACHE, RestoreMode.NONE):
             kv_cache_creator.build_managers(resources, estimating_kv_cache)
             # Originally, max_seq_len might be mutated inside build_managers as field of executor config.
             # Since now, we are changing kv_cache_creator._max_seq_len instead. Restore max_seq_len here.
@@ -557,23 +590,26 @@ def create_py_executor(
     # Resource managers for speculative decoding
     # For user-specified drafters, use extra_resource_managers in PyTorchBackend config
     # to provide a resource manager if required.
-    spec_resource_manager = get_spec_resource_manager(model_engine,
-                                                      draft_model_engine)
+
+    with allocation_scope(ExecutorMemoryType.SPEC_RESOURCES,
+                          RestoreMode.PINNED):
+        spec_resource_manager = get_spec_resource_manager(
+            model_engine, draft_model_engine)
     if spec_resource_manager is not None:
         resources[
             ResourceManagerType.SPEC_RESOURCE_MANAGER] = spec_resource_manager
 
     # Drafter for speculative decoding
-    with mem_monitor.observe_creation_stage(_ExecutorCreationStage.DRAFTER):
+    with allocation_scope(ExecutorMemoryType.DRAFTER, RestoreMode.PINNED):
         drafter = get_spec_drafter(model_engine,
                                    draft_model_engine,
                                    sampler,
                                    spec_resource_manager=spec_resource_manager,
                                    guided_decoder=guided_decoder)
 
-    with mem_monitor.observe_creation_stage(
-            _ExecutorCreationStage.INIT_EXTRA_RESOURCES
-            if estimating_kv_cache else _ExecutorCreationStage.EXTRA_RESOURCES):
+    with allocation_scope(
+            ExecutorMemoryType.INIT_EXTRA_RESOURCES if estimating_kv_cache else
+            ExecutorMemoryType.EXTRA_RESOURCES, RestoreMode.PINNED):
         py_executor = create_py_executor_instance(
             dist=dist,
             resources=resources,
@@ -596,6 +632,7 @@ def create_py_executor(
             peft_cache_config=peft_cache_config,
             scheduler_config=scheduler_config,
             cache_transceiver_config=cache_transceiver_config,
+            virtual_memory_pools=vm_pools if not estimating_kv_cache else None,
         )
         # Originally, peft_cache_config might be mutated inside
         # create_py_executor_instance. Restore it here.
@@ -603,14 +640,13 @@ def create_py_executor(
 
     if estimating_kv_cache:
         assert kv_cache_creator is not None
-        with mem_monitor.observe_creation_stage(
-                _ExecutorCreationStage.MODEL_EXTRA):
+        with allocation_scope(ExecutorMemoryType.MODEL_EXTRA,
+                              RestoreMode.PINNED):
             kv_cache_creator.configure_kv_cache_capacity(py_executor)
         kv_cache_creator.teardown_managers(resources)
         del py_executor  # free before constructing new
 
-        with mem_monitor.observe_creation_stage(
-                _ExecutorCreationStage.KV_CACHE):
+        with allocation_scope(ExecutorMemoryType.KV_CACHE, RestoreMode.NONE):
             # Before estimating KV cache size, a minimal KV cache has been allocated using
             # create_kv_cache_manager above, which caps kv_cache_creator.max_seq_len. Restoring
             # the original value before creating the final KV cache.
@@ -629,8 +665,8 @@ def create_py_executor(
                         eng._release_cuda_graphs()
                     eng.attn_metadata = None
 
-        with mem_monitor.observe_creation_stage(
-                _ExecutorCreationStage.EXTRA_RESOURCES):
+        with allocation_scope(ExecutorMemoryType.EXTRA_RESOURCES,
+                              RestoreMode.PINNED):
             py_executor = create_py_executor_instance(
                 dist=dist,
                 resources=resources,
@@ -653,6 +689,7 @@ def create_py_executor(
                 peft_cache_config=peft_cache_config,
                 scheduler_config=scheduler_config,
                 cache_transceiver_config=cache_transceiver_config,
+                virtual_memory_pools=vm_pools,
             )
 
     _adjust_torch_mem_fraction()
