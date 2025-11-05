@@ -151,6 +151,9 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
                                                         device='cuda',
                                                         dtype=torch.int32)
 
+        self.max_kt_tokens = (self.max_seq_len + self.page_size -
+                              1) // self.page_size
+
     @property
     def kt_tokens_per_block(self) -> Optional[int]:
         """
@@ -256,14 +259,6 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.num_kt_tokens[:self.num_generations], dim=0)
         self.cum_kt_lens_cuda[:self.num_generations + 1].copy_(
             self.cum_kt_lens[:self.num_generations + 1], non_blocking=True)
-
-        self.max_kt_tokens = (self.max_seq_len + self.page_size -
-                              1) // self.page_size
-        if self.num_generations > 0:
-            self.total_real_kt_tokens = self.cum_kt_lens[
-                self.num_generations].item()
-        else:
-            self.total_real_kt_tokens = 0
 
         self.total_kt_tokens = self.num_generations * self.max_kt_tokens
         self.total_kv_tokens = self.num_generations * self.max_seq_len
@@ -514,7 +509,6 @@ class RocketTrtllmAttention(TrtllmAttention):
             metadata.kt_tokens_per_block,
             metadata.kv_cache_manager.max_kt_blocks_per_seq,
             metadata.total_kt_tokens,
-            metadata.total_real_kt_tokens,
         )
 
         scores = triton_softmax(scores, metadata.cum_kt_lens_cuda,
@@ -539,20 +533,20 @@ class RocketTrtllmAttention(TrtllmAttention):
             interleaved_scores = triton_interleave(
                 scores, metadata.cum_kt_lens_cuda,
                 metadata.cum_kv_gen_lens_cuda, metadata.total_kv_tokens,
-                metadata.num_generations, self.page_size)
+                metadata.num_generations, metadata.page_size)
 
             # Use interleaved scores with kv_lens
             selected_indices = triton_topk(interleaved_scores,
                                            metadata.cum_kv_gen_lens_cuda,
                                            sparse_attn_offsets,
                                            metadata.total_sparse_gen_indices,
-                                           self.topk)
+                                           metadata.topk)
         else:
             # Use original kt scores directly
             selected_indices = triton_topk(scores, metadata.cum_kt_lens_cuda,
                                            sparse_attn_offsets,
                                            metadata.total_sparse_gen_indices,
-                                           self.topk)
+                                           metadata.topk)
 
         return selected_indices, sparse_attn_offsets
 
@@ -1002,6 +996,12 @@ class RocketKVCacheManager(KVCacheManager):
                 seq_len = request.get_num_tokens(0)
                 rewind_len = max(seq_len - 1 - self.prompt_budget, 0)
                 self.rewind_kv_cache(request, rewind_len)
+                # get the rewind length for kt cache
+                num_tokens = request.max_beam_num_tokens
+                updated_kt_token_num = num_tokens - rewind_len
+                rewind_len = (math.ceil(num_tokens / self.page_size) -
+                              math.ceil(updated_kt_token_num / self.page_size))
+                self.kt_cache_manager.rewind_cache(request, rewind_len)
 
     def free_resources(self, request):
         super().free_resources(request)

@@ -83,10 +83,14 @@ __global__ void gatherKvPageOffsetsKernel(
         for (int32_t i = threadIdx.x; i < num_sparse_indices; i += blockDim.x)
         {
             int32_t const src_idx = sparse_params.sparse_attn_indices[sparse_idx_global + i];
-            int32_t const src_page_idx = src_idx * indices_block_size / tokens_per_page;
-            if (src_page_idx >= src_page_idx_offset && src_page_idx < src_page_idx_offset + loop_num_valid_pages)
+            int32_t const src_idx_start = src_idx * indices_block_size;
+            for (int32_t j = src_idx_start; j < src_idx_start + indices_block_size; j++)
             {
-                atomicExch(&s_page_mask[src_page_idx - src_page_idx_offset], 1);
+                int32_t const src_page_idx = j / tokens_per_page;
+                if (src_page_idx >= src_page_idx_offset && src_page_idx < src_page_idx_offset + loop_num_valid_pages)
+                {
+                    atomicExch(&s_page_mask[src_page_idx - src_page_idx_offset], 1);
+                }
             }
         }
         __syncthreads();

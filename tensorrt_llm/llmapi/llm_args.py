@@ -234,7 +234,7 @@ class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
                                          description="Prompt budget")
     page_size: Optional[int] = Field(default=3, description="Page size")
     use_interleave: Optional[bool] = Field(
-        default=True, description="Whether to use interleave")
+        default=False, description="Whether to use interleave")
 
     @classmethod
     def from_dict(cls, data: dict):
