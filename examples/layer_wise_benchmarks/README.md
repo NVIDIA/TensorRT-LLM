@@ -15,7 +15,7 @@ pip install -e ../..
 **Step 3:** In the container, run benchmarks and generate profiles:
 
 ```bash
-# Run DeepSeek-R1
+# Run DeepSeek-R1 NVFP4
 NP=4 ./mpi_launch.sh ./run_single.sh config_ctx.yaml
 NP=4 ./mpi_launch.sh ./run_single.sh config_gen.yaml
 
@@ -24,7 +24,7 @@ NP=4 ./mpi_launch.sh ./run_single.sh config_ctx.yaml --model deepseek-ai/DeepSee
 NP=4 ./mpi_launch.sh ./run_single.sh config_gen.yaml --model deepseek-ai/DeepSeek-V3.2-Exp --tokens-per-block 64 --moe-backend DEEPGEMM
 
 # Run DeepSeek-V3.2-Exp with 32k context length
-NP=4 ./mpi_launch.sh ./run_single.sh config_ctx.yaml --model deepseek-ai/DeepSeek-V3.2-Exp --tokens-per-block 64 --max-seq-len $((32768 + 1024 + 4)) --max-num-tokens $((32768 + 1024 + 4)) --moe-backend DEEPGEMM --batch-size 1 --seq-len-q 32769
+NP=4 ./mpi_launch.sh ./run_single.sh config_ctx.yaml --model deepseek-ai/DeepSeek-V3.2-Exp --tokens-per-block 64 --max-seq-len $((32768 + 1024 + 4)) --moe-backend DEEPGEMM --batch-size 1 --seq-len-q 32769
 NP=4 ./mpi_launch.sh ./run_single.sh config_gen.yaml --model deepseek-ai/DeepSeek-V3.2-Exp --tokens-per-block 64 --max-seq-len $((32768 + 1024 + 4)) --moe-backend DEEPGEMM --seq-len-kv-cache 32769
 
 # Run with attention TP
@@ -76,7 +76,7 @@ It uses the image recorded in `../../jenkins/current_image_tags.properties`. The
 **Step 3:** Run benchmarks to generate profiles. Run the following command on the controller node, where `NODES` &le; the number of allocated nodes:
 
 ```bash
-# Run DeepSeek-R1 with wide ep: uses MNNVL A2A if applicable
+# Run DeepSeek-R1 NVFP4 with wide ep: uses MNNVL A2A if applicable
 SLURM_JOB_ID=$SLURM_JOB_ID NODES=4 NP=16 ./slurm_launch.sh ./run_single.sh config_gen.yaml --moe-backend WIDEEP
 
 # Run with attention TP and TRTLLMGen
@@ -93,3 +93,9 @@ SLURM_JOB_ID=$SLURM_JOB_ID NODES=2 NP=8 ./slurm_launch.sh ./run_single.sh config
 ## Parse profiles
 
 Coming soon.
+
+## Trouble shooting
+
+1. Error `fp8 blockscale gemm only support Hopper` on Blackwell.
+
+   The default MoE backend "CUTLASS" does not support FP8 weights. Please choose the same MoE backend as your end-to-end config. A typical choice is adding `--moe-backend DEEPGEMM`, `--moe-backend TRTLLM`, or `--moe-backend WIDEEP` option.

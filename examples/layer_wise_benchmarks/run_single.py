@@ -27,6 +27,7 @@ parser.add_argument(
 parser.add_argument("--run-type", type=str, choices=["CTX", "GEN"])
 parser.add_argument("--scaled-from", type=int)
 # KV cache related args
+parser.add_argument("--max-batch-size", type=int)
 parser.add_argument("--tokens-per-block", type=int)
 parser.add_argument("--max-seq-len", type=int)
 group = parser.add_mutually_exclusive_group(required=False)
@@ -40,6 +41,7 @@ parser.set_defaults(enable_attention_dp=None)
 # Model init args
 parser.add_argument("--max-num-tokens", type=int)
 parser.add_argument("--moe-backend", type=str)
+parser.add_argument("--moe-max-num-tokens", type=int)
 group = parser.add_mutually_exclusive_group(required=False)
 group.add_argument("--use-cuda-graph",
                    action="store_true",
@@ -59,8 +61,12 @@ with open(args.config_path) as f:
     config = yaml.safe_load(f)
 del args.config_path
 for k, v in vars(args).items():
-    if v is None:
+    if v is None and k in config:
         setattr(args, k, config[k])
+if args.max_batch_size is None:
+    args.max_batch_size = args.batch_size
+if args.max_num_tokens is None:
+    args.max_num_tokens = args.max_batch_size * args.seq_len_q
 print(args)
 
 # MPI args
@@ -72,12 +78,11 @@ torch.cuda.set_device(local_rank)
 # Create KV cache manager
 mapping = DeepSeekV3Runner.create_mapping(
     enable_attention_dp=args.enable_attention_dp)
-max_batch_size = 2048
 kv_cache_manager = DeepSeekV3Runner.create_kv_cache_manager(
     args.model,
     mapping,
     tokens_per_block=args.tokens_per_block,
-    max_batch_size=max_batch_size,
+    max_batch_size=args.max_batch_size,
     max_seq_len=args.max_seq_len,
     layer_indices=args.layer_indices)
 attn_workspace = torch.empty((0, ), device="cuda", dtype=torch.int8)
@@ -94,10 +99,11 @@ runner = DeepSeekV3Runner(args.model,
                           scaled_from=args.scaled_from,
                           max_seq_len=args.max_seq_len,
                           max_num_tokens=args.max_num_tokens,
+                          moe_max_num_tokens=args.moe_max_num_tokens,
                           use_cuda_graph=args.use_cuda_graph)
 
 # Warm up
-assert args.batch_size <= max_batch_size
+assert args.batch_size <= args.max_batch_size
 assert args.seq_len_q + args.seq_len_kv_cache <= args.max_seq_len
 run_pack = runner.create_run_pack(args.run_type,
                                   batch_size=args.batch_size,

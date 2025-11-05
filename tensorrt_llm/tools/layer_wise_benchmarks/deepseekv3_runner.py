@@ -142,7 +142,8 @@ class DeepSeekV3Runner:
     def __init__(self, pretrained_model_name_or_path: str, mapping: Mapping, *,
                  moe_backend: str, layer_indices: List[int],
                  scaled_from: Optional[int], max_seq_len: int,
-                 max_num_tokens: int, use_cuda_graph: bool):
+                 max_num_tokens: int, moe_max_num_tokens: int,
+                 use_cuda_graph: bool):
 
         # Temporally replace the gate class
         gate_cls_orig = tensorrt_llm._torch.models.modeling_deepseekv3.DeepseekV3Gate
@@ -158,7 +159,7 @@ class DeepSeekV3Runner:
             sparse_attention_config=None,  # To be loaded from config
             max_num_tokens=max_num_tokens,
             max_seq_len=max_seq_len,
-            moe_max_num_tokens=None,
+            moe_max_num_tokens=moe_max_num_tokens,
             moe_load_balancer=None,
             lora_config=None,
             allreduce_strategy=AllReduceStrategy.AUTO,
