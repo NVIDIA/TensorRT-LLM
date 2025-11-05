@@ -1,7 +1,7 @@
 import pytest
 import torch
 from utils.llm_data import llm_models_root
-from utils.util import skip_gpu_memory_less_than
+from utils.util import similar, skip_gpu_memory_less_than
 
 from tensorrt_llm import LLM
 from tensorrt_llm.llmapi import KvCacheConfig
@@ -342,7 +342,6 @@ def test_nemotron_h_cuda_graph_overlap_scheduler():
         )
 
 
-@pytest.mark.skip(reason="https://nvbugs/5626259")
 def test_nemotron_h_chunked_prefill():
     # Long prompts (~100 tokens) to make sure chunked prefill is enabled
     # (At the time of development, tokens_per_block isn't configurable from the LLM API,
@@ -377,7 +376,12 @@ def test_nemotron_h_chunked_prefill():
 
     for i, (output, chunked_prefill_output) in enumerate(
             zip(outputs, chunked_prefill_outputs)):
-        assert output.outputs[0].text == chunked_prefill_output.outputs[0].text
+        # The output is short, so we use a low threshold
+        # e.g. 'revolutionize patient care and medical practices.\n\nQuestion:'
+        #  vs  ' revolutionize patient care and improve overall health outcomes.\n\n'
+        assert similar(output.outputs[0].text,
+                       chunked_prefill_output.outputs[0].text,
+                       threshold=0.4)
 
         # assert same prefill logprobs. Same atol as diff between mcore and initial impl
         prefill_logprobs = extract_prefill_logprobs(output)
