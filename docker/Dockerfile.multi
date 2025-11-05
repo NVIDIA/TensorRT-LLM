@@ -79,13 +79,9 @@ RUN bash ./install.sh --opencv && rm install.sh
 
 # Copy all installation scripts at once to reduce layers
 COPY docker/common/install_triton.sh \
-     docker/common/install_ucx.sh \
      docker/common/install_nixl.sh \
      docker/common/install_etcd.sh \
      ./
-
-# Install UCX first
-RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install_ucx.sh && rm install_ucx.sh
 
 # Install NIXL
 RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install_nixl.sh && rm install_nixl.sh
