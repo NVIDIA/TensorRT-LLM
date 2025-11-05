@@ -156,6 +156,23 @@ class FusedMoEMethodBase(ABC):
     """
     weight_alignment: int = 1
 
+    @classmethod
+    def _online_eplb_not_supported(cls, module):
+        if hasattr(
+                module, "layer_load_balancer"
+        ) and module.layer_load_balancer and module.layer_load_balancer.need_load_shared_weights(
+        ):
+            raise NotImplementedError(
+                f'{cls.__name__} doesn\'t support online EPLB now')
+
+    @classmethod
+    def _online_eplb_not_verified(cls, module):
+        if hasattr(
+                module, "layer_load_balancer"
+        ) and module.layer_load_balancer and module.layer_load_balancer.need_load_shared_weights(
+        ):
+            logger.warning(f'{cls.__name__} online EPLB is not verified yet')
+
     def need_load_shared_weights(self, module):
         if hasattr(
                 module, "layer_load_balancer"
@@ -516,6 +533,8 @@ class FP8QDQFusedMoEMethod(FusedMoEMethodBase):
                                           requires_grad=False)
         module.register_parameter("fc31_input_dequant", fc31_input_dequant)
 
+        self._online_eplb_not_supported(module)
+
         self.setup_quant_scales(module)
 
     def setup_quant_scales(self, module: torch.nn.Module):
@@ -617,6 +636,8 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
                                                 requires_grad=False)
         module.register_parameter("w2_weight_scaling_factor",
                                   w2_weight_scaling_factor)
+
+        self._online_eplb_not_verified(module)
 
         self.setup_quant_scales(module)
 
@@ -794,6 +815,9 @@ class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
 
         super().create_weights(module, weight_dtype, w3_w1_weight_shape,
                                w2_weight_shape)
+
+        self._online_eplb_not_supported(module)
+
         self.setup_quant_scales(module)
 
     def setup_quant_scales(self, module: torch.nn.Module):
@@ -967,6 +991,9 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
 
         super().create_weights(module, weight_dtype, w3_w1_weight_shape,
                                w2_weight_shape)
+
+        self._online_eplb_not_supported(module)
+
         self.setup_quant_scales(module)
 
     def setup_quant_scales(self, module: torch.nn.Module):
@@ -1364,6 +1391,9 @@ class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
 
         super().create_weights(module, weight_dtype, w3_w1_weight_shape,
                                w2_weight_shape)
+
+        self._online_eplb_not_supported(module)
+
         self.setup_quant_scales(module)
 
     def setup_quant_scales(self, module: torch.nn.Module):
@@ -2145,6 +2175,8 @@ class W4A8NVFP4FP8TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEMethod):
                                     requires_grad=False)
         module.register_parameter("fc31_scale_c", fc31_scale_c)
 
+        self._online_eplb_not_verified(module)
+
         self.setup_quant_scales(module)
 
     def load_expert_w3_w1_weight_scale_nvfp4(
@@ -2340,6 +2372,8 @@ class MXFP4WeightCutlassFusedMoEMethod(MXFP4WeightFusedMoEMethod):
                                self.block_scales_dtype, block_scales_vec_size,
                                self.weight_alignment)
 
+        self._online_eplb_not_verified(module)
+
     def load_expert_w3_w1_weight(self, module: torch.nn.Module,
                                  w1_weight: torch.Tensor,
                                  w3_weight: torch.Tensor,
@@ -2506,6 +2540,8 @@ class W4A8MXFP4MXFP8CutlassFusedMoEMethod(MXFP4WeightCutlassFusedMoEMethod):
 
         super().create_weights(module)
 
+        self._online_eplb_not_verified(module)
+
         self.setup_quant_scales(module)
 
     def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
@@ -2546,6 +2582,8 @@ class W4A8MXFP4FP8CutlassFusedMoEMethod(MXFP4WeightCutlassFusedMoEMethod):
         module.register_parameter("fc2_input_dequant", fc2_input_dequant)
 
         super().create_weights(module)
+
+        self._online_eplb_not_supported(module)
 
         self.setup_quant_scales(module)
 
@@ -2901,6 +2939,8 @@ class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
         module.register_parameter("fc2_input_dequant", fc2_input_dequant)
 
         super().create_weights(module)
+
+        self._online_eplb_not_supported(module)
 
     def load_expert_fc31_input_scale_w4a8_mxfp4_fp8(
             self, w1_input_scale, w3_input_scale, w2_input_scale,
