@@ -577,8 +577,8 @@ class AllReduce(nn.Module):
 
                 - MIN_LATENCY: AllReduce uses MIN_LATENCY mode kernel.
 
-                - AUTO: AUTO chooses the best available strategy. Will try SYMM_MEM first (if available),
-                  then MNNVL, then choose between NCCL and MIN_LATENCY based on a heuristic policy.
+                - AUTO: AUTO chooses the best available strategy. Will try MNNVL,
+                  then choose between NCCL and MIN_LATENCY based on a heuristic policy.
 
                 - LOWPRECISION: AllReduce quantizes data to lower precision for transmission.
                   Should only be used on topologies with PCIe switches and without NVLink.
@@ -613,15 +613,14 @@ class AllReduce(nn.Module):
         self.all_reduce_op = torch.ops.trtllm.allreduce_pg if self._disable_mpi else torch.ops.trtllm.allreduce
 
         if self.mapping.tp_size > 1:
-            # When Strategy is UB, it is guaranteed that the workspace is not used.
-            if self.strategy != AllReduceStrategy.UB:
+            # When Strategy is UB or SYMM_MEM, it is guaranteed that the workspace is not used.
+            if self.strategy != AllReduceStrategy.UB and self.strategy != AllReduceStrategy.SYMM_MEM:
                 if self.strategy == AllReduceStrategy.LOWPRECISION:
                     allocate_low_presicion_allreduce_workspace(self.mapping)
                 self.workspace = get_allreduce_workspace(self.mapping)
 
             # Initialize Symmetric Memory AllReduce if needed
-            if self.strategy in (AllReduceStrategy.AUTO,
-                                 AllReduceStrategy.SYMM_MEM):
+            if self.strategy == AllReduceStrategy.SYMM_MEM:
                 try:
                     symm_mem = SymmetricMemoryAllReduce(
                         self.mapping,
@@ -643,8 +642,8 @@ class AllReduce(nn.Module):
                     self.symm_mem_allreduce = None
 
             # Initialize MNNVL AllReduce if needed
-            if self.strategy in (AllReduceStrategy.AUTO,
-                                 AllReduceStrategy.MNNVL):
+            elif self.strategy in (AllReduceStrategy.AUTO,
+                                   AllReduceStrategy.MNNVL):
                 if MNNVLAllReduce.is_mnnvl(self.mapping, dtype):
                     # ALWAYS capture the exception when creating this instance
                     try:
