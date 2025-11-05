@@ -124,18 +124,10 @@ std::size_t Tensor::getSizeInBytes() const
     return mTensor ? mTensor->getSizeInBytes() : 0;
 }
 
-namespace
+namespace detail
 {
-tr::ITensor::Shape toDims(Shape const& shape)
-{
-    TLLM_CHECK(shape.size() <= tr::ITensor::Shape::MAX_DIMS);
-    tr::ITensor::Shape dims;
-    dims.nbDims = static_cast<decltype(dims.nbDims)>(shape.size());
-    std::copy(shape.begin(), shape.end(), dims.d);
-    return dims;
-}
 
-nvinfer1::DataType toDataType(DataType dataType)
+nvinfer1::DataType toTrtDataType(DataType dataType)
 {
     switch (dataType)
     {
@@ -152,6 +144,24 @@ nvinfer1::DataType toDataType(DataType dataType)
     }
 
     TLLM_THROW("Unsupported data type");
+}
+
+} // namespace detail
+
+namespace
+{
+tr::ITensor::Shape toDims(Shape const& shape)
+{
+    TLLM_CHECK(shape.size() <= tr::ITensor::Shape::MAX_DIMS);
+    tr::ITensor::Shape dims;
+    dims.nbDims = static_cast<decltype(dims.nbDims)>(shape.size());
+    std::copy(shape.begin(), shape.end(), dims.d);
+    return dims;
+}
+
+nvinfer1::DataType toDataType(DataType dataType)
+{
+    return detail::toTrtDataType(dataType);
 }
 
 } // namespace

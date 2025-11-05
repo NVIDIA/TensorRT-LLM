@@ -57,12 +57,14 @@ private:
 class CacheTransBufferManager
 {
 public:
-    CacheTransBufferManager(
-        KVCacheManager::BaseKVCacheManager* cacheManager, std::optional<size_t> maxNumTokens = std::nullopt);
+    CacheTransBufferManager(KVCacheManager::BaseKVCacheManager* cacheManager,
+        std::optional<size_t> maxNumTokens = std::nullopt,
+        std::optional<executor::DataType> transferDataType = std::nullopt);
 
     static size_t preAllocBufferSize(std::map<SizeType32, SizeType32> const& cacheSizeBytesPerTokenPerWindow,
         SizeType32 tokensPerBlock,
-        std::optional<executor::CacheTransceiverConfig> const& cacheTransceiverConfig = std::nullopt);
+        std::optional<executor::CacheTransceiverConfig> const& cacheTransceiverConfig = std::nullopt,
+        nvinfer1::DataType localCacheDtype = nvinfer1::DataType::kHALF);
 
     std::optional<int> assignBufferIndexForSend();
     void freeBufferIndexForSend(std::optional<int> bufferId);
@@ -81,6 +83,13 @@ public:
     runtime::ITensor::SharedPtr getRecvBuffer(std::optional<int> bufferId);
     size_t getRecvBufferCount();
     size_t getSendBufferCount();
+    
+    /// @brief Get the transfer data type used for KV cache wire transfer
+    /// @return The nvinfer1::DataType used for transfer buffers
+    [[nodiscard]] nvinfer1::DataType getTransferDataType() const
+    {
+        return mTransferDataType;
+    }
 
 private:
     struct ConcurrenceResource
@@ -108,7 +117,8 @@ private:
     bool mOnlyUseDynamicBuffer;
     bool mUseFabricMemory;
     size_t mBufferEleSize;
-    nvinfer1::DataType mDataType;
+    nvinfer1::DataType mDataType;           // Local cache storage data type
+    nvinfer1::DataType mTransferDataType;   // Transfer wire data type
     ConcurrenceResource mConcurrenceSendResource;
     ConcurrenceResource mConcurrenceRecvResource;
     KVCacheManager::BaseKVCacheManager* mCacheManager;

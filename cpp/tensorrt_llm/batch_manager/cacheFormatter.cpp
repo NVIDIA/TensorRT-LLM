@@ -43,6 +43,108 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
+namespace {
+    std::string dataTypeToString(nvinfer1::DataType type) // For testing, TODO: REMOVE LATER
+    {
+    switch (type)
+    {
+    case nvinfer1::DataType::kINT64: return "INT64";
+    case nvinfer1::DataType::kINT32: return "INT32";
+    case nvinfer1::DataType::kFLOAT: return "FP32";
+    case nvinfer1::DataType::kBF16: return "BF16";
+    case nvinfer1::DataType::kHALF: return "FP16";
+    case nvinfer1::DataType::kINT8: return "INT8";
+    case nvinfer1::DataType::kUINT8: return "UINT8";
+    case nvinfer1::DataType::kFP8: return "FP8";
+    case nvinfer1::DataType::kBOOL: return "BOOL";
+    default: return "UNKNOWN";
+    }
+    }
+}
+
+void convertKVCachePrecisionVectorToType(
+    std::vector<runtime::ITensor::SharedPtr>& blocks,
+    nvinfer1::DataType srcDataType,
+    nvinfer1::DataType destDataType,
+    runtime::BufferManager const& bufferManager)
+{
+    if (blocks.empty() || srcDataType == destDataType)
+    {
+        return;
+    }
+
+    auto stream = bufferManager.getStream().get();
+
+    TLLM_LOG_INFO("Converting %zu blocks from %s to %s", blocks.size(),
+        dataTypeToString(srcDataType).c_str(), dataTypeToString(destDataType).c_str());
+
+    for (size_t i = 0; i < blocks.size(); ++i)
+    {
+        auto& block = blocks[i];
+        auto blockShape = block->getShape();
+        auto blockVolume = runtime::ITensor::volume(blockShape);
+
+        auto tempBuffer = bufferManager.gpu(blockShape, destDataType);
+
+        if (srcDataType == nvinfer1::DataType::kHALF && destDataType == nvinfer1::DataType::kFP8)
+        {
+            kernels::invokeConversion<__nv_fp8_e4m3, half>( // Dest, Src
+                reinterpret_cast<__nv_fp8_e4m3*>(tempBuffer->data()),
+                reinterpret_cast<half const*>(block->data()),
+                blockVolume,
+                nullptr,
+                stream);
+        }
+        else if (srcDataType == nvinfer1::DataType::kFP8 && destDataType == nvinfer1::DataType::kHALF)
+        {
+            kernels::invokeConversion<half, __nv_fp8_e4m3>(
+                reinterpret_cast<half*>(tempBuffer->data()),
+                reinterpret_cast<__nv_fp8_e4m3 const*>(block->data()),
+                blockVolume,
+                nullptr,
+                stream);
+        }
+#ifdef ENABLE_BF16
+        else if (srcDataType == nvinfer1::DataType::kBF16 && destDataType == nvinfer1::DataType::kFP8)
+        {
+            kernels::invokeConversion<__nv_fp8_e4m3, __nv_bfloat16>(
+                reinterpret_cast<__nv_fp8_e4m3*>(tempBuffer->data()),
+                reinterpret_cast<__nv_bfloat16 const*>(block->data()),
+                blockVolume,
+                nullptr,
+                stream);
+        }
+        else if (srcDataType == nvinfer1::DataType::kFP8 && destDataType == nvinfer1::DataType::kBF16)
+        {
+            kernels::invokeConversion<__nv_bfloat16, __nv_fp8_e4m3>(
+                reinterpret_cast<__nv_bfloat16*>(tempBuffer->data()),
+                reinterpret_cast<__nv_fp8_e4m3 const*>(block->data()),
+                blockVolume,
+                nullptr,
+                stream);
+        }
+#endif
+        else
+        {
+            TLLM_THROW("Unsupported KV-cache precision conversion from %s to %s",
+                dataTypeToString(srcDataType).c_str(), dataTypeToString(destDataType).c_str());
+        }
+
+        bufferManager.copy(*tempBuffer, *block);
+    }
+
+    bufferManager.getStream().synchronize();
+}
+
+void convertKVCachePrecisionVector( //TODO: Instead of iterating and calling kernal, concat into a single tensor and call the kernel once
+    std::vector<runtime::ITensor::SharedPtr>& blocks,
+    BaseCacheFormatter::CacheState const& srcConfig,
+    BaseCacheFormatter::CacheState const& destConfig,
+    runtime::BufferManager const& bufferManager)
+{
+    convertKVCachePrecisionVectorToType(blocks, srcConfig.getDataType(), destConfig.getDataType(), bufferManager);
+}
+
 BlockRange getBlockRangeForSending(
     BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest, BlockKey const& lastBlockKey, int32_t indexFromEnd)
 {
@@ -419,13 +521,21 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
             inputKvCacheBlocksPerWindow, outputSplitCaches, destConfig, selfConfig, selfIdx, bufferManager);
 
         bufferManager.getStream().synchronize();
+
+        auto transferDtype = mCacheTransBufferManager->getTransferDataType();
+        auto localCacheDtype = selfConfig.getDataType();
+        if (transferDtype != localCacheDtype)
+        {
+            NVTX3_SCOPED_RANGE(kvCacheSendPrecisionConv);
+            convertKVCachePrecisionVectorToType(outputSplitCaches, localCacheDtype, transferDtype, bufferManager);
+        }
+
         session.setTime(TransferSession::kTimePreprocess);
 
         auto preAllocSendBuffer = mCacheTransBufferManager->getSendBuffer(cacheBufferId);
         if (preAllocSendBuffer != nullptr)
         {
-            TLLM_CHECK(preAllocSendBuffer->getDataType()
-                == inputKvCacheBlocksPerWindow.begin()->second.front()->getDataType());
+            TLLM_CHECK(preAllocSendBuffer->getDataType() == transferDtype);
         }
         auto sendBufferFun = [&](int deviceId, size_t processIdx)
         {
@@ -534,80 +644,6 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
     }
     TLLM_LOG_DEBUG(
         mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID:%ld ", llmRequest.mRequestId);
-}
-
-namespace {
-    std::string dataTypeToString(nvinfer1::DataType type)
-    {
-    switch (type)
-    {
-    case nvinfer1::DataType::kINT64: return "INT64";
-    case nvinfer1::DataType::kINT32: return "INT32";
-    case nvinfer1::DataType::kFLOAT: return "FP32";
-    case nvinfer1::DataType::kBF16: return "BF16";
-    case nvinfer1::DataType::kHALF: return "FP16";
-    case nvinfer1::DataType::kINT8: return "INT8";
-    case nvinfer1::DataType::kUINT8: return "UINT8";
-    case nvinfer1::DataType::kFP8: return "FP8";
-    case nvinfer1::DataType::kBOOL: return "BOOL";
-    default: return "UNKNOWN";
-    }
-    }
-} // namespace
-
-void convertKVCachePrecisionVector( //TODO: Instead of iterating and calling kernal, concat into a single tensor and call the kernel once
-    std::vector<runtime::ITensor::SharedPtr>& blocks,
-    BaseCacheFormatter::CacheState const& srcConfig,
-    BaseCacheFormatter::CacheState const& destConfig,
-    runtime::BufferManager const& bufferManager)
-{
-    auto const srcDataType = srcConfig.getDataType();
-    auto const destDataType = destConfig.getDataType();
-    auto stream = bufferManager.getStream().get();
-    
-    TLLM_LOG_INFO("Converting %zu blocks from %s to %s", blocks.size(),
-        dataTypeToString(srcDataType).c_str(), dataTypeToString(destDataType).c_str());
-    
-    for (size_t i = 0; i < blocks.size(); ++i)
-    {
-        auto& block = blocks[i];
-        auto blockShape = block->getShape();
-        auto blockVolume = runtime::ITensor::volume(blockShape);
-        
-        auto tempBuffer = bufferManager.gpu(blockShape, destDataType);
-        
-        if (srcDataType == nvinfer1::DataType::kHALF && destDataType == nvinfer1::DataType::kFP8)
-        {
-            kernels::invokeConversion<__nv_fp8_e4m3, half>( // Dest, Src
-                reinterpret_cast<__nv_fp8_e4m3*>(tempBuffer->data()),
-                reinterpret_cast<half const*>(block->data()),
-                blockVolume,
-                nullptr,
-                stream
-            );
-        }
-        else if (srcDataType == nvinfer1::DataType::kFP8 && destDataType == nvinfer1::DataType::kHALF)
-        {
-            kernels::invokeConversion<half, __nv_fp8_e4m3>(
-                reinterpret_cast<half*>(tempBuffer->data()),
-                reinterpret_cast<__nv_fp8_e4m3 const*>(block->data()),
-                blockVolume,
-                nullptr,
-                stream
-            );
-        }
-        else
-        {
-            TLLM_LOG_WARNING("Unsupported conversion %s -> %s, skipping",
-                dataTypeToString(srcDataType).c_str(),
-                dataTypeToString(destDataType).c_str());
-            continue;
-        }
-        
-        block = std::move(tempBuffer);
-    }
-    
-    bufferManager.getStream().synchronize();
 }
 
 void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& session)
@@ -964,7 +1000,7 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
             {
                 NVTX3_SCOPED_RANGE(formatInputConcatenate);
 
-                if (destConfig.getDataType() != selfConfig.getDataType() && common::getEnvEnableKVCachePrecisionConversion())
+                if (destConfig.getDataType() != selfConfig.getDataType() && common::getEnvKVCacheEnablePrecisionConversion())
                 {
                     TLLM_LOG_INFO("WE ARE TAKING THIS PATH, CONVERSING.......");
                     NVTX3_SCOPED_RANGE(kvCacheRecvPrecisionConv);
@@ -993,12 +1029,17 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
 
 [[nodiscard]] bool CacheFormatter::inquireSupport(CacheState const& selfConfig, CacheState const& destConfig) const
 {
-    // TODO: Change
-    // if (selfConfig.getDataType() != destConfig.getDataType()) // Overriding for now
-    // {
-    //     TLLM_LOG_WARNING("CacheFormatter::inquireSupport: selfConfig.getDataType() != destConfig.getDataType()");
-    //     return false;
-    // }
+    // Currently, only take this path when datatypes disagree (only add additional feature without modifying existing path)
+    if (selfConfig.getDataType() != destConfig.getDataType()) 
+    {
+        auto transferDtype = mCacheTransBufferManager->getTransferDataType();
+        TLLM_LOG_WARNING(
+            "Mixed-precision disaggregated serving detected: local cache dtype=%d, remote cache dtype=%d, transfer dtype=%d. "
+            "For mixed-precision serving, it is recommended to explicitly set transfer_dtype in CacheTransceiverConfig. "
+            "Example: CacheTransceiverConfig(transfer_dtype='FP8') for FP16 context to FP8 generation transfer.",
+            static_cast<int>(selfConfig.getDataType()), static_cast<int>(destConfig.getDataType()),
+            static_cast<int>(transferDtype));
+    }
 
     std::unordered_set<SizeType32> setVecSelf{
         selfConfig.getModelConfig().mNbKvHeadsPerLayer.begin(), selfConfig.getModelConfig().mNbKvHeadsPerLayer.end()};

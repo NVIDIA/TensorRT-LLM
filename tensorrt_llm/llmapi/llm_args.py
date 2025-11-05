@@ -1462,11 +1462,67 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "Timeout in milliseconds for KV cache transfer. Requests exceeding this timeout will be cancelled."
     )
 
+    transfer_dtype: Optional[Literal["FP32", "FP16", "BF16", "FP8", "INT8"]] = Field(
+        default=None,
+        description=
+        "Data type for KV cache transfer over the wire. If not specified (None), uses the local cache's data type automatically. "
+        "This is useful for mixed-precision disaggregated serving, e.g., FP16 context server to FP8 generation server. "
+        "When transferring between servers with different cache precisions, this should be explicitly set to avoid mismatches."
+    )
+
     def _to_pybind(self):
-        return _CacheTransceiverConfig(
-            backend=_CacheTransceiverBackendType.from_string(self.backend),
+        from ..bindings import DataType as BindingsDataType
+        from ..bindings import executor as executor_bindings
+        
+        # Convert to executor::DataType if provided
+        binding_dtype_map = {
+            "FP32": BindingsDataType.FLOAT,
+            "FP16": BindingsDataType.HALF,
+            "BF16": BindingsDataType.BF16,
+            "FP8": BindingsDataType.FP8,
+            "INT8": BindingsDataType.INT8,
+        }
+
+        transfer_dtype_executor = None
+        transfer_dtype_value = self.transfer_dtype
+        if transfer_dtype_value is not None:
+            if not hasattr(executor_bindings, "DataType"):
+                raise RuntimeError(
+                    "executor.DataType enum is not available in bindings; please update TensorRT-LLM")
+
+            if isinstance(transfer_dtype_value, str):
+                binding_dtype = binding_dtype_map.get(transfer_dtype_value.upper())
+                if binding_dtype is None:
+                    raise ValueError(f"Unsupported transfer_dtype '{transfer_dtype_value}'")
+            elif isinstance(transfer_dtype_value, BindingsDataType):
+                binding_dtype = transfer_dtype_value
+            elif isinstance(transfer_dtype_value, executor_bindings.DataType):
+                transfer_dtype_executor = transfer_dtype_value
+                binding_dtype = None
+            else:
+                raise TypeError(
+                    "transfer_dtype must be a supported string or a DataType enum instance")
+
+            if transfer_dtype_executor is None:
+                binding_to_executor_map = {
+                    BindingsDataType.FLOAT: executor_bindings.DataType.FP32,
+                    BindingsDataType.HALF: executor_bindings.DataType.FP16,
+                    BindingsDataType.BF16: executor_bindings.DataType.BF16,
+                    BindingsDataType.FP8: executor_bindings.DataType.FP8,
+                    BindingsDataType.INT8: executor_bindings.DataType.INT8,
+                }
+                transfer_dtype_executor = binding_to_executor_map.get(binding_dtype)
+                if transfer_dtype_executor is None:
+                    raise ValueError(
+                        f"transfer_dtype '{transfer_dtype_value}' cannot be converted to executor.DataType")
+        
+        config = _CacheTransceiverConfig(
+            backend=_CacheTransceiverBackendType.from_string(self.backend) if self.backend else None,
             max_tokens_in_buffer=self.max_tokens_in_buffer,
             kv_transfer_timeout_ms=self.kv_transfer_timeout_ms)
+        if transfer_dtype_executor is not None:
+            config.transfer_dtype = transfer_dtype_executor
+        return config
 
 
 @dataclass

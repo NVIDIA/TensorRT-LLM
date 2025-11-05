@@ -21,18 +21,20 @@
 namespace tensorrt_llm::executor
 {
 
-CacheTransceiverConfig::CacheTransceiverConfig(
-    std::optional<BackendType> backendType, std::optional<size_t> maxNumTokens, std::optional<int> kvTransferTimeoutMs)
+CacheTransceiverConfig::CacheTransceiverConfig(std::optional<BackendType> backendType,
+    std::optional<size_t> maxNumTokens, std::optional<int> kvTransferTimeoutMs,
+    std::optional<DataType> transferDataType)
     : mBackendType(backendType)
     , mMaxTokensInBuffer(maxNumTokens)
     , mKvTransferTimeoutMs(kvTransferTimeoutMs)
+    , mTransferDataType(transferDataType)
 {
 }
 
 bool CacheTransceiverConfig::operator==(CacheTransceiverConfig const& other) const
 {
     return mMaxTokensInBuffer == other.mMaxTokensInBuffer && mBackendType == other.mBackendType
-        && mKvTransferTimeoutMs == other.mKvTransferTimeoutMs;
+        && mKvTransferTimeoutMs == other.mKvTransferTimeoutMs && mTransferDataType == other.mTransferDataType;
 }
 
 void CacheTransceiverConfig::setBackendType(std::optional<BackendType> backendType)
@@ -54,6 +56,11 @@ void CacheTransceiverConfig::setKvTransferTimeoutMs(std::optional<int> kvTransfe
     mKvTransferTimeoutMs = kvTransferTimeoutMs;
 }
 
+void CacheTransceiverConfig::setTransferDataType(std::optional<DataType> transferDataType)
+{
+    mTransferDataType = transferDataType;
+}
+
 std::optional<CacheTransceiverConfig::BackendType> CacheTransceiverConfig::getBackendType() const
 {
     return mBackendType;
@@ -67,6 +74,11 @@ std::optional<size_t> CacheTransceiverConfig::getMaxTokensInBuffer() const
 std::optional<int> CacheTransceiverConfig::getKvTransferTimeoutMs() const
 {
     return mKvTransferTimeoutMs;
+}
+
+std::optional<DataType> CacheTransceiverConfig::getTransferDataType() const
+{
+    return mTransferDataType;
 }
 
 } // namespace tensorrt_llm::executor

@@ -165,8 +165,10 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         " CacheTransceiverConfig::BackendType is not set.");
 
     std::optional<size_t> maxNumTokens = mCacheTransceiverConfig.value().getMaxTokensInBuffer();
+    std::optional<executor::DataType> transferDataType = mCacheTransceiverConfig.value().getTransferDataType();
 
-    mCacheTransBufferManager = std::make_unique<kv_cache_manager::CacheTransBufferManager>(cacheManager, maxNumTokens);
+    mCacheTransBufferManager
+        = std::make_unique<kv_cache_manager::CacheTransBufferManager>(cacheManager, maxNumTokens, transferDataType);
     if (backendType.value() == executor::CacheTransceiverConfig::BackendType::UCX)
     {
         std::lock_guard<std::mutex> lock(mDllMutex);

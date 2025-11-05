@@ -19,7 +19,9 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/opUtils.h"
+#include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/executor/executor.h"
+#include "tensorrt_llm/executor/tensor.h"
 #include <NvInferRuntimeBase.h>
 #include <mutex>
 
@@ -188,8 +190,8 @@ bool FabricMemory::supportFbaricMemory()
 #endif
 }
 
-CacheTransBufferManager::CacheTransBufferManager(
-    KVCacheManager::BaseKVCacheManager* cacheManager, std::optional<size_t> maxNumTokens)
+CacheTransBufferManager::CacheTransBufferManager(KVCacheManager::BaseKVCacheManager* cacheManager,
+    std::optional<size_t> maxNumTokens, std::optional<executor::DataType> transferDataType)
     : mCacheManager{cacheManager}
     , mBufferManager{std::make_shared<runtime::CudaStream>()}
 {
@@ -198,25 +200,46 @@ CacheTransBufferManager::CacheTransBufferManager(
     TLLM_CHECK(mCacheManager);
     mDataType = mCacheManager->getPrimaryPool(0)->getDataType();
 
+    // Determine transfer data type and convert to nvinfer1::DataType
+    nvinfer1::DataType transferDtype;
+    if (transferDataType.has_value())
+    {
+        // Explicit transfer dtype specified - use it
+        transferDtype = executor::detail::toTrtDataType(transferDataType.value());
+        TLLM_LOG_INFO("CacheTransBufferManager: Using explicit transfer dtype: %d (local cache dtype: %d)",
+            static_cast<int>(transferDtype), static_cast<int>(mDataType));
+    }
+    else
+    {
+        // No transfer dtype specified - use local cache dtype (AUTO behavior)
+        transferDtype = mDataType;
+        TLLM_LOG_INFO("CacheTransBufferManager: Using AUTO transfer dtype (same as local cache): %d",
+            static_cast<int>(transferDtype));
+    }
+
+    mTransferDataType = transferDtype;
+    TLLM_LOG_INFO("TESTING!! CacheTransBufferManager: mTransferDataType: %d", static_cast<int>(mTransferDataType));
+
     auto tokensPerBlock = mCacheManager->getBlockManager().getTokensPerBlock();
     size_t bufferSizeFromMaxNumToken = 0;
     if (maxNumTokens.has_value())
     {
         TLLM_CHECK(maxNumTokens.value() % tokensPerBlock == 0);
-        auto dataSize = common::getDTypeSize(mDataType);
+        // Use transfer dtype for buffer size calculation since buffer holds transferred data
+        auto transferDataSize = common::getDTypeSize(mTransferDataType);
         auto kvCacheByteSizePerTokenPerLayer = mCacheManager->getBlockManager().getBlockSize(0) / tokensPerBlock
-            * (mCacheManager->getCacheType() == CacheType::kSELFKONLY ? 1 : 2) * dataSize;
+            * (mCacheManager->getCacheType() == CacheType::kSELFKONLY ? 1 : 2) * transferDataSize;
         for (auto layerId = 0; layerId < mCacheManager->getBlockManager().getNumLayers(); layerId++)
         {
             auto poolIdx = mCacheManager->getBlockManager().getLayerPoolIdx(layerId);
             auto windowSize = static_cast<size_t>(mCacheManager->getBlockManager().getPoolWindowSize(poolIdx));
-            auto alignedWindowSize = (windowSize + tokensPerBlock - 1) / tokensPerBlock * tokensPerBlock;
+            auto alignedWindowSize = (windowSize + static_cast<size_t>(tokensPerBlock) - 1) / static_cast<size_t>(tokensPerBlock) * static_cast<size_t>(tokensPerBlock);
             auto validTokenNum = (alignedWindowSize < maxNumTokens.value() ? alignedWindowSize : maxNumTokens.value());
             if (common::getEnvKVCacheTransferAllBlocksForWindow())
             {
                 validTokenNum = maxNumTokens.value();
             }
-            validTokenNum += tokensPerBlock; // add one more block
+            validTokenNum += static_cast<size_t>(tokensPerBlock); // add one more block
 
             bufferSizeFromMaxNumToken += validTokenNum * kvCacheByteSizePerTokenPerLayer;
         }
@@ -237,17 +260,20 @@ CacheTransBufferManager::CacheTransBufferManager(
     TLLM_LOG_INFO(
         "CacheTransBufferManager: mMaxNumTokens:%ld, mRecvBufferCount:%ld, "
         "mSendBufferCount:%ld,mTransferBufferSize:%ld, mPreAllocBufferSize:%ld,mOnlyUseDynamicBuffer:%d "
-        "mUseFabricMemory:%d mDataType:%d",
+        "mUseFabricMemory:%d mDataType:%d mTransferDataType:%d",
         maxNumTokens.has_value() ? maxNumTokens.value() : 0, mRecvBufferCount, mSendBufferCount, mTransferBufferSize,
-        mPreAllocBufferSize, mOnlyUseDynamicBuffer, mUseFabricMemory, mDataType);
+        mPreAllocBufferSize, mOnlyUseDynamicBuffer, mUseFabricMemory, static_cast<int>(mDataType),
+        static_cast<int>(mTransferDataType));
 
     allocateBuffer();
 }
 
 
-size_t CacheTransBufferManager::preAllocBufferSize(size_t tokensPerBlock,
+size_t CacheTransBufferManager::preAllocBufferSize(
     std::map<SizeType32, SizeType32> const& cacheSizeBytesPerTokenPerWindow,
-    std::optional<executor::CacheTransceiverConfig> const& cacheTransceiverConfig)
+    SizeType32 tokensPerBlock,
+    std::optional<executor::CacheTransceiverConfig> const& cacheTransceiverConfig,
+    nvinfer1::DataType localCacheDtype)
 {
     if (!cacheTransceiverConfig.has_value())
     {
@@ -261,13 +287,30 @@ size_t CacheTransBufferManager::preAllocBufferSize(size_t tokensPerBlock,
     size_t TransferBufferSize = common::getEnvMemSizeForKVCacheTransferBuffer();
     if (maxNumTokens.has_value())
     {
+        // Determine if we need to scale cache sizes for transfer dtype
+        float dtypeScaleFactor = 1.0f;
+        if (cacheTransceiverConfig->getTransferDataType().has_value())
+        {
+            auto transferDtype = executor::detail::toTrtDataType(cacheTransceiverConfig->getTransferDataType().value());
+            auto localDtypeSize = common::getDTypeSize(localCacheDtype);
+            auto transferDtypeSize = common::getDTypeSize(transferDtype);
+            // cacheSizeBytesPerToken is calculated with localCacheDtype, scale to transferDtype
+            dtypeScaleFactor = static_cast<float>(transferDtypeSize) / static_cast<float>(localDtypeSize);
+        }
+        
         TransferBufferSize = 0;
         for (auto const& [windowSize, cacheSizeBytesPerToken] : cacheSizeBytesPerTokenPerWindow)
         {
-            auto alignedWindowSize = (windowSize + tokensPerBlock - 1) / tokensPerBlock * tokensPerBlock;
+            auto alignedWindowSize = (static_cast<size_t>(windowSize) + static_cast<size_t>(tokensPerBlock) - 1) / static_cast<size_t>(tokensPerBlock) * static_cast<size_t>(tokensPerBlock);
             auto validTokenNum = (alignedWindowSize < maxNumTokens.value() ? alignedWindowSize : maxNumTokens.value());
-            validTokenNum += tokensPerBlock; // add one more block
-            TransferBufferSize += validTokenNum * cacheSizeBytesPerToken;
+            if (common::getEnvKVCacheTransferAllBlocksForWindow())
+            {
+                validTokenNum = maxNumTokens.value();
+            }
+            validTokenNum += static_cast<size_t>(tokensPerBlock); // add one more block
+            // Scale by dtype size ratio if transfer dtype is different
+            size_t adjustedCacheSizeBytesPerToken = static_cast<size_t>(cacheSizeBytesPerToken * dtypeScaleFactor);
+            TransferBufferSize += validTokenNum * adjustedCacheSizeBytesPerToken;
         }
     }
     bool useFabricMemory = FabricMemory::supportFbaricMemory()
@@ -369,13 +412,9 @@ std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> CacheTransBuf
             }
             else
             {
-
+                // Allocate dynamic buffer with transfer dtype when pre-allocated buffer is full
                 retSplitCaches.push_back(bufferManagerToUse.gpu(
-                    runtime::ITensor::makeShape({static_cast<int64_t>(targetBufferEleSizes[i])}), nvinfer1::DataType::kHALF)); // Overriding for now
-
-
-                // retSplitCaches.push_back(bufferManagerToUse.gpu(
-                //     runtime::ITensor::makeShape({static_cast<int64_t>(targetBufferEleSizes[i])}), mDataType));
+                    runtime::ITensor::makeShape({static_cast<int64_t>(targetBufferEleSizes[i])}), mTransferDataType));
             }
         }
         TLLM_LOG_DEBUG("getOrAllocateBuffers bufferCoverTargetNum:%d", bufferCoverTargetNum);
@@ -391,15 +430,11 @@ std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> CacheTransBuf
     }
     else
     {
+        // Only dynamic buffers mode - allocate all with transfer dtype
         for (int i = 0; i < targetNum; i++)
         {
-
             retSplitCaches.push_back(bufferManagerToUse.gpu(
-                runtime::ITensor::makeShape({static_cast<int64_t>(targetBufferEleSizes[i])}), nvinfer1::DataType::kHALF));
-
-
-            // retSplitCaches.push_back(bufferManagerToUse.gpu(
-            //     runtime::ITensor::makeShape({static_cast<int64_t>(targetBufferEleSizes[i])}), mDataType)); // Overriding for now
+                runtime::ITensor::makeShape({static_cast<int64_t>(targetBufferEleSizes[i])}), mTransferDataType));
         }
         bufferCoverTargetNum = targetNum;
     }
@@ -413,8 +448,8 @@ void CacheTransBufferManager::allocateBuffer()
     {
         return;
     }
-    mBufferEleSize = mTransferBufferSize / common::getDTypeSize(nvinfer1::DataType::kHALF); // Overriding for now
-    // mBufferEleSize = mTransferBufferSize / common::getDTypeSize(mDataType);
+    // Use transfer dtype for buffer element size calculation
+    mBufferEleSize = mTransferBufferSize / common::getDTypeSize(mTransferDataType);
     mConcurrenceSendResource.mBufferIndexFlag.resize(mSendBufferCount, 0);
     mConcurrenceRecvResource.mBufferIndexFlag.resize(mRecvBufferCount, 0);
     if (mUseFabricMemory)
@@ -423,35 +458,27 @@ void CacheTransBufferManager::allocateBuffer()
         for (size_t i = 0; i < mSendBufferCount; i++) 
         {
             mFabricMemory.emplace_back(std::make_unique<FabricMemory>(mTransferBufferSize));
-            mConcurrenceSendResource.mBuffers[i] = runtime::ITensor::wrap(mFabricMemory.back()->getPtr(), nvinfer1::DataType::kHALF, // Overriding for now
-                runtime::ITensor::makeShape({static_cast<int64_t>(mBufferEleSize)}), mBufferEleSize);
-            // mConcurrenceSendResource.mBuffers[i] = runtime::ITensor::wrap(mFabricMemory.back()->getPtr(), mDataType,
-            //     runtime::ITensor::makeShape({static_cast<int64_t>(mBufferEleSize)}), mBufferEleSize);
+            mConcurrenceSendResource.mBuffers[i] = runtime::ITensor::wrap(mFabricMemory.back()->getPtr(),
+                mTransferDataType, runtime::ITensor::makeShape({static_cast<int64_t>(mBufferEleSize)}), mBufferEleSize);
         }
         for (size_t i = 0; i < mRecvBufferCount; i++)
         {
             mFabricMemory.emplace_back(std::make_unique<FabricMemory>(mTransferBufferSize));
-            mConcurrenceRecvResource.mBuffers[i] = runtime::ITensor::wrap(mFabricMemory.back()->getPtr(), nvinfer1::DataType::kHALF, // Overriding for now
-                runtime::ITensor::makeShape({static_cast<int64_t>(mBufferEleSize)}), mBufferEleSize);
-            // mConcurrenceRecvResource.mBuffers[i] = runtime::ITensor::wrap(mFabricMemory.back()->getPtr(), mDataType,
-            //     runtime::ITensor::makeShape({static_cast<int64_t>(mBufferEleSize)}), mBufferEleSize);
+            mConcurrenceRecvResource.mBuffers[i] = runtime::ITensor::wrap(mFabricMemory.back()->getPtr(),
+                mTransferDataType, runtime::ITensor::makeShape({static_cast<int64_t>(mBufferEleSize)}), mBufferEleSize);
         }
     }
     else if (common::getEnvKVCacheTransferUseAsyncBuffer())
     {
         for (size_t i = 0; i < mSendBufferCount; i++)
         {
-            mConcurrenceSendResource.mBuffers[i]
-                = mBufferManager.gpu(runtime::ITensor::makeShape({static_cast<int64_t>(mBufferEleSize)}), nvinfer1::DataType::kHALF); // Overriding for now
-            // mConcurrenceSendResource.mBuffers[i]
-            //     = mBufferManager.gpu(runtime::ITensor::makeShape({static_cast<int64_t>(mBufferEleSize)}), mDataType);
+            mConcurrenceSendResource.mBuffers[i] = mBufferManager.gpu(
+                runtime::ITensor::makeShape({static_cast<int64_t>(mBufferEleSize)}), mTransferDataType);
         }
         for (size_t i = 0; i < mRecvBufferCount; i++)
         {
-            mConcurrenceRecvResource.mBuffers[i]
-                = mBufferManager.gpu(runtime::ITensor::makeShape({static_cast<int64_t>(mBufferEleSize)}), nvinfer1::DataType::kHALF); // Overriding for now
-            // mConcurrenceRecvResource.mBuffers[i]
-            //     = mBufferManager.gpu(runtime::ITensor::makeShape({static_cast<int64_t>(mBufferEleSize)}), mDataType);
+            mConcurrenceRecvResource.mBuffers[i] = mBufferManager.gpu(
+                runtime::ITensor::makeShape({static_cast<int64_t>(mBufferEleSize)}), mTransferDataType);
         }
         mBufferManager.getStream().synchronize();
     }
@@ -460,16 +487,12 @@ void CacheTransBufferManager::allocateBuffer()
         for (size_t i = 0; i < mSendBufferCount; i++)
         {
             mConcurrenceSendResource.mBuffers[i] = mBufferManager.gpuSync(
-                runtime::ITensor::makeShape({static_cast<int64_t>(mBufferEleSize)}), nvinfer1::DataType::kHALF); // Overriding for now
-            // mConcurrenceSendResource.mBuffers[i] = mBufferManager.gpuSync(
-            //     runtime::ITensor::makeShape({static_cast<int64_t>(mBufferEleSize)}), mDataType);
+                runtime::ITensor::makeShape({static_cast<int64_t>(mBufferEleSize)}), mTransferDataType);
         }
         for (size_t i = 0; i < mRecvBufferCount; i++)
         {
             mConcurrenceRecvResource.mBuffers[i] = mBufferManager.gpuSync(
-                runtime::ITensor::makeShape({static_cast<int64_t>(mBufferEleSize)}), nvinfer1::DataType::kHALF); // Overriding for now
-            // mConcurrenceRecvResource.mBuffers[i] = mBufferManager.gpuSync(
-            //     runtime::ITensor::makeShape({static_cast<int64_t>(mBufferEleSize)}), mDataType);
+                runtime::ITensor::makeShape({static_cast<int64_t>(mBufferEleSize)}), mTransferDataType);
         }
     }
 }

@@ -4,7 +4,7 @@ from os import getenv
 import tensorrt_llm
 from tensorrt_llm import logger
 from tensorrt_llm._torch.distributed.communicator import Distributed
-from tensorrt_llm.bindings import WorldConfig
+from tensorrt_llm.bindings import DataType, WorldConfig
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -142,15 +142,21 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
 
 class CacheTransBufferManager:
 
-    def __init__(self, kv_cache_manager: KVCacheManager, max_num_tokens: int):
-        self.impl = CacheTransBufferManagerCpp(kv_cache_manager.impl,
-                                               max_num_tokens)
+    def __init__(self,
+                 kv_cache_manager: KVCacheManager,
+                 max_num_tokens: int,
+                 transfer_dtype: DataType | None = None):
+        self.impl = CacheTransBufferManagerCpp(
+            kv_cache_manager.impl,
+            max_num_tokens,
+            transfer_dtype)
 
     @staticmethod
     def pre_alloc_buffer_size(
             kv_cache_size_bytes_per_token_per_window: dict[int, int],
             tokens_per_block: int,
-            cache_transceiver_config: CacheTransceiverConfig):
+            cache_transceiver_config: CacheTransceiverConfig,
+            local_cache_dtype: DataType = DataType.HALF):
         return CacheTransBufferManagerCpp.pre_alloc_buffer_size(
             kv_cache_size_bytes_per_token_per_window, tokens_per_block,
-            cache_transceiver_config)
+            cache_transceiver_config, local_cache_dtype)

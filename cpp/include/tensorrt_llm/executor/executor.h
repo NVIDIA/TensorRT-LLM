@@ -1465,16 +1465,19 @@ public:
         NIXL = 3
     };
     explicit CacheTransceiverConfig(std::optional<BackendType> backendType = std::nullopt,
-        std::optional<size_t> maxNumTokens = std::nullopt, std::optional<int> kvTransferTimeoutMs = std::nullopt);
+        std::optional<size_t> maxNumTokens = std::nullopt, std::optional<int> kvTransferTimeoutMs = std::nullopt,
+        std::optional<DataType> transferDataType = std::nullopt);
 
     bool operator==(CacheTransceiverConfig const& other) const;
     void setBackendType(std::optional<BackendType> backendType);
     void setMaxTokensInBuffer(std::optional<size_t> maxTokensInBuffer);
     void setKvTransferTimeoutMs(std::optional<int> kvTransferTimeoutMs);
+    void setTransferDataType(std::optional<DataType> transferDataType);
 
     [[nodiscard]] std::optional<int> getKvTransferTimeoutMs() const;
     [[nodiscard]] std::optional<size_t> getMaxTokensInBuffer() const;
     [[nodiscard]] std::optional<BackendType> getBackendType() const;
+    [[nodiscard]] std::optional<DataType> getTransferDataType() const;
 
 private:
     std::optional<BackendType> mBackendType;
@@ -1483,6 +1486,10 @@ private:
     /// transfer may be degraded.
     std::optional<size_t> mMaxTokensInBuffer;
     std::optional<int> mKvTransferTimeoutMs;
+    /// @brief Data type for KV cache transfer over the wire. If not specified, uses the local cache's data type.
+    /// This is useful for mixed-precision disaggregated serving (e.g., FP16 context server to FP8 generation server).
+    /// When transferring between servers with different precision, this must be explicitly set.
+    std::optional<DataType> mTransferDataType;
 };
 
 /// @brief Configuration class for the model executor

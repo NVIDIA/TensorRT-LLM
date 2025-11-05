@@ -34,6 +34,7 @@
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
 namespace tb = tensorrt_llm::batch_manager;
+namespace tle = tensorrt_llm::executor;
 namespace nb = nanobind;
 
 namespace
@@ -179,9 +180,11 @@ void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
             nb::arg("input"), nb::arg("sizes"));
 
     nb::class_<tb::kv_cache_manager::CacheTransBufferManager>(m, "CacheTransBufferManager")
-        .def(nb::init<tb::kv_cache_manager::BaseKVCacheManager*, std::optional<size_t>>(), nb::arg("cache_manager"),
-            nb::arg("max_num_tokens") = std::nullopt)
+        .def(nb::init<tb::kv_cache_manager::BaseKVCacheManager*, std::optional<size_t>,
+                 std::optional<tle::DataType>>(),
+            nb::arg("cache_manager"), nb::arg("max_num_tokens") = std::nullopt,
+            nb::arg("transfer_dtype") = std::nullopt)
         .def_static("pre_alloc_buffer_size", &tb::kv_cache_manager::CacheTransBufferManager::preAllocBufferSize,
             nb::arg("cache_size_bytes_per_token_per_window"), nb::arg("tokens_per_block"),
-            nb::arg("cache_transceiver_config") = nb::none());
+            nb::arg("cache_transceiver_config") = nb::none(), nb::arg("local_cache_dtype") = nvinfer1::DataType::kHALF);
 }

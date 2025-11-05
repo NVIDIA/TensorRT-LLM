@@ -48,6 +48,17 @@ void instantiateEventDiff(nb::module_& m, std::string const& name)
 void initBindings(nb::module_& m)
 {
     m.attr("__version__") = tle::version();
+    nb::enum_<tle::DataType>(m, "DataType")
+        .value("BOOL", tle::DataType::kBOOL)
+        .value("UINT8", tle::DataType::kUINT8)
+        .value("INT8", tle::DataType::kINT8)
+        .value("INT32", tle::DataType::kINT32)
+        .value("INT64", tle::DataType::kINT64)
+        .value("BF16", tle::DataType::kBF16)
+        .value("FP8", tle::DataType::kFP8)
+        .value("FP16", tle::DataType::kFP16)
+        .value("FP32", tle::DataType::kFP32)
+        .value("UNKNOWN", tle::DataType::kUNKNOWN);
     nb::enum_<tle::ModelType>(m, "ModelType")
         .value("DECODER_ONLY", tle::ModelType::kDECODER_ONLY)
         .value("ENCODER_ONLY", tle::ModelType::kENCODER_ONLY)

@@ -28,6 +28,11 @@
 #include <type_traits>
 #include <vector>
 
+namespace nvinfer1
+{
+enum class DataType : int;
+}
+
 namespace tensorrt_llm::runtime
 {
 class ITensor;
@@ -44,6 +49,12 @@ namespace detail
 std::shared_ptr<runtime::ITensor> const& toITensor(Tensor const& tensor);
 Tensor ofITensor(std::shared_ptr<runtime::ITensor> tensor);
 using DimType64 = int64_t;
+
+/// @brief Convert executor::DataType to nvinfer1::DataType
+/// @param dataType The executor data type to convert
+/// @return The corresponding nvinfer1::DataType
+/// @throws If dataType is kUNKNOWN or unsupported
+nvinfer1::DataType toTrtDataType(DataType dataType);
 
 } // namespace detail
 
