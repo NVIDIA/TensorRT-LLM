@@ -1617,7 +1617,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_device_not_contain(["GB200"])
-    @parametrize_with_ids("moe_backend", ["WIDEEP"])
+    @parametrize_with_ids("moe_backend", ["WIDEEP", "CUTLASS", "TRTLLM"])
     @parametrize_with_ids("mtp_nextn", [0, 2])
     def test_bfloat16_4gpus_online_eplb(self, moe_backend, mtp_nextn):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
@@ -3917,7 +3917,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             chat_template_kwargs = dict(reasoning_effort="medium")
             extra_evaluator_kwargs = {
                 **self.extra_evaluator_kwargs, "chat_template_kwargs":
-                    chat_template_kwargs
+                chat_template_kwargs
             }
 
             sampling_params = SamplingParams(
@@ -3929,7 +3929,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           sampling_params=sampling_params,
                           extra_evaluator_kwargs=extra_evaluator_kwargs)
-
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_device_not_contain(["GB200"])
@@ -3966,6 +3965,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             task = GSM8K(model_name)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
+
 
 @skip_pre_hopper
 class TestEXAONE4(LlmapiAccuracyTestHarness):
