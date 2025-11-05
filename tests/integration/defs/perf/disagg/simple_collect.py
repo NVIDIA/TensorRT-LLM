@@ -261,7 +261,7 @@ class TextWriter:
                     [
                         sys.executable,
                         "-c",
-                        'import tensorrt_llm; '
+                        "import tensorrt_llm; "
                         'print(f"[TensorRT-LLM] TensorRT-LLM version: {tensorrt_llm.__version__}")',
                     ],
                     capture_output=True,
