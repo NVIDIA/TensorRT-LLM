@@ -99,7 +99,7 @@ DEFAULT_METRICS_CONFIG = {
     ),
     # Accuracy test default configuration
     ("disagg", "accuracy"): COMMON_ACCURACY_METRICS_CONFIG,
-    ("widep", "accuracy"): COMMON_ACCURACY_METRICS_CONFIG,
+    ("wideep", "accuracy"): COMMON_ACCURACY_METRICS_CONFIG,
 }
 
 
