@@ -38,6 +38,14 @@ def _triton_cached_ssm(
     - Prefill: run one varlen combined scan over concatenated prefill tokens and update final states per slot.
     - Decode: batch single-token updates with selective_state_update and update states per slot.
     """
+    hidden_states = hidden_states.to(torch.float32)
+    A = A.to(torch.float32)
+    B = B.to(torch.float32)
+    C = C.to(torch.float32)
+    D = D.to(torch.float32)
+    dt = dt.to(torch.float32)
+    dt_bias = dt_bias.to(torch.float32)
+
     b, s = hidden_states.shape[:2]
     num_seq = seq_len.shape[0]
     # Flatten tokens for indexing/scatter
