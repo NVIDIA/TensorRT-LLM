@@ -54,12 +54,12 @@ class RpcWorker(BaseWorker):
         super().__init__(
             engine=engine,
             executor_config=executor_config,
-            is_llm_executor=is_llm_executor,
-            llm_args=llm_args,
             batched_logits_processor=batched_logits_processor,
             postproc_worker_config=postproc_worker_config,
+            is_llm_executor=is_llm_executor,
             hf_model_dir=hf_model_dir,
             tokenizer=tokenizer,
+            llm_args=llm_args,
         )
 
         # Extract garbage_collection_gen0_threshold from llm_args if available

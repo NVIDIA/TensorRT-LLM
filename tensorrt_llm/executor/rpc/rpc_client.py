@@ -4,7 +4,8 @@ import threading
 import uuid
 from typing import Any, AsyncIterator, Callable, Optional
 
-from ...llmapi.utils import logger_debug
+from ..._utils import nvtx_mark_debug
+from ...llmapi.utils import enable_llmapi_debug, logger_debug
 from ...logger import logger
 from ..ipc import ZeroMqQueue
 from .rpc_common import (RPCCancelled, RPCParams, RPCRequest, RPCResponse,

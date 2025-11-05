@@ -6,6 +6,8 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional
 
+import zmq
+
 from ...llmapi.utils import logger_debug
 from ...logger import logger
 from ..ipc import ZeroMqQueue
