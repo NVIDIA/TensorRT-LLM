@@ -574,7 +574,11 @@ class HCXVisionInputProcessor(BaseMultimodalDummyInputsBuilder,
                  tokenizer: AutoTokenizer,
                  trust_remote_code: bool = True,
                  **kwargs):
-        super().__init__(**kwargs)
+        super().__init__(model_path=model_path,
+                         config=config,
+                         tokenizer=tokenizer,
+                         trust_remote_code=trust_remote_code,
+                         **kwargs)
         self._config = config
         self._tokenizer = tokenizer if tokenizer is not None else AutoTokenizer.from_pretrained(
             model_path,
