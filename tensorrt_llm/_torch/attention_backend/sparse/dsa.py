@@ -1009,8 +1009,8 @@ class Indexer(nn.Module):
                         # The logits is a sliced tensor, the original shape[-1] is divisible by 4.
                         # We need to align the shape[-1] back to be multiple of 4 to support allreduce.
                         num_chunked_ctx_tokens = chunk.token_end - chunk.token_start
-                        seq_len_kv_aligned = (num_chunked_ctx_tokens +
-                                              3) // 4 * 4
+                        seq_len_kv_aligned = fp8_utils.align(
+                            num_chunked_ctx_tokens, 4)
                         logits_aligned = torch.as_strided(
                             logits,
                             size=(num_chunked_ctx_tokens, seq_len_kv_aligned),
@@ -1050,7 +1050,7 @@ class Indexer(nn.Module):
                 if self.tp_size > 1:
                     # The logits is a sliced tensor, the original shape[-1] is divisible by 4.
                     # We need to align the shape[-1] back to be multiple of 4 to support allreduce.
-                    seq_len_kv_aligned = (num_ctx_tokens + 3) // 4 * 4
+                    seq_len_kv_aligned = fp8_utils.align(num_ctx_tokens, 4)
                     logits_aligned = torch.as_strided(
                         logits,
                         size=(num_ctx_tokens, seq_len_kv_aligned),
@@ -1073,8 +1073,7 @@ class Indexer(nn.Module):
                                         dtype=torch.int32)
 
         if has_decode:
-            # round up to multiple of 4 to make sure the shape[-1] of the logits is divisible by 4 support allreduce
-            max_seq_len = (metadata.kv_cache_manager.max_seq_len + 3) // 4 * 4
+            max_seq_len = metadata.kv_cache_manager.max_seq_len
             # Get decode lengths per request (from seq_lens) for validation
             gen_seq_lens = metadata.seq_lens[num_contexts:num_contexts +
                                              num_generations]
@@ -1108,7 +1107,21 @@ class Indexer(nn.Module):
                     num_generations],  # Only pass generation request block tables
                 metadata.scheduler_metadata_buffer,
                 max_seq_len)
-            logits_decode = self.allreduce(logits_decode)
+            if self.tp_size > 1:
+                # The logits_decode is a sliced tensor, the original shape[-1] is divisible by 4 * tokens_per_block.
+                # We need to align the shape[-1] back to be multiple of 4 to support allreduce.
+                tokens_per_block = metadata.kv_cache_manager.tokens_per_block
+                aligned_max_len = fp8_utils.align(max_seq_len,
+                                                  4 * tokens_per_block)
+                logits_aligned = torch.as_strided(
+                    logits_decode,
+                    size=(num_gen_tokens, aligned_max_len),
+                    stride=logits_decode.stride(),
+                    storage_offset=logits_decode.storage_offset())
+                logits_decode = self.allreduce(
+                    logits_aligned.reshape(-1, 4 * tokens_per_block))
+                logits_decode = logits_decode.reshape(num_gen_tokens,
+                                                      -1)[:, :max_seq_len]
             # padded
             positions = torch.arange(
                 max_seq_len,
