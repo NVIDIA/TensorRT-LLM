@@ -547,11 +547,23 @@ def run_moe_reference_fp4(args):
         args.gemm2_weights, args.gemm2_scales, 1 / args.gemm2_scales_global,
         sf_vec_size).cuda()
 
-    args_dequant = moe_args_dequant(
-        args.num_tokens, args.num_experts, args.hidden_size,
-        args.intermediate_size, args.top_k, args.padding, hidden_states_dequant,
-        args.expert_logits, gemm1_weights_dequant, gemm2_weights_dequant,
-        args.permute_info, args.use_routing_scales_on_input)
+    args_dequant = moe_args_dequant(args.num_tokens,
+                                    args.num_experts,
+                                    args.hidden_size,
+                                    args.intermediate_size,
+                                    args.top_k,
+                                    args.padding,
+                                    hidden_states_dequant,
+                                    args.expert_logits,
+                                    gemm1_weights_dequant,
+                                    gemm2_weights_dequant,
+                                    args.permute_info,
+                                    args.use_routing_scales_on_input,
+                                    gemm1_bias=None,
+                                    gemm1_alpha=args.gemm1_alpha,
+                                    gemm1_beta=None,
+                                    gemm1_clamp_limit=None,
+                                    gemm2_bias=None)
 
     return run_moe_dequant(args_dequant, "fp4"), args_dequant
 
@@ -827,6 +839,8 @@ def check_accuracy(a, b, atol, rtol, percent):
         raise Exception("NaN in a")
     if torch.any(torch.isnan(b)):
         raise Exception("NaN in b")
+    print("check_accuracy a:", a)
+    print("check_accuracy b:", b)
     assert a.shape == b.shape
     left = torch.abs(a - b)
     right = atol + rtol * torch.abs(b)
@@ -1165,14 +1179,16 @@ class TestMoeFp4:
                 id="RoutingGPTOSS")
         ],
     )
+    @pytest.mark.parametrize("swiglu_alpha", [1, 0.1])
     def test_gptoss(self, num_tokens, hidden_size, intermediate_size,
-                    routing_info):
+                    routing_info, swiglu_alpha):
 
         self.run_moe_fp4_gptoss_test(num_tokens,
                                      hidden_size,
                                      intermediate_size,
                                      routing_info,
-                                     use_autotune=False)
+                                     use_autotune=False,
+                                     swiglu_alpha=swiglu_alpha)
 
     @pytest.mark.parametrize("num_tokens", [1])
     @pytest.mark.parametrize("hidden_size", [1024])
@@ -1491,8 +1507,8 @@ class TestMoeFp4:
 
     def run_moe_fp4_gptoss_test(self, num_tokens: int, hidden_size: int,
                                 intermediate_size: int, routing_info: dict,
-                                use_autotune: bool) -> None:
-
+                                use_autotune: bool,
+                                swiglu_alpha: float) -> None:
         torch.random.manual_seed(0)
 
         #
@@ -1604,14 +1620,34 @@ class TestMoeFp4:
             permute_info, scores = routing_reference_renormalize_naive(
                 expert_logits, top_k, num_experts, padding)
 
-        args = moe_args(num_tokens, num_experts, hidden_size, intermediate_size,
-                        top_k, padding, hidden_states_fp4_bytes,
+        swiglu_alpha_tensor = torch.full((num_experts, ),
+                                         swiglu_alpha,
+                                         device='cuda',
+                                         dtype=torch.float)
+
+        args = moe_args(num_tokens,
+                        num_experts,
+                        hidden_size,
+                        intermediate_size,
+                        top_k,
+                        padding,
+                        hidden_states_fp4_bytes,
                         hidden_states_scale_fp4_bytes,
-                        hidden_states_scale_global, scores,
-                        gemm1_weights_fp4_bytes, gemm1_scales_fp4_bytes,
-                        gemm1_scales_global, gemm2_weights_fp4_bytes,
-                        gemm2_scales_fp4_bytes, gemm2_scales_global,
-                        permute_info, False)
+                        hidden_states_scale_global,
+                        scores,
+                        gemm1_weights_fp4_bytes,
+                        gemm1_scales_fp4_bytes,
+                        gemm1_scales_global,
+                        gemm2_weights_fp4_bytes,
+                        gemm2_scales_fp4_bytes,
+                        gemm2_scales_global,
+                        permute_info,
+                        False,
+                        gemm1_bias=None,
+                        gemm1_alpha=swiglu_alpha_tensor,
+                        gemm1_beta=None,
+                        gemm1_clamp_limit=None,
+                        gemm2_bias=None)
         #
         # Run the reference implementations
         #
@@ -1702,6 +1738,7 @@ class TestMoeFp4:
                 hidden_states_scale_linear_fp4,
                 gemm1_weights_fp4_shuffled,
                 gemm1_scales_fp4_shuffled,
+                swiglu_alpha_tensor,
                 gemm2_weights_fp4_shuffled,
                 gemm2_scales_fp4_shuffled,
                 scale_c_fc1,
@@ -1722,9 +1759,9 @@ class TestMoeFp4:
 
         check_accuracy(output_dequant_reference,
                        output_dequant_actual,
-                       atol=0.1,
-                       rtol=0.85,
-                       percent=0.925)
+                       atol=0.2,
+                       rtol=0.2,
+                       percent=0.9)
 
     def run_moe_fp8_fp4_test(self, num_tokens: int, hidden_size: int,
                              intermediate_size: int, routing_info: dict,
