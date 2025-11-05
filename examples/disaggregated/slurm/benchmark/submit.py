@@ -84,12 +84,8 @@ def submit_job(config):
     log_base = os.path.join(env_config['work_dir'], f"{isl}-{osl}")
 
     # Get eplb num_slots for gen worker
-    eplb_num_slots = (
-        config['worker_config']['gen']
-        .get('moe_config', {})
-        .get('load_balancer', {})
-        .get('num_slots', 0)
-    )
+    eplb_num_slots = (config['worker_config']['gen'].get('moe_config', {}).get(
+        'load_balancer', {}).get('num_slots', 0))
     # Determine directory suffix based on attention_dp
     if gen_enable_attention_dp:
         dir_suffix = f"ctx{ctx_num}_gen{gen_num}_dep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}_mtp{mtp_size}"
