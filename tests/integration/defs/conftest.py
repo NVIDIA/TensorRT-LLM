@@ -1893,6 +1893,12 @@ def get_sm_version():
     return prop.major * 10 + prop.minor
 
 
+def is_sm_100f(sm_version=None):
+    if sm_version is None:
+        sm_version = get_sm_version()
+    return sm_version == 100 or sm_version == 103
+
+
 def get_gpu_device_list():
     "get device list"
     with tempfile.TemporaryDirectory() as temp_dirname:
@@ -2235,6 +2241,89 @@ def pytest_configure(config):
         # Create output directory early (like --junitxml does) to avoid conflicts with other plugins
         # that may need to write to the same directory (e.g., pytest-split)
         os.makedirs(output_dir, exist_ok=True)
+
+        # Create the reporter with logger
+        xmlpath = os.path.join(output_dir, "results.xml")
+        reporter = PeriodicJUnitXML(
+            xmlpath=xmlpath,
+            interval=periodic_interval,
+            batch_size=periodic_batch_size,
+            logger={
+                'info': print_info,
+                'warning': print_warning
+            },
+        )
+
+        # Configure and register the reporter
+        reporter.pytest_configure(config)
+        config.pluginmanager.register(reporter, 'periodic_junit')
+
+        print_info("PeriodicJUnitXML reporter registered")
+        print_info(
+            f"  Interval: {periodic_interval}s ({periodic_interval/60:.1f} min)"
+        )
+        print_info(f"  Batch size: {periodic_batch_size} tests")
+    elif periodic and not output_dir:
+        print_warning(
+            "Warning: --periodic-junit requires --output-dir to be set. "
+            "Periodic reporting disabled.")
+
+
+def deselect_by_test_model_suites(test_model_suites, items, test_prefix,
+                                  config):
+    """Filter tests based on the test model suites specified.
+    If a test matches any of the test model suite names, it is considered selected.
+
+    Args:
+        test_model_suites: String containing test model suite names separated by semicolons
+        items: List of pytest items to filter
+        test_prefix: Test prefix if any
+        config: Pytest config object
+    """
+    if not test_model_suites:
+        return
+
+    # Split by semicolon or space and strip whitespace
+    suite_names = [
+        suite.strip() for suite in test_model_suites.replace(';', ' ').split()
+        if suite.strip()
+    ]
+
+    if not suite_names:
+        return
+
+    selected = []
+    deselected = []
+
+    for item in items:
+        # Get the test name without prefix for comparison
+        test_name = item.nodeid
+        if test_prefix and test_name.startswith(f"{test_prefix}/"):
+            test_name = test_name[len(f"{test_prefix}/"):]
+
+        # Check if any suite name matches the test name
+        found = False
+        for suite_name in suite_names:
+            if suite_name in test_name or test_name.endswith(suite_name):
+                found = True
+                break
+
+        if found:
+            selected.append(item)
+        else:
+            deselected.append(item)
+
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+    items[:] = selected
+
+    # Initialize PeriodicJUnitXML reporter if enabled
+    periodic = config.getoption("--periodic-junit", default=False)
+    output_dir = config.getoption("--output-dir", default=None)
+
+    if periodic and output_dir:
+        periodic_interval = config.getoption("--periodic-interval")
+        periodic_batch_size = config.getoption("--periodic-batch-size")
 
         # Create the reporter with logger
         xmlpath = os.path.join(output_dir, "results.xml")

@@ -128,7 +128,8 @@ class PyExecutor:
                  start_worker: bool = True,
                  kv_connector_manager: Optional[KvCacheConnectorManager] = None,
                  max_seq_len: Optional[int] = None,
-                 peft_cache_config: Optional[PeftCacheConfig] = None):
+                 peft_cache_config: Optional[PeftCacheConfig] = None,
+                 virtual_memory_pools: Optional[dict] = None):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = dist.rank
@@ -151,6 +152,7 @@ class PyExecutor:
         self.guided_decoder = guided_decoder
         self.dist = dist
         self.disable_overlap_scheduler = disable_overlap_scheduler
+        self.virtual_memory_pools = virtual_memory_pools
 
         # enqueue and _fetch_new_requests used data
         self.active = True
@@ -256,6 +258,8 @@ class PyExecutor:
         )
         self.executor_request_queue.set_exclude_last_generation_logits(
             self.disable_overlap_scheduler, self.dist.pp_size)
+        self.control_request_barrier = threading.Event()
+        self.control_action_done = threading.Event()
 
         self.stats_lock = threading.Lock()
         self.stats = []
@@ -441,6 +445,10 @@ class PyExecutor:
         del self.model_engine
         if self.draft_model_engine is not None:
             del self.draft_model_engine
+        if self.virtual_memory_pools is not None:
+            keys = list(self.virtual_memory_pools.keys())
+            for key in keys:
+                del self.virtual_memory_pools[key]
 
     def can_enqueue_requests(self) -> bool:
         """
@@ -788,6 +796,8 @@ class PyExecutor:
                 if self.should_stop_processing:
                     break
 
+                self._handle_control_request()
+
                 if self.kv_cache_transceiver:
                     self._check_disagg_gen_transfer_status()
 
@@ -821,12 +831,7 @@ class PyExecutor:
                     f'{len(scheduled_batch.generation_requests)} generation requests'
                 )
 
-                if self.enable_attention_dp:
-                    tp_batch_sizes = self.dist.tp_allgather(
-                        scheduled_batch.batch_size)
-                    can_queue = 0 not in tp_batch_sizes
-                else:
-                    can_queue = scheduled_batch.batch_size > 0
+                can_queue = self._can_queue(scheduled_batch)
 
                 if not can_queue:
                     self.micro_batches[microbatch_id] = None
@@ -1004,6 +1009,16 @@ class PyExecutor:
             self.send_handles[microbatch_id].wait()
             self.send_handles[microbatch_id] = None
 
+    def _can_queue(self, scheduled_batch):
+
+        if self.enable_attention_dp:
+            tp_batch_sizes = self.dist.tp_allgather(scheduled_batch.batch_size)
+            can_queue = 0 not in tp_batch_sizes
+        else:
+            can_queue = scheduled_batch.batch_size > 0
+
+        return can_queue
+
     def _prepare_and_schedule_batch(self):
         new_requests = self._fetch_and_activate_new_requests()
         if self.should_stop_processing:
@@ -1119,6 +1134,8 @@ class PyExecutor:
                     iter_start_time = time.time()
 
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
+                self._handle_control_request()
+
                 if scheduled_batch is None:
                     break
 
@@ -1126,8 +1143,8 @@ class PyExecutor:
 
                 finished_requests = []
 
-                if scheduled_batch.batch_size > 0 or (
-                        self.enable_attention_dp and self.dist.tp_size > 1):
+                can_queue = self._can_queue(scheduled_batch)
+                if can_queue:
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
                         self._prepare_disagg_gen_transmission_complete(
@@ -1139,8 +1156,11 @@ class PyExecutor:
 
                     self._kv_connector_start_batch(scheduled_batch)
 
-                if scheduled_batch.batch_size > 0 or (
-                        self.enable_attention_dp and self.dist.tp_size > 1):
+                # if using a kv connector, we need to call can_queue again since scheduled_batch might have changed
+                if self.kv_connector_manager:
+                    can_queue = self._can_queue(scheduled_batch)
+
+                if can_queue:
                     # init_disagg_gen_requests must be before drafter loop, otherwise draft requests do not have initialized matchers.
                     # init_disagg_gen_requests must be before engine forward, where the prev_seq_slot is updated.
                     if self.guided_decoder is not None:
@@ -1249,6 +1269,47 @@ class PyExecutor:
             logger.error(f"Encountered an error in decode: {error_msg}")
             self._handle_errors(error_msg)
 
+    def _handle_control_request(self):
+        if len(self.active_requests) == 0 and \
+            self.executor_request_queue.get_waiting_queue_size() == 0 and \
+            len(self.executor_request_queue.control_requests) > 0:
+            assert len(self.executor_request_queue.control_requests) == 1, (
+                f"Expected exactly one control request to be processed at a time, "
+                f"but found {len(self.executor_request_queue.control_requests)} control requests. "
+                f"This may indicate a race condition or improper control request handling."
+            )
+            self.executor_request_queue.control_requests.pop(0)
+            self.control_request_barrier.set()
+            self.control_action_done.wait()
+            self.control_action_done.clear()
+
+    @contextmanager
+    def control_action(self):
+        """
+        Context manager for synchronized control actions.
+
+        Usage:
+            with control_action():
+                # Eventloop thread has finished all previous requests and paused
+                do some actions here
+            # Eventloop thread resumes automatically after exiting
+        """
+
+        if self.dist.rank == 0:
+            self.executor_request_queue.enqueue_control_request()
+
+        # Wait for worker to finish all previous requests
+        self.control_request_barrier.wait()
+
+        try:
+            # Yield control to the with block
+            # Worker is now paused, safe to execute actions
+            yield self
+        finally:
+            # Cleanup: signal worker to resume
+            self.control_action_done.set()
+            self.control_request_barrier.clear()
+
     def _executor_loop_overlap(self):
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
@@ -1263,6 +1324,8 @@ class PyExecutor:
                     iter_start_time = time.time()
 
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
+                self._handle_control_request()
+
                 if scheduled_batch is None:
                     break
                 # In gen-only benchmarking mode, wait until the number of scheduled generation
@@ -1298,7 +1361,8 @@ class PyExecutor:
 
                 self._pause_requests(scheduled_batch.paused_requests)
 
-                if scheduled_batch.batch_size > 0:
+                can_queue = self._can_queue(scheduled_batch)
+                if can_queue:
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
                         self._prepare_disagg_gen_transmission_complete(
@@ -1307,7 +1371,11 @@ class PyExecutor:
 
                     self._kv_connector_start_batch(scheduled_batch)
 
-                if scheduled_batch.batch_size > 0:
+                # if using a kv connector, we need to call can_queue again since scheduled_batch might have changed
+                if self.kv_connector_manager:
+                    can_queue = self._can_queue(scheduled_batch)
+
+                if can_queue:
 
                     # The generation requests that are do not have batch_idx,
                     # needs to be in front of the batch due to the assumptions
@@ -2362,6 +2430,9 @@ class PyExecutor:
                 self.guided_decoder.add_batch(scheduled_batch)
                 if hasattr(self.drafter, "guided_decoder"):
                     self.guided_decoder.rollback_draft_tokens()
+
+    def reset_prefix_cache(self):
+        self.kv_cache_manager.reset_reuse_state()
 
 
 class DisaggPPTerminationHandler:
