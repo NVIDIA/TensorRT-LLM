@@ -613,13 +613,7 @@ class AllReduce(nn.Module):
         self.all_reduce_op = torch.ops.trtllm.allreduce_pg if self._disable_mpi else torch.ops.trtllm.allreduce
 
         if self.mapping.tp_size > 1:
-            # When Strategy is UB or SYMM_MEM, it is guaranteed that the workspace is not used.
-            if self.strategy != AllReduceStrategy.UB and self.strategy != AllReduceStrategy.SYMM_MEM:
-                if self.strategy == AllReduceStrategy.LOWPRECISION:
-                    allocate_low_presicion_allreduce_workspace(self.mapping)
-                self.workspace = get_allreduce_workspace(self.mapping)
-
-            # Initialize Symmetric Memory AllReduce if needed
+            # Initialize Symmetric Memory AllReduce if needed (before workspace allocation)
             if self.strategy == AllReduceStrategy.SYMM_MEM:
                 try:
                     symm_mem = SymmetricMemoryAllReduce(
@@ -629,21 +623,35 @@ class AllReduce(nn.Module):
                     if not symm_mem.disabled:
                         self.symm_mem_allreduce = symm_mem
                         logger.info(
-                            f"SymmetricMemoryAllReduce (MULTIMEM) is enabled for world_size={self.mapping.tp_size}"
+                            f"SymmetricMemoryAllReduce (MULTIMEM) is enabled with fallback support for world_size={self.mapping.tp_size}"
                         )
+                        # Keep SYMM_MEM strategy but allocate workspace for fallback to regular allreduce
                     else:
-                        logger.debug(
-                            f"SymmetricMemoryAllReduce is disabled (not supported or unavailable)"
+                        logger.info(
+                            f"SymmetricMemoryAllReduce is disabled (not supported or unavailable), falling back to AUTO strategy"
                         )
+                        # Fall back to AUTO if SYMM_MEM can't be enabled
+                        self.strategy = AllReduceStrategy.AUTO
                 except Exception as e:
-                    logger.debug(
-                        f"Symmetric Memory AllReduce can't be enabled due to {e}."
+                    logger.info(
+                        f"Symmetric Memory AllReduce can't be enabled due to {e}, falling back to AUTO strategy"
                     )
                     self.symm_mem_allreduce = None
+                    # Fall back to AUTO if SYMM_MEM initialization fails
+                    self.strategy = AllReduceStrategy.AUTO
 
-            # Initialize MNNVL AllReduce if needed
-            elif self.strategy in (AllReduceStrategy.AUTO,
-                                   AllReduceStrategy.MNNVL):
+            # Allocate workspace for strategies that need it
+            # Note: SYMM_MEM now also needs workspace for fallback scenarios (fused ops, etc.)
+            # Only UB doesn't need workspace
+            if self.strategy != AllReduceStrategy.UB:
+                if self.strategy == AllReduceStrategy.LOWPRECISION:
+                    allocate_low_presicion_allreduce_workspace(self.mapping)
+                self.workspace = get_allreduce_workspace(self.mapping)
+
+            # Initialize MNNVL if using AUTO or MNNVL strategy
+            if self.strategy in (AllReduceStrategy.AUTO,
+                                 AllReduceStrategy.MNNVL):
+                # Try to initialize MNNVL
                 if MNNVLAllReduce.is_mnnvl(self.mapping, dtype):
                     # ALWAYS capture the exception when creating this instance
                     try:
@@ -708,6 +716,13 @@ class AllReduce(nn.Module):
                     f"Using SymmetricMemoryAllReduce (MULTIMEM) for input shape {input.shape}"
                 )
                 return symm_mem_output
+        elif self.symm_mem_allreduce and all_reduce_params.fusion_op != AllReduceFusionOp.NONE:
+            # Log once per rank that we're skipping symm_mem due to fusion
+            if not hasattr(self, '_logged_fusion_skip'):
+                logger.debug(
+                    f"Skipping SymmetricMemoryAllReduce for fused operation (fusion_op={all_reduce_params.fusion_op}), using regular allreduce"
+                )
+                self._logged_fusion_skip = True
 
         # Try MNNVL AllReduce if symm_mem didn't handle it
         if self.mnnvl_allreduce:
@@ -724,6 +739,7 @@ class AllReduce(nn.Module):
 
         additional_args = {}
         if self._disable_mpi:
+            # Get ProcessGroup from mapping
             pg = self.mapping.tp_group_pg
             assert pg is not None, "TP ProcessGroup not initialised"
             additional_args = {

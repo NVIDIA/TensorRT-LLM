@@ -110,14 +110,39 @@ class SymmetricMemoryAllReduce(nn.Module):
                 self.disabled = True
                 return
 
-            # Get actual TP group ranks from mapping
-            tp_group_ranks = mapping.tp_group()
+            # Get actual TP group ranks from mapping (tp_group is a property, not a method)
+            tp_group_ranks = mapping.tp_group
             self.group = dist.new_group(tp_group_ranks) if len(tp_group_ranks) > 1 else None
         else:
             self.group = group
 
         if self.group is None:
             logger.warning("SymmetricMemoryAllReduce: No valid process group")
+            self.disabled = True
+            return
+
+        # Enable symmetric memory for this group
+        try:
+            # Get group_name - this may fail if ProcessGroup doesn't have group_name set
+            if not hasattr(self.group, "group_name"):
+                logger.warning(
+                    "SymmetricMemoryAllReduce: ProcessGroup does not have group_name attribute"
+                )
+                self.disabled = True
+                return
+
+            group_name_str = str(self.group.group_name)
+            torch_symm_mem.enable_symm_mem_for_group(group_name_str)
+            logger.debug(
+                f"SymmetricMemoryAllReduce: Enabled symmetric memory for group {group_name_str}"
+            )
+        except Exception as e:
+            logger.warning(
+                f"SymmetricMemoryAllReduce: Failed to enable symmetric memory for group: {e}"
+            )
+            import traceback
+
+            logger.debug(traceback.format_exc())
             self.disabled = True
             return
 
@@ -128,8 +153,9 @@ class SymmetricMemoryAllReduce(nn.Module):
                 device=device,
                 dtype=self.dtype,
             )
-            # Pass group_name (string) not the group object
-            handle = torch_symm_mem.rendezvous(self.buffer, self.group.group_name)
+            # Pass group name string
+            group_name_str = str(self.group.group_name)
+            handle = torch_symm_mem.rendezvous(self.buffer, group_name_str)
 
             if handle.multicast_ptr == 0:
                 logger.warning(
@@ -162,6 +188,11 @@ class SymmetricMemoryAllReduce(nn.Module):
         except Exception as e:
             logger.warning(f"SymmetricMemoryAllReduce initialization failed: {e}")
             return
+
+    @property
+    def process_group(self) -> Optional[dist.ProcessGroup]:
+        """Expose the ProcessGroup for use in fallback scenarios."""
+        return self.group if not self.disabled else None
 
     def should_use_symm_mem(self, inp: torch.Tensor) -> bool:
         """Check if symmetric memory can be used for this tensor."""
@@ -201,10 +232,12 @@ class SymmetricMemoryAllReduce(nn.Module):
         self.buffer[: inp.numel()].copy_(inp.view(-1))
 
         # Perform MULTIMEM allreduce
+        # Pass group name string (matching vLLM's implementation)
+        group_name_str = str(self.group.group_name)
         torch.ops.symm_mem.multimem_all_reduce_(
             self.buffer[: inp.numel()],
             "sum",
-            self.group.group_name,
+            group_name_str,
         )
 
         # Copy result back

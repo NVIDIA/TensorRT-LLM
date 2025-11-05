@@ -26,9 +26,9 @@ try:
         cache_key = (rank, world_size, tensor.dtype)
         if cache_key not in _allreduce_cache:
             p_config = Mapping(world_size=world_size, tp_size=world_size, rank=rank)
-            # Use Strategy.AUTO for optimal performance
+            # Use SYMM_MEM strategy (tries symmetric memory first, falls back to AUTO if needed)
             _allreduce_cache[cache_key] = AllReduce(
-                mapping=p_config, strategy=AllReduceStrategy.AUTO, dtype=tensor.dtype
+                mapping=p_config, strategy=AllReduceStrategy.SYMM_MEM, dtype=tensor.dtype
             )
 
         torch_op = _allreduce_cache[cache_key]
