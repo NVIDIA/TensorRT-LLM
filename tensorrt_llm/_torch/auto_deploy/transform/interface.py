@@ -173,6 +173,10 @@ class TransformInfo(BaseModel):
             has_valid_shapes=self.has_valid_shapes and other.has_valid_shapes,
         )
 
+    # implement + addition operator for TransformInfo
+    def __add__(self, other: "TransformInfo") -> "TransformInfo":
+        return self.__and__(other)
+
 
 TransformHistory = Dict[str, TransformInfo]
 
