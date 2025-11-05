@@ -11,7 +11,7 @@ from tensorrt_llm.executor.request import GenerationRequest
 from tensorrt_llm.executor.rpc import RPCClient
 from tensorrt_llm.executor.rpc.rpc_common import get_unique_ipc_addr
 from tensorrt_llm.executor.rpc_worker import RpcWorker
-from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, TorchLlmArgs
 from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -33,6 +33,7 @@ class TestRpcWorkerTP1:
             tensor_parallel_size=1,
             backend='pytorch',
             enable_iter_perf_stats=True,
+            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.5, ),
         )
         self.pool, self.addr = self.create_worker_pool()
         self.client = self.create_rpc_client(self.addr)
