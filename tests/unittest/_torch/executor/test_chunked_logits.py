@@ -95,7 +95,6 @@ class TestPyResult:
                           max_new_tokens=10,
                           use_device_memory=True,
                           streaming=False,
-                          return_log_probs=True,
                           return_context_logits=True,
                           return_generation_logits=True,
                           exclude_last_generation_logits=False,
@@ -105,7 +104,6 @@ class TestPyResult:
         assert result._streaming is False
         assert result._context_logits is not None
         assert result._generation_logits is not None
-        assert result._log_probs is not None
         assert result._mm_embeddings is None
 
     def test_append_logits_no_storage(self, sample_logits):
