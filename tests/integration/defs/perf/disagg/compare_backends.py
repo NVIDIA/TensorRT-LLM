@@ -299,7 +299,7 @@ def generate_html_report(result_df, threshold, default_backend, output_path):
             <strong>⚠️ Attention:</strong>
             <ul style="margin: 5px 0;">
                 <li>✅ <strong>Pass</strong>: DEFAULT is similar to or better than UCX</li>
-                <li>❌ <strong>Fail</strong>: DEFAULT is slower than UCX{threshold}%（Preformance degradation）</li>
+                <li>❌ <strong>Fail</strong>: DEFAULT is slower than UCX{threshold}%（Performance degradation）</li>
                 <li>📊 Positive value means DEFAULT is slower than UCX, negative value means
                 DEFAULT is faster than UCX</li>
             </ul>

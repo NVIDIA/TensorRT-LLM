@@ -832,11 +832,11 @@ def check_job_result(job_id: str, benchmark_type: str, config: dict,
     print(f"   📁 Checking result directory: {result_dir}")
     
     # Print the slurm log to console
-    slurm_log_writer = LogWritter(EnvManager.get_work_dir())
+    slurm_log_writer = LogWriter(EnvManager.get_work_dir())
     slurm_log_writer.print_to_console(f"slurm-{job_id}.out")
     
     # Print the metrics log file specified in metrics_config
-    log_writer = LogWritter(result_dir)
+    log_writer = LogWriter(result_dir)
     if os.path.exists(os.path.join(result_dir, metrics_config.log_file)):
         log_writer.print_to_console(metrics_config.log_file)
     else:

@@ -8,7 +8,7 @@ import pandas as pd
 from common import GPU_RESOURCE_CONFIG, EnvManager
 
 
-class LogWritter(object):
+class LogWriter(object):
     def __init__(self, log_path: str):
         self.log_path = log_path
 

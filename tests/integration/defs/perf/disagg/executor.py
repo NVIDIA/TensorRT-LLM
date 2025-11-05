@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from common import GPU_RESOURCE_CONFIG, SESSION_COLLECT_CMD_TYPE, EnvManager, extract_config_fields
-from report import LogParser, LogWritter, ResultSaver
+from report import LogParser, LogWriter, ResultSaver
 from trt_test_alternative import call, check_output
 
 # ============================================================================
@@ -350,11 +350,11 @@ class JobManager:
             result_dir: Result directory containing log and config files
         """
         # Print the slurm log to console
-        slurm_log_writer = LogWritter(EnvManager.get_work_dir())
+        slurm_log_writer = LogWriter(EnvManager.get_work_dir())
         slurm_log_writer.print_to_console(f"slurm-{job_id}.out")
 
         # Print all .log and .yaml files in result_dir (except output_server.log)
-        log_writer = LogWritter(result_dir)
+        log_writer = LogWriter(result_dir)
         files_to_print = []
         if os.path.exists(result_dir):
             for file in os.listdir(result_dir):
