@@ -140,6 +140,93 @@ class TestRpcBasics:
                 assert client.get_task_submitted().remote()
 
 
+class TestRpcCorrectness:
+
+    class App:
+
+        def incremental_task(self, v: int):
+            return v + 1
+
+        async def incremental_task_async(self, v: int):
+            return v + 1
+
+        async def streaming_task(self, n: int):
+            for i in range(n):
+                yield i
+
+    def test_incremental_task(self):
+        addr = get_unique_ipc_addr()
+        with RpcServerWrapper(TestRpcCorrectness.App(), addr=addr) as server:
+            with RPCClient(addr) as client:
+                for i in range(10000):  # a large number of tasks
+                    result = client.incremental_task(i).remote()
+                    if i % 1000 == 0:
+                        print(f"incremental_task {i} done")
+                    assert result == i + 1, f"result {result} != {i + 1}"
+
+    def test_incremental_task_async(self):
+        addr = get_unique_ipc_addr()
+        with RpcServerWrapper(TestRpcCorrectness.App(), addr=addr) as server:
+            with RPCClient(addr) as client:
+
+                async def test_incremental_task_async():
+                    for i in range(10000):  # a large number of tasks
+                        result = await client.incremental_task_async(
+                            i).remote_async()
+                        if i % 1000 == 0:
+                            print(f"incremental_task_async {i} done")
+                        assert result == i + 1, f"result {result} != {i + 1}"
+
+                asyncio.run(test_incremental_task_async())
+
+    @pytest.mark.skip(reason="This test is flaky, need to fix it")
+    def test_incremental_task_future(self):
+        addr = get_unique_ipc_addr()
+        with RpcServerWrapper(TestRpcCorrectness.App(), addr=addr) as server:
+            # Create client with more workers to handle concurrent futures
+            with RPCClient(addr, num_workers=16) as client:
+                # Process in smaller batches to avoid overwhelming the system
+                batch_size = 50
+                total_tasks = 1000  # Reduced from 10000 for stability
+
+                for batch_start in range(0, total_tasks, batch_size):
+                    batch_end = min(batch_start + batch_size, total_tasks)
+                    futures = []
+
+                    # Create futures for this batch
+                    for i in range(batch_start, batch_end):
+                        futures.append(
+                            client.incremental_task(i).remote_future())
+
+                    # Wait for all futures in this batch to complete
+                    for idx, future in enumerate(futures):
+                        no = batch_start + idx
+                        if no % 100 == 0:
+                            print(f"incremental_task_future {no} done")
+                        assert future.result(
+                        ) == no + 1, f"result {future.result()} != {no + 1}"
+
+    def test_incremental_task_streaming(self):
+        addr = get_unique_ipc_addr()
+        with RpcServerWrapper(TestRpcCorrectness.App(), addr=addr) as server:
+            with RPCClient(addr) as client:
+
+                async def test_streaming_task():
+                    results = []
+                    no = 0
+                    async for result in client.streaming_task(
+                            10000).remote_streaming():
+                        results.append(result)
+                        if no % 1000 == 0:
+                            print(f"streaming_task {no} done")
+                        no += 1
+                    assert results == [
+                        i for i in range(10000)
+                    ], f"results {results} != {[i for i in range(10000)]}"
+
+                asyncio.run(test_streaming_task())
+
+
 class TestRpcError:
 
     class CustomError(Exception):

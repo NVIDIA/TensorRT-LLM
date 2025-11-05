@@ -86,5 +86,5 @@ class RPCResponse(NamedTuple):
     result: Any
     error: Optional[RPCError] = None
     is_streaming: bool = False  # True if more responses coming
-    sequence_number: int = 0  # For ordering streaming responses
+    chunk_index: int = 0  # For ordering streaming responses
     stream_status: Literal['start', 'data', 'end', 'error'] = 'data'

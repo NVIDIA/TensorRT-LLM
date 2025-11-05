@@ -2,7 +2,7 @@ import asyncio
 import concurrent.futures
 import threading
 import uuid
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Callable, Optional
 
 from ...llmapi.utils import logger_debug
 from ...logger import logger
@@ -14,7 +14,8 @@ from .rpc_common import (RPCCancelled, RPCParams, RPCRequest, RPCResponse,
 class RemoteCall:
     """Helper class to enable chained remote call syntax like client.method().remote()"""
 
-    def __init__(self, client: 'RPCClient', method_name: str, *args, **kwargs):
+    def __init__(self, client: 'RPCClient', method_name: str, *args,
+                 **kwargs) -> None:
         self.client = client
         self.method_name = method_name
         self.args = args
@@ -57,7 +58,7 @@ class RemoteCall:
 
     def remote_async(self,
                      timeout: Optional[float] = None,
-                     need_response: bool = True):
+                     need_response: bool = True) -> Any:
         """Asynchronous remote call that returns a coroutine.
 
         Args:
@@ -106,9 +107,9 @@ class RPCClient:
 
     def __init__(self,
                  address: str,
-                 hmac_key=None,
+                 hmac_key: Optional[bytes] = None,
                  timeout: Optional[float] = None,
-                 num_workers: int = 4):
+                 num_workers: int = 4) -> None:
         '''
         Args:
             address: The ZMQ address to connect to.
@@ -137,7 +138,7 @@ class RPCClient:
 
         logger_debug(f"RPC Client initialized. Connected to {self._address}")
 
-    def shutdown_server(self):
+    def shutdown_server(self) -> None:
         """Shutdown the server."""
         if self._server_stopped:
             return
@@ -146,7 +147,7 @@ class RPCClient:
 
         self._server_stopped = True
 
-    def close(self):
+    def close(self) -> None:
         """Gracefully close the client, cleaning up background tasks."""
         if self._closed:
             return
@@ -182,112 +183,7 @@ class RPCClient:
 
         logger_debug("RPC Client closed")
 
-    def _handle_streaming_response(self, response: RPCResponse):
-        """Handle a streaming response by putting it in the appropriate queue.
-
-        Args:
-            response: The streaming response to handle
-        """
-        assert response.stream_status in [
-            'start', 'data', 'end', 'error'
-        ], f"Invalid stream status: {response.stream_status}"
-
-        queue = self._streaming_queues.get(response.request_id)
-        if queue:
-            # put to the sync queue, as the current event loop is
-            # different from the one in call_async or call_streaming
-            assert isinstance(queue, AsyncQueue)
-            if enable_llmapi_debug() or logger.level == 'debug':
-                logger_debug(
-                    f"RPC Client putting response to AsyncQueue: status={response.stream_status}, request_id={response.request_id}"
-                )
-            queue.sync_q.put(response)
-            # Clean up if stream ended
-            if response.stream_status in ['end', 'error']:
-                self._streaming_queues.pop(response.request_id, None)
-
-    def _handle_regular_response(self, response: RPCResponse):
-        """Handle a regular (non-streaming) response by setting the future result.
-
-        Args:
-            response: The response to handle
-        """
-        if future_info := self._pending_futures.get(response.request_id):
-            future, target_loop = future_info
-
-            if not future.done():
-
-                def safe_set_result():
-                    """Safely set result on future, handling race conditions."""
-                    try:
-                        if not future.done():
-                            if response.error is None:
-                                future.set_result(response.result)
-                            else:
-                                future.set_exception(response.error)
-                    except asyncio.InvalidStateError:
-                        # Future was cancelled or completed between the check and set
-                        # This is expected in high-load scenarios, just log and continue
-                        if enable_llmapi_debug() or logger.level == 'debug':
-                            logger_debug(
-                                f"Future already done for request_id: {response.request_id}, skipping"
-                            )
-
-                if enable_llmapi_debug() or logger.level == 'debug':
-                    if response.error is None:
-                        logger_debug(
-                            f"Setting result for request_id: {response.request_id}"
-                        )
-                    else:
-                        logger_debug(
-                            f"Setting exception for request_id: {response.request_id}, error: {response.error}"
-                        )
-
-                target_loop.call_soon_threadsafe(safe_set_result)
-        else:
-            if enable_llmapi_debug() or logger.level == 'debug':
-                logger_debug(
-                    f"No future found for request_id: {response.request_id}")
-
-        self._pending_futures.pop(response.request_id, None)
-
-    async def _handle_reader_exception(self, exception: Exception):
-        """Propagate an exception to all pending futures and streaming queues.
-
-        Args:
-            exception: The exception to propagate
-        """
-        logger.error(f"Exception in RPC response reader: {exception}")
-
-        # Propagate exception to all pending futures
-        for (future, target_loop) in self._pending_futures.values():
-            if not future.done():
-
-                def safe_set_exception(f=future, exc=exception):
-                    """Safely set exception on future, handling race conditions."""
-                    try:
-                        if not f.done():
-                            f.set_exception(exc)
-                    except asyncio.InvalidStateError:
-                        # Future was cancelled or completed, this is fine
-                        pass
-
-                target_loop.call_soon_threadsafe(safe_set_exception)
-
-        # Also signal error to streaming queues
-        for queue in self._streaming_queues.values():
-            await queue.put(RPCResponse("", None, exception, False, 0, 'error'))
-
-    async def _wait_for_response(self) -> RPCResponse:
-        """Wait for a response from the socket.
-
-        Returns:
-            RPCResponse from the server
-        """
-        # Directly await the socket - cancellation will be handled by task cancellation
-        return await self._client_socket.get_async()
-
-    async def _response_reader(self):
+    async def _response_reader(self) -> None:
         """Task to read responses from the socket and set results on futures."""
         logger_debug("Response reader started")
 
@@ -359,7 +255,7 @@ class RPCClient:
         finally:
             logger_debug("Response reader exiting gracefully")
 
-    def _ensure_reader_task(self):
+    def _ensure_reader_task(self) -> None:
         """Ensure the response reader task is running."""
         with self._reader_lock:
             if self._reader_task is None or self._reader_task.done():
@@ -371,7 +267,7 @@ class RPCClient:
                     # No running event loop, will be started when needed
                     pass
 
-    async def _call_async(self, method_name, *args, **kwargs):
+    async def _call_async(self, method_name: str, *args, **kwargs) -> Any:
         """Async version of RPC call.
         Args:
             method_name: Method name to call
@@ -435,7 +331,7 @@ class RPCClient:
         except Exception:
             raise
 
-    def _call_sync(self, method_name, *args, **kwargs):
+    def _call_sync(self, method_name: str, *args, **kwargs) -> Any:
         """Synchronous version of RPC call."""
         logger_debug(
             f"RPC Client calling method: {method_name} with args: {args} and kwargs: {kwargs}"
@@ -446,7 +342,7 @@ class RPCClient:
             asyncio.get_running_loop()
 
             # We're inside an event loop, we need to run in a thread to avoid deadlock
-            def run_in_thread():
+            def run_in_thread() -> Any:
                 return asyncio.run(
                     self._call_async(method_name, *args, **kwargs))
 
@@ -566,12 +462,12 @@ class RPCClient:
             # Clean up
             self._streaming_queues.pop(request_id, None)
 
-    def get_server_attr(self, name: str):
+    def get_server_attr(self, name: str) -> Any:
         """ Get the attribute of the RPC server.
         This is mainly used for testing. """
         return self._rpc_get_attr(name).remote()
 
-    def __getattr__(self, name):
+    def __getattr__(self, name: str) -> Callable[..., RemoteCall]:
         """
         Magically handles calls to non-existent methods.
         Returns a callable that when invoked returns a RemoteCall instance.
@@ -584,16 +480,16 @@ class RPCClient:
         """
         logger_debug(f"RPC Client getting attribute: {name}")
 
-        def method_caller(*args, **kwargs):
+        def method_caller(*args, **kwargs) -> RemoteCall:
             return RemoteCall(self, name, *args, **kwargs)
 
         return method_caller
 
-    def __enter__(self):
+    def __enter__(self) -> 'RPCClient':
         return self
 
-    def __exit__(self, exc_type, exc_value, traceback):
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
         self.close()
 
-    def __del__(self):
+    def __del__(self) -> None:
         self.close()
