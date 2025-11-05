@@ -92,7 +92,6 @@ class ModelList(OpenAIBaseModel):
 
 
 class ResponseFormat(OpenAIBaseModel):
-    # type must be one of "text", "json", "json_schema", "json_object", or "structural_tag"
     type: Literal["text", "json", "json_schema", "json_object", "regex", "ebnf",
                   "structural_tag"]
     schema: Optional[dict] = None
