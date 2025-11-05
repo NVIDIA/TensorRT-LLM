@@ -882,8 +882,6 @@ class ServerArrivalTimeMiddleware:
         if scope["type"] == "http":
             # Add arrival time to scope
             scope["state"] = {}
-            scope["ctx_server"] = ""
-            scope["gen_server"] = ""
             scope["state"][
                 "server_arrival_time"] = get_steady_clock_now_in_seconds()
 
