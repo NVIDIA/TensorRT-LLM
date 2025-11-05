@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import cute_dsl_nvfp4_grouped_gemm_ref
 from tensorrt_llm._torch.modules.fused_moe.routing import RoutingMethodType
 from tensorrt_llm._torch.utils import unswizzle_sf
 from tensorrt_llm._utils import get_sm_version
@@ -17,68 +18,6 @@ def get_max_num_permuted_tokens(
     num_tokens: int, top_k: int, tile_size: int, num_local_experts: int
 ) -> int:
     return get_max_num_tiles(num_tokens, top_k, tile_size, num_local_experts) * tile_size
-
-
-def cute_dsl_nvfp4_grouped_gemm_ref(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    a_sf: torch.Tensor,
-    b_sf: torch.Tensor,
-    alpha: torch.Tensor,
-    tile_idx_to_group_idx: torch.Tensor,
-    num_non_exiting_tiles: torch.Tensor,
-    output_dtype: torch.dtype,
-    tile_size: int = 128,
-    scaling_vector_size: int = 16,
-):
-    assert a.dtype == torch.float4_e2m1fn_x2
-    assert a.dim() == 2
-    assert b.dtype == torch.float4_e2m1fn_x2
-    assert b.dim() == 3
-    assert a_sf.dtype == torch.uint8
-    assert a_sf.dim() == 1
-    assert b_sf.dtype == torch.uint8
-    assert b_sf.dim() == 3
-    assert alpha.dtype == torch.float32
-    assert alpha.dim() == 1
-
-    m, k = a.size(0), a.size(1) * 2
-    l, n = b.size(0), b.size(1)  # noqa: E741
-    assert b.size(2) * 2 == k
-    assert m % tile_size == 0
-    assert k % (scaling_vector_size * 4) == 0
-    assert a_sf.size(0) == m * k // scaling_vector_size
-    assert b_sf.size(0) == l
-    assert b_sf.size(1) == n
-    assert b_sf.size(2) == k // scaling_vector_size
-    assert alpha.size(0) == l
-
-    num_tiles_per_expert = torch.bincount(
-        tile_idx_to_group_idx[: num_non_exiting_tiles[0].item()], minlength=l
-    )
-    offsets = [0] + num_tiles_per_expert.cumsum(dim=0).tolist()
-
-    ref = torch.empty(m, n, dtype=output_dtype, device="cuda")
-    for i, (start, end) in enumerate(zip(offsets[:-1], offsets[1:])):
-        if end <= start:
-            continue
-        a_sliced = a[start * tile_size : end * tile_size]
-        a_sf_sliced = a_sf[
-            start * tile_size * k // scaling_vector_size : end
-            * tile_size
-            * k
-            // scaling_vector_size
-        ]
-        ref[start * tile_size : end * tile_size] = torch.ops.trtllm.nvfp4_gemm(
-            a_sliced.view(torch.uint8),
-            b[i].view(torch.uint8),
-            a_sf_sliced,
-            b_sf[i],
-            alpha[i],
-            output_dtype,
-        )
-
-    return ref
 
 
 @pytest.mark.parametrize("tile_size", [128, 256])
