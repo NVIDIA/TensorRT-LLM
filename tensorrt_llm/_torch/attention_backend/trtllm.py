@@ -197,6 +197,7 @@ class TrtllmAttentionWrapper:
         sparse_kv_offsets: Optional[torch.Tensor] = None,
         sparse_attn_indices: Optional[torch.Tensor] = None,
         sparse_attn_offsets: Optional[torch.Tensor] = None,
+        sparse_mla_topk: int = 0,
         **kwargs,
     ):
         """
@@ -240,6 +241,7 @@ class TrtllmAttentionWrapper:
             sparse_kv_offsets (torch.Tensor): The batch offsets for the sparse KV indices, with shape of (num_contexts + 1) on GPU.
             sparse_attn_indices (torch.Tensor): The sparse indices for the attention layer, with shape of (num_heads_kv, num_sparse_tokens) on GPU.
             sparse_attn_offsets (torch.Tensor): The batch offsets for the sparse attention indices, with shape of (num_generations + 1) on GPU.
+            sparse_mla_topk (int): The topk for the sparse MLA, used by DSA attention.
         """
         self.layer_idx = layer_idx
         self.tokens_per_block = tokens_per_block
@@ -281,6 +283,7 @@ class TrtllmAttentionWrapper:
         self.sparse_kv_offsets = sparse_kv_offsets
         self.sparse_attn_indices = sparse_attn_indices
         self.sparse_attn_offsets = sparse_attn_offsets
+        self.sparse_mla_topk = sparse_mla_topk
         if max_sequence_length > self.rope_params.max_positions:
             self.rope_params.max_positions = max_sequence_length
             self.rotary_inv_freq, self.rotary_cos_sin = self.rope_params.create_rope_const_params(
@@ -385,7 +388,14 @@ class TrtllmAttentionWrapper:
             else:
                 raise ValueError("Unexpected attention mask type")
         else:
-            if self.attention_input_type == AttentionInputType.context_only:
+            # For DSA, use the same qkv hidden size for context and generation phases
+            is_sparse_attn = self.sparse_attn_indices is not None and self.sparse_attn_indices.numel(
+            ) > 0
+            if self.attention_input_type == AttentionInputType.context_only and is_sparse_attn:
+                assert is_fused_qkv
+                qkv_hidden_size = self.num_heads * (self.kv_lora_rank +
+                                                    self.qk_rope_head_dim)
+            elif self.attention_input_type == AttentionInputType.context_only:
                 assert not is_fused_qkv
                 qkv_hidden_size = self.num_heads * (self.qk_nope_head_dim +
                                                     self.qk_rope_head_dim)
@@ -438,12 +448,6 @@ class TrtllmAttentionWrapper:
             self.spec_decoding_position_offsets, self.spec_decoding_packed_mask
         ]
         mla_tensor_params = [self.helix_position_offsets]
-        sparse_attention_params = [
-            self.sparse_kv_indices,
-            self.sparse_kv_offsets,
-            self.sparse_attn_indices,
-            self.sparse_attn_offsets,
-        ]
 
         thop.attention(
             q,
@@ -511,7 +515,11 @@ class TrtllmAttentionWrapper:
             self.softmax_stats_tensor,
             spec_decoding_bool_params,
             spec_decoding_tensor_params,
-            sparse_attention_params,
+            self.sparse_kv_indices,
+            self.sparse_kv_offsets,
+            self.sparse_attn_indices,
+            self.sparse_attn_offsets,
+            self.sparse_mla_topk,
         )
         # reset the planned states (especially tensors) to avoid memory leak
         self.plan()
@@ -641,50 +649,24 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
         capture_graph = torch.cuda.is_current_stream_capturing()
 
-        def get_empty(tensor_shape: list[int], dtype: torch.dtype,
-                      cache_name: str) -> torch.Tensor:
-            """
-            Finds a compatible, reusable buffer from a cache or creates a new one.
-
-            This function searches for a pre-allocated tensor (buffer) that can be
-            reused for an operation involving a tensor with the shape of `tensor_shape`.
-
-            The compatibility rules are: The buffer's total elements must be >= tensor_shape's.
-
-            If a compatible buffer is found, it's returned immediately. Otherwise, a new
-            buffer is allocated on the 'cuda' device with the give properties of 'tensor_shape' and 'dtype'.
-
-            Args:
-                tensor_shape: The required shape.
-                dtype: The required dtype.
-                cache_name: The key for the specific list of buffers to search in.
-            Returns:
-                An existing compatible buffer or a newly created one.
-            """
-            if buffers is None:
-                return torch.zeros(tensor_shape, device='cuda', dtype=dtype)
-
-            return buffers.get_buffer(tensor_shape, dtype, cache_name,
-                                      capture_graph)
-
-        def get_empty_like(like_tensor: torch.Tensor,
-                           cache_name: str) -> torch.Tensor:
-            return get_empty(like_tensor.shape,
-                             cache_name=cache_name,
-                             dtype=like_tensor.dtype)
-
-        self.prompt_lens_cuda = get_empty(
+        self.prompt_lens_cuda = self.get_empty(
+            buffers,
             (self.max_num_sequences, ),
             cache_name="prompt_lens_cuda",
             dtype=torch.int,
+            capture_graph=capture_graph,
         )
         self.prompt_lens_cpu = torch.empty_like(
             self.prompt_lens_cuda,
             device='cpu',
             pin_memory=True,
         )
-        self.kv_lens_cuda = get_empty_like(self.prompt_lens_cuda,
-                                           cache_name="kv_lens_cuda")
+        self.kv_lens_cuda = self.get_empty_like(
+            buffers,
+            self.prompt_lens_cuda,
+            cache_name="kv_lens_cuda",
+            capture_graph=capture_graph,
+        )
         self.kv_lens = torch.empty_like(self.kv_lens_cuda,
                                         device='cpu',
                                         pin_memory=True)
@@ -699,13 +681,15 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 dtype=torch.int8,
             )
         if self.kv_cache_manager is not None:
-            self.kv_cache_block_offsets = get_empty(
+            self.kv_cache_block_offsets = self.get_empty(
+                buffers,
                 [
                     self.kv_cache_manager.num_pools, self.max_num_sequences, 2,
                     self.kv_cache_manager.max_blocks_per_seq
                 ],
                 cache_name="kv_cache_block_offsets",
                 dtype=torch.int32,
+                capture_graph=capture_graph,
             )
             self.host_kv_cache_block_offsets = torch.empty_like(
                 self.kv_cache_block_offsets,
@@ -715,38 +699,46 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.block_ids_per_seq = None
             self.kv_block_ids_per_seq = None
             if self.enable_flash_mla:
-                self.block_ids_per_seq = get_empty(
+                self.block_ids_per_seq = self.get_empty(
+                    buffers,
                     [
                         self.kv_cache_manager.max_batch_size,
                         self.kv_cache_manager.max_blocks_per_seq
                     ],
                     cache_name="block_ids_per_seq",
                     dtype=torch.int32,
+                    capture_graph=capture_graph,
                 )
-                self.kv_block_ids_per_seq = get_empty(
+                self.kv_block_ids_per_seq = self.get_empty(
+                    buffers,
                     [
                         self.kv_cache_manager.max_batch_size,
                         self.kv_cache_manager.max_blocks_per_seq
                     ],
                     cache_name="kv_block_ids_per_seq",
                     dtype=torch.int32,
+                    capture_graph=capture_graph,
                 )
             if self.enable_context_mla_with_cached_kv:
                 # for kv cache reuse/chunked context in MLA
-                self.ctx_cached_token_indptr = get_empty(
+                self.ctx_cached_token_indptr = self.get_empty(
+                    buffers,
                     (self.max_num_requests + 1, ),
                     cache_name="ctx_cached_token_indptr",
                     dtype=torch.int64,
+                    capture_graph=capture_graph,
                 )
                 self.host_ctx_cached_token_indptr = torch.zeros_like(
                     self.ctx_cached_token_indptr,
                     device='cpu',
                     pin_memory=True,
                 )
-                self.ctx_uncached_token_indptr = get_empty(
+                self.ctx_uncached_token_indptr = self.get_empty(
+                    buffers,
                     (self.max_num_requests + 1, ),
                     cache_name="ctx_uncached_token_indptr",
                     dtype=torch.int64,
+                    capture_graph=capture_graph,
                 )
                 self.host_ctx_uncached_token_indptr = torch.zeros_like(
                     self.ctx_uncached_token_indptr,
@@ -754,10 +746,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     pin_memory=True,
                 )
                 # context full seqlens include cached tokens and uncached tokens
-                self.ctx_kv_indptr = get_empty(
+                self.ctx_kv_indptr = self.get_empty(
+                    buffers,
                     (self.max_num_requests + 1, ),
                     cache_name="ctx_kv_indptr",
                     dtype=torch.int64,
+                    capture_graph=capture_graph,
                 )
                 self.host_ctx_kv_indptr = torch.zeros_like(
                     self.ctx_kv_indptr,
@@ -1354,7 +1348,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             sparse_kv_offsets=sparse_kv_offsets,
             sparse_attn_indices=sparse_attn_indices,
             sparse_attn_offsets=sparse_attn_offsets,
-        )
+            sparse_mla_topk=metadata.sparse_mla_topk if hasattr(
+                metadata, 'sparse_mla_topk') else 0)
         out_dtype = None
         if out_scale is not None:
             if use_nvfp4_output:

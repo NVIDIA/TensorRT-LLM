@@ -1,4 +1,4 @@
-# Quick Start Recipe for GPT-OSS on TensorRT-LLM - Blackwell Hardware
+# Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware
 
 ## Introduction
 
@@ -23,12 +23,12 @@ The guide is intended for developers and practitioners seeking high-throughput o
 
 There are multiple MOE backends inside TensorRT LLM. Here are the support matrix of the MOE backends.
 
-| Device     | Activation Type | MoE Weights Type | MoE Backend | Use Case       |
-|------------|------------------|------------------|-------------|----------------|
-| B200/GB200 | MXFP8            | MXFP4            | TRTLLM      | Low Latency    |
-| B200/GB200 | MXFP8            | MXFP4            | CUTLASS     | Max Throughput |
+| Device                | Activation Type | MoE Weights Type | MoE Backend | Use Case                       |
+|---------------------- |-----------------|------------------|-------------|--------------------------------|
+| B200/GB200/B300/GB300 | MXFP8           | MXFP4            | TRTLLM      | Low Latency and Max Throughput |
 
-The default moe backend is `CUTLASS`, so for the combination which is not supported by `CUTLASS`, one must set the `moe_config.backend` explicitly to run the model.
+The default moe backend is `CUTLASS`, so for the best possible perf, one must set the `moe_config.backend` explicitly to run the model.
+`CUTLASS` was better for max throughput at first but now we have optimized `TRTLLM` moe to be universally faster.
 
 ## Deployment Steps
 
@@ -43,7 +43,7 @@ docker run --rm -it \
 -p 8000:8000 \
 -v ~/.cache:/root/.cache:rw \
 --name tensorrt_llm \
-nvcr.io/nvidia/tensorrt-llm/release:1.0.0rc6 \
+nvcr.io/nvidia/tensorrt-llm/release:x.y.z \
 /bin/bash
 ```
 
@@ -56,104 +56,102 @@ Note:
 
 If you want to use latest main branch, you can choose to build from source to install TensorRT-LLM, the steps refer to <https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html>.
 
-### Creating the TensorRT LLM Server config
+### Recommended Performance Settings
 
-We create a YAML configuration file `/tmp/config.yml` for the TensorRT-LLM Server and populate it with the following recommended performance settings.
+We maintain YAML configuration files with recommended performance settings in the [`examples/configs`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/configs) directory. These config files are present in the TensorRT LLM container at the path `/app/tensorrt_llm/examples/configs`. You can use these out-of-the-box, or adjust them to your specific use case.
 
-For low-latency with `TRTLLM` MOE backend:
-
-```shell
-EXTRA_LLM_API_FILE=/tmp/config.yml
-
-cat << EOF > ${EXTRA_LLM_API_FILE}
-enable_attention_dp: false
-cuda_graph_config:
-  enable_padding: true
-  max_batch_size: 720
-moe_config:
-    backend: TRTLLM
-stream_interval: 20
-num_postprocess_workers: 4
-EOF
-```
-
-For max-throughput with `CUTLASS` MOE backend:
+For low-latency use cases:
 
 ```shell
-EXTRA_LLM_API_FILE=/tmp/config.yml
-
-cat << EOF > ${EXTRA_LLM_API_FILE}
-enable_attention_dp: true
-cuda_graph_config:
-  enable_padding: true
-  max_batch_size: 720
-moe_config:
-    backend: CUTLASS
-stream_interval: 20
-num_postprocess_workers: 4
-attention_dp_config:
-    enable_balance: true
-    batching_wait_iters: 50
-    timeout_iters: 1
-EOF
+TRTLLM_DIR=/app/tensorrt_llm # change as needed to match your environment
+EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/gpt-oss-120b-latency.yaml
 ```
+
+Note: if you don't have access to the source code locally, you can manually create the YAML config file using the code in the dropdown below.
+
+````{admonition} Show code
+:class: dropdown
+
+```{literalinclude} ../../../examples/configs/gpt-oss-120b-latency.yaml
+---
+language: shell
+prepend: |
+  EXTRA_LLM_API_FILE=/tmp/config.yml
+
+  cat << EOF > ${EXTRA_LLM_API_FILE}
+append: EOF
+---
+```
+````
+
+For max-throughput use cases:
+
+```shell
+TRTLLM_DIR=/app/tensorrt_llm # change as needed to match your environment
+EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/gpt-oss-120b-throughput.yaml
+```
+
+Note: if you don't have access to the source code locally, you can manually create the YAML config file using the code in the dropdown below.
+
+````{admonition} Show code
+:class: dropdown
+
+```{literalinclude} ../../../examples/configs/gpt-oss-120b-throughput.yaml
+---
+language: shell
+prepend: |
+  EXTRA_LLM_API_FILE=/tmp/config.yml
+
+  cat << EOF > ${EXTRA_LLM_API_FILE}
+append: EOF
+---
+```
+````
 
 ### Launch the TensorRT LLM Server
 
-Below is an example command to launch the TensorRT LLM server with the GPT-OSS model from within the container. The command is specifically configured for the 1024/1024 Input/Output Sequence Length test. The explanation of each flag is shown in the “Configs and Parameters” section.
+Below is an example command to launch the TensorRT LLM server with the GPT-OSS model from within the container. The command is specifically configured for the 1024/1024 Input/Output Sequence Length test. The explanation of each flag is shown in the “LLM API Options (YAML Configuration)” section.
 
 ```shell
-trtllm-serve openai/gpt-oss-120b \
-    --host 0.0.0.0 \
-    --port 8000 \
-    --max_batch_size 720 \
-    --max_num_tokens 16384 \
-    --kv_cache_free_gpu_memory_fraction 0.9 \
-    --tp_size 8 \
-    --ep_size 8 \
-    --trust_remote_code \
-    --extra_llm_api_options ${EXTRA_LLM_API_FILE}
+trtllm-serve openai/gpt-oss-120b --host 0.0.0.0 --port 8000 --extra_llm_api_options ${EXTRA_LLM_API_FILE}
 ```
 
 After the server is set up, the client can now send prompt requests to the server and receive results.
 
-### Configs and Parameters
+### LLM API Options (YAML Configuration)
 
-These options are used directly on the command line when you start the `trtllm-serve` process.
+<!-- TODO: this section is duplicated across the deployment guides; they should be consolidated to a central file and imported as needed, or we can remove this and link to LLM API reference -->
 
-#### `--tp_size`
+These options provide control over TensorRT LLM's behavior and are set within the YAML file passed to the `trtllm-serve` command via the `--extra_llm_api_options` argument.
+
+#### `tensor_parallel_size`
 
 * **Description:** Sets the **tensor-parallel size**. This should typically match the number of GPUs you intend to use for a single model instance.
 
-#### `--ep_size`
+#### `moe_expert_parallel_size`
 
-* **Description:** Sets the **expert-parallel size** for Mixture-of-Experts (MoE) models. Like `tp_size`, this should generally match the number of GPUs you're using. This setting has no effect on non-MoE models.
+* **Description:** Sets the **expert-parallel size** for Mixture-of-Experts (MoE) models. Like `tensor_parallel_size`, this should generally match the number of GPUs you're using. This setting has no effect on non-MoE models.
 
-#### `--kv_cache_free_gpu_memory_fraction`
+#### `kv_cache_free_gpu_memory_fraction`
 
 * **Description:** A value between `0.0` and `1.0` that specifies the fraction of free GPU memory to reserve for the KV cache after the model is loaded. Since memory usage can fluctuate, this buffer helps prevent out-of-memory (OOM) errors.
 * **Recommendation:** If you experience OOM errors, try reducing this value to `0.7` or lower.
 
-#### `--max_batch_size`
+#### `max_batch_size`
 
 * **Description:** The maximum number of user requests that can be grouped into a single batch for processing. The actual max batch size that can be achieved depends on total sequence length (input + output).
 
-#### `--max_num_tokens`
+#### `max_num_tokens`
 
 * **Description:** The maximum total number of tokens (across all requests) allowed inside a single scheduled batch.
 
-#### `--max_seq_len`
+#### `max_seq_len`
 
-* **Description:** The maximum possible sequence length for a single request, including both input and generated output tokens. We won't specifically set it. It will be inferred from model config.
+* **Description:** The maximum possible sequence length for a single request, including both input and generated output tokens. If not set, it will be inferred from model config.
 
-#### `--trust_remote_code`
+#### `trust_remote_code`
 
 * **Description:** Allows TensorRT-LLM to download models and tokenizers from Hugging Face. This flag is passed directly to the Hugging Face API.
-
-
-#### Extra LLM API Options (YAML Configuration)
-
-These options provide finer control over performance and are set within a YAML file passed to the `trtllm-serve` command via the `--extra_llm_api_options` argument.
 
 #### `cuda_graph_config`
 

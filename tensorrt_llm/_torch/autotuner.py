@@ -711,7 +711,7 @@ class AutoTuner:
             if not is_cache_hit:
                 logger.warning_once(
                     f"[AutoTunner] Using the fallback tactic, due to cache miss on input shapes={input_shapes}",
-                    key=custom_op)
+                    key=(custom_op, "warning_autotuning_cache_miss_fallback"))
 
             return (best_runner, best_tactic)
 
@@ -750,22 +750,24 @@ class AutoTuner:
                         f"[Autotuner] Profiling runner={runners[best_runner_id]}, tactic={best_tactic} for cache_key={cache_key}."
                     )
                 else:
-                    logger.warning(
+                    logger.warning_once(
                         f"[Autotuner] No valid runner/tactic was found for custom_op={custom_op}, input_shapes={input_shapes}. "
                         f"At least one valid (runner, tactic) pair is required. "
                         f"If get_valid_tactics is intended to return empty list, please ensure that this profile is not valid for the custom_op "
-                        f"and should not occurs during the inference stage, or fallback tactic is implemented. Otherwise, the the tuning process will crash."
+                        f"and should not occurs during the inference stage, or fallback tactic is implemented. Otherwise, the the tuning process will crash.",
+                        key=(custom_op, "warning_autotuning_no_valid_tactic"),
                     )
                 new_tuning_failure_occured = new_tuning_failure_occured or has_tuning_failure_occured
 
         # If failed profiling tactics occurs, log the error.
         if new_tuning_failure_occured:
-            logger.warning(
+            logger.warning_once(
                 f"[Autotuner] New tuning error occurs:"
                 f"Total failed profiling tactics occurs: {len(self.stats.failed_profiling_count[custom_op])} for custom_op={custom_op}. "
                 f"This will not block the tuning process. "
                 f"Please set TLLM_LOG_LEVEL=WARNING to find out when the tactic profiling fails. "
-                f"Set TLLM_LOG_LEVEL=DEBUG to get more details of the failures."
+                f"Set TLLM_LOG_LEVEL=DEBUG to get more details of the failures.",
+                key=(custom_op, "warning_autotuning_tuning_error_summary"),
             )
 
         # Get the best runner and tactic from cache
@@ -813,10 +815,14 @@ class AutoTuner:
                 except Exception as e:
                     # Handle None tensors for optional inputs
                     shapes = self._get_input_sizes(input_tensors)
-                    logger.warning(
-                        f"[Autotuner] Failed when profiling runner={runner}, tactic={tac}, shapes={shapes}. Set TLLM_LOG_LEVEL=DEBUG for more details."
+                    logger.warning_once(
+                        f"[Autotuner] Failed when profiling runner={runner}, tactic={tac}, shapes={shapes}. Set TLLM_LOG_LEVEL=DEBUG for more details.",
+                        key=(custom_op, "warning_autotuning_profile_failure"),
                     )
-                    logger.debug(f"[Autotuner] Exception captured: {e}")
+                    logger.debug_once(
+                        f"[Autotuner] Exception captured: {e}",
+                        key=(custom_op, "debug_autotuning_exception"),
+                    )
 
                     # Record the failed profiling combinations
                     if custom_op not in self.stats.failed_profiling_count:

@@ -4,8 +4,8 @@ set -ex
 
 # Use latest stable version from https://pypi.org/project/torch/#history
 # and closest to the version specified in
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-08.html#rel-25-08
-TORCH_VERSION="2.8.0"
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-10.html#rel-25-10
+TORCH_VERSION="2.9.0"
 SYSTEM_ID=$(grep -oP '(?<=^ID=).+' /etc/os-release | tr -d '"')
 
 prepare_environment() {
@@ -69,8 +69,8 @@ install_from_pypi() {
     if [ "$ARCH" = "amd64" ];then ARCH="x86_64";fi
     if [ "$ARCH" = "aarch64" ];then ARCH="sbsa";fi
 
-    pip3 uninstall -y torch torchvision torchaudio
-    pip3 install torch==${TORCH_VERSION} torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+    pip3 uninstall -y torch torchvision
+    pip3 install torch==${TORCH_VERSION} torchvision --index-url https://download.pytorch.org/whl/cu130
 }
 
 case "$1" in

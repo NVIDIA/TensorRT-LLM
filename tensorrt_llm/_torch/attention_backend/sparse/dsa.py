@@ -85,7 +85,6 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
 def transform_local_topk_and_prepare_pool_view(
     topk_indices: torch.Tensor,
     attn_metadata: "DSAtrtllmAttentionMetadata",
-    kv_cache_manager,
     layer_idx: int,
     is_generation: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -108,6 +107,7 @@ def transform_local_topk_and_prepare_pool_view(
     assert topk_indices.dtype == torch.int32
 
     # Get all layer KV cache pool: [num_blocks, num_layers, kv_factor, blockSize]
+    kv_cache_manager = attn_metadata.kv_cache_manager
     all_layer_kv_pool = kv_cache_manager.get_unique_primary_pool(
     )  # [num_blocks, num_layers, kv_factor, blockSize]
     num_blocks, num_layers, _, _ = all_layer_kv_pool.shape
@@ -287,6 +287,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     # 1. Request-level: Pack multiple small requests into one chunk (up to indexer_max_chunk_size)
     # 2. Intra-request: Split large requests into Q-blocks when seq_len > max_chunk_size
     indexer_max_chunk_size: int
+    # Topk for sparse MLA
+    sparse_mla_topk: int
 
     def __init__(self, *args, **kwargs):
         self.num_sms = tensorrt_llm.deep_gemm.get_num_sms()
@@ -295,23 +297,19 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.indexer_max_chunk_size = self.sparse_attention_config.indexer_max_chunk_size
         else:
             self.indexer_max_chunk_size = 32768  # Default to 32K tokens for the indexer
+        self.sparse_mla_topk = self.sparse_attention_config.index_topk
 
     def __post_init__(self):
         super().__post_init__()
 
         capture_graph = torch.cuda.is_current_stream_capturing()
 
-        def get_empty(tensor_shape: list[int], dtype: torch.dtype,
-                      cache_name: str) -> torch.Tensor:
-            if self.cuda_graph_buffers is None:
-                return torch.zeros(tensor_shape, device='cuda', dtype=dtype)
-            return self.cuda_graph_buffers.get_buffer(tensor_shape, dtype,
-                                                      cache_name, capture_graph)
-
-        self.indexer_k_cache_block_offsets = get_empty(
+        self.indexer_k_cache_block_offsets = self.get_empty(
+            self.cuda_graph_buffers,
             [self.max_num_sequences, self.kv_cache_manager.max_blocks_per_seq],
             cache_name="indexer_k_cache_block_offsets",
             dtype=torch.int32,
+            capture_graph=capture_graph,
         )
         self.host_indexer_k_cache_block_offsets = torch.zeros_like(
             self.indexer_k_cache_block_offsets,
@@ -321,20 +319,24 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
         # For mla_rope_append_paged_kv_assign_q
         if not self.enable_context_mla_with_cached_kv:
-            self.ctx_cached_token_indptr = get_empty(
+            self.ctx_cached_token_indptr = self.get_empty(
+                self.cuda_graph_buffers,
                 (self.max_num_requests + 1, ),
                 cache_name="ctx_cached_token_indptr",
                 dtype=torch.int64,
+                capture_graph=capture_graph,
             )
             self.host_ctx_cached_token_indptr = torch.zeros_like(
                 self.ctx_cached_token_indptr,
                 device='cpu',
                 pin_memory=True,
             )
-            self.ctx_kv_indptr = get_empty(
+            self.ctx_kv_indptr = self.get_empty(
+                self.cuda_graph_buffers,
                 (self.max_num_requests + 1, ),
                 cache_name="ctx_kv_indptr",
                 dtype=torch.int64,
+                capture_graph=capture_graph,
             )
             self.host_ctx_kv_indptr = torch.zeros_like(
                 self.ctx_kv_indptr,
@@ -342,20 +344,24 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 pin_memory=True,
             )
         # New generation buffers for dsa
-        self.gen_cached_token_indptr = get_empty(
+        self.gen_cached_token_indptr = self.get_empty(
+            self.cuda_graph_buffers,
             (self.max_num_requests + 1, ),
             cache_name="gen_cached_token_indptr",
             dtype=torch.int64,
+            capture_graph=capture_graph,
         )
         self.host_gen_cached_token_indptr = torch.zeros_like(
             self.gen_cached_token_indptr,
             device='cpu',
             pin_memory=True,
         )
-        self.gen_kv_indptr = get_empty(
+        self.gen_kv_indptr = self.get_empty(
+            self.cuda_graph_buffers,
             (self.max_num_requests + 1, ),
             cache_name="gen_kv_indptr",
             dtype=torch.int64,
+            capture_graph=capture_graph,
         )
         self.host_gen_kv_indptr = torch.zeros_like(
             self.gen_kv_indptr,
@@ -364,20 +370,24 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         )
         # Indexer metadata
         # Separate slot mappings for non-interleaved layout (flat byte indices)
-        self.slot_mapping_fp8 = get_empty(
+        self.slot_mapping_fp8 = self.get_empty(
+            self.cuda_graph_buffers,
             (self.max_num_tokens, ),
             cache_name="slot_mapping_fp8",
             dtype=torch.int64,
+            capture_graph=capture_graph,
         )
         self.host_slot_mapping_fp8 = torch.zeros_like(
             self.slot_mapping_fp8,
             device='cpu',
             pin_memory=True,
         )
-        self.slot_mapping_scale = get_empty(
+        self.slot_mapping_scale = self.get_empty(
+            self.cuda_graph_buffers,
             (self.max_num_tokens, ),
             cache_name="slot_mapping_scale",
             dtype=torch.int64,
+            capture_graph=capture_graph,
         )
         self.host_slot_mapping_scale = torch.zeros_like(
             self.slot_mapping_scale,
@@ -385,31 +395,41 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             pin_memory=True,
         )
         # Per-token request index buffer for topk_indices conversion
-        self.req_idx_per_token = get_empty(
+        self.req_idx_per_token = self.get_empty(
+            self.cuda_graph_buffers,
             (self.max_num_tokens, ),
             cache_name="req_idx_per_token",
             dtype=torch.int32,
+            capture_graph=capture_graph,
         )
         # Block table for topk_indices conversion (shared for context and generation)
-        self.block_table = get_empty(
+        self.block_table = self.get_empty(
+            self.cuda_graph_buffers,
             (self.max_num_requests, self.kv_cache_manager.max_blocks_per_seq),
             cache_name="block_table",
             dtype=torch.int32,
+            capture_graph=capture_graph,
         )
-        self.scheduler_metadata_buffer = get_empty(
+        self.scheduler_metadata_buffer = self.get_empty(
+            self.cuda_graph_buffers,
             (self.num_sms + 1, 2),
             cache_name="scheduler_metadata_buffer",
             dtype=torch.int32,
+            capture_graph=capture_graph,
         )
-        self.cu_seqlen_ks = get_empty(
+        self.cu_seqlen_ks = self.get_empty(
+            self.cuda_graph_buffers,
             (self.max_num_tokens, ),
             cache_name="cu_seqlen_ks",
             dtype=torch.int32,
+            capture_graph=capture_graph,
         )
-        self.cu_seqlen_ke = get_empty(
+        self.cu_seqlen_ke = self.get_empty(
+            self.cuda_graph_buffers,
             (self.max_num_tokens, ),
             cache_name="cu_seqlen_ke",
             dtype=torch.int32,
+            capture_graph=capture_graph,
         )
 
     def prepare(self):
@@ -609,6 +629,7 @@ class Indexer(nn.Module):
         self.scale_fmt = "ue8m0"
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+        self.weight_scale_factor = self.softmax_scale * self.n_heads**-0.5
 
     @staticmethod
     def prepare_one_prefill_chunk(
@@ -1085,65 +1106,86 @@ class Indexer(nn.Module):
 
         return topk_indices_buffer
 
+    def weight_scale(self, hidden_states: torch.Tensor,
+                     indexer_weights: Optional[torch.Tensor],
+                     q_scale: torch.Tensor) -> torch.Tensor:
+        weights = indexer_weights if indexer_weights is not None else self.weights_proj(
+            hidden_states)
+        weights = weights.unsqueeze(-1) * q_scale * self.weight_scale_factor
+        # output weights is guaranteed to be float32 due to type promotion from q_scale (float32)
+        weights = weights.squeeze(-1)
+        return weights
+
     @torch.inference_mode()
     def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
                 metadata: DSAtrtllmAttentionMetadata,
-                position_ids: torch.Tensor):
+                position_ids: torch.Tensor, indexer_k: Optional[torch.Tensor],
+                indexer_weights: Optional[torch.Tensor]):
         quant_block_size = metadata.kv_cache_manager.quant_block_size
         assert quant_block_size == 128, "Only support quant_block_size = 128 for now"
 
-        q, k = maybe_execute_in_parallel(
-            lambda: self.wq_b(qr),
-            lambda: self.wk(hidden_states),
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
+        if indexer_k is not None:
+            q, k = maybe_execute_in_parallel(
+                lambda: self.wq_b(
+                    qr),  # TODO: fuse wq_b and move this outside of the indexer
+                lambda: self.k_norm(indexer_k),
+                self.ln_events[0],
+                self.ln_events[1],
+                self.aux_stream,
+            )
+        else:
+            q, k = maybe_execute_in_parallel(
+                lambda: self.wq_b(qr),
+                lambda: self.k_norm(self.wk(hidden_states)),
+                self.ln_events[0],
+                self.ln_events[1],
+                self.aux_stream,
+            )
+
+        # q/k rope + possible fast_hadamard_transform
         q = q.view(-1, self.n_heads, self.head_dim)
-        q_pe, q_nope = torch.split(
-            q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
-        k = self.k_norm(k)
-        k_pe, k_nope = torch.split(
-            k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
 
-        # k_pe needs unsqueeze to match n_heads
+        q, k = maybe_execute_in_parallel(
+            lambda: torch.split(
+                q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1),
+            lambda: torch.split(
+                k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1),
+            self.ln_events[0],
+            self.ln_events[1],
+            self.aux_stream,
+        )
+
+        q_pe, q_nope = q
+        k_pe, k_nope = k
         q_pe, k_pe = self.rotary_emb(position_ids, [q_pe, k_pe.unsqueeze(1)])
-        q = torch.cat([q_pe, q_nope], dim=-1)
-        # Remove head dimension (size 1) for MQA k
-        k = torch.cat([k_pe[:, 0, :], k_nope], dim=-1)
+
+        k_pe = k_pe[:, 0, :]
+
+        def _prep_q_or_k(qk_pe, qk_nope):
+            q_or_k = torch.cat([qk_pe, qk_nope], dim=-1)
+            q_or_k = rotate_activation(q_or_k)
+            q_or_k = q_or_k.view(-1, self.head_dim)
+            q_or_k = fp8_utils.fp8_quantize_1x128_sf_transpose(
+                q_or_k, use_ue8m0=self.scale_fmt == "ue8m0")
+            return q_or_k
 
         q, k = maybe_execute_in_parallel(
-            lambda: rotate_activation(q),
-            lambda: rotate_activation(k),
+            lambda: _prep_q_or_k(q_pe, q_nope),
+            lambda: _prep_q_or_k(k_pe, k_nope),
             self.ln_events[0],
             self.ln_events[1],
             self.aux_stream,
         )
-        # we only quant q here since k quant is fused with cache insertion
-        q = q.view(-1, self.head_dim)
 
-        q, k = maybe_execute_in_parallel(
-            lambda: fp8_utils.fp8_quantize_1x128_sf_transpose(
-                q, use_ue8m0=self.scale_fmt == "ue8m0"),
-            lambda: fp8_utils.fp8_quantize_1x128_sf_transpose(
-                k, use_ue8m0=self.scale_fmt == "ue8m0"),
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
         q_fp8, q_scale = q
         k_fp8, k_scale = k
         q_fp8 = q_fp8.view(-1, self.n_heads, self.head_dim)
         q_scale = q_scale.view(-1, self.n_heads, 1)
 
-        weights = self.weights_proj(hidden_states)
-        weights = weights.unsqueeze(
-            -1) * q_scale * self.softmax_scale * self.n_heads**-0.5
-        weights = weights.squeeze(-1)
-
+        weights = self.weight_scale(hidden_states, indexer_weights, q_scale)
         # Return topk indices buffer for sparse attention [num_tokens, index_topk]
         return self.sparse_attn_indexer(metadata, hidden_states, q_fp8, k_fp8,
-                                        k_scale, weights.to(torch.float32))
+                                        k_scale, weights)
 
 
 class DSATrtllmAttention(TrtllmAttention):
@@ -1197,9 +1239,17 @@ class DSATrtllmAttention(TrtllmAttention):
         hidden_states: Optional[torch.Tensor] = None,
         qr: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
+        topk_indices: Optional[torch.Tensor] = None,
+        is_generation: bool = True,
         **kwargs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        return self.indexer(q, k, metadata, hidden_states, qr, position_ids)
+        # Transform the local topk indices to global topk indices in paged kv cache
+        topk_indices_global, _ = transform_local_topk_and_prepare_pool_view(
+            topk_indices, metadata, self.layer_idx, is_generation)
+
+        # TODO: Use sparse_attn_indexer to predict the indices for DSA attention
+        # return self.indexer(q, k, metadata, hidden_states, qr, position_ids)
+        return topk_indices_global, None
 
     def sparse_kv_predict(
         self,
