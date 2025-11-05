@@ -224,18 +224,24 @@ class CutlassFusedMoE(MoE):
                 )
             return AlltoallMethodType[all2all_method_type]
 
-        if not self.mapping.enable_attention_dp:
+        # If no attention DP, no need to use AlltoAll.
+        if self.mapping.dp_size == 1:
             return AlltoallMethodType.NotEnabled
 
-        if self.mapping.tp_size == 1:
+        # AlltoAll cannot support MoE TP.
+        if self.mapping.moe_tp_size != 1:
             return AlltoallMethodType.NotEnabled
 
         if os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") == "1":
             return AlltoallMethodType.NotEnabled
 
-        if not (self.mapping.moe_ep_size > self.routing_method.experts_per_token
-                and MnnvlMemory.supports_mnnvl()):
+        if not MnnvlMemory.supports_mnnvl():
             return AlltoallMethodType.NotEnabled
+
+        # TODO: We found that MNNVL performs better than NCCL AllGather/ReduceScatter,
+        # regardless of the relationship between EP size and topK. We favor AlltoAll for now.
+        # if not self.mapping.moe_ep_size > self.routing_method.experts_per_token:
+        #     return AlltoallMethodType.NotEnabled
 
         return AlltoallMethodType.MNNVL
 
@@ -247,9 +253,9 @@ class CutlassFusedMoE(MoE):
 
     @cached_property
     def moe_alltoall_backend(self):
-        # "mnnvllatency" (default) or "mnnvlthroughput"
+        # "mnnvlthroughput" (default) or "mnnvllatency"
         return os.environ.get("TRTLLM_MOE_ALLTOALL_BACKEND",
-                              "mnnvllatency").strip().lower()
+                              "mnnvlthroughput").strip().lower()
 
     def _supports_load_balancer(self) -> bool:
         """CutlassFusedMoE supports load balancer."""
