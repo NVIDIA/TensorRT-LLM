@@ -186,6 +186,9 @@ docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
 ## These scripts install and pin dependency versions
 /docker/common/** @NVIDIA/trt-llm-setup-infra-devs @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
 
+### TAVA Architecture Diagram
+/.github/tava_architecture_diagram.md @NVIDIA/trt-llm-TAVA-design-change
+
 ### CODEOWNERS file itself
 /.github/CODEOWNERS @NVIDIA/trt-llm-gh-workflows-infra-devs @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
 
