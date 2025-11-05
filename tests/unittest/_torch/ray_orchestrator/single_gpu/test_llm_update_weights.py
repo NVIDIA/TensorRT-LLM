@@ -139,7 +139,7 @@ def run_generate(llm, hf_model, prompts, sampling_params):
     return llm_logits, ref_logits
 
 
-def test_llm_update_weights(add_worker_extension_path):
+def test_llm_update_weights():
     llama_model_path = str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
     kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
 
@@ -147,7 +147,7 @@ def test_llm_update_weights(add_worker_extension_path):
 
     llm = LLM(
         model=llama_model_path,
-        ray_worker_extension_cls="rlhf_utils.WorkerExtension",
+        ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
         tensor_parallel_size=1,
         pipeline_parallel_size=1,
         kv_cache_config=kv_cache_config,
