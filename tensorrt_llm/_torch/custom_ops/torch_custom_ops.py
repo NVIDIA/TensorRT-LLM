@@ -172,13 +172,13 @@ def fused_moe(
     tune_max_num_tokens: int = 8192,
     tuner_num_tokens: Optional[int] = None,
     tuner_top_k: Optional[int] = None,
-    activation_type: ActivationType = ActivationType.Swiglu,
+    activation_type: int = ActivationType.Swiglu,
     unpadded_hidden_size: Optional[int] = None,
     out_tensor: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
-
+    activation_type = ActivationType(activation_type)
     # Only the non-alltoall case is considered for profiling in the warmup phase.
     # Therefore, to get the correct tactics during the actual inference, the inputs to the tuner should be the same as when not using alltoall.
     if enable_alltoall:
