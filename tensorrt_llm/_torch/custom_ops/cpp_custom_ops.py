@@ -74,16 +74,15 @@ def _register_fake():
         return allreduce(input, residual, norm_weight, scale, bias, workspace,
                          group, strategy, op, eps, trigger_completion_at_end)
 
-    #MNNVL Allreduce
-    @torch.library.register_fake("trtllm::mnnvl_twoshot_allreduce")
-    def _(input, buffer, buffer_flags, buffer_size, wait_for_results):
+    # MNNVL Allreduce
+    @torch.library.register_fake("trtllm::mnnvl_fusion_allreduce")
+    def _(input, residual, gamma, epsilon, buffer, buffer_flags,
+          rmsnorm_fusion):
         output = input.new_empty(input.shape)
-        return output
-
-    @torch.library.register_fake("trtllm::mnnvl_twoshot_rmsnorm")
-    def _(comm_buf, gamma, eps, residual, buffer_flags, buffer_size):
-        output = residual.new_empty(residual.shape)
-        residual_out = residual.new_empty(residual.shape)
+        if rmsnorm_fusion:
+            residual_out = residual.new_empty(residual.shape)
+        else:
+            residual_out = None
         return [output, residual_out]
 
     @torch.library.register_fake("trtllm::moe_allreduce")
@@ -559,6 +558,10 @@ def _register_fake():
             input_list[i].new_empty((num_ranks, ) + i.shape)
             for i in range(0, len(input_list), num_ranks)
         ]
+
+    @torch.library.register_fake("trtllm::helix_post_process")
+    def _(gathered_o, gathered_stats, scale):
+        return gathered_o.new_empty(*gathered_o.shape[1:])
 
     @torch.library.register_fake("trtllm::tinygemm2")
     def _(input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):

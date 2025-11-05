@@ -561,10 +561,10 @@ private:
 
         // The number of tokens per page.
         int numTokensPerPage = params.mNumTokensPerPage;
-        // SparseMla kernels use a fixed numTokensPerPage of 4 (TMALDG.Gather4).
+        // SparseMla kernels use a fixed numTokensPerPage = 1.
         if (params.mSparseMla)
         {
-            numTokensPerPage = 4;
+            numTokensPerPage = 1;
         }
         else if (!isPagedKv(params.mQkvLayout))
         {

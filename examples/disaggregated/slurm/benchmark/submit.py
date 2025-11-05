@@ -39,9 +39,9 @@ def save_worker_config(config, output_path, worker_type):
         yaml.dump(worker_config, f, default_flow_style=False)
 
 
-def calculate_nodes(tp_size, num_servers, gpus_per_node):
-    """Calculate required nodes based on tensor parallel size and server count."""
-    return (tp_size + gpus_per_node - 1) // gpus_per_node * num_servers
+def calculate_nodes(world_size, num_servers, gpus_per_node):
+    """Calculate required nodes based on world size and server count."""
+    return (world_size + gpus_per_node - 1) // gpus_per_node * num_servers
 
 
 def submit_job(config):
@@ -49,10 +49,6 @@ def submit_job(config):
     slurm_config = config['slurm']
     hw_config = config['hardware']
     env_config = config['environment']
-
-    # Calculate nodes based on tensor parallel sizes
-    ctx_tp_size = config['worker_config']['ctx']['tensor_parallel_size']
-    gen_tp_size = config['worker_config']['gen']['tensor_parallel_size']
 
     # Get number of servers from config
     ctx_num = hw_config['num_ctx_servers']
@@ -63,9 +59,16 @@ def submit_job(config):
     mtp_size = gen_config.get('speculative_config',
                               {}).get('num_nextn_predict_layers', 0)
 
-    ctx_nodes = calculate_nodes(ctx_tp_size, ctx_num,
+    # Calculate nodes based on world sizes
+    ctx_tp_size = config['worker_config']['ctx']['tensor_parallel_size']
+    ctx_pp_size = config['worker_config']['ctx']['pipeline_parallel_size']
+    ctx_world_size = ctx_tp_size * ctx_pp_size
+    ctx_nodes = calculate_nodes(ctx_world_size, ctx_num,
                                 hw_config['gpus_per_node'])
-    gen_nodes = calculate_nodes(gen_tp_size, gen_num,
+    gen_tp_size = config['worker_config']['gen']['tensor_parallel_size']
+    gen_pp_size = config['worker_config']['gen']['pipeline_parallel_size']
+    gen_world_size = gen_tp_size * gen_pp_size
+    gen_nodes = calculate_nodes(gen_world_size, gen_num,
                                 hw_config['gpus_per_node'])
     total_nodes = ctx_nodes + gen_nodes
     total_tasks = total_nodes * hw_config['gpus_per_node']
@@ -82,9 +85,9 @@ def submit_job(config):
 
     # Determine directory suffix based on attention_dp
     if gen_enable_attention_dp:
-        dir_suffix = f"ctx{ctx_num}_gen{gen_num}_dep{gen_tp_size}_batch{gen_batch_size}_eplb{config['worker_config']['eplb_num_slots']}_mtp{mtp_size}"
+        dir_suffix = f"ctx{ctx_num}_gen{gen_num}_dep{gen_tp_size}_batch{gen_batch_size}_eplb{config['worker_config']['gen']['moe_config']['load_balancer']['num_slots']}_mtp{mtp_size}"
     else:
-        dir_suffix = f"ctx{ctx_num}_gen{gen_num}_tep{gen_tp_size}_batch{gen_batch_size}_eplb{config['worker_config']['eplb_num_slots']}_mtp{mtp_size}"
+        dir_suffix = f"ctx{ctx_num}_gen{gen_num}_tep{gen_tp_size}_batch{gen_batch_size}_eplb{config['worker_config']['gen']['moe_config']['load_balancer']['num_slots']}_mtp{mtp_size}"
 
     # Create full log directory path
     log_dir = os.path.join(log_base, dir_suffix)
@@ -114,8 +117,8 @@ def submit_job(config):
         str(slurm_config['numa_bind']).lower(),
         str(ctx_nodes),  # Number of nodes needed for ctx workers
         str(gen_nodes),  # Number of nodes needed for gen workers
-        str(ctx_tp_size),  # Tensor parallel size for ctx workers
-        str(gen_tp_size),  # Tensor parallel size for gen workers
+        str(ctx_world_size),  # World size for ctx workers
+        str(gen_world_size),  # World size for gen workers
 
         # Worker configuration
         str(ctx_num),
