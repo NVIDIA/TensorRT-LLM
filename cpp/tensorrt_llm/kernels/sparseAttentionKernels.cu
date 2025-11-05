@@ -51,14 +51,14 @@ __global__ void gatherKvPageOffsetsKernel(
     // Get the range of sparse indices and the sequence length.
     int32_t const start_offset = sparse_params.sparse_attn_offsets[batch_idx];
     int32_t const end_offset = sparse_params.sparse_attn_offsets[batch_idx + 1];
-    int32_t const total_indices = sparse_params.sparse_attn_offsets[batch_size];
+    int32_t const sparse_attn_indices_stride = sparse_params.sparse_attn_indices_stride;
     int32_t const num_sparse_indices = end_offset - start_offset;
     int32_t const original_seq_len = seq_lengths[batch_idx];
     int32_t const ori_valid_pages = (original_seq_len + tokens_per_page - 1) / tokens_per_page;
     int32_t const page_loops = (ori_valid_pages + MAX_NUM_PAGES - 1) / MAX_NUM_PAGES;
 
     // Get global sparse index.
-    int32_t const sparse_idx_global = head_idx * total_indices + start_offset;
+    int32_t const sparse_idx_global = head_idx * sparse_attn_indices_stride + start_offset;
 
     // Get the base memory offset. shape: [batch_size, 2, max_num_pages_per_seq]
     size_t const src_base_offset = (size_t) batch_idx * 2 * max_num_pages_per_seq;
@@ -84,7 +84,8 @@ __global__ void gatherKvPageOffsetsKernel(
         {
             int32_t const src_idx = sparse_params.sparse_attn_indices[sparse_idx_global + i];
             int32_t const src_idx_start = src_idx * indices_block_size;
-            for (int32_t j = src_idx_start; j < src_idx_start + indices_block_size; j++)
+            int32_t const src_idx_end = min(src_idx_start + indices_block_size, original_seq_len);
+            for (int32_t j = src_idx_start; j < src_idx_end; j++)
             {
                 int32_t const src_page_idx = j / tokens_per_page;
                 if (src_page_idx >= src_page_idx_offset && src_page_idx < src_page_idx_offset + loop_num_valid_pages)
