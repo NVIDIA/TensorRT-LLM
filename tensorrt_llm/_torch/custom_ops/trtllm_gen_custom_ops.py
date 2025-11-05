@@ -158,6 +158,7 @@ class FP4BlockScaleMoEInputs:
     gemm1_weights: torch.Tensor
     gemm1_weights_scale: torch.Tensor
     gemm1_alpha: torch.Tensor
+    gemm1_beta: torch.Tensor
     gemm2_weights: torch.Tensor
     gemm2_weights_scale: torch.Tensor
     output1_scale_scalar: torch.Tensor
@@ -231,14 +232,14 @@ class FP4BlockScaleMoERunner(TunableRunner):
         return kernel_runner.run_moe(
             args.routing_logits, args.routing_bias, args.hidden_states,
             args.hidden_states_scale, args.gemm1_weights,
-            args.gemm1_weights_scale, args.gemm1_alpha, args.gemm2_weights,
-            args.gemm2_weights_scale, args.output1_scale_scalar,
-            args.output1_scale_gate_scalar, args.output2_scale_scalar,
-            self.num_experts, self.top_k, self.n_group, self.topk_group,
-            self.intermediate_size, self.local_expert_offset,
-            self.local_num_experts, self.routed_scaling_factor,
-            self.routing_method_type, self.do_finalize, tactic,
-            args.topk_weights, args.topk_ids)
+            args.gemm1_weights_scale, args.gemm1_alpha, args.gemm1_beta,
+            args.gemm2_weights, args.gemm2_weights_scale,
+            args.output1_scale_scalar, args.output1_scale_gate_scalar,
+            args.output2_scale_scalar, self.num_experts, self.top_k,
+            self.n_group, self.topk_group, self.intermediate_size,
+            self.local_expert_offset, self.local_num_experts,
+            self.routed_scaling_factor, self.routing_method_type,
+            self.do_finalize, tactic, args.topk_weights, args.topk_ids)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile,
@@ -356,6 +357,7 @@ def fp4_block_scale_moe_runner(
         gemm1_weights: torch.Tensor,
         gemm1_weights_scale: torch.Tensor,
         gemm1_alpha: torch.Tensor,
+        gemm1_beta: torch.Tensor,
         gemm2_weights: torch.Tensor,
         gemm2_weights_scale: torch.Tensor,
         output1_scale_scalar: torch.Tensor,
@@ -411,6 +413,7 @@ def fp4_block_scale_moe_runner(
         gemm1_weights,
         gemm1_weights_scale,
         gemm1_alpha,
+        gemm1_beta,
         gemm2_weights,
         gemm2_weights_scale,
         output1_scale_scalar,
