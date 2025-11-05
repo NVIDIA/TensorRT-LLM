@@ -540,7 +540,7 @@ def test_qwen3_eagle3(enable_block_reuse: bool, use_one_model: bool,
     attention_dp = False
 
     models_path = llm_models_root()
-    eagle_model_dir = "/ziqingc_large/03_Data/models/Zhi-Create-Qwen3-32B-Eagle3"  # temp
+    eagle_model_dir = f"{models_path}/Zhi-Create-Qwen3-32B-Eagle3"
     target_model_dir = f"{models_path}/Qwen3/Qwen3-32B"
     if fp8_target:
         target_model_dir = f"{models_path}/Qwen3/Qwen3-32B-FP8/"
