@@ -967,6 +967,7 @@ async def test_llm_rpc_streaming():
 
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.part0
+@skip_ray
 def test_llm_context_only_timed_out():
     tp_size = 1
     use_overlap = False
