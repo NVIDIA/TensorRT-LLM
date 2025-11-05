@@ -60,6 +60,8 @@ __global__ void moePermuteKernel(InputType const* input, InputType* permuted_out
 {
     int32_t constexpr kElemPerCopy = elemPerCopy<InputType>();
     int32_t constexpr kSFElemPerCopy = sfElemPerCopy<SFType>();
+    // Need int64_t to prevent overflow when computing pointer offsets.
+    int64_t const kCopyPerToken = hidden_size / kElemPerCopy;
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     asm volatile("griddepcontrol.wait;");
@@ -76,9 +78,9 @@ __global__ void moePermuteKernel(InputType const* input, InputType* permuted_out
         int32_t const expanded_idx = permuted_idx_to_expanded_idx[permuted_idx];
         int32_t const token_idx = expanded_idx / top_k;
 
-        auto const* src_ptr = reinterpret_cast<ElemCopyType const*>(input) + token_idx * hidden_size / kElemPerCopy;
-        auto* dst_ptr = reinterpret_cast<ElemCopyType*>(permuted_output) + permuted_idx * hidden_size / kElemPerCopy;
-        for (int32_t i = threadIdx.x; i < hidden_size / kElemPerCopy; i += kThreadsPerBlock)
+        auto const* src_ptr = reinterpret_cast<ElemCopyType const*>(input) + token_idx * kCopyPerToken;
+        auto* dst_ptr = reinterpret_cast<ElemCopyType*>(permuted_output) + permuted_idx * kCopyPerToken;
+        for (int32_t i = threadIdx.x; i < kCopyPerToken; i += kThreadsPerBlock)
         {
             dst_ptr[i] = src_ptr[i];
         }
@@ -87,13 +89,14 @@ __global__ void moePermuteKernel(InputType const* input, InputType* permuted_out
         if constexpr (std::is_same_v<InputType, __nv_fp4_e2m1>)
         {
             int32_t const sf_hidden_size = hidden_size / kSFVecSize;
+            int64_t const kSFCopyPerToken = sf_hidden_size / kSFElemPerCopy;
             auto const* sf_src_ptr = reinterpret_cast<SFCopyType const*>(input_sf);
             auto* sf_dst_ptr = reinterpret_cast<SFCopyType*>(permuted_sf);
-            for (int32_t i = threadIdx.x; i < sf_hidden_size / kSFElemPerCopy; i += kThreadsPerBlock)
+            for (int32_t i = threadIdx.x; i < kSFCopyPerToken; i += kThreadsPerBlock)
             {
                 // input_sf is not swizzled, while permuted_sf is swizzled.
-                int32_t const src_offset = token_idx * sf_hidden_size / kSFElemPerCopy + i;
-                int32_t const dst_offset = get_sf_out_offset_128x4(/* batchIdx= */ std::nullopt, permuted_idx,
+                int64_t const src_offset = token_idx * kSFCopyPerToken + i;
+                int64_t const dst_offset = get_sf_out_offset_128x4(/* batchIdx= */ std::nullopt, permuted_idx,
                                                i * kSFElemPerCopy, /* numRows= */ std::nullopt, sf_hidden_size)
                     / kSFElemPerCopy;
 
@@ -175,6 +178,8 @@ __global__ void moeUnpermuteKernel(InputType const* permuted_input, InputType* o
 {
     using AccumType = float;
     int32_t constexpr kElemPerCopy = elemPerCopy<InputType>();
+    // Need int64_t to prevent overflow when computing pointer offsets.
+    int64_t const kCopyPerToken = hidden_size / kElemPerCopy;
     InputType rmem[kElemPerCopy];
     AccumType rmemAccum[kElemPerCopy];
 
@@ -184,8 +189,8 @@ __global__ void moeUnpermuteKernel(InputType const* permuted_input, InputType* o
     asm volatile("griddepcontrol.wait;");
 #endif
 
-    auto* dst_ptr = reinterpret_cast<ElemCopyType*>(output) + token_idx * hidden_size / kElemPerCopy;
-    for (int32_t i = threadIdx.x; i < hidden_size / kElemPerCopy; i += kThreadsPerBlock)
+    auto* dst_ptr = reinterpret_cast<ElemCopyType*>(output) + token_idx * kCopyPerToken;
+    for (int32_t i = threadIdx.x; i < kCopyPerToken; i += kThreadsPerBlock)
     {
 #pragma unroll
         for (int32_t j = 0; j < kElemPerCopy; j++)
@@ -195,14 +200,13 @@ __global__ void moeUnpermuteKernel(InputType const* permuted_input, InputType* o
         for (int32_t k = 0; k < top_k; k++)
         {
             int32_t const permuted_idx = expanded_idx_to_permuted_idx[token_idx * top_k + k];
-            TopKScaleType const scale = topk_scales[token_idx * top_k + k];
             if (permuted_idx < 0)
             {
                 continue;
             }
-            auto const* src_ptr
-                = reinterpret_cast<ElemCopyType const*>(permuted_input) + permuted_idx * hidden_size / kElemPerCopy;
+            auto const* src_ptr = reinterpret_cast<ElemCopyType const*>(permuted_input) + permuted_idx * kCopyPerToken;
             *reinterpret_cast<ElemCopyType*>(rmem) = src_ptr[i];
+            TopKScaleType const scale = topk_scales[token_idx * top_k + k];
 
 #pragma unroll
             for (int32_t j = 0; j < kElemPerCopy; j++)
