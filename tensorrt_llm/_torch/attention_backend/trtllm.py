@@ -1064,9 +1064,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             spec_decoding_position_offsets = None
             spec_decoding_packed_mask = None
             spec_decoding_generation_lengths = None
-        # spec_dec mode should only be enabled for pre-Blackwell machines and when there's a spec-dec tree.
-        self.is_spec_decoding_enabled = is_spec_decoding_enabled and get_sm_version(
-        ) < 100
+        # spec_dec mode should only be enabled for non-sm100 machines and when there's a spec-dec tree.
+        self.is_spec_decoding_enabled = is_spec_decoding_enabled and (
+            get_sm_version() < 100 or get_sm_version() == 120)
 
         if get_sm_version() >= 100:
             if is_spec_dec_tree or is_spec_dec_dynamic_tree:
