@@ -44,7 +44,8 @@ from tensorrt_llm.serve.openai_disagg_service import (
 from tensorrt_llm.serve.openai_protocol import (UCompletionRequest,
                                                 UCompletionResponse)
 from tensorrt_llm.serve.perf_metrics import DisaggPerfMetricsCollector
-from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
+from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
+                                                get_steady_clock_now_in_seconds)
 from tensorrt_llm.serve.router import Router, create_router
 from tensorrt_llm.version import __version__ as VERSION
 
@@ -129,7 +130,7 @@ class OpenAIDisaggServer:
 
         self.app = FastAPI(lifespan=lifespan)
 
-        # self.app.add_middleware(ServerArrivalTimeMiddleware)
+        self.app.add_middleware(ServerArrivalTimeMiddleware)
 
         @self.app.exception_handler(RequestValidationError)
         async def validation_exception_handler(_, exc):

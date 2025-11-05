@@ -14,7 +14,7 @@ from defs.trt_test_alternative import popen
 from transformers import AutoTokenizer
 
 from tensorrt_llm import logger
-from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
+from tensorrt_llm.serve.openai_client import OpenAIHttpClient
 from tensorrt_llm.serve.openai_protocol import (CompletionRequest,
                                                 DisaggregatedParams)
 from tensorrt_llm.serve.router import (KvCacheAwareRouter,
@@ -66,6 +66,34 @@ DEFAULT_TIMEOUT_SERVER_START = 900
 DEFAULT_TIMEOUT_REQUEST = 180
 
 
+async def wait_until_all_servers_ready(
+    session: aiohttp.ClientSession,
+    servers: List[str],
+    server_start_timeout_secs: int = 180,
+) -> None:
+
+    async def check_all_servers_ready():
+        elapsed_time = 0
+        interval = 3
+        while elapsed_time < server_start_timeout_secs:
+            _, unready_servers = await OpenAIHttpClient.check_ready_for_servers(
+                session, servers)
+            if len(unready_servers) == 0:
+                return
+            await asyncio.sleep(interval)
+            elapsed_time += interval
+            logger.info(
+                f"[{elapsed_time}] Waiting for servers, {unready_servers}...")
+
+    try:
+        await asyncio.wait_for(check_all_servers_ready(),
+                               timeout=server_start_timeout_secs)
+    except asyncio.TimeoutError:
+        raise TimeoutError(
+            f"Timeout waiting for all servers to be ready in {server_start_timeout_secs} seconds"
+        )
+
+
 class BasicWorkerTester:
 
     def __init__(self,
@@ -82,9 +110,9 @@ class BasicWorkerTester:
         session = aiohttp.ClientSession(
             connector=aiohttp.TCPConnector(force_close=True),
             timeout=aiohttp.ClientTimeout(total=self.req_timeout_secs))
-        await OpenAIDisaggServer.wait_for_all_servers_ready(
-            session, self.ctx_servers, self.gen_servers,
-            self.server_start_timeout_secs)
+        await wait_until_all_servers_ready(session,
+                                           self.ctx_servers + self.gen_servers,
+                                           self.server_start_timeout_secs)
         return session
 
     async def send_request(self, session: aiohttp.ClientSession, url: str,

@@ -29,7 +29,7 @@ from tensorrt_llm.serve.openai_protocol import (
     UCompletionRequest,
     UCompletionResponse,
 )
-from tensorrt_llm.serve.perf_metrics import ClientMetricsCollector, DisaggPerfMetricsCollector
+from tensorrt_llm.serve.perf_metrics import ClientMetricsCollector
 from tensorrt_llm.serve.responses_utils import (
     ResponseHooks,
     UCompletionResponseOrGenerator,
@@ -93,13 +93,13 @@ class OpenAIHttpClient(OpenAIClient):
         client_type: str,
         timeout_secs: int = 180,
         max_retries: int = 1,
-        perf_metrics_collector: DisaggPerfMetricsCollector = None,
+        session: Optional[aiohttp.ClientSession] = None,
     ):
         assert client_type in ["ctx", "gen"]
         self._router = router
         self._client_type = client_type
         self._metrics_collector = ClientMetricsCollector(client_type)
-        self._session = aiohttp.ClientSession(
+        self._session = session or aiohttp.ClientSession(
             connector=aiohttp.TCPConnector(limit=0, limit_per_host=0, force_close=False),
             timeout=aiohttp.ClientTimeout(total=timeout_secs),
         )
@@ -263,16 +263,25 @@ class OpenAIHttpClient(OpenAIClient):
         await self._session.close()
 
     async def check_ready(self) -> Tuple[List[str], List[str]]:
+        return await OpenAIHttpClient.check_ready_for_servers(self._session, self._router.servers)
+
+    @staticmethod
+    async def check_ready_for_servers(
+        session: aiohttp.ClientSession, servers: List[str]
+    ) -> Tuple[List[str], List[str]]:
         async def check_server_ready(server: str) -> bool:
             try:
-                async with self._session.get(f"http://{server}/health") as response:
+                url = (
+                    f"{server}/health"
+                    if server.startswith("http://")
+                    else f"http://{server}/health"
+                )
+                async with session.get(url) as response:
                     return response.status == 200
             except Exception:
                 return False
 
-        servers_ready = await asyncio.gather(
-            *[check_server_ready(server) for server in self._router.servers]
-        )
-        return [server for server, ready in zip(self._router.servers, servers_ready) if ready], [
-            server for server, ready in zip(self._router.servers, servers_ready) if not ready
+        servers_ready = await asyncio.gather(*[check_server_ready(server) for server in servers])
+        return [server for server, ready in zip(servers, servers_ready) if ready], [
+            server for server, ready in zip(servers, servers_ready) if not ready
         ]
