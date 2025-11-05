@@ -6,3 +6,4 @@ cuda_graph_config:
     batch_sizes: [1,2,3,4,5,6,7,8,16,32,64,96,112,114,120,128,256]
 moe_config:
     backend: DEEPGEMM
+
