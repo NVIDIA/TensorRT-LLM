@@ -22,7 +22,7 @@ from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
                             clear_sched_affinity, logger_debug,
                             print_traceback_on_error)
 from ..sampling_params import BatchedLogitsProcessor
-from .base_worker import BaseWorker
+from .base_worker import BaseWorker, _init_hf_modules
 from .executor import IterationResultQueue
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import (PostprocWorker, PostprocWorkerConfig,
@@ -35,28 +35,6 @@ from .utils import (ErrorResponse, RequestError, WorkerCommIpcAddrs,
 __all__ = [
     "GenerationExecutorWorker",
 ]
-
-
-def _init_hf_modules():
-    """Initialize cached HuggingFace modules for models with trust_remote_code=True.
-
-    This is safe to call multiple times (idempotent) and should be called:
-    1. At module import time (for main process and spawned subprocesses)
-    2. At worker_main entry (for forked processes or external MPI ranks)
-
-    References: https://github.com/vllm-project/vllm/pull/871
-    """
-    try:
-        from transformers.dynamic_module_utils import init_hf_modules
-        init_hf_modules()
-        logger.debug("HF modules initialized")
-    except ImportError as e:
-        logger.warning(f"ImportError initializing HF modules: {e}")
-    except Exception as e:
-        logger.error(f"Exception initializing HF modules: {e}")
-
-
-_init_hf_modules()
 
 
 class GenerationExecutorWorker(BaseWorker):
