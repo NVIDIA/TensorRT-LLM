@@ -33,7 +33,10 @@ def test_model(backend, model_name, attention_backend):
         prompt_budget=2048,
     )
 
-    cuda_graph_config = CudaGraphConfig(max_batch_size=max_batch_size)
+    cuda_graph_config = CudaGraphConfig(
+        batch_sizes=[1, 2, 4, 8, 16],
+        enable_padding=True,
+    )
 
     llm = LLM(
         model=model_dir,
@@ -341,13 +344,15 @@ def test_sparse_kv_predict(batch_size, num_contexts):
 
 
 @pytest.mark.parametrize(
-    "batch_size,num_contexts",
+    "batch_size,num_contexts,use_interleave",
     [
-        (1, 0),  # bs=1, generation only (1 generation)
-        (2, 0),  # bs=2, generation only (2 generations)
-        (5, 3),  # bs=5, mixed (3 contexts + 2 generations)
+        (1, 0, True),  # bs=1, generation only (1 generation)
+        (2, 0, True),  # bs=2, generation only (2 generations)
+        (5, 3, True),  # bs=5, mixed (3 contexts + 2 generations)
+        (3, 0, False),  # bs=3, generation only, no interleave
+        (6, 2, False),  # bs=6, mixed (2 ctx + 4 gen), no interleave
     ])
-def test_sparse_attn_predict(batch_size, num_contexts):
+def test_sparse_attn_predict(batch_size, num_contexts, use_interleave):
     """Test sparse_attn_predict against vanilla _rocketkv_selection."""
     num_generations = batch_size - num_contexts
 
@@ -365,6 +370,7 @@ def test_sparse_attn_predict(batch_size, num_contexts):
         page_size=3,
         topk=128,
         topr=96,
+        use_interleave=use_interleave,
     )
 
     # Create sequence lengths
@@ -524,6 +530,38 @@ def test_sparse_attn_predict(batch_size, num_contexts):
             vanilla_sparse_attn_indices_list, dim=0).transpose(0,
                                                                1).contiguous()
 
+        if not sparse_attn_config.use_interleave:
+            # Apply interleave operation to trtllm indices
+            # For each head, multiply indices by page_size and expand to include all tokens in each page
+            page_size = sparse_attn_config.page_size
+            num_kv_heads, total_indices = trtllm_sparse_attn_indices.shape
+
+            interleaved_indices_list = []
+            for head_idx in range(num_kv_heads):
+                head_indices = trtllm_sparse_attn_indices[
+                    head_idx]  # Shape: [total_indices]
+
+                page_starts = head_indices * page_size  # Shape: [total_indices]
+
+                expanded_indices = []
+                for page_start in page_starts:
+                    page_indices = torch.arange(page_start,
+                                                page_start + page_size,
+                                                device=page_starts.device)
+                    expanded_indices.append(page_indices)
+
+                head_interleaved = torch.cat(expanded_indices, dim=0)
+
+                # Slice to match vanilla shape
+                target_length = vanilla_sparse_attn_indices.shape[1]
+                head_interleaved = head_interleaved[:target_length]
+
+                interleaved_indices_list.append(head_interleaved)
+
+            # Stack all heads
+            trtllm_sparse_attn_indices = torch.stack(interleaved_indices_list,
+                                                     dim=0)
+
         assert trtllm_sparse_attn_indices.shape == vanilla_sparse_attn_indices.shape, \
             f"Shape mismatch: {trtllm_sparse_attn_indices.shape} vs {vanilla_sparse_attn_indices.shape}"
 
@@ -571,8 +609,9 @@ def test_sparse_attn_predict(batch_size, num_contexts):
         print(f"Average overlap ratio: {avg_overlap_ratio:.4f}")
         print(f"Per-batch average: {batch_overlap_details}")
 
-        assert avg_overlap_ratio >= 0.97, \
-            f"Indices overlap ratio {avg_overlap_ratio:.4f} is too low (< 0.97)"
+        threshold = 0.94 if not use_interleave else 0.97
+        assert avg_overlap_ratio >= threshold, \
+            f"Indices overlap ratio {avg_overlap_ratio:.4f} is too low (< {threshold})"
     else:
         assert len(
             vanilla_sparse_attn_indices_list
@@ -593,6 +632,10 @@ if __name__ == '__main__':
 
     # Unit tests for sparse_attn_predict
     print("\n=== Testing sparse_attn_predict ===")
-    test_sparse_attn_predict(1, 0)  # bs=1, generation only
-    test_sparse_attn_predict(2, 0)  # bs=2, generation only
-    test_sparse_attn_predict(5, 3)  # bs=5, mixed (3 ctx + 2 gen)
+    test_sparse_attn_predict(1, 0, True)  # bs=1, generation only
+    test_sparse_attn_predict(2, 0, True)  # bs=2, generation only
+    test_sparse_attn_predict(5, 3, True)  # bs=5, mixed (3 ctx + 2 gen)
+    test_sparse_attn_predict(3, 0,
+                             False)  # bs=3, generation only, no interleave
+    test_sparse_attn_predict(
+        6, 2, False)  # bs=6, mixed (2 ctx + 4 gen), no interleave

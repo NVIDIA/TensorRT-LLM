@@ -24,10 +24,12 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .kernel import (triton_bmm, triton_flatten_to_batch, triton_index_gather,
-                     triton_interleave, triton_paged_kt_cache_bmm,
-                     triton_qk_split, triton_rocket_batch_to_flatten,
-                     triton_rocket_reduce_scores, triton_softmax, triton_topk,
-                     triton_update_kt_cache_ctx, triton_update_kt_cache_gen)
+                     triton_interleave, triton_rocket_batch_to_flatten,
+                     triton_rocket_paged_kt_cache_bmm, triton_rocket_qk_split,
+                     triton_rocket_reduce_scores,
+                     triton_rocket_update_kt_cache_ctx,
+                     triton_rocket_update_kt_cache_gen, triton_softmax,
+                     triton_topk)
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
@@ -350,7 +352,7 @@ class RocketTrtllmAttention(TrtllmAttention):
             qkv_input = torch.cat([q, k], dim=1)
 
         if metadata.valid_batch_size > 0:
-            q_window, k_context = triton_qk_split(
+            q_window, k_context = triton_rocket_qk_split(
                 qkv_input,
                 metadata.context_lens_cuda,
                 metadata.context_cumsum_cuda,
@@ -413,7 +415,7 @@ class RocketTrtllmAttention(TrtllmAttention):
         kt_cache_tensor = metadata.kv_cache_manager.get_kt_buffers(
             self.layer_idx)
 
-        triton_update_kt_cache_ctx(
+        triton_rocket_update_kt_cache_ctx(
             qkv_input.contiguous(),
             kt_cache_tensor,
             metadata.kt_cache_block_offsets[:metadata.num_contexts],
@@ -485,7 +487,7 @@ class RocketTrtllmAttention(TrtllmAttention):
             self.layer_idx)
 
         # Update KT cache with new key values
-        triton_update_kt_cache_gen(
+        triton_rocket_update_kt_cache_gen(
             k,
             kt_cache_tensor,
             metadata.kt_cache_block_offsets[metadata.num_contexts:],
@@ -498,7 +500,7 @@ class RocketTrtllmAttention(TrtllmAttention):
         )
 
         # Perform BMM with updated cache
-        scores = triton_paged_kt_cache_bmm(
+        scores = triton_rocket_paged_kt_cache_bmm(
             q,
             kt_cache_tensor,
             metadata.kt_cache_block_offsets[metadata.num_contexts:],

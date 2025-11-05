@@ -84,15 +84,16 @@ def triton_index_gather(input, indices):
 
 
 @triton.jit
-def qk_split_kernel(input_ptr, q_output_ptr, k_output_ptr, k_output_offsets_ptr,
-                    context_lens_ptr, context_cumsum_ptr, valid_seq_indices_ptr,
-                    window_size, num_heads, num_kv_heads, head_dim,
-                    q_total_output_tokens, k_total_output_tokens,
-                    valid_batch_size, BLOCK_SIZE: tl.constexpr,
-                    BLOCK_SIZE_M: tl.constexpr):
-    valid_seq_idx = tl.program_id(0)  # Which valid sequence
-    head_idx = tl.program_id(1)  # Which head
-    dim_offset = tl.program_id(2) * BLOCK_SIZE  # Which dimension block
+def rocket_qk_split_kernel(input_ptr, q_output_ptr, k_output_ptr,
+                           k_output_offsets_ptr, context_lens_ptr,
+                           context_cumsum_ptr, valid_seq_indices_ptr,
+                           window_size, num_heads, num_kv_heads, head_dim,
+                           q_total_output_tokens, k_total_output_tokens,
+                           valid_batch_size, BLOCK_SIZE: tl.constexpr,
+                           BLOCK_SIZE_M: tl.constexpr):
+    valid_seq_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    dim_offset = tl.program_id(2) * BLOCK_SIZE
 
     if valid_seq_idx >= valid_batch_size:
         return
@@ -104,13 +105,10 @@ def qk_split_kernel(input_ptr, q_output_ptr, k_output_ptr, k_output_offsets_ptr,
     if not (is_q_head or is_k_head):
         return
 
-    # Get original sequence index
     orig_seq_idx = tl.load(valid_seq_indices_ptr + valid_seq_idx)
 
-    # Get sequence start offset in original tensor
     seq_start_offset = tl.load(context_cumsum_ptr + orig_seq_idx)
 
-    # Get context length for this sequence
     context_len = tl.load(context_lens_ptr + orig_seq_idx)
 
     if is_q_head:
@@ -132,42 +130,34 @@ def qk_split_kernel(input_ptr, q_output_ptr, k_output_ptr, k_output_offsets_ptr,
         total_output_tokens = k_total_output_tokens
         input_dim_offset = num_heads * head_dim
 
-    # Calculate dimension indices and mask
     dim_indices = dim_offset + tl.arange(0, BLOCK_SIZE)
     dim_mask = dim_indices < head_dim
 
-    # Use tl.range for dynamic loop over token blocks
     for token_block_start in tl.range(0, extract_length, BLOCK_SIZE_M):
-        # Generate token indices for current block
         token_indices = token_block_start + tl.arange(0, BLOCK_SIZE_M)
         token_mask = token_indices < extract_length
 
-        # Calculate source and destination positions for current token block
         src_token_pos = seq_start_offset + extract_start_offset + token_indices  # [BLOCK_SIZE_M]
         dst_token_pos = output_offset + token_indices  # [BLOCK_SIZE_M]
 
         # Calculate input indices with proper dimension offset for Q/K separation
-        # Input tensor: [total_tokens, num_heads*head_dim + num_kv_heads*head_dim + num_kv_heads*head_dim]
         input_dim_indices = input_dim_offset + actual_head_idx * head_dim + dim_indices
         src_indices = src_token_pos[:, None] * (
             num_heads * head_dim +
             2 * num_kv_heads * head_dim) + input_dim_indices[None, :]
 
         # Calculate output indices
-        # Output tensor: [num_heads/num_kv_heads, total_output_tokens, head_dim]
         dst_indices = (actual_head_idx * total_output_tokens +
                        dst_token_pos[:, None]) * head_dim + dim_indices[None, :]
 
-        # Create 2D mask combining token and dimension masks
         full_mask = token_mask[:, None] & dim_mask[
             None, :]  # [BLOCK_SIZE_M, BLOCK_SIZE]
 
-        # Parallel load and store for current token block
         data = tl.load(input_ptr + src_indices, mask=full_mask, other=0.0)
         tl.store(output_ptr + dst_indices, data, mask=full_mask)
 
 
-def triton_qk_split(
+def triton_rocket_qk_split(
     input_tensor: torch.Tensor,
     input_lens: torch.Tensor,
     input_lens_cumsum: torch.Tensor,
@@ -180,9 +170,11 @@ def triton_qk_split(
     valid_batch_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Splits input tensor into:
+    Splits input flattened tensor along along token dimension into:
     - Q: last window_size tokens from each sequence
     - K: first (context_len - window_size) tokens from each sequence
+    It will ignore the invalid sequences, the length of which is less than a threshold.
+    So we should prepare the valid_seq_indices, valid_batch_size and k_output_offsets in advance.
 
     Args:
         input_tensor: Input tensor [total_tokens, num_heads*head_dim + 2*num_kv_heads*head_dim]
@@ -218,22 +210,22 @@ def triton_qk_split(
     total_heads = num_heads + num_kv_heads
     grid = (valid_batch_size, total_heads, triton.cdiv(head_dim, BLOCK_SIZE))
 
-    qk_split_kernel[grid](input_tensor,
-                          q_window,
-                          k_context,
-                          k_output_offsets,
-                          input_lens,
-                          input_lens_cumsum,
-                          valid_seq_indices,
-                          window_size,
-                          num_heads,
-                          num_kv_heads,
-                          head_dim,
-                          q_total_output_tokens,
-                          k_total_output_tokens,
-                          valid_batch_size,
-                          BLOCK_SIZE=BLOCK_SIZE,
-                          BLOCK_SIZE_M=BLOCK_SIZE_M)
+    rocket_qk_split_kernel[grid](input_tensor,
+                                 q_window,
+                                 k_context,
+                                 k_output_offsets,
+                                 input_lens,
+                                 input_lens_cumsum,
+                                 valid_seq_indices,
+                                 window_size,
+                                 num_heads,
+                                 num_kv_heads,
+                                 head_dim,
+                                 q_total_output_tokens,
+                                 k_total_output_tokens,
+                                 valid_batch_size,
+                                 BLOCK_SIZE=BLOCK_SIZE,
+                                 BLOCK_SIZE_M=BLOCK_SIZE_M)
 
     return q_window, k_context
 
@@ -351,6 +343,7 @@ def triton_bmm(q: torch.Tensor,
                causal: bool = False) -> torch.Tensor:
     """
     Compute softmax(QK^T) with flattened input and output.
+    In this kernel we assume that each sequence in the batch has the same Q length.
 
     Args:
         q: Query tensor [num_q_heads, total_q_tokens, head_dim]
@@ -507,32 +500,32 @@ def triton_softmax(
     batch_size: int,
 ) -> torch.Tensor:
     """
-    Apply softmax to KT token scores with batch-aware sequence boundaries.
+    Apply softmax to flattened input tensor.
 
     Args:
-        input_tensor: Input tensor [total_num_heads, 1, total_k_tokens]
+        input_tensor: Input tensor [num_heads, q_len_per_seq, total_k_tokens]
         cum_lens: Cumulative lengths [batch_size + 1]
-        batch_size: Number of generation batches
+        batch_size: Number of batches
 
     Returns:
-        output: Softmax results [total_num_heads, 1, total_k_tokens]
+        output: Softmax results [num_heads, q_len_per_seq, total_k_tokens]
     """
-    total_num_heads, q_len_per_seq, total_k_tokens = input_tensor.shape
+    num_heads, q_len_per_seq, total_k_tokens = input_tensor.shape
 
     output = torch.empty_like(input_tensor,
                               dtype=input_tensor.dtype,
                               device=input_tensor.device)
 
-    BLOCK_SIZE = 1024
+    BLOCK_SIZE = 512
 
-    grid = (total_num_heads, batch_size * q_len_per_seq)
+    grid = (num_heads, batch_size * q_len_per_seq)
 
     softmax_kernel[grid](
         input_tensor,
         output,
         cum_lens,
         batch_size,
-        total_num_heads,
+        num_heads,
         q_len_per_seq,
         total_k_tokens,
         BLOCK_SIZE=BLOCK_SIZE,
@@ -553,7 +546,7 @@ def flatten_to_batch_kernel(
     input_offsets,
     num_heads,
     total_tokens,
-    padding_size,
+    padding_to_size,
     padding_value,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -564,16 +557,16 @@ def flatten_to_batch_kernel(
     context_len = tl.load(input_offsets + batch_idx + 1) - k_offset
 
     # Process in blocks
-    for block_start in tl.range(0, padding_size, BLOCK_SIZE):
+    for block_start in tl.range(0, padding_to_size, BLOCK_SIZE):
         pos_offsets = block_start + tl.arange(0, BLOCK_SIZE)
 
-        pos_mask = pos_offsets < padding_size
+        pos_mask = pos_offsets < padding_to_size
         valid_mask = pos_offsets < context_len
         combined_mask = pos_mask & valid_mask
 
         input_indices = head_idx * total_tokens + k_offset + pos_offsets
 
-        output_indices = batch_idx * num_heads * padding_size + head_idx * padding_size + pos_offsets
+        output_indices = batch_idx * num_heads * padding_to_size + head_idx * padding_to_size + pos_offsets
 
         values = tl.where(
             combined_mask,
@@ -587,24 +580,24 @@ def flatten_to_batch_kernel(
 def triton_flatten_to_batch(input_tensor: torch.Tensor,
                             input_offsets: torch.Tensor,
                             batch_size: int,
-                            padding_size: int,
+                            padding_to_size: int,
                             padding_value=-1e10) -> torch.Tensor:
     """
-    Reshape input_tensor from [num_heads, total_tokens] to [batch_size, num_heads, padding_size]
+    Reshape input_tensor from [num_heads, total_tokens] to [batch_size, num_heads, padding_to_size]
 
     Args:
         input_tensor: Input tensor tensor [num_heads, total_tokens]
         input_offsets: Offset for each valid sequence [batch_size + 1]
         batch_size: Number of batches
-        padding_size: Target padding size
+        padding_to_size: Target padding size
         padding_value: Value to fill for padding
 
     Returns:
-        batched_tensor: Output tensor [batch_size, num_heads, padding_size]
+        batched_tensor: Output tensor [batch_size, num_heads, padding_to_size]
     """
     num_heads, total_tokens = input_tensor.shape
 
-    batched_tensor = torch.empty((batch_size, num_heads, padding_size),
+    batched_tensor = torch.empty((batch_size, num_heads, padding_to_size),
                                  device=input_tensor.device,
                                  dtype=input_tensor.dtype)
 
@@ -614,7 +607,7 @@ def triton_flatten_to_batch(input_tensor: torch.Tensor,
                                   input_offsets,
                                   num_heads,
                                   total_tokens,
-                                  padding_size,
+                                  padding_to_size,
                                   padding_value,
                                   BLOCK_SIZE=1024)
 
@@ -770,7 +763,7 @@ def triton_rocket_batch_to_flatten(
 
 
 @triton.jit
-def update_kt_cache_gen_kernel(
+def rocket_update_kt_cache_gen_kernel(
     k_ptr,
     kt_cache_tensor_ptr,
     kt_cache_block_offsets_ptr,
@@ -840,7 +833,7 @@ def update_kt_cache_gen_kernel(
     tl.store(kt_cache_tensor_ptr + cache_max_indices, k_max_new, mask=dim_mask)
 
 
-def triton_update_kt_cache_gen(
+def triton_rocket_update_kt_cache_gen(
     k: torch.Tensor,
     kt_cache_tensor: torch.Tensor,
     kt_cache_block_offsets: torch.Tensor,
@@ -867,21 +860,21 @@ def triton_update_kt_cache_gen(
 
     grid = (num_gen_tokens, num_kv_heads, 1)
 
-    update_kt_cache_gen_kernel[grid](k,
-                                     kt_cache_tensor,
-                                     kt_cache_block_offsets,
-                                     kv_lens,
-                                     num_gen_tokens,
-                                     num_kv_heads,
-                                     head_dim,
-                                     kt_page_size,
-                                     tokens_per_block,
-                                     max_kt_blocks_per_seq,
-                                     DIM_BLOCK_SIZE=128)
+    rocket_update_kt_cache_gen_kernel[grid](k,
+                                            kt_cache_tensor,
+                                            kt_cache_block_offsets,
+                                            kv_lens,
+                                            num_gen_tokens,
+                                            num_kv_heads,
+                                            head_dim,
+                                            kt_page_size,
+                                            tokens_per_block,
+                                            max_kt_blocks_per_seq,
+                                            DIM_BLOCK_SIZE=128)
 
 
 @triton.jit
-def update_kt_cache_ctx_kernel(
+def rocket_update_kt_cache_ctx_kernel(
     k_ptr,
     kt_cache_tensor_ptr,
     kt_cache_block_offsets_ptr,
@@ -1013,7 +1006,7 @@ def update_kt_cache_ctx_kernel(
                      mask=store_mask)
 
 
-def triton_update_kt_cache_ctx(
+def triton_rocket_update_kt_cache_ctx(
     qkv_input: torch.Tensor,
     kt_cache_tensor: torch.Tensor,
     kt_cache_block_offsets: torch.Tensor,
@@ -1051,7 +1044,7 @@ def triton_update_kt_cache_ctx(
 
     grid = (batch_size, num_kv_heads)
 
-    update_kt_cache_ctx_kernel[grid](
+    rocket_update_kt_cache_ctx_kernel[grid](
         qkv_input,
         kt_cache_tensor,
         kt_cache_block_offsets,
@@ -1077,7 +1070,7 @@ def triton_update_kt_cache_ctx(
 
 
 @triton.jit
-def paged_kt_cache_bmm_kernel(
+def rocket_paged_kt_cache_bmm_kernel(
     q_ptr,
     kt_cache_tensor_ptr,
     kt_cache_block_offsets_ptr,
@@ -1176,7 +1169,7 @@ def paged_kt_cache_bmm_kernel(
                  mask=kt_token_mask)
 
 
-def triton_paged_kt_cache_bmm(
+def triton_rocket_paged_kt_cache_bmm(
     q: torch.Tensor,
     kt_cache_tensor: torch.Tensor,
     kt_cache_block_offsets: torch.Tensor,
@@ -1220,7 +1213,7 @@ def triton_paged_kt_cache_bmm(
 
     grid = lambda meta: (num_gen_tokens, total_num_heads)
 
-    paged_kt_cache_bmm_kernel[grid](
+    rocket_paged_kt_cache_bmm_kernel[grid](
         q,
         kt_cache_tensor,
         kt_cache_block_offsets,
@@ -1341,11 +1334,6 @@ def triton_interleave(input_tensor: torch.Tensor, input_offsets: torch.Tensor,
 
 ########################################################
 # Triton TopK kernel
-# Divide elements into bins and use argsort to find the topk elements.
-# NOTE: This kernel may cause OOM when the input tensor is too large (e.g. 8k+ tokens).
-#       Because it's possible to have all elements in the same bin.
-# TODO: Consider some other algorithms to resolve this issue.
-#       Argsort is too slow when the input tensor is too large.
 ########################################################
 
 
@@ -1596,13 +1584,21 @@ def triton_topk(input_tensor: torch.Tensor, input_offsets: torch.Tensor,
                 topk: int) -> torch.Tensor:
     """
     Perform topk operation on input tensor.
+    The core idea: divide elements into bins and use argsort to find the topk elements.
+
+    NOTE: This kernel may cause OOM when the input tensor is too large (e.g. 8k+ tokens).
+        Because it's possible to have all elements in the same bin.
+        Argsort is too slow in this case.
+    TODO: Consider some other algorithms to resolve this issue.
+        Maybe we can map fp32 values to fp8, or fetch lower bits
+        due to feature of softmax results (0~1 values)
 
     Args:
         input_tensor: Input scores [num_kv_heads, total_tokens]
         input_offsets: Input offsets [batch_size + 1]
         output_offsets: Sparse offsets [batch_size + 1]
         total_output_tokens: Total number of output tokens
-        topk: TopK parameter (must be power of 2)
+        topk: TopK parameter
 
     Returns:
         output_indices: Selected indices [num_kv_heads, total_output_tokens]
@@ -1659,7 +1655,7 @@ def triton_topk(input_tensor: torch.Tensor, input_offsets: torch.Tensor,
 def rocket_reduce_scores_kernel(
     input_ptr,
     output_ptr,
-    cum_kt_lens_ptr,
+    cum_lens_ptr,
     batch_size,
     num_kv_heads,
     num_heads_per_kv,
@@ -1673,8 +1669,8 @@ def rocket_reduce_scores_kernel(
         return
 
     # Get KT token boundaries for this batch
-    kt_start = tl.load(cum_kt_lens_ptr + batch_idx)
-    kt_end = tl.load(cum_kt_lens_ptr + batch_idx + 1)
+    kt_start = tl.load(cum_lens_ptr + batch_idx)
+    kt_end = tl.load(cum_lens_ptr + batch_idx + 1)
     kt_len = kt_end - kt_start
 
     if kt_len <= 0:
@@ -1708,7 +1704,7 @@ def rocket_reduce_scores_kernel(
 
 def triton_rocket_reduce_scores(
     scores: torch.Tensor,
-    cum_kt_lens: torch.Tensor,
+    cum_lens: torch.Tensor,
     batch_size: int,
     num_kv_heads: int,
     num_heads_per_kv: int,
@@ -1718,7 +1714,7 @@ def triton_rocket_reduce_scores(
 
     Args:
         scores: Input scores [num_kv_heads * num_heads_per_kv, 1, total_kt_tokens]
-        cum_kt_lens: Cumulative KT lengths [batch_size + 1]
+        cum_lens: Cumulative scores lengths [batch_size + 1]
         batch_size: Number of batches
         num_kv_heads: Number of KV heads
         num_heads_per_kv: Number of Q heads per KV head
@@ -1738,7 +1734,7 @@ def triton_rocket_reduce_scores(
     rocket_reduce_scores_kernel[grid](
         scores,
         output,
-        cum_kt_lens,
+        cum_lens,
         batch_size,
         num_kv_heads,
         num_heads_per_kv,
