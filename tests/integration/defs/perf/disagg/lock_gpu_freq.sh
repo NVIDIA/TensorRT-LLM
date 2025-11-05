@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # GPU Frequency Locking Script
-# 
+#
 # This script locks GPU graphics and memory clocks to specified frequencies
 # to ensure consistent performance during benchmarking.
 #
@@ -37,36 +37,36 @@ fi
 lock_gpu_frequency() {
     local graphics=$1
     local memory=$2
-    
+
     # Skip if both frequencies are 0
     if [ "$graphics" -eq 0 ] && [ "$memory" -eq 0 ]; then
         echo "⚠️  No lock frequencies specified (both are 0), skipping GPU frequency locking"
         return 0
     fi
-    
+
     # Enable persistence mode (recommended for frequency locking)
     echo "📌 Enabling GPU persistence mode..."
     nvidia-smi -pm 1 2>&1 || echo "⚠️  Warning: Failed to enable persistence mode"
-    
+
     # Lock GPU clocks using nvidia-smi commands
     # Note: -lgc locks graphics clock, -ac sets application clocks (memory,graphics)
-    
+
     if [ "$graphics" -gt 0 ] && [ "$memory" -gt 0 ]; then
         echo "🔒 Locking GPU clocks..."
         echo "  - Graphics: ${graphics} MHz"
         echo "  - Memory:   ${memory} MHz"
-        
+
         # Lock graphics clock
         sudo nvidia-smi -lgc ${graphics} 2>&1 || echo "⚠️  Warning: lgc command failed"
-        
+
         # Set application clocks (memory,graphics)
         sudo nvidia-smi -ac ${memory},${graphics} 2>&1 || echo "⚠️  Warning: ac command failed"
-        
+
         echo "✅ GPU clocks locked successfully"
     else
         echo "⏭️  Skipping GPU clock locking (one or both frequencies are 0)"
     fi
-    
+
     return 0
 }
 
@@ -80,4 +80,3 @@ nvidia-smi --query-gpu=index,name,clocks.current.graphics,clocks.current.memory,
 
 echo ""
 echo "✅ GPU frequency locking completed on $(hostname)"
-

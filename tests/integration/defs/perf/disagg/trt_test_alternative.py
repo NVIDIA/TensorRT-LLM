@@ -17,11 +17,31 @@ general_logger = logging.getLogger("general")
 general_logger.setLevel(logging.CRITICAL)
 
 exists = os.path.exists
-is_windows = lambda: platform.system() == "Windows"
-is_linux = lambda: platform.system() == "Linux"
-is_wsl = lambda: False  # FIXME: llm cases never on WSL?
+
+
+def is_windows():
+    """Check if running on Windows."""
+    return platform.system() == "Windows"
+
+
+def is_linux():
+    """Check if running on Linux."""
+    return platform.system() == "Linux"
+
+
+def is_wsl():  # FIXME: llm cases never on WSL?
+    """Check if running on WSL."""
+    return False
+
+
 makedirs = os.makedirs
-wsl_to_win_path = lambda x: x  # FIXME: a hack for llm not run on WSL
+
+
+def wsl_to_win_path(x):  # FIXME: a hack for llm not run on WSL
+    """Convert WSL path to Windows path."""
+    return x
+
+
 SessionDataWriter = None  # TODO: hope never runs
 
 
@@ -61,8 +81,8 @@ if is_linux():
         current_uid = os.getuid()
 
         pids = []
-        for proc in psutil.process_iter(['pid', 'uids']):
-            if current_uid in proc.info['uids']:
+        for proc in psutil.process_iter(["pid", "uids"]):
+            if current_uid in proc.info["uids"]:
                 try:
                     if os.getsid(proc.pid) == sid:
                         pids.append(proc.pid)
@@ -71,9 +91,7 @@ if is_linux():
 
         return pids
 
-    def cleanup_process_tree(p: subprocess.Popen,
-                             has_session=False,
-                             verbose_message=False):
+    def cleanup_process_tree(p: subprocess.Popen, has_session=False, verbose_message=False):
         target_pids = set()
         if has_session:
             # Session ID is the pid of the leader process
@@ -81,9 +99,7 @@ if is_linux():
 
         # Backup plan: using ppid to build subprocess tree
         try:
-            target_pids.update(
-                sub.pid
-                for sub in psutil.Process(p.pid).children(recursive=True))
+            target_pids.update(sub.pid for sub in psutil.Process(p.pid).children(recursive=True))
         except psutil.Error:
             pass
 
@@ -102,10 +118,13 @@ if is_linux():
                         cmdline = sp.cmdline()
 
                         # Detect repetitive torch inductor worker processes
-                        if len(cmdline) > 3 and \
-                            'python' in cmdline[0] and \
-                            'torch/_inductor/compile_worker/__main__.py' in cmdline[1] and \
-                            '--pickler=torch._inductor.compile_worker.subproc_pool.SubprocPickler' == cmdline[2]:
+                        if (
+                            len(cmdline) > 3
+                            and "python" in cmdline[0]
+                            and "torch/_inductor/compile_worker/__main__.py" in cmdline[1]
+                            and "--pickler=torch._inductor.compile_worker.subproc_pool.SubprocPickler"
+                            == cmdline[2]
+                        ):
                             torch_inductors.append(pid)
                             continue
 
@@ -115,14 +134,12 @@ if is_linux():
                     pass
 
             if torch_inductors:
-                lines.append(
-                    f"{len(torch_inductors)}*torch inductor workers: {torch_inductors}"
-                )
+                lines.append(f"{len(torch_inductors)}*torch inductor workers: {torch_inductors}")
 
             if persist_pids:
                 msg = f"Found leftover subprocesses: {persist_pids} launched by {p.args}"
                 if verbose_message:
-                    detail = '\n'.join(lines)
+                    detail = "\n".join(lines)
                     msg = f"{msg}\n{detail}"
                 warnings.warn(msg)
 
@@ -139,7 +156,6 @@ elif is_windows():
     import win32job
 
     class MyHandle:
-
         def __init__(self, handle):
             self.handle = handle
 
@@ -166,18 +182,14 @@ elif is_windows():
     def cleanup_process_tree(p: subprocess.Popen, has_session=False):
         target_pids = []
         try:
-            target_pids = [
-                sub.pid
-                for sub in psutil.Process(p.pid).children(recursive=True)
-            ]
+            target_pids = [sub.pid for sub in psutil.Process(p.pid).children(recursive=True)]
         except psutil.Error:
             pass
 
         if has_session and p.job_handle is not None:
             process_exit_code = 3600  # Some obvious special exit code
             try:
-                win32job.TerminateJobObject(p.job_handle.handle,
-                                            process_exit_code)
+                win32job.TerminateJobObject(p.job_handle.handle, process_exit_code)
             except pywintypes.error:
                 pass
 
@@ -192,10 +204,9 @@ elif is_windows():
 
 
 @contextlib.contextmanager
-def popen(*popenargs,
-          start_new_session=True,
-          suppress_output_info=False,
-          **kwargs) -> Generator[subprocess.Popen]:
+def popen(
+    *popenargs, start_new_session=True, suppress_output_info=False, **kwargs
+) -> Generator[subprocess.Popen]:
     if not suppress_output_info:
         print(f"Start subprocess with popen({popenargs}, {kwargs})")
 
@@ -214,20 +225,21 @@ def popen(*popenargs,
             raise
 
 
-def call(*popenargs,
-         timeout: Optional[float] = None,
-         start_new_session=True,
-         suppress_output_info=False,
-         spin_time: float = 1.0,
-         poll_procs: Optional[List[subprocess.Popen]] = None,
-         **kwargs):
+def call(
+    *popenargs,
+    timeout: Optional[float] = None,
+    start_new_session=True,
+    suppress_output_info=False,
+    spin_time: float = 1.0,
+    poll_procs: Optional[List[subprocess.Popen]] = None,
+    **kwargs,
+):
     poll_procs = poll_procs or []
     if not suppress_output_info:
         print(f"Start subprocess with call({popenargs}, {kwargs})")
-    with popen(*popenargs,
-               start_new_session=start_new_session,
-               suppress_output_info=True,
-               **kwargs) as p:
+    with popen(
+        *popenargs, start_new_session=start_new_session, suppress_output_info=True, **kwargs
+    ) as p:
         elapsed_time = 0
         while True:
             try:
@@ -256,10 +268,9 @@ def check_call(*popenargs, **kwargs):
 
 def check_output(*popenargs, timeout=None, start_new_session=True, **kwargs):
     print(f"Start subprocess with check_output({popenargs}, {kwargs})")
-    with Popen(*popenargs,
-               stdout=subprocess.PIPE,
-               start_new_session=start_new_session,
-               **kwargs) as process:
+    with Popen(
+        *popenargs, stdout=subprocess.PIPE, start_new_session=start_new_session, **kwargs
+    ) as process:
         try:
             stdout, stderr = process.communicate(None, timeout=timeout)
         except subprocess.TimeoutExpired as exc:
@@ -276,45 +287,35 @@ def check_output(*popenargs, timeout=None, start_new_session=True, **kwargs):
         if start_new_session:
             cleanup_process_tree(process, True, True)
         if retcode:
-            raise subprocess.CalledProcessError(retcode,
-                                                process.args,
-                                                output=stdout,
-                                                stderr=stderr)
+            raise subprocess.CalledProcessError(retcode, process.args, output=stdout, stderr=stderr)
     return stdout.decode()
 
 
 def make_clean_dirs(path):
-    """
-    Make directories for @path, clean content if it already exists.
-    """
+    """Make directories for @path, clean content if it already exists."""
     import shutil
+
     if os.path.exists(path):
         shutil.rmtree(path)
     os.makedirs(path)
 
 
 def print_info(message: str) -> None:
-    """
-    Prints an informational message.
-    """
+    """Prints an informational message."""
     print(f"[INFO] {message}")
     sys.stdout.flush()
     general_logger.info(message)
 
 
 def print_warning(message: str) -> None:
-    """
-    Prints a warning message.
-    """
+    """Prints a warning message."""
     print(f"[WARNING] {message}")
     sys.stdout.flush()
     general_logger.warning(message)
 
 
 def print_error(message: str) -> None:
-    """
-    Prints an error message.
-    """
+    """Prints an error message."""
     print(f"[ERROR] {message}")
     sys.stdout.flush()
     general_logger.error(message)
@@ -322,9 +323,7 @@ def print_error(message: str) -> None:
 
 # custom test checker
 def check_call_negative_test(*popenargs, **kwargs):
-    print(
-        f"Start subprocess with check_call_negative_test({popenargs}, {kwargs})"
-    )
+    print(f"Start subprocess with check_call_negative_test({popenargs}, {kwargs})")
     retcode = call(*popenargs, suppress_output_info=True, **kwargs)
     if retcode:
         return 0

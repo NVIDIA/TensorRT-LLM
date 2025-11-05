@@ -135,7 +135,7 @@
 <body>
     <div class="container">
         <h1>🔍 Backend性能对比报告: DEFAULT (NIXL) vs UCX</h1>
-        
+
         <div class="info">
             <strong>DEFAULT Backend:</strong> NIXL
             <br>
@@ -145,16 +145,16 @@
             <br>
             <strong>说明:</strong> 只关注DEFAULT比UCX慢的情况。性能退化超过阈值时标记为Fail
         </div>
-        
+
         <div class="warning-box">
-            <strong>⚠️ 注意:</strong> 
+            <strong>⚠️ 注意:</strong>
             <ul style="margin: 5px 0;">
                 <li>✅ <strong>Pass</strong>: DEFAULT性能与UCX接近，或比UCX更好</li>
                 <li>❌ <strong>Fail</strong>: DEFAULT比UCX慢超过5.0%（性能退化）</li>
                 <li>📊 正值表示DEFAULT比UCX慢，负值表示DEFAULT比UCX快</li>
             </ul>
         </div>
-        
+
         <div class="summary">
             <div class="summary-box total">
                 <h2>52</h2>
@@ -169,7 +169,7 @@
                 <p>性能退化</p>
             </div>
         </div>
-        
+
         <table>
             <thead>
                 <tr>
@@ -184,7 +184,7 @@
                 </tr>
             </thead>
             <tbody>
-                
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_dep:32_bs:32_mtp:0_ccbackend:NIXL]_con:1075</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_dep:32_bs:32_mtp:0_ccbackend:UCX]_con:1075</td>
@@ -195,7 +195,7 @@
                     <td class="regression">+1.90%</td>
                     <td><span class="status-pass">Pass</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_dep:32_bs:32_mtp:0_ccbackend:NIXL]_con:1075</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_dep:32_bs:32_mtp:0_ccbackend:UCX]_con:1075</td>
@@ -206,7 +206,7 @@
                     <td class="regression">+18.22%</td>
                     <td><span class="status-fail">Fail</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:144</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:144</td>
@@ -217,7 +217,7 @@
                     <td class="regression">+0.82%</td>
                     <td><span class="status-pass">Pass</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:144</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:144</td>
@@ -228,7 +228,7 @@
                     <td class="improvement">-18.77%</td>
                     <td><span class="status-pass">Pass</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:16</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:16</td>
@@ -239,7 +239,7 @@
                     <td class="regression">+2.11%</td>
                     <td><span class="status-pass">Pass</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:16</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:16</td>
@@ -250,7 +250,7 @@
                     <td class="regression">+2.46%</td>
                     <td><span class="status-pass">Pass</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:32</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:32</td>
@@ -261,7 +261,7 @@
                     <td class="regression">+0.41%</td>
                     <td><span class="status-pass">Pass</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:32</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:32</td>
@@ -272,7 +272,7 @@
                     <td class="regression">+3.31%</td>
                     <td><span class="status-pass">Pass</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:4</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:4</td>
@@ -283,7 +283,7 @@
                     <td class="regression">+7.60%</td>
                     <td><span class="status-fail">Fail</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:4</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:4</td>
@@ -294,7 +294,7 @@
                     <td class="improvement">-1.05%</td>
                     <td><span class="status-pass">Pass</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:64</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:64</td>
@@ -305,7 +305,7 @@
                     <td class="improvement">-0.70%</td>
                     <td><span class="status-pass">Pass</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:64</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:64</td>
@@ -316,7 +316,7 @@
                     <td class="regression">+6.08%</td>
                     <td><span class="status-fail">Fail</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:8</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:8</td>
@@ -327,7 +327,7 @@
                     <td class="regression">+1.82%</td>
                     <td><span class="status-pass">Pass</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:8</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:8</td>
@@ -338,7 +338,7 @@
                     <td class="regression">+0.84%</td>
                     <td><span class="status-pass">Pass</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:NIXL]_con:144</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:UCX]_con:144</td>
@@ -349,7 +349,7 @@
                     <td class="regression">+25.88%</td>
                     <td><span class="status-fail">Fail</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:NIXL]_con:144</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:UCX]_con:144</td>
@@ -360,7 +360,7 @@
                     <td class="regression">+215.17%</td>
                     <td><span class="status-fail">Fail</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:NIXL]_con:16</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:UCX]_con:16</td>
@@ -371,7 +371,7 @@
                     <td class="regression">+20.76%</td>
                     <td><span class="status-fail">Fail</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:NIXL]_con:16</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:UCX]_con:16</td>
@@ -382,7 +382,7 @@
                     <td class="improvement">-6.34%</td>
                     <td><span class="status-pass">Pass</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:NIXL]_con:32</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:UCX]_con:32</td>
@@ -393,7 +393,7 @@
                     <td class="regression">+18.16%</td>
                     <td><span class="status-fail">Fail</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:NIXL]_con:32</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:UCX]_con:32</td>
@@ -404,7 +404,7 @@
                     <td class="regression">+13.39%</td>
                     <td><span class="status-fail">Fail</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:NIXL]_con:4</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:UCX]_con:4</td>
@@ -415,7 +415,7 @@
                     <td class="regression">+22.58%</td>
                     <td><span class="status-fail">Fail</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:NIXL]_con:4</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:UCX]_con:4</td>
@@ -426,7 +426,7 @@
                     <td class="regression">+13.50%</td>
                     <td><span class="status-fail">Fail</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:NIXL]_con:64</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:UCX]_con:64</td>
@@ -437,7 +437,7 @@
                     <td class="regression">+21.02%</td>
                     <td><span class="status-fail">Fail</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:NIXL]_con:64</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:UCX]_con:64</td>
@@ -448,7 +448,7 @@
                     <td class="regression">+5.61%</td>
                     <td><span class="status-fail">Fail</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:NIXL]_con:8</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:UCX]_con:8</td>
@@ -459,7 +459,7 @@
                     <td class="regression">+21.77%</td>
                     <td><span class="status-fail">Fail</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:NIXL]_con:8</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_1k1k_tep:8_bs:32_mtp:3_ccbackend:UCX]_con:8</td>
@@ -470,7 +470,7 @@
                     <td class="regression">+3.19%</td>
                     <td><span class="status-pass">Pass</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_dep:16_bs:64_mtp:0_ccbackend:NIXL]_con:1075</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_dep:16_bs:64_mtp:0_ccbackend:UCX]_con:1075</td>
@@ -481,7 +481,7 @@
                     <td class="regression">+27.00%</td>
                     <td><span class="status-fail">Fail</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_dep:16_bs:64_mtp:0_ccbackend:NIXL]_con:1075</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_dep:16_bs:64_mtp:0_ccbackend:UCX]_con:1075</td>
@@ -492,7 +492,7 @@
                     <td class="regression">+11.80%</td>
                     <td><span class="status-fail">Fail</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_dep:32_bs:16_mtp:3_ccbackend:NIXL]_con:538</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_dep:32_bs:16_mtp:3_ccbackend:UCX]_con:538</td>
@@ -503,7 +503,7 @@
                     <td class="regression">+4.26%</td>
                     <td><span class="status-pass">Pass</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_dep:32_bs:16_mtp:3_ccbackend:NIXL]_con:538</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_dep:32_bs:16_mtp:3_ccbackend:UCX]_con:538</td>
@@ -514,7 +514,7 @@
                     <td class="regression">+3.25%</td>
                     <td><span class="status-pass">Pass</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:NIXL]_con:12</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:UCX]_con:12</td>
@@ -525,7 +525,7 @@
                     <td class="regression">+8.52%</td>
                     <td><span class="status-fail">Fail</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:NIXL]_con:12</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:UCX]_con:12</td>
@@ -536,7 +536,7 @@
                     <td class="regression">+4.65%</td>
                     <td><span class="status-pass">Pass</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:NIXL]_con:24</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:UCX]_con:24</td>
@@ -547,7 +547,7 @@
                     <td class="regression">+0.34%</td>
                     <td><span class="status-pass">Pass</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:NIXL]_con:24</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:UCX]_con:24</td>
@@ -558,7 +558,7 @@
                     <td class="improvement">-4.81%</td>
                     <td><span class="status-pass">Pass</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:NIXL]_con:3</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:UCX]_con:3</td>
@@ -569,7 +569,7 @@
                     <td class="regression">+3.81%</td>
                     <td><span class="status-pass">Pass</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:NIXL]_con:3</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:UCX]_con:3</td>
@@ -580,7 +580,7 @@
                     <td class="improvement">-11.46%</td>
                     <td><span class="status-pass">Pass</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:NIXL]_con:54</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:UCX]_con:54</td>
@@ -591,7 +591,7 @@
                     <td class="regression">+1.24%</td>
                     <td><span class="status-pass">Pass</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:NIXL]_con:54</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:UCX]_con:54</td>
@@ -602,7 +602,7 @@
                     <td class="improvement">-26.51%</td>
                     <td><span class="status-pass">Pass</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:NIXL]_con:6</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:UCX]_con:6</td>
@@ -613,7 +613,7 @@
                     <td class="regression">+9.06%</td>
                     <td><span class="status-fail">Fail</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:NIXL]_con:6</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:16_mtp:3_ccbackend:UCX]_con:6</td>
@@ -624,7 +624,7 @@
                     <td class="improvement">-4.64%</td>
                     <td><span class="status-pass">Pass</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:102</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:102</td>
@@ -635,7 +635,7 @@
                     <td class="improvement">-4.12%</td>
                     <td><span class="status-pass">Pass</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:102</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:102</td>
@@ -646,7 +646,7 @@
                     <td class="regression">+62.02%</td>
                     <td><span class="status-fail">Fail</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:12</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:12</td>
@@ -657,7 +657,7 @@
                     <td class="improvement">-12.39%</td>
                     <td><span class="status-pass">Pass</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:12</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:12</td>
@@ -668,7 +668,7 @@
                     <td class="regression">+29.20%</td>
                     <td><span class="status-fail">Fail</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:24</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:24</td>
@@ -679,7 +679,7 @@
                     <td class="improvement">-11.93%</td>
                     <td><span class="status-pass">Pass</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:24</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:24</td>
@@ -690,7 +690,7 @@
                     <td class="regression">+36.53%</td>
                     <td><span class="status-fail">Fail</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:3</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:3</td>
@@ -701,7 +701,7 @@
                     <td class="improvement">-13.38%</td>
                     <td><span class="status-pass">Pass</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:3</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:3</td>
@@ -712,7 +712,7 @@
                     <td class="regression">+15.52%</td>
                     <td><span class="status-fail">Fail</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:48</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:48</td>
@@ -723,7 +723,7 @@
                     <td class="improvement">-12.87%</td>
                     <td><span class="status-pass">Pass</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:48</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:48</td>
@@ -734,7 +734,7 @@
                     <td class="regression">+30.67%</td>
                     <td><span class="status-fail">Fail</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:6</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:6</td>
@@ -745,7 +745,7 @@
                     <td class="improvement">-14.73%</td>
                     <td><span class="status-pass">Pass</span></td>
                 </tr>
-        
+
                 <tr>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:NIXL]_con:6</td>
                     <td class="test-name">test_benchmark[disagg_perf_file:deepseek-r1-fp4_8k1k_tep:8_bs:32_mtp:0_ccbackend:UCX]_con:6</td>
@@ -756,10 +756,10 @@
                     <td class="regression">+20.94%</td>
                     <td><span class="status-fail">Fail</span></td>
                 </tr>
-        
+
             </tbody>
         </table>
-        
+
         <div class="footer">
             <p>生成时间: 2025-11-03 14:01:20</p>
         </div>

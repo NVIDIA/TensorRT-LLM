@@ -177,4 +177,3 @@ pytest test_disagg_yaml.py -s -vv
 | `gen_mtp_size` | `worker_config.gen.speculative_config.num_nextn_predict_layers` |
 | `concurrency_list` | `benchmark.concurrency_list` |
 | `extractor_pattern`, `metric_names` | `benchmark.metrics` (可选，默认使用 perf 配置) |
-

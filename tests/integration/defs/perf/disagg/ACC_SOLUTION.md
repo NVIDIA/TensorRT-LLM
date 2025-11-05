@@ -398,4 +398,3 @@ benchmark:
 - [ ] Add AccuracyParser class in report.py (parse and validate from benchmark.log)
 - [ ] Modify check_result method in executor.py to pass test_category and accuracy_config
 - [ ] Modify _check_job_result method to add test_category routing logic and integrate AccuracyParser
-

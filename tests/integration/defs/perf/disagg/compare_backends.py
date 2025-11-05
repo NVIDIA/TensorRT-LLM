@@ -1,56 +1,53 @@
 #!/usr/bin/env python3
-"""
-Compare performance test results between different backends (UCX vs NIXL)
-"""
+"""Compare performance test results between different backends (UCX vs NIXL)."""
 
-import pandas as pd
 import argparse
 import re
 import sys
 
+import pandas as pd
+
 
 def normalize_test_name(test_name):
-    """
-    Remove number suffixes (e.g., _001, _015) from test_name
+    """Remove number suffixes (e.g., _001, _015) from test_name.
+
     Example: deepseek-r1-fp4_015_8k1k -> deepseek-r1-fp4_8k1k
     """
     # Match model_XXX_ format, remove XXX number
-    pattern = r'(_\d{3}_)'
-    normalized = re.sub(pattern, '_', test_name)
+    pattern = r"(_\d{3}_)"
+    normalized = re.sub(pattern, "_", test_name)
     return normalized
 
 
 def extract_backend(test_name):
-    """Extract backend type from test_name"""
-    match = re.search(r'ccbackend:(\w+)', test_name)
+    """Extract backend type from test_name."""
+    match = re.search(r"ccbackend:(\w+)", test_name)
     return match.group(1) if match else None
 
 
 def extract_base_case_name(test_name):
-    """
-    Extract standardized case name (remove backend information and number suffix)
-    """
+    """Extract standardized case name (remove backend information and number suffix)."""
     # Standardize by removing number suffix first
     normalized = normalize_test_name(test_name)
-    
+
     # Remove ccbackend part, keep other parameters
     # Replace ccbackend:XXX with ccbackend:BACKEND
-    pattern = r'ccbackend:\w+'
-    base_case = re.sub(pattern, 'ccbackend:BACKEND', normalized)
-    
+    pattern = r"ccbackend:\w+"
+    base_case = re.sub(pattern, "ccbackend:BACKEND", normalized)
+
     return base_case
 
 
-def compare_backends(csv_path, threshold=5.0, default_backend='NIXL'):
-    """
-    Compare performance metrics between DEFAULT backend and UCX
-    Only focus on cases where DEFAULT is slower than UCX
-    
+def compare_backends(csv_path, threshold=5.0, default_backend="NIXL"):
+    """Compare performance metrics between DEFAULT backend and UCX.
+
+    Only focus on cases where DEFAULT is slower than UCX.
+
     Args:
         csv_path: CSV file path
         threshold: Performance difference threshold (percentage)
         default_backend: DEFAULT backend name (currently NIXL, may switch in the future)
-    
+
     Returns:
         DataFrame: Comparison results
     """
@@ -63,41 +60,41 @@ def compare_backends(csv_path, threshold=5.0, default_backend='NIXL'):
 
     # Filter only keep tests related to disagg_perf
     # Determine from test_name field
-    df = df[df['test_name'].str.contains('disagg_perf_file:', na=False)]
+    df = df[df["test_name"].str.contains("disagg_perf_file:", na=False)]
     if len(df) == 0:
         print(f"No disagg_perf tests found in CSV file: {csv_path}")
         sys.exit(0)
 
     # Extract backend and standardized case name
-    df['backend'] = df['test_name'].apply(extract_backend)
-    df['base_case_name'] = df['test_name'].apply(extract_base_case_name)
-    
+    df["backend"] = df["test_name"].apply(extract_backend)
+    df["base_case_name"] = df["test_name"].apply(extract_base_case_name)
+
     # Group by base_case_name and metric_type
-    grouped = df.groupby(['base_case_name', 'metric_type'])
-    
+    grouped = df.groupby(["base_case_name", "metric_type"])
+
     results = []
-    
+
     for (base_case, metric_type), group in grouped:
         # Get DEFAULT backend and UCX data
-        default_data = group[group['backend'] == default_backend]
-        ucx_data = group[group['backend'] == 'UCX']
-        
+        default_data = group[group["backend"] == default_backend]
+        ucx_data = group[group["backend"] == "UCX"]
+
         # If both have no data, skip (this case may not exist)
         if len(default_data) == 0 and len(ucx_data) == 0:
             continue
-        
+
         # Extract values
-        default_value = default_data['perf_metric'].values[0] if len(default_data) > 0 else None
-        ucx_value = ucx_data['perf_metric'].values[0] if len(ucx_data) > 0 else None
-        
+        default_value = default_data["perf_metric"].values[0] if len(default_data) > 0 else None
+        ucx_value = ucx_data["perf_metric"].values[0] if len(ucx_data) > 0 else None
+
         # Determine status
-        status = 'Pass'
+        status = "Pass"
         diff_pct = None
         regression_pct = None
-        
+
         # If one has value and the other has no value, mark as Fail (test run failed)
         if default_value is None or ucx_value is None:
-            status = 'Fail'
+            status = "Fail"
         elif ucx_value != 0:
             # Calculate performance difference percentage
             # For TTFT and E2EL metrics, smaller is better
@@ -105,46 +102,49 @@ def compare_backends(csv_path, threshold=5.0, default_backend='NIXL'):
             # regression_pct < 0 means DEFAULT is faster than UCX (performance improvement)
             regression_pct = ((default_value - ucx_value) / ucx_value) * 100
             diff_pct = abs(regression_pct)
-            
+
             # Only fail if DEFAULT is slower than UCX and exceeds threshold
             if regression_pct > threshold:
-                status = 'Fail'
+                status = "Fail"
             else:
-                status = 'Pass'
+                status = "Pass"
         else:
             # UCX value is 0 is an abnormal case
             if default_value != 0:
-                status = 'Fail'
-        
+                status = "Fail"
+
         # Build output row
-        test_case_name_default = base_case.replace('ccbackend:BACKEND', f'ccbackend:{default_backend}')
-        test_case_name_ucx = base_case.replace('ccbackend:BACKEND', f'ccbackend:UCX')
-        
-        results.append({
-            'test_case_name_default': test_case_name_default,
-            'test_case_name_ucx': test_case_name_ucx,
-            'metric_type': metric_type,
-            'default_value': default_value,
-            'ucx_value': ucx_value,
-            'diff_pct': diff_pct,
-            'regression_pct': regression_pct,
-            'status': status
-        })
-    
+        test_case_name_default = base_case.replace(
+            "ccbackend:BACKEND", f"ccbackend:{default_backend}"
+        )
+        test_case_name_ucx = base_case.replace("ccbackend:BACKEND", "ccbackend:UCX")
+
+        results.append(
+            {
+                "test_case_name_default": test_case_name_default,
+                "test_case_name_ucx": test_case_name_ucx,
+                "metric_type": metric_type,
+                "default_value": default_value,
+                "ucx_value": ucx_value,
+                "diff_pct": diff_pct,
+                "regression_pct": regression_pct,
+                "status": status,
+            }
+        )
+
     # Convert to DataFrame
     result_df = pd.DataFrame(results)
-    
+
     return result_df
 
 
 def generate_html_report(result_df, threshold, default_backend, output_path):
-    """Generate HTML format comparison report"""
-    
+    """Generate HTML format comparison report."""
     # Statistics
     total = len(result_df)
-    failed = len(result_df[result_df['status'] == 'Fail'])
+    failed = len(result_df[result_df["status"] == "Fail"])
     passed = total - failed
-    
+
     # HTML template
     html_template = """
 <!DOCTYPE html>
@@ -283,7 +283,7 @@ def generate_html_report(result_df, threshold, default_backend, output_path):
 <body>
     <div class="container">
         <h1>🔍 Backend Comparison Report: DEFAULT ({default_backend}) vs UCX</h1>
-        
+
         <div class="info">
             <strong>DEFAULT Backend:</strong> {default_backend}
             <br>
@@ -291,18 +291,20 @@ def generate_html_report(result_df, threshold, default_backend, output_path):
             <br>
             <strong>Threshold:</strong> {threshold}%
             <br>
-            <strong>Description:</strong> Only focus on cases where DEFAULT is slower than UCX. Mark as Fail if performance degradation exceeds threshold
+            <strong>Description:</strong> Only focus on cases where DEFAULT is slower than UCX.
+            Mark as Fail if performance degradation exceeds threshold
         </div>
-        
+
         <div class="warning-box">
-            <strong>⚠️ Attention:</strong> 
+            <strong>⚠️ Attention:</strong>
             <ul style="margin: 5px 0;">
                 <li>✅ <strong>Pass</strong>: DEFAULT is similar to or better than UCX</li>
                 <li>❌ <strong>Fail</strong>: DEFAULT is slower than UCX{threshold}%（Preformance degradation）</li>
-                <li>📊 Positive value means DEFAULT is slower than UCX, negative value means DEFAULT is faster than UCX</li>
+                <li>📊 Positive value means DEFAULT is slower than UCX, negative value means
+                DEFAULT is faster than UCX</li>
             </ul>
         </div>
-        
+
         <div class="summary">
             <div class="summary-box total">
                 <h2>{total}</h2>
@@ -317,7 +319,7 @@ def generate_html_report(result_df, threshold, default_backend, output_path):
                 <p>Performance degradation</p>
             </div>
         </div>
-        
+
         <table>
             <thead>
                 <tr>
@@ -335,7 +337,7 @@ def generate_html_report(result_df, threshold, default_backend, output_path):
                 {table_rows}
             </tbody>
         </table>
-        
+
         <div class="footer">
             <p>Generated time: {timestamp}</p>
         </div>
@@ -343,133 +345,131 @@ def generate_html_report(result_df, threshold, default_backend, output_path):
 </body>
 </html>
 """
-    
+
     # Generate table rows
     table_rows = []
     for _, row in result_df.iterrows():
-        status_class = 'status-pass' if row['status'] == 'Pass' else 'status-fail'
-        
+        status_class = "status-pass" if row["status"] == "Pass" else "status-fail"
+
         # Format difference percentage
-        if pd.notna(row['diff_pct']):
+        if pd.notna(row["diff_pct"]):
             diff_str = f"{row['diff_pct']:.2f}%"
         else:
-            diff_str = 'N/A'
-        
+            diff_str = "N/A"
+
         # Format regression/improvement percentage
-        if pd.notna(row['regression_pct']):
-            if row['regression_pct'] > 0:
+        if pd.notna(row["regression_pct"]):
+            if row["regression_pct"] > 0:
                 # Positive value: DEFAULT is slower than UCX (regression)
                 regression_str = f"+{row['regression_pct']:.2f}%"
-                regression_class = 'regression'
+                regression_class = "regression"
             else:
                 # Negative value: DEFAULT is faster than UCX (improvement)
                 regression_str = f"{row['regression_pct']:.2f}%"
-                regression_class = 'improvement'
+                regression_class = "improvement"
         else:
-            regression_str = 'N/A'
-            regression_class = 'neutral'
-        
+            regression_str = "N/A"
+            regression_class = "neutral"
+
         # Format values
-        default_val = f"{row['default_value']:.2f}" if pd.notna(row['default_value']) else 'N/A'
-        ucx_val = f"{row['ucx_value']:.2f}" if pd.notna(row['ucx_value']) else 'N/A'
-        
+        default_val = f"{row['default_value']:.2f}" if pd.notna(row["default_value"]) else "N/A"
+        ucx_val = f"{row['ucx_value']:.2f}" if pd.notna(row["ucx_value"]) else "N/A"
+
         row_html = f"""
                 <tr>
-                    <td class="test-name">{row['test_case_name_default']}</td>
-                    <td class="test-name">{row['test_case_name_ucx']}</td>
-                    <td><span class="metric-type">{row['metric_type']}</span></td>
+                    <td class="test-name">{row["test_case_name_default"]}</td>
+                    <td class="test-name">{row["test_case_name_ucx"]}</td>
+                    <td><span class="metric-type">{row["metric_type"]}</span></td>
                     <td>{default_val}</td>
                     <td>{ucx_val}</td>
                     <td>{diff_str}</td>
                     <td class="{regression_class}">{regression_str}</td>
-                    <td><span class="{status_class}">{row['status']}</span></td>
+                    <td><span class="{status_class}">{row["status"]}</span></td>
                 </tr>
         """
         table_rows.append(row_html)
-    
+
     # Fill template
     from datetime import datetime
+
     html_content = html_template.format(
         default_backend=default_backend,
         threshold=threshold,
         total=total,
         passed=passed,
         failed=failed,
-        table_rows=''.join(table_rows),
-        timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        table_rows="".join(table_rows),
+        timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     )
-    
+
     # Write to file
-    with open(output_path, 'w', encoding='utf-8') as f:
+    with open(output_path, "w", encoding="utf-8") as f:
         f.write(html_content)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Compare performance test results between DEFAULT backend and UCX, only focus on cases where DEFAULT is slower than UCX'
+        description=(
+            "Compare performance test results between DEFAULT backend and UCX, "
+            "only focus on cases where DEFAULT is slower than UCX"
+        )
     )
     parser.add_argument(
-        '--csv-path',
-        type=str,
-        required=True,
-        help='Performance test results CSV file path'
+        "--csv-path", type=str, required=True, help="Performance test results CSV file path"
     )
     parser.add_argument(
-        '--threshold',
+        "--threshold",
         type=float,
         default=5.0,
-        help='Performance difference threshold (percentage), default 5.0%. Only mark as Fail if DEFAULT is slower than UCX exceeds this threshold'
+        help=(
+            "Performance difference threshold (percentage), default 5.0%. "
+            "Only mark as Fail if DEFAULT is slower than UCX exceeds this threshold"
+        ),
     )
     parser.add_argument(
-        '--default-backend',
+        "--default-backend",
         type=str,
-        default='NIXL',
-        help='DEFAULT backend name (default NIXL, may switch to other backend in the future)'
+        default="NIXL",
+        help="DEFAULT backend name (default NIXL, may switch to other backend in the future)",
     )
     parser.add_argument(
-        '--output',
-        type=str,
-        help='Output CSV file path (optional, default print to stdout)'
+        "--output", type=str, help="Output CSV file path (optional, default print to stdout)"
     )
-    parser.add_argument(
-        '--html',
-        type=str,
-        help='Output HTML report file path (optional)'
-    )
-    
+    parser.add_argument("--html", type=str, help="Output HTML report file path (optional)")
+
     args = parser.parse_args()
-    
+
     # Execute comparison
     result_df = compare_backends(args.csv_path, args.threshold, args.default_backend)
-    
+
     # Output CSV results
     if args.output:
         result_df.to_csv(args.output, index=False)
         print(f"CSV results saved to: {args.output}")
     else:
         print(result_df.to_string(index=False))
-    
+
     # Output HTML report
     if args.html:
         generate_html_report(result_df, args.threshold, args.default_backend, args.html)
         print(f"HTML report saved to: {args.html}")
-    
+
     # Statistics
     total = len(result_df)
-    failed = len(result_df[result_df['status'] == 'Fail'])
+    failed = len(result_df[result_df["status"] == "Fail"])
     passed = total - failed
-    
-    print(f"\n============= Statistics =============")
+
+    print("\n============= Statistics =============")
     print(f"DEFAULT Backend: {args.default_backend}")
-    print(f"Comparison Backend: UCX")
+    print("Comparison Backend: UCX")
     print(f"Threshold: {args.threshold}%")
-    print(f"-----------------------------------")
+    print("-----------------------------------")
     print(f"Total: {total}")
     print(f"Pass: {passed} (DEFAULT performance normal)")
     print(f"Fail: {failed} (DEFAULT is slower than UCX exceeds {args.threshold}%)")
-    print(f"===================================\n")    
+    print("===================================\n")
     sys.exit(1 if failed > 0 else 0)
 
-if __name__ == '__main__':
-    main()
 
+if __name__ == "__main__":
+    main()

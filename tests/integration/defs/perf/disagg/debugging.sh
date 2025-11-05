@@ -37,7 +37,7 @@ srun -N1 -n1 \
     --container-name=debug-collect \
     --container-mounts=${WORK_DIR}:${WORK_DIR},${OUTPUT_PATH}:${OUTPUT_PATH},${REPO_DIR}:${REPO_DIR} \
     bash -c "cd ${REPO_DIR}
-     pip3 install -r ${REPO_DIR}/requirements-dev.txt || echo '⚠️  requirements-dev.txt install failed, continuing...'       
+     pip3 install -r ${REPO_DIR}/requirements-dev.txt || echo '⚠️  requirements-dev.txt install failed, continuing...'
      echo '📦 Step 2: Installing TensorRT-LLM wheel...'
      pip3 install ${REPO_DIR}/build/*.whl --extra-index-url https://gitlab-master.nvidia.com/api/v4/projects/100660/packages/pypi/simple
      cd ${WORK_DIR}
