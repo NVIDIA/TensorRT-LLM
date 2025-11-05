@@ -16,8 +16,6 @@ import asyncio
 from collections import defaultdict, deque
 from typing import Any, Dict, List
 
-from prometheus_client import Counter, Histogram
-
 COUNTER_METRICS = [
     ("total_requests", "Total number of requests"),
     ("error_requests", "Total number of error requests"),
@@ -55,9 +53,12 @@ HISTOGRAM_METRICS = [
 
 class ClientMetricsCollector:
     def __init__(self, client_type: str):
+        # import prometheus_client lazily to break the `set_prometheus_multiproc_dir`
+        from prometheus_client import Counter, Histogram
+
         assert client_type in ["ctx", "gen"]
         self._client_type = client_type
-        # TODO: add server address to metric labels
+        # TODO: add server address as metric label
         self._counter_metrics = {
             f"{name}": Counter(f"{self._client_type}_{name}", description)
             for name, description in COUNTER_METRICS

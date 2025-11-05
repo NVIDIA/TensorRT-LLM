@@ -25,7 +25,6 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from prometheus_client import make_asgi_app
 
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
@@ -61,7 +60,7 @@ class RawRequestResponseHooks(ResponseHooks):
         self.perf_metrics_collector = perf_metrics_collector
 
     def on_req_begin(self, request: UCompletionRequest):
-        self.raw_req.state.server_arrival_time = get_steady_clock_now_in_seconds()
+        ...
 
     def on_ctx_resp(self, ctx_server: str, response: UCompletionResponse):
         self.ctx_server = ctx_server
@@ -76,7 +75,6 @@ class RawRequestResponseHooks(ResponseHooks):
         if request.disaggregated_params:
             ctx_req_id = request.disaggregated_params.ctx_request_id
             asyncio.create_task(self.perf_metrics_collector.add_per_request_metrics(self.ctx_server, gen_server, ctx_req_id, self.raw_req.state.server_arrival_time, self.server_first_token_time))
-            logger.debug(f"Request {ctx_req_id} completed")
 
 
 class OpenAIDisaggServer:
@@ -150,6 +148,8 @@ class OpenAIDisaggServer:
         self.app.add_api_route("/cluster_info", self.cluster_info, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
         self.app.add_api_route("/perf_metrics", self._perf_metrics_collector.get_perf_metrics, methods=["GET"])
+        # import prometheus_client lazily to break the `set_prometheus_multiproc_dir`
+        from prometheus_client import make_asgi_app
         self.app.mount("/prometheus/metrics", make_asgi_app())
         if self._disagg_cluster_storage and isinstance(self._disagg_cluster_storage, HttpClusterStorageServer):
             self._disagg_cluster_storage.add_routes(self.app)

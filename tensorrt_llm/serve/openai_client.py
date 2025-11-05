@@ -253,9 +253,10 @@ class OpenAIHttpClient(OpenAIClient):
         metrics = {}
         for server in self._router.servers:
             try:
-                async with self._session.get(f"http://{server}/metrics") as response:
+                async with self._session.get(f"http://{server}/perf_metrics") as response:
                     metrics[server] = await response.json()
             except Exception:
+                logger.error(f"Failed to collect metrics from {server}")
                 continue
         return metrics
 
