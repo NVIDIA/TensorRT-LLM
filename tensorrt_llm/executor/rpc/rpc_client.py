@@ -1,6 +1,7 @@
 import asyncio
 import concurrent.futures
 import threading
+import time
 import uuid
 from typing import Any, AsyncIterator, Dict, Optional
 
@@ -406,6 +407,26 @@ class RPCClient:
         if self._loop is None or not self._loop.is_running():
             self._loop = asyncio.new_event_loop()
 
+            # TODO: WAR. Need to fix Ray+RPC shutdown.
+            def custom_exception_handler(loop, context):
+                exception = context.get('exception')
+                message = context.get('message', '')
+
+                if isinstance(exception, asyncio.CancelledError):
+                    if '_chain' in message or 'zmq' in message.lower(
+                    ) or '_AsyncSocket' in message:
+                        print(
+                            f"Suppressed zmq error during shutdown: {message}")
+                        return
+
+                if 'pending' in message:
+                    print(f"Suppressed error during shutdown: {message}")
+                    return
+
+                loop.default_exception_handler(context)
+
+            self._loop.set_exception_handler(custom_exception_handler)
+
             def run_loop():
                 asyncio.set_event_loop(self._loop)
                 self._loop.run_forever()
@@ -416,7 +437,6 @@ class RPCClient:
             self._loop_thread.start()
 
             # Give the loop a moment to start
-            import time
             time.sleep(0.1)
 
     def _call_sync(self, method_name, *args, **kwargs):
