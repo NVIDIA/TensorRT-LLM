@@ -452,7 +452,7 @@ class Llama4MinLatencyFusedMoE(CutlassFusedMoE):
             dtype=dtype,
             reduce_results=reduce_results,
             model_config=model_config,
-            aux_stream_dict=aux_stream,
+            aux_stream=aux_stream,
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
         )
