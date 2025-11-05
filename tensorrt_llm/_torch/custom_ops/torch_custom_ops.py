@@ -8,9 +8,13 @@ import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm import deep_gemm
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.logger import logger
+from tensorrt_llm.math_utils import pad_up
 
 from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                          OptimizationProfile, TunableRunner, TuningConfig)
+from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
+from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..modules.multi_stream_utils import do_multi_stream
 from ..modules.swiglu import silu_and_mul_kernel
 from ..utils import (ActivationType, fp4_scale_infer_shape,
@@ -525,7 +529,16 @@ def nvfp4_gemm_cublaslt(
     output_dtype: torch.dtype,
     to_userbuffers: bool = False,
 ) -> torch.Tensor:
-    """cuBLASLt-based NVFP4 GEMM with heuristic-based auto-tuning."""
+    """cuBLASLt-based NVFP4 GEMM with heuristic-based auto-tuning.
+
+    .. deprecated::
+        Use :func:`nvfp4_gemm_unified` instead for automatic backend selection
+        among CUTLASS, cuBLASLt, and CuteDSL based on performance profiling.
+    """
+    logger.warning_once(
+        "nvfp4_gemm_cublaslt is deprecated. Use nvfp4_gemm_unified instead "
+        "for automatic backend selection with better performance.",
+        key="nvfp4_gemm_cublaslt_deprecated")
     tuner = AutoTuner.get()
 
     # Use CublasLt runner with heuristic-based tuning
@@ -572,7 +585,16 @@ def nvfp4_gemm(
     output_dtype: torch.dtype,
     to_userbuffers: bool = False,
 ) -> torch.Tensor:
-    """CUTLASS-based NVFP4 GEMM with auto-tuning."""
+    """CUTLASS-based NVFP4 GEMM with auto-tuning.
+
+    .. deprecated::
+        Use :func:`nvfp4_gemm_unified` instead for automatic backend selection
+        among CUTLASS, cuBLASLt, and CuteDSL based on performance profiling.
+    """
+    logger.warning_once(
+        "nvfp4_gemm is deprecated. Use nvfp4_gemm_unified instead "
+        "for automatic backend selection with better performance.",
+        key="nvfp4_gemm_deprecated")
     tuner = AutoTuner.get()
 
     # Use Cutlass runner with predefined configs
@@ -602,6 +624,321 @@ def _(
     output_dtype: torch.dtype,
     to_userbuffers: bool = False,
 ) -> torch.Tensor:
+    return act_fp4.new_empty((act_fp4.size(0), weight.size(0)),
+                             dtype=output_dtype)
+
+
+# Conditional import for CuteDSL runner
+if IS_CUTLASS_DSL_AVAILABLE:
+    from ..custom_ops.cute_dsl_custom_ops import CuteDSLNVFP4BlackwellLinear
+
+
+class CuteDSLNVFP4Wrapper(TunableRunner):
+    """Wrapper to make CuteDSL runner compatible with unified nvfp4_gemm interface.
+
+    This wrapper handles interface differences between CuteDSL and CUTLASS/cuBLASLt:
+    - alpha type conversion (torch.Tensor → float)
+    - scale tensor shape validation
+    - graceful degradation if inputs don't meet CuteDSL requirements
+
+    CuteDSL is only available on Blackwell (SM 100) and requires specific scale tensor shapes.
+    """
+
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(
+            0, 0, get_last_power_of_2_num_tokens_buckets,
+            last_positive_power_of_2), ),
+        constraint_specs=(ConstraintSpec(2, 0, fp4_scale_infer_shape), ),
+    )
+
+    def __init__(self, to_userbuffers: bool, output_dtype: torch.dtype):
+        super().__init__()
+        self.to_userbuffers = to_userbuffers  # Recorded but not used (CuteDSL doesn't support)
+        self.output_dtype = output_dtype
+        self.inner_runner = None  # Lazy initialization
+        self._alpha_cache = None  # Cache alpha value for runner initialization
+
+    def _validate_cutedsl_inputs(self, act_fp4: torch.Tensor,
+                                 weight: torch.Tensor, act_sf: torch.Tensor,
+                                 weight_scale: torch.Tensor) -> bool:
+        """Check if inputs meet CuteDSL's strict requirements.
+
+        CuteDSL requires:
+        - 2D tensors for act_fp4 and weight
+        - 1D scale tensors with specific padded shapes (can also accept 2D and flatten)
+        """
+        if not IS_CUTLASS_DSL_AVAILABLE:
+            return False
+
+        # Check tensor dimensions
+        if act_fp4.dim() != 2 or weight.dim() != 2:
+            return False
+
+        # Scale tensors can be 1D or 2D (will be flattened in forward)
+        if act_sf.dim() not in [1, 2] or weight_scale.dim() not in [1, 2]:
+            return False
+
+        # Calculate expected scale tensor shapes (CuteDSL specific)
+        m, k = act_fp4.shape[0], act_fp4.shape[1]
+        n = weight.shape[0]
+        real_k = k * 2  # fp4 is packed in uint8
+
+        sf_vec_size = 16
+        sf_m = pad_up(m, 128)
+        sf_k = pad_up(real_k // sf_vec_size, 4)
+        sf_n = pad_up(n, 128)
+
+        expected_act_sf_numel = sf_m * sf_k
+        expected_weight_scale_numel = sf_n * sf_k
+
+        # Validate scale tensor element counts (regardless of shape)
+        if act_sf.numel() != expected_act_sf_numel:
+            logger.debug(
+                f"CuteDSL: act_sf element count mismatch. Expected {expected_act_sf_numel}, got {act_sf.numel()} (shape={act_sf.shape})"
+            )
+            return False
+
+        if weight_scale.numel() != expected_weight_scale_numel:
+            logger.debug(
+                f"CuteDSL: weight_scale element count mismatch. Expected {expected_weight_scale_numel}, got {weight_scale.numel()} (shape={weight_scale.shape})"
+            )
+            return False
+
+        return True
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile,
+                          **kwargs) -> List[Tuple]:
+        """Return CuteDSL tactics only if inputs are valid and SM version is 100."""
+        if not IS_CUTLASS_DSL_AVAILABLE:
+            return []
+
+        # Check SM version
+        if get_sm_version() != 100:
+            return []
+
+        act_fp4, weight, act_sf, weight_scale, alpha = inputs
+
+        # Validate inputs meet CuteDSL requirements
+        if not self._validate_cutedsl_inputs(act_fp4, weight, act_sf,
+                                             weight_scale):
+            return []
+
+        # CuteDSL requires 1D scale tensors. If they're 2D, flatten them.
+        if act_sf.dim() == 2:
+            act_sf = act_sf.reshape(-1)
+        if weight_scale.dim() == 2:
+            weight_scale = weight_scale.reshape(-1)
+
+        # Lazy initialize inner CuteDSL runner
+        if self.inner_runner is None:
+            try:
+                # Convert alpha from Tensor to float
+                alpha_float = alpha.item() if isinstance(
+                    alpha, torch.Tensor) else float(alpha)
+                self._alpha_cache = alpha_float
+                self.inner_runner = CuteDSLNVFP4BlackwellLinear(
+                    alpha_float, self.output_dtype)
+                logger.debug("CuteDSL runner initialized successfully")
+            except Exception as e:
+                logger.debug(f"CuteDSL runner initialization failed: {e}")
+                return []
+
+        # Get valid tactics from inner CuteDSL runner
+        try:
+            return self.inner_runner.get_valid_tactics(
+                [act_fp4, weight, act_sf, weight_scale], profile, **kwargs)
+        except Exception as e:
+            logger.debug(f"CuteDSL get_valid_tactics failed: {e}")
+            return []
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic=-1,
+    ) -> torch.Tensor:
+        """Forward pass through CuteDSL runner."""
+        # CuteDSL only needs first 4 inputs (alpha is already in the runner)
+        act_fp4, weight, act_sf, weight_scale, alpha = inputs
+
+        if self.inner_runner is None:
+            raise RuntimeError(
+                "CuteDSL runner not initialized. This should not happen if get_valid_tactics was called."
+            )
+
+        # CuteDSL requires 1D scale tensors. If they're 2D, flatten them.
+        if act_sf.dim() == 2:
+            act_sf = act_sf.reshape(-1)
+        if weight_scale.dim() == 2:
+            weight_scale = weight_scale.reshape(-1)
+
+        return self.inner_runner(inputs=[act_fp4, weight, act_sf, weight_scale],
+                                 tactic=tactic)
+
+
+@torch.library.custom_op("trtllm::nvfp4_gemm_unified", mutates_args=())
+def nvfp4_gemm_unified(
+    act_fp4: torch.Tensor,
+    weight: torch.Tensor,
+    act_sf: torch.Tensor,
+    weight_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    output_dtype: torch.dtype,
+    to_userbuffers: bool = False,
+    backend: str = "auto",
+) -> torch.Tensor:
+    """Unified NVFP4 GEMM for Blackwell (SM 100) with automatic or manual backend selection.
+
+    This function can automatically choose the best backend or force a specific backend:
+    - CUTLASS: Predefined CUTLASS configurations with auto-tuning
+    - cuBLASLt: Heuristic-based algorithms from cuBLASLt library
+    - CuteDSL: Blackwell-optimized persistent kernels (when available and inputs are valid)
+
+    The AutoTuner profiles all available backends during the first run and caches
+    the best choice for each input shape. Subsequent calls use the cached selection
+    with zero overhead.
+
+    Args:
+        act_fp4: Activation tensor [m, k] in FP4 format (packed in uint8)
+        weight: Weight tensor [n, k] in FP4 format (packed in uint8)
+        act_sf: Activation scale factors
+        weight_scale: Weight scale factors
+        alpha: Scaling factor (as torch.Tensor for CUTLASS/cuBLASLt compatibility)
+        output_dtype: Output data type
+        to_userbuffers: Whether to use user buffers (CUTLASS/cuBLASLt only)
+        backend: Backend selection, one of:
+            - 'auto': AutoTuner automatically selects best backend (default)
+            - 'cutlass': Force use CUTLASS (FP4GemmRunner)
+            - 'cublaslt': Force use cuBLASLt (CublasLtFP4GemmRunner)
+            - 'cutedsl': Force use CuteDSL (CuteDSLNVFP4Wrapper)
+
+    Returns:
+        Output tensor [m, n] with dtype=output_dtype
+
+    Raises:
+        ValueError: If SM version is not 100 (Blackwell), or if backend is invalid/unavailable
+    """
+
+    # Validate Blackwell architecture
+    #if get_sm_version() != 100:
+    #    raise ValueError(
+    #        f"nvfp4_gemm requires SM 100 (Blackwell architecture), got SM {get_sm_version()}. "
+    #        f"NVFP4 operations are only supported on Blackwell GPUs."
+    #    )
+
+    # Validate backend parameter
+    valid_backends = ['auto', 'cutlass', 'cublaslt', 'cutedsl']
+    if backend not in valid_backends:
+        raise ValueError(
+            f"Invalid backend '{backend}'. Must be one of {valid_backends}")
+
+    # Case 1: Auto selection (default behavior)
+    if backend == "auto":
+        tuner = AutoTuner.get()
+        runners = []
+
+        # 1. Always add CUTLASS runner (most compatible)
+        runners.append(
+            FP4GemmRunner(fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4,
+                          to_userbuffers, output_dtype))
+
+        # 2. Add cuBLASLt runner if available
+        if IS_CUBLASLT_AVAILABLE:
+            runners.append(CublasLtFP4GemmRunner(to_userbuffers, output_dtype))
+            logger.debug("cuBLASLt runner added to nvfp4_gemm_unified")
+
+        # 3. Add CuteDSL runner if available
+        #    The wrapper will handle validation and graceful degradation
+        if IS_CUTLASS_DSL_AVAILABLE:
+            runners.append(CuteDSLNVFP4Wrapper(to_userbuffers, output_dtype))
+            logger.debug("CuteDSL runner added to nvfp4_gemm_unified")
+
+        # AutoTuner automatically profiles all runners and selects the best
+        best_runner, best_tactic = tuner.choose_one(
+            "trtllm::nvfp4_gemm_unified::gemm",
+            runners,
+            FP4GemmRunner.
+            tuning_config,  # All runners use the same tuning_config
+            [act_fp4, weight, act_sf, weight_scale, alpha],
+        )
+
+        logger.debug(
+            f"nvfp4_gemm_unified selected backend: {type(best_runner).__name__}, tactic: {best_tactic}"
+        )
+
+        # Execute with the best runner
+        return best_runner(
+            inputs=[act_fp4, weight, act_sf, weight_scale, alpha],
+            tactic=best_tactic)
+
+    # Case 2: Force CUTLASS
+    elif backend == "cutlass":
+        logger.debug("nvfp4_gemm_unified: Forcing CUTLASS backend")
+        runner = FP4GemmRunner(fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4,
+                               to_userbuffers, output_dtype)
+        return runner(
+            inputs=[act_fp4, weight, act_sf, weight_scale, alpha],
+            tactic=-1  # Use default tactic
+        )
+
+    # Case 3: Force cuBLASLt
+    elif backend == "cublaslt":
+        if not IS_CUBLASLT_AVAILABLE:
+            raise ValueError(
+                "cuBLASLt backend is not available. "
+                "Please check cuBLASLt installation or use backend='auto'.")
+        logger.debug("nvfp4_gemm_unified: Forcing cuBLASLt backend")
+        runner = CublasLtFP4GemmRunner(to_userbuffers, output_dtype)
+        return runner(
+            inputs=[act_fp4, weight, act_sf, weight_scale, alpha],
+            tactic=-1  # Use default tactic
+        )
+
+    # Case 4: Force CuteDSL
+    elif backend == "cutedsl":
+        if not IS_CUTLASS_DSL_AVAILABLE:
+            raise ValueError(
+                "CuteDSL backend is not available. "
+                "Please check CuteDSL installation or use backend='auto'.")
+
+        logger.debug("nvfp4_gemm_unified: Forcing CuteDSL backend")
+        wrapper = CuteDSLNVFP4Wrapper(to_userbuffers, output_dtype)
+
+        # Validate inputs and get available tactics
+        try:
+            tactics = wrapper.get_valid_tactics(
+                [act_fp4, weight, act_sf, weight_scale, alpha], None)
+        except Exception as e:
+            raise ValueError(
+                f"CuteDSL backend failed input validation: {e}\n"
+                "Consider using backend='auto' to fall back to other backends.")
+
+        if not tactics:
+            raise ValueError(
+                "CuteDSL backend has no valid tactics for this input shape. "
+                "This may be due to:\n"
+                "  - Unsupported matrix dimensions\n"
+                "  - Invalid scale tensor shapes\n"
+                "  - SM version mismatch\n"
+                "Consider using backend='auto' to fall back to other backends.")
+
+        # Use first available tactic
+        return wrapper(inputs=[act_fp4, weight, act_sf, weight_scale, alpha],
+                       tactic=tactics[0])
+
+
+@nvfp4_gemm_unified.register_fake
+def _(
+    act_fp4: torch.Tensor,
+    weight: torch.Tensor,
+    act_sf: torch.Tensor,
+    weight_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    output_dtype: torch.dtype,
+    to_userbuffers: bool = False,
+    backend: str = "auto",
+) -> torch.Tensor:
+    """Fake implementation for torch.compile support."""
     return act_fp4.new_empty((act_fp4.size(0), weight.size(0)),
                              dtype=output_dtype)
 

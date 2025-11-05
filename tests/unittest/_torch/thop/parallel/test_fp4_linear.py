@@ -116,7 +116,7 @@ def test_fp4_linear_cute_dsl(dtype, mnk):
                    bias=False,
                    dtype=dtype,
                    quant_config=qc,
-                   use_cute_dsl_nvfp4_blockscaling_mm=True)
+                   nvfp4_backend='cutedsl')
 
     assert l_fp4.weight.dtype == fp4_utils.float4_e2m1x2
     assert l_fp4.weight_scale.dtype == fp4_utils.float4_sf_dtype
@@ -179,7 +179,7 @@ def fp4_linear_perf_test(dtype, SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE):
                    bias=False,
                    dtype=dtype,
                    quant_config=qc,
-                   use_cute_dsl_nvfp4_blockscaling_mm=True)
+                   nvfp4_backend='cutedsl')
 
     assert l_fp4.weight.dtype == fp4_utils.float4_e2m1x2
     assert l_fp4.weight_scale.dtype == fp4_utils.float4_sf_dtype
@@ -214,7 +214,7 @@ def fp4_linear_perf_test(dtype, SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE):
                        bias=False,
                        dtype=dtype,
                        quant_config=qc,
-                       use_cute_dsl_nvfp4_blockscaling_mm=False)
+                       nvfp4_backend='cutlass')  # Use CUTLASS as reference
 
     assert l_fp4_ref.weight.dtype == fp4_utils.float4_e2m1x2
     assert l_fp4_ref.weight_scale.dtype == fp4_utils.float4_sf_dtype

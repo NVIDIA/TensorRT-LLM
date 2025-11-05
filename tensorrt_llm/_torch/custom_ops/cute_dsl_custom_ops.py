@@ -297,6 +297,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
         alpha: float,
         output_dtype: torch.dtype,
     ) -> torch.Tensor:
+        """CuteDSL-based NVFP4 GEMM optimized for Blackwell.
+
+        .. deprecated::
+            Use :func:`torch.ops.trtllm.nvfp4_gemm_unified` instead for automatic
+            backend selection among CUTLASS, cuBLASLt, and CuteDSL based on
+            performance profiling.
+        """
+        from tensorrt_llm.logger import logger
+        logger.warning_once(
+            "cute_dsl_nvfp4_gemm_blackwell is deprecated. Use nvfp4_gemm_unified instead "
+            "for automatic backend selection with better performance.",
+            key="cute_dsl_nvfp4_gemm_blackwell_deprecated")
 
         tuner = AutoTuner.get()
 
