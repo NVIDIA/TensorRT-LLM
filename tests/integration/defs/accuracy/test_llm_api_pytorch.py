@@ -2373,6 +2373,7 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_mpi_world_size(8)
     @skip_pre_hopper
+    @pytest.mark.skip_less_device_memory(140000)
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
         [
@@ -2439,9 +2440,9 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
         [
-            (8, 1, 8, 0, False, True, True, True, 24, "TRTLLM"),
-            (8, 1, 8, 1, False, True, True, True, 24, "TRTLLM"),
-            (8, 1, 8, 0, True, True, True, True, 24, "TRTLLM"),
+            (8, 1, 8, 0, False, True, True, True, 24, "CUTLASS"),
+            (8, 1, 8, 1, False, True, True, True, 24, "CUTLASS"),
+            (8, 1, 8, 0, True, True, True, True, 24, "CUTLASS"),
         ],
         ids=["baseline", "baseline_mtp1", "baseline_fp8kv"])
     def test_nvfp4_multi_gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
