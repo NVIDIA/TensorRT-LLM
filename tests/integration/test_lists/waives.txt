@@ -337,7 +337,6 @@ triton_server/test_triton_llm.py::test_llmapi_backend[4-0-disableDecoupleMode-te
 triton_server/test_triton_llm.py::test_llmapi_backend[1-0-disableDecoupleMode-tensorrt_llm] SKIP (https://nvbugs/5461874)
 triton_server/test_triton_llm.py::test_llmapi_backend[1-0-enableDecoupleMode-tensorrt_llm] SKIP (https://nvbugs/5461874)
 cpp/test_e2e.py::test_benchmarks[gpt-80] SKIP (https://nvbugs/5601670)
-disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_bf16_empty_batch[DeepSeek-V3-Lite-bf16] SKIP (https://nvbugs/5601682)
 disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[llama-v3-8b-hf] SKIP (https://nvbugs/5587574)
 full:H20-3e/accuracy/test_llm_api_pytorch.py::TestNemotronUltra::test_auto_dtype[tp8ep4-cuda_graph=True] SKIP (slow I/O)
 full:H20-3e/accuracy/test_llm_api_pytorch.py::TestKimiK2::test_fp8_blockscale[latency] SKIP (slow I/O)

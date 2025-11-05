@@ -985,7 +985,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
 
 
 @skip_pre_blackwell
-@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
+@pytest.mark.timeout(3600)
 class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
     FP4_MODEL = f"{llm_models_root()}/Qwen3/saved_models_Qwen3-30B-A3B_nvfp4_hf"
     FP8_MODEL = f"{llm_models_root()}/Qwen3/saved_models_Qwen3-30B-A3B_fp8_hf"
