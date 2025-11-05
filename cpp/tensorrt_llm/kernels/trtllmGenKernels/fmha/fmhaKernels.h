@@ -382,7 +382,7 @@ private:
                 // Need to select a different kernel.
                 selectKernelParams.mSelectNewKernel = true;
             }
-            else if (totalNumCtas < params.mMultiProcessorCount && isMlaGenKernel(params)
+            else if (totalNumCtas < params.mMultiProcessorCount && isMlaGenKernel(params) && !params.mSparseMla
                 && selectKernelParams.mTileSizeKv == 128 && tensorrt_llm::common::getEnvUseTileSizeKv64ForTrtllmGen())
             {
                 // Use smaller tileSizeKv to fully utilize the SMs.
@@ -484,12 +484,14 @@ private:
             // We use the low-latency kernel (SwapsMmaAbForGeneration with tileSizeQ = 16) when any of the following
             // conditions are met:
             // 1. The number of headsQPerKv is <= 32.
-            // 2. The seqLenPerCtaKv <= 1024 based on the benchmark results (this might be fine-tuned later) and
+            // 2. The number of headsQPerKv is < 128 for sparseMla.
+            // 3. The seqLenPerCtaKv <= 1024 based on the benchmark results (this might be fine-tuned later) and
             //    the numCtas (after splitting the heads across multiple CTAs) <= params.mMultiProcessorCount.
             // The sparseMla kernel will always use the 2CTA high-throughput kernel.
 
             // Check the conditions.
-            if ((params.mNumHeadsQPerKv <= 32 || useSwapsMmaAbMlaGenKernel(params)) && !params.mSparseMla)
+            if (params.mNumHeadsQPerKv <= 32 || (params.mSparseMla && params.mNumHeadsQPerKv < 128)
+                || useSwapsMmaAbMlaGenKernel(params))
             {
                 kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
             }
@@ -502,9 +504,9 @@ private:
                 {
                     selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::GmemReductionWithSeparateKernel;
                 }
-                // The sparseMla only supports numHeadsQPerKv = 128.
+                // The keepsMmaAbForGeneration sparseMla kernels only support numHeadsQPerKv = 128.
                 TLLM_CHECK_WITH_INFO(!params.mSparseMla || params.mNumHeadsQPerKv == 128,
-                    "The sparseMla only supports numHeadsQPerKv = 128");
+                    "The keepsMmaAbForGeneration sparseMla kernels only support numHeadsQPerKv = 128");
                 // The 2CTA keepsMmaAbForGeneration kernel is used when the numHeadsQPerKv is 128.
                 if (params.mNumHeadsQPerKv == 128)
                 {
