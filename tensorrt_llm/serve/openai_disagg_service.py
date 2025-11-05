@@ -226,7 +226,7 @@ class OpenAIDisaggregatedService(OpenAIService):
                 await self._gen_router.start_server_monitoring(
                     self._metadata_config.refresh_interval
                 )
-            await self._wait_for_servers_ready()
+            await self._wait_for_all_servers_ready()
 
     async def teardown(self) -> None:
         await self._ctx_client.shutdown()
@@ -239,7 +239,7 @@ class OpenAIDisaggregatedService(OpenAIService):
             await self._ctx_router.stop_server_monitoring()
             await self._gen_router.stop_server_monitoring()
 
-    async def _wait_for_servers_ready(self) -> None:
+    async def _wait_for_all_servers_ready(self) -> None:
         async def check_servers_ready():
             elapsed_time = 0
             interval = 3
