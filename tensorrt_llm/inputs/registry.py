@@ -42,9 +42,6 @@ class InputProcessor(Protocol):
     config: any
     tokenizer: any
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
     def __call__(
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
@@ -121,7 +118,7 @@ class DefaultInputProcessor(InputProcessor):
         return token_ids, None
 
 
-class BaseMultimodalInputProcessor(InputProcessor, ABC):
+class BaseMultimodalInputProcessor(ABC):
     """
     Base class for multimodal input processors with default implementations
     of get_num_tokens_per_image and get_num_tokens_per_video methods.
