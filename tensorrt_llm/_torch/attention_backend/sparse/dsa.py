@@ -17,6 +17,7 @@ from tensorrt_llm._torch.modules.multi_stream_utils import \
     maybe_execute_in_parallel
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._utils import get_size_in_bytes
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -572,6 +573,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.on_update_kv_lens()
 
 
+@maybe_compile(dynamic=True)
+def _scale(weights, q_scale, s):
+    return weights * q_scale.squeeze(-1) * s
+
+
 class Indexer(nn.Module):
 
     def __init__(self,
@@ -962,9 +968,6 @@ class Indexer(nn.Module):
             device=hidden_states.device)
         topk_indices_buffer[:hidden_states.shape[0]] = -1
 
-        # Store k_fp8 and k_scale into indexer k cache
-        self._update_k_cache(k_fp8, k_scale, metadata)
-
         if has_prefill:
             # Use chunked prefill to reduce memory footprint
             if metadata.indexer_prefill_chunks is not None:
@@ -1099,9 +1102,7 @@ class Indexer(nn.Module):
                      q_scale: torch.Tensor) -> torch.Tensor:
         weights = indexer_weights if indexer_weights is not None else self.weights_proj(
             hidden_states)
-        weights = weights.unsqueeze(-1) * q_scale * self.weight_scale_factor
-        # output weights is guaranteed to be float32 due to type promotion from q_scale (float32)
-        weights = weights.squeeze(-1)
+        weights = _scale(weights, q_scale, self.weight_scale_factor)
         return weights
 
     @torch.inference_mode()
@@ -1170,7 +1171,15 @@ class Indexer(nn.Module):
         q_fp8 = q_fp8.view(-1, self.n_heads, self.head_dim)
         q_scale = q_scale.view(-1, self.n_heads, 1)
 
-        weights = self.weight_scale(hidden_states, indexer_weights, q_scale)
+        weights, _ = maybe_execute_in_parallel(
+            lambda: self.weight_scale(hidden_states, indexer_weights, q_scale),
+            lambda: self._update_k_cache(
+                k_fp8, k_scale, metadata),  # store k_fp8 and k_scale in k cache
+            self.ln_events[0],
+            self.ln_events[1],
+            self.aux_stream,
+        )
+
         # Return topk indices buffer for sparse attention [num_tokens, index_topk]
         return self.sparse_attn_indexer(metadata, hidden_states, q_fp8, k_fp8,
                                         k_scale, weights)

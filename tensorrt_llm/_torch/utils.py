@@ -325,3 +325,17 @@ def get_device_uuid(device_idx: int) -> str:
     property = torch.cuda.get_device_properties(device_idx)
     uuid = "GPU-" + str(property.uuid)
     return uuid
+
+
+def maybe_compile(func=None, **compile_kwargs):
+
+    def decorator(f):
+
+        def wrapper(*args, **kwargs):
+            if is_piecewise_running():
+                return f(*args, **kwargs)
+            return torch.compile(f, **compile_kwargs)(*args, **kwargs)
+
+        return wrapper
+
+    return decorator(func) if func else decorator

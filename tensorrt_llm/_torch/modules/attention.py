@@ -23,7 +23,7 @@ from ..distributed import AllReduceParams, alltoall_helix
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
-                     is_piecewise_running, is_torch_compiling)
+                     is_torch_compiling, maybe_compile)
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from .multi_stream_utils import maybe_execute_in_parallel
 from .rms_norm import RMSNorm
@@ -74,17 +74,6 @@ def extract_extra_attrs(layer_idx: str, attn_type: str):
         ), "Attention layer must be a subclass of Attention or an instance of Attention"
 
     return metadata, attn_layer
-
-
-def maybe_compile(func):
-
-    def wrapper(*args, **kwargs):
-        if is_piecewise_running():
-            # When piecewise running, we don't need to compile the function to avoid host overhead in attention op.
-            return func(*args, **kwargs)
-        return torch.compile(func)(*args, **kwargs)
-
-    return wrapper
 
 
 @maybe_compile
