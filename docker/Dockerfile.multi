@@ -41,7 +41,6 @@ COPY docker/common/install.sh \
      docker/common/install_polygraphy.sh \
      docker/common/install_mpi4py.sh \
      docker/common/install_pytorch.sh \
-     docker/common/install_ucx.sh \
      docker/common/install_nixl.sh \
      docker/common/install_etcd.sh \
      ./
@@ -76,12 +75,6 @@ ARG TORCH_INSTALL_TYPE="skip"
 RUN TORCH_INSTALL_TYPE=${TORCH_INSTALL_TYPE} bash ./install.sh --pytorch && rm install_pytorch.sh
 
 RUN bash ./install.sh --opencv && rm install.sh
-
-# Copy all installation scripts at once to reduce layers
-COPY docker/common/install_triton.sh \
-     docker/common/install_nixl.sh \
-     docker/common/install_etcd.sh \
-     ./
 
 # Install NIXL
 RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install_nixl.sh && rm install_nixl.sh
