@@ -85,8 +85,8 @@ class PyTorchConfig:
     torch_compile_enable_userbuffers: bool = True
     torch_compile_max_num_streams: int = 1
 
-    # Enable autotuner only when torch compile is enabled
-    # TODO: after it can be work stable in warmup stage
+    # Enable autotuning process for all tunable ops.
+    # Otherwise, all tunable ops will rely on fallback implementations.
     enable_autotuner: bool = True
 
     # If true, enable layerwise nvtx marker
