@@ -6,7 +6,6 @@ Simplified version.
 import os
 import shutil
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -242,7 +241,7 @@ class JobManager:
                     print(f"   ✅ SLURM log copied successfully: {slurm_out_file}")
                 else:
                     print(f"   ⚠️  Warning: SLURM log not found: {slurm_out_file}")
-                
+
                 case_config_path = test_config.config_path
                 if os.path.exists(case_config_path):
                     shutil.copy(case_config_path, backup_dir)
