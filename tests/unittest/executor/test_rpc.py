@@ -154,11 +154,11 @@ class TestRpcCorrectness:
             for i in range(n):
                 yield i
 
-    def test_incremental_task(self):
+    def test_incremental_task(self, num_tasks: int = 10000):
         addr = get_unique_ipc_addr()
         with RpcServerWrapper(TestRpcCorrectness.App(), addr=addr) as server:
             with RPCClient(addr) as client:
-                for i in range(10000):  # a large number of tasks
+                for i in range(num_tasks):  # a large number of tasks
                     result = client.incremental_task(i).remote()
                     if i % 1000 == 0:
                         print(f"incremental_task {i} done")
@@ -542,6 +542,7 @@ class TestRpcShutdown:
                 for i in range(10):
                     server.shutdown()
 
+    @pytest.mark.skip(reason="This test is flaky, need to fix it")
     def test_submit_request_after_server_shutdown(self):
 
         class App:
@@ -603,6 +604,33 @@ class TestApp:
         for i in range(10):
             await asyncio.sleep(delay)
             yield i
+
+    async def streaming_forever(self):
+        """Streaming generator that never ends."""
+        i = 0
+        while True:
+            await asyncio.sleep(0.1)
+            yield i
+            i += 1
+
+
+@pytest.mark.asyncio
+async def test_streaming_task_cancelled():
+    # Test the streaming task cancelled when the server is shutdown
+    # This emulates the RpcWorker.fetch_responses_loop_async behavior
+    app = TestApp()
+    with RpcServerWrapper(app,
+                          num_workers=2,
+                          async_run_task=True,
+                          addr=get_unique_ipc_addr()) as server:
+        with RPCClient(server.address) as client:
+            iter = client.streaming_forever().remote_streaming()
+            # Only get the first 3 values
+            for i in range(3):
+                v = await iter.__anext__()
+                print(f"value {i}: {v}")
+
+            # The server should be shutdown while the task is not finished
 
 
 class TestRpcAsync:

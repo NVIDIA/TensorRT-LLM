@@ -132,7 +132,9 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         async def main_loop_task():
             tasks = [
                 self._fetch_responses_loop_async(),
-                self._fetch_stats_loop_async()
+                # FIXME: We may change the LLM.get_stats/_async API, and remove such logic
+                # Let user fetch stats via RPC is much simpler and more reliable
+                # self._fetch_stats_loop_async()
             ]
             if self._iter_kv_events_result is not None:
                 tasks.append(self._fetch_kv_cache_events_loop_async())
@@ -412,6 +414,7 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
+        logger_debug("GenerationExecutorRpcProxy is exiting", color="yellow")
         self.shutdown()
 
     def _create_mpi_session(self, model_world_size: int,

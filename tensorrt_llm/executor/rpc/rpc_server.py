@@ -72,7 +72,7 @@ class RPCServer:
 
         self.register_instance(instance)
 
-        logger_debug(f"RPC Server initialized with {num_workers} workers.",
+        logger_debug(f"RPCServer initialized with {num_workers} workers.",
                      color="green")
 
     @property
@@ -99,7 +99,7 @@ class RPCServer:
                                           is_async=True,
                                           use_hmac_encryption=False,
                                           socket_type=zmq.ROUTER)
-        logger.info(f"RPC Server bound to {self._address}")
+        logger.info(f"RPCServer is bound to {self._address}")
 
     def shutdown(self, is_remote_call: bool = False) -> None:
         """Internal method to trigger server shutdown.
@@ -115,15 +115,14 @@ class RPCServer:
             return
 
         logger_debug(
-            "RPC Server shutdown signal received. Terminating server immediately..."
-        )
+            "RPCServer is shutting down. Terminating server immediately...")
 
         # Set the stop event to True, this will trigger immediate shutdown
         self._stop_event.set()
 
         # Log pending requests that will be cancelled
         logger_debug(
-            f"RPC Server shutdown: {self._num_pending_requests} pending requests will be cancelled"
+            f"RPCServer is shutting down: {self._num_pending_requests} pending requests will be cancelled"
         )
 
         # Signal asyncio shutdown event if available
@@ -139,10 +138,10 @@ class RPCServer:
 
             # 2. Wait for the server thread to exit (this will wait for proper cleanup)
             if self._server_thread and self._server_thread.is_alive():
-                logger_debug("RPC Server waiting for server thread to exit")
+                logger_debug("RPCServer is waiting for server thread to exit")
                 self._server_thread.join()
                 self._server_thread = None
-            logger_debug("RPC Server thread joined")
+            logger_debug("RPCServer thread joined")
 
             # 3. Shutdown the executor immediately without waiting for tasks
             if self._executor:
@@ -158,6 +157,8 @@ class RPCServer:
             logger_debug(
                 f"RPC Server shutdown initiated: {self._num_pending_requests} pending requests will be cancelled"
             )
+
+        logger_debug("RPCServer is shutdown successfully", color="yellow")
 
     def register_function(self,
                           func: Callable[..., Any],
@@ -439,7 +440,6 @@ class RPCServer:
                     self._executor, call_with_kwargs),
                                                 timeout=adjusted_timeout)
 
-            logger_debug(f"RPC Server returned result for request {req}")
             response = RPCResponse(req.request_id, result=result)
 
         except asyncio.TimeoutError:

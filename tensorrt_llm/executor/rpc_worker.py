@@ -187,11 +187,11 @@ class RpcWorker(BaseWorker):
         super().setup_engine()
 
     def shutdown(self):
-        logger_debug(f"RPC worker {mpi_rank()} is shutting down",
+        logger_debug(f"RpcWorker #{mpi_rank()} is shutting down",
                      color="yellow")
         self.shutdown_event.set()
         super().shutdown()
-        logger_debug(f"RPC worker {mpi_rank()} is shutdown", color="yellow")
+        logger_debug(f"RpcWorker #{mpi_rank()} is shutdown", color="yellow")
 
     def start(self):
         pass
@@ -243,10 +243,11 @@ class RpcWorker(BaseWorker):
             rpc_server = RPCServer(worker, num_workers=RpcWorker.NUM_WORKERS)
             rpc_server.bind(rpc_addr)
             rpc_server.start()
+            logger_debug(f"RPC server {mpi_rank()} is started", color="yellow")
 
             # Step 3: Wait for the worker to shutdown
-            logger_debug(
-                f"Worker {mpi_rank()} is waiting for the worker to shutdown")
+            logger_debug(f"Worker {mpi_rank()} is waiting for shutdown event",
+                         color="yellow")
             worker.shutdown_event.wait()
             rpc_server.shutdown()
 
