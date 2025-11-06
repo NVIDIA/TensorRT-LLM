@@ -36,114 +36,122 @@ def benchmark_root():
 def shared_gpt_path():
     DEFAULT_LLM_MODEL_ROOT = os.path.join("/scratch.trt_llm_data", "llm-models")
     LLM_MODELS_ROOT = os.environ.get("LLM_MODELS_ROOT", DEFAULT_LLM_MODEL_ROOT)
-    return os.path.join(LLM_MODELS_ROOT, "datasets",
-                        "ShareGPT_V3_unfiltered_cleaned_split.json")
+    return os.path.join(LLM_MODELS_ROOT, "datasets", "ShareGPT_V3_unfiltered_cleaned_split.json")
 
 
 @pytest.fixture(scope="function")
 def benchmark_model_root(request):
     models_root = llm_models_root()
-    if (request.param == "DeepSeek-V3-Lite-fp8"):
+    if request.param == "DeepSeek-V3-Lite-fp8":
         model_path = os.path.join(models_root, "DeepSeek-V3-Lite", "fp8")
-    elif (request.param == "DeepSeek-V3-Lite-bf16"):
+    elif request.param == "DeepSeek-V3-Lite-bf16":
         model_path = os.path.join(models_root, "DeepSeek-V3-Lite", "bf16")
     elif request.param == "llama-v3-8b-hf":
         model_path = os.path.join(models_root, "llama-models-v3", "8B")
     elif request.param == "llama-3.1-8b-instruct-hf-fp8":
-        model_path = os.path.join(models_root, "llama-3.1-model",
-                                  "Llama-3.1-8B-Instruct-FP8")
+        model_path = os.path.join(models_root, "llama-3.1-model", "Llama-3.1-8B-Instruct-FP8")
     else:
         raise ValueError(f"Failed to find the model: {request.param}")
     return model_path
 
 
-def run_disaggregated_benchmark(example_dir,
-                                config_file,
-                                benchmark_root,
-                                benchmark_model_root,
-                                shared_gpt_path,
-                                env=None,
-                                cwd=None,
-                                num_ranks=2,
-                                random_input_len=16,
-                                random_output_len=64,
-                                num_prompts=100,
-                                max_concurrency=32,
-                                skip_warmup=False):
+def run_disaggregated_benchmark(
+    example_dir,
+    config_file,
+    benchmark_root,
+    benchmark_model_root,
+    shared_gpt_path,
+    env=None,
+    cwd=None,
+    num_ranks=2,
+    random_input_len=16,
+    random_output_len=64,
+    num_prompts=100,
+    max_concurrency=32,
+    skip_warmup=False,
+):
     """Run disaggregated benchmark with given configuration."""
     run_env = env.copy()
     run_env["UCX_TLS"] = "^ib"
     workers_cmd = [
-        'mpirun', '--allow-run-as-root', '--oversubscribe', '-n',
-        str(num_ranks), 'trtllm-serve', 'disaggregated_mpi_worker', '-c',
-        config_file
+        "mpirun",
+        "--allow-run-as-root",
+        "--oversubscribe",
+        "-n",
+        str(num_ranks),
+        "trtllm-serve",
+        "disaggregated_mpi_worker",
+        "-c",
+        config_file,
     ]
 
     server_start_timeout = 1200
     server_cmd = [
-        'trtllm-serve', 'disaggregated', '--server_start_timeout',
-        str(server_start_timeout), '-c', config_file
+        "trtllm-serve",
+        "disaggregated",
+        "--server_start_timeout",
+        str(server_start_timeout),
+        "-c",
+        config_file,
     ]
     try:
         with (  # Start workers
-                open('output_workers.log', 'w') as output_workers,
-                popen(workers_cmd,
-                      stdout=output_workers,
-                      stderr=subprocess.STDOUT,
-                      env=run_env,
-                      cwd=cwd) as workers_proc,
-                # Start server
-                open('output_disagg.log', 'w') as output_disagg,
-                popen(server_cmd,
-                      stdout=output_disagg,
-                      stderr=subprocess.STDOUT,
-                      env=run_env,
-                      cwd=cwd) as server_proc):
+            open("output_workers.log", "w") as output_workers,
+            popen(
+                workers_cmd, stdout=output_workers, stderr=subprocess.STDOUT, env=run_env, cwd=cwd
+            ) as workers_proc,
+            # Start server
+            open("output_disagg.log", "w") as output_disagg,
+            popen(
+                server_cmd, stdout=output_disagg, stderr=subprocess.STDOUT, env=run_env, cwd=cwd
+            ) as server_proc,
+        ):
             # Ensure the server has started
             client_dir = f"{example_dir}/clients"
             client_cmd = [
-                'python3', f'{client_dir}/disagg_client.py', '-c',
-                f'{example_dir}/disagg_config.yaml', '-p',
-                f'{client_dir}/prompts.json', '--ignore-eos',
-                '--server-start-timeout',
-                str(server_start_timeout)
+                "python3",
+                f"{client_dir}/disagg_client.py",
+                "-c",
+                f"{example_dir}/disagg_config.yaml",
+                "-p",
+                f"{client_dir}/prompts.json",
+                "--ignore-eos",
+                "--server-start-timeout",
+                str(server_start_timeout),
             ]
             # Warm up
-            check_call(client_cmd,
-                       env=env,
-                       poll_procs=[workers_proc, server_proc])
+            check_call(client_cmd, env=env, poll_procs=[workers_proc, server_proc])
             # Start Benchmark
-            benchmark_script = os.path.join(benchmark_root,
-                                            "benchmark_serving.py")
+            benchmark_script = os.path.join(benchmark_root, "benchmark_serving.py")
             benchmark_cmd = [
-                'python3',
+                "python3",
                 benchmark_script,
-                '--model',
+                "--model",
                 benchmark_model_root,
-                '--tokenizer',
+                "--tokenizer",
                 benchmark_model_root,
-                '--dataset-name',
-                'random',
-                '--dataset-path',
+                "--dataset-name",
+                "random",
+                "--dataset-path",
                 shared_gpt_path,
-                '--random-input-len',
+                "--random-input-len",
                 str(random_input_len),
-                '--random-output-len',
+                "--random-output-len",
                 str(random_output_len),
-                '--random-prefix-len',
-                '0',
-                '--num-prompts',
+                "--random-prefix-len",
+                "0",
+                "--num-prompts",
                 str(num_prompts),
-                '--max-concurrency',
+                "--max-concurrency",
                 str(max_concurrency),
-                '--host',
-                'localhost',
-                '--port',
-                '8000',
-                '--ignore-eos',
-                '--no-test-input',
-                '--percentile-metrics',
-                'e2el,ttft',
+                "--host",
+                "localhost",
+                "--port",
+                "8000",
+                "--ignore-eos",
+                "--no-test-input",
+                "--percentile-metrics",
+                "e2el,ttft",
             ]
             # warm up
             if not skip_warmup:
@@ -163,11 +171,11 @@ def run_disaggregated_benchmark(example_dir,
     except Exception:
         # Print outputs on error
         logger.error("-------- Workers output --------")
-        with open('output_workers.log', 'r') as f:
+        with open("output_workers.log", "r") as f:
             logger.error(f.read())
 
         logger.error("-------- Disagg server output --------")
-        with open('output_disagg.log', 'r') as f:
+        with open("output_disagg.log", "r") as f:
             logger.error(f.read())
         raise
     finally:
@@ -196,7 +204,7 @@ def get_config_for_benchmark(model_root, backend):
                 "backend": backend,
                 "max_tokens_in_buffer": 512,
             },
-            "urls": ["localhost:8001"]
+            "urls": ["localhost:8001"],
         },
         "generation_servers": {
             "num_instances": 1,
@@ -209,32 +217,45 @@ def get_config_for_benchmark(model_root, backend):
                 "backend": backend,
                 "max_tokens_in_buffer": 512,
             },
-            "urls": ["localhost:8002"]
-        }
+            "urls": ["localhost:8002"],
+        },
     }
     return serve_config
 
 
-@pytest.mark.parametrize("benchmark_model_root", [
-    'DeepSeek-V3-Lite-fp8', 'DeepSeek-V3-Lite-bf16', 'llama-v3-8b-hf',
-    'llama-3.1-8b-instruct-hf-fp8'
-],
-                         indirect=True)
+@pytest.mark.parametrize(
+    "benchmark_model_root",
+    [
+        "DeepSeek-V3-Lite-fp8",
+        "DeepSeek-V3-Lite-bf16",
+        "llama-v3-8b-hf",
+        "llama-3.1-8b-instruct-hf-fp8",
+    ],
+    indirect=True,
+)
 def test_disaggregated_benchmark_on_diff_backends(
-        disaggregated_test_root, disaggregated_example_root, llm_venv,
-        benchmark_model_root, benchmark_root, shared_gpt_path):
+    disaggregated_test_root,
+    disaggregated_example_root,
+    llm_venv,
+    benchmark_model_root,
+    benchmark_root,
+    shared_gpt_path,
+):
     """Benchmark test comparing NIXL vs UCX cache transceiver backends."""
-    if "DeepSeek-V3-Lite" in benchmark_model_root and "fp8" in benchmark_model_root and get_sm_version(
-    ) != 90:
+    if (
+        "DeepSeek-V3-Lite" in benchmark_model_root
+        and "fp8" in benchmark_model_root
+        and get_sm_version() != 90
+    ):
         pytest.skip("The test should only run on Hopper")
     nixl_config = get_config_for_benchmark(benchmark_model_root, "NIXL")
     ucx_config = get_config_for_benchmark(benchmark_model_root, "UCX")
     temp_dir = tempfile.TemporaryDirectory()
     nixl_config_path = os.path.join(temp_dir.name, "nixl_config.yaml")
     ucx_config_path = os.path.join(temp_dir.name, "ucx_config.yaml")
-    with open(nixl_config_path, 'w', encoding='utf-8') as f:
+    with open(nixl_config_path, "w", encoding="utf-8") as f:
         yaml.dump(nixl_config, f)
-    with open(ucx_config_path, 'w', encoding='utf-8') as f:
+    with open(ucx_config_path, "w", encoding="utf-8") as f:
         yaml.dump(ucx_config, f)
 
     env = llm_venv._new_env.copy()
@@ -245,7 +266,8 @@ def test_disaggregated_benchmark_on_diff_backends(
         benchmark_model_root,
         shared_gpt_path,
         env=env,
-        cwd=llm_venv.get_working_directory())
+        cwd=llm_venv.get_working_directory(),
+    )
     ucx_e2el, ucx_ttft = run_disaggregated_benchmark(
         disaggregated_example_root,
         ucx_config_path,
@@ -253,7 +275,8 @@ def test_disaggregated_benchmark_on_diff_backends(
         benchmark_model_root,
         shared_gpt_path,
         env=env,
-        cwd=llm_venv.get_working_directory())
+        cwd=llm_venv.get_working_directory(),
+    )
     print(f"Nixl E2EL: {nixl_e2el} ms, UCX E2EL: {ucx_e2el} ms")
     print(f"Nixl TTFT: {nixl_ttft} ms, UCX TTFT: {ucx_ttft} ms")
 
@@ -270,11 +293,7 @@ def get_config_for_empty_batch_test(model_root):
         "backend": "pytorch",
         "context_servers": {
             "num_instances": 1,
-            "build_config": {
-                "max_batch_size": 10,
-                "max_num_tokens": 512,
-                "max_seq_len": 768
-            },
+            "build_config": {"max_batch_size": 10, "max_num_tokens": 512, "max_seq_len": 768},
             "max_batch_size": 10,
             "max_num_tokens": 512,
             "max_seq_len": 768,
@@ -288,21 +307,14 @@ def get_config_for_empty_batch_test(model_root):
             "kv_cache_config": {
                 "enable_block_reuse": False,
                 "free_gpu_memory_fraction": 0.05,
-                "max_tokens": 512
+                "max_tokens": 512,
             },
-            "cache_transceiver_config": {
-                "max_tokens_in_buffer": 8448,
-                "backend": "DEFAULT"
-            },
-            "urls": ["localhost:8001"]
+            "cache_transceiver_config": {"max_tokens_in_buffer": 8448, "backend": "DEFAULT"},
+            "urls": ["localhost:8001"],
         },
         "generation_servers": {
             "num_instances": 1,
-            "build_config": {
-                "max_batch_size": 1,
-                "max_num_tokens": 2048,
-                "max_seq_len": 2560
-            },
+            "build_config": {"max_batch_size": 1, "max_num_tokens": 2048, "max_seq_len": 2560},
             "tensor_parallel_size": 1,
             "moe_expert_parallel_size": 1,
             "enable_attention_dp": False,
@@ -311,40 +323,29 @@ def get_config_for_empty_batch_test(model_root):
             "max_batch_size": 1,
             "max_num_tokens": 2048,
             "max_seq_len": 2560,
-            "cuda_graph_config": {
-                "enable_padding": True,
-                "batch_sizes": [1]
-            },
+            "cuda_graph_config": {"enable_padding": True, "batch_sizes": [1]},
             "print_iter_log": True,
             "kv_cache_config": {
                 "enable_block_reuse": False,
                 "free_gpu_memory_fraction": 0.7,
-                "max_tokens": 2560
+                "max_tokens": 2560,
             },
-            "moe_config": {
-                "backend": "CUTLASS"
-            },
-            "cache_transceiver_config": {
-                "max_tokens_in_buffer": 8448,
-                "backend": "DEFAULT"
-            },
+            "moe_config": {"backend": "CUTLASS"},
+            "cache_transceiver_config": {"max_tokens_in_buffer": 8448, "backend": "DEFAULT"},
             "stream_interval": 1,
             "num_postprocess_workers": 1,
-            "urls": ["localhost:8002"]
-        }
+            "urls": ["localhost:8002"],
+        },
     }
     return serve_config
 
 
-@pytest.mark.parametrize("benchmark_model_root", ['DeepSeek-V3-Lite-bf16'],
-                         indirect=True)
+@pytest.mark.parametrize("benchmark_model_root", ["DeepSeek-V3-Lite-bf16"], indirect=True)
 def test_disaggregated_deepseek_v3_lite_bf16_empty_batch(
-        disaggregated_example_root, llm_venv, benchmark_model_root,
-        benchmark_root, shared_gpt_path):
-
+    disaggregated_example_root, llm_venv, benchmark_model_root, benchmark_root, shared_gpt_path
+):
     src_dst_dict = {
-        benchmark_model_root:
-        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/bf16",
+        benchmark_model_root: f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/bf16",
     }
     for src, dst in src_dst_dict.items():
         if not os.path.islink(dst):
@@ -355,7 +356,7 @@ def test_disaggregated_deepseek_v3_lite_bf16_empty_batch(
     config = get_config_for_empty_batch_test(benchmark_model_root)
     temp_dir = tempfile.TemporaryDirectory()
     config_path = os.path.join(temp_dir.name, "config.yaml")
-    with open(config_path, 'w', encoding='utf-8') as f:
+    with open(config_path, "w", encoding="utf-8") as f:
         yaml.dump(config, f)
 
     env = llm_venv._new_env.copy()
@@ -372,7 +373,8 @@ def test_disaggregated_deepseek_v3_lite_bf16_empty_batch(
         max_concurrency=10,
         random_input_len=384,
         random_output_len=1536,
-        skip_warmup=True)
+        skip_warmup=True,
+    )
     print(f"E2EL: {e2el} ms, TTFT: {ttft} ms")
 
     assert e2el > 0 and ttft > 0
