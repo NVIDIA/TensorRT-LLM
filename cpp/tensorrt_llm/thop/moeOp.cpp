@@ -668,7 +668,8 @@ public:
         torch::optional<torch::Tensor> const& fc2_expert_biases, int64_t const top_k, int64_t const tp_size,
         int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size,
         int64_t const cluster_rank, bool const enable_alltoall, bool const min_latency_mode, int64_t const gemm_idx,
-        int64_t const profile_id, bool const do_preparation, int64_t const unpadded_hidden_size)
+        int64_t const profile_id, bool const do_preparation, int64_t const activation_type_int,
+        int64_t const unpadded_hidden_size)
     {
         std::lock_guard<std::mutex> lock(mMutex);
 
@@ -677,6 +678,7 @@ public:
         {
             return;
         }
+        ActivationType activation_type = static_cast<ActivationType>(activation_type_int);
 
         int64_t const num_rows = input.sizes()[0];
         int64_t hidden_size = fc2_expert_weights.sizes()[1];
@@ -731,14 +733,14 @@ public:
                 tensorrt_llm::runtime::TorchUtils::dataType(mWeightDtype),
                 tensorrt_llm::runtime::TorchUtils::dataType(mOutputDtype), num_experts, static_cast<int>(top_k),
                 hidden_size, unpadded_hidden_size > 0 ? unpadded_hidden_size : hidden_size, inter_size, group_size,
-                ActivationType::Swiglu, USE_BIAS, USE_LORA, min_latency_mode,
+                activation_type, USE_BIAS, USE_LORA, min_latency_mode,
                 /*need_weights*/ false, parallelism_config, enable_alltoall);
 #else
             mProfiler->init(*mKernelRunner.get(), mProfiler->mGemmToProfile,
                 tensorrt_llm::runtime::TorchUtils::dataType(activation_dtype),
                 tensorrt_llm::runtime::TorchUtils::dataType(mWeightDtype),
                 tensorrt_llm::runtime::TorchUtils::dataType(mOutputDtype), num_experts, static_cast<int>(top_k),
-                hidden_size, inter_size, group_size, ActivationType::Swiglu, USE_BIAS, USE_LORA, min_latency_mode,
+                hidden_size, inter_size, group_size, activation_type, USE_BIAS, USE_LORA, min_latency_mode,
                 /*need_weights*/ false, parallelism_config);
 #endif
 
