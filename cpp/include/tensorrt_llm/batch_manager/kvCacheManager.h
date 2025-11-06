@@ -1006,6 +1006,9 @@ public:
         return mBufferManager;
     }
 
+    //! \brief Sync internal streams used by transfer manager with buffer manager stream
+    void syncTransferManagerWithBufferManager();
+
     //! \brief Perform per-request bookkeeping
     void refreshBlocks();
 
@@ -1435,6 +1438,9 @@ public:
     //! \brief Store newest block for reuse
     void storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
 
+    //! \brief Sync internal streams used by transfer manager with buffer manager stream
+    void syncTransferManagerWithBufferManager();
+
     //! \brief Perform per-request bookkeeping
     void refreshBlocks();
 
@@ -1667,6 +1673,7 @@ public:
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getIndexerKCachePool() const = 0;
     [[nodiscard]] virtual SizeType32 getPoolLayerIdx(SizeType32 layer_idx) const = 0;
 
+    virtual void syncTransferManagerWithBufferManager() = 0;
     virtual void refreshBlocks() = 0;
     virtual void flushIterationEvents() = 0;
 
@@ -2030,6 +2037,11 @@ public:
     SizeType32 getPoolLayerIdx(SizeType32 layer_idx) const override
     {
         return mBlockManager.getPoolLayerIdx(layer_idx);
+    }
+
+    void syncTransferManagerWithBufferManager() override
+    {
+        mBlockManager.syncTransferManagerWithBufferManager();
     }
 
     //! \brief Perform per-iteration bookkeeping
