@@ -2597,7 +2597,7 @@ class TorchLlmArgs(BaseLlmArgs):
     # PrivateVars
     _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
 
-    _disable_flash_infer_sampling: bool = PrivateAttr(default=True)
+    _disable_flash_infer_sampling: bool = PrivateAttr(default=False)
     """Unless this is set to False, FlashInfer.sampling is not used, even if available."""
 
     @property
