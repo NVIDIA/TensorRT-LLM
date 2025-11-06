@@ -25,7 +25,10 @@ apt-get install -y --no-install-recommends \
     pkg-config \
     patchelf
 
+mkdir -p /third-party-source
+
 git clone --depth 1 https://github.com/alibaba/yalantinglibs.git
+tar -czf /third-party-source/yalantinglibs.tar.gz yalantinglibs
 cd yalantinglibs
 mkdir build && cd build
 cmake .. -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=OFF
@@ -35,6 +38,7 @@ cd ../..
 rm -rf yalantinglibs
 
 git clone --depth 1 -b ${MOONCAKE_VERSION} ${MOONCAKE_REPO}
+tar -czf /third-party-source/Mooncake-${MOONCAKE_VERSION}.tar.gz Mooncake
 cd Mooncake
 git submodule update --init --recursive --depth 1
 mkdir build && cd build
