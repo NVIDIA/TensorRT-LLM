@@ -506,12 +506,8 @@ bool LaunchConfig::supportsMultimem() const
 #ifdef ARCH_HAS_MULTIMEM
     TLLM_LOG_DEBUG("  ARCH_HAS_MULTIMEM is defined");
 
-    if (this->nRanks <= 2)
-    {
-        TLLM_LOG_DEBUG("  Returning FALSE: nRanks=%d <= 2 (requires > 2)", this->nRanks);
-        return false; // Current NCCL requires at least 3 ranks for multimem support
-    }
-    TLLM_LOG_DEBUG("  nRanks check passed: %d > 2", this->nRanks);
+    // Note: 2 ranks are now supported for multimem
+    TLLM_LOG_DEBUG("  nRanks=%d (multimem supports 2+ ranks)", this->nRanks);
 
     // Basic types are always supported on SM90+
     switch (dataType)
