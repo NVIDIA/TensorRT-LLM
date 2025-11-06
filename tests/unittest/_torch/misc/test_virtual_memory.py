@@ -1,10 +1,8 @@
 import gc
-import os
-import warnings
 
-import pynvml
 import pytest
 import torch
+from utils.util import get_current_process_gpu_memory
 
 import tensorrt_llm
 from tensorrt_llm._torch import virtual_memory
@@ -25,56 +23,6 @@ def cuda_sync_fixture():
     torch.cuda.synchronize()
 
 
-@pytest.fixture(scope="module")
-def memory_info_available():
-    """
-    Checks if NVML can get per-process memory information.
-    """
-
-    # Allocate a small tensor to test memory tracking
-    tensor = torch.zeros(4096, dtype=torch.int32, device='cuda')
-    torch.cuda.synchronize()
-
-    # Try to get memory usage
-    usage = get_current_process_memory_info()
-
-    # Clean up
-    del tensor
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
-
-    if usage == 0:
-        warnings.warn("Per process memory information unavailable.")
-        return False
-
-    return True
-
-
-@pytest.fixture(scope="module", autouse=True)
-def nvml_init():
-    pynvml.nvmlInit()
-
-
-def get_current_process_memory_info() -> int:
-    """
-    Returns GPU memory usage for current process in bytes.
-    """
-    # Get current process ID
-    current_pid = os.getpid()
-    # Get device handle for GPU 0
-    device_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-
-    # Get running processes
-    processes = pynvml.nvmlDeviceGetComputeRunningProcesses(device_handle)
-
-    # Find current process
-    for process in processes:
-        if process.pid == current_pid:
-            return process.usedGpuMemory
-
-    return 0
-
-
 @pytest.fixture(scope="function", autouse=True)
 def clean_cache():
     gc.collect()
@@ -84,16 +32,16 @@ def clean_cache():
     torch.cuda.empty_cache()
 
 
-def test_basic(memory_info_available):
-    memory_usage_begin = get_current_process_memory_info()
+def test_basic(process_gpu_memory_info_available):
+    memory_usage_begin = get_current_process_gpu_memory()
 
     alloc_size = 256 * 1024 * 1024
     tag = "test_tag"
 
     with virtual_memory.scope(tag) as pool:
         tensor = torch.full([alloc_size], 42, dtype=torch.int8, device='cuda')
-        memory_usage_materialized = get_current_process_memory_info()
-        if memory_info_available:
+        memory_usage_materialized = get_current_process_gpu_memory()
+        if process_gpu_memory_info_available:
             assert memory_usage_begin + alloc_size == memory_usage_materialized
 
     assert tensor[0].item() == 42
@@ -101,15 +49,15 @@ def test_basic(memory_info_available):
     torch.cuda.synchronize()
     virtual_memory.release_with_tag(tag)
 
-    memory_usage_released = get_current_process_memory_info()
-    if memory_info_available:
+    memory_usage_released = get_current_process_gpu_memory()
+    if process_gpu_memory_info_available:
         assert memory_usage_begin == memory_usage_released
 
     torch.cuda.synchronize()
     virtual_memory.materialize_with_tag(tag)
 
-    memory_usage_rematerialized = get_current_process_memory_info()
-    if memory_info_available:
+    memory_usage_rematerialized = get_current_process_gpu_memory()
+    if process_gpu_memory_info_available:
         assert memory_usage_begin + alloc_size == memory_usage_rematerialized
 
     torch.fill_(tensor, 24)
@@ -118,8 +66,8 @@ def test_basic(memory_info_available):
     del tensor
     del pool
 
-    memory_usage_end = get_current_process_memory_info()
-    if memory_info_available:
+    memory_usage_end = get_current_process_gpu_memory()
+    if process_gpu_memory_info_available:
         assert memory_usage_begin == memory_usage_end
 
 
@@ -146,7 +94,7 @@ def test_restore():
     del pool
 
 
-def test_kv_cache_manager(memory_info_available):
+def test_kv_cache_manager(process_gpu_memory_info_available):
     kv_cache_params = {
         "kv_cache_config": KvCacheConfig(max_tokens=1024),
         "kv_cache_type": CacheType.SELF,
@@ -164,7 +112,7 @@ def test_kv_cache_manager(memory_info_available):
     mgr.shutdown()
     del mgr
 
-    memory_usage_begin = get_current_process_memory_info()
+    memory_usage_begin = get_current_process_gpu_memory()
 
     tag = "test_tag"
     cache_size = torch.empty(
@@ -182,35 +130,35 @@ def test_kv_cache_manager(memory_info_available):
 
     with virtual_memory.scope(tag) as pool:
         mgr = KVCacheManager(**kv_cache_params)
-        memory_usage_materialized = get_current_process_memory_info()
-        if memory_info_available:
+        memory_usage_materialized = get_current_process_gpu_memory()
+        if process_gpu_memory_info_available:
             assert memory_usage_begin + alloc_size == memory_usage_materialized
 
     torch.cuda.synchronize()
     virtual_memory.release_with_tag(tag)
 
-    memory_usage_released = get_current_process_memory_info()
-    if memory_info_available:
+    memory_usage_released = get_current_process_gpu_memory()
+    if process_gpu_memory_info_available:
         assert memory_usage_begin == memory_usage_released
 
     torch.cuda.synchronize()
     virtual_memory.materialize_with_tag(tag)
 
-    memory_usage_rematerialized = get_current_process_memory_info()
-    if memory_info_available:
+    memory_usage_rematerialized = get_current_process_gpu_memory()
+    if process_gpu_memory_info_available:
         assert memory_usage_begin + alloc_size == memory_usage_rematerialized
 
     mgr.shutdown()
     del mgr
     del pool
 
-    memory_usage_end = get_current_process_memory_info()
-    if memory_info_available:
+    memory_usage_end = get_current_process_gpu_memory()
+    if process_gpu_memory_info_available:
         assert memory_usage_begin == memory_usage_end
 
 
 @pytest.mark.skip("https://nvbugspro.nvidia.com/bug/5458911")
-def test_cuda_graph(memory_info_available):
+def test_cuda_graph(process_gpu_memory_info_available):
 
     def work(input: torch.Tensor) -> torch.Tensor:
         intermediate = input + input
@@ -233,13 +181,13 @@ def test_cuda_graph(memory_info_available):
     torch.cuda.synchronize()
     assert static_output[0].item() == 3.0
 
-    memory_usage_before = get_current_process_memory_info()
+    memory_usage_before = get_current_process_gpu_memory()
 
     torch.cuda.synchronize()
     virtual_memory.release_with_tag(tag)
 
-    memory_usage_released = get_current_process_memory_info()
-    if memory_info_available:
+    memory_usage_released = get_current_process_gpu_memory()
+    if process_gpu_memory_info_available:
         assert memory_usage_released < memory_usage_before
 
     torch.cuda.synchronize()

@@ -18,6 +18,7 @@ from .llm_request import (ExecutorRequest, LlmRequest,
                           executor_request_to_llm_request)
 
 SHUTDOWN_REQUEST_ID = -1
+CONTROL_REQUEST_ID = -2
 
 
 @dataclasses.dataclass
@@ -35,7 +36,12 @@ class RequestQueueItem:
 
     @property
     def is_normal_request(self):
-        return not (self.is_shutdown_request or self.is_canceled_request)
+        return not (self.is_shutdown_request or self.is_canceled_request
+                    or self.is_control_request)
+
+    @property
+    def is_control_request(self):
+        return self.id == CONTROL_REQUEST_ID
 
 
 class ExecutorRequestQueue:
@@ -68,6 +74,8 @@ class ExecutorRequestQueue:
         self.new_active_requests_queue_latency_ms = 0
         self.is_shutdown = False
         self.should_exclude_last_generation_logits = False
+        self.control_requests: List[RequestQueueItem] = []
+        self.request_accumulated: List[RequestQueueItem] = []
 
         self._disable_mpi = mpi_disabled()
 
@@ -251,6 +259,10 @@ class ExecutorRequestQueue:
             self.request_queue.put(
                 RequestQueueItem(req_id, is_canceled_request=True))
 
+    def enqueue_control_request(self):
+        with self.enqueue_lock:
+            self.request_queue.put(RequestQueueItem(id=CONTROL_REQUEST_ID))
+
     def enqueue_shutdown_request(self):
         with self.enqueue_lock:
             self.request_queue.put(RequestQueueItem(SHUTDOWN_REQUEST_ID))
@@ -268,6 +280,10 @@ class ExecutorRequestQueue:
         all_ranks_num_active_requests: Optional[List[int]] = None
     ) -> List[RequestQueueItem]:
         """Common logic for fetching and processing requests from the queue."""
+        # Block new request processing while control requests are pending.
+        # Control requests must be handled exclusively to ensure proper synchronization.
+        if len(self.control_requests) != 0:
+            return []
         # Calculate timeout
         idle = (total_num_active_requests == 0) and len(self.waiting_queue) == 0
         if idle:
@@ -281,7 +297,13 @@ class ExecutorRequestQueue:
         # Fetch requests from rank 0
         new_requests = []
         if self.dist.rank == 0:
-            new_requests = self._get_from_request_queue(timeout)
+            # Process accumulated requests that were queued during control request handling.
+            if len(self.request_accumulated) != 0:
+                new_requests.extend(self.request_accumulated)
+                self.request_accumulated.clear()
+                # Reset timeout to 0 to avoid hanging when no new requests are available
+                timeout = datetime.timedelta(0)
+            new_requests.extend(self._get_from_request_queue(timeout))
 
         # Broadcast requests and handle Python objects
         new_requests, py_request_objects = self._handle_request_broadcasting(
@@ -465,12 +487,17 @@ class ExecutorRequestQueue:
             new_requests: List[RequestQueueItem]) -> List[RequestQueueItem]:
         """Validate and filter requests, handling shutdown signals."""
         valid_new_requests = []
-        for req_item in new_requests:
+        for idx, req_item in enumerate(new_requests):
             if req_item.is_shutdown_request:
                 self.is_shutdown = True
                 break
             elif req_item.is_canceled_request:
                 self.canceled_req_ids.append(req_item.id)
+            elif req_item.is_control_request:
+                self.control_requests.append(req_item)
+                if self.dist.rank == 0:
+                    self.request_accumulated.extend(new_requests[idx + 1:])
+                break
             else:
                 valid_new_requests.append(req_item)
 

@@ -34,9 +34,9 @@ transforms:
   match_eager_attention:
     stage: pattern_matcher
     requires_shape_prop: true
-  match_grouped_attention_with_repeat_kv:
+  match_sdpa_to_torch_attention:
     stage: pattern_matcher
-  match_grouped_attention_without_repeat_kv:
+  match_grouped_attention:
     stage: pattern_matcher
   match_attention_layout:
     stage: pattern_matcher
@@ -77,8 +77,8 @@ transforms:
   detect_sharding:
     stage: sharding
     simple_shard_only: false
-    use_sharding_from_factory: false
-    support_partial_config: false
+    sharding_source: ['heuristic']
+    support_partial_config: true
     sharding_dims: ['tp', 'ep', 'bmm']
     requires_shape_prop: true
   # TODO: (hg) need to ensure run_shape_prop after sharding.

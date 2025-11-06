@@ -629,6 +629,7 @@ class Indexer(nn.Module):
         self.scale_fmt = "ue8m0"
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+        self.weight_scale_factor = self.softmax_scale * self.n_heads**-0.5
 
     @staticmethod
     def prepare_one_prefill_chunk(
@@ -1105,65 +1106,86 @@ class Indexer(nn.Module):
 
         return topk_indices_buffer
 
+    def weight_scale(self, hidden_states: torch.Tensor,
+                     indexer_weights: Optional[torch.Tensor],
+                     q_scale: torch.Tensor) -> torch.Tensor:
+        weights = indexer_weights if indexer_weights is not None else self.weights_proj(
+            hidden_states)
+        weights = weights.unsqueeze(-1) * q_scale * self.weight_scale_factor
+        # output weights is guaranteed to be float32 due to type promotion from q_scale (float32)
+        weights = weights.squeeze(-1)
+        return weights
+
     @torch.inference_mode()
     def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
                 metadata: DSAtrtllmAttentionMetadata,
-                position_ids: torch.Tensor):
+                position_ids: torch.Tensor, indexer_k: Optional[torch.Tensor],
+                indexer_weights: Optional[torch.Tensor]):
         quant_block_size = metadata.kv_cache_manager.quant_block_size
         assert quant_block_size == 128, "Only support quant_block_size = 128 for now"
 
-        q, k = maybe_execute_in_parallel(
-            lambda: self.wq_b(qr),
-            lambda: self.wk(hidden_states),
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
+        if indexer_k is not None:
+            q, k = maybe_execute_in_parallel(
+                lambda: self.wq_b(
+                    qr),  # TODO: fuse wq_b and move this outside of the indexer
+                lambda: self.k_norm(indexer_k),
+                self.ln_events[0],
+                self.ln_events[1],
+                self.aux_stream,
+            )
+        else:
+            q, k = maybe_execute_in_parallel(
+                lambda: self.wq_b(qr),
+                lambda: self.k_norm(self.wk(hidden_states)),
+                self.ln_events[0],
+                self.ln_events[1],
+                self.aux_stream,
+            )
+
+        # q/k rope + possible fast_hadamard_transform
         q = q.view(-1, self.n_heads, self.head_dim)
-        q_pe, q_nope = torch.split(
-            q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
-        k = self.k_norm(k)
-        k_pe, k_nope = torch.split(
-            k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
 
-        # k_pe needs unsqueeze to match n_heads
+        q, k = maybe_execute_in_parallel(
+            lambda: torch.split(
+                q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1),
+            lambda: torch.split(
+                k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1),
+            self.ln_events[0],
+            self.ln_events[1],
+            self.aux_stream,
+        )
+
+        q_pe, q_nope = q
+        k_pe, k_nope = k
         q_pe, k_pe = self.rotary_emb(position_ids, [q_pe, k_pe.unsqueeze(1)])
-        q = torch.cat([q_pe, q_nope], dim=-1)
-        # Remove head dimension (size 1) for MQA k
-        k = torch.cat([k_pe[:, 0, :], k_nope], dim=-1)
+
+        k_pe = k_pe[:, 0, :]
+
+        def _prep_q_or_k(qk_pe, qk_nope):
+            q_or_k = torch.cat([qk_pe, qk_nope], dim=-1)
+            q_or_k = rotate_activation(q_or_k)
+            q_or_k = q_or_k.view(-1, self.head_dim)
+            q_or_k = fp8_utils.fp8_quantize_1x128_sf_transpose(
+                q_or_k, use_ue8m0=self.scale_fmt == "ue8m0")
+            return q_or_k
 
         q, k = maybe_execute_in_parallel(
-            lambda: rotate_activation(q),
-            lambda: rotate_activation(k),
+            lambda: _prep_q_or_k(q_pe, q_nope),
+            lambda: _prep_q_or_k(k_pe, k_nope),
             self.ln_events[0],
             self.ln_events[1],
             self.aux_stream,
         )
-        # we only quant q here since k quant is fused with cache insertion
-        q = q.view(-1, self.head_dim)
 
-        q, k = maybe_execute_in_parallel(
-            lambda: fp8_utils.fp8_quantize_1x128_sf_transpose(
-                q, use_ue8m0=self.scale_fmt == "ue8m0"),
-            lambda: fp8_utils.fp8_quantize_1x128_sf_transpose(
-                k, use_ue8m0=self.scale_fmt == "ue8m0"),
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
         q_fp8, q_scale = q
         k_fp8, k_scale = k
         q_fp8 = q_fp8.view(-1, self.n_heads, self.head_dim)
         q_scale = q_scale.view(-1, self.n_heads, 1)
 
-        weights = self.weights_proj(hidden_states)
-        weights = weights.unsqueeze(
-            -1) * q_scale * self.softmax_scale * self.n_heads**-0.5
-        weights = weights.squeeze(-1)
-
+        weights = self.weight_scale(hidden_states, indexer_weights, q_scale)
         # Return topk indices buffer for sparse attention [num_tokens, index_topk]
         return self.sparse_attn_indexer(metadata, hidden_states, q_fp8, k_fp8,
-                                        k_scale, weights.to(torch.float32))
+                                        k_scale, weights)
 
 
 class DSATrtllmAttention(TrtllmAttention):
