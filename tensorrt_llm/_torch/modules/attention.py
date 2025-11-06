@@ -1196,7 +1196,7 @@ class MLA(nn.Module):
                 assert position_ids is not None
                 k_pe_gen = self.apply_rope(q_gen, k_pe_gen, position_ids)
 
-            self.forward_absorption(
+            self.forward_absorption_generation(
                 q_gen,
                 compressed_kv_gen,
                 k_pe_gen,
@@ -1367,14 +1367,13 @@ class MLA(nn.Module):
         topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if get_sm_version() >= 100:
-            return self.forward_absorption(q,
-                                           compressed_kv,
-                                           k_pe,
-                                           attn_metadata,
-                                           output,
-                                           latent_cache=latent_cache,
-                                           topk_indices=topk_indices,
-                                           is_generation=False)
+            return self.forward_absorption_context(q,
+                                                   compressed_kv,
+                                                   k_pe,
+                                                   attn_metadata,
+                                                   output,
+                                                   latent_cache=latent_cache,
+                                                   topk_indices=topk_indices)
         else:
             return self.forward_sparse_mla_kvcache_bf16(q,
                                                         latent_cache,
@@ -1394,13 +1393,13 @@ class MLA(nn.Module):
         topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if get_sm_version() >= 100:
-            return self.forward_absorption(q,
-                                           compressed_kv,
-                                           k_pe,
-                                           attn_metadata,
-                                           output,
-                                           latent_cache=latent_cache,
-                                           topk_indices=topk_indices)
+            return self.forward_absorption_generation(q,
+                                                      compressed_kv,
+                                                      k_pe,
+                                                      attn_metadata,
+                                                      output,
+                                                      latent_cache=latent_cache,
+                                                      topk_indices=topk_indices)
         else:
             return self.forward_sparse_mla_kvcache_bf16(q,
                                                         latent_cache,
@@ -1665,7 +1664,7 @@ class MLA(nn.Module):
                                             position_ids, attn_metadata, output,
                                             latent_cache)
 
-    def forward_absorption(
+    def forward_absorption_generation(
         self,
         q: torch.Tensor,
         compressed_kv: torch.Tensor,
@@ -1675,7 +1674,171 @@ class MLA(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         latent_cache: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
-        is_generation: bool = True,
+    ) -> torch.Tensor:
+        num_tokens = q.shape[0]
+        q_nope, q_pe = q.view([-1, self.num_heads_tp, self.qk_head_dim]).split(
+            [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+
+        # fused_q contains 1) the result of the following bmm with shape [num_tokens, num_heads, kv_lora_rank]
+        # 2) rope(q_pe) with shape [num_tokens, num_heads, qk_rope_head_dim]. rope is applied inside AttentionOp
+        num_seqs = attn_metadata.kv_lens_cuda_runtime.size(0)
+
+        cu_q_seqlens = torch.empty(num_seqs + 1,
+                                   dtype=torch.int32,
+                                   device=q.device)
+        cu_kv_seqlens = torch.empty(num_seqs + 1,
+                                    dtype=torch.int32,
+                                    device=q.device)
+        fmha_scheduler_counter = torch.empty(1,
+                                             dtype=torch.uint32,
+                                             device=q.device)
+        has_fp8_kv_cache = self.mqa.has_fp8_kv_cache if hasattr(
+            self.mqa, 'has_fp8_kv_cache') else False
+
+        mla_bmm1_scale = None
+        mla_bmm2_scale = None
+        quant_q_buffer = None
+        if has_fp8_kv_cache:
+            mla_bmm1_scale = torch.empty(2,
+                                         dtype=torch.float32,
+                                         device=q.device)
+            mla_bmm2_scale = torch.empty(1,
+                                         dtype=torch.float32,
+                                         device=q.device)
+            quant_q_buffer = torch.empty(
+                num_tokens,
+                self.num_heads_tp, (self.kv_lora_rank + self.qk_rope_head_dim),
+                dtype=torch.uint8,
+                device=q.device)
+
+        fused_q = torch.empty(
+            [
+                num_tokens, self.num_heads_tp,
+                (self.kv_lora_rank + self.qk_rope_head_dim)
+            ],
+            dtype=q.dtype,
+            device=q.device,
+        )
+
+        rope_stream = self.aux_stream if not has_fp8_kv_cache else None
+        if self.k_b_proj_trans.dtype == torch.bfloat16:
+            # [num_heads, num_tokens, self.qk_nope_head_dim]
+            q_nope_t = q_nope.transpose(0, 1)
+            # [num_heads, num_tokens, self.kv_lora_rank]
+            q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
+
+            # [num_heads, num_tokens, self.qk_nope_head_dim] x [num_heads, kv_lora_rank, qk_nope_head_dim]
+            # -> [num_heads, num_tokens, kv_lora_rank] -> [num_tokens, num_heads, kv_lora_rank]
+            # The output of bmm is written directly into fused_q
+            maybe_execute_in_parallel(
+                lambda: torch.ops.trtllm.bmm_out(
+                    q_nope_t, self.k_b_proj_trans.transpose(1, 2), q_nope_out),
+                lambda: self.mqa.mla_rope_generation(
+                    fused_q, q_pe, latent_cache, attn_metadata, cu_q_seqlens,
+                    cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale,
+                    mla_bmm2_scale, quant_q_buffer),
+                self.ln_events[0],
+                self.ln_events[1],
+                rope_stream,
+            )
+
+        elif self.k_b_proj_trans.dtype == torch.float8_e4m3fn:
+            # [num_heads, num_tokens, self.kv_lora_rank]
+            q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
+
+            maybe_execute_in_parallel(
+                lambda: fp8_block_scaling_bmm_out(
+                    q_nope,
+                    self.k_b_proj_trans,
+                    self.k_b_proj_trans_scale,
+                    q_nope_out,
+                    self.k_b_proj_trans_dequant,
+                ),
+                lambda: self.mqa.mla_rope_generation(
+                    fused_q, q_pe, latent_cache, attn_metadata, cu_q_seqlens,
+                    cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale,
+                    mla_bmm2_scale, quant_q_buffer),
+                self.ln_events[0],
+                self.ln_events[1],
+                rope_stream,
+            )
+        else:
+            raise NotImplementedError(
+                f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}.")
+
+        fused_q = fused_q.view([
+            num_tokens,
+            self.num_heads_tp * (self.kv_lora_rank + self.qk_rope_head_dim)
+        ])
+
+        # Use generation_only for generation phase and context_only for context phase in DSA attention
+        attention_input_type = AttentionInputType.generation_only
+
+        attn_out_latent = self._attn_forward_gen(
+            self.mqa,
+            fused_q,
+            None,
+            None,
+            position_ids,
+            attn_metadata,
+            attention_input_type=attention_input_type,
+            out_scale=self.out_scale,
+            latent_cache=latent_cache,  # kvcache and k_pe
+            q_pe=q_pe,  # used by `invokeMLARopeGeneration`
+            topk_indices=topk_indices,  # used by DSA attention
+            is_generation=True,  # used by DSA attention
+            cu_q_seqlens=cu_q_seqlens,  # used by `mlaGeneration`
+            cu_kv_seqlens=cu_kv_seqlens,  # used by `mlaGeneration`
+            fmha_scheduler_counter=
+            fmha_scheduler_counter,  # used by `mlaGeneration`
+            mla_bmm1_scale=mla_bmm1_scale,  # used by `mlaGeneration`
+            mla_bmm2_scale=mla_bmm2_scale,  # used by `mlaGeneration`
+            quant_q_buffer=quant_q_buffer,  # used by `mlaGeneration`
+        )
+        fused_q = None
+
+        # note: if we do not have CP, then num_heads_tp_cp == num_heads_tp
+        assert (attn_out_latent.shape[0] == q.shape[0]
+                and attn_out_latent.shape[1]
+                == self.num_heads_tp_cp * self.kv_lora_rank)
+
+        # [seq, num_heads, kv_lora_rank]
+        attn_out_latent = attn_out_latent.view(
+            [-1, self.num_heads_tp_cp, self.kv_lora_rank])
+
+        attn_output = output.view(
+            [num_tokens, self.num_heads_tp_cp, self.v_head_dim])
+
+        if self.v_b_proj.dtype == torch.bfloat16:
+            # [num_heads, seq, kv_lora_rank] x [num_heads, kv_lora_rank, v_head_dim]
+            # -> [num_heads, seq, v_head_dim]
+            torch.ops.trtllm.bmm_out(attn_out_latent.transpose(0, 1),
+                                     self.v_b_proj.transpose(1, 2),
+                                     attn_output.transpose(0, 1))
+        elif self.v_b_proj.dtype == torch.float8_e4m3fn:
+            fp8_block_scaling_bmm_out(
+                attn_out_latent,
+                self.v_b_proj,
+                self.v_b_proj_scale,
+                attn_output.transpose(0, 1),
+                self.v_b_proj_dequant,
+            )
+        else:
+            raise NotImplementedError(
+                f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")
+
+        return output
+
+    def forward_absorption_context(
+        self,
+        q: torch.Tensor,
+        compressed_kv: torch.Tensor,
+        k_pe: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        output: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        latent_cache: Optional[torch.Tensor] = None,
+        topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         num_tokens = q.shape[0]
         q_nope, q_pe = q.view([-1, self.num_heads_tp, self.qk_head_dim]).split(
@@ -1727,7 +1890,7 @@ class MLA(nn.Module):
         ])
 
         # Use generation_only for generation phase and context_only for context phase in DSA attention
-        attention_input_type = AttentionInputType.generation_only if is_generation else AttentionInputType.context_only
+        attention_input_type = AttentionInputType.context_only
         attn_out_latent = self._attn_forward_gen(
             self.mqa,
             fused_q,
@@ -1740,7 +1903,7 @@ class MLA(nn.Module):
             latent_cache=latent_cache,  # kvcache and k_pe
             q_pe=q_pe,  # used by `invokeMLARopeGeneration`
             topk_indices=topk_indices,  # used by DSA attention
-            is_generation=is_generation,  # used by DSA attention
+            is_generation=False,  # used by DSA attention
         )
         fused_q = None
 
