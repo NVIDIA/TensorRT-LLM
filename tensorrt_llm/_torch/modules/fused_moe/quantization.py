@@ -1892,6 +1892,7 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         if has_pre_quant_scale:
             from ..linear import TensorParallelMode, load_weight_shard
 
+            device = module.fc31_act_scale.device
             # Load fc31 (w3/w1) pre_quant_scales
             # All experts should have identical pre_quant_scale since they share the same input
             all_w3_pre_quant_scales = []
@@ -1902,13 +1903,13 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                     module.tp_size,
                     module.tp_rank,
                     TensorParallelMode.ROW,
-                    device='cuda')
+                    device=device)
                 w1_pre_quant_scale = load_weight_shard(
                     weights[f"{expert_id}.w1.pre_quant_scale"],
                     module.tp_size,
                     module.tp_rank,
                     TensorParallelMode.ROW,
-                    device='cuda')
+                    device=device)
                 all_w3_pre_quant_scales.append(w3_pre_quant_scale)
                 all_w1_pre_quant_scales.append(w1_pre_quant_scale)
 
