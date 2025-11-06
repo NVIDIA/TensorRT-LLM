@@ -21,7 +21,6 @@
 
 #include <atomic>
 #include <cstddef>
-#include <limits>
 #include <string>
 
 namespace tensorrt_llm::runtime
@@ -30,32 +29,32 @@ namespace tensorrt_llm::runtime
 class MemoryCounters
 {
 public:
-    using SizeType32 = std::size_t;
+    using SizeType = std::size_t;
     using DiffType = std::ptrdiff_t;
 
     MemoryCounters() = default;
 
-    [[nodiscard]] SizeType32 getGpu() const
+    [[nodiscard]] SizeType getGpu() const
     {
         return mGpu;
     }
 
-    [[nodiscard]] SizeType32 getCpu() const
+    [[nodiscard]] SizeType getCpu() const
     {
         return mCpu;
     }
 
-    [[nodiscard]] SizeType32 getPinned() const
+    [[nodiscard]] SizeType getPinned() const
     {
         return mPinned;
     }
 
-    [[nodiscard]] SizeType32 getUVM() const
+    [[nodiscard]] SizeType getUVM() const
     {
         return mUVM;
     }
 
-    [[nodiscard]] SizeType32 getPinnedPool() const
+    [[nodiscard]] SizeType getPinnedPool() const
     {
         return mPinnedPool;
     }
@@ -91,12 +90,8 @@ public:
     };
 
     template <MemoryType T>
-    void allocate(SizeType32 size)
+    void allocate(SizeType size)
     {
-        if (size > static_cast<SizeType32>(std::numeric_limits<DiffType>::max()))
-        {
-            TLLM_THROW("Memory size too large for diff type: %zu", size);
-        }
         auto const sizeDiff = static_cast<DiffType>(size);
         if constexpr (T == MemoryType::kGPU)
         {
@@ -129,15 +124,11 @@ public:
         }
     }
 
-    void allocate(MemoryType memoryType, SizeType32 size);
+    void allocate(MemoryType memoryType, SizeType size);
 
     template <MemoryType T>
-    void deallocate(SizeType32 size)
+    void deallocate(SizeType size)
     {
-        if (size > static_cast<SizeType32>(std::numeric_limits<DiffType>::max()))
-        {
-            TLLM_THROW("Memory size too large for diff type: %zu", size);
-        }
         auto const sizeDiff = -static_cast<DiffType>(size);
         if constexpr (T == MemoryType::kGPU)
         {
@@ -170,23 +161,18 @@ public:
         }
     }
 
-    void deallocate(MemoryType memoryType, SizeType32 size);
+    void deallocate(MemoryType memoryType, SizeType size);
 
     static MemoryCounters& getInstance();
 
-    MemoryCounters(MemoryCounters const&) = delete;
-    MemoryCounters& operator=(MemoryCounters const&) = delete;
-    MemoryCounters(MemoryCounters&&) = delete;
-    MemoryCounters& operator=(MemoryCounters&&) = delete;
-
-    static std::string bytesToString(SizeType32 bytes, int precision = 2);
+    static std::string bytesToString(SizeType bytes, int precision = 2);
 
     static std::string bytesToString(DiffType bytes, int precision = 2);
 
     [[nodiscard]] std::string toString() const;
 
 private:
-    std::atomic<SizeType32> mGpu{}, mCpu{}, mPinned{}, mUVM{}, mPinnedPool{};
+    std::atomic<SizeType> mGpu{}, mCpu{}, mPinned{}, mUVM{}, mPinnedPool{};
     std::atomic<DiffType> mGpuDiff{}, mCpuDiff{}, mPinnedDiff{}, mUVMDiff{}, mPinnedPoolDiff{};
 };
 
