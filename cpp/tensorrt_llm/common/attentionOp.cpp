@@ -201,6 +201,7 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     // Medusa mode will have multiple query tokens.
     xqaParams.multi_query_tokens = mIsSpecDecodingEnabled && mUseSpecDecoding;
     xqaParams.is_spec_dec_tree = mIsSpecDecTree;
+    xqaParams.layer_idx = generationsParams.layer_idx;
 
     if (mKVCacheQuantMode.hasInt8KvCache())
     {
@@ -278,6 +279,9 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     xqaParams.spec_decoding_is_generation_length_variable
         = generationsParams.spec_decoding_is_generation_length_variable;
     xqaParams.spec_decoding_max_generation_length = generationsParams.spec_decoding_max_generation_length;
+    xqaParams.spec_decoding_bl_tree_mask_offset = generationsParams.spec_decoding_bl_tree_mask_offset;
+    xqaParams.spec_decoding_bl_tree_mask = generationsParams.spec_decoding_bl_tree_mask;
+    xqaParams.spec_bl_tree_first_sparse_mask_offset_kv = generationsParams.spec_bl_tree_first_sparse_mask_offset_kv;
     xqaParams.mrope_position_deltas = generationsParams.mrope_position_deltas;
 
     xqaParams.logn_scaling_ptr = generationsParams.logn_scaling_ptr;
@@ -2284,6 +2288,7 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
         // self attn
         XQAParams xqaParams{};
         this->template convertMMHAParamsToXQAParams<T, KVCacheBuffer>(xqaParams, params, /*forConfigurePlugin=*/false);
+
         if (mEnableXQA && mXqaDispatcher->shouldUse(xqaParams))
         {
             TLLM_LOG_DEBUG("XQA kernels are selected in the generation phase.");
@@ -2908,11 +2913,12 @@ int AttentionOp::initialize() noexcept
         {
             fixedParams.outputDataType = DATA_TYPE_E4M3;
         }
-        if (mIsSpecDecodingEnabled)
+        if (mIsSpecDecodingEnabled && !mUseTllmGen)
         {
             fixedParams.outputDataType = DATA_TYPE_E4M3;
             TLLM_CHECK_WITH_INFO(mNumHeads % mNumKVHeads == 0, "mNumHeads should be multiples of mNumKVHeads.");
         }
+
         fixedParams.numQHeads = mNumAttnHeads;
         fixedParams.numKvHeads = mNumAttnKVHeads;
         fixedParams.numTokensPerBlock = mTokensPerBlock;

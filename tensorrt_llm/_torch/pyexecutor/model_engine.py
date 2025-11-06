@@ -908,6 +908,11 @@ class PyTorchModelEngine(ModelEngine):
                 self.attn_runtime_features.cache_reuse
                 or self.attn_runtime_features.chunked_prefill)
         cache_indirection = self.cache_indirection_attention if self.attn_backend.Metadata is TrtllmAttentionMetadata else None
+        if self.model.model_config.pretrained_config.num_attention_heads is not None:
+            if self.model.model_config.pretrained_config.num_key_value_heads is not None:
+                num_heads_per_kv = self.model.model_config.pretrained_config.num_attention_heads // self.model.model_config.pretrained_config.num_key_value_heads
+            else:
+                num_heads_per_kv = 1
         if kv_cache_manager is None:
             return self.attn_backend.Metadata(
                 max_num_requests=self.batch_size,
@@ -920,7 +925,8 @@ class PyTorchModelEngine(ModelEngine):
                 enable_context_mla_with_cached_kv=
                 enable_context_mla_with_cached_kv,
                 cache_indirection=cache_indirection,
-                sparse_attention_config=self.sparse_attention_config)
+                sparse_attention_config=self.sparse_attention_config,
+                num_heads_per_kv=num_heads_per_kv)
 
         if self.attn_metadata is not None:
             # This assertion can be relaxed if needed: just create a new metadata
@@ -938,7 +944,9 @@ class PyTorchModelEngine(ModelEngine):
             enable_flash_mla=self.model.model_config.enable_flash_mla,
             enable_context_mla_with_cached_kv=enable_context_mla_with_cached_kv,
             cache_indirection=cache_indirection,
-            sparse_attention_config=self.sparse_attention_config)
+            sparse_attention_config=self.sparse_attention_config,
+            num_heads_per_kv=num_heads_per_kv,
+        )
 
         return self.attn_metadata
 

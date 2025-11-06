@@ -29,7 +29,10 @@
 #include "fmhaReduction.h"
 #include "fmhaRunnerParams.h"
 #include "kernelParams.h"
+#include "prepareCustomMask.h"
+#include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
+#include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 
 namespace tc = tensorrt_llm::common;
 
@@ -203,6 +206,11 @@ public:
             {
                 selectKernelIter++;
                 continue;
+            }
+            // Prepare custom mask for spec-decoding generation kernels.
+            if (params.layer_idx == 0 && params.is_spec_dec_tree)
+            {
+                runPrepareCustomMask(kernelMeta, params, params.stream);
             }
 
             // Prepare the kernel parameters.
@@ -518,9 +526,24 @@ private:
         }
         else if (isGenerationKernel(params.mKernelType))
         {
-            kernelType = (params.mNumHeadsQPerKv <= 16 && params.mHeadDimQk != 32)
-                ? FmhaKernelType::SwapsMmaAbForGeneration
-                : FmhaKernelType::KeepsMmaAbForGeneration;
+            if (params.is_spec_dec_tree)
+            {
+
+                if (params.mNumHeadsQPerKv <= 16 && (params.mHeadDimQk == 64 || params.mHeadDimQk == 128))
+                {
+                    kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
+                }
+                else
+                {
+                    kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
+                }
+            }
+            else
+            {
+                kernelType = (params.mNumHeadsQPerKv <= 16 && params.mHeadDimQk != 32)
+                    ? FmhaKernelType::SwapsMmaAbForGeneration
+                    : FmhaKernelType::KeepsMmaAbForGeneration;
+            }
         }
 
         // The maximum number of headsQPerKv that the kernel can support in one Cta.
@@ -538,6 +561,10 @@ private:
         {
             // Use the maxNumHeadsQPerKvInCta (tileSizeQ) = 64 for MLA high-throughput generation kernels.
             maxNumHeadsQPerKvInCta = isMlaGenKernel(params) ? 64 : 32;
+            if (params.is_spec_dec_tree)
+            {
+                maxNumHeadsQPerKvInCta = 128;
+            }
             TLLM_CHECK_WITH_INFO((params.mNumHeadsQPerKv < maxNumHeadsQPerKvInCta
                                      || params.mNumHeadsQPerKv % maxNumHeadsQPerKvInCta == 0),
                 "Not supported");

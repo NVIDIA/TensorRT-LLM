@@ -207,12 +207,14 @@ struct TllmGenFmhaRunnerParams
     void const* qkvPtr;
     // The attention sinks pointer (additional value per head in the denominator of the softmax).
     float const* attentionSinksPtr;
+    // The general packed custom mask ptr which does not meet specific format for trtllm gen kernels.
+    int32_t const* generalPackedCustoMaskPtr;
     // The custom mask ptr.
-    uint32_t const* customMaskPtr;
+    uint32_t* customMaskPtr;
     // The packed custom mask's offsets of each sequence.
-    int64_t const* customMaskOffsetsPtr;
+    int64_t* customMaskOffsetsPtr;
     // The first sparseMask offsets in the Kv sequence dimension.
-    int32_t const* firstSparseMaskOffsetsKvPtr;
+    int32_t* firstSparseMaskOffsetsKvPtr;
     // The counter for the multiCtasKv mode.
     int32_t* multiCtasKvCounterPtr;
     // The sequence length buffer for K/V.
@@ -240,6 +242,8 @@ struct TllmGenFmhaRunnerParams
     void* oPtr;
     // The output scaling factor buffer.
     void* oSfPtr;
+    // The spec-decoding generation lengths.
+    int const* spec_decoding_generation_lengths;
 
     // Head dimension for Q and K.
     int mHeadDimQk;
@@ -284,6 +288,10 @@ struct TllmGenFmhaRunnerParams
     int mSparseMlaTopK;
     // The cuda stream.
     cudaStream_t stream;
+    // The layer index.
+    int32_t layer_idx = 0;
+    // Whether the spec-dec tree is used.
+    bool is_spec_dec_tree = false;
 
     // set the attention mask type
     TllmGenFmhaRunnerParams& setAttentionMaskType(std::int8_t maskType)

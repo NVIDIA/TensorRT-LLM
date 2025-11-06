@@ -259,11 +259,6 @@ bool XqaDispatcher::isSupported()
             TLLM_LOG_WARNING("Unsupported data type combination.");
             return false;
         }
-        if (mFixedParams.isSpecDecoding)
-        {
-            TLLM_LOG_WARNING("TRTLLM-GEN does not support Speculative decoding.");
-            return false;
-        }
         if (mFixedParams.hasAlibi)
         {
             TLLM_LOG_WARNING("TRTLLM-GEN does not support ALiBi.");
@@ -274,7 +269,15 @@ bool XqaDispatcher::isSupported()
         TllmGenFmhaRunnerParams tllmRunnerParams;
         memset(&tllmRunnerParams, 0, sizeof(tllmRunnerParams));
         tllmRunnerParams.mQkvLayout = mFixedParams.isPagedKv ? QkvLayout::PagedKv : QkvLayout::ContiguousKv;
-        tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
+        if (mFixedParams.isSpecDecoding)
+        {
+            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Custom;
+        }
+        else
+        {
+            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
+        }
+        tllmRunnerParams.is_spec_dec_tree = mFixedParams.isSpecDecoding;
         tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
         tllmRunnerParams.mTileScheduler = TileScheduler::Static;
         tllmRunnerParams.mMultiCtasKvMode = true;
@@ -292,6 +295,7 @@ bool XqaDispatcher::isSupported()
 
         // Check if it is supported or not.
         auto [isSupported, info] = mTllmGenFMHARunner->isSupportedWithInfo(tllmRunnerParams);
+
         if (!isSupported)
         {
             TLLM_LOG_WARNING("TRTLLLM-Gen kernels are not selected: " + info);
@@ -398,7 +402,6 @@ void XqaDispatcher::runImpl(
         memset(&tllmRunnerParams, 0, sizeof(tllmRunnerParams));
 
         // Parameters to select kernels.
-        tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
         tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
         tllmRunnerParams.mMultiCtasKvMode = params.multi_block_mode;
         // Note that the tileScheduler and multiCtasKvMode will be automatically tuned when using multi_block mode.
@@ -486,7 +489,21 @@ void XqaDispatcher::runImpl(
         tllmRunnerParams.mMultiProcessorCount = mMultiProcessorCount;
         tllmRunnerParams.stream = params.stream;
         tllmRunnerParams.mSfStartTokenIdx = params.start_token_idx_sf;
-
+        tllmRunnerParams.is_spec_dec_tree = params.is_spec_dec_tree && params.multi_query_tokens;
+        if (tllmRunnerParams.is_spec_dec_tree)
+        {
+            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Custom;
+        }
+        else
+        {
+            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
+        }
+        tllmRunnerParams.layer_idx = params.layer_idx;
+        tllmRunnerParams.spec_decoding_generation_lengths = params.spec_decoding_generation_lengths;
+        tllmRunnerParams.generalPackedCustoMaskPtr = params.spec_decoding_packed_mask;
+        tllmRunnerParams.customMaskPtr = params.spec_decoding_bl_tree_mask;
+        tllmRunnerParams.customMaskOffsetsPtr = params.spec_decoding_bl_tree_mask_offset;
+        tllmRunnerParams.firstSparseMaskOffsetsKvPtr = params.spec_bl_tree_first_sparse_mask_offset_kv;
         mTllmGenFMHARunner->run(tllmRunnerParams);
     }
     else
