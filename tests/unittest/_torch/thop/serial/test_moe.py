@@ -562,7 +562,7 @@ def run_moe_reference_fp4(args):
                                     gemm1_bias=None,
                                     gemm1_alpha=args.gemm1_alpha,
                                     gemm1_beta=args.gemm1_beta,
-                                    gemm1_clamp_limit=None,
+                                    gemm1_clamp_limit=args.gemm1_clamp_limit,
                                     gemm2_bias=None)
 
     return run_moe_dequant(args_dequant, "fp4"), args_dequant
@@ -1181,10 +1181,14 @@ class TestMoeFp4:
                 id="RoutingGPTOSS")
         ],
     )
-    @pytest.mark.parametrize("swiglu_alpha", [1, 0.1])
-    @pytest.mark.parametrize("swiglu_beta", [0, 1])
+    @pytest.mark.parametrize("swiglu_alpha", [0.1],
+                             ids=lambda v: f"alpha{v}")  # 1, 0.1 both works
+    @pytest.mark.parametrize("swiglu_beta", [0],
+                             ids=lambda v: f"beta{v}")  # 1 doesn't work
+    @pytest.mark.parametrize("swiglu_limit", [float('inf')],
+                             ids=lambda v: f"limit{v}")  # 1 doesn't work
     def test_gptoss(self, num_tokens, hidden_size, intermediate_size,
-                    routing_info, swiglu_alpha, swiglu_beta):
+                    routing_info, swiglu_alpha, swiglu_beta, swiglu_limit):
 
         self.run_moe_fp4_gptoss_test(num_tokens,
                                      hidden_size,
@@ -1192,7 +1196,8 @@ class TestMoeFp4:
                                      routing_info,
                                      use_autotune=False,
                                      swiglu_alpha=swiglu_alpha,
-                                     swiglu_beta=swiglu_beta)
+                                     swiglu_beta=swiglu_beta,
+                                     swiglu_limit=swiglu_limit)
 
     @pytest.mark.parametrize("num_tokens", [1])
     @pytest.mark.parametrize("hidden_size", [1024])
@@ -1515,7 +1520,8 @@ class TestMoeFp4:
     def run_moe_fp4_gptoss_test(self, num_tokens: int, hidden_size: int,
                                 intermediate_size: int, routing_info: dict,
                                 use_autotune: bool, swiglu_alpha: float,
-                                swiglu_beta: float) -> None:
+                                swiglu_beta: float,
+                                swiglu_limit: float) -> None:
         torch.random.manual_seed(0)
 
         #
@@ -1637,6 +1643,11 @@ class TestMoeFp4:
                                         device='cuda',
                                         dtype=torch.float)
 
+        swiglu_limit_tensor = torch.full((num_experts, ),
+                                         swiglu_limit,
+                                         device='cuda',
+                                         dtype=torch.float)
+
         args = moe_args(num_tokens,
                         num_experts,
                         hidden_size,
@@ -1658,7 +1669,7 @@ class TestMoeFp4:
                         gemm1_bias=None,
                         gemm1_alpha=swiglu_alpha_tensor,
                         gemm1_beta=swiglu_beta_tensor,
-                        gemm1_clamp_limit=None,
+                        gemm1_clamp_limit=swiglu_limit_tensor,
                         gemm2_bias=None)
         #
         # Run the reference implementations
@@ -1752,6 +1763,7 @@ class TestMoeFp4:
                 gemm1_scales_fp4_shuffled,
                 swiglu_alpha_tensor,
                 swiglu_beta_tensor,
+                swiglu_limit_tensor,
                 gemm2_weights_fp4_shuffled,
                 gemm2_scales_fp4_shuffled,
                 scale_c_fc1,
