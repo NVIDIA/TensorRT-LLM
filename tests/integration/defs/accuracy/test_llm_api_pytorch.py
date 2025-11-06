@@ -2409,7 +2409,7 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
 
         if fp8kv:
             if get_sm_version() < 100:
-                pytest.skip("FP8 is not supported on pre-Blackwell architectures")
+                pytest.skip("FP8 KV cache is not supported on pre-Blackwell architectures")
             kv_cache_config.dtype = "fp8"
 
         mtp_config = None
