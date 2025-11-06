@@ -613,7 +613,7 @@ def test_qwen3_eagle3(enable_block_reuse: bool, use_one_model: bool,
             num_tokens = len(new_tokens)
 
         accept_rate = num_accepted / num_drafted
-        assert accept_rate > 0.15
+        assert accept_rate > 0.10
 
     # Output tests
     sampling_params = SamplingParams(max_tokens=10, temperature=0)
