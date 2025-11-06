@@ -430,10 +430,10 @@ class WideEPMoE(MoE):
 
         if self.layer_load_balancer:
             self._load_balancer_done_wait_gpu_stage(is_first_call)
-            use_mnnvl = use_all_to_all and self.alltoall_method_type == AlltoallMethodType.MNNVL
+            ignore_allreduce = self.enable_alltoall and self.alltoall_method_type == AlltoallMethodType.MNNVL and self.moe_alltoall_backend == "mnnvllatency"
             self._load_balancer_update_statistic(token_selected_experts,
                                                  is_first_call, is_last_call,
-                                                 use_mnnvl)
+                                                 ignore_allreduce)
             token_selected_slots = self._load_balancer_route(
                 token_selected_experts, self.use_dp)
         else:

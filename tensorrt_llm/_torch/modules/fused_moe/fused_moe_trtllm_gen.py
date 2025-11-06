@@ -341,6 +341,8 @@ class TRTLLMGenFusedMoE(MoE):
         x_col = x.shape[1]
         token_count = x.shape[0]
         alltoall_info = None
+        is_first_call = self.repeat_idx == 0
+        is_last_call = self.repeat_idx == self.repeat_count - 1
 
         if post_quant_comm:
             token_selected_experts, token_final_scales = self.routing_method.apply(
@@ -352,18 +354,17 @@ class TRTLLMGenFusedMoE(MoE):
             # Apply load balancer routing if available
             if self.layer_load_balancer:
                 # Determine if this is first/last call (TRTLLMGenFusedMoE doesn't use chunking)
-                is_first_call = self.repeat_idx == 0
-                is_last_call = self.repeat_idx == self.repeat_count - 1
 
                 # Start GPU stage for first call
                 self._load_balancer_start_wait_gpu_stage(is_first_call)
                 self._load_balancer_done_wait_gpu_stage(is_first_call)
 
-                # Update load balancer statistics (TRTLLMGenFusedMoE doesn't use MNNVL)
-                self._load_balancer_update_statistic(token_selected_experts,
-                                                     is_first_call,
-                                                     is_last_call,
-                                                     use_mnnvl=False)
+                ignore_allreduce = self.enable_alltoall and self.alltoall_method_type == AlltoallMethodType.MNNVL and self.moe_alltoall_backend == "mnnvllatency"
+                self._load_balancer_update_statistic(
+                    token_selected_experts,
+                    is_first_call,
+                    is_last_call,
+                    ignore_allreduce=ignore_allreduce)
 
                 # Route tokens to slots
                 token_selected_slots = self._load_balancer_route(
@@ -393,9 +394,14 @@ class TRTLLMGenFusedMoE(MoE):
 
             if self.moe_alltoall_backend == "mnnvllatency":
                 assert self.alltoall_prepare_workspace is not None, "alltoall_prepare_workspace should be initialized"
-                alltoall_info, _ = MnnvlMoe.mnnvl_moe_alltoallv_prepare_without_allgather(
+                if is_last_call:
+                    loadbalancer_local_statistic_info = self._load_balancer_get_local_statistic_tensor(
+                    )
+                else:
+                    loadbalancer_local_statistic_info = None
+                alltoall_info, gathered_loadbalancer_local_statistic_info = MnnvlMoe.mnnvl_moe_alltoallv_prepare_without_allgather(
                     token_selected_experts,
-                    None,
+                    loadbalancer_local_statistic_info,
                     self.alltoall_prepare_workspace,
                     runtime_max_tokens_per_rank,
                     self.ep_rank,
@@ -404,6 +410,11 @@ class TRTLLMGenFusedMoE(MoE):
                     self.num_slots,
                     top_k,
                 )
+                if gathered_loadbalancer_local_statistic_info is not None:
+                    gathered_loadbalancer_local_statistic_info = gathered_loadbalancer_local_statistic_info.view(
+                        (self.mapping.moe_ep_size, self.num_experts))
+                    self._load_balancer_update_statistic_with_gathered_statistic(
+                        gathered_loadbalancer_local_statistic_info)
 
                 if x_sf is not None:
                     x_sf = x_sf.view(x_row,

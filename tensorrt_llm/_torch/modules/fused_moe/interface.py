@@ -328,10 +328,18 @@ class MoE(nn.Module):
                                         token_selected_experts: torch.Tensor,
                                         is_first_call: bool,
                                         is_last_call: bool,
-                                        use_mnnvl: bool = False):
-        """Update load balancer statistics."""
+                                        ignore_allreduce: bool = False):
+        """
+        Update load balancer statistics.
+
+        Args:
+            token_selected_experts: The selected experts of all tokens, has shape of [tokenCount * topK]
+            is_first_call: Whether this is the first call for the same weights
+            is_last_call: Whether this is the last call for the same weights
+            ignore_allreduce: Whether to ignore allreduce, if True, only update local statistics, need call _load_balancer_get_local_statistic_tensor to get the local statistic tensor and then do external allgather and then call _load_balancer_update_statistic_with_gathered_statistic to update the global statistics. MnnvlLatency supports this.
+        """
         if self.layer_load_balancer:
-            if use_mnnvl:
+            if ignore_allreduce:
                 self.layer_load_balancer.update_local_statistic(
                     token_selected_experts,
                     is_first_stage=is_first_call,
