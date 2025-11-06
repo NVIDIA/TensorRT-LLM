@@ -529,7 +529,7 @@ public:
             gemm2_weights_scale, gemm2_bias, std::nullopt, std::nullopt, std::nullopt, num_experts, top_k, n_group,
             topk_group, intermediate_size, std::nullopt, local_expert_offset, local_num_experts, routed_scaling_factor,
             tileN, routing_method_type, mDtypeAct, *mRunners[tileN], config, topk_weights, topk_ids,
-            /*output=*/torch::nullopt); // TODO: Support user-provided output
+            /*out_tensor=*/torch::nullopt); // TODO: Support user-provided output
     }
 
 private:
