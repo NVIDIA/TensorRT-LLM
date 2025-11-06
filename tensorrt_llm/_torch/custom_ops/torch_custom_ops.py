@@ -761,10 +761,28 @@ class CuteDSLNVFP4Wrapper(TunableRunner):
         # CuteDSL only needs first 4 inputs (alpha is already in the runner)
         act_fp4, weight, act_sf, weight_scale, alpha = inputs
 
+        # Lazy initialization: AutoTuner skips get_valid_tactics on cache hits,
+        # so we need to initialize inner_runner here if it's still None
         if self.inner_runner is None:
-            raise RuntimeError(
-                "CuteDSL runner not initialized. This should not happen if get_valid_tactics was called."
-            )
+            # Validate inputs before initialization
+            if not self._validate_cutedsl_inputs(act_fp4, weight, act_sf,
+                                                 weight_scale):
+                raise ValueError(
+                    "CuteDSL backend has no valid tactics for these inputs. "
+                    "This may be due to:\n"
+                    "  - Unsupported matrix dimensions\n"
+                    "  - Invalid scale tensor shapes\n"
+                    "  - SM version mismatch\n"
+                    "Consider using backend='auto' to fall back to other backends."
+                )
+
+            # Initialize inner runner with alpha value
+            alpha_float = alpha.item() if isinstance(
+                alpha, torch.Tensor) else float(alpha)
+            self._alpha_cache = alpha_float
+            self.inner_runner = CuteDSLNVFP4BlackwellLinear(
+                alpha_float, self.output_dtype)
+            logger.debug("CuteDSL runner lazily initialized in forward()")
 
         # CuteDSL requires 1D scale tensors. If they're 2D, flatten them.
         if act_sf.dim() == 2:
