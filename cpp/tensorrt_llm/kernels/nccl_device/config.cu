@@ -498,26 +498,47 @@ void LaunchConfig::launchRMSNorm(ncclWindow_t inWindow, ncclWindow_t outWindow, 
 bool LaunchConfig::supportsMultimem() const
 {
     nvinfer1::DataType dataType = this->getDataType();
+    bool isValid = this->getValid();
+
+    TLLM_LOG_DEBUG("supportsMultimem() called: dataType=%d, nRanks=%d, valid=%d", static_cast<int>(dataType),
+        this->nRanks, isValid);
+
 #ifdef ARCH_HAS_MULTIMEM
+    TLLM_LOG_DEBUG("  ARCH_HAS_MULTIMEM is defined");
+
     if (this->nRanks <= 2)
+    {
+        TLLM_LOG_DEBUG("  Returning FALSE: nRanks=%d <= 2 (requires > 2)", this->nRanks);
         return false; // Current NCCL requires at least 3 ranks for multimem support
+    }
+    TLLM_LOG_DEBUG("  nRanks check passed: %d > 2", this->nRanks);
 
     // Basic types are always supported on SM90+
     switch (dataType)
     {
     case nvinfer1::DataType::kFLOAT: // float
     {
+        TLLM_LOG_DEBUG("  DataType is FLOAT, checking getValid()=%d", isValid);
         return this->getValid();
     }
     // Half and BFloat16 with .acc::f32 qualifier (SM90+)
 #ifdef ARCH_HAS_MULTIMEM_ACC_F32
     case nvinfer1::DataType::kHALF: // half
     {
+        TLLM_LOG_DEBUG("  DataType is HALF, ARCH_HAS_MULTIMEM_ACC_F32 defined, checking getValid()=%d", isValid);
         return this->getValid();
     }
     case nvinfer1::DataType::kBF16: // __nv_bfloat16
     {
+        TLLM_LOG_DEBUG("  DataType is BF16, ARCH_HAS_MULTIMEM_ACC_F32 defined, checking getValid()=%d", isValid);
         return this->getValid();
+    }
+#else
+    case nvinfer1::DataType::kHALF: // half
+    case nvinfer1::DataType::kBF16: // __nv_bfloat16
+    {
+        TLLM_LOG_DEBUG("  DataType is HALF/BF16 but ARCH_HAS_MULTIMEM_ACC_F32 NOT defined, returning FALSE");
+        return false;
     }
 #endif // ARCH_HAS_MULTIMEM_ACC_F32
 
@@ -525,12 +546,24 @@ bool LaunchConfig::supportsMultimem() const
 #ifdef ARCH_HAS_MULTIMEM_FP8
     case nvinfer1::DataType::kFP8: // FP8 (either E5M2 or E4M3)
     {
+        TLLM_LOG_DEBUG("  DataType is FP8, ARCH_HAS_MULTIMEM_FP8 defined, checking getValid()=%d", isValid);
         return this->getValid();
     }
-#endif // ARCH_HAS_MULTIMEM_FP8
+#else
+    case nvinfer1::DataType::kFP8:
+    {
+        TLLM_LOG_DEBUG("  DataType is FP8 but ARCH_HAS_MULTIMEM_FP8 NOT defined, returning FALSE");
+        return false;
     }
-#endif // ARCH_HAS_MULTIMEM
+#endif // ARCH_HAS_MULTIMEM_FP8
+    default:
+        TLLM_LOG_DEBUG("  DataType %d not supported for multimem, returning FALSE", static_cast<int>(dataType));
+        return false;
+    }
+#else
+    TLLM_LOG_DEBUG("  ARCH_HAS_MULTIMEM NOT defined, returning FALSE");
     return false;
+#endif // ARCH_HAS_MULTIMEM
 }
 
 } // namespace tensorrt_llm::kernels::nccl_device

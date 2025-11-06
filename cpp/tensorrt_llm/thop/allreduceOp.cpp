@@ -549,12 +549,35 @@ private:
                     "[RANK 0] NCCL_DEVICE: hidden_size=%d, num_tokens=%d, nRanks=%d", hidden_size, num_tokens, nRanks);
             }
             // Get cached launch config from NCCLUserBufferAllocator
+            if (myRank == 0)
+            {
+                TLLM_LOG_INFO(
+                    "[RANK 0] Getting cached NCCL device launch config with: dtype=%d, hidden_size=%d, num_tokens=%d, "
+                    "nRanks=%d",
+                    static_cast<int>(mType), hidden_size, num_tokens, nRanks);
+            }
             std::shared_ptr<tensorrt_llm::kernels::nccl_device::LaunchConfig> launchConfig
                 = nccl_ub_allocator.getCachedNCCLDeviceLaunchConfig(
                     mType, hidden_size, num_tokens, myRank, nRanks, true, false);
 
             // Check if multimem is supported for this data type
-            if (launchConfig->supportsMultimem())
+            bool multimemSupported = launchConfig->supportsMultimem();
+            if (myRank == 0)
+            {
+                TLLM_LOG_INFO("[RANK 0] NCCL_DEVICE: Checking multimem support...");
+                TLLM_LOG_INFO("[RANK 0] NCCL_DEVICE: - supportsMultimem() = %s", multimemSupported ? "TRUE" : "FALSE");
+                TLLM_LOG_INFO("[RANK 0] NCCL_DEVICE: - nRanks = %d", nRanks);
+                TLLM_LOG_INFO(
+                    "[RANK 0] NCCL_DEVICE: - dataType = %d (0=FLOAT, 1=HALF, 7=BF16, 9=FP8)", static_cast<int>(mType));
+                TLLM_LOG_INFO("[RANK 0] NCCL_DEVICE: - hidden_size = %d, num_tokens = %d", hidden_size, num_tokens);
+                if (!multimemSupported && nRanks <= 2)
+                {
+                    TLLM_LOG_WARNING(
+                        "[RANK 0] NCCL_DEVICE: *** MULTIMEM NOT SUPPORTED: nRanks=%d but requires nRanks > 2 ***",
+                        nRanks);
+                }
+            }
+            if (multimemSupported)
             {
                 if (myRank == 0)
                 {
@@ -580,6 +603,23 @@ private:
                 return {norm_out, residual_out};
             }
             // Fall back to old strategy with warning
+            if (myRank == 0)
+            {
+                if (nRanks <= 2)
+                {
+                    TLLM_LOG_WARNING(
+                        "[RANK 0] NCCL device Fused AR NOT SUPPORTED: nRanks=%d but multimem requires nRanks > 2. "
+                        "Falling back to standard allreduce + separate RMSNorm.",
+                        nRanks);
+                }
+                else
+                {
+                    TLLM_LOG_WARNING(
+                        "[RANK 0] NCCL device Fused AR not supported for data type %d, hidden size %d & %d nRanks. "
+                        "Falling back to standard allreduce + separate RMSNorm.",
+                        static_cast<int>(mType), hidden_size, nRanks);
+                }
+            }
             TLLM_LOG_WARNING(
                 "NCCL device Fused AR not supported for data type %d, hidden size %d & %d nRanks on current "
                 "architecture. Falling back to standard allreduce + separate RMSNorm.",
