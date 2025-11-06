@@ -99,6 +99,8 @@ def launch_disaggregated_llm(
 
     args = LlmArgs.from_kwargs(model=model_name,
                                tensor_parallel_size=tensor_parallel_size)
+    if "FP4" in model_name:
+        args.quant_config.quant_algo = "NVFP4"
 
     trtllm_serve_path = "trtllm-serve"
     # Common arguments for both servers

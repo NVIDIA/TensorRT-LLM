@@ -252,7 +252,6 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
             }
             else
             {
-
                 // If cacheIdx< bufferCoverTargetNum, the ouputSplitCaches.at(cacheIdx) is allocated by cudaMallocAsync,
                 // which is unable to be transferred by UCX GPU-direct RDMA. We need copy the data to pre-allocated
                 // cudaMalloc buffer,and then start send.

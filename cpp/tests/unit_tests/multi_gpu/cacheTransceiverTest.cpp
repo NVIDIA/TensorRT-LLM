@@ -193,7 +193,7 @@ protected:
         auto constexpr sizePerHead = 64;
         auto constexpr hiddenSize = numHeads * sizePerHead;
         auto constexpr tokensPerBlock = 8;
-        auto constexpr maxBlocksPerSeq = 10;
+        auto constexpr maxBlocksPerSeq = 100;
         auto constexpr maxBeamWidth = 4;
         auto constexpr sinkTokenLength = 0;
         mMaxNumSequences = 8;

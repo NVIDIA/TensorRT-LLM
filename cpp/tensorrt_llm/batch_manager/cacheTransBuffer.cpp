@@ -222,7 +222,7 @@ CacheTransBufferManager::CacheTransBufferManager(
             auto poolIdx = mCacheManager->getBlockManager().getLayerPoolIdx(layerId);
             auto windowSize = static_cast<size_t>(mCacheManager->getBlockManager().getPoolWindowSize(poolIdx));
             auto alignedWindowSize = (windowSize + tokensPerBlock - 1) / tokensPerBlock * tokensPerBlock;
-            auto validTokenNum = (alignedWindowSize > maxNumTokens.value() ? alignedWindowSize : maxNumTokens.value());
+            auto validTokenNum = (alignedWindowSize < maxNumTokens.value() ? alignedWindowSize : maxNumTokens.value());
             if (common::getEnvKVCacheTransferAllBlocksForWindow())
             {
                 validTokenNum = maxNumTokens.value();
