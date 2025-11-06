@@ -27,7 +27,7 @@ from defs.trt_test_alternative import check_call
 # Utility functions for disaggregated tests
 def cleanup_output_files():
     """Clean up output files from previous runs."""
-    for file in ['output.json', 'output_streaming.json']:
+    for file in ["output.json", "output_streaming.json"]:
         try:
             os.remove(file)
         except FileNotFoundError:
@@ -43,16 +43,15 @@ def get_disagg_server_url_from_cfg(config_file: str) -> str:
     Returns:
         Server URL in format "http://hostname:port"
     """
-    with open(config_file, 'r') as file:
+    with open(config_file, "r") as file:
         config = yaml.safe_load(file)
-    server_host = config.get('hostname', 'localhost')
-    server_port = config.get('port', 8000)
+    server_host = config.get("hostname", "localhost")
+    server_port = config.get("port", 8000)
     return f"http://{server_host}:{server_port}"
 
 
 def validate_timing_metrics(perf_metrics_item, request_context=""):
-    """
-    Helper function to validate timing metrics relationships.
+    """Helper function to validate timing metrics relationships.
 
     Args:
         perf_metrics_item: A single performance metrics item from the /perf_metrics endpoint
@@ -60,76 +59,94 @@ def validate_timing_metrics(perf_metrics_item, request_context=""):
     """
     # Validate basic structure
     required_keys = [
-        "ctx_server", "gen_server", "ctx_perf_metrics", "gen_perf_metrics",
-        "disagg_server_arrival_time", "disagg_server_first_token_time"
+        "ctx_server",
+        "gen_server",
+        "ctx_perf_metrics",
+        "gen_perf_metrics",
+        "disagg_server_arrival_time",
+        "disagg_server_first_token_time",
     ]
     for key in required_keys:
         assert key in perf_metrics_item, f"Missing key: {key} in {request_context}"
 
-    assert perf_metrics_item["ctx_perf_metrics"][
-        "ctx_request_id"] == perf_metrics_item["gen_perf_metrics"][
-            "ctx_request_id"]
+    assert (
+        perf_metrics_item["ctx_perf_metrics"]["ctx_request_id"]
+        == perf_metrics_item["gen_perf_metrics"]["ctx_request_id"]
+    )
 
     # Extract timing metrics
-    ctx_metrics = perf_metrics_item["ctx_perf_metrics"]["perf_metrics"][
-        "timing_metrics"]
-    gen_metrics = perf_metrics_item["gen_perf_metrics"]["perf_metrics"][
-        "timing_metrics"]
+    ctx_metrics = perf_metrics_item["ctx_perf_metrics"]["perf_metrics"]["timing_metrics"]
+    gen_metrics = perf_metrics_item["gen_perf_metrics"]["perf_metrics"]["timing_metrics"]
     disagg_arrival = perf_metrics_item["disagg_server_arrival_time"]
     disagg_first_token = perf_metrics_item["disagg_server_first_token_time"]
 
     # Validate disaggregated server timing metrics
     assert disagg_arrival is not None, f"disagg_server_arrival_time is None in {request_context}"
-    assert disagg_first_token is not None, f"disagg_server_first_token_time is None in {request_context}"
-    assert isinstance(
-        disagg_arrival,
-        (int, float
-         )), f"disagg_server_arrival_time is not numeric in {request_context}"
-    assert isinstance(
-        disagg_first_token, (int, float)
-    ), f"disagg_server_first_token_time is not numeric in {request_context}"
+    assert disagg_first_token is not None, (
+        f"disagg_server_first_token_time is None in {request_context}"
+    )
+    assert isinstance(disagg_arrival, (int, float)), (
+        f"disagg_server_arrival_time is not numeric in {request_context}"
+    )
+    assert isinstance(disagg_first_token, (int, float)), (
+        f"disagg_server_first_token_time is not numeric in {request_context}"
+    )
     assert disagg_arrival > 0, f"disagg_server_arrival_time is not positive in {request_context}"
-    assert disagg_first_token > 0, f"disagg_server_first_token_time is not positive in {request_context}"
-    assert disagg_arrival <= disagg_first_token, f"disagg_server_arrival_time > disagg_server_first_token_time in {request_context}"
+    assert disagg_first_token > 0, (
+        f"disagg_server_first_token_time is not positive in {request_context}"
+    )
+    assert disagg_arrival <= disagg_first_token, (
+        f"disagg_server_arrival_time > disagg_server_first_token_time in {request_context}"
+    )
 
     # Validate server-level timing metrics for context server
     ctx_server_arrival = ctx_metrics.get("server_arrival_time")
     ctx_server_first_token = ctx_metrics.get("server_first_token_time")
     assert ctx_server_arrival is not None, f"ctx server_arrival_time is None in {request_context}"
-    assert ctx_server_first_token is not None, f"ctx server_first_token_time is None in {request_context}"
-    assert isinstance(
-        ctx_server_arrival,
-        (int,
-         float)), f"ctx server_arrival_time is not numeric in {request_context}"
-    assert isinstance(
-        ctx_server_first_token,
-        (int, float
-         )), f"ctx server_first_token_time is not numeric in {request_context}"
-    assert ctx_server_arrival <= ctx_server_first_token, f"ctx server_arrival_time > server_first_token_time in {request_context}"
+    assert ctx_server_first_token is not None, (
+        f"ctx server_first_token_time is None in {request_context}"
+    )
+    assert isinstance(ctx_server_arrival, (int, float)), (
+        f"ctx server_arrival_time is not numeric in {request_context}"
+    )
+    assert isinstance(ctx_server_first_token, (int, float)), (
+        f"ctx server_first_token_time is not numeric in {request_context}"
+    )
+    assert ctx_server_arrival <= ctx_server_first_token, (
+        f"ctx server_arrival_time > server_first_token_time in {request_context}"
+    )
     assert ctx_metrics["last_token_time"] - ctx_server_first_token < 1e-3
 
     # Validate server-level timing metrics for generation server
     gen_server_arrival = gen_metrics.get("server_arrival_time")
     gen_server_first_token = gen_metrics.get("server_first_token_time")
     assert gen_server_arrival is not None, f"gen server_arrival_time is None in {request_context}"
-    assert gen_server_first_token is not None, f"gen server_first_token_time is None in {request_context}"
-    assert isinstance(
-        gen_server_arrival,
-        (int,
-         float)), f"gen server_arrival_time is not numeric in {request_context}"
-    assert isinstance(
-        gen_server_first_token,
-        (int, float
-         )), f"gen server_first_token_time is not numeric in {request_context}"
-    assert gen_server_arrival <= gen_server_first_token, f"gen server_arrival_time > server_first_token_time in {request_context}"
+    assert gen_server_first_token is not None, (
+        f"gen server_first_token_time is None in {request_context}"
+    )
+    assert isinstance(gen_server_arrival, (int, float)), (
+        f"gen server_arrival_time is not numeric in {request_context}"
+    )
+    assert isinstance(gen_server_first_token, (int, float)), (
+        f"gen server_first_token_time is not numeric in {request_context}"
+    )
+    assert gen_server_arrival <= gen_server_first_token, (
+        f"gen server_arrival_time > server_first_token_time in {request_context}"
+    )
 
     # Validate timing relationships between different levels
     # Disaggregated server should receive request before individual servers
-    assert disagg_arrival <= ctx_server_arrival, f"disagg_arrival > ctx_server_arrival in {request_context}"
-    assert disagg_arrival <= gen_server_arrival, f"disagg_arrival > gen_server_arrival in {request_context}"
+    assert disagg_arrival <= ctx_server_arrival, (
+        f"disagg_arrival > ctx_server_arrival in {request_context}"
+    )
+    assert disagg_arrival <= gen_server_arrival, (
+        f"disagg_arrival > gen_server_arrival in {request_context}"
+    )
 
     # Context should complete before generation starts
-    assert ctx_server_first_token <= gen_server_arrival, f"ctx_server_first_token > gen_server_arrival in {request_context}"
+    assert ctx_server_first_token <= gen_server_arrival, (
+        f"ctx_server_first_token > gen_server_arrival in {request_context}"
+    )
 
     # Validate internal timing consistency
     ctx_arrival_time = ctx_metrics["arrival_time"]
@@ -137,34 +154,45 @@ def validate_timing_metrics(perf_metrics_item, request_context=""):
     gen_arrival_time = gen_metrics["arrival_time"]
     gen_first_token_time = gen_metrics["first_token_time"]
 
-    assert ctx_arrival_time <= ctx_first_token_time, f"ctx arrival_time > first_token_time in {request_context}"
-    assert gen_arrival_time <= gen_first_token_time, f"gen arrival_time > first_token_time in {request_context}"
+    assert ctx_arrival_time <= ctx_first_token_time, (
+        f"ctx arrival_time > first_token_time in {request_context}"
+    )
+    assert gen_arrival_time <= gen_first_token_time, (
+        f"gen arrival_time > first_token_time in {request_context}"
+    )
 
     # Test KV cache transfer timing (if present)
     if "kv_cache_transfer_start" in gen_metrics and "kv_cache_transfer_end" in gen_metrics:
         kv_start = gen_metrics["kv_cache_transfer_start"]
         kv_end = gen_metrics["kv_cache_transfer_end"]
         assert gen_metrics["kv_cache_size"] > 0
-        assert kv_start <= kv_end, f"kv_cache_transfer_start > kv_cache_transfer_end in {request_context}"
-        assert gen_arrival_time <= kv_start, f"gen_arrival_time > kv_cache_transfer_start in {request_context}"
-        assert kv_end <= gen_metrics[
-            "first_scheduled_time"], f"kv_cache_transfer_end > first_scheduled_time in {request_context}"
+        assert kv_start <= kv_end, (
+            f"kv_cache_transfer_start > kv_cache_transfer_end in {request_context}"
+        )
+        assert gen_arrival_time <= kv_start, (
+            f"gen_arrival_time > kv_cache_transfer_start in {request_context}"
+        )
+        assert kv_end <= gen_metrics["first_scheduled_time"], (
+            f"kv_cache_transfer_end > first_scheduled_time in {request_context}"
+        )
 
     return True
 
 
-def run_client_tests(example_dir,
-                     config_file,
-                     test_desc,
-                     num_iters,
-                     env,
-                     server_start_timeout,
-                     prompt_file,
-                     extra_endpoints_test,
-                     server_url,
-                     workers_proc,
-                     server_proc,
-                     use_ray=False):
+def run_client_tests(
+    example_dir,
+    config_file,
+    test_desc,
+    num_iters,
+    env,
+    server_start_timeout,
+    prompt_file,
+    extra_endpoints_test,
+    server_url,
+    workers_proc,
+    server_proc,
+    use_ray=False,
+):
     """Run client tests against the disaggregated server.
 
     Args:
@@ -184,14 +212,19 @@ def run_client_tests(example_dir,
     client_dir = f"{example_dir}/clients"
     for _ in range(num_iters):
         client_cmd = [
-            'python3', f'{client_dir}/disagg_client.py', '-c', f'{config_file}',
-            '-p', f'{client_dir}/{prompt_file}', '--ignore-eos',
-            '--server-start-timeout',
-            str(server_start_timeout)
+            "python3",
+            f"{client_dir}/disagg_client.py",
+            "-c",
+            f"{config_file}",
+            "-p",
+            f"{client_dir}/{prompt_file}",
+            "--ignore-eos",
+            "--server-start-timeout",
+            str(server_start_timeout),
         ]
         if prompt_file == "long_prompts.json":
             # Use max_tokens 4 for long prompts to reduce test time
-            client_cmd.extend(['--max-tokens', '4'])
+            client_cmd.extend(["--max-tokens", "4"])
 
         # Prepare poll processes
         worker_processes = []
@@ -205,24 +238,20 @@ def run_client_tests(example_dir,
         check_call(client_cmd, env=env, poll_procs=poll_procs)
 
         # Streaming client run
-        streaming_client_cmd = client_cmd + [
-            '--streaming', '-o', 'output_streaming.json'
-        ]
+        streaming_client_cmd = client_cmd + ["--streaming", "-o", "output_streaming.json"]
         check_call(streaming_client_cmd, env=env, poll_procs=poll_procs)
 
         # Run the chat completion endpoint test only for TinyLlama
         if test_desc == "overlap" or test_desc == "trtllm_sampler":
-            chat_client_cmd = client_cmd + [
-                '-e', 'chat', '-o', 'output_chat.json'
-            ]
+            chat_client_cmd = client_cmd + ["-e", "chat", "-o", "output_chat.json"]
             check_call(chat_client_cmd, env=env, poll_procs=poll_procs)
 
             streaming_chat_client_cmd = chat_client_cmd + [
-                '--streaming', '-o', 'output_streaming_chat.json'
+                "--streaming",
+                "-o",
+                "output_streaming_chat.json",
             ]
-            check_call(streaming_chat_client_cmd,
-                       env=env,
-                       poll_procs=poll_procs)
+            check_call(streaming_chat_client_cmd, env=env, poll_procs=poll_procs)
 
         # Skip output verification for long prompts test
         if prompt_file == "long_prompts.json":
@@ -234,42 +263,45 @@ def run_client_tests(example_dir,
         # Verify outputs
         not_expected_strings = ["Berlin Berlin"]
 
-        output_files = ['output.json', 'output_streaming.json']
+        output_files = ["output.json", "output_streaming.json"]
         if test_desc == "overlap" or test_desc == "trtllm_sampler":
             # Disable streaming chat completion for overlap test
             # due to bug
-            output_files.extend(['output_chat.json'])
+            output_files.extend(["output_chat.json"])
 
         if test_desc.startswith("gen_only"):
             continue
 
         for output_file in output_files:
-            with open(output_file, 'r') as f:
+            with open(output_file, "r") as f:
                 content = f.read()
                 if "ds_v3_lite" in test_desc or output_file == "output_chat.json":
-                    expected_strings = [
-                        "Berlin", ["Asyncio is a", "Asyncio module in"]
-                    ]
+                    expected_strings = ["Berlin", ["Asyncio is a", "Asyncio module in"]]
                 else:
                     expected_strings = [
                         "The capital of Germany is Berlin",
-                        "Asyncio is a Python library"
+                        "Asyncio is a Python library",
                     ]
                 for expected_string in expected_strings:
                     if isinstance(expected_string, list):
                         # At least one of the strings in the list should be found in the content
-                        assert any(
-                            string in content for string in expected_string
-                        ), f"None of the strings in {expected_string} found in {output_file}"
+                        assert any(string in content for string in expected_string), (
+                            f"None of the strings in {expected_string} found in {output_file}"
+                        )
                     else:
-                        assert expected_string in content, f"Expected string '{expected_string}' not found in {output_file}"
+                        assert expected_string in content, (
+                            f"Expected string '{expected_string}' not found in {output_file}"
+                        )
                 for not_expected_string in not_expected_strings:
-                    assert not_expected_string not in content, f"Unexpected string '{not_expected_string}' found in {output_file}"
+                    assert not_expected_string not in content, (
+                        f"Unexpected string '{not_expected_string}' found in {output_file}"
+                    )
 
 
 @dataclass
 class DisaggregatedTestConfig:
     """Complete configuration for a disaggregated test."""
+
     test_name: str
     model_root: str
 
@@ -287,8 +319,9 @@ class DisaggregatedTestConfig:
     env_vars: Optional[Dict[str, str]] = None
     prompt_file: str = "prompts.json"
     num_iters: int = 5
-    extra_validation: Optional[
-        str] = None  # Special validation type: 'perf_metrics', 'kv_cache_time'
+    extra_validation: Optional[str] = (
+        None  # Special validation type: 'perf_metrics', 'kv_cache_time'
+    )
 
     @staticmethod
     def _deep_merge_dicts(base: dict, override: dict) -> dict:
@@ -303,31 +336,29 @@ class DisaggregatedTestConfig:
         """
         result = deepcopy(base)
         for key, value in override.items():
-            if key in result and isinstance(result[key], dict) and isinstance(
-                    value, dict):
-                result[key] = DisaggregatedTestConfig._deep_merge_dicts(
-                    result[key], value)
+            if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+                result[key] = DisaggregatedTestConfig._deep_merge_dicts(result[key], value)
             else:
                 result[key] = deepcopy(value)
         return result
 
     @classmethod
     def from_base(
-            cls,
-            base: 'DisaggregatedTestConfig',
-            test_name: str,
-            model_root: Optional[str] = None,
-            global_config: Optional[dict] = None,
-            ctx_config: Optional[dict] = None,
-            gen_config: Optional[dict] = None,
-            skip_device_count: Optional[int] = None,
-            skip_hopper: Optional[bool] = None,
-            skip_arm_arch: Optional[bool] = None,
-            env_vars: Optional[Dict[str, str]] = None,
-            prompt_file: Optional[str] = None,
-            num_iters: Optional[int] = None,
-            extra_validation: Optional[str] = None
-    ) -> 'DisaggregatedTestConfig':
+        cls,
+        base: "DisaggregatedTestConfig",
+        test_name: str,
+        model_root: Optional[str] = None,
+        global_config: Optional[dict] = None,
+        ctx_config: Optional[dict] = None,
+        gen_config: Optional[dict] = None,
+        skip_device_count: Optional[int] = None,
+        skip_hopper: Optional[bool] = None,
+        skip_arm_arch: Optional[bool] = None,
+        env_vars: Optional[Dict[str, str]] = None,
+        prompt_file: Optional[str] = None,
+        num_iters: Optional[int] = None,
+        extra_validation: Optional[str] = None,
+    ) -> "DisaggregatedTestConfig":
         """Create a new config based on an existing one with selective overrides.
 
         Args:
@@ -358,14 +389,13 @@ class DisaggregatedTestConfig:
 
         # Remove any parameters from global_config that are already specified in ctx_config or gen_config
         for key in list(new_global_config.keys()):
-            if (ctx_config is not None
-                    and key in ctx_config) or (gen_config is not None
-                                               and key in gen_config):
+            if (ctx_config is not None and key in ctx_config) or (
+                gen_config is not None and key in gen_config
+            ):
                 new_global_config.pop(key, None)
 
         if global_config:
-            new_global_config = cls._deep_merge_dicts(new_global_config,
-                                                      global_config)
+            new_global_config = cls._deep_merge_dicts(new_global_config, global_config)
         if ctx_config:
             new_ctx_config = cls._deep_merge_dicts(new_ctx_config, ctx_config)
         if gen_config:
@@ -378,34 +408,32 @@ class DisaggregatedTestConfig:
 
         return cls(
             test_name=test_name,
-            model_root=model_root
-            if model_root is not None else base.model_root,
+            model_root=model_root if model_root is not None else base.model_root,
             global_config=new_global_config,
             ctx_config=new_ctx_config,
             gen_config=new_gen_config,
             skip_device_count=skip_device_count
-            if skip_device_count is not None else base.skip_device_count,
-            skip_hopper=skip_hopper
-            if skip_hopper is not None else base.skip_hopper,
-            skip_arm_arch=skip_arm_arch
-            if skip_arm_arch is not None else base.skip_arm_arch,
+            if skip_device_count is not None
+            else base.skip_device_count,
+            skip_hopper=skip_hopper if skip_hopper is not None else base.skip_hopper,
+            skip_arm_arch=skip_arm_arch if skip_arm_arch is not None else base.skip_arm_arch,
             env_vars=new_env_vars,
-            prompt_file=prompt_file
-            if prompt_file is not None else base.prompt_file,
+            prompt_file=prompt_file if prompt_file is not None else base.prompt_file,
             num_iters=num_iters if num_iters is not None else base.num_iters,
             extra_validation=extra_validation
-            if extra_validation is not None else base.extra_validation,
+            if extra_validation is not None
+            else base.extra_validation,
         )
 
     def get_num_ranks(self) -> int:
         """Calculate total number of ranks needed."""
-        ctx_tp = self.ctx_config.get('tensor_parallel_size', 1)
-        ctx_pp = self.ctx_config.get('pipeline_parallel_size', 1)
-        ctx_num_instances = self.ctx_config.get('num_instances', 1)
+        ctx_tp = self.ctx_config.get("tensor_parallel_size", 1)
+        ctx_pp = self.ctx_config.get("pipeline_parallel_size", 1)
+        ctx_num_instances = self.ctx_config.get("num_instances", 1)
 
-        gen_tp = self.gen_config.get('tensor_parallel_size', 1)
-        gen_pp = self.gen_config.get('pipeline_parallel_size', 1)
-        gen_num_instances = self.gen_config.get('num_instances', 1)
+        gen_tp = self.gen_config.get("tensor_parallel_size", 1)
+        gen_pp = self.gen_config.get("pipeline_parallel_size", 1)
+        gen_num_instances = self.gen_config.get("num_instances", 1)
 
         ctx_ranks = ctx_tp * ctx_pp * ctx_num_instances
         gen_ranks = gen_tp * gen_pp * gen_num_instances
@@ -421,13 +449,15 @@ class DisaggregatedTestConfig:
             config["cache_transceiver_config"] = {"backend": "DEFAULT"}
 
         if "backend" in config and config["backend"] == "trt":
-            del config["disable_overlap_scheduler"]
-            del config["cuda_graph_config"]
+            if "disable_overlap_scheduler" in config:
+                del config["disable_overlap_scheduler"]
+            if "cuda_graph_config" in config:
+                del config["cuda_graph_config"]
 
         # Build context servers config
         context_servers = self.ctx_config.copy()
 
-        ctx_num_instances = self.ctx_config.get('num_instances', 1)
+        ctx_num_instances = self.ctx_config.get("num_instances", 1)
         context_servers["num_instances"] = ctx_num_instances
 
         ctx_urls = []
@@ -440,7 +470,7 @@ class DisaggregatedTestConfig:
         # Build generation servers config
         gen_servers = self.gen_config.copy()
 
-        gen_num_instances = self.gen_config.get('num_instances', 1)
+        gen_num_instances = self.gen_config.get("num_instances", 1)
         gen_servers["num_instances"] = gen_num_instances
 
         gen_urls = []
@@ -450,15 +480,14 @@ class DisaggregatedTestConfig:
         gen_servers["urls"] = gen_urls
 
         # Special handling for gen-only mode
-        if ctx_num_instances == 0 and "backend" in config and config[
-                "backend"] == "pytorch":
+        if ctx_num_instances == 0 and "backend" in config and config["backend"] == "pytorch":
             gen_servers["print_iter_log"] = True
 
         config["generation_servers"] = gen_servers
 
         # Write to temporary file
         config_path = os.path.join(temp_dir, f"{self.test_name}.yaml")
-        with open(config_path, 'w') as f:
+        with open(config_path, "w") as f:
             yaml.dump(config, f, default_flow_style=False)
 
         return config_path
@@ -496,13 +525,11 @@ _tiny_llama_cfg = DisaggregatedTestConfig(
     model_root="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
     global_config={
         "backend": "pytorch",
-        "kv_cache_config": {
-            "free_gpu_memory_fraction": 0.2,
-            "enable_partial_reuse": False
-        },
+        "kv_cache_config": {"free_gpu_memory_fraction": 0.2, "enable_partial_reuse": False},
         "disable_overlap_scheduler": True,
         "cuda_graph_config": None,
-    })
+    },
+)
 
 _tiny_llama_multi_gpus_cfg = DisaggregatedTestConfig.from_base(
     _tiny_llama_cfg,
@@ -570,14 +597,8 @@ TEST_CONFIGS = [
         _tiny_llama_cfg,
         test_name="perf_metrics",
         global_config={"perf_metrics_max_requests": 1000},
-        ctx_config={
-            "return_perf_metrics": True,
-            "perf_metrics_max_requests": 1000
-        },
-        gen_config={
-            "return_perf_metrics": True,
-            "perf_metrics_max_requests": 1000
-        },
+        ctx_config={"return_perf_metrics": True, "perf_metrics_max_requests": 1000},
+        gen_config={"return_perf_metrics": True, "perf_metrics_max_requests": 1000},
         extra_validation="perf_metrics",
     ),
     # KV cache time variant - same as perf_metrics but different validation
@@ -585,58 +606,38 @@ TEST_CONFIGS = [
         _tiny_llama_cfg,
         test_name="kv_cache_time_output",
         global_config={"perf_metrics_max_requests": 1000},
-        ctx_config={
-            "return_perf_metrics": True,
-            "perf_metrics_max_requests": 1000
-        },
-        gen_config={
-            "return_perf_metrics": True,
-            "perf_metrics_max_requests": 1000
-        },
+        ctx_config={"return_perf_metrics": True, "perf_metrics_max_requests": 1000},
+        gen_config={"return_perf_metrics": True, "perf_metrics_max_requests": 1000},
         extra_validation="kv_cache_time",
     ),
     # Create TRT variant from base - only need to override backend
-    DisaggregatedTestConfig(test_name="trt_backend",
-                            model_root="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-                            global_config={
-                                "backend": "trt",
-                                "kv_cache_config": {
-                                    "free_gpu_memory_fraction": 0.2,
-                                    "enable_partial_reuse": False
-                                },
-                            }),
+    DisaggregatedTestConfig(
+        test_name="trt_backend",
+        model_root="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        global_config={
+            "backend": "trt",
+            "kv_cache_config": {"free_gpu_memory_fraction": 0.2, "enable_partial_reuse": False},
+        },
+    ),
     DisaggregatedTestConfig.from_base(
         _tiny_llama_cfg,
         test_name="diff_max_tokens",
         prompt_file="long_prompts.json",
-        ctx_config={
-            "max_num_tokens": 512,
-            "max_batch_size": 64
-        },
-        gen_config={
-            "max_num_tokens": 256,
-            "max_batch_size": 32
-        },
+        ctx_config={"max_num_tokens": 512, "max_batch_size": 64},
+        gen_config={"max_num_tokens": 256, "max_batch_size": 32},
     ),
-
     # TinyLlama - CUDA graph
     DisaggregatedTestConfig.from_base(
         _tiny_llama_cfg,
         test_name="cuda_graph",
-        ctx_config={"cuda_graph_config": {
-            "batch_sizes": [1, 3000]
-        }},
+        ctx_config={"cuda_graph_config": {"batch_sizes": [1, 3000]}},
         gen_config={
-            "cuda_graph_config": {
-                "enable_padding": True,
-                "batch_sizes": [1, 4, 8, 16, 24, 32]
-            },
+            "cuda_graph_config": {"enable_padding": True, "batch_sizes": [1, 4, 8, 16, 24, 32]},
             "max_batch_size": 256,
             "max_num_tokens": 4096,
             "max_seq_len": 4096,
         },
     ),
-
     # TinyLlama - overlap
     DisaggregatedTestConfig.from_base(
         _tiny_llama_cfg,
@@ -653,14 +654,12 @@ TEST_CONFIGS = [
             "disable_overlap_scheduler": False,
         },
     ),
-
     # TinyLlama - mixed
     DisaggregatedTestConfig.from_base(
         _tiny_llama_cfg,
         test_name="mixed",
         gen_config={"num_instances": 2},
     ),
-
     # TinyLlama - trtllm sampler
     DisaggregatedTestConfig.from_base(
         _tiny_llama_cfg,
@@ -680,40 +679,29 @@ TEST_CONFIGS = [
             "disable_overlap_scheduler": False,
         },
     ),
-
     # TinyLlama - load balance
     DisaggregatedTestConfig.from_base(
         _tiny_llama_cfg,
         test_name="load_balance",
         global_config={
-            "kv_cache_config": {
-                "free_gpu_memory_fraction": 0.15,
-                "enable_partial_reuse": False
-            },
+            "kv_cache_config": {"free_gpu_memory_fraction": 0.15, "enable_partial_reuse": False},
         },
         ctx_config={
             "num_instances": 2,
-            "router": {
-                "type": "load_balancing",
-                "use_tokens": True
-            },
+            "router": {"type": "load_balancing", "use_tokens": True},
             "max_num_tokens": 3000,
             "max_seq_len": 4096,
             "disable_overlap_scheduler": True,
         },
         gen_config={
             "num_instances": 2,
-            "router": {
-                "type": "load_balancing",
-                "use_tokens": False
-            },
+            "router": {"type": "load_balancing", "use_tokens": False},
             "max_batch_size": 256,
             "max_num_tokens": 4096,
             "max_seq_len": 4096,
             "disable_overlap_scheduler": False,
         },
     ),
-
     # TinyLlama - cache aware balance
     DisaggregatedTestConfig.from_base(
         _tiny_llama_cfg,
@@ -725,29 +713,24 @@ TEST_CONFIGS = [
                 "enable_block_reuse": True,
                 "enable_partial_reuse": False,
                 "event_buffer_max_size": 1024,
-                "free_gpu_memory_fraction": 0.1
+                "free_gpu_memory_fraction": 0.1,
             },
         },
         ctx_config={
             "num_instances": 2,
-            "router": {
-                "type": "kv_cache_aware"
-            },
+            "router": {"type": "kv_cache_aware"},
             "max_batch_size": 16,
             "max_num_tokens": 3000,
             "max_seq_len": 4096,
         },
         gen_config={
             "num_instances": 2,
-            "router": {
-                "type": "kv_cache_aware"
-            },
+            "router": {"type": "kv_cache_aware"},
             "max_batch_size": 256,
             "max_num_tokens": 4096,
             "max_seq_len": 4096,
         },
     ),
-
     # TinyLlama - conditional
     DisaggregatedTestConfig.from_base(
         _tiny_llama_cfg,
@@ -755,24 +738,19 @@ TEST_CONFIGS = [
         model_root="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
         global_config={
             "free_gpu_memory_fraction": 0.15,
-            "conditional_disagg_config": {
-                "max_local_prefill_length": 100
-            },
+            "conditional_disagg_config": {"max_local_prefill_length": 100},
             "enable_autotuner": False,
             "kv_cache_config": {
                 "enable_block_reuse": True,
                 "enable_partial_reuse": True,
                 "event_buffer_max_size": 1024,
-                "free_gpu_memory_fraction": 0.15
+                "free_gpu_memory_fraction": 0.15,
             },
         },
         gen_config={
-            "router": {
-                "type": "kv_cache_aware"
-            },
+            "router": {"type": "kv_cache_aware"},
         },
     ),
-
     # TinyLlama - ngram
     DisaggregatedTestConfig.from_base(
         _tiny_llama_cfg,
@@ -787,7 +765,7 @@ TEST_CONFIGS = [
                 "max_matching_ngram_size": 4,
                 "is_keep_all": True,
                 "is_use_oldest": True,
-                "is_public_pool": True
+                "is_public_pool": True,
             },
         },
     ),
@@ -820,7 +798,6 @@ TEST_CONFIGS = [
         },
         skip_device_count=4,
     ),
-
     # TinyLlama - TP variations
     DisaggregatedTestConfig.from_base(
         _tiny_llama_multi_gpus_cfg,
@@ -916,17 +893,13 @@ TEST_CONFIGS = [
         skip_device_count=8,
     ),
     # DeepSeek V3 Lite tests
-
     # TP1 tests
     _ds_v3_lite_tp1_cfg,
     DisaggregatedTestConfig.from_base(
         _ds_v3_lite_tp1_cfg,
         test_name="ds_v3_lite_tp1_mtp",
         global_config={
-            "speculative_config": {
-                "decoding_type": "MTP",
-                "num_nextn_predict_layers": 1
-            },
+            "speculative_config": {"decoding_type": "MTP", "num_nextn_predict_layers": 1},
         },
         ctx_config={
             "enable_attention_dp": True,
@@ -936,10 +909,7 @@ TEST_CONFIGS = [
         _ds_v3_lite_tp1_cfg,
         test_name="ds_v3_lite_tp1_mtp_adp_overlap",
         global_config={
-            "speculative_config": {
-                "decoding_type": "MTP",
-                "num_nextn_predict_layers": 1
-            },
+            "speculative_config": {"decoding_type": "MTP", "num_nextn_predict_layers": 1},
             "enable_attention_dp": True,
         },
         ctx_config={
@@ -953,10 +923,7 @@ TEST_CONFIGS = [
         _ds_v3_lite_tp1_cfg,
         test_name="ds_v3_lite_tp1_mtp2",
         global_config={
-            "speculative_config": {
-                "decoding_type": "MTP",
-                "num_nextn_predict_layers": 2
-            },
+            "speculative_config": {"decoding_type": "MTP", "num_nextn_predict_layers": 2},
         },
         ctx_config={
             "enable_attention_dp": True,
@@ -965,23 +932,14 @@ TEST_CONFIGS = [
     DisaggregatedTestConfig.from_base(
         _ds_v3_lite_tp1_cfg,
         test_name="ds_v3_lite_tp1_cache_aware_balance",
-        global_config={
-            "enable_autotuner": False,
-            "kv_cache_config": {
-                "enable_block_reuse": True
-            }
-        },
+        global_config={"enable_autotuner": False, "kv_cache_config": {"enable_block_reuse": True}},
         ctx_config={
             "num_instances": 2,
-            "router": {
-                "type": "kv_cache_aware"
-            },
+            "router": {"type": "kv_cache_aware"},
         },
         gen_config={
             "num_instances": 2,
-            "router": {
-                "type": "kv_cache_aware"
-            },
+            "router": {"type": "kv_cache_aware"},
         },
         skip_hopper=True,
     ),
@@ -990,26 +948,19 @@ TEST_CONFIGS = [
         test_name="ds_v3_lite_tp1_conditional",
         global_config={
             "enable_autotuner": False,
-            "conditional_disagg_config": {
-                "enable_conditional_generation": True
-            },
+            "conditional_disagg_config": {"max_local_prefill_length": 100},
             "kv_cache_config": {
                 "event_buffer_max_size": 1024,
                 "free_gpu_memory_fraction": 0.15,
             },
         },
         ctx_config={
-            "router": {
-                "type": "kv_cache_aware"
-            },
+            "router": {"type": "kv_cache_aware"},
         },
         gen_config={
-            "router": {
-                "type": "kv_cache_aware"
-            },
+            "router": {"type": "kv_cache_aware"},
         },
     ),
-
     # 4 ranks different backends
     DisaggregatedTestConfig.from_base(
         _ds_v3_lite_4_gpus_cfg,
@@ -1033,10 +984,7 @@ TEST_CONFIGS = [
             },
         },
         skip_arm_arch=True,
-        env_vars={
-            "TRTLLM_USE_UCX_KVCACHE": "1",
-            "UCX_TLS": "^ib"
-        },
+        env_vars={"TRTLLM_USE_UCX_KVCACHE": "1", "UCX_TLS": "^ib"},
     ),
     DisaggregatedTestConfig.from_base(
         _ds_v3_lite_4_gpus_cfg,
@@ -1047,10 +995,7 @@ TEST_CONFIGS = [
             },
         },
         skip_arm_arch=True,
-        env_vars={
-            "TRTLLM_USE_NIXL_KVCACHE": "1",
-            "UCX_TLS": "^ib"
-        },
+        env_vars={"TRTLLM_USE_NIXL_KVCACHE": "1", "UCX_TLS": "^ib"},
     ),
     # 4 ranks
     _ds_v3_lite_4_gpus_cfg,
@@ -1084,9 +1029,7 @@ TEST_CONFIGS = [
             "disable_overlap_scheduler": True,
         },
         gen_config={
-            "cuda_graph_config": {
-                "enable_padding": False
-            },
+            "cuda_graph_config": {"enable_padding": False},
             "disable_overlap_scheduler": False,
         },
     ),
@@ -1094,9 +1037,7 @@ TEST_CONFIGS = [
         _ds_v3_lite_4_gpus_cfg,
         test_name="ds_v3_lite_overlap_cuda_graph",
         gen_config={
-            "cuda_graph_config": {
-                "enable_padding": False
-            },
+            "cuda_graph_config": {"enable_padding": False},
             "disable_overlap_scheduler": False,
         },
     ),
@@ -1104,10 +1045,7 @@ TEST_CONFIGS = [
         _ds_v3_lite_4_gpus_cfg,
         test_name="ds_v3_lite_adp_mtp",
         global_config={
-            "speculative_config": {
-                "decoding_type": "MTP",
-                "num_nextn_predict_layers": 1
-            },
+            "speculative_config": {"decoding_type": "MTP", "num_nextn_predict_layers": 1},
             "enable_attention_dp": True,
         },
     ),
@@ -1115,10 +1053,7 @@ TEST_CONFIGS = [
         _ds_v3_lite_4_gpus_cfg,
         test_name="ds_v3_lite_mtp",
         global_config={
-            "speculative_config": {
-                "decoding_type": "MTP",
-                "num_nextn_predict_layers": 1
-            },
+            "speculative_config": {"decoding_type": "MTP", "num_nextn_predict_layers": 1},
         },
     ),
 ]
@@ -1150,20 +1085,16 @@ def pytest_generate_tests(metafunc):
         for config in configs:
             marks = apply_skip_marks(config)
             if marks:
-                marked_configs.append(
-                    pytest.param(config, marks=marks, id=get_test_id(config)))
+                marked_configs.append(pytest.param(config, marks=marks, id=get_test_id(config)))
             else:
-                marked_configs.append(
-                    pytest.param(config, id=get_test_id(config)))
+                marked_configs.append(pytest.param(config, id=get_test_id(config)))
 
         metafunc.parametrize("config", marked_configs)
 
 
-def run_disaggregated_test_parametrized(example_dir,
-                                        config: DisaggregatedTestConfig,
-                                        env=None,
-                                        cwd=None,
-                                        extra_endpoints_test=None):
+def run_disaggregated_test_parametrized(
+    example_dir, config: DisaggregatedTestConfig, env=None, cwd=None, extra_endpoints_test=None
+):
     """Run disaggregated test with parametrized configuration.
 
     Args:
@@ -1188,13 +1119,13 @@ def run_disaggregated_test_parametrized(example_dir,
     config_path = config.generate_yaml_config(cwd)
 
     # Print generated config for debugging
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print(f"Generated YAML config for test: {config.test_name}")
     print(f"Config file: {config_path}")
-    print(f"{'='*80}")
-    with open(config_path, 'r') as f:
+    print(f"{'=' * 80}")
+    with open(config_path, "r") as f:
         print(f.read())
-    print(f"{'='*80}\n")
+    print(f"{'=' * 80}\n")
 
     try:
         num_ranks = config.get_num_ranks()
@@ -1202,27 +1133,32 @@ def run_disaggregated_test_parametrized(example_dir,
 
         if not use_ray:
             workers_cmd = [
-                'mpirun', '--allow-run-as-root', '--oversubscribe', '-n',
-                str(num_ranks), 'trtllm-serve', 'disaggregated_mpi_worker',
-                '-c', config_path
+                "mpirun",
+                "--allow-run-as-root",
+                "--oversubscribe",
+                "-n",
+                str(num_ranks),
+                "trtllm-serve",
+                "disaggregated_mpi_worker",
+                "-c",
+                config_path,
             ]
         else:
             pytest.skip(
                 "https://nvbugs/5584607 Ray orchestrator is not supported with NIXL(DEFAULT) cache transceiver backend."
             )
             # Check backend compatibility
-            backend = config.global_config.get('backend', 'pytorch')
+            backend = config.global_config.get("backend", "pytorch")
             if backend != "pytorch":
-                pytest.skip(
-                    "Ray orchestrator is only supported with pytorch backend.")
+                pytest.skip("Ray orchestrator is only supported with pytorch backend.")
 
             # Generate extra config files for Ray workers
             def get_extra_llm_config(server_config, suffix):
                 extra_config = {
-                    'orchestrator_type': 'ray',
+                    "orchestrator_type": "ray",
                 }
                 for key, value in server_config.items():
-                    if key not in ['num_instances', 'urls']:
+                    if key not in ["num_instances", "urls"]:
                         extra_config[key] = value
                 return extra_config
 
@@ -1230,121 +1166,149 @@ def run_disaggregated_test_parametrized(example_dir,
             workers_cmds = []
 
             # Create config for context servers
-            ctx_num_instances = config.ctx_config.get('num_instances', 1)
+            ctx_num_instances = config.ctx_config.get("num_instances", 1)
             for i in range(ctx_num_instances):
-                extra_llm_config = get_extra_llm_config(config.ctx_config,
-                                                        f'ctx_{i}')
-                extra_file = os.path.join(cwd,
-                                          f'{config.test_name}_ctx_{i}.yaml')
-                with open(extra_file, 'w') as f:
+                extra_llm_config = get_extra_llm_config(config.ctx_config, f"ctx_{i}")
+                extra_file = os.path.join(cwd, f"{config.test_name}_ctx_{i}.yaml")
+                with open(extra_file, "w") as f:
                     yaml.dump(extra_llm_config, f, default_flow_style=False)
                 extra_config_files.append(extra_file)
-                workers_cmds.append([
-                    'trtllm-serve', 'disaggregated_ray_worker', '-c',
-                    extra_file, '--model', config.model_root
-                ])
+                workers_cmds.append(
+                    [
+                        "trtllm-serve",
+                        "disaggregated_ray_worker",
+                        "-c",
+                        extra_file,
+                        "--model",
+                        config.model_root,
+                    ]
+                )
 
             # Create config for generation servers
-            gen_num_instances = config.gen_config.get('num_instances', 1)
+            gen_num_instances = config.gen_config.get("num_instances", 1)
             for i in range(gen_num_instances):
-                extra_llm_config = get_extra_llm_config(config.gen_config,
-                                                        f'gen_{i}')
-                extra_file = os.path.join(cwd,
-                                          f'{config.test_name}_gen_{i}.yaml')
-                with open(extra_file, 'w') as f:
+                extra_llm_config = get_extra_llm_config(config.gen_config, f"gen_{i}")
+                extra_file = os.path.join(cwd, f"{config.test_name}_gen_{i}.yaml")
+                with open(extra_file, "w") as f:
                     yaml.dump(extra_llm_config, f, default_flow_style=False)
                 extra_config_files.append(extra_file)
-                workers_cmds.append([
-                    'trtllm-serve', 'disaggregated_ray_worker', '-c',
-                    extra_file, '--model', config.model_root
-                ])
+                workers_cmds.append(
+                    [
+                        "trtllm-serve",
+                        "disaggregated_ray_worker",
+                        "-c",
+                        extra_file,
+                        "--model",
+                        config.model_root,
+                    ]
+                )
 
         server_start_timeout = 1200
         server_cmd = [
-            'trtllm-serve', 'disaggregated', '--server_start_timeout',
-            str(server_start_timeout), '-c', config_path
+            "trtllm-serve",
+            "disaggregated",
+            "--server_start_timeout",
+            str(server_start_timeout),
+            "-c",
+            config_path,
         ]
         server_url = get_disagg_server_url_from_cfg(config_path)
 
         try:
             if not use_ray:
-                with (open('output_workers.log', 'w') as output_workers,
-                      popen(workers_cmd,
-                            stdout=output_workers,
-                            stderr=subprocess.STDOUT,
-                            env=run_env,
-                            cwd=cwd) as
-                      workers_proc, open('output_disagg.log',
-                                         'w') as output_disagg,
-                      popen(server_cmd,
-                            stdout=output_disagg,
-                            stderr=subprocess.STDOUT,
-                            env=run_env,
-                            cwd=cwd) as server_proc):
-                    run_client_tests(example_dir,
-                                     config_path,
-                                     config.test_name,
-                                     config.num_iters,
-                                     env,
-                                     server_start_timeout,
-                                     config.prompt_file,
-                                     extra_endpoints_test,
-                                     server_url,
-                                     workers_proc,
-                                     server_proc,
-                                     use_ray=False)
+                with (
+                    open("output_workers.log", "w") as output_workers,
+                    popen(
+                        workers_cmd,
+                        stdout=output_workers,
+                        stderr=subprocess.STDOUT,
+                        env=run_env,
+                        cwd=cwd,
+                    ) as workers_proc,
+                    open("output_disagg.log", "w") as output_disagg,
+                    popen(
+                        server_cmd,
+                        stdout=output_disagg,
+                        stderr=subprocess.STDOUT,
+                        env=run_env,
+                        cwd=cwd,
+                    ) as server_proc,
+                ):
+                    run_client_tests(
+                        example_dir,
+                        config_path,
+                        config.test_name,
+                        config.num_iters,
+                        env,
+                        server_start_timeout,
+                        config.prompt_file,
+                        extra_endpoints_test,
+                        server_url,
+                        workers_proc,
+                        server_proc,
+                        use_ray=False,
+                    )
             else:
                 # Ray orchestrator path
                 workers_proc = []
                 for worker_cmd in workers_cmds:
                     workers_proc.append(
-                        popen(worker_cmd,
-                              stdout=subprocess.PIPE,
-                              stderr=subprocess.STDOUT,
-                              env=run_env,
-                              cwd=cwd))
+                        popen(
+                            worker_cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            env=run_env,
+                            cwd=cwd,
+                        )
+                    )
 
                 # Enter all worker contexts
                 for proc_cm in workers_proc:
                     proc_cm.__enter__()
 
-                with (open('output_disagg.log', 'w') as output_disagg,
-                      popen(server_cmd,
-                            stdout=output_disagg,
-                            stderr=subprocess.STDOUT,
-                            env=run_env,
-                            cwd=cwd) as server_proc):
-                    run_client_tests(example_dir,
-                                     config_path,
-                                     config.test_name,
-                                     config.num_iters,
-                                     env,
-                                     server_start_timeout,
-                                     config.prompt_file,
-                                     extra_endpoints_test,
-                                     server_url,
-                                     workers_proc,
-                                     server_proc,
-                                     use_ray=True)
+                with (
+                    open("output_disagg.log", "w") as output_disagg,
+                    popen(
+                        server_cmd,
+                        stdout=output_disagg,
+                        stderr=subprocess.STDOUT,
+                        env=run_env,
+                        cwd=cwd,
+                    ) as server_proc,
+                ):
+                    run_client_tests(
+                        example_dir,
+                        config_path,
+                        config.test_name,
+                        config.num_iters,
+                        env,
+                        server_start_timeout,
+                        config.prompt_file,
+                        extra_endpoints_test,
+                        server_url,
+                        workers_proc,
+                        server_proc,
+                        use_ray=True,
+                    )
         except Exception:
             logger.error("-------- Workers output --------")
-            if not use_ray and os.path.exists('output_workers.log'):
-                with open('output_workers.log', 'r') as f:
+            if not use_ray and os.path.exists("output_workers.log"):
+                with open("output_workers.log", "r") as f:
                     logger.error(f.read())
 
             logger.error("-------- Disagg server output --------")
-            if os.path.exists('output_disagg.log'):
-                with open('output_disagg.log', 'r') as f:
+            if os.path.exists("output_disagg.log"):
+                with open("output_disagg.log", "r") as f:
                     logger.error(f.read())
             raise
         finally:
             if use_ray:
-                subprocess.run(['ray', 'stop', '--force'], check=False)
+                subprocess.run(["ray", "stop", "--force"], check=False)
                 for extra_file in extra_config_files:
                     if os.path.exists(extra_file):
                         os.remove(extra_file)
             else:
-                if 'server_proc' in locals() and 'workers_proc' in locals():
+                if "server_proc" in locals() and "workers_proc" in locals():
                     server_proc.terminate()
                     workers_proc.terminate()
                     server_proc.wait()
@@ -1364,8 +1328,7 @@ def model_root_fixture(config, llm_venv, request):
 
     print("Running model root fixture for config: ", config.test_name)
     if config.model_root == "TinyLlama/TinyLlama-1.1B-Chat-v1.0":
-        src_root = os.path.join(models_root, "llama-models-v2",
-                                "TinyLlama-1.1B-Chat-v1.0")
+        src_root = os.path.join(models_root, "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0")
     else:
         src_root = os.path.join(models_root, config.model_root)
 
@@ -1407,8 +1370,7 @@ def test_disagg(
             import json
             import urllib.request
 
-            with urllib.request.urlopen(f"{server_url}/perf_metrics",
-                                        timeout=10) as resp:
+            with urllib.request.urlopen(f"{server_url}/perf_metrics", timeout=10) as resp:
                 assert resp.status == 200
                 perf_metrics = json.load(resp)
             assert len(perf_metrics) > 0
@@ -1419,8 +1381,7 @@ def test_disagg(
 
     elif config.extra_validation == "kv_cache_time":
         # Test KV cache time output files
-        kv_cache_output_path = os.path.join(llm_venv.get_working_directory(),
-                                            "cache_time")
+        kv_cache_output_path = os.path.join(llm_venv.get_working_directory(), "cache_time")
         env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = kv_cache_output_path
 
     # Apply test-specific environment variables
@@ -1433,7 +1394,8 @@ def test_disagg(
         config,
         env=env,
         cwd=llm_venv.get_working_directory(),
-        extra_endpoints_test=extra_endpoints_test)
+        extra_endpoints_test=extra_endpoints_test,
+    )
 
     # Post-test validation for kv_cache_time
     if config.extra_validation == "kv_cache_time":
@@ -1450,14 +1412,14 @@ def test_disagg(
             )
             assert ",Delay,Duration,Bandwidth(Gbps)" in lines[0]
             # get a send sample and match the recv
-            sample = lines[1].split(',')
+            sample = lines[1].split(",")
             assert len(sample) >= 9
         with open(recv_file, "r") as f:
             lines = f.readlines()
             assert len(lines) > 1
             matched = False
             for line in lines:
-                sample_recv = line.split(',')
+                sample_recv = line.split(",")
                 if sample_recv[0] == sample[0]:
                     matched = True
                     break
