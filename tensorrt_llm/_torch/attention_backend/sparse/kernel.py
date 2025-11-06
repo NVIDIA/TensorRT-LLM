@@ -1547,12 +1547,15 @@ def topk_kernel(
 
         # Vectorized write for candidates
         candidate_write_offsets = final_offset + temp_base + candidate_positions
+        # NOTE: WAR to avoid out of bounds access, but may cause performance regression
+        candidate_write_mask = (candidate_write_offsets
+                                < FINAL_SIZE) & candidate_mask
         tl.store(temp_values_ptr + candidate_write_offsets,
                  values,
-                 mask=candidate_mask)
+                 mask=candidate_write_mask)
         tl.store(temp_indices_ptr + candidate_write_offsets,
                  block_offsets,
-                 mask=candidate_mask)
+                 mask=candidate_write_mask)
 
         final_offset += num_candidates
 
@@ -1618,7 +1621,7 @@ def triton_topk(input_tensor: torch.Tensor, input_offsets: torch.Tensor,
 
     BLOCK_SIZE = 512
     NUM_BINS = 512
-    FINAL_SIZE = 512
+    FINAL_SIZE = 1024
 
     temp_values = torch.empty((num_kv_heads, batch_size, FINAL_SIZE),
                               dtype=torch.float32,

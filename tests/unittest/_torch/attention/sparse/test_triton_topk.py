@@ -31,10 +31,9 @@ def pytorch_reference_topk(
     pad_size = max(max_seq_len, topk)
 
     # Create padded tensor [num_kv_heads, batch_size, pad_size]
-    padded_tensor = torch.full((num_kv_heads, batch_size, pad_size),
-                               float('-inf'),
-                               dtype=input_tensor.dtype,
-                               device=device)
+    padded_tensor = torch.full(
+        (num_kv_heads, batch_size, pad_size), float("-inf"), dtype=input_tensor.dtype, device=device
+    )
 
     # Fill in actual values
     for batch_idx in range(batch_size):
@@ -43,9 +42,7 @@ def pytorch_reference_topk(
         seq_len = kv_lens[batch_idx].item()
 
         for head_idx in range(num_kv_heads):
-            padded_tensor[head_idx,
-                          batch_idx, :seq_len] = input_tensor[head_idx,
-                                                              start:end]
+            padded_tensor[head_idx, batch_idx, :seq_len] = input_tensor[head_idx, start:end]
 
     # Perform batch topk: [num_kv_heads, batch_size, pad_size] -> [num_kv_heads, batch_size, topk]
     topk_values, topk_indices = torch.topk(
@@ -56,8 +53,7 @@ def pytorch_reference_topk(
     )
 
     # Mask out invalid indices based on each batch's seq_len
-    seq_lens_expanded = kv_lens.to(device).unsqueeze(0).unsqueeze(
-        -1)  # [1, batch_size, 1]
+    seq_lens_expanded = kv_lens.to(device).unsqueeze(0).unsqueeze(-1)  # [1, batch_size, 1]
     # topk_indices: [num_kv_heads, batch_size, topk]
     mask = topk_indices >= seq_lens_expanded
     topk_indices.masked_fill_(mask, -1)
@@ -86,23 +82,21 @@ def triton_topk_wrapper(
     device = input_tensor.device
 
     sparse_lens = torch.tensor(
-        [min(topk, seq_len.item()) for seq_len in kv_lens],
-        dtype=torch.int32,
-        device=device)
-    sparse_offsets = torch.cat([
-        torch.zeros(1, dtype=torch.int32, device=device),
-        torch.cumsum(sparse_lens, dim=0)
-    ]).to(device)
+        [min(topk, seq_len.item()) for seq_len in kv_lens], dtype=torch.int32, device=device
+    )
+    sparse_offsets = torch.cat(
+        [torch.zeros(1, dtype=torch.int32, device=device), torch.cumsum(sparse_lens, dim=0)]
+    ).to(device)
     total_sparse_indices = sparse_offsets[-1].item()
 
-    output_indices_flat = triton_topk(input_tensor, kv_offsets, sparse_offsets,
-                                      total_sparse_indices, topk)
+    output_indices_flat = triton_topk(
+        input_tensor, kv_offsets, sparse_offsets, total_sparse_indices, topk
+    )
 
     # Convert flat format to padded format [num_kv_heads, batch_size, topk]
-    output_indices_padded = torch.full((num_kv_heads, batch_size, topk),
-                                       -1,
-                                       dtype=torch.int32,
-                                       device=device)
+    output_indices_padded = torch.full(
+        (num_kv_heads, batch_size, topk), -1, dtype=torch.int32, device=device
+    )
 
     for batch_idx in range(batch_size):
         start = sparse_offsets[batch_idx].item()
@@ -110,8 +104,9 @@ def triton_topk_wrapper(
         actual_len = end - start
 
         for head_idx in range(num_kv_heads):
-            output_indices_padded[head_idx, batch_idx, :actual_len] = \
-                output_indices_flat[head_idx, start:end]
+            output_indices_padded[head_idx, batch_idx, :actual_len] = output_indices_flat[
+                head_idx, start:end
+            ]
 
     return output_indices_padded
 
@@ -140,8 +135,7 @@ def compute_overlap_ratio(
         for head_idx in range(num_kv_heads):
             # Extract indices for this batch and head
             triton_batch = triton_indices[head_idx, batch_idx, :].cpu().tolist()
-            reference_batch = reference_indices[head_idx,
-                                                batch_idx, :].cpu().tolist()
+            reference_batch = reference_indices[head_idx, batch_idx, :].cpu().tolist()
 
             # Filter out -1 (invalid/padding indices)
             triton_set = set([x for x in triton_batch if x >= 0])
@@ -163,30 +157,26 @@ def compute_overlap_ratio(
     [
         # Single batch, seq_len > topk
         (1, [3000], 1, 2048),
-
         # Single batch, seq_len < topk
         (1, [1000], 8, 2048),
-
         # Multiple batches, mixed seq_len (some < topk, some > topk)
         (6, [50, 150, 80, 300, 100, 256], 8, 128),
         (6, [1000, 2500, 1500, 3000, 1800, 4000], 8, 2048),
-    ])
+    ],
+)
 def test_topk_kernel(batch_size, seq_lens, num_kv_heads, topk):
-    device = torch.device('cuda')
+    device = torch.device("cuda")
     dtype = torch.float32
 
     kv_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
 
-    kv_offsets = torch.cat([
-        torch.zeros(1, dtype=torch.int32, device=device),
-        torch.cumsum(kv_lens, dim=0)
-    ]).to(device)
+    kv_offsets = torch.cat(
+        [torch.zeros(1, dtype=torch.int32, device=device), torch.cumsum(kv_lens, dim=0)]
+    ).to(device)
 
     total_tokens = kv_offsets[-1].item()
 
-    input_tensor = torch.randn((num_kv_heads, total_tokens),
-                               dtype=dtype,
-                               device=device)
+    input_tensor = torch.randn((num_kv_heads, total_tokens), dtype=dtype, device=device)
 
     triton_output = triton_topk_wrapper(
         input_tensor=input_tensor,
@@ -212,11 +202,12 @@ def test_topk_kernel(batch_size, seq_lens, num_kv_heads, topk):
 
     print(f"overlap_ratio: {overlap_ratio}")
 
-    assert overlap_ratio >= min_threshold, \
+    assert overlap_ratio >= min_threshold, (
         f"Overlap ratio {overlap_ratio:.4f} is too low (< {min_threshold})"
+    )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     print("\n" + "=" * 80)
     print("Testing Triton TopK Kernel")
     print("=" * 80)

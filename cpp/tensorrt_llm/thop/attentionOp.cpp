@@ -397,7 +397,7 @@ public:
             = sparse_attn_offsets.has_value() ? sparse_attn_offsets.value().data_ptr<int32_t>() : nullptr;
         op.mRuntimeSparseAttentionParams.sparse_attn_indices_block_size = sparse_attn_indices_block_size;
         op.mRuntimeSparseAttentionParams.sparse_attn_indices_stride
-                = sparse_attn_indices.has_value() ? sparse_attn_indices.value().size(-1) : 0;
+            = sparse_attn_indices.has_value() ? sparse_attn_indices.value().size(-1) : 0;
         if (op.isMLAEnabled() && op.mUseSparseAttention)
         {
             op.mRuntimeSparseAttentionParams.sparse_mla_topk = sparse_mla_topk;
