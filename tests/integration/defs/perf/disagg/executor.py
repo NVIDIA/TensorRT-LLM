@@ -221,15 +221,15 @@ class JobManager:
         print(f"   📁 Context directory: {context_dir}")
 
         result_dir = os.path.join(EnvManager.get_script_dir(), log_dir_name, context_dir)
-        
+
         # Copy result_dir to a timestamped backup directory
         if os.path.exists(result_dir):
             timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
             backup_dir_name = f"{os.path.basename(result_dir)}_{timestamp}"
             backup_dir = os.path.join(os.path.dirname(result_dir), backup_dir_name)
-            
+
             try:
-                print(f"   📦 Copying result directory to backup...")
+                print("   📦 Copying result directory to backup...")
                 print(f"   📁 Source: {result_dir}")
                 print(f"   📁 Destination: {backup_dir}")
                 shutil.copytree(result_dir, backup_dir)
@@ -238,7 +238,7 @@ class JobManager:
                 print(f"   ⚠️  Warning: Failed to create backup copy: {e}")
         else:
             print(f"   ⚠️  Warning: Result directory does not exist yet: {result_dir}")
-        
+
         # Call the internal implementation method
         return JobManager._check_job_result(
             job_id=job_id,
