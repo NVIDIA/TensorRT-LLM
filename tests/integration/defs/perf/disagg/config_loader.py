@@ -465,22 +465,6 @@ class ConfigLoader:
             print(f"   ⚠️  Warning: Failed to write config file {yaml_path}: {e}")
             # Don't fail the test if write fails, just log warning
 
-    def load_config_by_path(self, config_path: str) -> TestConfig:
-        """Load configuration by file path."""
-        yaml_path = Path(config_path)
-
-        # Parse path to extract metadata
-        # Expected: test_configs/{test_type}/{category}/{config}.yaml
-        parts = yaml_path.relative_to(self.base_dir).parts
-
-        if len(parts) < 3:
-            raise ValueError(f"Invalid config path structure: {config_path}")
-
-        test_type = parts[0]
-        test_category = parts[1]
-
-        return self._load_config_file(yaml_path, test_type, test_category)
-
     def get_all_models(self) -> List[str]:
         """Get list of all unique model names."""
         configs = self.scan_configs()

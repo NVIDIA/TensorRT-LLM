@@ -242,6 +242,14 @@ class JobManager:
                     print(f"   ✅ SLURM log copied successfully: {slurm_out_file}")
                 else:
                     print(f"   ⚠️  Warning: SLURM log not found: {slurm_out_file}")
+                
+                case_config_path = test_config.config_path
+                if os.path.exists(case_config_path):
+                    shutil.copy(case_config_path, backup_dir)
+                    print(f"   ✅ Case config copied successfully: {case_config_path}")
+                else:
+                    print(f"   ⚠️  Warning: Case config not found: {case_config_path}")
+
             except Exception as e:
                 print(f"   ⚠️  Warning: Failed to create backup copy: {e}")
         else:
