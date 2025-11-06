@@ -472,6 +472,7 @@ class KvCacheCreator:
                 kv_connector_manager=self._kv_connector_manager
                 if not estimating_kv_cache else None,
                 sparse_attn_config=sparse_attn_config,
+                enforce_memory_limit=estimating_kv_cache,
             )
         elif is_nemotron_hybrid(config):
             if self._max_beam_width > 1:
@@ -595,6 +596,7 @@ class KvCacheCreator:
                 kv_connector_manager=self._kv_connector_manager
                 if not estimating_kv_cache else None,
                 sparse_attn_config=sparse_attn_config,
+                enforce_memory_limit=estimating_kv_cache,
             )
         # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to self
         if model_engine.kv_cache_manager_key == ResourceManagerType.KV_CACHE_MANAGER:
