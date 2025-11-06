@@ -114,7 +114,7 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
                 },
             },
         ),
-        (
+        pytest.param(
             "meta-llama/Llama-4-Scout-17B-16E-Instruct",
             {
                 "transforms": {
@@ -122,6 +122,7 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
                     "compile_model": {"backend": "torch-opt"},
                 },
             },
+            marks=pytest.mark.skip(reason="https://nvbugs/5625972"),
         ),
         (
             "meta-llama/Llama-4-Scout-17B-16E-Instruct",
@@ -188,7 +189,6 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
         ),
     ],
 )
-@pytest.mark.skip(reason="https://nvbugs/5625972")
 def test_build_ad(model_hub_id: str, llm_extra_args: dict):
     experiment_config = get_small_model_config(model_hub_id, **llm_extra_args)
     experiment_config["args"]["runtime"] = "demollm"  # Default runtime set to demollm
