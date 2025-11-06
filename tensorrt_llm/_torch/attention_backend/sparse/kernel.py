@@ -1111,7 +1111,6 @@ def rocket_paged_kt_cache_bmm_kernel(
     for kt_block_idx_start in tl.range(0, num_kt_tokens, KT_BLOCK_SIZE):
         kt_token_indices = kt_block_idx_start + tl.arange(0, KT_BLOCK_SIZE)
         kt_token_mask = kt_token_indices < num_kt_tokens
-        kt_token_indices = tl.where(kt_token_mask, kt_token_indices, 0)
 
         block_offsets = batch_idx * max_kt_blocks_per_seq + kt_token_indices // tokens_per_block
 
@@ -1230,7 +1229,7 @@ def triton_rocket_paged_kt_cache_bmm(
         max_kt_blocks_per_seq,
         total_kt_tokens,
         sm_scale,
-        KT_BLOCK_SIZE=256,
+        KT_BLOCK_SIZE=128,
         DIM_BLOCK_SIZE=128,
     )
 
@@ -1337,7 +1336,6 @@ def triton_interleave(input_tensor: torch.Tensor, input_offsets: torch.Tensor,
 ########################################################
 
 
-# Argsort utilities for topk operations
 # Adapted from https://github.com/triton-lang/triton/issues/3698#issuecomment-2067681396
 @triton.jit
 def _compare_and_swap(x, ids, flip, i: core.constexpr, n_dims: core.constexpr):
@@ -1359,8 +1357,11 @@ def _compare_and_swap(x, ids, flip, i: core.constexpr, n_dims: core.constexpr):
     right_idx = core.reshape(right_idx, x.shape)
 
     # actual compare-and-swap
-    idtype = core.get_int_dtype(bitwidth=x.dtype.primitive_bitwidth,
-                                signed=True)
+    idtype = tl.int32
+    num_bits = x.dtype.primitive_bitwidth
+    if num_bits == 16:
+        idtype = tl.int16
+
     ileft = left.to(idtype, bitcast=True)
     iright = right.to(idtype, bitcast=True)
     ix = x.to(idtype, bitcast=True)
