@@ -215,9 +215,9 @@ class PyExecutor:
         self.responses = {}
         self.result_wait_queues = {}
 
-        self.sm_disagg_request_lock = threading.Lock()
-        self.ctx_request_cv = threading.Condition(self.sm_disagg_request_lock)
-        self.gen_request_cv = threading.Condition(self.sm_disagg_request_lock)
+        self.sm_disagg_lock = threading.Lock()
+        self.ctx_request_cv = threading.Condition(self.sm_disagg_lock)
+        self.gen_request_cv = threading.Condition(self.sm_disagg_lock)
 
         # kv cache events
         self.kv_cache_manager = self.resource_manager.resource_managers.get(
@@ -1537,7 +1537,7 @@ class PyExecutor:
                         self.executor_request_queue.
                         get_new_active_requests_queue_latency())
 
-                with self.sm_disagg_request_lock:
+                with self.sm_disagg_lock:
                     ctx_requests = get_context_requests(self.active_requests)
                     if self.is_shutdown and len(ctx_requests) == 0 \
                             and self.executor_request_queue.get_waiting_queue_size() == 0:
@@ -1560,7 +1560,8 @@ class PyExecutor:
 
                 if scheduled_batch.batch_size > 0 or (
                         self.enable_attention_dp and self.dist.tp_size > 1):
-                    self.resource_manager.prepare_resources(scheduled_batch)
+                    with self.sm_disagg_lock:
+                        self.resource_manager.prepare_resources(scheduled_batch)
 
                     with torch.cuda.stream(stream):
                         batch_outputs = self._forward_step(
@@ -1570,23 +1571,25 @@ class PyExecutor:
                         # To avoid long sync time in critical section below
                         sample_state.sampler_event.synchronize()
 
-                    with self.sm_disagg_request_lock:
+                    with self.sm_disagg_lock:
                         self._update_request_states(scheduled_batch)
                         self._update_requests(sample_state,
                                               self.resource_manager)
                         self._handle_canceled_requests()
                         finished_requests = self._handle_responses()
-                        self.ctx_request_cv.notify()
 
-                    attn_metadata = getattr(self.ctx_model_engine,
-                                            'attn_metadata', None)
-                    kv_cache_dtype_byte_size = getattr(
-                        self.ctx_model_engine, 'kv_cache_dtype_byte_size', None)
-                    self.resource_manager.update_resources(
-                        scheduled_batch, attn_metadata,
-                        kv_cache_dtype_byte_size)
-                    if self.enable_kv_cache_events:
-                        self._add_kv_cache_events()
+                        attn_metadata = getattr(self.ctx_model_engine,
+                                                'attn_metadata', None)
+                        kv_cache_dtype_byte_size = getattr(
+                            self.ctx_model_engine, 'kv_cache_dtype_byte_size',
+                            None)
+                        self.resource_manager.update_resources(
+                            scheduled_batch, attn_metadata,
+                            kv_cache_dtype_byte_size)
+                        if self.enable_kv_cache_events:
+                            self._add_kv_cache_events()
+
+                        self.ctx_request_cv.notify()
 
                 if self.enable_iter_perf_stats and sample_state is not None:
                     iter_stats.iter_counter = self.ctx_model_engine.iter_counter
@@ -1622,7 +1625,7 @@ class PyExecutor:
                         num_new_active_requests=0,
                         new_active_requests_queue_latency_ms=0)
 
-                with self.sm_disagg_request_lock:
+                with self.sm_disagg_lock:
                     self._pad_attention_dp_dummy_request()
 
                     gen_requests = get_generation_requests(self.active_requests)
@@ -1642,7 +1645,8 @@ class PyExecutor:
                     self._pause_requests(scheduled_batch.paused_requests)
 
                 if scheduled_batch.batch_size > 0:
-                    self.resource_manager.prepare_resources(scheduled_batch)
+                    with self.sm_disagg_lock:
+                        self.resource_manager.prepare_resources(scheduled_batch)
 
                     # The generation requests that just finished context phase
                     # needs to be in front of the batch due to the assumptions
@@ -1663,7 +1667,7 @@ class PyExecutor:
                             self.previous_batch.sample_state.sampler_event.synchronize(
                             )
 
-                    with self.sm_disagg_request_lock:
+                    with self.sm_disagg_lock:
                         if self.previous_batch is not None:
                             self._update_requests(
                                 self.previous_batch.sample_state)
@@ -1673,7 +1677,7 @@ class PyExecutor:
                             scheduled_batch, batch_outputs)
                         assert sample_state is not None, "Sampling failed"
 
-                    with self.sm_disagg_request_lock:
+                    with self.sm_disagg_lock:
                         self._update_request_states(scheduled_batch)
 
                         if self.previous_batch is not None:
