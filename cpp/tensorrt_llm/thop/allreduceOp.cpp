@@ -921,7 +921,7 @@ private:
             }
             else
             {
-                runtime_strategy = selectImplementation(seq_len, size, mGroup.size(), mType);
+                runtime_strategy = selectImplementation(seq_len, size);
             }
         }
         return runtime_strategy;
