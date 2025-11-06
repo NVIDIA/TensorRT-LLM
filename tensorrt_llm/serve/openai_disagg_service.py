@@ -59,6 +59,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         server_start_timeout_secs: int = 180,
         perf_metrics_collector: Optional[DisaggPerfMetricsCollector] = None,
         disagg_cluster_storage: Optional[ClusterStorage] = None,
+        health_check_interval_secs: int = 3,
     ):
         self._config = config
         self._ctx_router = ctx_router
@@ -70,6 +71,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         self._server_start_timeout_secs = server_start_timeout_secs
         self._perf_metrics_collector = perf_metrics_collector
         self._cluster_storage = disagg_cluster_storage
+        self._health_check_interval_secs = health_check_interval_secs
 
         self._ctx_client = None
         self._gen_client = None
@@ -250,7 +252,7 @@ class OpenAIDisaggregatedService(OpenAIService):
     async def _wait_for_all_servers_ready(self) -> None:
         async def check_servers_ready():
             elapsed_time = 0
-            interval = 3
+            interval = self._health_check_interval_secs
             while elapsed_time < self._server_start_timeout_secs:
                 _, unready_ctx_servers = await self._ctx_client.check_ready()
                 _, unready_gen_servers = await self._gen_client.check_ready()
