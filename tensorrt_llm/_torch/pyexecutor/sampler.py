@@ -19,7 +19,7 @@ from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
 from itertools import repeat
-from typing import Any, Callable, List, Optional, TypeVar, cast
+from typing import Any, Callable, List, Optional, Type, TypeVar, cast
 
 import torch
 import torch.nn.functional as F
@@ -53,6 +53,7 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
 
+from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..speculative.spec_tree_manager import SpecTreeManager
 from .finish_reason import FinishedState
 from .llm_request import LlmRequest, LlmRequestState, get_draft_token_length
@@ -60,6 +61,7 @@ from .resource_manager import ResourceManager, ResourceManagerType
 from .sampling_utils import (
     GREEDY,
     GenericStrategyKeyType,
+    GroupedStrategySampler,
     SimpleGroupedStrategySampler,
     Strategy,
     UtilsSamplingParams,
@@ -266,7 +268,7 @@ def _request_strategy(request: LlmRequest, *, vocab_size: int) -> Strategy:
 def _group_requests_by_strategy_key(
     requests: Iterable[LlmRequest],
     *,
-    strategy_to_key: Callable[[Strategy], GenericStrategyKeyType],
+    strategy_to_key: Callable[[Strategy, bool], GenericStrategyKeyType],
     pin_memory: bool = False,
     vocab_size: int,
 ) -> dict[tuple[GenericStrategyKeyType, bool], tuple[torch.Tensor, List[Strategy]]]:
@@ -276,8 +278,8 @@ def _group_requests_by_strategy_key(
     )
     for req_index, req in enumerate(requests):
         strategy = _request_strategy(req, vocab_size=vocab_size)
-        strategy_key = strategy_to_key(strategy)
         speculation_needs_probs = req.py_draft_logits is not None and strategy is not GREEDY
+        strategy_key = strategy_to_key(strategy, speculation_needs_probs)
         group_dict_entry = group_dict[(strategy_key, speculation_needs_probs)]
         group_dict_entry[0].append(req_index)
         group_dict_entry[1].append(strategy)
@@ -586,6 +588,7 @@ class TorchSampler(Sampler):
         max_num_sequences: int
         max_beam_width: int
         max_total_draft_tokens: int
+        disable_flash_infer_sampling: bool = False
 
     def __init__(self, args: Args):
         self.max_seq_len = args.max_seq_len
@@ -601,6 +604,13 @@ class TorchSampler(Sampler):
         # So, we temporarily exit inference mode.
         with torch.inference_mode(False):
             self.store = self.create_store()
+
+        self._grouped_sampler_cls: Type[GroupedStrategySampler]
+        if IS_FLASHINFER_AVAILABLE and not args.disable_flash_infer_sampling:
+            from .sampling_utils_flashinfer import FlashInferGroupedStrategySampler
+            self._grouped_sampler_cls = FlashInferGroupedStrategySampler
+        else:
+            self._grouped_sampler_cls = SimpleGroupedStrategySampler
 
         # Initialize seed for multi-GPU consistency
         self._global_seed = 42
@@ -1181,7 +1191,7 @@ class TorchSampler(Sampler):
             requests,
             pin_memory=True,
             vocab_size=logits_cuda.size(1),
-            strategy_to_key=SimpleGroupedStrategySampler.strategy_grouping_key,
+            strategy_to_key=self._grouped_sampler_cls.strategy_grouping_key,
         )
         generator_cuda = self.get_generator(cuda_device)
 
@@ -1238,7 +1248,7 @@ class TorchSampler(Sampler):
                 for _ in range(steps)
             ]
             group_next_tokens_cuda, group_softmax_cuda = (
-                SimpleGroupedStrategySampler.sample_grouped_strategies(
+                self._grouped_sampler_cls.sample_grouped_strategies(
                     strategy_key,
                     group_strategies_per_step,
                     group_logits_cuda,

@@ -216,7 +216,7 @@ def get_guided_decoding_config(guided_decoding_backend: str,
 
 def create_py_executor(
     llm_args: TorchLlmArgs,
-    checkpoint_dir: str = None,
+    checkpoint_dir: Optional[str] = None,
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
 ) -> PyExecutor:
@@ -513,16 +513,19 @@ def create_py_executor(
                     )
 
     with allocation_scope(ExecutorMemoryType.SAMPLER, RestoreMode.PINNED):
-        sampler = instantiate_sampler(model_engine,
-                                      pytorch_backend_config,
-                                      mapping,
-                                      max_batch_size=max_batch_size,
-                                      max_beam_width=max_beam_width,
-                                      max_seq_len=max_seq_len,
-                                      mm_encoder_only=mm_encoder_only,
-                                      speculative_config=spec_config,
-                                      decoding_config=decoding_config,
-                                      kv_cache_config=kv_cache_config)
+        sampler = instantiate_sampler(
+            model_engine,
+            pytorch_backend_config,
+            mapping,
+            max_batch_size=max_batch_size,
+            max_beam_width=max_beam_width,
+            max_seq_len=max_seq_len,
+            mm_encoder_only=mm_encoder_only,
+            speculative_config=spec_config,
+            decoding_config=decoding_config,
+            kv_cache_config=kv_cache_config,
+            disable_flash_infer_sampling=llm_args._disable_flash_infer_sampling,
+        )
         logger.info(f"Using Sampler: {type(sampler).__name__}")
 
     if kv_connector_config is not None:
