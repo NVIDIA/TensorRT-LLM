@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import time
 
 import pytest
@@ -794,3 +795,272 @@ class TestResponsePickleError:
                         pass
 
                 assert "Failed to pickle response" in str(exc_info.value)
+
+
+class TestRpcRobustness:
+
+    class App:
+        LARGE_RESPONSE_SIZE = 1024 * 1024 * 10  # 10MB
+
+        def remote_with_large_response(self):
+            return b"a" * self.LARGE_RESPONSE_SIZE
+
+        async def streaming_with_large_response(self):
+            for i in range(1000):
+                yield b"a" * self.LARGE_RESPONSE_SIZE
+
+        async def get_streaming(self):
+            for i in range(1000):
+                yield i
+
+    def test_remote_with_large_response(self):
+        addr = get_unique_ipc_addr()
+        with RpcServerWrapper(self.App(), addr=addr) as server:
+            with RPCClient(addr) as client:
+                for i in range(100):
+                    result = client.remote_with_large_response().remote()
+                    assert result == b"a" * self.App.LARGE_RESPONSE_SIZE
+
+    @pytest.mark.asyncio
+    async def test_streaming_with_large_response(self):
+        addr = get_unique_ipc_addr()
+        with RpcServerWrapper(self.App(), addr=addr) as server:
+            with RPCClient(addr) as client:
+                async for result in client.streaming_with_large_response(
+                ).remote_streaming():
+                    assert result == b"a" * self.App.LARGE_RESPONSE_SIZE
+
+    def test_threaded_streaming(self):
+        """Test that get_streaming can be safely called from multiple threads."""
+        # All the async remote calls will be submitted to the RPCClient._loop, let
+        # it handle the concurrent requests.  Once the response arrives, it will
+        # be processed by the RPCClient._loop, and dispatch to the corresponding
+        # task via the dedicated AsyncQueue.
+        addr = get_unique_ipc_addr()
+        num_threads = 100
+        items_per_stream = 100
+
+        # Use shorter stream for faster test
+        class TestApp:
+
+            async def get_streaming(self):
+                for i in range(items_per_stream):
+                    yield i
+
+        with RpcServerWrapper(TestApp(), addr=addr,
+                              async_run_task=True) as server:
+            errors = []
+            results = [None] * num_threads
+
+            def stream_consumer(thread_id: int):
+                """Function to be executed in each thread."""
+                print(f"Thread {thread_id} started")
+                try:
+                    # Each thread creates its own client connection
+                    with RPCClient(addr) as client:
+                        collected = []
+
+                        async def consume_stream():
+                            async for value in client.get_streaming(
+                            ).remote_streaming():
+                                collected.append(value)
+
+                        # Run the async streaming call in this thread
+                        asyncio.run(consume_stream())
+
+                        # Verify we got all expected values
+                        expected = list(range(items_per_stream))
+                        if collected != expected:
+                            errors.append(
+                                f"Thread {thread_id}: Expected {expected}, got {collected}"
+                            )
+                        else:
+                            results[thread_id] = collected
+
+                except Exception as e:
+                    errors.append(
+                        f"Thread {thread_id}: {type(e).__name__}: {str(e)}")
+
+            # Create and start multiple threads
+            threads = []
+            for i in range(num_threads):
+                thread = threading.Thread(target=stream_consumer, args=(i, ))
+                threads.append(thread)
+                thread.start()
+
+            # Wait for all threads to complete
+            for thread in threads:
+                thread.join(timeout=30)  # 30 second timeout per thread
+
+            # Check for any errors
+            if errors:
+                error_msg = "\n".join(errors)
+                pytest.fail(
+                    f"Thread safety test failed with errors:\n{error_msg}")
+
+            # Verify all threads completed successfully
+            for i, result in enumerate(results):
+                assert result is not None, f"Thread {i} did not complete successfully"
+                assert len(
+                    result
+                ) == items_per_stream, f"Thread {i} got {len(result)} items, expected {items_per_stream}"
+
+    def test_threaded_remote_call(self):
+        """Test that regular remote calls can be safely made from multiple threads."""
+        # Each thread will make multiple synchronous remote calls
+        # This tests if RPCClient can handle concurrent requests from different threads
+        addr = get_unique_ipc_addr()
+        num_threads = 100
+        calls_per_thread = 100
+
+        class TestApp:
+
+            def __init__(self):
+                self.call_count = 0
+                self.lock = threading.Lock()
+
+            def increment(self, v):
+                with self.lock:
+                    self.call_count += 1
+                threading.get_ident()
+                return v + 1
+
+        app = TestApp()
+        with RpcServerWrapper(app, addr=addr) as server:
+            errors = []
+            results = [None] * num_threads
+
+            client = RPCClient(addr)
+
+            def remote_caller(thread_id: int):
+                """Function to be executed in each thread."""
+                print(f"Thread {thread_id} started")
+                try:
+                    thread_results = []
+
+                    for i in range(calls_per_thread):
+                        result = client.increment(i).remote()
+                        expected = i + 1
+
+                        if result != expected:
+                            errors.append(
+                                f"Thread {thread_id}, call {i}: Expected {expected}, got {result}"
+                            )
+                        thread_results.append(result)
+
+                    results[thread_id] = thread_results
+
+                except Exception as e:
+                    errors.append(
+                        f"Thread {thread_id}: {type(e).__name__}: {str(e)}")
+                finally:
+                    print(f"Thread {thread_id} completed")
+
+            # Create and start multiple threads
+            threads = []
+            for i in range(num_threads):
+                thread = threading.Thread(target=remote_caller,
+                                          args=(i, ),
+                                          daemon=True)
+                threads.append(thread)
+                thread.start()
+
+            # Wait for all threads to complete
+            for thread in threads:
+                thread.join(timeout=30)  # 30 second timeout per thread
+
+            client.close()
+
+            # Check for any errors
+            if errors:
+                error_msg = "\n".join(errors)
+                pytest.fail(
+                    f"Thread safety test failed with errors:\n{error_msg}")
+
+            # Verify all threads completed successfully
+            for i, result in enumerate(results):
+                assert result is not None, f"Thread {i} did not complete successfully"
+                assert len(
+                    result
+                ) == calls_per_thread, f"Thread {i} made {len(result)} calls, expected {calls_per_thread}"
+
+            # Verify total call count
+            expected_total_calls = num_threads * calls_per_thread
+            assert app.call_count == expected_total_calls, \
+                f"Expected {expected_total_calls} total calls, but got {app.call_count}"
+
+    def test_mimic_rpc_proxy(self):
+        """ Test mimic the rpc proxy behavior. """
+        addr = get_unique_ipc_addr()
+        num_requests = 10
+        item_size = 10
+
+        class App:
+
+            def __init__(self):
+                self.queue = asyncio.Queue()
+
+            async def submit(self, v: int):
+                await self.queue.put(v)
+
+            async def executor_and_stream(self):
+                while True:
+                    v = await self.queue.get()
+                    if v is None:
+                        break
+                    yield list(range(v))
+
+        app = App()
+        with RpcServerWrapper(app, addr=addr, async_run_task=True) as server:
+            received_payloads = []
+            results_fetched_event = threading.Event()
+
+            def fetch_responses_loop_async():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                client = None
+                try:
+                    client = RPCClient(addr)
+
+                    async def fetch():
+                        nonlocal received_payloads
+                        async for result in client.executor_and_stream(
+                        ).remote_streaming():
+                            received_payloads.append(result)
+                            if len(received_payloads) == num_requests:
+                                results_fetched_event.set()
+                                break
+
+                    loop.run_until_complete(fetch())
+                finally:
+                    if client:
+                        client.close()
+                    loop.close()
+
+            fetcher_thread = threading.Thread(target=fetch_responses_loop_async)
+            fetcher_thread.start()
+
+            with RPCClient(addr) as client:
+                for i in range(num_requests):
+                    client.submit(i + 1).remote(need_response=False)
+                    print(f"Submitted request {i + 1}")
+
+            # Wait for the fetcher to finish
+            fetcher_thread.join(timeout=10.0)
+            if fetcher_thread.is_alive():
+                raise AssertionError("Fetcher thread did not exit in time")
+
+            # Signal the server to shutdown the stream
+            with RPCClient(addr) as client:
+                client.submit(None).remote(need_response=False)
+
+            assert len(received_payloads) == num_requests
+            # The order is not guaranteed.
+            sizes = sorted([len(p) for p in received_payloads])
+            expected_sizes = sorted([i + 1 for i in range(num_requests)])
+            assert sizes == expected_sizes
+
+
+if __name__ == "__main__":
+    test_rpc = TestRpcRobustness()
+    test_rpc.test_mimic_rpc_proxy()

@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import os
 import pickle  # nosec B403
+import threading
 import time
 import traceback
 from queue import Queue
@@ -65,6 +66,8 @@ class ZeroMqQueue:
         self.hmac_key = address[1] if address is not None else None
         self.use_hmac_encryption = use_hmac_encryption
 
+        self._setup_lock = threading.Lock()
+
         # Check HMAC key condition
         if self.use_hmac_encryption and not self.is_server and self.hmac_key is None:
             raise ValueError(
@@ -93,18 +96,23 @@ class ZeroMqQueue:
             self.address = (self.address_endpoint, self.hmac_key)
 
     def setup_lazily(self):
+        # Early return if setup is already done
         if self._setup_done:
             return
-        self._setup_done = True
 
-        if not self.is_server:
-            logger_debug(
-                f"Client [{self.name}] connecting to {self.address_endpoint} in {self.socket_type_str[self.socket_type]}\n",
-                "green")
-            self.socket.connect(self.address_endpoint)
+        with self._setup_lock:
+            if self._setup_done:
+                return
+            self._setup_done = True
 
-        self.poller = zmq.Poller()
-        self.poller.register(self.socket, zmq.POLLIN)
+            if not self.is_server:
+                logger_debug(
+                    f"Client [{self.name}] connecting to {self.address_endpoint} in {self.socket_type_str[self.socket_type]}\n",
+                    "green")
+                self.socket.connect(self.address_endpoint)
+
+            self.poller = zmq.Poller()
+            self.poller.register(self.socket, zmq.POLLIN)
 
     def poll(self, timeout: int) -> bool:
         """

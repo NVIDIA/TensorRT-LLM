@@ -95,4 +95,4 @@ class TestRpcProxy:
 
 
 if __name__ == "__main__":
-    TestRpcProxy().test_tp1(1)
+    TestRpcProxy().test_tp1(10)

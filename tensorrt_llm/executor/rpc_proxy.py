@@ -145,7 +145,7 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
             existing_loop = asyncio.get_running_loop()
             # If we're already in an async context, schedule the task on the existing loop
             logger_debug(
-                "Found existing event loop, scheduling main loop task on it",
+                "[proxy] Found existing event loop, scheduling main loop task on it",
                 color="yellow")
             self.main_loop = existing_loop
             self.main_loop_task_obj = asyncio.create_task(main_loop_task())
@@ -155,7 +155,7 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         except RuntimeError:
             # No running loop, create one in a separate thread
             logger_debug(
-                "No existing event loop, creating new one in separate thread",
+                "[proxy] No existing event loop, creating new one in separate thread",
                 color="yellow")
 
             def _run_main_loop_task():
@@ -222,6 +222,10 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
 
         if async_queues:
             _SyncQueue.notify_many(event_loop, async_queues)
+
+        logger_debug(
+            f"[proxy] fetched {len(responses)} responses and notified {len(async_queues)} async queues",
+            color="green")
 
     def _handle_iteration_data(self, data, result_singleton, data_type: str):
         """Generic method to handle iteration data received from RPC worker.
@@ -339,6 +343,10 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
                 self._results.pop(client_id, None)
                 raise
 
+            logger_debug(
+                f"[proxy] Submitted request {request.id} to RPC worker",
+                color="green")
+
         return result
 
     def fetch_stats_remote(self):
@@ -348,7 +356,7 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         return self.rpc_client.setup_engine().remote(need_response=True)
 
     def shutdown_remote(self):
-        logger_debug(f"Shutting down rpc remote", color="yellow")
+        logger_debug(f"[proxy] Shutting down rpc remote", color="yellow")
         self.rpc_client.shutdown().remote()
 
     def abort_request(self, request_id: int) -> None:
@@ -358,7 +366,7 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         if self._shutdown_event.is_set():
             return
         self._shutdown_event.set()
-        logger_debug(f"Shutting down GenerationExecutorRpcProxy",
+        logger_debug(f"[proxy] Shutting down GenerationExecutorRpcProxy",
                      color="yellow")
 
         # 1. shutdown the rpc server (PyExecutor Rank 0 + RPC server)
@@ -397,9 +405,10 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         # processes are shutdown
         if hasattr(self, 'mpi_session') and self.mpi_session is not None:
             try:
-                logger_debug(f"Shutting down mpi session", color="yellow")
+                logger_debug(f"[proxy] Shutting down mpi session",
+                             color="yellow")
                 self.mpi_session.shutdown()
-                logger_debug(f"Mpi session shutdown", color="yellow")
+                logger_debug(f"[proxy] Mpi session shutdown", color="yellow")
                 self.mpi_session = None
             except Exception as e:
                 logger.warning(f"Error during MPI session shutdown: {e}")
@@ -414,7 +423,8 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        logger_debug("GenerationExecutorRpcProxy is exiting", color="yellow")
+        logger_debug("[proxy] GenerationExecutorRpcProxy is exiting",
+                     color="yellow")
         self.shutdown()
 
     def _create_mpi_session(self, model_world_size: int,
@@ -422,11 +432,11 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
         if mpi_session is None:
             if mpi_process_pre_spawned:
-                logger_debug('create comm session ...\n', "yellow")
+                logger_debug('[proxy] create comm session ...\n', "yellow")
                 self.mpi_session = create_mpi_comm_session(model_world_size)
             else:
-                logger_debug('create pool session ...\n', "yellow")
+                logger_debug('[proxy] create pool session ...\n', "yellow")
                 self.mpi_session = MpiPoolSession(n_workers=model_world_size)
         else:
-            logger_debug('using external mpi session ...\n', "yellow")
+            logger_debug('[proxy] using external mpi session ...\n', "yellow")
             self.mpi_session = mpi_session

@@ -98,7 +98,8 @@ class RPCClient:
                                           is_server=False,
                                           is_async=True,
                                           use_hmac_encryption=False,
-                                          socket_type=zmq.DEALER)
+                                          socket_type=zmq.DEALER,
+                                          name="rpc_client")
         self._pending_futures = {}
         # map request_id to the queue for streaming responses
         self._streaming_queues: Dict[str, AsyncQueue] = {}
@@ -111,6 +112,8 @@ class RPCClient:
         self._loop = None
         self._loop_thread = None
         self._reader_asyncio_task = None  # Track the asyncio task for proper cancellation
+        self._loop_lock = threading.Lock(
+        )  # Lock to protect event loop initialization
 
         logger_debug(f"RPC Client initialized. Connected to {self._address}")
 
@@ -132,12 +135,17 @@ class RPCClient:
 
         logger_debug("RPC Client closing")
 
-        # Cancel the reader task first to avoid socket closure errors
+        # Notify any active streaming consumers so they don't hang waiting for
+        # further data. This must be done *before* shutting down the event
+        # loop/executor because they may depend on the loop to complete.
+        self._broadcast_streaming_error(RPCCancelled("RPC client closed"))
+
+        # 1. Cancel the reader task
         if self._reader_task and not self._reader_task.done():
             if self._loop and self._loop.is_running(
             ) and self._reader_asyncio_task:
                 try:
-                    # Cancel the asyncio task in its event loop
+
                     async def cancel_reader_task():
                         if self._reader_asyncio_task and not self._reader_asyncio_task.done(
                         ):
@@ -145,7 +153,7 @@ class RPCClient:
                             try:
                                 await self._reader_asyncio_task
                             except asyncio.CancelledError:
-                                pass  # Expected
+                                pass
 
                     cancel_future = asyncio.run_coroutine_threadsafe(
                         cancel_reader_task(), self._loop)
@@ -155,23 +163,24 @@ class RPCClient:
                     logger.warning("Reader task did not exit gracefully")
                 except Exception as e:
                     logger_debug(f"Reader task cleanup: {e}")
-            self._reader_task = None
-            self._reader_asyncio_task = None
 
-        # Now close the socket after reader has stopped
-        if self._client_socket:
-            self._client_socket.close()
-            self._client_socket = None
-
-        # Stop the event loop
+        # 2. Stop the event loop
         if self._loop and self._loop.is_running():
             self._loop.call_soon_threadsafe(self._loop.stop)
+
+        # 3. Join the event loop thread
         if self._loop_thread:
             self._loop_thread.join(timeout=2.0)
-            self._loop_thread = None
+            if self._loop_thread.is_alive():
+                logger.warning("Event loop thread did not exit gracefully")
 
+        # 4. Shutdown the executor
         if self._executor:
             self._executor.shutdown(wait=True)
+
+        # 5. Close the socket
+        if self._client_socket:
+            self._client_socket.close()
 
         logger_debug("RPC Client closed")
 
@@ -267,15 +276,8 @@ class RPCClient:
 
                 target_loop.call_soon_threadsafe(safe_set_exception)
 
-        # Also signal error to streaming queues
-        for queue in self._streaming_queues.values():
-            await queue.put(
-                RPCResponse("",
-                            result=None,
-                            error=exception,
-                            is_streaming=False,
-                            chunk_index=0,
-                            stream_status='error'))
+        # Propagate to streaming queues via common helper
+        self._broadcast_streaming_error(exception)
 
     async def _wait_for_response(self) -> RPCResponse:
         """Wait for a response from the socket.
@@ -424,21 +426,32 @@ class RPCClient:
             self._pending_futures.pop(request_id, None)
 
     def _ensure_event_loop(self):
-        """Ensure we have a running event loop in a background thread."""
-        if self._loop is None or not self._loop.is_running():
-            self._loop = asyncio.new_event_loop()
+        """Ensure we have a running event loop in a background thread.
 
-            def run_loop():
-                asyncio.set_event_loop(self._loop)
-                self._loop.run_forever()
+        This method is thread-safe and ensures only one event loop is created
+        even when called from multiple threads simultaneously.
+        """
+        # Fast path: check without lock first
+        if self._loop is not None and self._loop.is_running():
+            return
 
-            self._loop_thread = threading.Thread(target=run_loop,
-                                                 daemon=True,
-                                                 name="rpc_client_loop")
-            self._loop_thread.start()
+        # Slow path: need to create/start loop
+        with self._loop_lock:
+            # Double-check after acquiring lock
+            if self._loop is None or not self._loop.is_running():
+                self._loop = asyncio.new_event_loop()
 
-            # Give the loop a moment to start
-            time.sleep(0.2)
+                def run_loop():
+                    asyncio.set_event_loop(self._loop)
+                    self._loop.run_forever()
+
+                self._loop_thread = threading.Thread(target=run_loop,
+                                                     daemon=True,
+                                                     name="rpc_client_loop")
+                self._loop_thread.start()
+
+                # Give the loop a moment to start
+                time.sleep(0.2)
 
     def _call_sync(self, method_name, *args, **kwargs):
         """Synchronous version of RPC call."""
@@ -552,6 +565,35 @@ class RPCClient:
             # Clean up
             self._streaming_queues.pop(request_id, None)
 
+    def _broadcast_streaming_error(self, exc: Exception):
+        """Send an error response to all pending streaming queues so that
+        any coroutines blocked in _call_streaming can exit promptly.
+
+        Args:
+            exc: The exception instance to propagate downstream.
+        """
+        # Iterate over a copy because callbacks may mutate the dict
+        for request_id, queue in list(self._streaming_queues.items()):
+            if not isinstance(queue, AsyncQueue):
+                continue
+            try:
+                # Use the underlying sync_q to ensure cross-thread delivery
+                queue.sync_q.put(
+                    RPCResponse(
+                        request_id,
+                        result=None,
+                        error=exc,
+                        is_streaming=True,
+                        chunk_index=0,
+                        stream_status='error',
+                    ))
+            except Exception as e:
+                # Best-effort; log and continue
+                if enable_llmapi_debug() or logger.level == 'debug':
+                    logger_debug(
+                        f"Failed to broadcast streaming error for {request_id}: {e}"
+                    )
+
     def get_server_attr(self, name: str):
         """ Get the attribute of the RPC server.
         This is mainly used for testing. """
@@ -579,7 +621,4 @@ class RPCClient:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        self.close()
-
-    def __del__(self):
         self.close()
