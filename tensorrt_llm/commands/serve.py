@@ -33,6 +33,7 @@ from tensorrt_llm.llmapi.mpi_session import find_free_port
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
+from tensorrt_llm.serve.tool_parser import ToolParserFactory
 
 # Global variable to store the Popen object of the child process
 _child_p_global: Optional[subprocess.Popen] = None
@@ -75,24 +76,29 @@ def _signal_handler_cleanup_child(signum, frame):
     sys.exit(128 + signum)
 
 
-def get_llm_args(model: str,
-                 tokenizer: Optional[str] = None,
-                 backend: str = "pytorch",
-                 max_beam_width: int = BuildConfig.max_beam_width,
-                 max_batch_size: int = BuildConfig.max_batch_size,
-                 max_num_tokens: int = BuildConfig.max_num_tokens,
-                 max_seq_len: int = BuildConfig.max_seq_len,
-                 tensor_parallel_size: int = 1,
-                 pipeline_parallel_size: int = 1,
-                 moe_expert_parallel_size: Optional[int] = None,
-                 gpus_per_node: Optional[int] = None,
-                 free_gpu_memory_fraction: float = 0.9,
-                 num_postprocess_workers: int = 0,
-                 trust_remote_code: bool = False,
-                 reasoning_parser: Optional[str] = None,
-                 fail_fast_on_attention_window_too_large: bool = False,
-                 enable_chunked_prefill: bool = False,
-                 **llm_args_extra_dict: Any):
+def get_llm_args(
+        model: str,
+        tokenizer: Optional[str] = None,
+        backend: str = "pytorch",
+        max_beam_width: int = BuildConfig.model_fields["max_beam_width"].
+    default,
+        max_batch_size: int = BuildConfig.model_fields["max_batch_size"].
+    default,
+        max_num_tokens: int = BuildConfig.model_fields["max_num_tokens"].
+    default,
+        max_seq_len: int = BuildConfig.model_fields["max_seq_len"].default,
+        tensor_parallel_size: int = 1,
+        pipeline_parallel_size: int = 1,
+        moe_expert_parallel_size: Optional[int] = None,
+        gpus_per_node: Optional[int] = None,
+        free_gpu_memory_fraction: float = 0.9,
+        num_postprocess_workers: int = 0,
+        trust_remote_code: bool = False,
+        reasoning_parser: Optional[str] = None,
+        fail_fast_on_attention_window_too_large: bool = False,
+        otlp_traces_endpoint: Optional[str] = None,
+        enable_chunked_prefill: bool = False,
+        **llm_args_extra_dict: Any):
 
     if gpus_per_node is None:
         gpus_per_node = device_count()
@@ -134,6 +140,7 @@ def get_llm_args(model: str,
         "reasoning_parser": reasoning_parser,
         "fail_fast_on_attention_window_too_large":
         fail_fast_on_attention_window_too_large,
+        "otlp_traces_endpoint": otlp_traces_endpoint,
         "enable_chunked_prefill": enable_chunked_prefill,
     }
 
@@ -144,6 +151,7 @@ def launch_server(
         host: str,
         port: int,
         llm_args: dict,
+        tool_parser: Optional[str] = None,
         metadata_server_cfg: Optional[MetadataServerConfig] = None,
         server_role: Optional[ServerRole] = None,
         disagg_cluster_config: Optional[DisaggClusterConfig] = None,
@@ -167,6 +175,7 @@ def launch_server(
 
     server = OpenAIServer(llm=llm,
                           model=model,
+                          tool_parser=tool_parser,
                           server_role=server_role,
                           metadata_server_cfg=metadata_server_cfg,
                           disagg_cluster_config=disagg_cluster_config,
@@ -240,23 +249,23 @@ class ChoiceWithAlias(click.Choice):
               help="The logging level.")
 @click.option("--max_beam_width",
               type=int,
-              default=BuildConfig.max_beam_width,
+              default=BuildConfig.model_fields["max_beam_width"].default,
               help="Maximum number of beams for beam search decoding.")
 @click.option("--max_batch_size",
               type=int,
-              default=BuildConfig.max_batch_size,
+              default=BuildConfig.model_fields["max_batch_size"].default,
               help="Maximum number of requests that the engine can schedule.")
 @click.option(
     "--max_num_tokens",
     type=int,
-    default=BuildConfig.max_num_tokens,
+    default=BuildConfig.model_fields["max_num_tokens"].default,
     help=
     "Maximum number of batched input tokens after padding is removed in each batch."
 )
 @click.option(
     "--max_seq_len",
     type=int,
-    default=BuildConfig.max_seq_len,
+    default=BuildConfig.model_fields["max_seq_len"].default,
     help="Maximum total length of one request, including prompt and outputs. "
     "If unspecified, the value is deduced from the model config.")
 @click.option("--tp_size", type=int, default=1, help='Tensor parallelism size.')
@@ -305,6 +314,12 @@ class ChoiceWithAlias(click.Choice):
     default=None,
     help="[Experimental] Specify the parser for reasoning models.",
 )
+@click.option(
+    "--tool_parser",
+    type=click.Choice(ToolParserFactory.parsers.keys()),
+    default=None,
+    help="[Experimental] Specify the parser for tool models.",
+)
 @click.option("--metadata_server_config_file",
               type=str,
               default=None,
@@ -322,6 +337,10 @@ class ChoiceWithAlias(click.Choice):
     help=
     "Exit with runtime error when attention window is too large to fit even a single sequence in the KV cache."
 )
+@click.option("--otlp_traces_endpoint",
+              type=str,
+              default=None,
+              help="Target URL to which OpenTelemetry traces will be sent.")
 @click.option("--disagg_cluster_uri",
               type=str,
               default=None,
@@ -342,10 +361,11 @@ def serve(
         gpus_per_node: Optional[int], kv_cache_free_gpu_memory_fraction: float,
         num_postprocess_workers: int, trust_remote_code: bool,
         extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
-        metadata_server_config_file: Optional[str], server_role: Optional[str],
+        tool_parser: Optional[str], metadata_server_config_file: Optional[str],
+        server_role: Optional[str],
         fail_fast_on_attention_window_too_large: bool,
-        enable_chunked_prefill: bool, disagg_cluster_uri: Optional[str],
-        media_io_kwargs: Optional[str]):
+        otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
+        disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -371,6 +391,7 @@ def serve(
         reasoning_parser=reasoning_parser,
         fail_fast_on_attention_window_too_large=
         fail_fast_on_attention_window_too_large,
+        otlp_traces_endpoint=otlp_traces_endpoint,
         enable_chunked_prefill=enable_chunked_prefill)
 
     llm_args_extra_dict = {}
@@ -412,8 +433,8 @@ def serve(
 
     multimodal_server_config = MultimodalServerConfig(
         media_io_kwargs=parsed_media_io_kwargs)
-    launch_server(host, port, llm_args, metadata_server_cfg, server_role,
-                  disagg_cluster_config, multimodal_server_config)
+    launch_server(host, port, llm_args, tool_parser, metadata_server_cfg,
+                  server_role, disagg_cluster_config, multimodal_server_config)
 
 
 @click.command("mm_embedding_serve")
@@ -429,7 +450,7 @@ def serve(
               help="The logging level.")
 @click.option("--max_batch_size",
               type=int,
-              default=BuildConfig.max_batch_size,
+              default=BuildConfig.model_fields["max_batch_size"].default,
               help="Maximum number of requests that the engine can schedule.")
 @click.option(
     "--max_num_tokens",
@@ -522,10 +543,14 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
     help=
     "The interval of logging metrics in seconds. Set to 0 to disable metrics logging."
 )
-def disaggregated(config_file: Optional[str],
-                  metadata_server_config_file: Optional[str],
-                  server_start_timeout: int, request_timeout: int,
-                  log_level: str, metrics_log_interval: int):
+def disaggregated(
+    config_file: Optional[str],
+    metadata_server_config_file: Optional[str],
+    server_start_timeout: int,
+    request_timeout: int,
+    log_level: str,
+    metrics_log_interval: int,
+):
     """Running server in disaggregated mode"""
 
     logger.set_level(log_level)

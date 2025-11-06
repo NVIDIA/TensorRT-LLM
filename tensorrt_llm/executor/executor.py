@@ -5,6 +5,7 @@ import platform
 import signal
 import traceback
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from pathlib import Path
 from queue import Queue
 from typing import (TYPE_CHECKING, AsyncIterable, Dict, Generator, List,
@@ -123,6 +124,7 @@ class GenerationExecutor(ABC):
         streaming: bool = False,
         kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
         disaggregated_params: Optional[DisaggregatedParams] = None,
+        trace_headers: Optional[Mapping[str, str]] = None,
         postproc_params: Optional[PostprocParams] = None,
         multimodal_params: Optional[MultimodalParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
@@ -150,6 +152,7 @@ class GenerationExecutor(ABC):
             streaming=streaming,
             kv_cache_retention_config=kv_cache_retention_config,
             disaggregated_params=disaggregated_params,
+            trace_headers=trace_headers,
             multimodal_params=multimodal_params,
             scheduling_params=scheduling_params,
             cache_salt_id=cache_salt_id,
@@ -365,6 +368,7 @@ class GenerationExecutor(ABC):
         is_llm_executor: bool,
         tp_size: int,
     ):
+        logger.warning(f"Orchestrator is creating Ray executor")
         from .ray_executor import RayExecutor
 
         return RayExecutor(worker_kwargs,
@@ -383,6 +387,7 @@ class GenerationExecutor(ABC):
     ):
         """Create RPC-based executor (GenerationExecutorRpcProxy)."""
         from .rpc_proxy import GenerationExecutorRpcProxy
+        logger.warning(f"Orchestrator is creating RPC executor")
         return GenerationExecutorRpcProxy(
             worker_kwargs,
             model_world_size=model_world_size,
@@ -405,6 +410,7 @@ class GenerationExecutor(ABC):
             use_worker: If True, creates GenerationExecutorWorker (single process).
                        If False, creates GenerationExecutorProxy (multi-process with IPC).
         """
+        logger.warning(f"Orchestrator is creating IPC executor")
         if use_worker:
             from .worker import GenerationExecutorWorker
             return GenerationExecutorWorker(**worker_kwargs,

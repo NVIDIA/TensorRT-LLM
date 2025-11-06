@@ -27,6 +27,7 @@
 #include "topologyDetector.h"
 
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 
 namespace tensorrt_llm::runtime
@@ -169,7 +170,8 @@ bool HostAccessibleDeviceAllocator::mAllowManagedFallback = false;
 
 bool HostAccessibleDeviceAllocator::isSupported()
 {
-    if (TopologyDetector::getInstance().getCurrentGpuMemoryNumaId() >= 0)
+    if (!tensorrt_llm::common::getEnvEplbForceGdrcopy()
+        && TopologyDetector::getInstance().getCurrentGpuMemoryNumaId() >= 0)
     {
         // we are on systems that GPU memory is also a NUMA node.
         return true;
@@ -195,7 +197,16 @@ void HostAccessibleDeviceAllocator::init()
     }
 
     TLLM_CUDA_CHECK(cudaGetDevice(&mDevId));
-    mGpuMemNumaId = TopologyDetector::getInstance().getCurrentGpuMemoryNumaId();
+    if (tensorrt_llm::common::getEnvEplbForceGdrcopy())
+    {
+        mGpuMemNumaId = -1;
+        TLLM_LOG_INFO("Force using GDRCopy for EPLB, ignore NUMA node for GPU memory.");
+    }
+    else
+    {
+        mGpuMemNumaId = TopologyDetector::getInstance().getCurrentGpuMemoryNumaId();
+    }
+
     if (mGpuMemNumaId < 0)
     {
         // We only use GDRCopy when there is no NUMA node for GPU memory.

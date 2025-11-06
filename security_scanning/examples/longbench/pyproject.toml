@@ -1,0 +1,17 @@
+[tool.poetry]
+name = "longbench-examples"
+version = "0.1.0"
+description = ""
+authors = ["TensorRT LLM [90828364+tensorrt-cicd@users.noreply.github.com]"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.13"
+jieba = "^0.42.1"
+fuzzywuzzy = "^0.18.0"
+rouge = "^1.0.1"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

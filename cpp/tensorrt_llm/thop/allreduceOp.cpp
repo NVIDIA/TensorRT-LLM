@@ -22,7 +22,7 @@
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h"
-#include "tensorrt_llm/kernels/communicationKernels/mnnvlTwoShotAllreduceKernels.h"
+#include "tensorrt_llm/kernels/communicationKernels/mnnvlAllreduceKernels.h"
 #include "tensorrt_llm/kernels/communicationKernels/moeAllReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include "tensorrt_llm/kernels/quantization.h"
@@ -273,14 +273,16 @@ public:
     {
         size_t size = input.numel();
         size_t seq_len = input.size(0);
+        size_t hidden_size = input.size(-1);
         size_t bytes_per_element = input.element_size();
         TLLM_LOG_DEBUG("All reduce message size is %zu", size * bytes_per_element);
 
-        AllReduceStrategyType runtime_strategy = getRuntimeStrategy(seq_len, size);
+        AllReduceStrategyType runtime_strategy = selectImplementation(seq_len, hidden_size);
 
         // Log runtime strategy
         auto const rank = getRank();
-        logRunTimeStrategy(runtime_strategy, rank);
+        TLLM_LOG_DEBUG(
+            "AllReduceOp runtime strategy for rank %d: " + tensorrt_llm::kernels::toString(runtime_strategy), rank);
 
         // Dispatch to different allreduce implementations
         switch (runtime_strategy)
@@ -584,10 +586,11 @@ private:
         allreduce_fusion_params.norm_out = nullptr;
         allreduce_fusion_params.trigger_completion_at_end = trigger_completion_at_end;
 
-        // Determine if using oneshot or twoshot allreduce kernel
+        // Determine if using oneshot or twoshot allreduce kernel in case using MIN_LATENCY strategy.
         if (strategy == AllReduceStrategyType::MIN_LATENCY)
         {
-            allreduce_fusion_params.use_oneshot = seq_len <= tensorrt_llm::kernels::ar_fusion::kOneShotMaxToken;
+            allreduce_fusion_params.use_oneshot = seq_len <= tensorrt_llm::kernels::ar_fusion::kOneShotMaxToken
+                || hidden_size < static_cast<int64_t>(tp_size);
         }
         else
         {
@@ -757,7 +760,7 @@ private:
             return {norm_out, reduce_output};
         }
 
-        const int64_t sf_vecsize = 16;
+        int64_t const sf_vecsize = 16;
         bool const sf_use_ue8m0 = false;
         bool const is_sf_swizzled_layout = true;
         TORCH_CHECK(scale, "scale is required for quantization ops");
@@ -792,70 +795,6 @@ private:
 
         TORCH_CHECK(false, "Unsupported fusion operation: " + tensorrt_llm::kernels::toString(mOp));
         return {};
-    }
-
-    AllReduceStrategyType getRuntimeStrategy(size_t seq_len, size_t size)
-    {
-        AllReduceStrategyType runtime_strategy;
-        if (mStrategy == AllReduceStrategyType::UB)
-        {
-            runtime_strategy = AllReduceStrategyType::UB;
-        }
-        else if (mStrategy == AllReduceStrategyType::NCCL)
-        {
-            runtime_strategy = AllReduceStrategyType::NCCL;
-        }
-        else if (mStrategy == AllReduceStrategyType::NCCL_SYMMETRIC)
-        {
-            runtime_strategy = AllReduceStrategyType::NCCL_SYMMETRIC;
-        }
-        else
-        {
-            // This is for DEBUG and BENCHMARK purpose. It will overried the strategy if AUTO is set.
-            static char* ifForBenchMark = std::getenv("OVERRIDE_HEURISTIC_ALLREDUCE_STRATEGY");
-            if (ifForBenchMark != nullptr)
-            {
-                runtime_strategy = mStrategy;
-            }
-            else
-            {
-                runtime_strategy = selectImplementation(seq_len, size, mGroup.size(), mType);
-            }
-        }
-        return runtime_strategy;
-    }
-
-    void logRunTimeStrategy(AllReduceStrategyType strategy, int rank)
-    {
-        switch (strategy)
-        {
-        case AllReduceStrategyType::NCCL:
-        {
-            TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: NCCL", rank);
-            break;
-        }
-        case AllReduceStrategyType::NCCL_SYMMETRIC:
-        {
-            TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: NCCL_SYMMETRIC", rank);
-            break;
-        }
-        case AllReduceStrategyType::MIN_LATENCY:
-        {
-            TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: MIN_LATENCY", rank);
-            break;
-        }
-        case AllReduceStrategyType::UB:
-        {
-            TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: UB", rank);
-            break;
-        }
-        case AllReduceStrategyType::LOWPRECISION:
-        {
-            TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: LOWPRECISION", rank);
-            break;
-        }
-        default: TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: UNKNOWN: %d", rank, strategy); break;
-        }
     }
 
     void initGroupTopology()
@@ -985,134 +924,60 @@ private:
         }
     }
 
-    bool ifFallbackToNCCL(size_t seq_len, size_t message_size_bytes, size_t max_workspace_size, bool is_auto)
+    AllReduceStrategyType selectImplementation(size_t seq_len, size_t hidden_size)
     {
-        // If messageSize is less than maxWorkspaceSize, use NCCL, regardless of the fusion type.
-        if (message_size_bytes > max_workspace_size)
+        if (mStrategy != AllReduceStrategyType::AUTO)
         {
-            if (!is_auto)
+            // For UB,NCCL,NCCL_SYMMETRIC, the correctness of the strategy dispatching is guaranteed by the user.
+            if (mStrategy == AllReduceStrategyType::UB || mStrategy == AllReduceStrategyType::NCCL
+                || mStrategy == AllReduceStrategyType::NCCL_SYMMETRIC)
             {
-                TLLM_LOG_WARNING(
-                    "Since messageSize is greater than maxWorkspaceSize, fallback to AllReduceStrategy: NCCL");
+                return mStrategy;
             }
-            return true;
         }
 
-        // If Peer to Peer is not supported, fallback to NCCL.
-        if (!mIsP2PSupported)
-        {
-            if (!is_auto)
-            {
-                TLLM_LOG_WARNING("Since Peer to Peer not supported, fallback to AllReduceStrategy: NCCL");
-            }
-            return true;
-        }
+        // For ONESHOT, TWOSHOT, LOWPRECISION, fallback is allowed.
+        auto const message_size = seq_len * hidden_size;
 
-        // If NVLINK is not supported, fallback to NCCL.
-        if (!mIsNVLINKSupported)
-        {
-            if (!is_auto)
-            {
-                TLLM_LOG_WARNING("Since NVLINK not supported, fallback to AllReduceStrategy: NCCL");
-            }
-            return true;
-        }
-        return false;
-    }
-
-    AllReduceStrategyType selectImplementation(
-        size_t seq_len, size_t message_size, int world_size, nvinfer1::DataType type)
-    {
-
-        if (isUsingLowPrecision(message_size))
+        // Check if LOWPRECISION is supported.
+        if (isUsingLowPrecision(hidden_size))
         {
             return AllReduceStrategyType::LOWPRECISION;
         }
-        else
-        {
-            if (mStrategy == AllReduceStrategyType::LOWPRECISION)
-            {
-                mStrategy = AllReduceStrategyType::AUTO;
-            }
-        }
 
-        // Check that heuristic is only applied when AUTO is set.
-        // Use Auto select
-        bool const is_auto = (mStrategy == AllReduceStrategyType::AUTO);
-        auto const message_size_bytes = message_size * tensorrt_llm::common::getDTypeSize(type);
+        auto const message_size_bytes = message_size * tensorrt_llm::common::getDTypeSize(mType);
         auto const max_workspace_size
-            = tensorrt_llm::utils::customAllReduceUtils::getMaxRequiredWorkspaceSize(world_size);
+            = tensorrt_llm::utils::customAllReduceUtils::getMaxRequiredWorkspaceSize(mGroup.size());
 
-        if (ifFallbackToNCCL(seq_len, message_size_bytes, max_workspace_size, is_auto))
+        if (ifFallbackToNCCL(seq_len, message_size_bytes, max_workspace_size))
         {
             return AllReduceStrategyType::NCCL;
         }
 
         // This rule based heuristic only chooses between NCCL and MIN_LATENCY strategies.
-
-        // Heurisitic will only be applied on NONE and RESIDUAL_RMS_NORM fusion types.
-        // Because NCCL might be faster on some large messageSize cases.
-        // Otherwise, MIN_LATENCY strategy will be directly returned due to more fusions it can support.
-        // TODO: NCCL AllReduce + subsequent quantization ops (as fallback) can also support the fusion types.
-        // This should be compared with MIN_LATENCY fused kernels to determine the best strategy.
-        switch (mOp)
+        // From this point, all fusion patterns are supported by all these strategies: NCCL, ONESHOT, TWOSHOT and
+        // MIN_LATENCY.
+        if (mStrategy != AllReduceStrategyType::AUTO)
         {
-        case AllReduceFusionOp::NONE:
-        case AllReduceFusionOp::RESIDUAL_RMS_NORM: break;
-        case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8:
-        case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8:
-        case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4:
-        case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4: return AllReduceStrategyType::MIN_LATENCY;
-        // Suppose NCCL has fallback implementations for all fusion types.
-        default: return AllReduceStrategyType::NCCL;
-        }
-
-        // Check mOp to be supported by the heuristic.
-        TORCH_CHECK(mOp == AllReduceFusionOp::NONE || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM,
-            "Only NONE and RESIDUAL_RMS_NORM are supported for NCCL/MIN_LATENCY heuristic.");
-
-        // Default to NCCL.
-        AllReduceStrategyType strategy = AllReduceStrategyType::NCCL;
-
-        // Currently we will not remove ONESHOT and TWOSHOT from the strategy list
-        // But torch flow user should not use them, but use AUTO or MIN_LATENCY instead.
-        // NOTICE: When a fusion type is not supported by the corresponding strategy but strategy is not AUTO,
-        // user should guarantee the correctness of the fusion pattern dispatching.
-        if (!is_auto)
-        {
-            if (mStrategy == AllReduceStrategyType::ONESHOT || mStrategy == AllReduceStrategyType::TWOSHOT)
-            {
-                strategy = AllReduceStrategyType::MIN_LATENCY;
-            }
-            else
-            {
-                strategy = mStrategy;
-            }
-        }
-        else if (world_size <= 2)
-        {
-            strategy = AllReduceStrategyType::MIN_LATENCY;
+            return mStrategy;
         }
         else
         {
-            static char* threshold_ptr = std::getenv("ALLREDUCE_AUTO_HEURISTIC_MIN_LATENCY_THRESHOLD_TOKEN_NUM");
-            size_t threshold = 128;
-            if (threshold_ptr)
-            {
-                threshold = static_cast<size_t>(std::atoi(threshold_ptr));
-            }
-            // Generally, NCCL is faster than MIN_LATENCY when the token number is greater than 256. I conservatively
-            // set the threshold here to 128 tokens.
-            if (seq_len > threshold)
-            {
-                strategy = AllReduceStrategyType::NCCL;
-            }
-            else
-            {
-                strategy = AllReduceStrategyType::MIN_LATENCY;
-            }
+            return tensorrt_llm::utils::customAllReduceUtils::selectStrategyLookUpTable(
+                seq_len, hidden_size, mOp, mGroup.size());
         }
-        return strategy;
+        return AllReduceStrategyType::NCCL;
+    }
+
+    bool ifFallbackToNCCL(size_t seq_len, size_t message_size_bytes, size_t max_workspace_size)
+    {
+        // If messageSize is less than maxWorkspaceSize, use NCCL, regardless of the fusion type.
+        if (message_size_bytes > max_workspace_size || !mIsP2PSupported || !mIsNVLINKSupported)
+        {
+            return true;
+        }
+
+        return false;
     }
 
     bool isUsingLowPrecision(size_t message_size) const noexcept
@@ -1330,73 +1195,85 @@ std::vector<torch::Tensor> moe_finalize_allreduce(torch::Tensor const& input, to
     return {norm_out, residual_out};
 }
 
-at::Tensor mnnvlTwoShotAllReduce(
-    at::Tensor& input, at::Tensor& comm_buffer, at::Tensor& buffer_flags, int64_t buffer_size, bool wait_for_results)
+std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::optional<torch::Tensor> const& gamma,
+    torch::optional<torch::Tensor> const& residual_in, torch::optional<double> epsilon, torch::Tensor& comm_buffer,
+    torch::Tensor& buffer_flags, bool rmsnorm_fusion)
 {
     auto* mcast_mem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
-    TORCH_CHECK(mcast_mem != nullptr, "two_shot_all_reduce: comm_buffer must be obtained from a mcastBuffer instance.");
+    TORCH_CHECK(
+        mcast_mem != nullptr, "[mnnvlFusionAllReduce] comm_buffer must be obtained from a mcastBuffer instance.");
+    TORCH_CHECK(input.is_contiguous(), "[mnnvlFusionAllReduce] input must be contiguous");
+
+    auto const eltsPerThread = sizeof(float4) / input.itemsize();
+    auto const hiddenDim = input.size(1);
+    auto const numTokens = input.size(0);
+    TORCH_CHECK(hiddenDim % eltsPerThread == 0,
+        "[mnnvlFusionAllReduce] Hidden dimension must be divisible by " + std::to_string(eltsPerThread) + ", got "
+            + std::to_string(hiddenDim));
 
     auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
-    at::Tensor output = torch::empty_like(input);
+    torch::Tensor output = torch::empty_like(input);
+    torch::Tensor residualOut;
 
-    auto allreduce_params = tensorrt_llm::kernels::mnnvl::AllReduceParams();
-    allreduce_params.dtype = dtype;
-    allreduce_params.output = output.data_ptr();
-    allreduce_params.input = input.data_ptr();
-    allreduce_params.buffer_size = static_cast<uint32_t>(buffer_size);
-    allreduce_params.buffer_flags = buffer_flags.data_ptr();
-    allreduce_params.wait_for_results = wait_for_results;
-    allreduce_params.stream = at::cuda::getCurrentCUDAStream(output.get_device());
-    allreduce_params.nranks = mcast_mem->getWorldSize();
+    auto allreduce_params = tensorrt_llm::kernels::mnnvl::AllReduceFusionParams();
+    allreduce_params.nRanks = mcast_mem->getWorldSize();
     allreduce_params.rank = mcast_mem->getRank();
-    allreduce_params.buffer_M = comm_buffer.size(2);
-    allreduce_params.num_tokens = input.size(0);
-    allreduce_params.token_dim = input.size(1);
-    allreduce_params.buffer_ptrs_dev = reinterpret_cast<void**>(mcast_mem->getBufferPtrsDev());
-    allreduce_params.multicast_ptr = mcast_mem->getMulticastPtr();
+    allreduce_params.dType = dtype;
+    allreduce_params.numTokens = numTokens;
+    allreduce_params.tokenDim = hiddenDim;
+    allreduce_params.bufferPtrsDev = reinterpret_cast<void**>(mcast_mem->getBufferPtrsDev());
+    allreduce_params.bufferPtrLocal = comm_buffer.mutable_data_ptr();
+    allreduce_params.multicastPtr = mcast_mem->getMulticastPtr();
+    allreduce_params.bufferFlags = reinterpret_cast<uint32_t*>(buffer_flags.mutable_data_ptr());
+    allreduce_params.input = input.const_data_ptr();
+    allreduce_params.output = output.mutable_data_ptr();
 
-    tensorrt_llm::kernels::mnnvl::twoshot_allreduce_op(allreduce_params);
+    if (rmsnorm_fusion)
+    {
+        TORCH_CHECK(residual_in.has_value() && gamma.has_value() && epsilon.has_value(),
+            "[mnnvlFusionAllReduce] residual_in, gamma, and epsilon must be provided for rmsnorm fusion");
+        TORCH_CHECK(residual_in.value().is_contiguous(), "[mnnvlFusionAllReduce] residual_in must be contiguous");
+        TORCH_CHECK(gamma.value().is_contiguous(), "[mnnvlFusionAllReduce] gamma must be contiguous");
 
-    return output;
+        allreduce_params.residualIn = residual_in.value().const_data_ptr();
+        allreduce_params.gamma = gamma.value().const_data_ptr();
+        allreduce_params.epsilon = static_cast<float>(epsilon.value());
+        allreduce_params.rmsNormFusion = true;
+
+        residualOut = torch::empty_like(residual_in.value());
+        allreduce_params.residualOut = residualOut.mutable_data_ptr();
+    }
+    else
+    {
+        allreduce_params.rmsNormFusion = false;
+    }
+
+    allreduce_params.stream = at::cuda::getCurrentCUDAStream(output.get_device());
+
+    // Threshold to switch between one-shot and two-shot allreduce kernel
+    // Empirical value, MSG size * World size
+    constexpr size_t kOneShotSizeThreshold = 16 * 4 * 8192;
+
+    if (numTokens * hiddenDim * allreduce_params.nRanks * input.itemsize() <= kOneShotSizeThreshold)
+    {
+        tensorrt_llm::kernels::mnnvl::oneshotAllreduceFusionOp(allreduce_params);
+    }
+    else
+    {
+        tensorrt_llm::kernels::mnnvl::twoshotAllreduceFusionOp(allreduce_params);
+    }
+
+    return {output, residualOut};
 }
 
-std::vector<torch::Tensor> twoShotRMSNorm(torch::Tensor const& comm_buf, torch::Tensor const& gamma, double epsilon,
-    torch::Tensor const& residual, torch::Tensor& buffer_flags, int64_t buffer_size)
-{
-    auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(comm_buf.scalar_type());
-    auto rmsnorm_params = tensorrt_llm::kernels::mnnvl::RMSNormParams();
-
-    // Input is the communication buffer so we need to get the shape from residual
-    torch::Tensor normed_output = torch::empty_like(residual);
-    torch::Tensor prenorm_output = torch::empty_like(residual);
-
-    rmsnorm_params.dtype = dtype;
-    rmsnorm_params.residual_output = prenorm_output.data_ptr();
-    rmsnorm_params.output = normed_output.data_ptr();
-    rmsnorm_params.input = comm_buf.data_ptr();
-    rmsnorm_params.gamma = gamma.data_ptr();
-    rmsnorm_params.epsilon = epsilon;
-    rmsnorm_params.residual = residual.data_ptr();
-    rmsnorm_params.buffer_size = static_cast<uint32_t>(buffer_size);
-    rmsnorm_params.buffer_flags = reinterpret_cast<uint32_t*>(buffer_flags.data_ptr());
-    rmsnorm_params.batch = normed_output.size(0);
-    rmsnorm_params.hidden_dim = normed_output.size(1);
-    rmsnorm_params.stream = at::cuda::getCurrentCUDAStream(comm_buf.get_device());
-
-    tensorrt_llm::kernels::mnnvl::twoshot_rmsnorm_op(rmsnorm_params);
-
-    return {normed_output, prenorm_output};
-}
 } // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "mnnvl_twoshot_allreduce(Tensor(input!) input, Tensor(comm_buf!) comm_buffer, "
-        "Tensor(buffer_flags!) buffer_flags, int buffer_size, bool wait_for_result) -> Tensor");
-    m.def(
-        "mnnvl_twoshot_rmsnorm(Tensor comm_buf, Tensor gamma, "
-        "float epsilon, Tensor residual, Tensor buffer_flags, int buffer_size) -> Tensor[]");
+        "mnnvl_fusion_allreduce(Tensor input, Tensor? residual, Tensor? gamma, "
+        "float? epsilon, Tensor(a!) comm_buffer, Tensor buffer_flags, bool rmsnorm_fusion) -> "
+        "Tensor[]");
     m.def(
         "allreduce("
         "Tensor input,"
@@ -1454,8 +1331,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("mnnvl_twoshot_allreduce", &torch_ext::mnnvlTwoShotAllReduce);
-    m.impl("mnnvl_twoshot_rmsnorm", &torch_ext::twoShotRMSNorm);
+    m.impl("mnnvl_fusion_allreduce", &torch_ext::mnnvlFusionAllReduce);
     m.impl("allreduce", &torch_ext::allreduce_raw);
     m.impl("allreduce_pg", &torch_ext::allreduce_pg);
     m.impl("moe_allreduce", &torch_ext::moe_allreduce);

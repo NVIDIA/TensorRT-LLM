@@ -14,7 +14,7 @@ from ...custom_ops.quant import (
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.node_utils import (
-    extract_param_names_from_lin_node,
+    extract_param_names_from_node,
     get_quantization_params_from_linear_node,
     is_bmm_op,
     is_linear_op,
@@ -136,7 +136,7 @@ class Quantization(BaseTransform):
 
         The state_dict is also updated to contain the sharded weights.
         """
-        param_name, _ = extract_param_names_from_lin_node(node)
+        param_name, _ = extract_param_names_from_node(node)
         original_weight = gm.get_parameter(param_name)
         new_param = nn.Parameter(self.quantize_weight(original_weight), requires_grad=False)
         modname, _, attrname = param_name.rpartition(".")
@@ -375,12 +375,10 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
                     )
                     state_dict[input_scale_name] = 1 / state_dict[input_scale_name]
                     weight_scale = state_dict[weight_name + "_scale"].view(float4_sf_dtype)
-                    ori_shape = weight_scale.shape
                     state_dict[weight_name + "_scale"] = (
                         torch.ops.trtllm.block_scale_interleave(
                             weight_scale.view(torch.uint8).cpu().contiguous()
                         )
-                        .reshape(ori_shape)
                         .view(float4_sf_dtype)
                         .reshape(-1)
                     )

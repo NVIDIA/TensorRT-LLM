@@ -43,7 +43,7 @@ class TransferSession;
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
-    BlockKey const& lastBlockKey, SizeType32 indexFromEnd);
+    BlockKey const& lastBlockKey, SizeType32 indexFromEnd, bool recvSideHasCP = false);
 
 using DataContext = tensorrt_llm::executor::kv_cache::DataContext;
 using Connection = tensorrt_llm::executor::kv_cache::Connection;
@@ -52,8 +52,8 @@ using BaseKVCacheManager = kv_cache_manager::BaseKVCacheManager;
 using CacheTransBufferManager = kv_cache_manager::CacheTransBufferManager;
 using BlockRange = kv_cache_manager::BlockRange;
 
-BlockRange getBlockRangeForReceiving(
-    BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest, bool srcEnableBlockReuse);
+BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
+    bool srcEnableBlockReuse, bool recvSideHasCP = false);
 
 // Used to support the cache transmission with different layouts and different protocols.
 class BaseCacheFormatter

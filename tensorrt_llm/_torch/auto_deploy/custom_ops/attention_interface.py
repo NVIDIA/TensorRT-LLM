@@ -87,6 +87,7 @@ class SequenceInfo:
         max_batch_size: int = 1,
         page_size: int = 0,
         max_num_tokens: Optional[int] = None,
+        vocab_size_padded: Optional[int] = None,
     ):
         """Initialize the SequenceInfo object.
 
@@ -104,7 +105,7 @@ class SequenceInfo:
                 batch is min (max_batch_size, max_num_tokens // ISL). Similarly, if a batch is
                 composed of generate-only requests, then the maximum number of sequences possible in
                 the batch is min (max_batch_size, max_num_tokens).
-
+            vocab_size_padded: corresponds to the padded vocabulary size of the model.
         Returns:
             None
         """
@@ -112,6 +113,7 @@ class SequenceInfo:
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
         self.page_size = page_size if page_size > 0 else max_seq_len
+        self.vocab_size_padded = vocab_size_padded
 
         # NOTE (lucaslie): WAR to address issue when using flashinfer attention with
         # (max_batch_size, max_seq_len) input in trtllm runtime.
@@ -574,17 +576,22 @@ class SequenceInfo:
             else:
                 self._extra_args[name] = None
 
+    @nvtx_range("ad_get_unique_value")
     def _get_unique_value(self, occupied: Set[int], max_val: int) -> int:
         """Get un unoccupied value from the range indicated by max_val.
 
         In addition, this function performs a sanity check to ensure that no value in the occupied
         set is out of bounds.
         """
-        full_range = set(range(max_val))
-        free_values = full_range - occupied
-        out_of_range = occupied - full_range
+        # Validate without materializing the full range set
+        out_of_range = [v for v in occupied if v < 0 or v >= max_val]
         assert not out_of_range, f"Out of range values: {out_of_range}"
-        return free_values.pop() if free_values else 0
+
+        # Return the smallest free value; fall back to 0 if none
+        for candidate in range(max_val):
+            if candidate not in occupied:
+                return candidate
+        return 0
 
     @nvtx_range("ad_nest_sequences")
     def nest_sequences(

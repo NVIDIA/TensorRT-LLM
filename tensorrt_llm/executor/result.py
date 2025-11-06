@@ -1,6 +1,7 @@
 import asyncio
 import json
 import threading
+import time
 import weakref
 from dataclasses import dataclass, field
 from queue import Empty, Queue
@@ -10,6 +11,8 @@ from weakref import WeakMethod
 
 import torch
 import torch.nn.functional as F
+
+from tensorrt_llm.llmapi import tracing
 
 try:
     import ray
@@ -268,6 +271,7 @@ class GenerationResultBase:
         self.avg_decoded_tokens_per_iter: Optional[float] = None
         self._done = False
         self.metrics_dict = {}
+        self.trace_headers: Optional[dict[str, str]] = None
 
         if ray_queue is not None:
             if has_event_loop():
@@ -436,6 +440,7 @@ class GenerationResultBase:
                 raise ValueError(
                     f"Unknown finish reason: {finish_reasons[src_idx]}")
             self.record_stats(output, req_perf_metrics_dict)
+            self.do_tracing(output, req_perf_metrics_dict)
 
     @print_traceback_on_error
     @nvtx_range_debug("handle_response",
@@ -472,7 +477,7 @@ class GenerationResultBase:
                 self._outputs[0].disaggregated_params = disaggregated_params
 
             if response.metrics:
-                self.metrics_dict = response.metrics
+                self.metrics_dict.update(response.metrics)
 
             if response.error:
                 if self._background_error_handler is not None and (
@@ -570,7 +575,110 @@ class GenerationResultBase:
             stats, len(output.token_ids), self.sampling_params.n > 1)
         if processed_metrics_stat:
             metrics_stats.update(processed_metrics_stat)
-        self.metrics_dict = metrics_stats
+        self.metrics_dict.update(metrics_stats)
+
+    def do_tracing(
+        self,
+        output: CompletionOutput,
+        req_perf_metrics_dict: Optional[dict[str, float]] = None,
+    ) -> None:
+        """Perform distributed tracing for the generation request.
+
+        Args:
+            output (CompletionOutput): The output of the generation result.
+            req_perf_metrics_dict (Optional[dict[str, float]]): Request performance metrics. Defaults to None.
+        """
+        if not tracing.global_otlp_tracer():
+            return
+
+        metrics_dict = self.metrics_dict
+        if not metrics_dict or not req_perf_metrics_dict:
+            # Insufficient request metrics available; trace generation aborted.
+            tracing.insufficient_request_metrics_warning()
+            return
+
+        trace_context = tracing.extract_trace_context(self.trace_headers)
+        sampling_params = self.sampling_params
+
+        # Since arrival_time and other timing metrics are based on different time origins,
+        # we need to apply corrections to align them with absolute timestamps
+        time_correction = time.time() - time.monotonic()
+        arrival_time = req_perf_metrics_dict.get(
+            RequestEventTiming.ARRIVAL_TIME, 0)
+
+        with tracing.global_otlp_tracer().start_as_current_span(
+                "llm_request",
+                kind=tracing.SpanKind.SERVER,
+                context=trace_context,
+                start_time=int((arrival_time + time_correction) * 1e9),
+        ) as span:
+
+            def safe_set_attr(span, attr, value):
+                if value is not None:
+                    span.set_attribute(attr, value)
+
+            safe_set_attr(span,
+                          tracing.SpanAttributes.GEN_AI_REQUEST_TEMPERATURE,
+                          sampling_params.temperature)
+            safe_set_attr(span, tracing.SpanAttributes.GEN_AI_REQUEST_TOP_P,
+                          sampling_params.top_p)
+            safe_set_attr(span, tracing.SpanAttributes.GEN_AI_REQUEST_TOP_K,
+                          sampling_params.top_k)
+            safe_set_attr(
+                span,
+                tracing.SpanAttributes.GEN_AI_REQUEST_MAX_TOKENS,
+                sampling_params.max_tokens,
+            )
+            safe_set_attr(span, tracing.SpanAttributes.GEN_AI_REQUEST_N,
+                          sampling_params.n)
+            safe_set_attr(span, tracing.SpanAttributes.GEN_AI_REQUEST_ID,
+                          self.id)
+            if prompt_token_ids := getattr(self, "prompt_token_ids", None):
+                safe_set_attr(span,
+                              tracing.SpanAttributes.GEN_AI_USAGE_PROMPT_TOKENS,
+                              len(prompt_token_ids))
+            safe_set_attr(span,
+                          tracing.SpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS,
+                          output.length)
+            safe_set_attr(
+                span, tracing.SpanAttributes.GEN_AI_LATENCY_TIME_TO_FIRST_TOKEN,
+                metrics_dict.get(MetricNames.TTFT, -1))
+            safe_set_attr(span, tracing.SpanAttributes.GEN_AI_LATENCY_E2E,
+                          metrics_dict.get(MetricNames.E2E, -1))
+            safe_set_attr(span,
+                          tracing.SpanAttributes.GEN_AI_LATENCY_TIME_IN_QUEUE,
+                          metrics_dict.get(MetricNames.REQUEST_QUEUE_TIME, -1))
+            safe_set_attr(
+                span, tracing.SpanAttributes.GEN_AI_RESPONSE_FINISH_REASONS,
+                json.dumps([output.finish_reason])
+                if output.finish_reason else None)
+            safe_set_attr(
+                span,
+                tracing.SpanAttributes.GEN_AI_LATENCY_KV_CACHE_TRANSFER_TIME,
+                req_perf_metrics_dict.get(
+                    RequestEventTiming.KV_CACHE_TRANSFER_END, 0.0) -
+                req_perf_metrics_dict.get(
+                    RequestEventTiming.KV_CACHE_TRANSFER_START, 0.0))
+
+            if req_perf_metrics_dict.get(
+                    RequestEventTiming.KV_CACHE_TRANSFER_START,
+                    0) and req_perf_metrics_dict.get(
+                        RequestEventTiming.KV_CACHE_TRANSFER_END, 0):
+                tracing.add_event(
+                    tracing.SpanEvents.KV_CACHE_TRANSFER_START,
+                    timestamp=int((req_perf_metrics_dict.get(
+                        RequestEventTiming.KV_CACHE_TRANSFER_START, 0.0) +
+                                   time_correction) * 1e9))
+                tracing.add_event(
+                    tracing.SpanEvents.KV_CACHE_TRANSFER_END,
+                    attributes={
+                        "kv_cache_size":
+                        req_perf_metrics_dict.get(
+                            RequestEventTiming.KV_CACHE_SIZE, 0)
+                    },
+                    timestamp=int((req_perf_metrics_dict.get(
+                        RequestEventTiming.KV_CACHE_TRANSFER_END, 0.0) +
+                                   time_correction) * 1e9))
 
 
 class DetokenizedGenerationResultBase(GenerationResultBase):
@@ -688,6 +796,7 @@ class GenerationResult(GenerationResultBase):
         self.disaggregated_params = disaggregated_params
         # minimal sampling params needed for logprob calculation
         self._logprob_params = logprob_params
+        self.trace_headers = generation_request.trace_headers
 
         # for aborting the request
         self._executor: Optional[weakref.ReferenceType[

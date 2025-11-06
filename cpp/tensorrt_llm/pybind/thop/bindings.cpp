@@ -19,6 +19,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <tensorrt_llm/thop/attentionOp.h>
+#include <tensorrt_llm/thop/moeAlltoAllMeta.h>
 #include <torch/extension.h>
 
 namespace py = pybind11;
@@ -28,6 +29,12 @@ namespace tensorrt_llm::pybind::thop
 
 void initBindings(pybind11::module_& m)
 {
+    // Export MoE A2A constants
+    for (auto const& kv : torch_ext::mnnvl_throughput::getMoeA2AMetaInfoIndexPairs())
+    {
+        m.attr(kv.first) = py::int_(kv.second);
+    }
+
     m.def("attention", &torch_ext::attention,
         // Parameters with default values using std::nullopt for optional arguments
         py::arg("q"), py::arg("k") = std::nullopt, py::arg("v") = std::nullopt, py::arg("output"),
@@ -55,7 +62,9 @@ void initBindings(pybind11::module_& m)
         py::arg("mrope_rotary_cos_sin") = std::nullopt, py::arg("mrope_position_deltas") = std::nullopt,
         py::arg("mla_tensor_params"), py::arg("attention_chunk_size") = std::nullopt,
         py::arg("softmax_stats_tensor") = std::nullopt, py::arg("spec_decoding_bool_params"),
-        py::arg("spec_decoding_tensor_params"), py::arg("sparse_attention_params"), "Multi-head attention operation",
-        py::call_guard<py::gil_scoped_release>());
+        py::arg("spec_decoding_tensor_params"), py::arg("sparse_kv_indices") = std::nullopt,
+        py::arg("sparse_kv_offsets") = std::nullopt, py::arg("sparse_attn_indices") = std::nullopt,
+        py::arg("sparse_attn_offsets") = std::nullopt, py::arg("sparse_mla_topk") = std::nullopt,
+        "Multi-head attention operation", py::call_guard<py::gil_scoped_release>());
 }
 } // namespace tensorrt_llm::pybind::thop

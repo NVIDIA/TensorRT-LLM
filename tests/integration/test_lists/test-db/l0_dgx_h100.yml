@@ -43,6 +43,8 @@ l0_dgx_h100:
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[True-True-True]
   # ------------- AutoDeploy tests ---------------
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[False-2]
+  # llmapi
+  - unittest/llmapi/test_mpi_session.py::test_llmapi_launch_multiple_tasks
 - condition:
     ranges:
       system_gpu_count:
@@ -91,12 +93,20 @@ l0_dgx_h100:
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[MMLU-gen_tp=2-ctx_pp=2]
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_multi_instance[GSM8K]
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_multi_instance[MMLU]
-  - disaggregated/test_auto_scaling.py::test_service_discovery[round_robin]
-  - disaggregated/test_auto_scaling.py::test_service_discovery[load_balancing]
-  - disaggregated/test_auto_scaling.py::test_worker_restart[round_robin]
-  - disaggregated/test_auto_scaling.py::test_worker_restart[load_balancing]
-  - disaggregated/test_auto_scaling.py::test_minimal_instances[round_robin]
-  - disaggregated/test_auto_scaling.py::test_disagg_server_restart[round_robin]
+  - disaggregated/test_auto_scaling.py::test_service_discovery[etcd-round_robin]
+  - disaggregated/test_auto_scaling.py::test_service_discovery[etcd-load_balancing]
+  - disaggregated/test_auto_scaling.py::test_worker_restart[etcd-round_robin]
+  - disaggregated/test_auto_scaling.py::test_worker_restart[etcd-load_balancing]
+  - disaggregated/test_auto_scaling.py::test_minimal_instances[etcd-round_robin]
+  - disaggregated/test_auto_scaling.py::test_disagg_server_restart[etcd-round_robin]
+  - disaggregated/test_auto_scaling.py::test_service_discovery[http-round_robin]
+  - disaggregated/test_auto_scaling.py::test_service_discovery[http-load_balancing]
+  - disaggregated/test_auto_scaling.py::test_service_discovery[http-kv_cache_aware]
+  - disaggregated/test_auto_scaling.py::test_worker_restart[http-round_robin]
+  - disaggregated/test_auto_scaling.py::test_worker_restart[http-load_balancing]
+  - disaggregated/test_auto_scaling.py::test_worker_restart[http-kv_cache_aware]
+  - disaggregated/test_auto_scaling.py::test_minimal_instances[http-round_robin]
+  - disaggregated/test_auto_scaling.py::test_disagg_server_restart[http-round_robin]
 - condition:
     ranges:
       system_gpu_count:
@@ -116,6 +126,7 @@ l0_dgx_h100:
   - unittest/_torch/multi_gpu_modeling/test_deepseek.py::test_deepseek_streaming[tp4-bf16-trtllm-deepseekv3_lite]
   - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_alltoall[DeepEP]
   - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_alltoall[DeepEPLowLatency]
+  - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_alltoall[MNNVL]
   - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_w4afp8[MoEWeightLoadingMode.VANILLA-dtype0]
   - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_w4afp8[MoEWeightLoadingMode.VANILLA-dtype1]
   - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_w4afp8[MoEWeightLoadingMode.W4A8_CUSTOM-dtype0]
@@ -147,6 +158,7 @@ l0_dgx_h100:
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_overlap_cuda_graph[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_bf16_cache_aware_balance[DeepSeek-V3-Lite-bf16]
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_bf16_conditional[DeepSeek-V3-Lite-bf16]
+  - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_bf16_empty_batch[DeepSeek-V3-Lite-bf16]
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_guided_decoding[xgrammar-mtp_nextn=2]
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_ctxpp2_gentp2_one_mtp[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_workers.py::test_workers_conditional_disaggregation_deepseek_v3_lite_bf16[DeepSeek-V3-Lite-bf16]
@@ -173,6 +185,8 @@ l0_dgx_h100:
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[dp4-cutlass-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[dp4-triton-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4a16[dp4-auto]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[cutlass]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[triton]
 - condition:
     ranges:
       system_gpu_count:

@@ -1,10 +1,28 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import math
 import os
+import time
 import unittest
 from contextlib import contextmanager
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Generator
 
+import psutil
 import pynvml
 import pytest
 import tensorrt as trt
@@ -19,6 +37,7 @@ except ImportError:
 from parameterized import parameterized
 
 import tensorrt_llm
+from tensorrt_llm._torch.hostfunc import hostfunc
 from tensorrt_llm._utils import (mpi_disabled, torch_dtype_to_trt,
                                  trt_dtype_to_torch)
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
@@ -451,3 +470,79 @@ def check_accuracy(a, b, atol, rtol, percent):
 
 skip_ray = pytest.mark.skipif(
     mpi_disabled(), reason="This test is skipped for Ray orchestrator.")
+
+
+@dataclass
+class DeviceSleepCtl:
+    _cancellation_requested: bool = False
+
+    @property
+    def cancellation_requested(self):
+        return self._cancellation_requested
+
+    def cancel(self):
+        self._cancellation_requested = True
+
+
+@hostfunc
+def device_sleep(duration_s: float,
+                 *,
+                 ctl: DeviceSleepCtl,
+                 spin_s: float = 0.1):
+    spin_iters = math.ceil(duration_s / spin_s)
+    for _ in range(spin_iters):
+        if ctl.cancellation_requested:
+            break
+        time.sleep(spin_s)
+
+
+@contextmanager
+def assert_no_cuda_sync(
+        sync_timeout_s: float = 5) -> Generator[None, None, None]:
+    """Check that the function does not stream synchronize."""
+
+    sleep_finished_event = torch.cuda.Event()
+    scope_finished_event = torch.cuda.Event()
+
+    torch.cuda.synchronize()
+    sleep_ctl = DeviceSleepCtl()
+    device_sleep(sync_timeout_s, ctl=sleep_ctl)
+    sleep_finished_event.record()
+    yield None
+    scope_finished_event.record()
+
+    assert not sleep_finished_event.query(
+    ), """sync code should return quickly"""
+
+    sleep_ctl.cancel()
+    scope_finished_event.synchronize()
+
+
+_pynvmlInited = False
+
+
+def get_current_process_gpu_memory(include_subprocess: bool = False) -> int:
+    """
+    Returns GPU memory usage for current process in bytes.
+    """
+    global _pynvmlInited
+    if not _pynvmlInited:
+        pynvml.nvmlInit()
+        _pynvmlInited = True
+
+    # Get current process ID
+    targets = [os.getpid()]
+    if include_subprocess:
+        targets.extend(
+            p.pid for p in psutil.Process(targets[0]).children(recursive=True))
+    targets = frozenset(targets)
+
+    # Get device handle for GPU 0
+    device_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+
+    # Get running processes
+    processes = pynvml.nvmlDeviceGetComputeRunningProcesses(device_handle)
+
+    # Find current process
+    return sum(process.usedGpuMemory for process in processes
+               if process.pid in targets)

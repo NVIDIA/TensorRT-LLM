@@ -540,6 +540,7 @@ def main(args):
                 repetition_penalty=args.repetition_penalty,
                 presence_penalty=args.presence_penalty,
                 frequency_penalty=args.frequency_penalty,
+                prompt_ignore_length=args.prompt_ignore_length,
                 min_p=args.min_p,
                 stop_words_list=stop_words_list,
                 bad_words_list=bad_words_list,
@@ -639,6 +640,7 @@ def main(args):
                     repetition_penalty=args.repetition_penalty,
                     presence_penalty=args.presence_penalty,
                     frequency_penalty=args.frequency_penalty,
+                    prompt_ignore_length=args.prompt_ignore_length,
                     min_p=args.min_p,
                     stop_words_list=stop_words_list,
                     bad_words_list=bad_words_list,
@@ -677,6 +679,7 @@ def main(args):
                     repetition_penalty=args.repetition_penalty,
                     presence_penalty=args.presence_penalty,
                     frequency_penalty=args.frequency_penalty,
+                    prompt_ignore_length=args.prompt_ignore_length,
                     stop_words_list=stop_words_list,
                     bad_words_list=bad_words_list,
                     output_cum_log_probs=(args.output_cum_log_probs_npy

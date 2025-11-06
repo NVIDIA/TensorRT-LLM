@@ -12,7 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import functools
 from contextlib import contextmanager
+from typing import Callable
 
 try:
     import ray
@@ -26,3 +28,16 @@ def unwrap_ray_errors():
         yield
     except ray.exceptions.RayTaskError as e:
         raise e.as_instanceof_cause() from e
+
+
+def control_action_decorator(func: Callable) -> Callable:
+    """
+    Decorator that wraps a method to use control_action context manager.
+    """
+
+    @functools.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        with self.engine.control_action():
+            return func(self, *args, **kwargs)
+
+    return wrapper

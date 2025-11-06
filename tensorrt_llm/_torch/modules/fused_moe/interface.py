@@ -1,6 +1,6 @@
 import weakref
 from abc import abstractmethod
-from enum import Enum
+from enum import Enum, IntEnum
 from typing import Dict, List, Optional, Union, final
 
 import torch
@@ -20,6 +20,18 @@ class MoEWeightLoadingMode(Enum):
     FUSED_GATE_UP_PROJ = 1
     # Custom W4A8 weights from examples/quantization/quantize_mixed_precision_moe.py
     W4A8_CUSTOM = 2
+
+
+# The type of alltoall method
+class AlltoallMethodType(IntEnum):
+    # Not available
+    NotEnabled = 0
+    # MNNVL
+    MNNVL = 1
+    # DeepEP intranode or internode: CUDA Graphs are supported, IBGDA is required by internode
+    DeepEP = 2
+    # DeepEP low latency: CUDA Graphs are supported, IBGDA is required
+    DeepEPLowLatency = 3
 
 
 def extract_extra_attrs(layer_idx: str):
@@ -242,6 +254,7 @@ class MoE(nn.Module):
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
+        **kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
         if self.register_to_config and is_torch_compiling():
             hidden_states = x.fp4_tensor if isinstance(
@@ -274,6 +287,7 @@ class MoE(nn.Module):
                 output_dtype=output_dtype,
                 all_rank_num_tokens=all_rank_num_tokens,
                 use_dp_padding=use_dp_padding,
+                **kwargs,
             )
 
     @property

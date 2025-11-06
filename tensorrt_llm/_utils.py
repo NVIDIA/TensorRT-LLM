@@ -28,13 +28,14 @@ from contextlib import contextmanager
 from enum import EnumMeta
 from functools import lru_cache, partial, wraps
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 
 import numpy as np
 import nvtx
 from mpi4py import MPI
 from mpi4py.util import pkl5
 from packaging import version
+from typing_extensions import ParamSpec
 
 # isort: off
 import torch
@@ -917,6 +918,18 @@ def nvtx_range_debug(msg: str,
         return _null_context_manager()
 
 
+def nvtx_mark_debug(msg: str,
+                    color: str = "grey",
+                    domain: str = "TensorRT-LLM",
+                    category: Optional[str] = None) -> None:
+    """
+    Creates an NVTX marker for debugging purposes.
+    """
+    if os.getenv("TLLM_LLMAPI_ENABLE_NVTX", "0") == "1" or \
+            os.getenv("TLLM_NVTX_DEBUG", "0") == "1":
+        nvtx_mark(msg, color=color, domain=domain, category=category)
+
+
 def nvtx_mark(msg: str,
               color: str = "grey",
               domain: str = "TensorRT-LLM",
@@ -1155,13 +1168,33 @@ def set_prometheus_multiproc_dir() -> object:
         f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")
 
 
+P = ParamSpec("P")
+
+
+# From: https://stackoverflow.com/a/4104188/2749989
+def run_once(f: Callable[P, None]) -> Callable[P, None]:
+
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> None:
+        if not wrapper.has_run:  # type: ignore[attr-defined]
+            wrapper.has_run = True  # type: ignore[attr-defined]
+            return f(*args, **kwargs)
+
+    wrapper.has_run = False  # type: ignore[attr-defined]
+    return wrapper
+
+
 TORCH_PYBIND11_ABI = None
 
 
 def torch_pybind11_abi() -> str:
     global TORCH_PYBIND11_ABI
     if TORCH_PYBIND11_ABI is None:
-        TORCH_PYBIND11_ABI = f"{torch._C._PYBIND11_COMPILER_TYPE}{torch._C._PYBIND11_STDLIB}{torch._C._PYBIND11_BUILD_ABI}"
+        if hasattr(torch._C, '_PYBIND11_COMPILER_TYPE'):
+            # Old pybind11 abi string before torch 2.9.0
+            TORCH_PYBIND11_ABI = f"{torch._C._PYBIND11_COMPILER_TYPE}{torch._C._PYBIND11_STDLIB}{torch._C._PYBIND11_BUILD_ABI}"
+        else:
+            # New pybind11 abi string since torch 2.9.0
+            TORCH_PYBIND11_ABI = f"system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_{int(torch.compiled_with_cxx11_abi())}"
     return TORCH_PYBIND11_ABI
 
 
@@ -1179,3 +1212,71 @@ def is_device_integrated() -> bool:
     if not torch.cuda.is_available():
         return False
     return torch.cuda.get_device_properties().is_integrated
+
+
+# Environment variable to enable garbage collection profiling.
+# Set to "1" to enable recording of garbage collection events during profiling.
+PROFILE_RECORD_GC_ENV_VAR_NAME = "TLLM_PROFILE_RECORD_GC"
+
+
+class _GCNvtxHandle:
+    """Handle object for GC NVTX watcher to keep it alive."""
+
+
+# Singleton for the GC NVTX watcher handle.
+_gc_watcher_handle: Optional[_GCNvtxHandle] = None
+
+
+def _setup_gc_nvtx_profiling() -> Optional[_GCNvtxHandle]:
+    """
+    Set up NVTX range markers for Python garbage collection events (singleton).
+    This helps in profiling to visualize when GC occurs during execution.
+
+    This function is called automatically at module import time. The environment
+    variable TLLM_PROFILE_RECORD_GC must be set before importing this module.
+
+    This is an internal function and should not be called directly by users.
+
+    Returns:
+        _GCNvtxHandle or None: A handle object that keeps the GC callback alive,
+                               or None if GC profiling is not enabled.
+    """
+    global _gc_watcher_handle
+
+    # Return existing handle if already initialized
+    if _gc_watcher_handle is not None:
+        return _gc_watcher_handle
+
+    enabled = os.environ.get(PROFILE_RECORD_GC_ENV_VAR_NAME, None)
+    if not enabled:
+        return None
+
+    range_id: Optional[int] = None
+
+    def gc_callback(phase, _):
+        nonlocal range_id
+        if phase == "start":
+            assert range_id is None, "Unexpected state in GC callback: another GC while last GC not finished?"
+            range_id = torch.cuda.nvtx.range_start("Python GC")
+        elif phase == "stop":
+            assert range_id is not None, "Unexpected state in GC callback: no active GC but got GC finished?"
+            torch.cuda.nvtx.range_end(range_id)
+            range_id = None
+
+    gc.callbacks.append(gc_callback)
+
+    def gc_cleanup(callback):
+        try:
+            gc.callbacks.remove(callback)
+        except ValueError:
+            pass
+
+    handle = _GCNvtxHandle()
+    weakref.finalize(handle, gc_cleanup, gc_callback)
+
+    _gc_watcher_handle = handle
+    return handle
+
+
+# Initialize GC NVTX profiling singleton at module import time
+_setup_gc_nvtx_profiling()

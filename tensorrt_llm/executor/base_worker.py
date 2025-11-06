@@ -84,9 +84,8 @@ class BaseWorker(GenerationExecutor):
         # mapping: client_id from Proxy -> request_id returned from runtime backend
         self._client_id_to_request_id: Dict[int, int] = {}
         self._await_response_helper = AwaitResponseHelper(weakref.proxy(self))
-        self._is_pytorch_backend = llm_args is not None and llm_args.backend in [
-            "pytorch", "_autodeploy"
-        ]
+        self._backend = None if llm_args is None else llm_args.backend
+        self._is_pytorch_backend = self._backend in ["pytorch", "_autodeploy"]
         self._lora_config = llm_args.lora_config if self._is_pytorch_backend else None
 
         if global_mpi_size() > 1:
@@ -115,14 +114,14 @@ class BaseWorker(GenerationExecutor):
                 self.llm_args, "backend"
             ), "llm_args should be with backend in _create_py_executor"
             _ = self._get_comm_ranks_device_id()
-            if self.llm_args.backend == "pytorch":
+            if self._backend == "pytorch":
                 from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
                     create_py_executor
                 create_executor = create_py_executor
                 args["llm_args"] = self.llm_args
                 args["checkpoint_dir"] = self._hf_model_dir
                 args["tokenizer"] = self._tokenizer
-            elif self.llm_args.backend == "_autodeploy":
+            elif self._backend == "_autodeploy":
                 from tensorrt_llm._torch.auto_deploy.llm_args import \
                     LlmArgs as ADLlmArgs
                 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import \
@@ -130,22 +129,23 @@ class BaseWorker(GenerationExecutor):
                 create_executor = create_autodeploy_executor
                 assert isinstance(self.llm_args, ADLlmArgs)
                 args["ad_config"] = self.llm_args.get_pytorch_backend_config()
+                args["tokenizer"] = self._tokenizer
             else:
-                raise ValueError(
-                    f"Unsupported backend config: {self.llm_args.backend}")
+                raise ValueError(f"Unsupported backend config: {self._backend}")
 
             # Define additional attributes that can be used later, such as in _deduce_max_tokens
             self.mapping = self.llm_args.parallel_config.to_mapping()
             self.checkpoint_loader = None
-            if self.llm_args.backend == "pytorch":
+            if self._backend == "pytorch":
                 from tensorrt_llm._torch.pyexecutor.config import \
                     _construct_checkpoint_loader
                 self.checkpoint_loader = _construct_checkpoint_loader(
                     self.llm_args.backend, self.llm_args.checkpoint_loader,
                     self.llm_args.checkpoint_format)
 
-            _executor = create_executor(**args)
             self.max_seq_len = self.llm_args.max_seq_len
+            # creare_py_executor may change some fields of llm_args
+            _executor = create_executor(**args)
             if _executor.max_seq_len is not None:
                 # max_seq_len might be updated by model engine as in create_py_executor
                 self.max_seq_len = _executor.max_seq_len
@@ -202,9 +202,7 @@ class BaseWorker(GenerationExecutor):
             if engine_config.build_config.max_prompt_embedding_table_size > 0:
                 self._prompt_adapter_manager = PromptAdapterManager()
 
-        if self.llm_args and getattr(
-                self.llm_args, "backend",
-                "") == "pytorch" and self._lora_config is not None:
+        if self._backend == "pytorch" and self._lora_config is not None:
             from tensorrt_llm._torch.pyexecutor.resource_manager import \
                 ResourceManagerType
             peft_cache_manager = self.engine.resource_manager.resource_managers.get(
@@ -886,7 +884,15 @@ def _get_metrics_dict(
                 req_perf_metrics.timing_metrics.first_scheduled_time.
                 total_seconds(),
                 RequestEventTiming.LAST_TOKEN_TIME:
-                req_perf_metrics.timing_metrics.last_token_time.total_seconds()
+                req_perf_metrics.timing_metrics.last_token_time.total_seconds(),
+                RequestEventTiming.KV_CACHE_TRANSFER_START:
+                req_perf_metrics.timing_metrics.kv_cache_transfer_start.
+                total_seconds(),
+                RequestEventTiming.KV_CACHE_TRANSFER_END:
+                req_perf_metrics.timing_metrics.kv_cache_transfer_end.
+                total_seconds(),
+                RequestEventTiming.KV_CACHE_SIZE:
+                req_perf_metrics.timing_metrics.kv_cache_size,
             }
     return metrics_dict
 

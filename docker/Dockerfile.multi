@@ -1,8 +1,9 @@
 # Multi-stage Dockerfile
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
 ARG TRITON_IMAGE=nvcr.io/nvidia/tritonserver
-ARG BASE_TAG=25.08-py3
-ARG TRITON_BASE_TAG=25.08-py3
+ARG BASE_TAG=25.10-py3
+# [TODO] Update to NVIDIA Triton 25.10 when it's available
+ARG TRITON_BASE_TAG=25.09-py3
 ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE}:${BASE_TAG} AS base
@@ -40,6 +41,10 @@ COPY docker/common/install.sh \
      docker/common/install_polygraphy.sh \
      docker/common/install_mpi4py.sh \
      docker/common/install_pytorch.sh \
+     docker/common/install_ucx.sh \
+     docker/common/install_nixl.sh \
+     docker/common/install_mooncake.sh \
+     docker/common/install_etcd.sh \
      ./
 
 RUN GITHUB_MIRROR=${GITHUB_MIRROR} \
@@ -71,36 +76,15 @@ RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install.sh --mpi4py && rm install_mpi4
 ARG TORCH_INSTALL_TYPE="skip"
 RUN TORCH_INSTALL_TYPE=${TORCH_INSTALL_TYPE} bash ./install.sh --pytorch && rm install_pytorch.sh
 
-RUN bash ./install.sh --opencv && bash ./install.sh --protobuf && rm install.sh
-
-# wait for new triton to be published
-# Rename pytorch_triton package to triton
-RUN if [ -f /etc/redhat-release ]; then \
-        echo "Rocky8 detected, skipping symlink and ldconfig steps"; \
-    else \
-        cd /usr/local/lib/python3.12/dist-packages/ && \
-        ls -la | grep pytorch_triton && \
-        mv pytorch_triton-3.3.1+gitc8757738.dist-info triton-3.3.1+gitc8757738.dist-info && \
-        cd triton-3.3.1+gitc8757738.dist-info && \
-        echo "Current directory: $(pwd)" && \
-        echo "Files in directory:" && \
-        ls -la && \
-        sed -i 's/^Name: pytorch-triton/Name: triton/' METADATA && \
-        sed -i 's|pytorch_triton-3.3.1+gitc8757738.dist-info/|triton-3.3.1+gitc8757738.dist-info/|g' RECORD && \
-        echo "METADATA after update:" && \
-        grep "^Name:" METADATA; \
-    fi
+RUN bash ./install.sh --opencv && rm install.sh
 
 # Install UCX first
-COPY docker/common/install_ucx.sh install_ucx.sh
 RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install_ucx.sh && rm install_ucx.sh
 
 # Install NIXL
-COPY docker/common/install_nixl.sh install_nixl.sh
 RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install_nixl.sh && rm install_nixl.sh
 
 # Install etcd
-COPY docker/common/install_etcd.sh install_etcd.sh
 RUN bash ./install_etcd.sh && rm install_etcd.sh
 
 # Install Mooncake
@@ -123,10 +107,6 @@ COPY --from=triton /opt/tritonserver/caches /opt/tritonserver/caches
 
 # Copy all installation scripts at once to reduce layers
 COPY docker/common/install_triton.sh \
-     docker/common/install_ucx.sh \
-     docker/common/install_nixl.sh \
-     docker/common/install_etcd.sh \
-     docker/common/install_mooncake.sh
      ./
 
 RUN bash ./install_triton.sh && rm install_triton.sh
@@ -139,7 +119,7 @@ COPY docker docker
 COPY scripts scripts
 COPY tensorrt_llm tensorrt_llm
 COPY 3rdparty 3rdparty
-COPY .gitmodules setup.py requirements.txt requirements-dev.txt constraints.txt ./
+COPY .gitmodules setup.py requirements.txt requirements-dev.txt constraints.txt README.md ./
 
 # Create cache directories for pip and ccache
 RUN mkdir -p /root/.cache/pip /root/.cache/ccache
