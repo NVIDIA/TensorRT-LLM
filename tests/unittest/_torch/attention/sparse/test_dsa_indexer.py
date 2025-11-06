@@ -70,12 +70,9 @@ def create_dsa_cache_manager(
         index_topk=2048)
 
     # Create KV cache config
-    # Note: max_attention_window expects list[int] (one per layer)
     kv_cache_config = KvCacheConfig(
         enable_block_reuse=False,
         max_tokens=max_seq_len * batch_size,
-        max_attention_window=[max_seq_len] *
-        num_layers,  # List of max window per layer
     )
 
     # Create mapping (single GPU, no parallelism)
@@ -474,6 +471,177 @@ def _create_mock_metadata(request_ids,
             self.indexer_prefill_chunks = None
 
     return MockMetadata()
+
+
+@pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
+@pytest.mark.skipif(getSMVersion() < 90, reason="FP8 operations require SM90+")
+def test_indexer_k_cache_scatter_custom_op():
+    """
+    Direct comparison: CUDA kernel vs Python reference for k_cache scatter.
+
+    This test ensures the new CUDA kernel indexer_k_cache_scatter_op produces
+    exactly the same results as the Python scatter implementation.
+    """
+    torch.manual_seed(123)
+
+    # Test parameters
+    head_dim = 128
+    block_size = 64
+    batch_size = 3
+    num_tokens = 96  # 3 requests × 32 tokens each
+    max_seq_len = 512
+
+    # Use different layers for CUDA vs Python to test non-contiguous handling
+    layer_idx_cuda = 1  # CUDA kernel writes to layer 0
+    layer_idx_python = 2  # Python reference writes to layer 1
+
+    # Create cache manager with multiple layers
+    cache_manager, sparse_attn_config = create_dsa_cache_manager(
+        batch_size=batch_size,
+        head_dim=head_dim,
+        tokens_per_block=block_size,
+        max_seq_len=max_seq_len,
+        num_layers=3)  # Multi-layer pool for non-contiguous test
+
+    # Allocate blocks
+    request_ids = list(range(batch_size))
+    tokens_per_req = [32, 32, 32]
+    cache_manager.add_dummy_requests(request_ids,
+                                     tokens_per_req,
+                                     is_gen=False,
+                                     prepare_resource=True)
+
+    # Create metadata
+    metadata = _create_mock_metadata(
+        request_ids,
+        batch_size,
+        num_contexts=batch_size,
+        num_generations=0,
+        seq_lens=torch.tensor(tokens_per_req, dtype=torch.int32),
+        kv_lens=torch.tensor(tokens_per_req, dtype=torch.int32),
+        num_cached_tokens=[0] * batch_size,
+        cache_manager=cache_manager,
+        num_ctx_tokens=num_tokens,
+        num_tokens=num_tokens,
+    )
+
+    from tensorrt_llm._torch.attention_backend.sparse.dsa import Indexer
+    Indexer.prepare(metadata)
+
+    # Generate test data
+    k_original = torch.randn((num_tokens, head_dim),
+                             device="cuda",
+                             dtype=torch.bfloat16)
+    k_fp8, k_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(k_original)
+
+    # Prepare byte-level data
+    scale_size = k_scale.shape[1] * 4
+    k_fp8_bytes = k_fp8.view(-1).view(torch.uint8).view(num_tokens, head_dim)
+    k_scale_flat = k_scale.view(-1)
+    if k_scale_flat.stride(-1) != 1:
+        k_scale_flat = torch.as_strided(k_scale_flat.contiguous(),
+                                        size=(k_scale_flat.numel(), ),
+                                        stride=(1, ))
+    k_scale_bytes = k_scale_flat.view(torch.uint8).view(num_tokens, scale_size)
+
+    flat_indices_fp8 = metadata.slot_mapping_fp8[:num_tokens]
+    flat_indices_scale = metadata.slot_mapping_scale[:num_tokens]
+
+    # ========== Use Different Layers for CUDA vs Python ==========
+    # Simple approach: use layer 0 for CUDA, layer 1 for Python
+    # Both get the same input data, but write to different layers
+    # Then we extract and compare the outputs from each layer
+
+    # Get k_cache for CUDA path (layer 0)
+    k_cache_cuda = cache_manager.get_indexer_k_cache_buffers(layer_idx_cuda)
+    k_cache_cuda.zero_()
+
+    # Get k_cache for Python path (layer 1)
+    k_cache_python = cache_manager.get_indexer_k_cache_buffers(layer_idx_python)
+    k_cache_python.zero_()
+
+    # Print cache properties
+    print(f"\n=== Cache Properties ===")
+    print(f"  CUDA (layer {layer_idx_cuda}):")
+    print(f"    Shape: {k_cache_cuda.shape}")
+    print(f"    Stride: {k_cache_cuda.stride()}")
+    print(f"    is_contiguous: {k_cache_cuda.is_contiguous()}")
+    print(f"  Python (layer {layer_idx_python}):")
+    print(f"    Shape: {k_cache_python.shape}")
+    print(f"    Stride: {k_cache_python.stride()}")
+    print(f"    is_contiguous: {k_cache_python.is_contiguous()}")
+
+    # ========== Path 1: CUDA Kernel ==========
+    print(f"\n=== Path 1: CUDA Kernel ===")
+    torch.ops.trtllm.indexer_k_cache_scatter_op(k_fp8_bytes, k_scale_bytes,
+                                                k_cache_cuda, flat_indices_fp8,
+                                                flat_indices_scale)
+    torch.cuda.synchronize()
+    print(f"✓ CUDA kernel completed")
+
+    # ========== Path 2: Python Reference ==========
+    print(f"\n=== Path 2: Python Reference ===")
+
+    def _unravel_indices(flat_indices, shape):
+        d3 = shape[3]
+        i3 = flat_indices % d3
+        flat_indices = flat_indices // d3
+        d2 = shape[2]
+        i2 = flat_indices % d2
+        flat_indices = flat_indices // d2
+        d1 = shape[1]
+        i1 = flat_indices % d1
+        flat_indices = flat_indices // d1
+        i0 = flat_indices
+        return i0, i1, i2, i3
+
+    # Scatter FP8 data
+    byte_offsets = torch.arange(head_dim,
+                                device=k_cache_python.device).unsqueeze(0)
+    scatter_indices_fp8 = flat_indices_fp8.unsqueeze(1) + byte_offsets
+    scatter_indices_fp8 = _unravel_indices(scatter_indices_fp8,
+                                           k_cache_python.shape)
+    k_cache_python[scatter_indices_fp8] = k_fp8_bytes
+
+    # Scatter scale data
+    byte_offsets = torch.arange(scale_size,
+                                device=k_cache_python.device).unsqueeze(0)
+    scatter_indices_scale = flat_indices_scale.unsqueeze(1) + byte_offsets
+    scatter_indices_scale = _unravel_indices(scatter_indices_scale,
+                                             k_cache_python.shape)
+    k_cache_python[scatter_indices_scale] = k_scale_bytes
+
+    # ========== Validation: Byte-for-Byte Comparison ==========
+    print(f"\n=== Validation ===")
+
+    total_bytes = k_cache_cuda.numel()
+
+    # Compare entire cache tensors
+    if torch.equal(k_cache_cuda, k_cache_python):
+        print(f"✅ PERFECT MATCH! CUDA and Python produce identical cache")
+        print(f"  Total bytes compared: {total_bytes}")
+        print(
+            f"  Tokens: {num_tokens}, head_dim: {head_dim}, block_size: {block_size}"
+        )
+    else:
+        # Find differences
+        diff_mask = k_cache_cuda != k_cache_python
+        num_diffs = diff_mask.sum().item()
+
+        print(
+            f"⚠️  Found {num_diffs}/{total_bytes} byte differences ({100*num_diffs/total_bytes:.4f}%)"
+        )
+
+        # Show first few differences
+        diff_indices = torch.nonzero(diff_mask.view(-1))[:5]
+        for idx in diff_indices:
+            flat_idx = idx.item()
+            print(
+                f"  Byte {flat_idx}: CUDA={k_cache_cuda.view(-1)[flat_idx].item()}, "
+                f"Python={k_cache_python.view(-1)[flat_idx].item()}")
+
+        # Fail the test
+        assert False, f"CUDA kernel produced different results than Python reference"
 
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
