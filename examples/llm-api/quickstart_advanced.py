@@ -84,6 +84,7 @@ def add_llm_args(parser):
     parser.add_argument('--disable_kv_cache_reuse',
                         default=False,
                         action='store_true')
+    parser.add_argument("--tokens_per_block", type=int, default=32)
 
     # Runtime
     parser.add_argument('--disable_overlap_scheduler',
@@ -171,7 +172,6 @@ def parse_arguments():
         description="LLM models with the PyTorch workflow.")
     parser = add_llm_args(parser)
     parser.add_argument("--kv_cache_fraction", type=float, default=0.9)
-    parser.add_argument("--tokens_per_block", type=int, default=32)
     args = parser.parse_args()
     return args
 
