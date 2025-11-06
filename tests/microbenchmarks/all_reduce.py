@@ -34,7 +34,6 @@ from tensorrt_llm._utils import (get_sm_version, local_mpi_rank, local_mpi_size,
                                  nvtx_range)
 from tensorrt_llm.bindings.internal.runtime import delay_kernel
 from tensorrt_llm.functional import AllReduceParams, AllReduceStrategy
-from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
 
 def profile_allreduce(
@@ -291,10 +290,6 @@ def allreduce_benchmark(
     for (num_tokens, hidden_size) in shape_list:
         message_size = num_tokens * hidden_size * torch.finfo(
             torch_dtype).bits // 8
-
-        if message_size > CustomAllReduceHelper.max_workspace_size_auto(
-                mapping.tp_size):
-            continue
 
         input = torch.ones((num_tokens, hidden_size),
                            dtype=torch_dtype,
