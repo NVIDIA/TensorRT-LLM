@@ -347,14 +347,13 @@ class TRTLLMGenFusedMoE(MoE):
             if token_final_scales is not None:
                 token_final_scales = token_final_scales.to(torch.bfloat16)
 
-
             # Apply pre_quant_scale if it exists (for NVFP4_AWQ)
             # fc31_act_scale shape: (1, hidden_size)
             # x shape: (num_tokens, hidden_size)
-            if hasattr(self, 'fc31_act_scale'
-                        ) and self.fc31_act_scale is not None:
+            if hasattr(self,
+                       'fc31_act_scale') and self.fc31_act_scale is not None:
                 x = x * self.fc31_act_scale
-            x, x_sf, x_row, x_col = self._quantize_for_post_quant_comm(x, do_finalize)
+            x, x_sf, x_row, x_col = self._quantize_for_post_quant_comm(x)
 
         if self.enable_alltoall:
             assert all_rank_num_tokens is not None, "all_rank_num_tokens required for alltoall"
@@ -514,8 +513,9 @@ class TRTLLMGenFusedMoE(MoE):
                 # Apply pre_quant_scale if it exists (for NVFP4_AWQ)
                 # fc31_act_scale shape: (1, hidden_size)
                 # x shape: (num_tokens, hidden_size)
-                if hasattr(self, 'fc31_act_scale'
-                            ) and self.fc31_act_scale is not None:
+                if hasattr(
+                        self,
+                        'fc31_act_scale') and self.fc31_act_scale is not None:
                     x = x * self.fc31_act_scale
 
                 hidden_states_fp4, hidden_states_scale_linear_fp4 = (
