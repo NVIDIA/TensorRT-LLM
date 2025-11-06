@@ -483,11 +483,8 @@ private:
         torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias)
     {
         auto const myRank = getRank();
-        if (myRank == 0)
-        {
-            TLLM_LOG_INFO("[RANK 0] *** ENTERED runNCCLAllReduceDeviceFusion ***");
-            TLLM_LOG_INFO("[RANK 0] Fusion op: %s", tensorrt_llm::kernels::toString(mOp).c_str());
-        }
+        TLLM_LOG_DEBUG("runNCCLAllReduceDeviceFusion: rank=%d, fusion_op=%s", myRank,
+            tensorrt_llm::kernels::toString(mOp).c_str());
 
         TLLM_CHECK_WITH_INFO(tensorrt_llm::runtime::ub::ub_is_initialized(),
             "UserBuffer has not been initialized (required for NCCL_DEVICE)");
@@ -532,52 +529,26 @@ private:
             return {norm_out};
         case AllReduceFusionOp::RESIDUAL_RMS_NORM:
         {
-            if (myRank == 0)
-            {
-                TLLM_LOG_INFO("[RANK 0] NCCL_DEVICE: Processing RESIDUAL_RMS_NORM fusion");
-            }
-
             TORCH_CHECK(norm_weight, "norm_weight is required for residual rms norm allreduce");
             TORCH_CHECK(residual, "residual is required for residual rms norm allreduce");
             TORCH_CHECK(!bias, "bias is not supported for residual rms norm allreduce");
 
             int const hidden_size = input.size(-1);
             int const num_tokens = size / hidden_size;
-            if (myRank == 0)
-            {
-                TLLM_LOG_INFO(
-                    "[RANK 0] NCCL_DEVICE: hidden_size=%d, num_tokens=%d, nRanks=%d", hidden_size, num_tokens, nRanks);
-            }
-            // Get cached launch config from NCCLUserBufferAllocator
-            if (myRank == 0)
-            {
-                TLLM_LOG_INFO(
-                    "[RANK 0] Getting cached NCCL device launch config with: dtype=%d, hidden_size=%d, num_tokens=%d, "
-                    "nRanks=%d",
-                    static_cast<int>(mType), hidden_size, num_tokens, nRanks);
-            }
+
+            TLLM_LOG_DEBUG("NCCL_DEVICE RESIDUAL_RMS_NORM: rank=%d, hidden_size=%d, num_tokens=%d, nRanks=%d, dtype=%d",
+                myRank, hidden_size, num_tokens, nRanks, static_cast<int>(mType));
+
             std::shared_ptr<tensorrt_llm::kernels::nccl_device::LaunchConfig> launchConfig
                 = nccl_ub_allocator.getCachedNCCLDeviceLaunchConfig(
                     mType, hidden_size, num_tokens, myRank, nRanks, true, false);
 
             // Check if multimem is supported for this data type
             bool multimemSupported = launchConfig->supportsMultimem();
-            if (myRank == 0)
-            {
-                TLLM_LOG_INFO("[RANK 0] NCCL_DEVICE: Checking multimem support...");
-                TLLM_LOG_INFO("[RANK 0] NCCL_DEVICE: - supportsMultimem() = %s", multimemSupported ? "TRUE" : "FALSE");
-                TLLM_LOG_INFO("[RANK 0] NCCL_DEVICE: - nRanks = %d", nRanks);
-                TLLM_LOG_INFO(
-                    "[RANK 0] NCCL_DEVICE: - dataType = %d (0=FLOAT, 1=HALF, 7=BF16, 9=FP8)", static_cast<int>(mType));
-                TLLM_LOG_INFO("[RANK 0] NCCL_DEVICE: - hidden_size = %d, num_tokens = %d", hidden_size, num_tokens);
-            }
+            TLLM_LOG_DEBUG("NCCL_DEVICE: rank=%d, supportsMultimem=%s", myRank, multimemSupported ? "true" : "false");
+
             if (multimemSupported)
             {
-                if (myRank == 0)
-                {
-                    TLLM_LOG_INFO(
-                        "[RANK 0] NCCL_DEVICE: *** Multimem IS SUPPORTED - launching fused NCCL device kernel ***");
-                }
                 ncclWindow_t inWindow = ub_buffer0.window;
                 ncclWindow_t outWindow = ub_buffer1.window;
                 TLLM_CHECK(inWindow != nullptr);
@@ -590,10 +561,8 @@ private:
 
                 launchConfig->launchRMSNorm(inWindow, outWindow, residual.value().data_ptr(), ub_buffer2.window,
                     norm_weight.value().data_ptr(), nullptr, devComm, mEps, stream);
-                if (myRank == 0)
-                {
-                    TLLM_LOG_INFO("[RANK 0] NCCL_DEVICE: Fused kernel launched successfully");
-                }
+
+                TLLM_LOG_DEBUG("NCCL_DEVICE: rank=%d, fused kernel launched successfully", myRank);
                 return {norm_out, residual_out};
             }
             // Fall back to old strategy with warning
@@ -1142,9 +1111,11 @@ private:
     {
         if (mStrategy != AllReduceStrategyType::AUTO)
         {
-            // For UB,NCCL,NCCL_SYMMETRIC, the correctness of the strategy dispatching is guaranteed by the user.
+            // For UB,NCCL,NCCL_SYMMETRIC,NCCL_DEVICE, the correctness of the strategy dispatching is guaranteed by the
+            // user.
             if (mStrategy == AllReduceStrategyType::UB || mStrategy == AllReduceStrategyType::NCCL
-                || mStrategy == AllReduceStrategyType::NCCL_SYMMETRIC)
+                || mStrategy == AllReduceStrategyType::NCCL_SYMMETRIC
+                || mStrategy == AllReduceStrategyType::NCCL_DEVICE)
             {
                 return mStrategy;
             }
