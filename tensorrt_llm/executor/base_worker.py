@@ -2,11 +2,13 @@ import copy
 import datetime
 import enum
 import json
+import os
 import weakref
 from pathlib import Path
 from queue import Queue
 from typing import Dict, List, Optional, Tuple, Union
 
+import psutil
 import torch
 
 from tensorrt_llm.logger import logger
@@ -19,7 +21,8 @@ from ..builder import ConfigEncoder, Engine, EngineConfig
 from ..llmapi.llm_args import BaseLlmArgs, KvCacheConnectorConfig, PybindMirror
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
-from ..llmapi.utils import _SyncQueue, print_colored_debug
+from ..llmapi.utils import (_SyncQueue, get_numa_aware_cpu_affinity,
+                            print_colored_debug)
 from ..lora_helper import LoraConfig
 from ..lora_manager import LoraManager
 from ..metrics import RequestEventTiming
@@ -100,6 +103,48 @@ class BaseWorker(GenerationExecutor):
         if global_mpi_size() > 1:
             logger.set_rank(self.global_rank)
 
+    def _configure_affinity(self, device_id):
+        '''Probe and configure the CPU affinity of the worker based on NUMA topology.
+
+        Args:
+            device_id: The CUDA device ID to determine optimal CPU affinity.
+
+        Note:
+            If the process already has constrained affinity, a warning is logged.
+            Configuration is handled as follows:
+                TLLM_NUMA_WORKER_AFFINITY = <unset>
+                    -> affinity is auto-configured only if it is unconstrained
+                TLLM_NUMA_WORKER_AFFINITY = 1
+                    -> affinity is unconditionally auto-configured
+                TLLM_NUMA_WORKER_AFFINITY = 0 or any other value
+                    -> affinity is unconditionally _not_ auto-configured
+        '''
+
+        # Get the current affinity setting
+        pid = os.getpid()
+        process = psutil.Process(pid)
+        cpu_affinity = process.cpu_affinity()
+
+        all_cpus = list(range(psutil.cpu_count()))
+
+        constrained_affinity = (cpu_affinity != all_cpus)
+
+        # If the process is affined to a constrained set of CPUs, warn the user
+        # so as to ensure that this is what is intended
+        if constrained_affinity:
+            logger.warning(
+                f"Worker process {pid} is affined to run on the following CPUs: "
+                f"{cpu_affinity} (subset of all logical CPUs). This may harm "
+                f"performance if set incorrectly.")
+
+        # If affinity is unconstrained and the user hasn't explicitly
+        # prohibited it or the user has explicitly requested it, choose the
+        # optimal affinity based upon the NUMA topology
+        numa_aware_affinity = os.environ.get("TLLM_NUMA_AWARE_WORKER_AFFINITY")
+        if ((numa_aware_affinity is None and not constrained_affinity)
+                or (numa_aware_affinity == "1")):
+            process.cpu_affinity(get_numa_aware_cpu_affinity(device_id))
+
     def setup_engine(self):
         """
         Setup the engine for the worker.
@@ -115,6 +160,9 @@ class BaseWorker(GenerationExecutor):
             global_rank = global_mpi_rank()
             comm_ranks = mpi_comm().allgather(global_rank)
             device_ids = mpi_comm().allgather(device_id)
+
+            self._configure_affinity(device_id)
+
             return comm_ranks, device_ids
 
         def _create_py_executor():

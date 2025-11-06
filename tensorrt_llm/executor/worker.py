@@ -1,5 +1,4 @@
 import json
-import os
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor
@@ -19,8 +18,7 @@ from ..llmapi.mpi_session import set_mpi_session_cpp
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import VizTracer, set_global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
-                            clear_sched_affinity, print_colored_debug,
-                            print_traceback_on_error)
+                            print_colored_debug, print_traceback_on_error)
 from ..lora_helper import LoraConfig
 from ..sampling_params import BatchedLogitsProcessor
 from .base_worker import BaseWorker
@@ -275,15 +273,6 @@ def worker_main(
     mpi_comm().barrier()
     print_colored_debug(f"Worker {mpi_rank()} entering worker_main...\n",
                         "green")
-
-    pid = os.getpid()
-    cpus = os.sched_getaffinity(pid)
-    if cpus:
-        logger.warning(
-            f"Found worker process {pid} was bound to {cpus}, this may harm "
-            "performance.", )
-        logger.warning(f"Will clear the cpu affinity")
-        clear_sched_affinity(pid)
 
     result_queue: Optional[IpcQueue] = None
     result_queues: Optional[List[IpcQueue]] = None
