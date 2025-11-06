@@ -51,6 +51,12 @@ namespace tensorrt_llm::kernels::mnnvl_throughput
         __VA_ARGS__;                                                                                                   \
         break;                                                                                                         \
     }                                                                                                                  \
+    case 6:                                                                                                            \
+    {                                                                                                                  \
+        constexpr int TOP_K = 6;                                                                                       \
+        __VA_ARGS__;                                                                                                   \
+        break;                                                                                                         \
+    }                                                                                                                  \
     case 4:                                                                                                            \
     {                                                                                                                  \
         constexpr int TOP_K = 4;                                                                                       \
