@@ -23,8 +23,12 @@ from mpi4py import MPI
 
 import tensorrt_llm
 import tensorrt_llm.bindings.internal.userbuffers as ub
-from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
-                                             AllReduceParams, AllReduceStrategy)
+from tensorrt_llm._torch.distributed import (
+    AllReduce,
+    AllReduceFusionOp,
+    AllReduceParams,
+    AllReduceStrategy,
+)
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.mapping import Mapping
 
@@ -40,9 +44,9 @@ pytestmark = pytest.mark.threadleak(enabled=False)
 
 
 def init_userbuffers_allocator(tp_size, rank, max_ub_size):
-    ub.initialize_userbuffers_manager(tp_size, 1, 1, rank,
-                                      torch.cuda.device_count(), max_ub_size,
-                                      True)
+    ub.initialize_userbuffers_manager(
+        tp_size, 1, 1, rank, torch.cuda.device_count(), max_ub_size, True
+    )
 
 
 def create_userbuffers_tensor(shape, dtype):
@@ -123,9 +127,7 @@ def run_single_rank_ar_rms_norm(tensor_parallel_size, a, b, c, gamma):
         # Fully simulate matmul + allreduce behavior
         ax = [a_partial[i].cuda() for i in range(0, tensor_parallel_size)]
         bx = [b_partial[i].cuda() for i in range(0, tensor_parallel_size)]
-        h1 = [
-            torch.matmul(ax[i], bx[i]) for i in range(0, tensor_parallel_size)
-        ]
+        h1 = [torch.matmul(ax[i], bx[i]) for i in range(0, tensor_parallel_size)]
         sum = h1[0]
         for i in range(1, tensor_parallel_size):
             sum = sum + h1[i]
@@ -133,9 +135,12 @@ def run_single_rank_ar_rms_norm(tensor_parallel_size, a, b, c, gamma):
         ref = rms_norm(ref_residual.to(torch.float32), gamma, eps).to(res.dtype)
         torch.testing.assert_close(ref, res, atol=5e-1, rtol=1e-2)
 
-        chunked_residual_comparison = False  # Current production version performs full scatter also for the residual, so we can compare unchunked
+        # Current production version performs full scatter also for the
+        # residual, so we can compare unchunked
+        chunked_residual_comparison = False
 
-        # Since we do not always perform an AllGather of the residual, let's compare on every rank the right portions of the residual
+        # Since we do not always perform an AllGather of the residual,
+        # let's compare on every rank the right portions of the residual
         residual_chunk_size = ref_residual.size(0) // tensor_parallel_size
         if ref_residual.size(0) % tensor_parallel_size != 0:
             residual_chunk_size += 1
@@ -157,10 +162,10 @@ def run_single_rank_ar_rms_norm(tensor_parallel_size, a, b, c, gamma):
     return True
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2,
-                    reason="needs 2 GPUs to run this test")
-@pytest.mark.parametrize("mnk", [(128, 8192, 64), (79, 512, 32)],
-                         ids=lambda x: f"m{x[0]}_n{x[1]}_k{x[2]}")
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs to run this test")
+@pytest.mark.parametrize(
+    "mnk", [(128, 8192, 64), (79, 512, 32)], ids=lambda x: f"m{x[0]}_n{x[1]}_k{x[2]}"
+)
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
 def test_user_buffers_ar_rms_norm(mnk, mpi_pool_executor):
     # Ensure all MPI processes are synchronized before any test execution
@@ -175,12 +180,12 @@ def test_user_buffers_ar_rms_norm(mnk, mpi_pool_executor):
     k = mnk[2]
 
     # Ensure tensor dimensions are compatible with 2-way tensor parallelism
-    assert (
-        k % tensor_parallel_size == 0
-    ), f"k dimension {k} must be divisible by tensor_parallel_size {tensor_parallel_size}"
-    assert (
-        n % tensor_parallel_size == 0
-    ), f"n dimension {n} must be divisible by tensor_parallel_size {tensor_parallel_size}"
+    assert k % tensor_parallel_size == 0, (
+        f"k dimension {k} must be divisible by tensor_parallel_size {tensor_parallel_size}"
+    )
+    assert n % tensor_parallel_size == 0, (
+        f"n dimension {n} must be divisible by tensor_parallel_size {tensor_parallel_size}"
+    )
 
     a = torch.randn((m, k), dtype=dtype)
     b = torch.randn((k, n), dtype=dtype)
