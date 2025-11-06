@@ -1548,7 +1548,7 @@ def topk_kernel(
         # Vectorized write for candidates
         candidate_write_offsets = final_offset + temp_base + candidate_positions
         # NOTE: WAR to avoid out of bounds access, but may cause performance regression
-        candidate_write_mask = (candidate_write_offsets
+        candidate_write_mask = (final_offset + candidate_positions
                                 < FINAL_SIZE) & candidate_mask
         tl.store(temp_values_ptr + candidate_write_offsets,
                  values,
