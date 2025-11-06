@@ -369,7 +369,8 @@ def create_py_executor(
                 guided_decoding_config is None
                 and draft_spec_config._allow_chain_drafter
                 and draft_spec_config._allow_greedy_draft_tokens
-                and pytorch_backend_config.attn_backend == "TRTLLM")
+                and pytorch_backend_config.attn_backend == "TRTLLM"
+                and draft_spec_config.draft_len_schedule is None)
 
             logger.debug(f"USE CHAIN DRAFTER: {use_chain_drafter}")
             if use_chain_drafter:

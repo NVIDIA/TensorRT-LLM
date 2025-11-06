@@ -453,6 +453,16 @@ class DecodingBaseConfig(StrictBaseModel):
     # this value. Otherwise, speculation will always be on.
     max_concurrency: Optional[int] = None
 
+    # Developer interface: dynamically adjust draft length based on active batch size in runtime.
+    # Maps batch size to draft lengths. For example:
+    # {1: 4, 4: 2, 8: 0} means:
+    # - batch_size >= 1: use draft_len=4
+    # - batch_size >= 4: use draft_len=2
+    # - batch_size >= 8: use draft_len=0 (disable speculation)
+    # draft_len_schedule is enforced to contain batch_size=1 and its according draft_len equals max_draft_len for consistency
+    # for example, if max_draft_len=4, the schedule must contain {1: 4}
+    draft_len_schedule: Optional[dict[int, int]] = None
+
     load_format: Optional[str] = None
     # PyTorch only.
     # Rolling average window size (N) for acceptance length across completed requests.
@@ -489,6 +499,51 @@ class DecodingBaseConfig(StrictBaseModel):
     _allow_chain_drafter: bool = PrivateAttr(True)
     # If set, drafting uses greedy sampling, irrespective of sampling parameters.
     _allow_greedy_draft_tokens: bool = PrivateAttr(True)
+
+    @field_validator('draft_len_schedule')
+    @classmethod
+    def validate_draft_len_schedule_and_sort(cls, v, info):
+        """Validate and sort draft_len_schedule by batch size thresholds."""
+        if v is not None:
+            # Validate values
+            for batch_size, draft_len in v.items():
+                if batch_size < 1:
+                    raise ValueError(
+                        f"draft_len_schedule: batch size threshold must be >= 1, got {batch_size}"
+                    )
+                if draft_len < 0:
+                    raise ValueError(
+                        f"draft_len_schedule: draft length must be >= 0, got {draft_len}"
+                    )
+
+            # Require batch_size=1 in schedule
+            if 1 not in v:
+                raise ValueError(
+                    "draft_len_schedule must include batch_size=1. "
+                    "All systems can have batch_size=1. Add {1: <max_draft_len>} to your schedule."
+                )
+
+            # Enforce schedule[1] == max_draft_len for consistency
+            max_draft_len = info.data.get('max_draft_len')
+            if max_draft_len is not None and v[1] != max_draft_len:
+                raise ValueError(
+                    f"draft_len_schedule[1] must equal max_draft_len for consistency. "
+                    f"Got schedule[1]={v[1]}, but max_draft_len={max_draft_len}. "
+                    f"batch_size=1 should use maximum draft length.")
+
+            # Enforce all draft lengths <= max_draft_len
+            if max_draft_len is not None:
+                for batch_size, draft_len in v.items():
+                    if draft_len > max_draft_len:
+                        raise ValueError(
+                            f"draft_len_schedule: all draft lengths must be <= max_draft_len. "
+                            f"Got draft_len={draft_len} for batch_size={batch_size}, "
+                            f"but max_draft_len={max_draft_len}.")
+
+            # Return sorted dict (by batch size thresholds)
+            # This ensures efficient lookup
+            return dict(sorted(v.items(), key=lambda x: x[0]))
+        return v
 
     @classmethod
     def from_dict(cls, data: dict):
