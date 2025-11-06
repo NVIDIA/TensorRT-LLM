@@ -213,22 +213,16 @@ class TRTLLMGenFusedMoE(MoE):
         x_row = x.shape[0]
         x_col = x.shape[1]
         
-        # For TP attention with ENABLE_PERFECT_ROUTER, we need to apply routing to get token_selected_experts
-        if not run_post_quant_allgather and enable_perfect_router:
-            # Apply routing to get token_selected_experts and token_final_scales for perfect router
-            token_selected_experts, token_final_scales = self.routing_method.apply(
-                router_logits)
+        # Apply routing when needed: either for perfect router with TP attention or for post-quant allgather
+        should_apply_routing = enable_perfect_router or run_post_quant_allgather
+        
+        if should_apply_routing:
+            token_selected_experts, token_final_scales = self.routing_method.apply(router_logits)
             token_final_scales = token_final_scales.to(torch.bfloat16)
             assert token_final_scales.dtype == torch.bfloat16
             assert token_selected_experts.dtype == torch.int32
         
         if run_post_quant_allgather:
-            # apply routing
-            token_selected_experts, token_final_scales = self.routing_method.apply(
-                router_logits)
-            token_final_scales = token_final_scales.to(torch.bfloat16)
-            assert token_final_scales.dtype == torch.bfloat16
-            assert token_selected_experts.dtype == torch.int32
             # quantize inputs
             if self.has_w4a8_mxfp4_fp8:
                 x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
