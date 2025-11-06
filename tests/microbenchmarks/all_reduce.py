@@ -50,8 +50,6 @@ def profile_allreduce(
     scale=None,
     bias=None,
 ):
-    tllm.logger.set_level('error')
-
     allreduce_params = AllReduceParams(
         fusion_op=fusion,
         residual=residual,
@@ -144,7 +142,6 @@ def allreduce_benchmark(
         tokens_range: Range for number of tokens in 2D mode (min,max,ratio) (default: "1,16384,2")
         hidden_sizes_range: Range for hidden sizes in 2D mode (min,max,ratio) (default: "128,8192,2")
     """
-    tllm.logger.set_level('error')
     world_size = tllm.mpi_world_size()
     rank = tllm.mpi_rank()
     local_rank = local_mpi_rank()
@@ -353,6 +350,9 @@ def allreduce_benchmark(
     # print the dataframe
     if mapping.rank == 0:
         pd.set_option('display.max_rows', None)
+        pd.set_option('display.max_columns', None)
+        pd.set_option('display.width', None)
+        pd.set_option('display.max_colwidth', None)
         print(df)
 
     # # save the dataframe to a csv file
