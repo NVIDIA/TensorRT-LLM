@@ -1181,10 +1181,11 @@ class TestMoeFp4:
     )
     @pytest.mark.parametrize("swiglu_alpha", [0.1],
                              ids=lambda v: f"alpha{v}")  # 1, 0.1 both works
-    @pytest.mark.parametrize("swiglu_beta", [0],
-                             ids=lambda v: f"beta{v}")  # 1 doesn't work
-    @pytest.mark.parametrize("swiglu_limit", [float('inf')],
-                             ids=lambda v: f"limit{v}")  # 1 doesn't work
+    @pytest.mark.parametrize(
+        "swiglu_beta", [1], ids=lambda v: f"beta{v}")  # 0 works, 1 doesn't work
+    @pytest.mark.parametrize(
+        "swiglu_limit", [float('inf')],
+        ids=lambda v: f"limit{v}")  # inf works, 1 doesn't work
     def test_gptoss(self, num_tokens, hidden_size, intermediate_size,
                     routing_info, swiglu_alpha, swiglu_beta, swiglu_limit):
 
@@ -1578,6 +1579,7 @@ class TestMoeFp4:
         # Quantize hidden states. Produces scales for activations in 128x4 layout for ref impl.
         hidden_states_fp4_bytes, hidden_states_scale_fp4_bytes, hidden_states_scale_global = quant_fp4(
             hidden_states, use_ue8m0, True)
+
         # We do it twice to get the linear layout for scales for the FP4 kernels.
         _, hidden_states_scale_linear_fp4_bytes, _ = quant_fp4(
             hidden_states, use_ue8m0, False)
@@ -1730,6 +1732,12 @@ class TestMoeFp4:
             torch.float8_e4m3fn).reshape(num_experts, hidden_size,
                                          intermediate_size // 16)
 
+        # NOTE: correct the beta and clamp to account for the global scale factor
+        # Check cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/GemmGatedActOptions.h
+        # for more details
+        print("args.hidden_states_scale_global:",
+              args.hidden_states_scale_global)
+        swiglu_beta_tensor = swiglu_beta_tensor * args.hidden_states_scale_global
         #
         # Run the TRT-LLM kernel
         #
