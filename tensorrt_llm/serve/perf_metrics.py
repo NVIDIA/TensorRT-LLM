@@ -14,7 +14,10 @@
 
 import asyncio
 from collections import defaultdict, deque
-from typing import Any, Dict, List
+from dataclasses import dataclass
+from typing import Any, Dict, List, Literal, Optional, Union
+
+from tensorrt_llm.llmapi.disagg_utils import ServerRole
 
 COUNTER_METRICS = [
     ("total_requests", "Total number of requests"),
@@ -50,29 +53,72 @@ HISTOGRAM_METRICS = [
     ),
 ]
 
+MetricsTypeLiteral = Literal["counter", "histogram"]
+
+
+@dataclass
+class MetricsDefinition:
+    name: str
+    description: str
+    type: MetricsTypeLiteral
+    buckets: Optional[List[float]] = None
+
+
+METRICS_DEFINITIONS = [
+    MetricsDefinition("total_requests", "Total number of requests", "counter"),
+    MetricsDefinition("error_requests", "Total number of error requests", "counter"),
+    MetricsDefinition("retry_requests", "Total number of retry requests", "counter"),
+    MetricsDefinition("completed_requests", "Total number of completed requests", "counter"),
+    MetricsDefinition(
+        "first_token_latency_seconds",
+        "Histogram of latency from first token to completion in seconds",
+        "histogram",
+        SHORT_TIME_BUCKETS,
+    ),
+    MetricsDefinition(
+        "complete_latency_seconds",
+        "Histogram of latency from request arrival to last token in seconds",
+        "histogram",
+        LONG_TIME_BUCKETS,
+    ),
+    MetricsDefinition(
+        "per_token_latency_seconds",
+        "Histogram of latency from request arrival to completion in seconds",
+        "histogram",
+        SHORT_TIME_BUCKETS,
+    ),
+]
+
+ROLE_TO_CLIENT_TYPE = {
+    ServerRole.CONTEXT: "ctx",
+    ServerRole.GENERATION: "gen",
+    ServerRole.MM_ENCODER: "mme",
+}
+
 
 class ClientMetricsCollector:
-    def __init__(self, client_type: str):
-        # import prometheus_client lazily to break the `set_prometheus_multiproc_dir`
+    def __init__(self, role: ServerRole):
+        self._role = role
+        # import lazily to avoid breaking `set_prometheus_multiproc_dir`
         from prometheus_client import Counter, Histogram
 
-        assert client_type in ["ctx", "gen"]
-        self._client_type = client_type
-        # TODO: add server address as metric label
-        self._counter_metrics = {
-            f"{name}": Counter(f"{self._client_type}_{name}", description)
-            for name, description in COUNTER_METRICS
-        }
-        self._histogram_metrics = {
-            f"{name}": Histogram(f"{self._client_type}_{name}", description, buckets=buckets)
-            for name, description, buckets in HISTOGRAM_METRICS
+        def instance_metric(definition: MetricsDefinition) -> Union[Counter | Histogram]:
+            name = f"{ROLE_TO_CLIENT_TYPE[role]}_{definition.name}"
+            if definition.type == "counter":
+                return Counter(name, definition.description)
+            elif definition.type == "histogram":
+                return Histogram(name, definition.description, buckets=definition.buckets)
+            else:
+                raise ValueError(f"Invalid metric type: {definition.type}")
+
+        self._metrics = {
+            definition.name: instance_metric(definition) for definition in METRICS_DEFINITIONS
         }
 
-    def inc(self, metric: str, amount: int = 1):
-        self._counter_metrics[metric].inc(amount)
-
-    def observe(self, metric: str, value: float):
-        self._histogram_metrics[metric].observe(value)
+    def __getattr__(
+        self, key: str
+    ):  # no return type hint to not import prometheus_client at module level
+        return self._metrics[key]
 
 
 class DisaggPerfMetricsCollector:

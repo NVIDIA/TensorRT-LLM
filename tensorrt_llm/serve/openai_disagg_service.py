@@ -52,7 +52,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         config: DisaggServerConfig,
         ctx_router: Router,
         gen_router: Router,
-        client_factory: Callable[[Router, str], OpenAIClient],
+        client_factory: Callable[[Router, ServerRole], OpenAIClient],
         metadata_server: Optional[JsonDictionary] = None,
         metadata_config: Optional[MetadataServerConfig] = None,
         req_timeout_secs: int = 180,
@@ -106,21 +106,25 @@ class OpenAIDisaggregatedService(OpenAIService):
         if hooks:
             hooks.on_req_begin(request)
         # empty server means client decides which server to use
-        gen_server = ""
-        ctx_server = ""
+        reserved_gen_server = None
+        reserved_ctx_server = None
         # reserve a gen_server if conditional disagg is needed
-        gen_server, need_ctx = await self._check_conditional_disagg(request)
+        reserved_gen_server, need_ctx = await self._check_conditional_disagg(request)
         need_ctx = need_ctx and not await self._check_gen_only_disagg(request)
         ctx_response = None
         gen_req = request
         if need_ctx:
             ctx_req = self._get_ctx_request(request)
             # ctx generator is empty
-            ctx_response = await self._ctx_client.send_request(ctx_server, ctx_req, hooks)
+            ctx_response = await self._ctx_client.send_request(
+                ctx_req, server=reserved_ctx_server, hooks=hooks
+            )
             await self._verify_ctx_response(ctx_response)
             gen_req = self._get_gen_request(request, ctx_response)
         if ctx_response is None or self._need_gen(ctx_response):
-            return await self._gen_client.send_request(gen_server, gen_req, hooks)
+            return await self._gen_client.send_request(
+                gen_req, server=reserved_gen_server, hooks=hooks
+            )
         else:
             if request.stream:
                 # ctx client will never return a generator when streaming is requested
@@ -170,7 +174,7 @@ class OpenAIDisaggregatedService(OpenAIService):
             ):
                 return gen_server, True
             return gen_server, False
-        return "", True
+        return None, True
 
     async def _check_gen_only_disagg(self, request: UCompletionRequest) -> bool:
         if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":
@@ -206,8 +210,12 @@ class OpenAIDisaggregatedService(OpenAIService):
         return self._config.conditional_disagg_config
 
     async def setup(self) -> None:
-        self._ctx_client = self._client_factory(self._ctx_router, "ctx", self._config.max_retries)
-        self._gen_client = self._client_factory(self._gen_router, "gen", self._config.max_retries)
+        self._ctx_client = self._client_factory(
+            self._ctx_router, ServerRole.CONTEXT, self._config.max_retries
+        )
+        self._gen_client = self._client_factory(
+            self._gen_router, ServerRole.GENERATION, self._config.max_retries
+        )
 
         if self.disagg_cluster_config and self._cluster_storage:
             logger.info("Starting disagg cluster manager")
@@ -263,12 +271,17 @@ class OpenAIDisaggregatedService(OpenAIService):
     async def _on_worker_event(self, worker_info: WorkerInfo, event_type: WatchEventType):
         router_map = {ServerRole.CONTEXT: self._ctx_router, ServerRole.GENERATION: self._gen_router}
         worker_addr = f"{worker_info.host}:{worker_info.port}"
-        router = router_map[worker_info.role]
-        if event_type == WatchEventType.SET:
-            await router.add_server(worker_addr)
-        elif event_type == WatchEventType.DELETE:
-            await router.remove_server(worker_addr)
-        logger.info(f"Worker {event_type.name} event: {worker_info.worker_id}, {worker_addr}")
+        try:
+            router = router_map[worker_info.role]
+            if event_type == WatchEventType.SET:
+                await router.add_server(worker_addr)
+            elif event_type == WatchEventType.DELETE:
+                await router.remove_server(worker_addr)
+            logger.info(f"Worker {event_type.name} event: {worker_info.worker_id}, {worker_addr}")
+        except KeyError:
+            logger.error(
+                f"Unknown worker role: {worker_info.role}, Worker {worker_info.worker_id} event: {event_type.name}"
+            )
 
     async def _verify_ctx_response(self, ctx_response: UCompletionResponse) -> None:
         if ctx_response:
@@ -281,49 +294,3 @@ class OpenAIDisaggregatedService(OpenAIService):
             if ctx_response.choices[0].disaggregated_params.ctx_request_id is None:
                 raise ValueError("Invalid disaggregated params in context phase response.")
             return ctx_response
-
-
-# FIXME: This is a demo to show the basic idea of disagg-service with pre-allocating generation
-class OpenAIDisaggregatedPreAllocService(OpenAIDisaggregatedService):
-    def _need_gen(self, request: UCompletionRequest) -> bool:
-        if isinstance(request, CompletionRequest) and request.max_tokens is not None:
-            return request.max_tokens > 1
-        if isinstance(request, ChatCompletionRequest) and request.max_completion_tokens is not None:
-            return request.max_completion_tokens > 1
-        return False
-
-    async def _send_disagg_request(
-        self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
-    ) -> UCompletionResponseOrGenerator:
-        if hooks:
-            hooks.on_req_begin(request)
-        # empty server means client decides which server to use
-        gen_server = ""
-        ctx_server = ""
-        # reserve a gen_server if conditional disagg is needed
-        gen_server, need_ctx = await self._check_conditional_disagg(request)
-        need_ctx = need_ctx and not await self._check_gen_only_disagg(request)
-        need_gen = self._need_gen(request)
-        # send ctx and gen requests in parallel
-        assert need_gen or need_ctx, "Neither generation nor context is required"
-        gen_task = None
-        ctx_task = None
-        tasks = []
-
-        async def _run_ctx_task():
-            # send ctx request and gen request in parallel
-            ctx_req = self._get_ctx_request(request)
-            ctx_response = await self._ctx_client.send_request(ctx_server, ctx_req, hooks)
-            return ctx_response
-
-        if need_ctx:
-            ctx_task = asyncio.create_task(_run_ctx_task())
-        if need_gen:
-            gen_task = asyncio.create_task(
-                self._gen_client.send_request(gen_server, request, hooks)
-            )
-            tasks.append(gen_task)
-        await asyncio.gather(*tasks)
-        if need_gen:
-            return gen_task.result()
-        return ctx_task.result()

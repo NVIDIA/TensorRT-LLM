@@ -20,6 +20,7 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Type
 
 import aiohttp
 
+from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
@@ -42,15 +43,18 @@ from tensorrt_llm.serve.router import Router
 
 class OpenAIClient(ABC):
     async def send_request(
-        self, server: str, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
+        self,
+        request: UCompletionRequest,
+        server: Optional[str] = None,
+        hooks: Optional[ResponseHooks] = None,
     ) -> UCompletionResponseOrGenerator:
         if isinstance(request, CompletionRequest):
             return await self._send_request(
-                server, "v1/completions", request, CompletionResponse, hooks
+                "v1/completions", request, CompletionResponse, server, hooks
             )
         elif isinstance(request, ChatCompletionRequest):
             return await self._send_request(
-                server, "v1/chat/completions", request, ChatCompletionResponse, hooks
+                "v1/chat/completions", request, ChatCompletionResponse, server, hooks
             )
         else:
             raise ValueError(f"Invalid request type: {type(request)}")
@@ -58,10 +62,10 @@ class OpenAIClient(ABC):
     @abstractmethod
     async def _send_request(
         self,
-        server: str,
         endpoint: str,
         request: UCompletionRequest,
         response_type: Type[UCompletionResponse],
+        server: Optional[str] = None,
         hooks: Optional[ResponseHooks] = None,
     ) -> UCompletionResponseOrGenerator:
         """Send a request to the server and return the response and the body generator.
@@ -90,40 +94,41 @@ class OpenAIHttpClient(OpenAIClient):
     def __init__(
         self,
         router: Router,
-        client_type: str,
+        role: ServerRole,
         timeout_secs: int = 180,
         max_retries: int = 1,
+        retry_interval_sec: int = 1,
         session: Optional[aiohttp.ClientSession] = None,
     ):
-        assert client_type in ["ctx", "gen"]
         self._router = router
-        self._client_type = client_type
-        self._metrics_collector = ClientMetricsCollector(client_type)
+        self._role = role
+        self._metrics_collector = ClientMetricsCollector(role)
         self._session = session or aiohttp.ClientSession(
             connector=aiohttp.TCPConnector(limit=0, limit_per_host=0, force_close=False),
             timeout=aiohttp.ClientTimeout(total=timeout_secs),
         )
         self._max_retries = max_retries
-        self._retry_interval = 1
+        self._retry_interval_sec = retry_interval_sec
 
     async def _send_request(
         self,
-        server: str,
         endpoint: str,
         request: UCompletionRequest,
         response_type: Type[UCompletionResponse],
+        server: Optional[str] = None,
         hooks: Optional[ResponseHooks] = None,
     ) -> UCompletionResponseOrGenerator:
-        if len(server) == 0:
+        if server is None:
             server, _ = await self._router.get_next_server(request)
         url = f"http://{server}/{endpoint}"
         logger.debug(
-            f"Sending {self._client_type} request {request.disaggregated_params.ctx_request_id} to {url}"
+            f"Sending {self._role} request {request.disaggregated_params.ctx_request_id} to {url}"
         )
         try:
-            self._metrics_collector.inc("total_requests")
+            self._metrics_collector.total_requests.inc()
             resp_generator = self._post_with_retry(server, url, request, hooks)
             if request.stream:
+                # return the response generator, the request is not done yet
                 return resp_generator
             else:
                 # consume the generator to get the response and return it directly when it's not streaming
@@ -131,14 +136,16 @@ class OpenAIHttpClient(OpenAIClient):
                 async for resp_json in resp_generator:
                     response = response_type(**resp_json)
                     if hooks:
-                        if self._client_type == "ctx":
+                        if self._role == ServerRole.CONTEXT:
                             hooks.on_ctx_resp(server, response)
                         else:
                             hooks.on_first_token(server, request)
                             hooks.on_resp_done(server, request, response)
                 return response
         except Exception:
-            self._metrics_collector.inc("error_requests")
+            self._metrics_collector.error_requests.inc()
+            # finish the request upon error
+            await self._finish_request(request)
             raise
 
     async def _post_with_retry(
@@ -163,45 +170,45 @@ class OpenAIHttpClient(OpenAIClient):
                         # do NOT return generator directly here or the response will go
                         # out of scope and get destroyed
                         async for line in self._response_generator(
-                            request, http_response, start_time, hooks, server
+                            request, http_response, start_time, server, hooks
                         ):
                             yield line
+                        # don't finish the request here since the response generator is not done yet
                     else:
                         http_response.raise_for_status()
                         response_dict = await http_response.json()
                         # yield here since python forbids return statements in async generators
                         yield response_dict
+                        # finish the request after the successful response
+                        await self._finish_request(request)
                 break  # break and skip retries if the whole response is processed without exception
             except (aiohttp.ClientError, OSError) as e:
                 if attempt == self._max_retries:
                     logger.error(
-                        f"{self._client_type} client error to {url}: {e} - last retry {attempt} of {self._max_retries}"
+                        f"Client error to {url}: {e} - last retry {attempt} of {self._max_retries}"
                         "failed",
                         traceback.format_exc(),
                     )
                     raise
-
                 logger.error(
-                    f"{self._client_type} client error to {url}: {e} - retry {attempt} of {self._max_retries}",
+                    f"{self._role} client error to {url}: {e} - retry {attempt} of {self._max_retries}",
                     traceback.format_exc(),
                 )
-                await asyncio.sleep(self._retry_interval)
-                self._metrics_collector.inc("retry_requests")
+                await asyncio.sleep(self._retry_interval_sec)
+                self._metrics_collector.retry_requests.inc()
             except Exception as e:
                 logger.error(
-                    f"Unexpected error while processing {self._client_type} request to {url}: {e}"
+                    f"Unexpected error while processing {self._role} request to {url}: {e}"
                 )
                 raise
-            finally:
-                await self._finish_request(request)
 
     async def _response_generator(
         self,
         request: UCompletionRequest,
         http_response: aiohttp.ClientResponse,
         start_time: float,
+        server: str,
         hooks: Optional[ResponseHooks] = None,
-        server: str = "",
     ) -> AsyncGenerator[Any, None]:
         assert request.stream, "Request is not streaming"
         assert "text/event-stream" in http_response.headers.get("Content-Type", ""), (
@@ -215,12 +222,12 @@ class OpenAIHttpClient(OpenAIClient):
                 if i == 0:
                     if hooks:
                         hooks.on_first_token(server, request)
-                    self._metrics_collector.observe(
-                        "first_token_latency_seconds", now_time - last_token_time
+                    self._metrics_collector.first_token_latency_seconds.observe(
+                        now_time - last_token_time
                     )
                 else:
-                    self._metrics_collector.observe(
-                        "per_token_latency_seconds", now_time - last_token_time
+                    self._metrics_collector.per_token_latency_seconds.observe(
+                        now_time - last_token_time
                     )
                 i += 1
                 if line:
@@ -230,20 +237,20 @@ class OpenAIHttpClient(OpenAIClient):
 
             if hooks:
                 hooks.on_resp_done(server, request, None)
-            self._metrics_collector.inc("completed_requests")
-            self._metrics_collector.observe(
-                "complete_latency_seconds",
-                get_steady_clock_now_in_seconds() - start_time,
+            self._metrics_collector.completed_requests.inc()
+            self._metrics_collector.complete_latency_seconds.observe(
+                get_steady_clock_now_in_seconds() - start_time
             )
         except aiohttp.ClientError as e:
             # a client error is expected when the response stream is done if the connector has close=True
-            logger.error(f"{self._client_type} Client error: {e}")
-            self._metrics_collector.inc("error_requests")
+            logger.error(f"{self._role} client {server} error: {e}")
+            self._metrics_collector.error_requests.inc()
             raise
         except Exception:
-            self._metrics_collector.inc("error_requests")
+            self._metrics_collector.error_requests.inc()
             raise
         finally:
+            # finish the request after streaming response is done or error is raised
             await self._finish_request(request)
 
     async def _finish_request(self, request: UCompletionRequest) -> None:
