@@ -3,8 +3,9 @@
 # Parse command line arguments
 BACKEND="ray"
 ATTACH_MODE=false
+MODEL_DIR="TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 TP_SIZE=1
-USAGE="Usage: $0 [--executor ray|mpi] [--attach] [--tp_size N] [--help]"
+USAGE="Usage: $0 [--executor ray|mpi] [--attach] [--model model_dir] [--tp_size N] [--help]"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -16,6 +17,10 @@ while [[ $# -gt 0 ]]; do
             ATTACH_MODE=true
             shift
             ;;
+        --model)
+            MODEL_DIR="$2"
+            shift 2
+            ;;
         --tp_size)
             TP_SIZE="$2"
             shift 2
@@ -25,6 +30,7 @@ while [[ $# -gt 0 ]]; do
             echo "Options:"
             echo "  --executor ray|mpi   Choose distributed executor (default: ray)"
             echo "  --attach             Attach to existing ray cluster (skip ray start/stop)"
+            echo "  --model model_dir    Model directory (default: TinyLlama/TinyLlama-1.1B-Chat-v1.0)"
             echo "  --tp_size N          Tensor parallel size (default: 1)"
             echo "  --help, -h           Show this help message"
             exit 0
@@ -77,7 +83,7 @@ echo "Generating disagg_config_local.yaml"
 cat > disagg_config_local.yaml << EOF
 hostname: localhost
 port: 8000
-model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+model: $MODEL_DIR
 free_gpu_memory_fraction: 0.25
 backend: "pytorch"
 disable_overlap_scheduler: True
@@ -123,14 +129,14 @@ if [[ "$BACKEND" == "mpi" ]]; then
     export CUDA_VISIBLE_DEVICES=0
 fi
 
-trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --tp_size $TP_SIZE --port 8001 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --extra_llm_api_options extra_llm_config.yaml &> output_ctx0 &
+trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8001 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --extra_llm_api_options extra_llm_config.yaml &> output_ctx0 &
 
 if [[ "$BACKEND" == "mpi" ]]; then
     export CUDA_VISIBLE_DEVICES=1
 fi
 # Launching generation servers
 echo "Launching generation servers..."
-trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --tp_size $TP_SIZE --port 8002 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --extra_llm_api_options extra_llm_config.yaml &> output_gen0 &
+trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8002 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --extra_llm_api_options extra_llm_config.yaml &> output_gen0 &
 
 # Launching disaggregated server
 echo "Launching disaggregated server..."
