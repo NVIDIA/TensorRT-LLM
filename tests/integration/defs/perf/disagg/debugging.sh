@@ -21,7 +21,7 @@ poetry run python compare_backends.py \
     --html backend_comparison.html
 
 # run with test list file
-poetry run pytest --disagg test_disagg.py -s -vv --test-list=./testlist/testlist_gb200_debug.txt
+poetry run pytest --disagg test_disagg.py -s -vv --disagg-test-list=./testlist/testlist_gb200_debug.txt
 
 # Remove the .cache directory when it's too big
 # This one will lead the poetry install command to fail

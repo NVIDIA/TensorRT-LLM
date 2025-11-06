@@ -1,7 +1,7 @@
 """Pytest configuration for disagg tests.
 
 Only collects tests in this directory when --disagg parameter is provided.
-Can share options like --test-list defined in the main conftest.py.
+Can share options like --disagg-test-list defined in this conftest.py.
 """
 
 import pytest
@@ -16,11 +16,11 @@ def pytest_addoption(parser):
         help="Enable disaggregated tests collection. Example: pytest --disagg",
     )
     parser.addoption(
-        "--test-list",
+        "--disagg-test-list",
         action="store",
         default=None,
         help="Path to a file containing test IDs (one per line) to run. "
-        "Example: pytest --disagg --test-list=testlist/testlist_gb200.txt",
+        "Example: pytest --disagg --disagg-test-list=testlist/testlist_gb200.txt",
     )
 
 
@@ -44,21 +44,21 @@ def pytest_collect_directory(path, parent):
         return True
 
     # With --disagg parameter, proceed with normal collection
-    # Can subsequently use --test-list and other options from main conftest.py for filtering
+    # Can subsequently use --disagg-test-list and other options from main conftest.py for filtering
     return None
 
 
 def pytest_collection_modifyitems(config, items):
-    """Filter tests based on --test-list option.
+    """Filter tests based on --disagg-test-list option.
 
     Args:
         config: pytest config object
         items: list of collected test items
     """
-    test_list_file = config.getoption("--test-list")
+    test_list_file = config.getoption("--disagg-test-list")
 
     if not test_list_file:
-        # No filtering needed if --test-list is not provided
+        # No filtering needed if --disagg-test-list is not provided
         return
 
     # Read test IDs from file
