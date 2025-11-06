@@ -1338,12 +1338,12 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
         if w4a8_custom and has_fp8_weight_scale:
             all_w2_scales = torch.stack(
                 all_w2_scales) / all_w2_scales_fp8.unsqueeze(2)
-        if module.sm_version == 89:
-            w2_scales = torch.stack(all_w2_scales).to(torch.float16).view(
-                module.dtype)
         else:
-            w2_scales = torch.stack(all_w2_scales).to(torch.bfloat16).view(
-                module.dtype)
+            all_w2_scales = torch.stack(all_w2_scales)
+        if module.sm_version == 89:
+            w2_scales = all_w2_scales.to(torch.float16).view(module.dtype)
+        else:
+            w2_scales = all_w2_scales.to(torch.bfloat16).view(module.dtype)
 
         if module.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
             w2_scales = w2_scales.permute(1, 2, 0)
