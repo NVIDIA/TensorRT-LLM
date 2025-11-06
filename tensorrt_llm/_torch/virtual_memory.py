@@ -78,6 +78,7 @@ class ExecutorMemoryType(StrEnum):
     EXTRA_RESOURCES = "executor_extra"
     KV_CACHE = "kv_cache"
     MODEL_ENGINE_MAIN = "model"
+    MODEL_ENGINE_CTX = "ctx_model"
     MODEL_ENGINE_DRAFT = "draft_model"
 
 

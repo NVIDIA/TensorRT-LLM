@@ -14,7 +14,7 @@ from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig,
                                           EagleDecodingConfig, KvCacheConfig,
                                           MTPDecodingConfig, PeftCacheConfig,
                                           SamplerType, SchedulerConfig,
-                                          SparseAttentionConfig,
+                                          SmDisaggConfig, SparseAttentionConfig,
                                           SpeculativeConfig, TorchLlmArgs)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import (LoraConfig,
@@ -38,7 +38,7 @@ from .resource_manager import (KVCacheManager, PeftCacheManager,
 from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
                       TRTLLMSampler)
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
-                        SimpleScheduler)
+                        SimpleScheduler, SmDisaggCtxScheduler)
 from .seq_slot_manager import SeqSlotManager
 
 GB = 1 << 30
@@ -665,6 +665,8 @@ def create_py_executor_instance(
     max_batch_size: Optional[int] = None,
     max_beam_width: Optional[int] = None,
     max_num_tokens: Optional[int] = None,
+    ctx_model_engine: Optional[PyTorchModelEngine] = None,
+    sm_disagg_config: Optional[SmDisaggConfig] = None,
     peft_cache_config: Optional[PeftCacheConfig] = None,
     scheduler_config: Optional[SchedulerConfig] = None,
     cache_transceiver_config: Optional[CacheTransceiverConfig] = None,
@@ -789,6 +791,21 @@ def create_py_executor_instance(
                                            ctx_chunk_config)
     scheduler = SimpleScheduler(capacity_scheduler, mb_scheduler)
 
+    if sm_disagg_config is not None:
+        scheduler_capacity += sm_disagg_config.context_max_batch_size * mapping.pp_size
+        capacity_scheduler = BindCapacityScheduler(
+            scheduler_capacity,
+            kv_cache_manager.impl if kv_cache_manager is not None else None,
+            peft_cache_manager.impl if peft_cache_manager is not None else None,
+            scheduler_config.capacity_scheduler_policy,
+            two_step_lookahead=mapping.has_pp())
+        mb_scheduler = BindMicroBatchScheduler(
+            sm_disagg_config.context_max_batch_size,
+            sm_disagg_config.context_max_num_tokens, ctx_chunk_config)
+        ctx_scheduler = SmDisaggCtxScheduler(capacity_scheduler, mb_scheduler)
+    else:
+        ctx_scheduler = None
+
     config = model_engine.model.model_config.pretrained_config
     attention_type = AttentionTypeCpp.MLA if is_mla(
         config) else AttentionTypeCpp.DEFAULT
@@ -801,6 +818,8 @@ def create_py_executor_instance(
         model_engine=model_engine,
         sampler=sampler,
         drafter=drafter,
+        ctx_scheduler=ctx_scheduler,
+        ctx_model_engine=ctx_model_engine,
         dist=dist,
         max_num_sequences=max_num_sequences,
         disable_overlap_scheduler=llm_args.disable_overlap_scheduler,

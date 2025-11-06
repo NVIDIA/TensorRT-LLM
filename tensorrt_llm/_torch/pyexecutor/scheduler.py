@@ -7,7 +7,7 @@ from strenum import StrEnum
 from tensorrt_llm.bindings import internal as tb_internal
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 
-from .llm_request import LlmRequest, LlmRequestState
+from .llm_request import LlmRequest, LlmRequestState, get_context_requests
 
 RequestList = list[LlmRequest]
 
@@ -207,6 +207,31 @@ class SimpleScheduler(RequestScheduler):
                          inflight_request_ids: set[int]) -> SchedulerOutput:
         fitting_requests, fitting_disagg_gen_init_requests, paused_requests = self.capacity_scheduler.schedule_request(
             active_requests)
+
+        context_requests, generation_requests = self.micro_batch_scheduler.schedule(
+            fitting_requests, inflight_request_ids)
+        # Convert from binding type RequestVector to list[LlmRequest],
+        # so Python fields on LlmRequest won't be stripped away
+        return SchedulerOutput(list(context_requests),
+                               list(generation_requests), list(paused_requests),
+                               list(fitting_disagg_gen_init_requests),
+                               len(fitting_requests))
+
+
+class SmDisaggCtxScheduler(RequestScheduler):
+
+    def __init__(self, capacity_scheduler: CapacityScheduler,
+                 micro_batch_scheduler: MicroBatchScheduler):
+        super(SmDisaggCtxScheduler, self).__init__()
+        self.capacity_scheduler = capacity_scheduler
+        self.micro_batch_scheduler = micro_batch_scheduler
+
+    def schedule_request(self, active_requests: RequestList,
+                         inflight_request_ids: set[int]) -> SchedulerOutput:
+        fitting_requests, fitting_disagg_gen_init_requests, paused_requests = self.capacity_scheduler.schedule_request(
+            active_requests)
+
+        fitting_requests = get_context_requests(fitting_requests)
 
         context_requests, generation_requests = self.micro_batch_scheduler.schedule(
             fitting_requests, inflight_request_ids)
