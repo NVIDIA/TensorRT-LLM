@@ -348,7 +348,6 @@ examples/test_gpt.py::test_llm_minitron_fp8_with_pseudo_loras[4b] SKIP (https://
 disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[True-False-DeepSeek-V3-Lite-fp8/fp8] SKIP (https://nvbugs/5626197)
 disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[True-True-DeepSeek-V3-Lite-fp8/fp8] SKIP (https://nvbugs/5628952)
 cpp/test_e2e.py::test_benchmarks[t5-90] SKIP (https://nvbugs/5630196)
-accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4_4gpus[latency_moe_trtllm_eagle3] SKIP (https://nvbugs/5630700)
 accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_nixl_backend SKIP (https://nvbugs/5628952)
 accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_guided_decoding[xgrammar-mtp_nextn=2] SKIP (https://nvbugs/5628952)
 full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype SKIP (https://nvbugs/5569696)
