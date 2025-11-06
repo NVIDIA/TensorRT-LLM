@@ -266,9 +266,10 @@ class PyTorchModelEngine(ModelEngine):
 
         try:
 
-            use_ub_for_nccl = (
-                self.llm_args.allreduce_strategy in ("NCCL_SYMMETRIC", "NCCL_DEVICE")
-                and self._init_userbuffers(self.model.config.hidden_size))
+            use_ub_for_nccl = (self.llm_args.allreduce_strategy
+                               in ("NCCL_SYMMETRIC", "NCCL_DEVICE")
+                               and self._init_userbuffers(
+                                   self.model.config.hidden_size))
             if self._torch_compile_enabled:
                 set_torch_compiling(True)
                 use_ub = not use_ub_for_nccl and (

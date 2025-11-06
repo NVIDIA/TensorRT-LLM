@@ -120,6 +120,7 @@ inline std::ostream& operator<<(std::ostream& os, AllReduceStrategyType op)
     case AllReduceStrategyType::LOWPRECISION: os << "LOWPRECISION"; break;
     case AllReduceStrategyType::MNNVL: os << "MNNVL"; break;
     case AllReduceStrategyType::NCCL_SYMMETRIC: os << "NCCL_SYMMETRIC"; break;
+    case AllReduceStrategyType::NCCL_DEVICE: os << "NCCL_DEVICE"; break;
     }
     return os;
 }
