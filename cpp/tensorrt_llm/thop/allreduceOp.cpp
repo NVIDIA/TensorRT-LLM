@@ -482,8 +482,8 @@ private:
         torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& norm_weight,
         torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias)
     {
-        auto const rank = getRank();
-        if (rank == 0)
+        auto const myRank = getRank();
+        if (myRank == 0)
         {
             TLLM_LOG_INFO("[RANK 0] *** ENTERED runNCCLAllReduceDeviceFusion ***");
             TLLM_LOG_INFO("[RANK 0] Fusion op: %s", tensorrt_llm::kernels::toString(mOp).c_str());
@@ -516,15 +516,12 @@ private:
 
         auto [norm_out, ub_buffer1] = torch_ext::create_userbuffers_tensor(input.sizes(), input.scalar_type());
         TLLM_CHECK(!ub_buffer1.invalid());
-        // Get rank and size
+        // Get communicator size
         auto& rawComm = std::get<std::shared_ptr<ncclComm_t>>(mNcclComm);
-        int rank, nRanks;
+        int nRanks;
         ncclResult_t ncclError = ncclCommCount(*rawComm, &nRanks);
         TLLM_CHECK_WITH_INFO(
             ncclError == ncclSuccess, "Failed to get NCCL communicator size: %s", ncclGetErrorString(ncclError));
-        ncclError = ncclCommUserRank(*rawComm, &rank);
-        TLLM_CHECK_WITH_INFO(
-            ncclError == ncclSuccess, "Failed to get NCCL communicator rank: %s", ncclGetErrorString(ncclError));
 
         switch (mOp)
         {
@@ -535,7 +532,7 @@ private:
             return {norm_out};
         case AllReduceFusionOp::RESIDUAL_RMS_NORM:
         {
-            if (rank == 0)
+            if (myRank == 0)
             {
                 TLLM_LOG_INFO("[RANK 0] NCCL_DEVICE: Processing RESIDUAL_RMS_NORM fusion");
             }
@@ -546,7 +543,7 @@ private:
 
             int const hidden_size = input.size(-1);
             int const num_tokens = size / hidden_size;
-            if (rank == 0)
+            if (myRank == 0)
             {
                 TLLM_LOG_INFO(
                     "[RANK 0] NCCL_DEVICE: hidden_size=%d, num_tokens=%d, nRanks=%d", hidden_size, num_tokens, nRanks);
@@ -554,12 +551,12 @@ private:
             // Get cached launch config from NCCLUserBufferAllocator
             std::shared_ptr<tensorrt_llm::kernels::nccl_device::LaunchConfig> launchConfig
                 = nccl_ub_allocator.getCachedNCCLDeviceLaunchConfig(
-                    mType, hidden_size, num_tokens, rank, nRanks, true, false);
+                    mType, hidden_size, num_tokens, myRank, nRanks, true, false);
 
             // Check if multimem is supported for this data type
             if (launchConfig->supportsMultimem())
             {
-                if (rank == 0)
+                if (myRank == 0)
                 {
                     TLLM_LOG_INFO(
                         "[RANK 0] NCCL_DEVICE: *** Multimem IS SUPPORTED - launching fused NCCL device kernel ***");
@@ -576,7 +573,7 @@ private:
 
                 launchConfig->launchRMSNorm(inWindow, outWindow, residual.value().data_ptr(), ub_buffer2.window,
                     norm_weight.value().data_ptr(), nullptr, devComm, mEps, stream);
-                if (rank == 0)
+                if (myRank == 0)
                 {
                     TLLM_LOG_INFO("[RANK 0] NCCL_DEVICE: Fused kernel launched successfully");
                 }
