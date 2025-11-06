@@ -482,6 +482,12 @@ private:
         torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& norm_weight,
         torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias)
     {
+        auto const rank = getRank();
+        if (rank == 0)
+        {
+            TLLM_LOG_INFO("[RANK 0] *** ENTERED runNCCLAllReduceDeviceFusion ***");
+            TLLM_LOG_INFO("[RANK 0] Fusion op: %s", tensorrt_llm::kernels::toString(mOp).c_str());
+        }
 
         TLLM_CHECK_WITH_INFO(tensorrt_llm::runtime::ub::ub_is_initialized(),
             "UserBuffer has not been initialized (required for NCCL_DEVICE)");
@@ -529,6 +535,10 @@ private:
             return {norm_out};
         case AllReduceFusionOp::RESIDUAL_RMS_NORM:
         {
+            if (rank == 0)
+            {
+                TLLM_LOG_INFO("[RANK 0] NCCL_DEVICE: Processing RESIDUAL_RMS_NORM fusion");
+            }
 
             TORCH_CHECK(norm_weight, "norm_weight is required for residual rms norm allreduce");
             TORCH_CHECK(residual, "residual is required for residual rms norm allreduce");
@@ -536,6 +546,11 @@ private:
 
             int const hidden_size = input.size(-1);
             int const num_tokens = size / hidden_size;
+            if (rank == 0)
+            {
+                TLLM_LOG_INFO(
+                    "[RANK 0] NCCL_DEVICE: hidden_size=%d, num_tokens=%d, nRanks=%d", hidden_size, num_tokens, nRanks);
+            }
             // Get cached launch config from NCCLUserBufferAllocator
             std::shared_ptr<tensorrt_llm::kernels::nccl_device::LaunchConfig> launchConfig
                 = nccl_ub_allocator.getCachedNCCLDeviceLaunchConfig(
@@ -544,6 +559,11 @@ private:
             // Check if multimem is supported for this data type
             if (launchConfig->supportsMultimem())
             {
+                if (rank == 0)
+                {
+                    TLLM_LOG_INFO(
+                        "[RANK 0] NCCL_DEVICE: *** Multimem IS SUPPORTED - launching fused NCCL device kernel ***");
+                }
                 ncclWindow_t inWindow = ub_buffer0.window;
                 ncclWindow_t outWindow = ub_buffer1.window;
                 TLLM_CHECK(inWindow != nullptr);
@@ -556,6 +576,10 @@ private:
 
                 launchConfig->launchRMSNorm(inWindow, outWindow, residual.value().data_ptr(), ub_buffer2.window,
                     norm_weight.value().data_ptr(), nullptr, devComm, mEps, stream);
+                if (rank == 0)
+                {
+                    TLLM_LOG_INFO("[RANK 0] NCCL_DEVICE: Fused kernel launched successfully");
+                }
                 return {norm_out, residual_out};
             }
             // Fall back to old strategy with warning
@@ -1149,6 +1173,12 @@ private:
         // If messageSize is less than maxWorkspaceSize, use NCCL, regardless of the fusion type.
         if (message_size_bytes > max_workspace_size || !mIsP2PSupported || !mIsNVLINKSupported)
         {
+            auto const rank = getRank();
+            if (rank == 0)
+            {
+                TLLM_LOG_INFO("[RANK 0] Fallback to NCCL: msg_size_bytes=%zu, max_workspace=%zu, P2P=%d, NVLINK=%d",
+                    message_size_bytes, max_workspace_size, mIsP2PSupported, mIsNVLINKSupported);
+            }
             return true;
         }
 
