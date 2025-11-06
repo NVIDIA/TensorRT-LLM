@@ -224,9 +224,9 @@ class JobManager:
 
         # Copy result_dir to a timestamped backup directory
         if os.path.exists(result_dir):
-            timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
-            backup_dir_name = f"{os.path.basename(result_dir)}_{timestamp}"
-            backup_dir = os.path.join(os.path.dirname(result_dir), backup_dir_name)
+            # Replace colons with underscores for safe directory naming
+            dst_dir_name = test_config.test_id.replace(":", "-")
+            backup_dir = os.path.join(os.path.dirname(result_dir), dst_dir_name)
 
             try:
                 print("   📦 Copying result directory to backup...")
@@ -234,6 +234,14 @@ class JobManager:
                 print(f"   📁 Destination: {backup_dir}")
                 shutil.copytree(result_dir, backup_dir)
                 print(f"   ✅ Backup created successfully: {backup_dir}")
+
+                work_dir = EnvManager.get_work_dir()
+                slurm_out_file = os.path.join(work_dir, f"slurm-{job_id}.out")
+                if os.path.exists(slurm_out_file):
+                    shutil.copy(slurm_out_file, backup_dir)
+                    print(f"   ✅ SLURM log copied successfully: {slurm_out_file}")
+                else:
+                    print(f"   ⚠️  Warning: SLURM log not found: {slurm_out_file}")
             except Exception as e:
                 print(f"   ⚠️  Warning: Failed to create backup copy: {e}")
         else:
