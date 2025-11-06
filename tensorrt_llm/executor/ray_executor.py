@@ -1,7 +1,4 @@
-import asyncio
-import atexit
 import os
-import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
@@ -19,24 +16,18 @@ from tensorrt_llm._ray_utils import unwrap_ray_errors
 from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.logger import logger
 
-from .._utils import nvtx_range_debug
-from ..llmapi.tracer import global_tracer
-from ..llmapi.utils import _SyncQueue, logger_debug
+from ..llmapi.utils import logger_debug
 from .executor import GenerationExecutor
 from .postproc_worker import PostprocWorkerConfig
 from .ray_gpu_worker import RayGPUWorker, RayWorkerWrapper
-from .request import GenerationRequest
-from .result import GenerationResult
-from .rpc import RPCClient
-from .rpc.rpc_common import get_unique_ipc_addr
-from .utils import ErrorResponse, is_llm_response
+from .rpc_proxy import RpcExecutorMixin
 
 __all__ = [
     "RayExecutor",
 ]
 
 
-class RayExecutor(GenerationExecutor):
+class RayExecutor(RpcExecutorMixin, GenerationExecutor):
 
     def __init__(self,
                  worker_kwargs: Dict,
@@ -83,134 +74,21 @@ class RayExecutor(GenerationExecutor):
             self.tp_size = tp_size
             self.master_address = ray.util.get_node_ip_address()
             self.master_port = get_free_port()
-
-            self.rpc_addr = get_unique_ipc_addr()
-            self.rpc_client = RPCClient(self.rpc_addr)
-
-            self._results = {}
-            self._shutdown_event = threading.Event()
-            self.main_loop_task_obj = None
-            self.main_loop = None
+            self.init_rpc_executor()
 
             worker_kwargs = dict(**worker_kwargs,
                                  postproc_worker_config=postproc_worker_config,
                                  is_llm_executor=is_llm_executor,
                                  rpc_addr=self.rpc_addr)
-
             self.create_workers(RayGPUWorker, worker_kwargs)
-
-            logger.info("Setting up engine via RPC")
             self.setup_engine_remote()
-            self.setup_mainloop()
+            self.setup_mainloop(tasks=[self._fetch_responses_loop_async],
+                                thread_name="ray_executor_main_loop")
         except Exception as e:
             # Clean up the Ray resources early during exception
             self.shutdown()
             logger.error(f"Failed to initialize RayExecutor: {e}")
             raise e
-
-    @staticmethod
-    def create_actor_weak_ref(actor_handle: ray.actor.ActorHandle):
-        state, _, _ = actor_handle._serialization_helper()
-        return ray.actor.ActorHandle._deserialization_helper(state,
-                                                             weak_ref=True)
-
-    async def _generic_fetch_loop_async(self, fetch_method_name: str,
-                                        handler_method, method_name: str):
-        # TODO copied from GenerationExecutorRpcProxy, need refactoring.
-        """Generic method for fetching data in a loop from RPC worker.
-
-        Args:
-            fetch_method_name: Name of the RPC client method to call
-            handler_method: The handler method to call with the fetched data
-            method_name: Name of the method for logging
-        """
-        try:
-            fetch_method = getattr(self.rpc_client, fetch_method_name)
-            async for data in fetch_method().remote_streaming():
-                if self._shutdown_event.is_set():
-                    return
-                handler_method(data)
-        except asyncio.CancelledError:
-            logger.debug(f"{method_name} task cancelled")
-        except Exception as e:
-            logger.error(f"Error in {method_name}: {e}")
-            raise
-
-    async def _fetch_responses_loop_async(self):
-        # TODO copied from GenerationExecutorRpcProxy, need refactoring.
-        await self._generic_fetch_loop_async(
-            fetch_method_name="fetch_responses_loop_async",
-            handler_method=self.handle_responses,
-            method_name="_fetch_responses_loop_async")
-
-    def setup_mainloop(self):
-        # TODO copied from GenerationExecutorRpcProxy, need refactoring.
-        async def main_loop_task():
-            await self._fetch_responses_loop_async()
-
-        def _run_main_loop_task():
-            """Local method to run the main loop task."""
-            self.main_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self.main_loop)
-
-            self.main_loop_task_obj = self.main_loop.create_task(
-                main_loop_task())
-            try:
-                self.main_loop.run_until_complete(self.main_loop_task_obj)
-            except asyncio.CancelledError:
-                pass  # Task cancellation is expected during shutdown
-            finally:
-                self.main_loop.close()
-
-        self.main_loop_thread = threading.Thread(target=_run_main_loop_task,
-                                                 daemon=True,
-                                                 name="ray_executor_main_loop")
-        self.main_loop_thread.start()
-        atexit.register(self.shutdown)
-
-    def setup_engine_remote(self):
-        return self.collective_rpc("setup_engine", non_block=False)
-
-    def handle_responses(self, responses: list[GenerationResult]) -> bool:
-        # TODO copied from GenerationExecutorRpcProxy, need refactoring.
-        async_queues = []
-        event_loop = None
-
-        def process_res(res: list):
-            for r in res:
-                client_id = r.client_id
-                nonlocal event_loop
-                nonlocal async_queues
-
-                if client_id not in self._results:
-                    logger.warning(
-                        f"Received response for unknown client_id: {client_id}")
-                    continue
-
-                queue = self._results[client_id].queue
-                if isinstance(queue, _SyncQueue):
-                    queue.put_nowait(r)
-                    async_queues.append(queue)
-                    # all the loops are identical
-                    event_loop = event_loop or queue.loop
-                else:
-                    queue.put(r)
-
-                if (is_llm_response(r) and r.result.is_final) or isinstance(
-                        r, ErrorResponse):
-                    self._results.pop(client_id)
-
-        # Handle the case where responses might not be a list of lists
-        if responses and not isinstance(responses[0], list):
-            # If responses is a flat list, wrap it
-            responses = [responses]
-
-        for res in responses:
-            global_tracer().log_instant("RPC.get")
-            process_res(res)
-
-        if async_queues:
-            _SyncQueue.notify_many(event_loop, async_queues)
 
     def create_workers(self, worker_cls, worker_kwargs):
         # When set to be a fraction, it allows Ray to schedule
@@ -287,30 +165,11 @@ class RayExecutor(GenerationExecutor):
                                                         **kwargs))
         return refs if non_block else ray.get(refs)
 
-    def submit(self, request: GenerationRequest) -> GenerationResult:
-        """
-            Low-level API to the executor. Return a "future" GenerationResult
-            which can be waited.
-            Forwards the request to the workers through RPC.
-        """
-        request.set_id(self._get_next_client_id())
-        logprob_params = self._get_logprob_params(request)
-
-        with nvtx_range_debug("rpc_submit"):
-            self.rpc_client.submit(request).remote(need_response=False)
-
-        result = GenerationResult(
-            request,
-            background_error_handler=self._handle_background_error,
-            executor=self,
-            disaggregated_params=request.disaggregated_params,
-            logprob_params=logprob_params)
-        self._results[request.id] = result
-
-        return result
-
     def start(self):
         pass
+
+    def setup_engine_remote(self):
+        return self.collective_rpc("setup_engine", non_block=False)
 
     def report_device_ids(self) -> list[str]:
         gpu_ids = self.call_all_ray_workers("report_device_id",

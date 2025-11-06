@@ -1,10 +1,7 @@
-import asyncio
 import importlib
 import os
 from pathlib import Path
-from queue import Queue
-from threading import Event
-from typing import Any, AsyncGenerator, List, Optional, Type, Union
+from typing import Any, List, Optional, Type, Union
 
 import ray
 import torch
@@ -15,19 +12,16 @@ from tensorrt_llm._torch.virtual_memory import (materialize_with_tag,
                                                 release_with_tag,
                                                 verify_sleep_wakeup_tags)
 
-from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
 from ..builder import Engine
 from ..llmapi.llm_args import BaseLlmArgs
 from ..llmapi.tokenizer import TokenizerBase
-from ..llmapi.utils import logger_debug
 from ..sampling_params import BatchedLogitsProcessor
 from .base_worker import BaseWorker
 from .postproc_worker import PostprocWorkerConfig
 from .request import GenerationRequest
 from .result import GenerationResult
-from .rpc import RPCServer
-from .rpc_worker import RpcWorker
+from .rpc_worker import RpcWorkerMixin
 
 __all__ = [
     "RayGPUWorker",
@@ -154,7 +148,7 @@ class RayWorkerWrapper:
         return ExtendedWorker
 
 
-class RayGPUWorker(BaseWorker):
+class RayGPUWorker(RpcWorkerMixin, BaseWorker):
 
     def __init__(
         self,
@@ -183,33 +177,13 @@ class RayGPUWorker(BaseWorker):
             llm_args=llm_args,
         )
 
-        if not self._is_pytorch_backend:
-            raise ValueError(f"Ray GPU worker only supports PyTorch backend.")
-
         self.device_id = device_id
-
-        # Override rank attributes using torch
         self.global_rank = torch.distributed.get_rank()
         if self.global_rank > 1:
             logger.set_rank(self.global_rank)
 
-        if rpc_addr is None:
-            raise RuntimeError(
-                "RPC mode enabled but no rpc_addr provided to RayGPUWorker")
-
-        self.shutdown_event = Event()
-
-        self._response_queue = Queue()
-        self.set_result_queue(self._response_queue)
-
-        self.rpc_server = None
-        if self.global_rank == 0:
-            logger.info(f"[Rank {self.global_rank}] Creating RPC server")
-            self.rpc_server = RPCServer(self, num_workers=RpcWorker.NUM_WORKERS)
-            self.rpc_server.bind(rpc_addr)
-            self.rpc_server.start()
-            logger.info(
-                f"[Rank {self.global_rank}] RPC server started at {rpc_addr}")
+        self.init_rpc_worker(self.global_rank, rpc_addr)
+        self.start_rpc_server()
 
     def setup_engine(self):
         if torch.distributed.is_initialized(
@@ -233,60 +207,6 @@ class RayGPUWorker(BaseWorker):
 
     def start(self):
         pass
-
-    def submit(self, request: GenerationRequest):
-        return super().submit(request)
-
-    def fetch_responses(self, timeout: Optional[float] = None) -> list:
-        # TODO copied from RpcWorker, need refactoring.
-        logger_debug(f"RayGPUWorker {self.rank} is fetching responses",
-                     color="yellow")
-        with nvtx_range_debug("RayGPUWorker.fetch_responses",
-                              color="orange",
-                              category="Worker"):
-            # NOTE: This is a blocking call, it will wait for the responses to be available.
-            responses = super().await_responses(timeout)
-            self._await_response_helper.responses_handler(responses)
-
-        qsize = self._response_queue.qsize()
-        logger_debug(f"RayGPUWorker returning {qsize} responses",
-                     color="yellow")
-
-        all_responses = []
-        for _ in range(qsize):
-            # The queue contains batches of responses, so extend the list
-            all_responses.extend(self._response_queue.get())
-        return all_responses
-
-    async def fetch_responses_async(self,
-                                    timeout: Optional[float] = None) -> list:
-        # TODO copied from RpcWorker, need refactoring.
-        # A really async version of fetch_responses
-        logger_debug(f"RayGPUWorker {self.rank} is fetching responses async",
-                     color="yellow")
-
-        # First, await any pending responses without blocking the event loop
-        responses = await asyncio.to_thread(self.fetch_responses,
-                                            timeout=timeout)
-        return responses
-
-    # for streaming performance
-    async def fetch_responses_loop_async(self) -> AsyncGenerator[list, None]:
-        # TODO copied from RpcWorker, need refactoring.
-        while not self.shutdown_event.is_set():
-            # Use a short timeout to allow checking shutdown_event periodically
-            responses = await self.fetch_responses_async(timeout=0.1)
-            if responses:  # Only yield if there are actual responses
-                logger_debug(
-                    f"RayGPUWorker {self.rank} is yielding responses: {responses}",
-                    color="yellow")
-                yield responses  # batching the responses to opt IPC performance
-            else:
-                # Small delay to prevent busy waiting when no responses
-                await asyncio.sleep(0)
-        logger_debug(
-            f"RayGPUWorker {self.rank} quitting fetch_responses_loop_async",
-            color="yellow")
 
     def shutdown(self):
 
