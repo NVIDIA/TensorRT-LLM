@@ -1179,13 +1179,11 @@ class TestMoeFp4:
                 id="RoutingGPTOSS")
         ],
     )
-    @pytest.mark.parametrize("swiglu_alpha", [0.1],
-                             ids=lambda v: f"alpha{v}")  # 1, 0.1 both works
-    @pytest.mark.parametrize(
-        "swiglu_beta", [1], ids=lambda v: f"beta{v}")  # 0 works, 1 doesn't work
-    @pytest.mark.parametrize(
-        "swiglu_limit", [float('inf')],
-        ids=lambda v: f"limit{v}")  # inf works, 1 doesn't work
+    @pytest.mark.parametrize("swiglu_alpha", [1, 0.1],
+                             ids=lambda v: f"alpha{v}")
+    @pytest.mark.parametrize("swiglu_beta", [0, 1], ids=lambda v: f"beta{v}")
+    @pytest.mark.parametrize("swiglu_limit", [float("inf"), 1],
+                             ids=lambda v: f"limit{v}")
     def test_gptoss(self, num_tokens, hidden_size, intermediate_size,
                     routing_info, swiglu_alpha, swiglu_beta, swiglu_limit):
 
@@ -1570,6 +1568,10 @@ class TestMoeFp4:
             (num_experts, 2 * intermediate_size, hidden_size),
             device='cuda',
             dtype=torch.bfloat16)
+        gemm1_bias = 50 * torch.randn(num_experts,
+                                      2 * intermediate_size,
+                                      device='cuda',
+                                      dtype=torch.float)
         gemm2_weights = torch.randn(
             (num_experts, hidden_size, intermediate_size),
             device='cuda',
@@ -1735,9 +1737,9 @@ class TestMoeFp4:
         # NOTE: correct the beta and clamp to account for the global scale factor
         # Check cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/GemmGatedActOptions.h
         # for more details
-        print("args.hidden_states_scale_global:",
-              args.hidden_states_scale_global)
-        swiglu_beta_tensor = swiglu_beta_tensor * args.hidden_states_scale_global
+        swiglu_beta_tensor = swiglu_beta_tensor * args.gemm1_scales_global * args.hidden_states_scale_global
+        swiglu_limit_tensor = swiglu_limit_tensor * args.gemm1_scales_global * args.hidden_states_scale_global
+
         #
         # Run the TRT-LLM kernel
         #
