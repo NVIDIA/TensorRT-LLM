@@ -1041,3 +1041,30 @@ class WideEPMoE(MoE):
 
     def post_load_weights(self):
         self.quant_method.post_load_weights(self)
+
+    def forward_fake(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        router_logits: torch.Tensor,
+        *,
+        do_finalize: bool = True,
+        output_dtype: Optional[torch.dtype] = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        use_dp_padding: Optional[bool] = None,
+        **kwargs,
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        moe_output = super().forward_fake(
+            x,
+            router_logits,
+            do_finalize=do_finalize,
+            output_dtype=torch.bfloat16,
+            all_rank_num_tokens=all_rank_num_tokens,
+            use_dp_padding=use_dp_padding,
+            **kwargs)
+        if self.alltoall_method_type == AlltoallMethodType.MNNVL:
+            shape = moe_output.shape
+            top_k = self.routing_method.experts_per_token
+            new_shape = [shape[0], top_k, shape[1]]
+            return moe_output.new_empty(new_shape)
+        else:
+            return moe_output

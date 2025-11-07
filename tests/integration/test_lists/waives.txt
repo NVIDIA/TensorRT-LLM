@@ -346,5 +346,6 @@ disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_spec_dec_batc
 accuracy/test_cli_flow.py::TestMinitron4BBase::test_fp8 SKIP (https://nvbugs/5606233)
 examples/test_gpt.py::test_llm_minitron_fp8_with_pseudo_loras[4b] SKIP (https://nvbugs/5606233)
 cpp/test_e2e.py::test_benchmarks[t5-90] SKIP (https://nvbugs/5630196)
-accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4_4gpus[latency_moe_trtllm_eagle3] SKIP (https://nvbugs/5630700)
 full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype SKIP (https://nvbugs/5569696)
+accuracy/test_cli_flow.py::TestGpt2::test_attention_ootb SKIP (https://nvbugs/5640940)
+llmapi/test_llm_examples.py::test_llmapi_speculative_decoding_mtp SKIP (https://nvbugs/5461796)
