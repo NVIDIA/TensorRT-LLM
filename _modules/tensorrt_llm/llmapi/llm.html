@@ -58,7 +58,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -68,7 +68,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc1" />
+  <meta name="docsearch:version" content="1.2.0rc2" />
 
 
   </head>
@@ -357,11 +357,11 @@
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-gpt-oss-on-trtllm.html">Quick Start Recipe for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-qwen3-next-on-trtllm.html">Quick Start Recipe for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 </ul>
 </details></li>
 </ul>
@@ -391,7 +391,7 @@
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../features/disagg-serving.html">Disaggregated Serving (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -401,10 +401,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -414,6 +416,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/api-change.html">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -508,6 +511,7 @@
 <span class="kn">import</span><span class="w"> </span><span class="nn">tempfile</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">weakref</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span><span class="p">,</span> <span class="n">List</span><span class="p">,</span> <span class="n">Literal</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Sequence</span><span class="p">,</span> <span class="n">Union</span>
 
@@ -519,6 +523,8 @@
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.inputs.data</span><span class="w"> </span><span class="kn">import</span> <span class="n">TextPrompt</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.inputs.multimodal</span><span class="w"> </span><span class="kn">import</span> <span class="n">MultimodalInput</span><span class="p">,</span> <span class="n">MultimodalParams</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.inputs.registry</span><span class="w"> </span><span class="kn">import</span> <span class="n">DefaultInputProcessor</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">tracing</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.metrics.enums</span><span class="w"> </span><span class="kn">import</span> <span class="n">MetricNames</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">.._utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">nvtx_range_debug</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..bindings</span><span class="w"> </span><span class="kn">import</span> <span class="n">executor</span> <span class="k">as</span> <span class="n">tllm</span>
@@ -546,7 +552,7 @@
 <span class="kn">from</span><span class="w"> </span><span class="nn">.tokenizer</span><span class="w"> </span><span class="kn">import</span> <span class="n">TokenizerBase</span><span class="p">,</span> <span class="n">_xgrammar_tokenizer_info</span>
 <span class="c1"># TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.utils</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">append_docstring</span><span class="p">,</span> <span class="n">exception_handler</span><span class="p">,</span> <span class="n">get_device_count</span><span class="p">,</span>
-                    <span class="n">print_colored_debug</span><span class="p">,</span> <span class="n">set_api_status</span><span class="p">)</span>
+                    <span class="n">logger_debug</span><span class="p">,</span> <span class="n">set_api_status</span><span class="p">)</span>
 
 
 <div class="viewcode-block" id="RequestOutput">
@@ -689,8 +695,8 @@
         <span class="k">finally</span><span class="p">:</span>
             <span class="n">logger</span><span class="o">.</span><span class="n">set_level</span><span class="p">(</span><span class="n">log_level</span><span class="p">)</span>  <span class="c1"># restore the log level</span>
 
-        <span class="n">print_colored_debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;LLM.args.mpi_session: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">mpi_session</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
-                            <span class="s2">&quot;yellow&quot;</span><span class="p">)</span>
+        <span class="n">logger_debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;LLM.args.mpi_session: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">mpi_session</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
+                     <span class="s2">&quot;yellow&quot;</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">mpi_session</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">is_multi_gpu</span><span class="p">:</span>
@@ -706,13 +712,11 @@
             <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span><span class="p">:</span>
                 <span class="n">mpi_process_pre_spawned</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">get_spawn_proxy_process_env</span><span class="p">()</span>
                 <span class="k">if</span> <span class="ow">not</span> <span class="n">mpi_process_pre_spawned</span><span class="p">:</span>
-                    <span class="n">print_colored_debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;LLM create MpiPoolSession</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
-                                        <span class="s2">&quot;yellow&quot;</span><span class="p">)</span>
+                    <span class="n">logger_debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;LLM create MpiPoolSession</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span> <span class="s2">&quot;yellow&quot;</span><span class="p">)</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span> <span class="o">=</span> <span class="n">MpiPoolSession</span><span class="p">(</span>
                         <span class="n">n_workers</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">world_size</span><span class="p">)</span>
                 <span class="k">else</span><span class="p">:</span>
-                    <span class="n">print_colored_debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;LLM create MpiCommSession</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
-                                        <span class="s2">&quot;yellow&quot;</span><span class="p">)</span>
+                    <span class="n">logger_debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;LLM create MpiCommSession</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span> <span class="s2">&quot;yellow&quot;</span><span class="p">)</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span> <span class="o">=</span> <span class="n">create_mpi_comm_session</span><span class="p">(</span>
                         <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">world_size</span><span class="p">)</span>
 
@@ -739,6 +743,15 @@
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
             <span class="k">raise</span>
+
+        <span class="k">try</span><span class="p">:</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">otlp_traces_endpoint</span><span class="p">:</span>
+                <span class="n">tracing</span><span class="o">.</span><span class="n">init_tracer</span><span class="p">(</span><span class="s2">&quot;trt.llm&quot;</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">otlp_traces_endpoint</span><span class="p">)</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">&quot;Initialized OTLP tracer successfully, endpoint: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">otlp_traces_endpoint</span><span class="si">}</span><span class="s2">&quot;</span>
+                <span class="p">)</span>
+        <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Failed to initialize OTLP tracer: </span><span class="si">{</span><span class="n">e</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
 
         <span class="n">exception_handler</span><span class="o">.</span><span class="n">register</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s1">&#39;shutdown&#39;</span><span class="p">)</span>
         <span class="n">atexit</span><span class="o">.</span><span class="n">register</span><span class="p">(</span><span class="n">LLM</span><span class="o">.</span><span class="n">_shutdown_wrapper</span><span class="p">,</span> <span class="n">weakref</span><span class="o">.</span><span class="n">ref</span><span class="p">(</span><span class="bp">self</span><span class="p">))</span>
@@ -848,6 +861,7 @@
         <span class="n">streaming</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
         <span class="n">kv_cache_retention_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">KvCacheRetentionConfig</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">disaggregated_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">DisaggregatedParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">trace_headers</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">_postproc_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">PostprocParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">scheduling_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">SchedulingParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">cache_salt</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -864,6 +878,7 @@
 <span class="sd">            streaming (bool): Whether to use the streaming mode for the generation. Defaults to False.</span>
 <span class="sd">            kv_cache_retention_config (tensorrt_llm.bindings.executor.KvCacheRetentionConfig, optional): Configuration for the request&#39;s retention in the KV Cache. Defaults to None.</span>
 <span class="sd">            disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Disaggregated parameters. Defaults to None.</span>
+<span class="sd">            trace_headers (Mapping[str, str], optional): Trace headers. Defaults to None.</span>
 <span class="sd">            scheduling_params (tensorrt_llm.scheduling_params.SchedulingParams, optional): Scheduling parameters. Defaults to None.</span>
 <span class="sd">            cache_salt (str, optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.</span>
 <span class="sd">        Returns:</span>
@@ -922,10 +937,8 @@
             <span class="n">prompt</span> <span class="o">=</span> <span class="n">inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;prompt&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
             <span class="n">query_token_ids</span> <span class="o">=</span> <span class="n">inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;query_token_ids&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">is_gen_only</span><span class="p">:</span>
-                <span class="c1"># TODO: support generation-only mode for multimodal disaggregated inference</span>
-                <span class="c1"># Need to set multimodal_params = None; but not tested yet</span>
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                    <span class="s2">&quot;Multimodal disaggregated inference is not supported for generation-only mode&quot;</span>
+                    <span class="s2">&quot;Generation-only mode should not need multimodal parameters&quot;</span>
                 <span class="p">)</span>
             <span class="k">else</span><span class="p">:</span>
                 <span class="n">mm_hashes</span> <span class="o">=</span> <span class="n">disaggregated_params</span><span class="o">.</span><span class="n">multimodal_hashes</span>
@@ -996,12 +1009,17 @@
             <span class="n">streaming</span><span class="o">=</span><span class="n">streaming</span><span class="p">,</span>
             <span class="n">kv_cache_retention_config</span><span class="o">=</span><span class="n">kv_cache_retention_config</span><span class="p">,</span>
             <span class="n">disaggregated_params</span><span class="o">=</span><span class="n">disaggregated_params</span><span class="p">,</span>
+            <span class="n">trace_headers</span><span class="o">=</span><span class="n">trace_headers</span><span class="p">,</span>
             <span class="n">postproc_params</span><span class="o">=</span><span class="n">_postproc_params</span><span class="p">,</span>
             <span class="n">multimodal_params</span><span class="o">=</span><span class="n">multimodal_params</span><span class="p">,</span>
             <span class="n">scheduling_params</span><span class="o">=</span><span class="n">scheduling_params</span><span class="p">,</span>
             <span class="n">cache_salt_id</span><span class="o">=</span><span class="n">cache_salt_id</span><span class="p">,</span>
             <span class="n">arrival_time</span><span class="o">=</span><span class="n">arrival_time</span><span class="p">,</span>
         <span class="p">)</span>
+
+        <span class="k">if</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">return_perf_metrics</span><span class="p">:</span>
+            <span class="n">result</span><span class="o">.</span><span class="n">metrics_dict</span><span class="o">.</span><span class="n">update</span><span class="p">(</span>
+                <span class="p">{</span><span class="n">MetricNames</span><span class="o">.</span><span class="n">ARRIVAL_TIMESTAMP</span><span class="p">:</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()})</span>
 
         <span class="k">return</span> <span class="n">RequestOutput</span><span class="o">.</span><span class="n">_from_generation_result</span><span class="p">(</span><span class="n">result</span><span class="p">,</span> <span class="n">prompt</span><span class="p">,</span>
                                                      <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">)</span>
@@ -1331,7 +1349,7 @@
             <span class="n">target_engine_dir</span><span class="o">.</span><span class="n">mkdir</span><span class="p">(</span><span class="n">parents</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">exist_ok</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
             <span class="c1"># copy files one by one</span>
             <span class="k">for</span> <span class="n">file</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span><span class="o">.</span><span class="n">iterdir</span><span class="p">():</span>
-                <span class="n">print_colored_debug</span><span class="p">(</span>
+                <span class="n">logger_debug</span><span class="p">(</span>
                     <span class="sa">f</span><span class="s2">&quot;Copying </span><span class="si">{</span><span class="n">file</span><span class="si">}</span><span class="s2"> to </span><span class="si">{</span><span class="n">target_engine_dir</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">file</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">)</span>
                 <span class="n">shutil</span><span class="o">.</span><span class="n">copy</span><span class="p">(</span><span class="n">file</span><span class="p">,</span> <span class="n">target_engine_dir</span> <span class="o">/</span> <span class="n">file</span><span class="o">.</span><span class="n">name</span><span class="p">)</span>
 
@@ -1544,8 +1562,10 @@
         <span class="c1"># Multimodal special handling:</span>
         <span class="c1"># 1. Default load_tokenizer may fail because MM has different tokenizer configuration. Hence we initialize it inside input processor</span>
         <span class="c1"># 2. May need to modify model weights for MM (e.g., resize vocab embedding). We must do such operation via input processor&#39;s __init__</span>
+        <span class="n">checkpoint_format</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">,</span> <span class="s2">&quot;checkpoint_format&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span> <span class="o">=</span> <span class="n">create_input_processor</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span><span class="p">,</span>
-                                                      <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">)</span>
+                                                      <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">,</span>
+                                                      <span class="n">checkpoint_format</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_tokenizer</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span><span class="o">.</span><span class="n">tokenizer</span>
 
         <span class="c1"># TODO: revisit gather_context_logits</span>
@@ -1733,9 +1753,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 19, 2025.</p>
+  <p>Last updated on November 05, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/796891b">796891b</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/3111682">3111682</a>.</p>
   
 </div></div>
       

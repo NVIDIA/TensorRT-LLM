@@ -59,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -71,7 +71,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc1" />
+  <meta name="docsearch:version" content="1.2.0rc2" />
 
 
   </head>
@@ -364,11 +364,11 @@
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-gpt-oss-on-trtllm.html">Quick Start Recipe for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-qwen3-next-on-trtllm.html">Quick Start Recipe for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 </ul>
 </details></li>
 </ul>
@@ -398,7 +398,7 @@
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -408,10 +408,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -421,6 +423,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -1025,6 +1028,125 @@ trtllm-eval<span class="w"> </span>--model<span class="w"> </span>meta-llama/Lla
 </dd></dl>
 
 </section>
+<section id="trtllm-eval-longbench-v2">
+<h4>longbench_v2<a class="headerlink" href="#trtllm-eval-longbench-v2" title="Link to this heading">#</a></h4>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-eval<span class="w"> </span>longbench_v2<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span>
+</pre></div>
+</div>
+<p class="rubric">Options</p>
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-longbench_v2-dataset_path">
+<span class="sig-name descname"><span class="pre">--dataset_path</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;dataset_path&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-longbench_v2-dataset_path" title="Link to this definition">#</a></dt>
+<dd><p>Path to LongBench v2 dataset (HF dataset name or local path).</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-longbench_v2-prompts_dir">
+<span class="sig-name descname"><span class="pre">--prompts_dir</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;prompts_dir&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-longbench_v2-prompts_dir" title="Link to this definition">#</a></dt>
+<dd><p>Path to directory containing prompt templates.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-longbench_v2-num_samples">
+<span class="sig-name descname"><span class="pre">--num_samples</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;num_samples&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-longbench_v2-num_samples" title="Link to this definition">#</a></dt>
+<dd><p>Number of samples to evaluate (None for all).</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-longbench_v2-start_idx">
+<span class="sig-name descname"><span class="pre">--start_idx</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;start_idx&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-longbench_v2-start_idx" title="Link to this definition">#</a></dt>
+<dd><p>Start index for evaluation.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-longbench_v2-difficulty">
+<span class="sig-name descname"><span class="pre">--difficulty</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;difficulty&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-longbench_v2-difficulty" title="Link to this definition">#</a></dt>
+<dd><p>Filter by difficulty level.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Options<span class="colon">:</span></dt>
+<dd class="field-odd"><p>easy | hard</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-longbench_v2-length">
+<span class="sig-name descname"><span class="pre">--length</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;length&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-longbench_v2-length" title="Link to this definition">#</a></dt>
+<dd><p>Filter by length category.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Options<span class="colon">:</span></dt>
+<dd class="field-odd"><p>short | medium | long</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-longbench_v2-domain">
+<span class="sig-name descname"><span class="pre">--domain</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;domain&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-longbench_v2-domain" title="Link to this definition">#</a></dt>
+<dd><p>Filter by domain.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-longbench_v2-cot">
+<span class="sig-name descname"><span class="pre">--cot</span></span><span class="sig-prename descclassname"></span><a class="headerlink" href="#cmdoption-trtllm-eval-longbench_v2-cot" title="Link to this definition">#</a></dt>
+<dd><p>Enable Chain-of-Thought reasoning.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-longbench_v2-no_context">
+<span class="sig-name descname"><span class="pre">--no_context</span></span><span class="sig-prename descclassname"></span><a class="headerlink" href="#cmdoption-trtllm-eval-longbench_v2-no_context" title="Link to this definition">#</a></dt>
+<dd><p>Test without long context.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-longbench_v2-rag">
+<span class="sig-name descname"><span class="pre">--rag</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;rag&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-longbench_v2-rag" title="Link to this definition">#</a></dt>
+<dd><p>Use top-N retrieved contexts (0 to disable).</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-longbench_v2-max_len">
+<span class="sig-name descname"><span class="pre">--max_len</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_len&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-longbench_v2-max_len" title="Link to this definition">#</a></dt>
+<dd><p>Maximum prompt length in tokens for truncation when building prompts.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-longbench_v2-output_dir">
+<span class="sig-name descname"><span class="pre">--output_dir</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;output_dir&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-longbench_v2-output_dir" title="Link to this definition">#</a></dt>
+<dd><p>Directory to save results.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-longbench_v2-random_seed">
+<span class="sig-name descname"><span class="pre">--random_seed</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;random_seed&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-longbench_v2-random_seed" title="Link to this definition">#</a></dt>
+<dd><p>Random seed for dataset processing.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-longbench_v2-apply_chat_template">
+<span class="sig-name descname"><span class="pre">--apply_chat_template</span></span><span class="sig-prename descclassname"></span><a class="headerlink" href="#cmdoption-trtllm-eval-longbench_v2-apply_chat_template" title="Link to this definition">#</a></dt>
+<dd><p>Whether to apply chat template.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-longbench_v2-system_prompt">
+<span class="sig-name descname"><span class="pre">--system_prompt</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;system_prompt&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-longbench_v2-system_prompt" title="Link to this definition">#</a></dt>
+<dd><p>System prompt.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-longbench_v2-max_input_length">
+<span class="sig-name descname"><span class="pre">--max_input_length</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_input_length&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-longbench_v2-max_input_length" title="Link to this definition">#</a></dt>
+<dd><p>Maximum prompt length in sampling parameters.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-eval-longbench_v2-max_output_length">
+<span class="sig-name descname"><span class="pre">--max_output_length</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_output_length&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-eval-longbench_v2-max_output_length" title="Link to this definition">#</a></dt>
+<dd><p>Maximum generation length in sampling parameters.</p>
+</dd></dl>
+
+</section>
 <section id="trtllm-eval-mmlu">
 <h4>mmlu<a class="headerlink" href="#trtllm-eval-mmlu" title="Link to this heading">#</a></h4>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-eval<span class="w"> </span>mmlu<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span>
@@ -1208,6 +1330,7 @@ trtllm-eval<span class="w"> </span>--model<span class="w"> </span>meta-llama/Lla
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-eval-gpqa-main">gpqa_main</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-eval-gsm8k">gsm8k</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-eval-json-mode-eval">json_mode_eval</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-eval-longbench-v2">longbench_v2</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-eval-mmlu">mmlu</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-eval-mmmu">mmmu</a></li>
 </ul>
@@ -1308,9 +1431,9 @@ trtllm-eval<span class="w"> </span>--model<span class="w"> </span>meta-llama/Lla
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 19, 2025.</p>
+  <p>Last updated on November 05, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/796891b">796891b</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/3111682">3111682</a>.</p>
   
 </div></div>
       

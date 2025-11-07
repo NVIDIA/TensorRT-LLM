@@ -59,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -71,7 +71,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc1" />
+  <meta name="docsearch:version" content="1.2.0rc2" />
 
 
   </head>
@@ -364,11 +364,11 @@
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="deployment-guide/quick-start-recipe-for-gpt-oss-on-trtllm.html">Quick Start Recipe for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="deployment-guide/quick-start-recipe-for-qwen3-next-on-trtllm.html">Quick Start Recipe for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 </ul>
 </details></li>
 </ul>
@@ -398,7 +398,7 @@
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
-<li class="toctree-l1"><a class="reference internal" href="features/disagg-serving.html">Disaggregated Serving (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -408,10 +408,12 @@
 <li class="toctree-l1"><a class="reference internal" href="features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -421,6 +423,7 @@
 <li class="toctree-l1"><a class="reference internal" href="developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="developer-guide/api-change.html">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -506,14 +509,15 @@
   <section class="tex2jax_ignore mathjax_ignore" id="quick-start-guide">
 <span id="id1"></span><h1>Quick Start Guide<a class="headerlink" href="#quick-start-guide" title="Link to this heading">#</a></h1>
 <p>This is the starting point to try out TensorRT LLM. Specifically, this Quick Start Guide enables you to quickly get set up and send HTTP requests using TensorRT LLM.</p>
-<section id="launch-docker-on-a-node-with-nvidia-gpus-deployed">
-<h2>Launch Docker on a node with NVIDIA GPUs deployed<a class="headerlink" href="#launch-docker-on-a-node-with-nvidia-gpus-deployed" title="Link to this heading">#</a></h2>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>-it<span class="w"> </span>--ipc<span class="w"> </span>host<span class="w"> </span>--gpus<span class="w"> </span>all<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">memlock</span><span class="o">=</span>-1<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">stack</span><span class="o">=</span><span class="m">67108864</span><span class="w"> </span>-p<span class="w"> </span><span class="m">8000</span>:8000<span class="w"> </span>nvcr.io/nvidia/tensorrt-llm/release:1.2.0rc1
+<section id="launch-docker-container">
+<h2>Launch Docker Container<a class="headerlink" href="#launch-docker-container" title="Link to this heading">#</a></h2>
+<p>The <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags">TensorRT LLM container</a> maintained by NVIDIA contains all of the required dependencies pre-installed. You can start the container on a machine with NVIDIA GPUs via:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>-it<span class="w"> </span>--ipc<span class="w"> </span>host<span class="w"> </span>--gpus<span class="w"> </span>all<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">memlock</span><span class="o">=</span>-1<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">stack</span><span class="o">=</span><span class="m">67108864</span><span class="w"> </span>-p<span class="w"> </span><span class="m">8000</span>:8000<span class="w"> </span>nvcr.io/nvidia/tensorrt-llm/release:1.2.0rc2
 </pre></div>
 </div>
 </section>
 <section id="deploy-online-serving-with-trtllm-serve">
-<span id="deploy-with-trtllm-serve"></span><h2>Deploy online serving with trtllm-serve<a class="headerlink" href="#deploy-online-serving-with-trtllm-serve" title="Link to this heading">#</a></h2>
+<span id="deploy-with-trtllm-serve"></span><h2>Deploy Online Serving with trtllm-serve<a class="headerlink" href="#deploy-online-serving-with-trtllm-serve" title="Link to this heading">#</a></h2>
 <p>You can use the <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> command to start an OpenAI compatible server to interact with a model.
 To start the server, you can run a command like the following example inside a Docker container:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span>
@@ -521,7 +525,7 @@ To start the server, you can run a command like the following example inside a D
 </div>
 <div class="admonition note">
 <p class="admonition-title">Note</p>
-<p>If you are running trtllm-server inside a Docker container, you have two options for sending API requests:</p>
+<p>If you are running <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> inside a Docker container, you have two options for sending API requests:</p>
 <ol class="arabic simple">
 <li><p>Expose a port (e.g., 8000) to allow external access to the server from outside the container.</p></li>
 <li><p>Open a new terminal and use the following command to directly attach to the running container:</p></li>
@@ -572,9 +576,13 @@ Inference can then be performed using examples similar to the one provided below
 </pre></div>
 </div>
 <p>For detailed examples and command syntax, refer to the <a class="reference internal" href="commands/trtllm-serve/trtllm-serve.html"><span class="std std-doc">trtllm-serve</span></a> section.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>Pre-configured settings for deploying popular models with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> can be found in our <a class="reference internal" href="deployment-guide/index.html"><span class="std std-doc">deployment guides</span></a>.</p>
+</div>
 </section>
 <section id="run-offline-inference-with-llm-api">
-<h2>Run Offline inference with LLM API<a class="headerlink" href="#run-offline-inference-with-llm-api" title="Link to this heading">#</a></h2>
+<h2>Run Offline Inference with LLM API<a class="headerlink" href="#run-offline-inference-with-llm-api" title="Link to this heading">#</a></h2>
 <p>The LLM API is a Python API designed to facilitate setup and inference with TensorRT LLM directly within Python. It enables model optimization by simply specifying a HuggingFace repository name or a model checkpoint. The LLM API streamlines the process by managing model loading, optimization, and inference, all through a single <code class="docutils literal notranslate"><span class="pre">LLM</span></code> instance.</p>
 <p>Here is a simple example to show how to use the LLM API with TinyLlama.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
@@ -625,6 +633,7 @@ To learn more about the LLM API, check out the <a class="reference internal" hre
 <p>To continue your journey with TensorRT LLM, explore these resources:</p>
 <ul class="simple">
 <li><p><strong><a class="reference internal" href="installation/index.html"><span class="std std-doc">Installation Guide</span></a></strong> - Detailed installation instructions for different platforms</p></li>
+<li><p><strong><a class="reference internal" href="deployment-guide/index.html"><span class="std std-doc">Model-Specific Deployment Guides</span></a></strong> - Instructions for serving specific models with TensorRT LLM</p></li>
 <li><p><strong><a class="reference internal" href="examples/llm_api_examples.html"><span class="doc std std-doc">Deployment Guide</span></a></strong> - Comprehensive examples for deploying LLM inference in various scenarios</p></li>
 <li><p><strong><a class="reference internal" href="models/supported-models.html"><span class="std std-doc">Model Support</span></a></strong> - Check which models are supported and how to add new ones</p></li>
 <li><p><strong>CLI Reference</strong> - Explore TensorRT LLM command-line tools:</p>
@@ -687,9 +696,9 @@ To learn more about the LLM API, check out the <a class="reference internal" hre
   </div>
   <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="visible nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#launch-docker-on-a-node-with-nvidia-gpus-deployed">Launch Docker on a node with NVIDIA GPUs deployed</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#deploy-online-serving-with-trtllm-serve">Deploy online serving with trtllm-serve</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#run-offline-inference-with-llm-api">Run Offline inference with LLM API</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#launch-docker-container">Launch Docker Container</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#deploy-online-serving-with-trtllm-serve">Deploy Online Serving with trtllm-serve</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#run-offline-inference-with-llm-api">Run Offline Inference with LLM API</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#next-steps">Next Steps</a></li>
 </ul>
   </nav></div>
@@ -785,9 +794,9 @@ To learn more about the LLM API, check out the <a class="reference internal" hre
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 19, 2025.</p>
+  <p>Last updated on November 05, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/796891b">796891b</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/3111682">3111682</a>.</p>
   
 </div></div>
       

@@ -59,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -69,7 +69,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc1" />
+  <meta name="docsearch:version" content="1.2.0rc2" />
 
 
   </head>
@@ -362,11 +362,11 @@
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-gpt-oss-on-trtllm.html">Quick Start Recipe for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-qwen3-next-on-trtllm.html">Quick Start Recipe for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 </ul>
 </details></li>
 </ul>
@@ -396,7 +396,7 @@
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -406,10 +406,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -419,6 +421,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -536,9 +539,6 @@
                     <span class="p">[</span><span class="o">--</span><span class="n">max_lora_rank</span> <span class="n">MAX_LORA_RANK</span><span class="p">]</span>
                     <span class="p">[</span><span class="o">--</span><span class="n">speculative_decoding_mode</span> <span class="p">{</span><span class="n">draft_tokens_external</span><span class="p">,</span><span class="n">lookahead_decoding</span><span class="p">,</span><span class="n">medusa</span><span class="p">,</span><span class="n">explicit_draft_tokens</span><span class="p">,</span><span class="n">eagle</span><span class="p">}]</span>
                     <span class="p">[</span><span class="o">--</span><span class="n">max_draft_len</span> <span class="n">MAX_DRAFT_LEN</span><span class="p">]</span>
-                    <span class="p">[</span><span class="o">--</span><span class="n">auto_parallel</span> <span class="n">AUTO_PARALLEL</span><span class="p">]</span>
-                    <span class="p">[</span><span class="o">--</span><span class="n">gpus_per_node</span> <span class="n">GPUS_PER_NODE</span><span class="p">]</span>
-                    <span class="p">[</span><span class="o">--</span><span class="n">cluster_key</span> <span class="p">{</span><span class="n">A100</span><span class="o">-</span><span class="n">SXM</span><span class="o">-</span><span class="mi">80</span><span class="n">GB</span><span class="p">,</span><span class="n">A100</span><span class="o">-</span><span class="n">SXM</span><span class="o">-</span><span class="mi">40</span><span class="n">GB</span><span class="p">,</span><span class="n">A100</span><span class="o">-</span><span class="n">PCIe</span><span class="o">-</span><span class="mi">80</span><span class="n">GB</span><span class="p">,</span><span class="n">A100</span><span class="o">-</span><span class="n">PCIe</span><span class="o">-</span><span class="mi">40</span><span class="n">GB</span><span class="p">,</span><span class="n">H100</span><span class="o">-</span><span class="n">SXM</span><span class="p">,</span><span class="n">H100</span><span class="o">-</span><span class="n">PCIe</span><span class="p">,</span><span class="n">H20</span><span class="p">,</span><span class="n">H200</span><span class="o">-</span><span class="n">SXM</span><span class="p">,</span><span class="n">H200</span><span class="o">-</span><span class="n">NVL</span><span class="p">,</span><span class="n">A40</span><span class="p">,</span><span class="n">A30</span><span class="p">,</span><span class="n">A10</span><span class="p">,</span><span class="n">A10G</span><span class="p">,</span><span class="n">L40S</span><span class="p">,</span><span class="n">L40</span><span class="p">,</span><span class="n">L20</span><span class="p">,</span><span class="n">L4</span><span class="p">,</span><span class="n">L2</span><span class="p">}]</span>
                     <span class="p">[</span><span class="o">--</span><span class="n">bert_attention_plugin</span> <span class="p">{</span><span class="n">auto</span><span class="p">,</span><span class="n">float16</span><span class="p">,</span><span class="n">float32</span><span class="p">,</span><span class="n">bfloat16</span><span class="p">,</span><span class="n">int32</span><span class="p">,</span><span class="n">disable</span><span class="p">,</span><span class="n">disable</span><span class="p">}]</span>
                     <span class="p">[</span><span class="o">--</span><span class="n">gpt_attention_plugin</span> <span class="p">{</span><span class="n">auto</span><span class="p">,</span><span class="n">float16</span><span class="p">,</span><span class="n">float32</span><span class="p">,</span><span class="n">bfloat16</span><span class="p">,</span><span class="n">int32</span><span class="p">,</span><span class="n">disable</span><span class="p">,</span><span class="n">disable</span><span class="p">}]</span>
                     <span class="p">[</span><span class="o">--</span><span class="n">gemm_plugin</span> <span class="p">{</span><span class="n">auto</span><span class="p">,</span><span class="n">float16</span><span class="p">,</span><span class="n">float32</span><span class="p">,</span><span class="n">bfloat16</span><span class="p">,</span><span class="n">int32</span><span class="p">,</span><span class="n">fp8</span><span class="p">,</span><span class="n">nvfp4</span><span class="p">,</span><span class="n">disable</span><span class="p">,</span><span class="n">disable</span><span class="p">}]</span>
@@ -625,7 +625,7 @@
 <dd><p>Set KV cache type (continuous, paged, or disabled). For disabled case, KV cache is disabled and only context phase is allowed.</p>
 </dd>
 <dt><kbd>--paged_kv_cache</kbd></dt>
-<dd><p>Deprecated. Enabling this option is equvilient to <code class="docutils literal notranslate"><span class="pre">--kv_cache_type</span> <span class="pre">paged</span></code> for transformer based models.</p>
+<dd><p>Deprecated. Enabling this option is equivalent to <code class="docutils literal notranslate"><span class="pre">--kv_cache_type</span> <span class="pre">paged</span></code> for transformer based models.</p>
 </dd>
 <dt><kbd>--input_timing_cache</kbd></dt>
 <dd><p>The file path to read the timing cache. This option is ignored if the file does not exist.</p>
@@ -733,23 +733,6 @@
 <dt><kbd>--max_draft_len</kbd></dt>
 <dd><p>Maximum lengths of draft tokens for speculative decoding target model.</p>
 <p>Default: <code class="docutils literal notranslate"><span class="pre">0</span></code></p>
-</dd>
-</dl>
-</section>
-<section id="tensorrt_llm.commands.build-parse_arguments-auto-parallel-arguments">
-<h2>Auto parallel arguments<a class="headerlink" href="#tensorrt_llm.commands.build-parse_arguments-auto-parallel-arguments" title="Link to this heading">#</a></h2>
-<dl class="option-list">
-<dt><kbd>--auto_parallel</kbd></dt>
-<dd><p>MPI world size for auto parallel.</p>
-<p>Default: <code class="docutils literal notranslate"><span class="pre">1</span></code></p>
-</dd>
-<dt><kbd>--gpus_per_node</kbd></dt>
-<dd><p>Number of GPUs each node has in a multi-node setup. This is a cluster spec and can be greater/smaller than world size. This option is only used for auto parallel specified with <code class="docutils literal notranslate"><span class="pre">--auto_parallel</span></code>.</p>
-<p>Default: <code class="docutils literal notranslate"><span class="pre">8</span></code></p>
-</dd>
-<dt><kbd>--cluster_key</kbd></dt>
-<dd><p>Possible choices: A100-SXM-80GB, A100-SXM-40GB, A100-PCIe-80GB, A100-PCIe-40GB, H100-SXM, H100-PCIe, H20, H200-SXM, H200-NVL, A40, A30, A10, A10G, L40S, L40, L20, L4, L2</p>
-<p>Unique name for target GPU type. Inferred from current GPU type if not specified. This option is only used for auto parallel specified with <code class="docutils literal notranslate"><span class="pre">--auto_parallel</span></code>.</p>
 </dd>
 </dl>
 </section>
@@ -933,7 +916,6 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.commands.build-parse_arguments-logits-arguments">Logits arguments</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.commands.build-parse_arguments-lora-arguments">LoRA arguments</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.commands.build-parse_arguments-speculative-decoding-arguments">Speculative decoding arguments</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.commands.build-parse_arguments-auto-parallel-arguments">Auto parallel arguments</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.commands.build-parse_arguments-plugin-config-arguments">Plugin config arguments</a></li>
 </ul>
   </nav></div>
@@ -1029,9 +1011,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 19, 2025.</p>
+  <p>Last updated on November 05, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/796891b">796891b</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/3111682">3111682</a>.</p>
   
 </div></div>
       

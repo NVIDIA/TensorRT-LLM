@@ -58,7 +58,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -68,7 +68,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc1" />
+  <meta name="docsearch:version" content="1.2.0rc2" />
 
 
   </head>
@@ -357,11 +357,11 @@
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-gpt-oss-on-trtllm.html">Quick Start Recipe for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-qwen3-next-on-trtllm.html">Quick Start Recipe for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 </ul>
 </details></li>
 </ul>
@@ -391,7 +391,7 @@
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../features/disagg-serving.html">Disaggregated Serving (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -401,10 +401,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -414,6 +416,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/api-change.html">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -521,7 +524,6 @@
 <span class="kn">from</span><span class="w"> </span><span class="nn">.._utils</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">QuantModeWrapper</span><span class="p">,</span> <span class="n">get_init_params</span><span class="p">,</span> <span class="n">numpy_to_torch</span><span class="p">,</span>
                       <span class="n">release_gc</span><span class="p">,</span> <span class="n">str_dtype_to_torch</span><span class="p">,</span> <span class="n">str_dtype_to_trt</span><span class="p">,</span>
                       <span class="n">trt_dtype_to_torch</span><span class="p">)</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..bindings</span><span class="w"> </span><span class="kn">import</span> <span class="n">KVCacheType</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..bindings.executor</span><span class="w"> </span><span class="kn">import</span> <span class="n">RuntimeDefaults</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..functional</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">PositionEmbeddingType</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">allgather</span><span class="p">,</span> <span class="n">constant</span><span class="p">,</span>
                           <span class="n">cp_split_plugin</span><span class="p">,</span> <span class="n">gather_last_token_logits</span><span class="p">,</span>
@@ -533,6 +535,7 @@
 <span class="kn">from</span><span class="w"> </span><span class="nn">..layers.linear</span><span class="w"> </span><span class="kn">import</span> <span class="n">ColumnLinear</span><span class="p">,</span> <span class="n">Linear</span><span class="p">,</span> <span class="n">RowLinear</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..layers.lora</span><span class="w"> </span><span class="kn">import</span> <span class="n">Dora</span><span class="p">,</span> <span class="n">Lora</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..layers.moe</span><span class="w"> </span><span class="kn">import</span> <span class="n">MOE</span><span class="p">,</span> <span class="n">MoeOOTB</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..llmapi.kv_cache_type</span><span class="w"> </span><span class="kn">import</span> <span class="n">KVCacheType</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..logger</span><span class="w"> </span><span class="kn">import</span> <span class="n">logger</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..mapping</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..module</span><span class="w"> </span><span class="kn">import</span> <span class="n">Module</span><span class="p">,</span> <span class="n">ModuleList</span>
@@ -1311,9 +1314,7 @@
             <span class="n">config</span><span class="o">.</span><span class="n">set_rank</span><span class="p">(</span><span class="n">rank</span><span class="p">)</span>
 
         <span class="n">rank</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">rank</span>
-        <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">auto_parallel</span><span class="p">:</span>
-            <span class="n">rank</span> <span class="o">=</span> <span class="mi">0</span>
-        <span class="k">elif</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">cp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">cp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
             <span class="c1"># tp_cp_pp rank -&gt; tp_pp rank: because different cp ranks share the same ckpt</span>
             <span class="n">tp_size</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span>
             <span class="n">cp_size</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">cp_size</span>
@@ -1893,7 +1894,7 @@
 
     <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">layer</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">named_modules</span><span class="p">():</span>
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">layer</span><span class="p">,</span> <span class="n">Attention</span><span class="p">)</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">layer</span><span class="o">.</span><span class="n">cross_attention</span><span class="p">:</span>
-            <span class="k">assert</span> <span class="n">layer</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">==</span> <span class="mi">1</span><span class="p">,</span> <span class="s2">&quot;please disable manual tp when enable auto parallel&quot;</span>
+            <span class="k">assert</span> <span class="n">layer</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">==</span> <span class="mi">1</span><span class="p">,</span> <span class="s2">&quot;unfuse_qkv_gemm requires tp_size == 1&quot;</span>
             <span class="k">if</span> <span class="n">layer</span><span class="o">.</span><span class="n">qkv</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="k">continue</span>
             <span class="n">qkv_params</span> <span class="o">=</span> <span class="n">get_init_params</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">qkv</span><span class="p">,</span> <span class="n">ColumnLinear</span><span class="p">)</span>
@@ -2672,9 +2673,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 19, 2025.</p>
+  <p>Last updated on November 05, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/796891b">796891b</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/3111682">3111682</a>.</p>
   
 </div></div>
       

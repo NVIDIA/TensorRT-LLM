@@ -59,19 +59,19 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
     <link rel="icon" href="../_static/favicon.png"/>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="ADP Balance Strategy" href="../blogs/tech_blog/blog10_ADP_Balance_Strategy.html" />
+    <link rel="next" title="Introduction to KV Cache Transmission" href="kv-transfer.html" />
     <link rel="prev" title="Using Dev Containers" href="dev-containers.html" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc1" />
+  <meta name="docsearch:version" content="1.2.0rc2" />
 
 
   </head>
@@ -364,11 +364,11 @@
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-gpt-oss-on-trtllm.html">Quick Start Recipe for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-qwen3-next-on-trtllm.html">Quick Start Recipe for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 </ul>
 </details></li>
 </ul>
@@ -398,7 +398,7 @@
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -408,10 +408,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="current nav bd-sidenav">
@@ -421,6 +423,7 @@
 <li class="toctree-l1"><a class="reference internal" href="ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="kv-transfer.html">Introduction to KV Cache Transmission</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -550,6 +553,85 @@
 <li><p>Protected by unit tests in <code class="docutils literal notranslate"><span class="pre">tests/unittest/api_stability/</span></code></p></li>
 <li><p>Automatically validated to ensure consistency</p></li>
 </ul>
+</section>
+<section id="api-change-principles">
+<h2>API Change Principles<a class="headerlink" href="#api-change-principles" title="Link to this heading">#</a></h2>
+<section id="knob-naming">
+<h3>1. Knob Naming<a class="headerlink" href="#knob-naming" title="Link to this heading">#</a></h3>
+<p><strong>Use Semantic Clarity</strong></p>
+<p>Argument names should describe what the argument represents, not how it is used internally.</p>
+<p>✅ <strong>Good</strong>: <code class="docutils literal notranslate"><span class="pre">max_new_tokens</span></code> (clear meaning)<br />
+❌ <strong>Bad</strong>: <code class="docutils literal notranslate"><span class="pre">num</span></code> (ambiguous)</p>
+<p><strong>Reflect Argument Type and Granularity</strong></p>
+<ul class="simple">
+<li><p>For <strong>boolean</strong> knobs, prefix with verbs like <code class="docutils literal notranslate"><span class="pre">enable_</span></code> and so on.
+Examples: <code class="docutils literal notranslate"><span class="pre">enable_cache</span></code>, <code class="docutils literal notranslate"><span class="pre">enable_flash_attention</span></code></p></li>
+<li><p>For <strong>numerical threshold</strong> knobs, suffix with <code class="docutils literal notranslate"><span class="pre">_limit</span></code>, <code class="docutils literal notranslate"><span class="pre">_size</span></code>, <code class="docutils literal notranslate"><span class="pre">_count</span></code>, <code class="docutils literal notranslate"><span class="pre">_len_</span></code> or <code class="docutils literal notranslate"><span class="pre">_ratio</span></code><br />
+Examples: <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code>, <code class="docutils literal notranslate"><span class="pre">prefill_batch_size</span></code></p></li>
+</ul>
+<p><strong>Avoid Redundant Prefixes</strong></p>
+<p>Example (in <code class="docutils literal notranslate"><span class="pre">MoeConfig</span></code>):</p>
+<p>✅ <strong>Good</strong>: <code class="docutils literal notranslate"><span class="pre">backend</span></code><br />
+❌ <strong>Bad</strong>: <code class="docutils literal notranslate"><span class="pre">moe_backend</span></code> (redundant since it’s already in <code class="docutils literal notranslate"><span class="pre">MoeConfig</span></code>)</p>
+<p><strong>Use Specific Names for Narrow Scenarios</strong></p>
+<p>When adding knobs for specific use cases, make the name convey the restriction clearly via a prefix. It’s acceptable to rename later when the knob becomes more generic or is moved into a dedicated config.</p>
+<p>Example (argument to the LLM class):</p>
+<p>✅ <strong>Good</strong>: <code class="docutils literal notranslate"><span class="pre">rope_scaling_factor</span></code> → clearly indicates it’s for RoPE<br />
+❌ <strong>Bad</strong>: <code class="docutils literal notranslate"><span class="pre">scaling_factor</span></code> → too generic and prone to misuse</p>
+</section>
+<section id="hierarchical-configuration">
+<h3>2. Hierarchical Configuration<a class="headerlink" href="#hierarchical-configuration" title="Link to this heading">#</a></h3>
+<p>Organize complex or hierarchical arguments into <strong>dedicated configuration dataclasses</strong> with intuitive and consistent naming.</p>
+<p><strong>Guidelines</strong></p>
+<ul class="simple">
+<li><p>Use the <code class="docutils literal notranslate"><span class="pre">XxxConfig</span></code> suffix consistently<br />
+Examples: <code class="docutils literal notranslate"><span class="pre">ModelConfig</span></code>, <code class="docutils literal notranslate"><span class="pre">ParallelConfig</span></code>, <code class="docutils literal notranslate"><span class="pre">MoeConfig</span></code></p></li>
+<li><p><strong>Reflect conceptual hierarchy</strong><br />
+The dataclass name should represent a coherent functional unit, not an arbitrary grouping</p></li>
+<li><p><strong>Avoid over-nesting</strong><br />
+Use only one level of configuration hierarchy whenever possible (e.g., <code class="docutils literal notranslate"><span class="pre">LlmArgs</span> <span class="pre">→</span> <span class="pre">ParallelConfig</span></code>) to balance readability and modularity</p></li>
+</ul>
+</section>
+<section id="prefer-llmargs-over-environment-variables">
+<h3>3. Prefer <code class="docutils literal notranslate"><span class="pre">LlmArgs</span></code> Over Environment Variables<a class="headerlink" href="#prefer-llmargs-over-environment-variables" title="Link to this heading">#</a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">LlmArgs</span></code> is the central place for all configuration knobs. It integrates with our infrastructure to ensure:</p>
+<ul class="simple">
+<li><p><strong>API Stability</strong></p>
+<ul>
+<li><p>Protects committed (stable) APIs</p></li>
+<li><p>GitHub reviewer committee oversees API stability</p></li>
+</ul>
+</li>
+<li><p><strong>API Status Registration</strong></p>
+<ul>
+<li><p>Uncommitted (unstable) APIs must be marked as <code class="docutils literal notranslate"><span class="pre">&quot;prototype&quot;</span></code> or <code class="docutils literal notranslate"><span class="pre">&quot;beta&quot;</span></code></p></li>
+<li><p>API statuses are displayed in the documentation</p></li>
+</ul>
+</li>
+<li><p><strong>API Documentation</strong></p>
+<ul>
+<li><p>Each knob uses a <code class="docutils literal notranslate"><span class="pre">Field</span></code> with a description</p></li>
+<li><p>Automatically rendered in public documentation</p></li>
+</ul>
+</li>
+</ul>
+<blockquote>
+<div><p>Managing knobs in <code class="docutils literal notranslate"><span class="pre">LlmArgs</span></code> remains <strong>scalable and maintainable</strong> thanks to our existing infrastructure and review processes.</p>
+</div></blockquote>
+<p><strong>Drawbacks of Environment Variables:</strong></p>
+<ul class="simple">
+<li><p>Dispersed across the codebase</p></li>
+<li><p>Lack documentation and discoverability</p></li>
+<li><p>Pose challenges for testing and validation</p></li>
+</ul>
+<p><strong>Guidelines for Adding Knobs:</strong></p>
+<ul class="simple">
+<li><p>✅ Add clear, descriptive documentation for each field</p></li>
+<li><p>✅ It’s fine to add temporary knobs and refine them later</p></li>
+<li><p>⚠️ Always mark temporary knobs as <code class="docutils literal notranslate"><span class="pre">&quot;prototype&quot;</span></code> if not stable yet</p></li>
+<li><p>✅ Refactor prototype knobs as they mature, promote them to “beta” or “stable”.</p></li>
+</ul>
+</section>
 </section>
 <section id="modifying-llm-constructor-arguments">
 <h2>Modifying LLM Constructor Arguments<a class="headerlink" href="#modifying-llm-constructor-arguments" title="Link to this heading">#</a></h2>
@@ -779,11 +861,11 @@ python<span class="w"> </span>-m<span class="w"> </span>pytest<span class="w"> <
       </div>
     </a>
     <a class="right-next"
-       href="../blogs/tech_blog/blog10_ADP_Balance_Strategy.html"
+       href="kv-transfer.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">ADP Balance Strategy</p>
+        <p class="prev-next-title">Introduction to KV Cache Transmission</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -815,6 +897,12 @@ python<span class="w"> </span>-m<span class="w"> </span>pytest<span class="w"> <
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#api-schema-management">API Schema Management</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#api-change-principles">API Change Principles</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#knob-naming">1. Knob Naming</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#hierarchical-configuration">2. Hierarchical Configuration</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#prefer-llmargs-over-environment-variables">3. Prefer <code class="docutils literal notranslate"><span class="pre">LlmArgs</span></code> Over Environment Variables</a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#modifying-llm-constructor-arguments">Modifying LLM Constructor Arguments</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#architecture">Architecture</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#adding-a-new-argument">Adding a New Argument</a><ul class="nav section-nav flex-column">
@@ -936,9 +1024,9 @@ python<span class="w"> </span>-m<span class="w"> </span>pytest<span class="w"> <
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 19, 2025.</p>
+  <p>Last updated on November 05, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/796891b">796891b</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/3111682">3111682</a>.</p>
   
 </div></div>
       

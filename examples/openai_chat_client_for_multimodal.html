@@ -59,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -71,7 +71,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc1" />
+  <meta name="docsearch:version" content="1.2.0rc2" />
 
 
   </head>
@@ -360,11 +360,11 @@
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="dynamo_k8s_example.html">Dynamo K8s Example</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-gpt-oss-on-trtllm.html">Quick Start Recipe for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-qwen3-next-on-trtllm.html">Quick Start Recipe for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 </ul>
 </details></li>
 </ul>
@@ -394,7 +394,7 @@
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -404,10 +404,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -417,6 +419,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -505,120 +508,135 @@
   <section id="openai-chat-client-for-multimodal">
 <h1>OpenAI Chat Client for Multimodal<a class="headerlink" href="#openai-chat-client-for-multimodal" title="Link to this heading">#</a></h1>
 <p>Refer to the <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html">trtllm-serve documentation</a> for starting a server.</p>
-<p>Source <a class="github reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/796891ba2a6959bad58c0da9645416c7264349e9/examples/serve/openai_chat_client_for_multimodal.py">NVIDIA/TensorRT-LLM</a>.</p>
+<p>Source <a class="github reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/31116825b39f4e6a6a1e127001f5204b73d1dc32/examples/serve/openai_chat_client_for_multimodal.py">NVIDIA/TensorRT-LLM</a>.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos">  1</span>
-<span class="linenos">  2</span><span class="kn">from</span><span class="w"> </span><span class="nn">openai</span><span class="w"> </span><span class="kn">import</span> <span class="n">OpenAI</span>
-<span class="linenos">  3</span>
-<span class="linenos">  4</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.inputs</span><span class="w"> </span><span class="kn">import</span> <span class="n">encode_base64_content_from_url</span>
-<span class="linenos">  5</span>
-<span class="linenos">  6</span><span class="n">client</span> <span class="o">=</span> <span class="n">OpenAI</span><span class="p">(</span>
-<span class="linenos">  7</span>    <span class="n">base_url</span><span class="o">=</span><span class="s2">&quot;http://localhost:8000/v1&quot;</span><span class="p">,</span>
-<span class="linenos">  8</span>    <span class="n">api_key</span><span class="o">=</span><span class="s2">&quot;tensorrt_llm&quot;</span><span class="p">,</span>
-<span class="linenos">  9</span><span class="p">)</span>
+<span class="linenos">  2</span><span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="linenos">  3</span><span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
+<span class="linenos">  4</span>
+<span class="linenos">  5</span><span class="kn">from</span><span class="w"> </span><span class="nn">openai</span><span class="w"> </span><span class="kn">import</span> <span class="n">OpenAI</span>
+<span class="linenos">  6</span><span class="kn">from</span><span class="w"> </span><span class="nn">PIL</span><span class="w"> </span><span class="kn">import</span> <span class="n">Image</span>
+<span class="linenos">  7</span>
+<span class="linenos">  8</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.inputs</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">encode_base64_content_from_url</span><span class="p">,</span>
+<span class="linenos">  9</span>                                 <span class="n">encode_base64_image</span><span class="p">)</span>
 <span class="linenos"> 10</span>
-<span class="linenos"> 11</span><span class="c1"># SINGLE IMAGE INFERENCE</span>
-<span class="linenos"> 12</span><span class="n">response</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">chat</span><span class="o">.</span><span class="n">completions</span><span class="o">.</span><span class="n">create</span><span class="p">(</span>
-<span class="linenos"> 13</span>    <span class="n">model</span><span class="o">=</span><span class="s2">&quot;Qwen2.5-VL-3B-Instruct&quot;</span><span class="p">,</span>
-<span class="linenos"> 14</span>    <span class="n">messages</span><span class="o">=</span><span class="p">[{</span>
-<span class="linenos"> 15</span>        <span class="s2">&quot;role&quot;</span><span class="p">:</span> <span class="s2">&quot;system&quot;</span><span class="p">,</span>
-<span class="linenos"> 16</span>        <span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="s2">&quot;you are a helpful assistant&quot;</span>
-<span class="linenos"> 17</span>    <span class="p">},</span> <span class="p">{</span>
-<span class="linenos"> 18</span>        <span class="s2">&quot;role&quot;</span><span class="p">:</span>
-<span class="linenos"> 19</span>        <span class="s2">&quot;user&quot;</span><span class="p">,</span>
-<span class="linenos"> 20</span>        <span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="p">[{</span>
-<span class="linenos"> 21</span>            <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;text&quot;</span><span class="p">,</span>
-<span class="linenos"> 22</span>            <span class="s2">&quot;text&quot;</span><span class="p">:</span> <span class="s2">&quot;Describe the natural environment in the image.&quot;</span>
-<span class="linenos"> 23</span>        <span class="p">},</span> <span class="p">{</span>
-<span class="linenos"> 24</span>            <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;image_url&quot;</span><span class="p">,</span>
-<span class="linenos"> 25</span>            <span class="s2">&quot;image_url&quot;</span><span class="p">:</span> <span class="p">{</span>
-<span class="linenos"> 26</span>                <span class="s2">&quot;url&quot;</span><span class="p">:</span>
-<span class="linenos"> 27</span>                <span class="s2">&quot;https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png&quot;</span>
-<span class="linenos"> 28</span>            <span class="p">}</span>
-<span class="linenos"> 29</span>        <span class="p">}]</span>
-<span class="linenos"> 30</span>    <span class="p">}],</span>
-<span class="linenos"> 31</span>    <span class="n">max_tokens</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span>
-<span class="linenos"> 32</span><span class="p">)</span>
-<span class="linenos"> 33</span><span class="nb">print</span><span class="p">(</span><span class="n">response</span><span class="p">)</span>
-<span class="linenos"> 34</span>
-<span class="linenos"> 35</span><span class="c1"># MULTI IMAGE INFERENCE</span>
-<span class="linenos"> 36</span><span class="n">response</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">chat</span><span class="o">.</span><span class="n">completions</span><span class="o">.</span><span class="n">create</span><span class="p">(</span>
-<span class="linenos"> 37</span>    <span class="n">model</span><span class="o">=</span><span class="s2">&quot;Qwen2.5-VL-3B-Instruct&quot;</span><span class="p">,</span>
-<span class="linenos"> 38</span>    <span class="n">messages</span><span class="o">=</span><span class="p">[{</span>
-<span class="linenos"> 39</span>        <span class="s2">&quot;role&quot;</span><span class="p">:</span> <span class="s2">&quot;system&quot;</span><span class="p">,</span>
-<span class="linenos"> 40</span>        <span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="s2">&quot;you are a helpful assistant&quot;</span>
-<span class="linenos"> 41</span>    <span class="p">},</span> <span class="p">{</span>
-<span class="linenos"> 42</span>        <span class="s2">&quot;role&quot;</span><span class="p">:</span>
-<span class="linenos"> 43</span>        <span class="s2">&quot;user&quot;</span><span class="p">,</span>
-<span class="linenos"> 44</span>        <span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="p">[{</span>
-<span class="linenos"> 45</span>            <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;text&quot;</span><span class="p">,</span>
-<span class="linenos"> 46</span>            <span class="s2">&quot;text&quot;</span><span class="p">:</span> <span class="s2">&quot;Tell me the difference between two images&quot;</span>
-<span class="linenos"> 47</span>        <span class="p">},</span> <span class="p">{</span>
-<span class="linenos"> 48</span>            <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;image_url&quot;</span><span class="p">,</span>
-<span class="linenos"> 49</span>            <span class="s2">&quot;image_url&quot;</span><span class="p">:</span> <span class="p">{</span>
-<span class="linenos"> 50</span>                <span class="s2">&quot;url&quot;</span><span class="p">:</span>
-<span class="linenos"> 51</span>                <span class="s2">&quot;https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/inpaint.png&quot;</span>
-<span class="linenos"> 52</span>            <span class="p">}</span>
-<span class="linenos"> 53</span>        <span class="p">},</span> <span class="p">{</span>
-<span class="linenos"> 54</span>            <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;image_url&quot;</span><span class="p">,</span>
-<span class="linenos"> 55</span>            <span class="s2">&quot;image_url&quot;</span><span class="p">:</span> <span class="p">{</span>
-<span class="linenos"> 56</span>                <span class="s2">&quot;url&quot;</span><span class="p">:</span>
-<span class="linenos"> 57</span>                <span class="s2">&quot;https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png&quot;</span>
-<span class="linenos"> 58</span>            <span class="p">}</span>
-<span class="linenos"> 59</span>        <span class="p">}]</span>
-<span class="linenos"> 60</span>    <span class="p">}],</span>
-<span class="linenos"> 61</span>    <span class="n">max_tokens</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span>
-<span class="linenos"> 62</span><span class="p">)</span>
-<span class="linenos"> 63</span><span class="nb">print</span><span class="p">(</span><span class="n">response</span><span class="p">)</span>
-<span class="linenos"> 64</span>
-<span class="linenos"> 65</span><span class="c1"># SINGLE VIDEO INFERENCE</span>
-<span class="linenos"> 66</span><span class="n">response</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">chat</span><span class="o">.</span><span class="n">completions</span><span class="o">.</span><span class="n">create</span><span class="p">(</span>
-<span class="linenos"> 67</span>    <span class="n">model</span><span class="o">=</span><span class="s2">&quot;Qwen2.5-VL-3B-Instruct&quot;</span><span class="p">,</span>
-<span class="linenos"> 68</span>    <span class="n">messages</span><span class="o">=</span><span class="p">[{</span>
-<span class="linenos"> 69</span>        <span class="s2">&quot;role&quot;</span><span class="p">:</span> <span class="s2">&quot;system&quot;</span><span class="p">,</span>
-<span class="linenos"> 70</span>        <span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="s2">&quot;you are a helpful assistant&quot;</span>
-<span class="linenos"> 71</span>    <span class="p">},</span> <span class="p">{</span>
-<span class="linenos"> 72</span>        <span class="s2">&quot;role&quot;</span><span class="p">:</span>
-<span class="linenos"> 73</span>        <span class="s2">&quot;user&quot;</span><span class="p">,</span>
-<span class="linenos"> 74</span>        <span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="p">[{</span>
-<span class="linenos"> 75</span>            <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;text&quot;</span><span class="p">,</span>
-<span class="linenos"> 76</span>            <span class="s2">&quot;text&quot;</span><span class="p">:</span> <span class="s2">&quot;Tell me what you see in the video briefly.&quot;</span>
-<span class="linenos"> 77</span>        <span class="p">},</span> <span class="p">{</span>
-<span class="linenos"> 78</span>            <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;video_url&quot;</span><span class="p">,</span>
-<span class="linenos"> 79</span>            <span class="s2">&quot;video_url&quot;</span><span class="p">:</span> <span class="p">{</span>
-<span class="linenos"> 80</span>                <span class="s2">&quot;url&quot;</span><span class="p">:</span>
-<span class="linenos"> 81</span>                <span class="s2">&quot;https://huggingface.co/datasets/Efficient-Large-Model/VILA-inference-demos/resolve/main/OAI-sora-tokyo-walk.mp4&quot;</span>
-<span class="linenos"> 82</span>            <span class="p">}</span>
-<span class="linenos"> 83</span>        <span class="p">}]</span>
-<span class="linenos"> 84</span>    <span class="p">}],</span>
-<span class="linenos"> 85</span>    <span class="n">max_tokens</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span>
-<span class="linenos"> 86</span><span class="p">)</span>
-<span class="linenos"> 87</span><span class="nb">print</span><span class="p">(</span><span class="n">response</span><span class="p">)</span>
-<span class="linenos"> 88</span>
-<span class="linenos"> 89</span><span class="c1"># IMAGE EMBED INFERENCE</span>
-<span class="linenos"> 90</span><span class="n">image64</span> <span class="o">=</span> <span class="n">encode_base64_content_from_url</span><span class="p">(</span>
-<span class="linenos"> 91</span>    <span class="s2">&quot;https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png&quot;</span>
-<span class="linenos"> 92</span><span class="p">)</span>
-<span class="linenos"> 93</span><span class="n">response</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">chat</span><span class="o">.</span><span class="n">completions</span><span class="o">.</span><span class="n">create</span><span class="p">(</span>
-<span class="linenos"> 94</span>    <span class="n">model</span><span class="o">=</span><span class="s2">&quot;Qwen2.5-VL-3B-Instruct&quot;</span><span class="p">,</span>
-<span class="linenos"> 95</span>    <span class="n">messages</span><span class="o">=</span><span class="p">[{</span>
-<span class="linenos"> 96</span>        <span class="s2">&quot;role&quot;</span><span class="p">:</span> <span class="s2">&quot;system&quot;</span><span class="p">,</span>
-<span class="linenos"> 97</span>        <span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="s2">&quot;you are a helpful assistant&quot;</span>
-<span class="linenos"> 98</span>    <span class="p">},</span> <span class="p">{</span>
-<span class="linenos"> 99</span>        <span class="s2">&quot;role&quot;</span><span class="p">:</span>
-<span class="linenos">100</span>        <span class="s2">&quot;user&quot;</span><span class="p">,</span>
-<span class="linenos">101</span>        <span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="p">[{</span>
-<span class="linenos">102</span>            <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;text&quot;</span><span class="p">,</span>
-<span class="linenos">103</span>            <span class="s2">&quot;text&quot;</span><span class="p">:</span> <span class="s2">&quot;Describe the natural environment in the image.&quot;</span>
-<span class="linenos">104</span>        <span class="p">},</span> <span class="p">{</span>
-<span class="linenos">105</span>            <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;image_url&quot;</span><span class="p">,</span>
-<span class="linenos">106</span>            <span class="s2">&quot;image_url&quot;</span><span class="p">:</span> <span class="p">{</span>
-<span class="linenos">107</span>                <span class="s2">&quot;url&quot;</span><span class="p">:</span> <span class="s2">&quot;data:image/png;base64,&quot;</span> <span class="o">+</span> <span class="n">image64</span>
-<span class="linenos">108</span>            <span class="p">}</span>
-<span class="linenos">109</span>        <span class="p">}]</span>
-<span class="linenos">110</span>    <span class="p">}],</span>
-<span class="linenos">111</span>    <span class="n">max_tokens</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span>
-<span class="linenos">112</span><span class="p">)</span>
-<span class="linenos">113</span><span class="nb">print</span><span class="p">(</span><span class="n">response</span><span class="p">)</span>
+<span class="linenos"> 11</span><span class="n">client</span> <span class="o">=</span> <span class="n">OpenAI</span><span class="p">(</span>
+<span class="linenos"> 12</span>    <span class="n">base_url</span><span class="o">=</span><span class="s2">&quot;http://localhost:8000/v1&quot;</span><span class="p">,</span>
+<span class="linenos"> 13</span>    <span class="n">api_key</span><span class="o">=</span><span class="s2">&quot;tensorrt_llm&quot;</span><span class="p">,</span>
+<span class="linenos"> 14</span><span class="p">)</span>
+<span class="linenos"> 15</span>
+<span class="linenos"> 16</span><span class="n">llm_models_root</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;LLM_MODELS_ROOT&quot;</span><span class="p">))</span>
+<span class="linenos"> 17</span>
+<span class="linenos"> 18</span><span class="k">if</span> <span class="n">llm_models_root</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos"> 19</span>    <span class="n">multimodal_test_data_path</span> <span class="o">=</span> <span class="n">llm_models_root</span> <span class="o">/</span> <span class="s2">&quot;multimodals&quot;</span> <span class="o">/</span> <span class="s2">&quot;test_data&quot;</span>
+<span class="linenos"> 20</span>    <span class="n">image_url1</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">multimodal_test_data_path</span> <span class="o">/</span> <span class="s2">&quot;seashore.png&quot;</span><span class="p">)</span>
+<span class="linenos"> 21</span>    <span class="n">image_url2</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">multimodal_test_data_path</span> <span class="o">/</span> <span class="s2">&quot;inpaint.png&quot;</span><span class="p">)</span>
+<span class="linenos"> 22</span>    <span class="n">video_url</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">multimodal_test_data_path</span> <span class="o">/</span> <span class="s2">&quot;OAI-sora-tokyo-walk.mp4&quot;</span><span class="p">)</span>
+<span class="linenos"> 23</span>    <span class="n">image64</span> <span class="o">=</span> <span class="n">encode_base64_image</span><span class="p">(</span>
+<span class="linenos"> 24</span>        <span class="n">Image</span><span class="o">.</span><span class="n">open</span><span class="p">(</span><span class="n">multimodal_test_data_path</span> <span class="o">/</span> <span class="s2">&quot;seashore.png&quot;</span><span class="p">))</span>
+<span class="linenos"> 25</span><span class="k">else</span><span class="p">:</span>
+<span class="linenos"> 26</span>    <span class="n">image_url1</span> <span class="o">=</span> <span class="s2">&quot;https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png&quot;</span>
+<span class="linenos"> 27</span>    <span class="n">image_url2</span> <span class="o">=</span> <span class="s2">&quot;https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/inpaint.png&quot;</span>
+<span class="linenos"> 28</span>    <span class="n">video_url</span> <span class="o">=</span> <span class="s2">&quot;https://huggingface.co/datasets/Efficient-Large-Model/VILA-inference-demos/resolve/main/OAI-sora-tokyo-walk.mp4&quot;</span>
+<span class="linenos"> 29</span>    <span class="n">image64</span> <span class="o">=</span> <span class="n">encode_base64_content_from_url</span><span class="p">(</span>
+<span class="linenos"> 30</span>        <span class="s2">&quot;https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png&quot;</span>
+<span class="linenos"> 31</span>    <span class="p">)</span>
+<span class="linenos"> 32</span>
+<span class="linenos"> 33</span><span class="c1"># SINGLE IMAGE INFERENCE</span>
+<span class="linenos"> 34</span><span class="n">response</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">chat</span><span class="o">.</span><span class="n">completions</span><span class="o">.</span><span class="n">create</span><span class="p">(</span>
+<span class="linenos"> 35</span>    <span class="n">model</span><span class="o">=</span><span class="s2">&quot;Qwen2.5-VL-3B-Instruct&quot;</span><span class="p">,</span>
+<span class="linenos"> 36</span>    <span class="n">messages</span><span class="o">=</span><span class="p">[{</span>
+<span class="linenos"> 37</span>        <span class="s2">&quot;role&quot;</span><span class="p">:</span> <span class="s2">&quot;system&quot;</span><span class="p">,</span>
+<span class="linenos"> 38</span>        <span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="s2">&quot;you are a helpful assistant&quot;</span>
+<span class="linenos"> 39</span>    <span class="p">},</span> <span class="p">{</span>
+<span class="linenos"> 40</span>        <span class="s2">&quot;role&quot;</span><span class="p">:</span>
+<span class="linenos"> 41</span>        <span class="s2">&quot;user&quot;</span><span class="p">,</span>
+<span class="linenos"> 42</span>        <span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="p">[{</span>
+<span class="linenos"> 43</span>            <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;text&quot;</span><span class="p">,</span>
+<span class="linenos"> 44</span>            <span class="s2">&quot;text&quot;</span><span class="p">:</span> <span class="s2">&quot;Describe the natural environment in the image.&quot;</span>
+<span class="linenos"> 45</span>        <span class="p">},</span> <span class="p">{</span>
+<span class="linenos"> 46</span>            <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;image_url&quot;</span><span class="p">,</span>
+<span class="linenos"> 47</span>            <span class="s2">&quot;image_url&quot;</span><span class="p">:</span> <span class="p">{</span>
+<span class="linenos"> 48</span>                <span class="s2">&quot;url&quot;</span><span class="p">:</span> <span class="n">image_url1</span>
+<span class="linenos"> 49</span>            <span class="p">}</span>
+<span class="linenos"> 50</span>        <span class="p">}]</span>
+<span class="linenos"> 51</span>    <span class="p">}],</span>
+<span class="linenos"> 52</span>    <span class="n">max_tokens</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span>
+<span class="linenos"> 53</span><span class="p">)</span>
+<span class="linenos"> 54</span><span class="nb">print</span><span class="p">(</span><span class="n">response</span><span class="p">)</span>
+<span class="linenos"> 55</span>
+<span class="linenos"> 56</span><span class="c1"># MULTI IMAGE INFERENCE</span>
+<span class="linenos"> 57</span><span class="n">response</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">chat</span><span class="o">.</span><span class="n">completions</span><span class="o">.</span><span class="n">create</span><span class="p">(</span>
+<span class="linenos"> 58</span>    <span class="n">model</span><span class="o">=</span><span class="s2">&quot;Qwen2.5-VL-3B-Instruct&quot;</span><span class="p">,</span>
+<span class="linenos"> 59</span>    <span class="n">messages</span><span class="o">=</span><span class="p">[{</span>
+<span class="linenos"> 60</span>        <span class="s2">&quot;role&quot;</span><span class="p">:</span> <span class="s2">&quot;system&quot;</span><span class="p">,</span>
+<span class="linenos"> 61</span>        <span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="s2">&quot;you are a helpful assistant&quot;</span>
+<span class="linenos"> 62</span>    <span class="p">},</span> <span class="p">{</span>
+<span class="linenos"> 63</span>        <span class="s2">&quot;role&quot;</span><span class="p">:</span>
+<span class="linenos"> 64</span>        <span class="s2">&quot;user&quot;</span><span class="p">,</span>
+<span class="linenos"> 65</span>        <span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="p">[{</span>
+<span class="linenos"> 66</span>            <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;text&quot;</span><span class="p">,</span>
+<span class="linenos"> 67</span>            <span class="s2">&quot;text&quot;</span><span class="p">:</span> <span class="s2">&quot;Tell me the difference between two images&quot;</span>
+<span class="linenos"> 68</span>        <span class="p">},</span> <span class="p">{</span>
+<span class="linenos"> 69</span>            <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;image_url&quot;</span><span class="p">,</span>
+<span class="linenos"> 70</span>            <span class="s2">&quot;image_url&quot;</span><span class="p">:</span> <span class="p">{</span>
+<span class="linenos"> 71</span>                <span class="s2">&quot;url&quot;</span><span class="p">:</span> <span class="n">image_url2</span>
+<span class="linenos"> 72</span>            <span class="p">}</span>
+<span class="linenos"> 73</span>        <span class="p">},</span> <span class="p">{</span>
+<span class="linenos"> 74</span>            <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;image_url&quot;</span><span class="p">,</span>
+<span class="linenos"> 75</span>            <span class="s2">&quot;image_url&quot;</span><span class="p">:</span> <span class="p">{</span>
+<span class="linenos"> 76</span>                <span class="s2">&quot;url&quot;</span><span class="p">:</span> <span class="n">image_url1</span>
+<span class="linenos"> 77</span>            <span class="p">}</span>
+<span class="linenos"> 78</span>        <span class="p">}]</span>
+<span class="linenos"> 79</span>    <span class="p">}],</span>
+<span class="linenos"> 80</span>    <span class="n">max_tokens</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span>
+<span class="linenos"> 81</span><span class="p">)</span>
+<span class="linenos"> 82</span><span class="nb">print</span><span class="p">(</span><span class="n">response</span><span class="p">)</span>
+<span class="linenos"> 83</span>
+<span class="linenos"> 84</span><span class="c1"># SINGLE VIDEO INFERENCE</span>
+<span class="linenos"> 85</span><span class="n">response</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">chat</span><span class="o">.</span><span class="n">completions</span><span class="o">.</span><span class="n">create</span><span class="p">(</span>
+<span class="linenos"> 86</span>    <span class="n">model</span><span class="o">=</span><span class="s2">&quot;Qwen2.5-VL-3B-Instruct&quot;</span><span class="p">,</span>
+<span class="linenos"> 87</span>    <span class="n">messages</span><span class="o">=</span><span class="p">[{</span>
+<span class="linenos"> 88</span>        <span class="s2">&quot;role&quot;</span><span class="p">:</span> <span class="s2">&quot;system&quot;</span><span class="p">,</span>
+<span class="linenos"> 89</span>        <span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="s2">&quot;you are a helpful assistant&quot;</span>
+<span class="linenos"> 90</span>    <span class="p">},</span> <span class="p">{</span>
+<span class="linenos"> 91</span>        <span class="s2">&quot;role&quot;</span><span class="p">:</span>
+<span class="linenos"> 92</span>        <span class="s2">&quot;user&quot;</span><span class="p">,</span>
+<span class="linenos"> 93</span>        <span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="p">[{</span>
+<span class="linenos"> 94</span>            <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;text&quot;</span><span class="p">,</span>
+<span class="linenos"> 95</span>            <span class="s2">&quot;text&quot;</span><span class="p">:</span> <span class="s2">&quot;Tell me what you see in the video briefly.&quot;</span>
+<span class="linenos"> 96</span>        <span class="p">},</span> <span class="p">{</span>
+<span class="linenos"> 97</span>            <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;video_url&quot;</span><span class="p">,</span>
+<span class="linenos"> 98</span>            <span class="s2">&quot;video_url&quot;</span><span class="p">:</span> <span class="p">{</span>
+<span class="linenos"> 99</span>                <span class="s2">&quot;url&quot;</span><span class="p">:</span> <span class="n">video_url</span>
+<span class="linenos">100</span>            <span class="p">}</span>
+<span class="linenos">101</span>        <span class="p">}]</span>
+<span class="linenos">102</span>    <span class="p">}],</span>
+<span class="linenos">103</span>    <span class="n">max_tokens</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span>
+<span class="linenos">104</span><span class="p">)</span>
+<span class="linenos">105</span><span class="nb">print</span><span class="p">(</span><span class="n">response</span><span class="p">)</span>
+<span class="linenos">106</span>
+<span class="linenos">107</span><span class="c1"># IMAGE EMBED INFERENCE</span>
+<span class="linenos">108</span><span class="n">response</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">chat</span><span class="o">.</span><span class="n">completions</span><span class="o">.</span><span class="n">create</span><span class="p">(</span>
+<span class="linenos">109</span>    <span class="n">model</span><span class="o">=</span><span class="s2">&quot;Qwen2.5-VL-3B-Instruct&quot;</span><span class="p">,</span>
+<span class="linenos">110</span>    <span class="n">messages</span><span class="o">=</span><span class="p">[{</span>
+<span class="linenos">111</span>        <span class="s2">&quot;role&quot;</span><span class="p">:</span> <span class="s2">&quot;system&quot;</span><span class="p">,</span>
+<span class="linenos">112</span>        <span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="s2">&quot;you are a helpful assistant&quot;</span>
+<span class="linenos">113</span>    <span class="p">},</span> <span class="p">{</span>
+<span class="linenos">114</span>        <span class="s2">&quot;role&quot;</span><span class="p">:</span>
+<span class="linenos">115</span>        <span class="s2">&quot;user&quot;</span><span class="p">,</span>
+<span class="linenos">116</span>        <span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="p">[{</span>
+<span class="linenos">117</span>            <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;text&quot;</span><span class="p">,</span>
+<span class="linenos">118</span>            <span class="s2">&quot;text&quot;</span><span class="p">:</span> <span class="s2">&quot;Describe the natural environment in the image.&quot;</span>
+<span class="linenos">119</span>        <span class="p">},</span> <span class="p">{</span>
+<span class="linenos">120</span>            <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;image_url&quot;</span><span class="p">,</span>
+<span class="linenos">121</span>            <span class="s2">&quot;image_url&quot;</span><span class="p">:</span> <span class="p">{</span>
+<span class="linenos">122</span>                <span class="s2">&quot;url&quot;</span><span class="p">:</span> <span class="s2">&quot;data:image/png;base64,&quot;</span> <span class="o">+</span> <span class="n">image64</span>
+<span class="linenos">123</span>            <span class="p">}</span>
+<span class="linenos">124</span>        <span class="p">}]</span>
+<span class="linenos">125</span>    <span class="p">}],</span>
+<span class="linenos">126</span>    <span class="n">max_tokens</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span>
+<span class="linenos">127</span><span class="p">)</span>
+<span class="linenos">128</span><span class="nb">print</span><span class="p">(</span><span class="n">response</span><span class="p">)</span>
 </pre></div>
 </div>
 </section>
@@ -751,9 +769,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 19, 2025.</p>
+  <p>Last updated on November 05, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/796891b">796891b</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/3111682">3111682</a>.</p>
   
 </div></div>
       

@@ -59,19 +59,19 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
     <link rel="icon" href="../_static/favicon.png"/>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="Quick Start Recipe for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware" href="quick-start-recipe-for-deepseek-r1-on-trtllm.html" />
+    <link rel="next" title="Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware" href="deployment-guide-for-deepseek-r1-on-trtllm.html" />
     <link rel="prev" title="Dynamo K8s Example" href="../examples/dynamo_k8s_example.html" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc1" />
+  <meta name="docsearch:version" content="1.2.0rc2" />
 
 
   </head>
@@ -214,6 +214,10 @@
     </div>
   
 
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
   
 </div>
 
@@ -360,11 +364,11 @@
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
 <li class="toctree-l1 current active has-children"><a class="current reference internal" href="#">Model Recipes</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quick-start-recipe-for-gpt-oss-on-trtllm.html">Quick Start Recipe for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quick-start-recipe-for-qwen3-next-on-trtllm.html">Quick Start Recipe for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 </ul>
 </details></li>
 </ul>
@@ -394,7 +398,7 @@
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -404,10 +408,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -417,6 +423,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -501,16 +508,112 @@
                   
   <section id="model-recipes">
 <h1>Model Recipes<a class="headerlink" href="#model-recipes" title="Link to this heading">#</a></h1>
-<div class="toctree-wrapper compound" id="id1">
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Model Recipes</span></p>
+<section id="quick-start-for-popular-models">
+<h2>Quick Start for Popular Models<a class="headerlink" href="#quick-start-for-popular-models" title="Link to this heading">#</a></h2>
+<p>The table below contains <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> commands that can be used to easily deploy popular models including DeepSeek-R1, gpt-oss, Llama 4, Qwen3, and more.</p>
+<p>We maintain LLM API configuration files for these models containing recommended performance settings in the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/configs">examples/configs</a> directory. The TensorRT LLM Docker container makes the config files available at <code class="docutils literal notranslate"><span class="pre">/app/tensorrt_llm/examples/configs</span></code>, but you can customize this as needed:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">TRTLLM_DIR</span><span class="o">=</span><span class="s2">&quot;/app/tensorrt_llm&quot;</span><span class="w"> </span><span class="c1"># path to the TensorRT LLM repo in your local environment</span>
+</pre></div>
+</div>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>The configs here are specifically optimized for a target ISL/OSL (Input/Output Sequence Length) of 1024/1024. If your traffic pattern is different, you may benefit from additional tuning. In the future, we plan to provide more configs for a wider range of traffic patterns.</p>
+</div>
+<p>This table is designed to provide a straightforward starting point; for detailed model-specific deployment guides, check out the guides below.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<colgroup>
+<col style="width: 20.0%" />
+<col style="width: 15.0%" />
+<col style="width: 15.0%" />
+<col style="width: 20.0%" />
+<col style="width: 30.0%" />
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>Model Name</p></th>
+<th class="head"><p>GPU</p></th>
+<th class="head"><p>Inference Scenario</p></th>
+<th class="head"><p>Config</p></th>
+<th class="head"><p>Command</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><a class="reference external" href="https://huggingface.co/deepseek-ai/DeepSeek-R1-0528">DeepSeek-R1</a></p></td>
+<td><p>H100, H200</p></td>
+<td><p>Max Throughput</p></td>
+<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/deepseek-r1-throughput.yaml">deepseek-r1-throughput.yaml</a></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">deepseek-ai/DeepSeek-R1-0528</span> <span class="pre">--extra_llm_api_options</span> <span class="pre">${TRTLLM_DIR}/examples/configs/deepseek-r1-throughput.yaml</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference external" href="https://huggingface.co/deepseek-ai/DeepSeek-R1-0528">DeepSeek-R1</a></p></td>
+<td><p>B200, GB200</p></td>
+<td><p>Max Throughput</p></td>
+<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/deepseek-r1-deepgemm.yaml">deepseek-r1-deepgemm.yaml</a></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">deepseek-ai/DeepSeek-R1-0528</span> <span class="pre">--extra_llm_api_options</span> <span class="pre">${TRTLLM_DIR}/examples/configs/deepseek-r1-deepgemm.yaml</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference external" href="https://huggingface.co/nvidia/DeepSeek-R1-FP4">DeepSeek-R1 (NVFP4)</a></p></td>
+<td><p>B200, GB200</p></td>
+<td><p>Max Throughput</p></td>
+<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/deepseek-r1-throughput.yaml">deepseek-r1-throughput.yaml</a></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">nvidia/DeepSeek-R1-FP4</span> <span class="pre">--extra_llm_api_options</span> <span class="pre">${TRTLLM_DIR}/examples/configs/deepseek-r1-throughput.yaml</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference external" href="https://huggingface.co/nvidia/DeepSeek-R1-FP4-v2">DeepSeek-R1 (NVFP4)</a></p></td>
+<td><p>B200, GB200</p></td>
+<td><p>Min Latency</p></td>
+<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/deepseek-r1-latency.yaml">deepseek-r1-latency.yaml</a></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">nvidia/DeepSeek-R1-FP4-v2</span> <span class="pre">--extra_llm_api_options</span> <span class="pre">${TRTLLM_DIR}/examples/configs/deepseek-r1-latency.yaml</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference external" href="https://huggingface.co/openai/gpt-oss-120b">gpt-oss-120b</a></p></td>
+<td><p>Any</p></td>
+<td><p>Max Throughput</p></td>
+<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/gpt-oss-120b-throughput.yaml">gpt-oss-120b-throughput.yaml</a></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--extra_llm_api_options</span> <span class="pre">${TRTLLM_DIR}/examples/configs/gpt-oss-120b-throughput.yaml</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference external" href="https://huggingface.co/openai/gpt-oss-120b">gpt-oss-120b</a></p></td>
+<td><p>Any</p></td>
+<td><p>Min Latency</p></td>
+<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/gpt-oss-120b-latency.yaml">gpt-oss-120b-latency.yaml</a></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">openai/gpt-oss-120b</span> <span class="pre">--extra_llm_api_options</span> <span class="pre">${TRTLLM_DIR}/examples/configs/gpt-oss-120b-latency.yaml</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference external" href="https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Thinking">Qwen3-Next-80B-A3B-Thinking</a></p></td>
+<td><p>Any</p></td>
+<td><p>Max Throughput</p></td>
+<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/qwen3-next.yaml">qwen3-next.yaml</a></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">Qwen/Qwen3-Next-80B-A3B-Thinking</span> <span class="pre">--extra_llm_api_options</span> <span class="pre">${TRTLLM_DIR}/examples/configs/qwen3-next.yaml</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Qwen3 family (e.g. <a class="reference external" href="https://huggingface.co/Qwen/Qwen3-30B-A3B">Qwen3-30B-A3B</a>)</p></td>
+<td><p>Any</p></td>
+<td><p>Max Throughput</p></td>
+<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/qwen3.yaml">qwen3.yaml</a></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">Qwen/Qwen3-30B-A3B</span> <span class="pre">--extra_llm_api_options</span> <span class="pre">${TRTLLM_DIR}/examples/configs/qwen3.yaml</span></code> (swap to another Qwen3 model name as needed)</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference external" href="https://huggingface.co/nvidia/Llama-3.3-70B-Instruct-FP8">Llama-3.3-70B (FP8)</a></p></td>
+<td><p>Any</p></td>
+<td><p>Max Throughput</p></td>
+<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/llama-3.3-70b.yaml">llama-3.3-70b.yaml</a></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">nvidia/Llama-3.3-70B-Instruct-FP8</span> <span class="pre">--extra_llm_api_options</span> <span class="pre">${TRTLLM_DIR}/examples/configs/llama-3.3-70b.yaml</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference external" href="https://huggingface.co/nvidia/Llama-4-Scout-17B-16E-Instruct-FP8">Llama 4 Scout (FP8)</a></p></td>
+<td><p>Any</p></td>
+<td><p>Max Throughput</p></td>
+<td><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/llama-4-scout.yaml">llama-4-scout.yaml</a></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">nvidia/Llama-4-Scout-17B-16E-Instruct-FP8</span> <span class="pre">--extra_llm_api_options</span> <span class="pre">${TRTLLM_DIR}/examples/configs/llama-4-scout.yaml</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="model-specific-deployment-guides">
+<h2>Model-Specific Deployment Guides<a class="headerlink" href="#model-specific-deployment-guides" title="Link to this heading">#</a></h2>
+<p>The deployment guides below provide more detailed instructions for serving specific models with TensorRT LLM.</p>
+<div class="toctree-wrapper compound" id="deployment-guides">
 <ul>
-<li class="toctree-l1"><a class="reference internal" href="quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l1"><a class="reference internal" href="quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l1"><a class="reference internal" href="quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l1"><a class="reference internal" href="quick-start-recipe-for-gpt-oss-on-trtllm.html">Quick Start Recipe for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
-<li class="toctree-l1"><a class="reference internal" href="quick-start-recipe-for-qwen3-next-on-trtllm.html">Quick Start Recipe for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 </ul>
 </div>
+</section>
 </section>
 
 
@@ -533,11 +636,11 @@
       </div>
     </a>
     <a class="right-next"
-       href="quick-start-recipe-for-deepseek-r1-on-trtllm.html"
+       href="deployment-guide-for-deepseek-r1-on-trtllm.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">Quick Start Recipe for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</p>
+        <p class="prev-next-title">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -548,9 +651,26 @@
             
             
 
-<div class="bd-sidebar-secondary"></div>
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
 
 
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#quick-start-for-popular-models">Quick Start for Popular Models</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#model-specific-deployment-guides">Model-Specific Deployment Guides</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
               
             
 
@@ -641,9 +761,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 19, 2025.</p>
+  <p>Last updated on November 05, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/796891b">796891b</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/3111682">3111682</a>.</p>
   
 </div></div>
       
