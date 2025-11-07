@@ -27,7 +27,6 @@ def bmm_out(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
 from enum import IntEnum
 
 
-# Copied from csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/common.hExpand commentComment on line R76Code has comments. Press enter to view.
 class ActivationType(IntEnum):
     Gelu = 0
     Relu = 1
