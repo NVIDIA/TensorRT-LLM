@@ -340,9 +340,6 @@ public:
         }
         else
         {
-            // TORCH_CHECK(fc1_expert_weights.sizes()[1] == fc2_expert_weights.sizes()[2] * mInnerDimMultiplier * 2,
-            //     "fc1_expert_weights inter size must be fc2_expert_weights inter size.");
-
             if (isGatedActivation(base_activation_type))
             {
                 TORCH_CHECK(fc1_expert_weights.sizes()[1] == fc2_expert_weights.sizes()[2] * mInnerDimMultiplier * 2,
