@@ -132,6 +132,15 @@ inline std::string toString(AllReduceStrategyType op)
     return oss.str();
 }
 
+// Helper function to determine if a strategy should skip topology detection
+// These strategies manage connectivity internally or are designed for specific hardware
+inline bool shouldSkipTopologyDetection(AllReduceStrategyType strategy)
+{
+    return (strategy == AllReduceStrategyType::NCCL || strategy == AllReduceStrategyType::NCCL_SYMMETRIC
+        || strategy == AllReduceStrategyType::NCCL_DEVICE || strategy == AllReduceStrategyType::UB
+        || strategy == AllReduceStrategyType::MNNVL);
+}
+
 struct AllReduceFusionParams
 {
     AllReduceFusionParams()

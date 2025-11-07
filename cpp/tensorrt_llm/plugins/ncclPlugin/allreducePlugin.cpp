@@ -819,13 +819,8 @@ int AllreducePlugin::initialize() noexcept
 
     TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
     mNcclComm = getComm(mGroup);
-    // Skip topology detection for strategies that don't need it:
-    // - NCCL, NCCL_SYMMETRIC, NCCL_DEVICE: Use NCCL's own connectivity management
-    // - UB: Uses User Buffers
-    // - MNNVL: Multi-Node NVLink handles connectivity natively
-    if (mStrategy != AllReduceStrategyType::NCCL && mStrategy != AllReduceStrategyType::NCCL_SYMMETRIC
-        && mStrategy != AllReduceStrategyType::NCCL_DEVICE && mStrategy != AllReduceStrategyType::UB
-        && mStrategy != AllReduceStrategyType::MNNVL)
+    // Skip topology detection for strategies that manage connectivity internally
+    if (!shouldSkipTopologyDetection(mStrategy))
     {
         initGroupTopology();
     }
