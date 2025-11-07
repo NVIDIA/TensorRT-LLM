@@ -111,6 +111,12 @@ pipeline {
         timestamps()
     }
 
+    triggers {
+        parameterizedCron('''
+            H 2 * * * %branchName=release/1.1.0rc3;repoUrlKey=tensorrt_llm_github
+        ''')
+    }
+
     stages {
         stage("Generating Poetry Locks"){
             agent {
