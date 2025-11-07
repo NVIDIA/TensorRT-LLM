@@ -10,6 +10,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence
 import click
 import torch
 import yaml
+from pydantic import ValidationError
 from strenum import StrEnum
 from torch.cuda import device_count
 
@@ -32,6 +33,7 @@ from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_port
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.logger import logger, severity_map
+from tensorrt_llm.recipes import RecipeConfig
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
 from tensorrt_llm.serve.tool_parser import ToolParserFactory
 
@@ -399,27 +401,21 @@ def serve(
         with open(extra_llm_api_options, 'r') as f:
             loaded_data = yaml.safe_load(f)
 
-            # Detect recipe format (has 'scenario' and 'llm_api_options' keys)
-            if isinstance(
-                    loaded_data, dict
-            ) and 'scenario' in loaded_data and 'llm_api_options' in loaded_data:
-                # Recipe format - extract llm_api_options section for LLM args
-                llm_args_extra_dict = loaded_data['llm_api_options']
+        # Try to parse as recipe format with Pydantic validation
+        try:
+            recipe = RecipeConfig(**loaded_data)
+            # Recipe format validated - extract llm_api_options and env
+            llm_args_extra_dict = recipe.llm_api_options
 
-                # TODO: Add llm_api_options validation once PR #8331 merges
-                # (standardizes LlmArgs with Pydantic - validation will happen automatically)
-
-                # Set environment variables from 'env' section (if not already set)
-                env_vars = loaded_data.get('env', {})
-                for key, value in env_vars.items():
-                    if key not in os.environ:
-                        os.environ[key] = str(value)
-                        logger.info(
-                            f"Set environment variable from recipe: {key}={value}"
-                        )
-            else:
-                # Simple format - use loaded data directly
-                llm_args_extra_dict = loaded_data
+            # Set environment variables from 'env' section (if not already set)
+            for key, value in recipe.env.items():
+                if key not in os.environ:
+                    os.environ[key] = str(value)
+                    logger.info(
+                        f"Set environment variable from recipe: {key}={value}")
+        except ValidationError:
+            # Not a valid recipe format - treat as simple llm_api_options format
+            llm_args_extra_dict = loaded_data
 
     llm_args = update_llm_args_with_extra_dict(llm_args, llm_args_extra_dict)
 

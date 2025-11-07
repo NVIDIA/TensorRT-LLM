@@ -11,8 +11,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 import yaml
+from pydantic import ValidationError
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.recipes import RecipeConfig, ScenarioConfig
 
 if TYPE_CHECKING:
     from tensorrt_llm.bench.benchmark import GeneralExecSettings
@@ -41,16 +43,12 @@ def extract_scenario_from_recipe(recipe_path: Optional[str]) -> Optional[Dict[st
         with open(recipe_path, "r") as f:
             loaded_data = yaml.safe_load(f)
 
-        # Check if this is a recipe format (has 'scenario' and 'llm_api_options' keys)
-        if (
-            isinstance(loaded_data, dict)
-            and "scenario" in loaded_data
-            and "llm_api_options" in loaded_data
-        ):
-            return loaded_data["scenario"]
+        # Parse and validate using Pydantic schema
+        recipe = RecipeConfig(**loaded_data)
+        return recipe.scenario.model_dump()
 
-        return None
-    except (FileNotFoundError, yaml.YAMLError, KeyError):
+    except (FileNotFoundError, yaml.YAMLError, KeyError, ValidationError):
+        # Not a valid recipe format, return None
         return None
 
 
@@ -120,46 +118,16 @@ def merge_params_with_priority(
 
 
 def validate_scenario_params(scenario: Dict[str, Any]) -> None:
-    """Validate scenario parameters.
+    """Validate scenario parameters using Pydantic schema.
 
     Args:
         scenario: Scenario dictionary to validate
 
     Raises:
-        ValueError: If scenario parameters are invalid
+        ValidationError: If scenario parameters are invalid
     """
-    required_fields = ["target_isl", "target_osl", "target_concurrency"]
-
-    # Check required fields
-    for field in required_fields:
-        if field not in scenario:
-            raise ValueError(f"Scenario missing required field: {field}")
-
-    # Validate numeric fields
-    if scenario["target_isl"] <= 0:
-        raise ValueError(f"target_isl must be positive, got: {scenario['target_isl']}")
-
-    if scenario["target_osl"] <= 0:
-        raise ValueError(f"target_osl must be positive, got: {scenario['target_osl']}")
-
-    if scenario["target_concurrency"] <= 0:
-        raise ValueError(
-            f"target_concurrency must be positive, got: {scenario['target_concurrency']}"
-        )
-
-    # Validate optional stdev fields
-    if "isl_stdev" in scenario:
-        if scenario["isl_stdev"] < 0:
-            raise ValueError(f"isl_stdev must be non-negative, got: {scenario['isl_stdev']}")
-
-    if "osl_stdev" in scenario:
-        if scenario["osl_stdev"] < 0:
-            raise ValueError(f"osl_stdev must be non-negative, got: {scenario['osl_stdev']}")
-
-    # Validate num_requests
-    if "num_requests" in scenario:
-        if scenario["num_requests"] <= 0:
-            raise ValueError(f"num_requests must be positive, got: {scenario['num_requests']}")
+    # Pydantic validation handles all field checks automatically
+    ScenarioConfig(**scenario)
 
 
 def prepare_llm_api_options_for_recipe(
