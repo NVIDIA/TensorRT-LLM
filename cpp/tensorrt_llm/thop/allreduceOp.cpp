@@ -312,9 +312,14 @@ public:
         {
             mNcclComm = getComm(mGroup);
         }
-        if (mStrategy != AllReduceStrategyType::NCCL && mStrategy != AllReduceStrategyType::UB)
+        // Skip topology detection for strategies that don't need it:
+        // - NCCL, NCCL_SYMMETRIC, NCCL_DEVICE: Use NCCL's own connectivity management
+        // - UB: Uses User Buffers
+        // - MNNVL: Multi-Node NVLink handles connectivity natively
+        if (mStrategy != AllReduceStrategyType::NCCL && mStrategy != AllReduceStrategyType::UB
+            && mStrategy != AllReduceStrategyType::MNNVL && mStrategy != AllReduceStrategyType::NCCL_SYMMETRIC
+            && mStrategy != AllReduceStrategyType::NCCL_DEVICE)
         {
-
             initGroupTopology();
         }
 
