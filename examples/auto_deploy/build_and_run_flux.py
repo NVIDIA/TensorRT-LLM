@@ -1,8 +1,10 @@
 import argparse
+import os
 from collections import abc
 
 import modelopt.torch.opt as mto
 import torch
+import yaml
 from diffusers import DiffusionPipeline
 from PIL import Image
 from tqdm import tqdm
@@ -21,6 +23,34 @@ dtype_map = {
     "BFloat16": torch.bfloat16,
     "Float": torch.float32,
 }
+
+
+def load_config(config_path):
+    """Load configuration from YAML file.
+
+    Args:
+        config_path: Path to YAML config file.
+
+    Returns:
+        Dictionary with export, optimizer, and compile configurations.
+    """
+    if not config_path:
+        raise ValueError("Config path is required. Use --config to specify a YAML config file.")
+
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+
+    ad_logger.info(f"Loading config from {config_path}")
+    with open(config_path, "r") as f:
+        config = yaml.safe_load(f)
+
+    # Validate required sections
+    required_sections = ["export", "optimizer", "compile"]
+    for section in required_sections:
+        if section not in config:
+            raise ValueError(f"Config file missing required section: {section}")
+
+    return config
 
 
 # TODO: Reuse the cache context from the original model
@@ -230,16 +260,16 @@ def main():
         help="The max batch size to use for the model",
     )
     parser.add_argument(
-        "--backend",
-        type=str,
-        default="torch-opt",
-        help="The backend to use for compilation (default: torch-opt)",
-    )
-    parser.add_argument(
         "--image_path",
         type=str,
         default="output.png",
         help="Path to save the generated image (default: output.png)",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=os.path.join(os.path.dirname(__file__), "flux_transforms.yaml"),
+        help="Path to YAML config file for export, optimizer, and compile settings (default: flux_transforms.yaml)",
     )
     args = parser.parse_args()
 
@@ -274,7 +304,19 @@ def main():
     flux_config = pipe.transformer.config
     flux_kwargs = _gen_dummy_inp_flux(model, min_bs=args.max_batch_size)
 
-    gm = torch_export_to_gm(model, args=(), kwargs=flux_kwargs, clone=False)
+    # Load config from YAML
+    config = load_config(args.config)
+
+    # Export to graph module with config params
+    ad_logger.info("Exporting model to graph module...")
+    export_config = config["export"]
+    gm = torch_export_to_gm(
+        model,
+        args=(),
+        kwargs=flux_kwargs,
+        clone=export_config.get("clone", False),
+        strict=export_config.get("strict", False),
+    )
 
     if args.restore_from:
         ad_logger.info(f"Restoring model from {args.restore_from}")
@@ -289,40 +331,31 @@ def main():
             raise
 
     # Apply inference optimizer fusions
+    optimizer_config = config["optimizer"]
     ad_logger.info("Applying inference optimizer fusions (FP8 and FP4)...")
-    optimizer_config = {
-        "quantize_fp8_from_graph": {
-            "stage": "pattern_matcher",
-        },
-        "quantize_nvfp4_from_graph": {
-            "stage": "pattern_matcher",
-        },
-        "fuse_fp8_linear": {
-            "stage": "post_load_fusion",
-            "backend": "torch",
-        },
-        "fuse_nvfp4_linear": {
-            "stage": "post_load_fusion",
-            "backend": "trtllm",
-        },
-        "fuse_fp8_gemms": {
-            "stage": "post_load_fusion",
-        },
-        "fuse_fp4_gemms": {
-            "stage": "post_load_fusion",
-        },
-    }
     optimizer = InferenceOptimizer(factory=None, config=optimizer_config)
     gm = optimizer(cm=None, mod=gm)
     ad_logger.info("Inference optimizer fusions applied successfully")
 
-    # Validate backend availability
-    if not CompileBackendRegistry.has(args.backend):
-        available = CompileBackendRegistry.list()
-        raise ValueError(f"Backend '{args.backend}' not found. Available backends: {available}")
+    # Compile model with config params
+    compile_config = config["compile"]
+    backend = compile_config.get("backend", "torch-opt")
+    cuda_graph_batch_sizes = compile_config.get("cuda_graph_batch_sizes", None)
 
-    compiler_cls = CompileBackendRegistry.get(args.backend)
-    gm = compiler_cls(gm, args=(), max_batch_size=args.max_batch_size, kwargs=flux_kwargs).compile()
+    # Validate backend availability
+    if not CompileBackendRegistry.has(backend):
+        available = CompileBackendRegistry.list()
+        raise ValueError(f"Backend '{backend}' not found. Available backends: {available}")
+
+    ad_logger.info(f"Compiling model with backend: {backend}")
+    compiler_cls = CompileBackendRegistry.get(backend)
+    gm = compiler_cls(
+        gm,
+        args=(),
+        max_batch_size=args.max_batch_size,
+        kwargs=flux_kwargs,
+        cuda_graph_batch_sizes=cuda_graph_batch_sizes,
+    ).compile()
 
     del model
     fx_model = TransformerWrapper(gm, flux_config)
