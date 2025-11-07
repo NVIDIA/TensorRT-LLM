@@ -74,9 +74,9 @@ void indexer_k_cache_scatter_op(th::Tensor const& k_fp8_bytes, th::Tensor const&
     int32_t cache_dim_3 = static_cast<int32_t>(k_cache.size(3));      // per_token_size
 
     // Validation for indexer k cache pool for DeepSeek-V3.2 constraints
-    TORCH_CHECK(cache_dim_2 == 1, "k_cache dimension 2 must be 1 for DeepSeek-V32, got %d", cache_dim_2);
-    TORCH_CHECK(head_dim == 128, "k_fp8_bytes head_dim must be 128 for DeepSeek-V32, got %d", head_dim);
-    TORCH_CHECK(scale_size == 4, "k_scale_bytes scale_size must be 4 bytes for DeepSeek-V32, got %d", scale_size);
+    TORCH_CHECK(cache_dim_2 == 1, "k_cache dimension 2 must be 1 for DeepSeek-V3.2, got %d", cache_dim_2);
+    TORCH_CHECK(head_dim == 128, "k_fp8_bytes head_dim must be 128 for DeepSeek-V3.2, got %d", head_dim);
+    TORCH_CHECK(scale_size == 4, "k_scale_bytes scale_size must be 4 bytes for DeepSeek-V3.2, got %d", scale_size);
 
     int64_t cache_stride_0 = static_cast<int64_t>(k_cache.stride(0));
     int64_t cache_stride_1 = static_cast<int64_t>(k_cache.stride(1));

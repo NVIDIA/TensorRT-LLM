@@ -46,7 +46,7 @@ __device__ __forceinline__ int64_t flatIndexToMemoryOffset(
     return i0 * s0 + i1 * s1 + i2 * s2 + i3 * s3;
 }
 
-} // namespace
+} // anonymous namespace
 
 /**
  * CUDA kernel to scatter both FP8 K values and scales into the indexer k cache pool
@@ -128,7 +128,7 @@ void invokeIndexerKCacheScatter(uint8_t const* k_fp8_bytes, uint8_t const* k_sca
         return;
     }
 
-    // Assertions for DeepSeek-V3 configuration
+    // Assertions for DeepSeek-V3.2 configuration
     constexpr int32_t QUANT_BLOCK_SIZE = 128;
     TLLM_CHECK_WITH_INFO(
         head_dim == QUANT_BLOCK_SIZE, "head_dim must equal 128 for DeepSeek-V3 indexer cache (got %d)", head_dim);

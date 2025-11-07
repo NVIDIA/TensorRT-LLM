@@ -12,7 +12,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
-from utils.util import check_accuracy, getSMVersion
+from utils.util import check_accuracy, skip_pre_hopper
 
 from tensorrt_llm import deep_gemm
 from tensorrt_llm._torch.attention_backend.interface import (
@@ -300,8 +300,7 @@ def _ref_fp8_mqa_logits(
 
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
-@pytest.mark.skipif(getSMVersion() < 90,
-                    reason="fp8_mqa_logits is only supported in SM90 and SM100")
+@skip_pre_hopper
 def test_deepgemm_fp8_mqa_logits_basic():
     """
     Basic test for deepgemm.fp8_mqa_logits kernel.
@@ -474,7 +473,7 @@ def _create_mock_metadata(request_ids,
 
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
-@pytest.mark.skipif(getSMVersion() < 90, reason="FP8 operations require SM90+")
+@skip_pre_hopper
 def test_indexer_k_cache_scatter_custom_op():
     """
     Direct comparison: CUDA kernel vs Python reference for k_cache scatter.
@@ -641,11 +640,12 @@ def test_indexer_k_cache_scatter_custom_op():
                 f"Python={k_cache_python.view(-1)[flat_idx].item()}")
 
         # Fail the test
-        assert False, f"CUDA kernel produced different results than Python reference"
+        raise AssertionError(
+            "CUDA kernel produced different results than Python reference")
 
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
-@pytest.mark.skipif(getSMVersion() < 90, reason="FP8 operations require SM90+")
+@skip_pre_hopper
 def test_fp8_k_cache_roundtrip():
     """Verify FP8 quantization scales survive write/read cycle for multiple requests."""
     torch.manual_seed(42)
@@ -730,9 +730,7 @@ def test_fp8_k_cache_roundtrip():
 
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
-@pytest.mark.skipif(
-    getSMVersion() < 90,
-    reason="fp8_paged_mqa_logits is only supported in SM90 and SM100")
+@skip_pre_hopper
 @pytest.mark.parametrize("batch_size,next_n", [(4, 1), (2, 2)])
 def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
     """
@@ -1027,7 +1025,7 @@ def test_split_prefill_chunks(max_chunk_size, seq_lens, start_idx,
 
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
-@pytest.mark.skipif(getSMVersion() < 90, reason="FP8 operations require SM90+")
+@skip_pre_hopper
 @pytest.mark.parametrize(
     "chunk_size,seq_lens_list,chunking_type",
     [
