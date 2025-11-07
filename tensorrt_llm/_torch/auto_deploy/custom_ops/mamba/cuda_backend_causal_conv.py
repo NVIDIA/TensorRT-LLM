@@ -185,9 +185,9 @@ def _cuda_cached_causal_conv1d(
 
     # DECODE: batch update for single-token sequences
     if num_decode > 0:
-        # Use true start offsets for decode tokens (tail after prefills)
-        decode_idx = seq_start[num_prefill:].to(torch.long)
-        x_decode = inp_flat.index_select(0, decode_idx)  # [num_decode, C_in]
+        x_decode = inp_flat[
+            total_prefill_tokens : total_prefill_tokens + num_decode
+        ]  # [num_decode, C_in]
 
         y_dec = causal_conv1d_update(
             x_decode,  # [batch, dim]
@@ -202,7 +202,9 @@ def _cuda_cached_causal_conv1d(
 
         if y_dec.dim() == 3:
             y_dec = y_dec.squeeze(-1)
-        y_flat.index_copy_(0, decode_idx, y_dec.to(y_flat.dtype))
+        y_flat[total_prefill_tokens : total_prefill_tokens + num_decode].copy_(
+            y_dec.to(y_flat.dtype)
+        )
 
     # Custom op must not return an alias of any input; return a fresh tensor
     return y.contiguous().clone()
