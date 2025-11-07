@@ -10,6 +10,7 @@ cur_dir = os.path.dirname(os.path.abspath(__file__))
 import pytest
 
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
+from tensorrt_llm.executor.utils import LlmLauncherEnvs
 from tensorrt_llm.llmapi.mpi_session import (MPINodeState, MpiPoolSession,
                                              RemoteMpiCommSessionClient,
                                              split_mpi_env)
@@ -62,16 +63,24 @@ def run_client(server_addr, values_to_process):
 
 
 @pytest.mark.parametrize("task_type", ["submit", "submit_sync"])
-def test_remote_mpi_session(task_type: Literal["submit", "submit_sync"]):
+@pytest.mark.parametrize(
+    "spawn_extra_main_process", [True, False],
+    ids=["spawn_extra_main_process", "no_spawn_extra_main_process"])
+def test_remote_mpi_session(task_type: Literal["submit", "submit_sync"],
+                            spawn_extra_main_process: bool):
     """Test RemoteMpiPoolSessionClient and RemoteMpiPoolSessionServer interaction"""
     cur_dir = os.path.dirname(os.path.abspath(__file__))
-    test_file = os.path.join(cur_dir, "_test_remote_mpi_session.sh")
+    test_file = os.path.join(cur_dir, "_run_remote_mpi_session.sh")
     assert os.path.exists(test_file), f"Test file {test_file} does not exist"
     command = ["bash", test_file, task_type]
     print(' '.join(command))
 
+    envs = os.environ.copy()
+    LlmLauncherEnvs.set_spawn_extra_main_process(spawn_extra_main_process)
+    envs[LlmLauncherEnvs.TLLM_SPAWN_EXTRA_MAIN_PROCESS] = os.environ[
+        LlmLauncherEnvs.TLLM_SPAWN_EXTRA_MAIN_PROCESS]
     with Popen(command,
-               env=os.environ,
+               env=envs,
                stdout=PIPE,
                stderr=PIPE,
                bufsize=1,
