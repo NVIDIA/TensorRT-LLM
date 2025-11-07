@@ -13,7 +13,7 @@ fi
 install_boost() {
   # Install boost version >= 1.78 for boost::span
   # Current libboost-dev apt packages are < 1.78, so install from tar.gz
-  wget --retry-connrefused --timeout=180 --tries=10 --continue -O /tmp/boost.tar.gz ${BOOST_URL} \
+  wget --no-verbose --retry-connrefused --timeout=180 --tries=10 --continue -O /tmp/boost.tar.gz ${BOOST_URL} \
     && tar xzf /tmp/boost.tar.gz -C /tmp \
     && mv /tmp/boost_1_80_0/boost /usr/include/boost \
     && rm -rf /tmp/boost_1_80_0 /tmp/boost.tar.gz
