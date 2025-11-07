@@ -164,7 +164,11 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=torch_compile,
         )
         if fp8kv:
-            pytorch_config["kv_cache_config"] = KvCacheConfig(dtype="fp8")
+            pytorch_config["kv_cache_config"] = KvCacheConfig(
+                dtype="fp8",
+                free_gpu_memory_fraction=
+                0.8,  # Prevent cublas/cublasLt handle allocation memory insufficient errors
+            )
         with LLM(
                 f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8",
                 **pytorch_config) as llm:
@@ -199,7 +203,11 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=torch_compile,
         )
         if fp8kv:
-            pytorch_config["kv_cache_config"] = KvCacheConfig(dtype="fp8")
+            pytorch_config["kv_cache_config"] = KvCacheConfig(
+                dtype="fp8",
+                free_gpu_memory_fraction=
+                0.8,  # Prevent cublas/cublasLt handle allocation memory insufficient errors
+            )
         with LLM(
                 f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8",
                 tensor_parallel_size=tp_size,
