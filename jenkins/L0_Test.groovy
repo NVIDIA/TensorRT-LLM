@@ -2683,7 +2683,6 @@ def launchTestJobs(pipeline, testFilter)
         "B300-PyTorch-1": ["b300-single", "l0_b300", 1, 1],
         "DGX_B200-4_GPUs-PyTorch-1": ["b200-x4", "l0_dgx_b200", 1, 2, 4],
         "DGX_B200-4_GPUs-PyTorch-2": ["b200-x4", "l0_dgx_b200", 2, 2, 4],
-        "DGX_B200-4_GPUs-PyTorch-Ray-1": ["b200-x4", "l0_dgx_b200", 1, 1, 4],
         "DGX_B200-8_GPUs-PyTorch-1": ["b200-x8", "l0_dgx_b200", 1, 1, 8],
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["b200-trtllm", "l0_dgx_b200", 1, 1, 4, 1, true],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["b300-x4", "l0_dgx_b300", 1, 1, 4],
@@ -2717,6 +2716,7 @@ def launchTestJobs(pipeline, testFilter)
         // Disable GB300 stages due to nodes will be offline temporarily.
         // "GB300-PyTorch-1": ["gb300-single", "l0_gb300", 1, 1],
         "GB200-4_GPUs-PyTorch-1": ["gb200-trtllm", "l0_gb200_multi_gpus", 1, 1, 4],
+        "GB200-4_GPUs-PyTorch-Ray-1": ["gb200-trtllm", "l0_gb200_multi_gpus", 1, 1, 4],
         "GB200-4_GPUs-PyTorch-Post-Merge-1": ["gb200-trtllm", "l0_gb200_multi_gpus", 1, 1, 4],
         // "GB300-4_GPUs-PyTorch-Post-Merge-1": ["gb300-trtllm", "l0_gb300_multi_gpus", 1, 1, 4],
     ]

@@ -51,6 +51,30 @@ l0_gb200_multi_gpus:
       linux_distribution_name: ubuntu*
       cpu: aarch64
     terms:
+      stage: pre_merge
+      backend: pytorch
+      orchestrator: ray
+  tests:
+  - unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu4"
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=False-attn_backend=TRTLLM-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp2pp2-fp8kv=False-attn_backend=TRTLLM-torch_compile=False]
+  - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_genpp2[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_ctxtp2_genpp2[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_gentp2[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp4_gentp4[TinyLlama-1.1B-Chat-v1.0]
+  - examples/test_ray.py::test_llm_inference_distributed_ray[tp2pp2]
+  - examples/test_ray.py::test_ray_disaggregated_serving[tp2]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+        lte: 4
+    wildcards:
+      gpu:
+      - '*gb200*'
+      linux_distribution_name: ubuntu*
+      cpu: aarch64
+    terms:
       stage: post_merge
       backend: pytorch
   tests:
