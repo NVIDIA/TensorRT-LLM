@@ -341,42 +341,38 @@ class TRTLLMGenFusedMoE(MoE):
         x_col = x.shape[1]
         token_count = x.shape[0]
         alltoall_info = None
+        # Determine if this is first/last call (TRTLLMGenFusedMoE doesn't use chunking)
         is_first_call = self.repeat_idx == 0
         is_last_call = self.repeat_idx == self.repeat_count - 1
 
         if post_quant_comm:
+            # Start GPU stage for first call
+            self._load_balancer_start_wait_gpu_stage(is_first_call)
             token_selected_experts, token_final_scales = self.routing_method.apply(
                 router_logits)
             token_selected_experts = token_selected_experts.to(torch.int32)
             if token_final_scales is not None:
                 token_final_scales = token_final_scales.to(torch.bfloat16)
 
-            # Apply load balancer routing if available
-            if self.layer_load_balancer:
-                # Determine if this is first/last call (TRTLLMGenFusedMoE doesn't use chunking)
+            self._load_balancer_done_wait_gpu_stage(is_first_call)
 
-                # Start GPU stage for first call
-                self._load_balancer_start_wait_gpu_stage(is_first_call)
-                self._load_balancer_done_wait_gpu_stage(is_first_call)
+            ignore_allreduce = self.enable_alltoall and self.alltoall_method_type == AlltoallMethodType.MNNVL and self.moe_alltoall_backend == "mnnvllatency"
+            self._load_balancer_update_statistic(
+                token_selected_experts,
+                is_first_call,
+                is_last_call,
+                ignore_allreduce=ignore_allreduce)
 
-                ignore_allreduce = self.enable_alltoall and self.alltoall_method_type == AlltoallMethodType.MNNVL and self.moe_alltoall_backend == "mnnvllatency"
-                self._load_balancer_update_statistic(
-                    token_selected_experts,
-                    is_first_call,
-                    is_last_call,
-                    ignore_allreduce=ignore_allreduce)
+            # Route tokens to slots
+            token_selected_slots = self._load_balancer_route(
+                token_selected_experts, self.use_dp)
 
-                # Route tokens to slots
-                token_selected_slots = self._load_balancer_route(
-                    token_selected_experts, self.use_dp)
+            # Update expert statistics
+            ExpertStatistic.set_layer(self.layer_idx)
+            ExpertStatistic.maybe_add_info(self.num_slots, token_selected_slots)
 
-                # Update expert statistics
-                ExpertStatistic.set_layer(self.layer_idx)
-                ExpertStatistic.maybe_add_info(self.num_slots,
-                                               token_selected_slots)
-
-                # Use routed slots for subsequent processing
-                token_selected_experts = token_selected_slots
+            # Use routed slots for subsequent processing
+            token_selected_experts = token_selected_slots
 
             x, x_sf, x_row, x_col = self._quantize_for_post_quant_comm(x)
 
@@ -756,6 +752,9 @@ class TRTLLMGenFusedMoE(MoE):
                 "TRTLLMGenFusedMoE only supports fp8_block_scaling, nvfp4, w4a16_mxfp4, w4a8_mxfp4_mxfp8 and w4a8_mxfp4_fp8 dtypes."
             )
 
+        # Handle load balancer CPU stage if needed
+        self._load_balancer_start_set_cpu_stage(is_last_call)
+
         # Combine results if using alltoall
         if self.enable_alltoall:
             if self.moe_alltoall_backend == "mnnvllatency":
@@ -803,11 +802,7 @@ class TRTLLMGenFusedMoE(MoE):
             use_dp_padding=use_dp_padding,
         )
 
-        # Handle load balancer CPU stage if needed
-        if self.layer_load_balancer:
-            is_last_call = self.repeat_idx == self.repeat_count - 1
-            self._load_balancer_start_set_cpu_stage(is_last_call)
-            self._load_balancer_done_set_cpu_stage(is_last_call)
+        self._load_balancer_done_set_cpu_stage(is_last_call)
 
         if use_dp_padding:
             rank = self.mapping.tp_rank

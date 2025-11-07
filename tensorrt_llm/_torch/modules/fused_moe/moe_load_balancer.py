@@ -459,8 +459,11 @@ class SingleLayerMoeLoadBalancer:
     def is_static_routing(self):
         return not self.updates_enabled
 
-    def need_load_shared_weights(self):
+    def is_dynamic_routing(self):
         return self.updates_enabled
+
+    def need_load_shared_weights(self):
+        return self.is_dynamic_routing()
 
     def set_shared_memory_base_name(self, shared_memory_base_name):
         """
@@ -807,8 +810,9 @@ class SingleLayerMoeLoadBalancer:
         Returns:
             A tensor of routed slot IDs
         """
-        assert self.func_called_count["done_wait_gpu_stage"] == 1
-        self.func_called_count["route"] += 1
+        if self.is_dynamic_routing():
+            assert self.func_called_count["done_wait_gpu_stage"] == 1
+            self.func_called_count["route"] += 1
         return torch.ops.trtllm.moe_load_balance_routing(
             token_selected_experts, offset_by_ep_rank,
             self.single_layer_load_balancer_ptr)
@@ -880,6 +884,9 @@ class MoeLoadBalancer:
     def is_static_routing(self):
         # if we don't update, then it is statistic routing.
         return self.layer_updates_per_iter == 0
+
+    def is_dynamic_routing(self):
+        return not self.is_static_routing()
 
     def _setup_mpi_comm(self):
         global_mpi_comm = tensorrt_llm.mpi_comm()

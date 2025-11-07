@@ -157,29 +157,25 @@ class FusedMoEMethodBase(ABC):
     weight_alignment: int = 1
 
     @classmethod
-    def _online_eplb_not_supported(cls, module):
-        if hasattr(
-                module, "layer_load_balancer"
-        ) and module.layer_load_balancer and module.layer_load_balancer.need_load_shared_weights(
-        ):
-            raise NotImplementedError(
-                f'{cls.__name__} doesn\'t support online EPLB now')
-
-    @classmethod
-    def _online_eplb_not_verified(cls, module):
-        if hasattr(
-                module, "layer_load_balancer"
-        ) and module.layer_load_balancer and module.layer_load_balancer.need_load_shared_weights(
-        ):
-            logger.warning(f'{cls.__name__} online EPLB is not verified yet')
-
-    def need_load_shared_weights(self, module):
+    def need_load_shared_weights(cls, module):
         if hasattr(
                 module, "layer_load_balancer"
         ) and module.layer_load_balancer and module.layer_load_balancer.need_load_shared_weights(
         ):
             return True
-        return False
+        else:
+            return False
+
+    @classmethod
+    def _online_eplb_not_supported(cls, module):
+        if cls.need_load_shared_weights(module):
+            raise NotImplementedError(
+                f'{cls.__name__} doesn\'t support online EPLB now')
+
+    @classmethod
+    def _online_eplb_not_verified(cls, module):
+        if cls.need_load_shared_weights(module):
+            logger.warning(f'{cls.__name__} online EPLB is not verified yet')
 
     def create_weights(
         self,

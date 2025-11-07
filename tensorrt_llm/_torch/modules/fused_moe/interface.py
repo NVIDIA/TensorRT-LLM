@@ -227,7 +227,9 @@ class MoE(nn.Module):
         ]
 
         # Setup load balancer if available
-        if moe_load_balancer and self._supports_load_balancer():
+        if moe_load_balancer:
+            assert self._supports_load_balancer()
+            assert self.use_dp and self.parallel_size > 1, "Load Balancer should be only used with ADP and EP > 1"
             assert moe_load_balancer_config is not None
             top_k = self.routing_method.experts_per_token
             self.expert_size_per_partition = moe_load_balancer_config.num_local_slots
@@ -282,8 +284,7 @@ class MoE(nn.Module):
             self.initial_local_expert_ids) == self.expert_size_per_partition
 
         # Setup AllReduce for dynamic routing if needed
-        if (self.layer_load_balancer
-                and not self.layer_load_balancer.is_static_routing()):
+        if self._using_dynamic_load_balancer():
             from tensorrt_llm.functional import AllReduceStrategy
 
             from ...distributed import AllReduce
@@ -294,7 +295,7 @@ class MoE(nn.Module):
 
     def _add_raw_shared_weights_for_unmap(self,
                                           weight_tensors: List[torch.Tensor]):
-        if self.layer_load_balancer:
+        if self._using_dynamic_load_balancer():
             self.layer_load_balancer._add_raw_host_weight_for_unmap(
                 weight_tensors)
 
@@ -303,6 +304,12 @@ class MoE(nn.Module):
 
         Subclasses can override this to indicate load balancer support.
         """
+        return False
+
+    def _using_dynamic_load_balancer(self) -> bool:
+        """Check if this MoE is using dynamic load balancer."""
+        if self.layer_load_balancer:
+            return self.layer_load_balancer.is_dynamic_routing()
         return False
 
     def _get_load_balancer_aux_stream(self) -> Optional[torch.cuda.Stream]:
@@ -316,12 +323,12 @@ class MoE(nn.Module):
 
     def _load_balancer_start_wait_gpu_stage(self, is_first_call: bool):
         """Start waiting for GPU stage in load balancer."""
-        if self.layer_load_balancer and is_first_call:
+        if self._using_dynamic_load_balancer() and is_first_call:
             self.layer_load_balancer.start_wait_gpu_stage()
 
     def _load_balancer_done_wait_gpu_stage(self, is_first_call: bool):
         """Mark GPU wait stage as done in load balancer."""
-        if self.layer_load_balancer and is_first_call:
+        if self._using_dynamic_load_balancer() and is_first_call:
             self.layer_load_balancer.done_wait_gpu_stage()
 
     def _load_balancer_update_statistic(self,
@@ -338,7 +345,7 @@ class MoE(nn.Module):
             is_last_call: Whether this is the last call for the same weights
             ignore_allreduce: Whether to ignore allreduce, if True, only update local statistics, need call _load_balancer_get_local_statistic_tensor to get the local statistic tensor and then do external allgather and then call _load_balancer_update_statistic_with_gathered_statistic to update the global statistics. MnnvlLatency supports this.
         """
-        if self.layer_load_balancer:
+        if self._using_dynamic_load_balancer():
             if ignore_allreduce:
                 self.layer_load_balancer.update_local_statistic(
                     token_selected_experts,
@@ -362,32 +369,31 @@ class MoE(nn.Module):
 
     def _load_balancer_start_set_cpu_stage(self, is_last_call: bool):
         """Start CPU stage in load balancer."""
-        if self.layer_load_balancer and is_last_call:
+        if self._using_dynamic_load_balancer() and is_last_call:
             self.layer_load_balancer.start_set_cpu_stage()
 
     def _load_balancer_done_set_cpu_stage(self, is_last_call: bool):
         """Mark CPU stage as done in load balancer."""
-        if self.layer_load_balancer and is_last_call:
+        if self._using_dynamic_load_balancer() and is_last_call:
             self.layer_load_balancer.done_set_cpu_stage()
 
     def _load_balancer_get_local_statistic_tensor(self):
         """Get local statistic tensor from load balancer."""
-        if (self.layer_load_balancer
-                and not self.layer_load_balancer.is_static_routing()):
+        if self._using_dynamic_load_balancer():
             return self.layer_load_balancer.get_local_statistic_tensor()
         return None
 
     def _load_balancer_update_statistic_with_gathered_statistic(
             self, gathered_statistic):
         """Update load balancer with gathered statistics."""
-        if self.layer_load_balancer:
+        if self._using_dynamic_load_balancer():
             self.layer_load_balancer.update_statistic_with_gathered_statistic(
                 gathered_statistic)
 
     def register_parameter_weight_slot_fn(self, weight_name: str,
                                           local_slot_id: int):
         """Register parameter weight slot function for load balancer."""
-        if not self.layer_load_balancer:
+        if not self._using_dynamic_load_balancer():
             return
 
         assert hasattr(
@@ -399,7 +405,7 @@ class MoE(nn.Module):
 
     def register_to_fix_weight_fn(self, weight_name: str):
         """Register weight fixing function for load balancer."""
-        if not self.layer_load_balancer:
+        if not self._using_dynamic_load_balancer():
             return
 
         assert hasattr(
@@ -424,7 +430,7 @@ class MoE(nn.Module):
     def register_all_parameter_slot_and_to_fix_weight_fns(
             self, weight_and_tensor_dict: Dict[str, torch.Tensor]):
         """Register all parameter slot and weight fixing functions for load balancer."""
-        if not self.layer_load_balancer:
+        if not self._using_dynamic_load_balancer():
             return
 
         # Register weight functions for each local slot
