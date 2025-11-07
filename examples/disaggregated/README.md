@@ -205,16 +205,16 @@ Additionally, we offer a fully executable script—please refer to [Disaggregate
 
 ## Mixed Precision Context and Generation
 
-In disaggregated serving, the context workers and generation workers have different performance characteristics: context workers are compute-bound while generation workers are memory-bound. Therefore, it may be beneficial to run context workers in higher precision. Running these workers with different precisions also enables the ability to interpolate between performance/compute trade-offs of different quantization levels.
+In disaggregated serving, the context workers and generation workers have different performance characteristics: context workers are compute-bound while generation workers are memory-bound. Therefore, it may be beneficial to run context workers and generation workers in different precisions.
 
 ### Prerequisites
 
-To enable mixed precision serving, you'll need:
+To enable mixed precision serving, you will need:
 1. A quantized checkpoint created with [TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer)
-2. The original unquantized checkpoint
+2. The original unquantized checkpoint (Can also be quantized)
 3. Both checkpoints must use the same KV cache dtype to ensure compatibility during transfer
 
-### Example (BF 16 Gen, FP 8 Ctx)
+### Example (BF 16 Ctx, FP 8 Gen)
 
 A quantized checkpoint can be created using `--kv_cache_qformat none`.
 
