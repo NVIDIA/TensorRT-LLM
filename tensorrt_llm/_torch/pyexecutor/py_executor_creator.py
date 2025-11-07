@@ -351,6 +351,18 @@ def create_py_executor(
     validate_feature_combination(llm_args, model_engine, llm_args.sampler_type)
 
     if llm_args.sm_disagg_config is not None:
+        if llm_args.cache_transceiver_config is not None:
+            raise ValueError(
+                "SM-level disaggregation is not compatible with disaggregated serving."
+            )
+        if llm_args.parallel_config.world_size > 1:
+            raise NotImplementedError(
+                "SM-level disaggregation is not supported with parallelism.")
+        if scheduler_config.capacity_scheduler_policy != CapacitySchedulerPolicy.GUARANTEED_NO_EVICT:
+            raise NotImplementedError(
+                "SM-level disaggregation is only supported with guaranteed no evict scheduler policy."
+            )
+
         with allocation_scope(ExecutorMemoryType.MODEL_ENGINE_CTX,
                               RestoreMode.PINNED):
             ctx_llm_args = copy.copy(llm_args)
@@ -358,23 +370,6 @@ def create_py_executor(
             ctx_model_engine = PyTorchModelEngine(
                 model_path=checkpoint_dir,
                 llm_args=ctx_llm_args,
-                mapping=mapping,
-                attn_runtime_features=attn_runtime_features,
-                dist=dist,
-                spec_config=spec_config,
-                weight_sharing_model=model_engine.model,
-            )
-    else:
-        ctx_model_engine = None
-
-    if llm_args.sm_disagg_config is not None:
-        with allocation_scope(ExecutorMemoryType.MODEL_ENGINE_CTX,
-                              RestoreMode.PINNED):
-            ctx_backend_config = copy.copy(pytorch_backend_config)
-            ctx_backend_config.use_cuda_graph = False
-            ctx_model_engine = PyTorchModelEngine(
-                model_path=checkpoint_dir,
-                llm_args=llm_args,
                 mapping=mapping,
                 attn_runtime_features=attn_runtime_features,
                 dist=dist,
