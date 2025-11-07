@@ -14,6 +14,7 @@ class MetricsCollector:
         from prometheus_client import Counter, Histogram
         self.last_log_time = time.time()
         self.labels = labels
+        self.metric_prefix = "trtllm_"
 
         self.finish_reason_label = {
             MetricsCollector.labelname_finish_reason: "unknown"
@@ -24,12 +25,12 @@ class MetricsCollector:
         }
 
         self.counter_request_success = Counter(
-            name="request_success_total",
+            name=self.metric_prefix + "request_success_total",
             documentation="Count of successfully processed requests.",
             labelnames=self.labels_with_finished_reason.keys())
 
         self.histogram_e2e_time_request = Histogram(
-            name="e2e_request_latency_seconds",
+            name=self.metric_prefix + "e2e_request_latency_seconds",
             documentation="Histogram of end to end request latency in seconds.",
             buckets=[
                 0.3, 0.5, 0.8, 1.0, 1.5, 2.0, 2.5, 5.0, 10.0, 15.0, 20.0, 30.0,
@@ -38,7 +39,7 @@ class MetricsCollector:
             labelnames=self.labels.keys())
 
         self.histogram_time_to_first_token = Histogram(
-            name="time_to_first_token_seconds",
+            name=self.metric_prefix + "time_to_first_token_seconds",
             documentation="Histogram of time to first token in seconds.",
             buckets=[
                 0.001, 0.005, 0.01, 0.02, 0.04, 0.06, 0.08, 0.1, 0.25, 0.5,
@@ -48,7 +49,7 @@ class MetricsCollector:
             labelnames=self.labels.keys())
 
         self.histogram_time_per_output_token = Histogram(
-            name="time_per_output_token_seconds",
+            name=self.metric_prefix + "time_per_output_token_seconds",
             documentation="Histogram of time per output token in seconds.",
             buckets=[
                 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.75,
@@ -57,7 +58,7 @@ class MetricsCollector:
             labelnames=self.labels.keys())
 
         self.histogram_queue_time_request = Histogram(
-            name="request_queue_time_seconds",
+            name=self.metric_prefix + "request_queue_time_seconds",
             documentation=
             "Histogram of time spent in WAITING phase for request.",
             buckets=[
