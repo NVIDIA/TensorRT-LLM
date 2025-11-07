@@ -713,7 +713,7 @@ def _stack_fp8_moe_weights(gm: GraphModule) -> int:
         # Create new node with get_attr for stacked parameters
         with graph.inserting_before(node):
             new_node = graph.call_function(
-                torch.ops.auto_deploy.trtllm_quant_fp8moe_fused,
+                torch.ops.auto_deploy.trtllm_quant_fp8_moe_fused,
                 args=(
                     hidden_states,
                     selected_experts,

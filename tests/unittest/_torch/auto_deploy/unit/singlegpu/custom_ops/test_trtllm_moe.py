@@ -376,7 +376,7 @@ def test_trtllm_fused_fp8moe(
 
     activation_type = _activation_type_from_str(activation_func)
 
-    ad_test_output = torch.ops.auto_deploy.trtllm_quant_fp8moe_fused(
+    ad_test_output = torch.ops.auto_deploy.trtllm_quant_fp8_moe_fused(
         x,  # Note! unquantized input is expected
         selected_experts.to(torch.int),
         routing_weights,
