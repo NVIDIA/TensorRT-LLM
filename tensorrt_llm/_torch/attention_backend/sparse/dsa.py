@@ -574,7 +574,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
 
 @maybe_compile(dynamic=True)
-def _scale(weights, q_scale, s):
+def _scale(weights: torch.Tensor, q_scale: torch.Tensor,
+           s: float) -> torch.Tensor:
     return weights * q_scale.squeeze(-1) * s
 
 

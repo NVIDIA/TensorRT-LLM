@@ -328,6 +328,15 @@ def get_device_uuid(device_idx: int) -> str:
 
 
 def maybe_compile(func=None, **compile_kwargs):
+    """
+    Conditionally compile a function with torch.compile.
+    If is_piecewise_running() is True, the function will be compiled with torch.compile.
+    Args:
+        func: The function to decorate (optional, for direct decoration).
+        **compile_kwargs: Keyword arguments for torch.compile.
+    Returns:
+        The conditionally compiled function..
+    """
 
     def decorator(f):
 
