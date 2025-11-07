@@ -8,7 +8,6 @@ from pydantic import (BaseModel, Field, PositiveFloat, field_validator,
                       model_validator)
 
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.llmapi import (BatchingType, CapacitySchedulerPolicy,
                                  ContextChunkingPolicy, DynamicBatchConfig,
                                  ExtendedRuntimePerfKnobConfig, KvCacheConfig,
@@ -126,7 +125,7 @@ class PerformanceOptions:
 
         return config
 
-    def get_pytorch_perf_config(self) -> PyTorchConfig:
+    def get_pytorch_perf_config(self):
         return self.pytorch_config
 
     def get_autodeploy_perf_config(self) -> Dict:

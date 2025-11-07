@@ -1,4 +1,4 @@
-from copy import deepcopy
+from copy import copy, deepcopy
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
@@ -327,7 +327,8 @@ class PyResult:
 
     @property
     def log_probs(self) -> list[TokenLogprobs] | None:
-        return self._log_probs and self._log_probs.log_probs
+        return self._log_probs and hasattr(
+            self._log_probs, 'log_probs') and self._log_probs.log_probs
 
     @property
     def cum_log_probs(self) -> list[float] | None:
@@ -589,10 +590,21 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         """
         result, is_final = super().create_serialized_result(
             use_fast_logits, mpi_world_rank)
+
+        # Performs a deep copy of py_result._log_probs to eliminate race conditions that may occur between IPC communication and the overriding of newly generated log_probs in streaming mode.
+        if self.streaming and self.py_result.log_probs and self.sampling_config.beam_width <= 1:
+            py_result = copy(self.py_result)
+            py_result._log_probs = deepcopy(self.py_result._log_probs)
+
+            for log_prob in self.py_result.log_probs:
+                log_prob.clear()
+        else:
+            py_result = self.py_result
+
         return LlmResponse(
             request_id=self.py_request_id
             if self.is_child else self.parent_request_id,
-            result=LlmResult(result, self.py_result, is_final),
+            result=LlmResult(result, py_result, is_final),
             client_id=self.py_client_id) if len(result) > 0 else None
 
     @property

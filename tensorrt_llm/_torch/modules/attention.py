@@ -751,7 +751,7 @@ class MLA(nn.Module):
             self.register_to_config = True
 
         # only support one kind of sparse attention, dsa now.
-        if config.sparse_attention_config is not None:
+        if config is not None and config.sparse_attention_config is not None:
             self.is_dsa = True
         else:
             self.is_dsa = False
