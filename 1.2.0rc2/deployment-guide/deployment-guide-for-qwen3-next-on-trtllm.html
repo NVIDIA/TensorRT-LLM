@@ -1,0 +1,941 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware &#8212; TensorRT LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=65e89d2a"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../_static/togglebutton.js?v=4a39c7ea"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'deployment-guide/deployment-guide-for-qwen3-next-on-trtllm';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc2';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <link rel="icon" href="../_static/favicon.png"/>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="Supported Models" href="../models/supported-models.html" />
+    <link rel="prev" title="Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware" href="deployment-guide-for-gpt-oss-on-trtllm.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="1.2.0rc2" />
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../installation/containers.html">Pre-built release container images on NGC</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_sparse_attention.html">Sparse Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client.html">Genai Perf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
+<li class="toctree-l1 current active has-children"><a class="reference internal" href="index.html">Model Recipes</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2 current active"><a class="current reference internal" href="#">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../models/supported-models.html">Supported Models</a></li>
+
+<li class="toctree-l1"><a class="reference internal" href="../models/adding-new-model.html">Adding a New Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-bench.html">trtllm-bench</a></li>
+
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-eval.html">trtllm-eval</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">LLM API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/long-sequence.html">Long Sequences</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/overlap-scheduler.html">Overlap Scheduler</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-analysis.html">Performance Analysis</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog5_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog6_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog7_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog8_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog9_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.html">How to get best performance on DeepSeek-R1 in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Quick Links</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">Releases</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../legacy/tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    
+    <li class="breadcrumb-item"><a href="index.html" class="nav-link">Model Recipes</a></li>
+    
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section class="tex2jax_ignore mathjax_ignore" id="deployment-guide-for-qwen3-next-on-tensorrt-llm-blackwell-hopper-hardware">
+<h1>Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware<a class="headerlink" href="#deployment-guide-for-qwen3-next-on-tensorrt-llm-blackwell-hopper-hardware" title="Link to this heading">#</a></h1>
+<section id="introduction">
+<h2>Introduction<a class="headerlink" href="#introduction" title="Link to this heading">#</a></h2>
+<p>This is a functional quick-start guide for running the Qwen3-Next model on TensorRT LLM. It focuses on a working setup with recommended defaults. Additional performance optimizations and support will be rolled out in future updates.</p>
+</section>
+<section id="prerequisites">
+<h2>Prerequisites<a class="headerlink" href="#prerequisites" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p>GPU: NVIDIA Blackwell or Hopper Architecture</p></li>
+<li><p>OS: Linux</p></li>
+<li><p>Drivers: CUDA Driver 575 or Later</p></li>
+<li><p>Docker with NVIDIA Container Toolkit installed</p></li>
+<li><p>Python3 and python3-pip (Optional, for accuracy evaluation only)</p></li>
+</ul>
+</section>
+<section id="models">
+<h2>Models<a class="headerlink" href="#models" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p>BF16 model: <a class="reference external" href="https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Thinking">Qwen3-Next-80B-A3B-Thinking</a></p></li>
+</ul>
+</section>
+<section id="deployment-steps">
+<h2>Deployment Steps<a class="headerlink" href="#deployment-steps" title="Link to this heading">#</a></h2>
+<section id="run-docker-container">
+<h3>Run Docker Container<a class="headerlink" href="#run-docker-container" title="Link to this heading">#</a></h3>
+<p>Build and run the docker container. See the <span class="xref myst">Docker guide</span> for details.</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">cd</span> <span class="n">TensorRT</span><span class="o">-</span><span class="n">LLM</span>
+
+<span class="n">make</span> <span class="o">-</span><span class="n">C</span> <span class="n">docker</span> <span class="n">release_build</span> <span class="n">IMAGE_TAG</span><span class="o">=</span><span class="n">qwen3</span><span class="o">-</span><span class="nb">next</span><span class="o">-</span><span class="n">local</span>
+
+<span class="n">make</span> <span class="o">-</span><span class="n">C</span> <span class="n">docker</span> <span class="n">release_run</span> <span class="n">IMAGE_NAME</span><span class="o">=</span><span class="n">tensorrt_llm</span> <span class="n">IMAGE_TAG</span><span class="o">=</span><span class="n">qwen3</span><span class="o">-</span><span class="nb">next</span><span class="o">-</span><span class="n">local</span> <span class="n">LOCAL_USER</span><span class="o">=</span><span class="mi">1</span>
+</pre></div>
+</div>
+</section>
+<section id="recommended-performance-settings">
+<h3>Recommended Performance Settings<a class="headerlink" href="#recommended-performance-settings" title="Link to this heading">#</a></h3>
+<p>We maintain YAML configuration files with recommended performance settings in the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/configs"><code class="docutils literal notranslate"><span class="pre">examples/configs</span></code></a> directory. These config files are present in the TensorRT LLM container at the path <code class="docutils literal notranslate"><span class="pre">/app/tensorrt_llm/examples/configs</span></code>. You can use these out-of-the-box, or adjust them to your specific use case.</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nv">TRTLLM_DIR</span><span class="o">=</span>/app/tensorrt_llm<span class="w"> </span><span class="c1"># change as needed to match your environment</span>
+<span class="nv">EXTRA_LLM_API_FILE</span><span class="o">=</span><span class="si">${</span><span class="nv">TRTLLM_DIR</span><span class="si">}</span>/examples/configs/qwen3-next.yaml
+</pre></div>
+</div>
+<p>Note: if you don’t have access to the source code locally, you can manually create the YAML config file using the code in the dropdown below.</p>
+<div class="dropdown admonition">
+<p class="admonition-title">Show code</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nv">EXTRA_LLM_API_FILE</span><span class="o">=</span>/tmp/config.yml
+
+cat<span class="w"> </span><span class="s">&lt;&lt; EOF &gt; ${EXTRA_LLM_API_FILE}</span>
+
+<span class="s">max_batch_size: 16</span>
+<span class="s">max_num_tokens: 4096</span>
+<span class="s">tensor_parallel_size: 4</span>
+<span class="s">moe_expert_parallel_size: 4</span>
+<span class="s">trust_remote_code: true</span>
+<span class="s">enable_attention_dp: false</span>
+<span class="s">cuda_graph_config:</span>
+<span class="s">  enable_padding: true</span>
+<span class="s">  max_batch_size: 720</span>
+<span class="s">moe_config:</span>
+<span class="s">    backend: TRTLLM</span>
+<span class="s">stream_interval: 20</span>
+<span class="s">num_postprocess_workers: 4</span>
+<span class="s">kv_cache_config:</span>
+<span class="s">  enable_block_reuse: false</span>
+<span class="s">  free_gpu_memory_fraction: 0.6</span>
+<span class="s">EOF</span>
+</pre></div>
+</div>
+</div>
+</section>
+<section id="launch-the-tensorrt-llm-server">
+<h3>Launch the TensorRT LLM Server<a class="headerlink" href="#launch-the-tensorrt-llm-server" title="Link to this heading">#</a></h3>
+<p>Below is an example command to launch the TensorRT LLM server with the Qwen3-Next model from within the container.</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span>Qwen/Qwen3-Next-80B-A3B-Thinking<span class="w"> </span>--host<span class="w"> </span><span class="m">0</span>.0.0.0<span class="w"> </span>--port<span class="w"> </span><span class="m">8000</span><span class="w"> </span>--extra_llm_api_options<span class="w"> </span><span class="si">${</span><span class="nv">EXTRA_LLM_API_FILE</span><span class="si">}</span>
+</pre></div>
+</div>
+<p>After the server is set up, the client can now send prompt requests to the server and receive results.</p>
+</section>
+<section id="llm-api-options-yaml-configuration">
+<h3>LLM API Options (YAML Configuration)<a class="headerlink" href="#llm-api-options-yaml-configuration" title="Link to this heading">#</a></h3>
+<!-- TODO: this section is duplicated across the deployment guides; they should be consolidated to a central file and imported as needed, or we can remove this and link to LLM API reference -->
+<p>These options provide control over TensorRT LLM’s behavior and are set within the YAML file passed to the <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> command via the <code class="docutils literal notranslate"><span class="pre">--extra_llm_api_options</span></code> argument.</p>
+<section id="tensor-parallel-size">
+<h4><code class="docutils literal notranslate"><span class="pre">tensor_parallel_size</span></code><a class="headerlink" href="#tensor-parallel-size" title="Link to this heading">#</a></h4>
+<ul class="simple">
+<li><p><strong>Description:</strong> Sets the <strong>tensor-parallel size</strong>. This should typically match the number of GPUs you intend to use for a single model instance.</p></li>
+</ul>
+</section>
+<section id="moe-expert-parallel-size">
+<h4><code class="docutils literal notranslate"><span class="pre">moe_expert_parallel_size</span></code><a class="headerlink" href="#moe-expert-parallel-size" title="Link to this heading">#</a></h4>
+<ul class="simple">
+<li><p><strong>Description:</strong> Sets the <strong>expert-parallel size</strong> for Mixture-of-Experts (MoE) models. Like <code class="docutils literal notranslate"><span class="pre">tensor_parallel_size</span></code>, this should generally match the number of GPUs you’re using. This setting has no effect on non-MoE models.</p></li>
+</ul>
+</section>
+<section id="kv-cache-config-free-gpu-memory-fraction">
+<h4><code class="docutils literal notranslate"><span class="pre">kv_cache_config.free_gpu_memory_fraction</span></code><a class="headerlink" href="#kv-cache-config-free-gpu-memory-fraction" title="Link to this heading">#</a></h4>
+<ul class="simple">
+<li><p><strong>Description:</strong> A value between <code class="docutils literal notranslate"><span class="pre">0.0</span></code> and <code class="docutils literal notranslate"><span class="pre">1.0</span></code> that specifies the fraction of free GPU memory to reserve for the KV cache after the model is loaded. Since memory usage can fluctuate, this buffer helps prevent out-of-memory (OOM) errors.</p></li>
+<li><p><strong>Recommendation:</strong> If you experience OOM errors, try reducing this value to <code class="docutils literal notranslate"><span class="pre">0.7</span></code> or lower.</p></li>
+</ul>
+</section>
+<section id="max-batch-size">
+<h4><code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code><a class="headerlink" href="#max-batch-size" title="Link to this heading">#</a></h4>
+<ul class="simple">
+<li><p><strong>Description:</strong> The maximum number of user requests that can be grouped into a single batch for processing. The actual max batch size that can be achieved depends on total sequence length (input + output).</p></li>
+</ul>
+</section>
+<section id="max-num-tokens">
+<h4><code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code><a class="headerlink" href="#max-num-tokens" title="Link to this heading">#</a></h4>
+<ul class="simple">
+<li><p><strong>Description:</strong> The maximum total number of tokens (across all requests) allowed inside a single scheduled batch.</p></li>
+</ul>
+</section>
+<section id="max-seq-len">
+<h4><code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code><a class="headerlink" href="#max-seq-len" title="Link to this heading">#</a></h4>
+<ul class="simple">
+<li><p><strong>Description:</strong> The maximum possible sequence length for a single request, including both input and generated output tokens. We won’t specifically set it. It will be inferred from model config.</p></li>
+</ul>
+</section>
+<section id="trust-remote-code">
+<h4><code class="docutils literal notranslate"><span class="pre">trust_remote_code</span></code><a class="headerlink" href="#trust-remote-code" title="Link to this heading">#</a></h4>
+<ul class="simple">
+<li><p><strong>Description:</strong> Allows TensorRT LLM to download models and tokenizers from Hugging Face. This flag is passed directly to the Hugging Face API.</p></li>
+</ul>
+</section>
+<section id="cuda-graph-config">
+<h4><code class="docutils literal notranslate"><span class="pre">cuda_graph_config</span></code><a class="headerlink" href="#cuda-graph-config" title="Link to this heading">#</a></h4>
+<ul>
+<li><p><strong>Description</strong>: A section for configuring CUDA graphs to optimize performance.</p></li>
+<li><p><strong>Options</strong>:</p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">enable_padding</span></code>: If <code class="docutils literal notranslate"><span class="pre">&quot;true&quot;</span></code>, input batches are padded to the nearest <code class="docutils literal notranslate"><span class="pre">cuda_graph_batch_size</span></code>. This can significantly improve performance.</p>
+<p><strong>Default</strong>: <code class="docutils literal notranslate"><span class="pre">false</span></code></p>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>: Sets the maximum batch size for which a CUDA graph will be created.</p>
+<p><strong>Default</strong>: <code class="docutils literal notranslate"><span class="pre">0</span></code></p>
+<p><strong>Recommendation</strong>: Set this to the same value as the <code class="docutils literal notranslate"><span class="pre">--max_batch_size</span></code> command-line option.</p>
+</li>
+</ul>
+</li>
+</ul>
+</section>
+<section id="moe-config">
+<h4><code class="docutils literal notranslate"><span class="pre">moe_config</span></code><a class="headerlink" href="#moe-config" title="Link to this heading">#</a></h4>
+<ul class="simple">
+<li><p><strong>Description</strong>: Configuration for Mixture-of-Experts (MoE) models.</p></li>
+<li><p><strong>Options</strong>:</p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">backend</span></code>: The backend to use for MoE operations.
+<strong>Default</strong>: <code class="docutils literal notranslate"><span class="pre">CUTLASS</span></code></p></li>
+</ul>
+</li>
+</ul>
+<p>See the <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs"><code class="docutils literal notranslate"><span class="pre">TorchLlmArgs</span></code> class</a> for the full list of options which can be used in the <code class="docutils literal notranslate"><span class="pre">extra_llm_api_options</span></code>.</p>
+</section>
+</section>
+</section>
+<section id="testing-api-endpoint">
+<h2>Testing API Endpoint<a class="headerlink" href="#testing-api-endpoint" title="Link to this heading">#</a></h2>
+<section id="basic-test">
+<h3>Basic Test<a class="headerlink" href="#basic-test" title="Link to this heading">#</a></h3>
+<p>Start a new terminal on the host to test the TensorRT LLM server you just launched.</p>
+<p>You can query the health/readiness of the server using:</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>-s<span class="w"> </span>-o<span class="w"> </span>/dev/null<span class="w"> </span>-w<span class="w"> </span><span class="s2">&quot;Status: %{http_code}\n&quot;</span><span class="w"> </span><span class="s2">&quot;http://localhost:8000/health&quot;</span>
+</pre></div>
+</div>
+<p>When the <code class="docutils literal notranslate"><span class="pre">Status:</span> <span class="pre">200</span></code> code is returned, the server is ready for queries. Note that the very first query may take longer due to initialization and compilation.</p>
+<p>After the TensorRT LLM server is set up and shows Application startup complete, you can send requests to the server.</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>http://localhost:8000/v1/chat/completions<span class="w"> </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;model&quot;: &quot;Qwen/Qwen3-Next-80B-A3B-Thinking&quot;,</span>
+<span class="s1">    &quot;messages&quot;: [</span>
+<span class="s1">        {</span>
+<span class="s1">            &quot;role&quot;: &quot;user&quot;,</span>
+<span class="s1">            &quot;content&quot;: &quot;Where is New York?&quot;</span>
+<span class="s1">        }</span>
+<span class="s1">    ],</span>
+<span class="s1">    &quot;max_tokens&quot;: 1024,</span>
+<span class="s1">    &quot;top_p&quot;: 1.0</span>
+<span class="s1">}&#39;</span><span class="w"> </span>-w<span class="w"> </span><span class="s2">&quot;\n&quot;</span>
+</pre></div>
+</div>
+<p>Here is an example response:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="p">{</span><span class="s2">&quot;id&quot;</span><span class="p">:</span><span class="s2">&quot;chatcmpl-64ac201c77bf46a7a3a4eca7759b1fd8&quot;</span><span class="p">,</span><span class="s2">&quot;object&quot;</span><span class="p">:</span><span class="s2">&quot;chat.completion&quot;</span><span class="p">,</span><span class="s2">&quot;created&quot;</span><span class="p">:</span><span class="mi">1759022940</span><span class="p">,</span><span class="s2">&quot;model&quot;</span><span class="p">:</span><span class="s2">&quot;Qwen/Qwen3-Next-80B-A3B-Thinking&quot;</span><span class="p">,</span><span class="s2">&quot;choices&quot;</span><span class="p">:[{</span><span class="s2">&quot;index&quot;</span><span class="p">:</span><span class="mi">0</span><span class="p">,</span><span class="s2">&quot;message&quot;</span><span class="p">:{</span><span class="s2">&quot;role&quot;</span><span class="p">:</span><span class="s2">&quot;assistant&quot;</span><span class="p">,</span><span class="s2">&quot;content&quot;</span><span class="p">:</span><span class="s2">&quot;Okay, the user is asking </span><span class="se">\&quot;</span><span class="s2">Where is New York?</span><span class="se">\&quot;</span><span class="s2"> Hmm, this seems straightforward but I need to be careful. New York could mean different things—maybe they&#39;re confused about the city versus the state. </span><span class="se">\n\n</span><span class="s2">First thought: Are they a tourist planning a trip? Or maybe a student doing homework? Could even be someone国外 who&#39;s only heard </span><span class="se">\&quot;</span><span class="s2">New York</span><span class="se">\&quot;</span><span class="s2"> in movies and isn&#39;t sure if it&#39;s a city or state. </span><span class="se">\n\n</span><span class="s2">I should clarify both possibilities immediately. People often mix them up. Like, if someone says </span><span class="se">\&quot;</span><span class="s2">I&#39;m going to New York</span><span class="se">\&quot;</span><span class="s2"> they&#39;re probably talking about NYC, but technically New York State is bigger. </span><span class="se">\n\n</span><span class="s2">Let me break it down: </span><span class="se">\n</span><span class="s2">- New York City (NYC) is the famous one—Manhattan, skyscrapers, Times Square. </span><span class="se">\n</span><span class="s2">- Then New York State (NY) is the whole state, which includes NYC but also upstate areas like Albany (the capital), Buffalo, and even the Adirondacks. </span><span class="se">\n\n</span><span class="s2">Wait, should I mention that NYC is in New York State? Yeah, that&#39;s crucial. Otherwise they might think it&#39;s two separate things. Also, where is the state located? Northeast US, borders other states like Pennsylvania, New Jersey... maybe name a few neighbors for context. </span><span class="se">\n\n</span><span class="s2">Oh! And the city vs state confusion is super common. Like, people say </span><span class="se">\&quot;</span><span class="s2">New York</span><span class="se">\&quot;</span><span class="s2"> for the city but forget it&#39;s part of a larger state. Should I give examples? </span><span class="se">\n</span><span class="s2">- </span><span class="se">\&quot;</span><span class="s2">If someone says &#39;hot dogs in New York&#39; they mean NYC</span><span class="se">\&quot;</span><span class="s2"> </span><span class="se">\n</span><span class="s2">- But </span><span class="se">\&quot;</span><span class="s2">the New York State Police</span><span class="se">\&quot;</span><span class="s2"> covers the whole state</span><span class="se">\&quot;</span><span class="s2"> </span><span class="se">\n\n</span><span class="s2">...Maybe add a fun fact? Like how NYC is just one city within the state? Or that the state capital isn&#39;t NYC but Albany? Yeah, that&#39;ll help clear confusion. </span><span class="se">\n\n</span><span class="s2">Also—should I ask if they meant the city or the state? Nah, better to cover both upfront. Keep it simple but precise. No jargon. They might not know terms like </span><span class="se">\&quot;</span><span class="s2">metropolitan area</span><span class="se">\&quot;</span><span class="s2"> or </span><span class="se">\&quot;</span><span class="s2">boroughs,</span><span class="se">\&quot;</span><span class="s2"> so explain </span><span class="se">\&quot;</span><span class="s2">boroughs</span><span class="se">\&quot;</span><span class="s2"> as neighborhoods (Manhattan, Brooklyn etc.). </span><span class="se">\n\n</span><span class="s2">Coordinates: 40.7°N, 74°W? Maybe overkill unless they&#39;re into geography. But for the state, roughly 42°N to 45°N latitude? Hmm, probably unnecessary. Stick to landmarks: borders Lake Erie, Atlantic coast... </span><span class="se">\n\n</span><span class="s2">Wait—user might be asking literally for GPS coordinates? Unlikely, but just in case I can add: </span><span class="se">\&quot;</span><span class="s2">Geographically, New York City is at approximately 40.7°N latitude and 74.0°W longitude...</span><span class="se">\&quot;</span><span class="s2"> but only if the answer feels too dry otherwise. </span><span class="se">\n\n</span><span class="s2">Priority: Clear, simple, correct. No assuming prior knowledge. Say </span><span class="se">\&quot;</span><span class="s2">New York can refer to...</span><span class="se">\&quot;</span><span class="s2"> then split into two cases. End with </span><span class="se">\&quot;</span><span class="s2">Most people mean the city when they say &#39;New York&#39; in casual talk.</span><span class="se">\&quot;</span><span class="s2"> That’s the key takeaway. </span><span class="se">\n\n</span><span class="s2">...Double-check: Is Albany really the capital? Yes. And NYC is the largest city but not capital. Got it. Also, New York State is the 27th largest by area? Maybe not relevant. Stick to basics. </span><span class="se">\n\n</span><span class="s2">Final structure: </span><span class="se">\n</span><span class="s2">1. </span><span class="se">\&quot;</span><span class="s2">New York can mean two things: the city or the state.</span><span class="se">\&quot;</span><span class="s2"> </span><span class="se">\n</span><span class="s2">2. For city: </span><span class="se">\n</span><span class="s2">   - Where it is (Northeast US) </span><span class="se">\n</span><span class="s2">   - Inside New York State </span><span class="se">\n</span><span class="s2">   - Famous parts (Manhattan etc.) </span><span class="se">\n</span><span class="s2">3. For state: </span><span class="se">\n</span><span class="s2">   - Larger area, includes city </span><span class="se">\n</span><span class="s2">   - Borders (PA, NJ, CT, MA, VT, Canada) </span><span class="se">\n</span><span class="s2">   - Capital is Albany (not NYC!) </span><span class="se">\n</span><span class="s2">4. Clear summary: </span><span class="se">\&quot;</span><span class="s2">In everyday talk, &#39;New York&#39; usually means NYC.</span><span class="se">\&quot;</span><span class="s2"> </span><span class="se">\n\n</span><span class="s2">Yeah. That covers it without overwhelming them. No markdown, just plain English. Keep it warm—add a </span><span class="se">\&quot;</span><span class="s2">hope that helps!</span><span class="se">\&quot;</span><span class="s2"> at the end.</span><span class="se">\n</span><span class="s2">&lt;/think&gt;</span><span class="se">\n\n</span><span class="s2">That&#39;s a common point of confusion! **</span><span class="se">\&quot;</span><span class="s2">New York</span><span class="se">\&quot;</span><span class="s2"> can refer to two different things**, and it&#39;s important to distinguish between them:</span><span class="se">\n\n</span><span class="s2">### 1. **New York City (NYC)**  </span><span class="se">\n</span><span class="s2">   - **What it is**: The largest and most famous city in the United States, known for landmarks like Times Square, Central Park, the Statue of Liberty, and Wall Street.  </span><span class="se">\n</span><span class="s2">   - **Where it is**:  </span><span class="se">\n</span><span class="s2">     - Located in the **northeastern United States**.  </span><span class="se">\n</span><span class="s2">     - Situated at the mouth of the **Hudson River**, where it meets the **Atlantic Ocean**.  </span><span class="se">\n</span><span class="s2">     - Part of **New York State** (see below).  </span><span class="se">\n</span><span class="s2">   - **Geographic details**:  </span><span class="se">\n</span><span class="s2">     - Coordinates: Approximately **40.7° N latitude, 74.0° W longitude**.  </span><span class="se">\n</span><span class="s2">     - Composed of **5 boroughs**: Manhattan (the </span><span class="se">\&quot;</span><span class="s2">city</span><span class="se">\&quot;</span><span class="s2"> most people picture), Brooklyn, Queens, The Bronx, and Staten Island.  </span><span class="se">\n</span><span class="s2">     - Panoramic view of NYC (including Brooklyn and New Jersey skyline):&quot;</span><span class="p">,</span><span class="s2">&quot;reasoning_content&quot;</span><span class="p">:</span><span class="n">null</span><span class="p">,</span><span class="s2">&quot;reasoning&quot;</span><span class="p">:</span><span class="n">null</span><span class="p">,</span><span class="s2">&quot;tool_calls&quot;</span><span class="p">:[]},</span><span class="s2">&quot;logprobs&quot;</span><span class="p">:</span><span class="n">null</span><span class="p">,</span><span class="s2">&quot;finish_reason&quot;</span><span class="p">:</span><span class="s2">&quot;length&quot;</span><span class="p">,</span><span class="s2">&quot;stop_reason&quot;</span><span class="p">:</span><span class="n">null</span><span class="p">,</span><span class="s2">&quot;mm_embedding_handle&quot;</span><span class="p">:</span><span class="n">null</span><span class="p">,</span><span class="s2">&quot;disaggregated_params&quot;</span><span class="p">:</span><span class="n">null</span><span class="p">,</span><span class="s2">&quot;avg_decoded_tokens_per_iter&quot;</span><span class="p">:</span><span class="mf">1.0</span><span class="p">}],</span><span class="s2">&quot;usage&quot;</span><span class="p">:{</span><span class="s2">&quot;prompt_tokens&quot;</span><span class="p">:</span><span class="mi">15</span><span class="p">,</span><span class="s2">&quot;total_tokens&quot;</span><span class="p">:</span><span class="mi">1039</span><span class="p">,</span><span class="s2">&quot;completion_tokens&quot;</span><span class="p">:</span><span class="mi">1024</span><span class="p">},</span><span class="s2">&quot;prompt_token_ids&quot;</span><span class="p">:</span><span class="n">null</span><span class="p">}</span>
+</pre></div>
+</div>
+</section>
+<section id="troubleshooting-tips">
+<h3>Troubleshooting Tips<a class="headerlink" href="#troubleshooting-tips" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p>If you encounter CUDA out-of-memory errors, try reducing <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> or <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code>.</p></li>
+<li><p>Ensure your model checkpoints are compatible with the expected format.</p></li>
+<li><p>For performance issues, check GPU utilization with nvidia-smi while the server is running.</p></li>
+<li><p>If the container fails to start, verify that the NVIDIA Container Toolkit is properly installed.</p></li>
+<li><p>For connection issues, make sure the server port (<code class="docutils literal notranslate"><span class="pre">8000</span></code> in this guide) is not being used by another application.</p></li>
+</ul>
+</section>
+</section>
+<section id="benchmarking-performance">
+<h2>Benchmarking Performance<a class="headerlink" href="#benchmarking-performance" title="Link to this heading">#</a></h2>
+<p>To benchmark the performance of your TensorRT LLM server you can leverage the built-in <code class="docutils literal notranslate"><span class="pre">benchmark_serving.py</span></code> script. To do this first creating a wrapper <code class="docutils literal notranslate"><span class="pre">bench.sh</span></code> script.</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>cat<span class="w"> </span><span class="s">&lt;&lt;&#39;EOF&#39; &gt; bench.sh</span>
+<span class="s">#!/usr/bin/env bash</span>
+<span class="s">set -euo pipefail</span>
+
+<span class="s">concurrency_list=&quot;1 2 4 8 16 32 64 128 256&quot;</span>
+<span class="s">multi_round=5</span>
+<span class="s">isl=1024</span>
+<span class="s">osl=1024</span>
+<span class="s">result_dir=/tmp/qwen3_output</span>
+
+<span class="s">for concurrency in ${concurrency_list}; do</span>
+<span class="s">    num_prompts=$((concurrency * multi_round))</span>
+<span class="s">    python -m tensorrt_llm.serve.scripts.benchmark_serving \</span>
+<span class="s">        --model Qwen/Qwen3-Next-80B-A3B-Thinking \</span>
+<span class="s">        --backend openai \</span>
+<span class="s">        --dataset-name &quot;random&quot; \</span>
+<span class="s">        --random-input-len ${isl} \</span>
+<span class="s">        --random-output-len ${osl} \</span>
+<span class="s">        --random-prefix-len 0 \</span>
+<span class="s">        --random-ids \</span>
+<span class="s">        --num-prompts ${num_prompts} \</span>
+<span class="s">        --max-concurrency ${concurrency} \</span>
+<span class="s">        --ignore-eos \</span>
+<span class="s">        --tokenize-on-client \</span>
+<span class="s">        --percentile-metrics &quot;ttft,tpot,itl,e2el&quot;</span>
+<span class="s">done</span>
+<span class="s">EOF</span>
+chmod<span class="w"> </span>+x<span class="w"> </span>bench.sh
+</pre></div>
+</div>
+<p>To achieve max through-put, with attention DP on, one needs to sweep up to <code class="docutils literal notranslate"><span class="pre">concurrency</span> <span class="pre">=</span> <span class="pre">max_batch_size</span> <span class="pre">*</span> <span class="pre">num_gpus</span></code>.</p>
+<p>If you want to save the results to a file add the following options.</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>--save-result<span class="w"> </span><span class="se">\</span>
+--result-dir<span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">result_dir</span><span class="si">}</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+--result-filename<span class="w"> </span><span class="s2">&quot;concurrency_</span><span class="si">${</span><span class="nv">concurrency</span><span class="si">}</span><span class="s2">.json&quot;</span>
+</pre></div>
+</div>
+<p>For more benchmarking options see <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/serve/scripts/benchmark_serving.py">benchmark_serving.py</a></p>
+<p>Run <code class="docutils literal notranslate"><span class="pre">bench.sh</span></code> to begin a serving benchmark. This will take a long time if you run all the concurrencies mentioned in the above <code class="docutils literal notranslate"><span class="pre">bench.sh</span></code> script.</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>./bench.sh
+</pre></div>
+</div>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="deployment-guide-for-gpt-oss-on-trtllm.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="../models/supported-models.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Supported Models</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#introduction">Introduction</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prerequisites">Prerequisites</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#models">Models</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#deployment-steps">Deployment Steps</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#run-docker-container">Run Docker Container</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#recommended-performance-settings">Recommended Performance Settings</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#launch-the-tensorrt-llm-server">Launch the TensorRT LLM Server</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#llm-api-options-yaml-configuration">LLM API Options (YAML Configuration)</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#tensor-parallel-size"><code class="docutils literal notranslate"><span class="pre">tensor_parallel_size</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#moe-expert-parallel-size"><code class="docutils literal notranslate"><span class="pre">moe_expert_parallel_size</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#kv-cache-config-free-gpu-memory-fraction"><code class="docutils literal notranslate"><span class="pre">kv_cache_config.free_gpu_memory_fraction</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#max-batch-size"><code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#max-num-tokens"><code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#max-seq-len"><code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#trust-remote-code"><code class="docutils literal notranslate"><span class="pre">trust_remote_code</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#cuda-graph-config"><code class="docutils literal notranslate"><span class="pre">cuda_graph_config</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#moe-config"><code class="docutils literal notranslate"><span class="pre">moe_config</span></code></a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#testing-api-endpoint">Testing API Endpoint</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#basic-test">Basic Test</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#troubleshooting-tips">Troubleshooting Tips</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#benchmarking-performance">Benchmarking Performance</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on November 05, 2025.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/3111682">3111682</a>.</p>
+  
+</div></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

@@ -1,0 +1,912 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary) &#8212; TensorRT LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../_static/copybutton.js?v=65e89d2a"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../../_static/togglebutton.js?v=4a39c7ea"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc2';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <link rel="icon" href="../../_static/favicon.png"/>
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs" href="blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html" />
+    <link rel="prev" title="Inference Time Compute Implementation in TensorRT LLM" href="blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="1.2.0rc2" />
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/containers.html">Pre-built release container images on NGC</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sparse_attention.html">Sparse Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/genai_perf_client.html">Genai Perf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../models/supported-models.html">Supported Models</a></li>
+
+<li class="toctree-l1"><a class="reference internal" href="../../models/adding-new-model.html">Adding a New Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-bench.html">trtllm-bench</a></li>
+
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-eval.html">trtllm-eval</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/index.html">LLM API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/overlap-scheduler.html">Overlap Scheduler</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/speculative-decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-analysis.html">Performance Analysis</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/api-change.html">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog5_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog6_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog7_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog8_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog9_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.html">How to get best performance on DeepSeek-R1 in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Quick Links</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">Releases</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../legacy/tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section class="tex2jax_ignore mathjax_ignore" id="scaling-expert-parallelism-in-tensorrt-llm-part-3-pushing-the-performance-boundary">
+<h1>Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)<a class="headerlink" href="#scaling-expert-parallelism-in-tensorrt-llm-part-3-pushing-the-performance-boundary" title="Link to this heading">#</a></h1>
+<p>This blog post is a continuation of previous posts:</p>
+<ul class="simple">
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog8_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.md">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></p></li>
+</ul>
+<p>In this blog post, we focus on performance optimization, diving deeper into techniques such as lower precision, network structure refactoring, and aggressive kernel fusion. We hope this analysis and optimization process brings new inspiration to your model inference optimization work.</p>
+<p><em>By NVIDIA TensorRT LLM Team</em></p>
+<section id="table-of-contents">
+<h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><a class="reference internal" href="#scaling-expert-parallelism-in-tensorrt-llm-part-3-pushing-the-performance-boundary">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></p>
+<ul>
+<li><p><a class="reference internal" href="#table-of-contents">Table of Contents</a></p></li>
+<li><p><a class="reference internal" href="#overview">Overview</a></p></li>
+<li><p><a class="reference internal" href="#lower-precision">Lower precision</a></p>
+<ul>
+<li><p><a class="reference internal" href="#wo-gemm-fp4-quantization">wo GEMM FP4 quantization</a></p></li>
+<li><p><a class="reference internal" href="#low-precision-alltoall">Low precision <code class="docutils literal notranslate"><span class="pre">AlltoAll</span></code></a></p></li>
+<li><p><a class="reference internal" href="#fp8-context-fmha-support">FP8 context FMHA support</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#rethink-network-structure">Rethink network structure</a></p>
+<ul>
+<li><p><a class="reference internal" href="#mtp-lm-head-tensor-parallelism">MTP LM head tensor parallelism</a></p></li>
+<li><p><a class="reference internal" href="#context-phase-q-k-v-concat-optimization">Context phase Q/K/V <code class="docutils literal notranslate"><span class="pre">concat</span></code> optimization</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#more-kernel-overlap-fusion-and-optimization">More kernel overlap, fusion and optimization</a></p>
+<ul>
+<li><p><a class="reference internal" href="#overlap-kernels-using-programmatic-dependent-launch-pdl">Overlap kernels using programmatic dependent launch (PDL)</a></p></li>
+<li><p><a class="reference internal" href="#fuse-several-alltoall-kernels">Fuse several <code class="docutils literal notranslate"><span class="pre">AlltoAll</span></code> kernels</a></p></li>
+<li><p><a class="reference internal" href="#fuse-add-sparse-exp-and-shared-exp-into-local-reduction">Fuse <code class="docutils literal notranslate"><span class="pre">add</span></code> (sparse exp and shared exp) into local reduction</a></p></li>
+<li><p><a class="reference internal" href="#optimize-pytorch-native-copy-and-concat-using-torch-compile">Optimize PyTorch native <code class="docutils literal notranslate"><span class="pre">copy</span></code> and <code class="docutils literal notranslate"><span class="pre">concat</span></code> using <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code></a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#end-to-end-performance">End-to-End Performance</a></p></li>
+<li><p><a class="reference internal" href="#acknowledgements">Acknowledgements</a></p></li>
+</ul>
+</li>
+</ul>
+</section>
+<section id="overview">
+<h2>Overview<a class="headerlink" href="#overview" title="Link to this heading">#</a></h2>
+<p>Let’s firstly take a look at how the network structure looks like before we did the optimizations, to give an overall review on how the workloads look like:</p>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog14_overview_before_opt.png" width="600">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 1: Network structure overview before optimization</em></sub></p>
+<p>In this third blog of our scaling Expert Parallelism (EP) series, we push the performance boundaries of large-scale EP on NVIDIA GB200 NVL72 through multiple optimization techniques. Building upon the foundation established in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md">part 1</a> and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog8_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.md">part 2</a>, this blog explores three key optimization pillars: <strong>lower precision computation</strong> (including FP4 quantization for wo GEMM, low-precision AlltoAll communication, and FP8 context FMHA), <strong>network structure rethinking</strong> (featuring MTP LM head tensor parallelism and context phase Q/K/V concatenation elimination), and <strong>aggressive kernel fusion and overlap</strong> (leveraging Programmatic Dependent Launch, fused AlltoAll operations, and torch.compile optimizations). These optimizations collectively deliver significant end-to-end performance improvements for wide-EP scenarios on NVIDIA GB200 NVL72, for DeepSeek R1 with its specialized Multi-head Latent Attention (MLA) mechanism. Each technique is carefully designed to maintain accuracy while maximizing performance, demonstrating the power of combining algorithmic innovation with deep hardware awareness.</p>
+</section>
+<section id="lower-precision">
+<h2>Lower precision<a class="headerlink" href="#lower-precision" title="Link to this heading">#</a></h2>
+<section id="wo-gemm-fp4-quantization">
+<h3>wo GEMM FP4 quantization<a class="headerlink" href="#wo-gemm-fp4-quantization" title="Link to this heading">#</a></h3>
+<p>The wo GEMM is the final linear layer within the multi-head attention block that produces the final outputs. While DeepSeek R1’s MLA modifies the initial projections for keys and values, the wo GEMM operator remains a critical and standard component for finalizing the attention computation. In the term, “wo” is the abbreviation for the weight matrix for the output.</p>
+<p>We’ve evaluated that quantizing the wo GEMM to FP4 still satisfies the accuracy requirements, maintaining a similar MTP accept rate (AR) while improving end-to-end performance. The <a class="reference external" href="https://github.com/NVIDIA/TensorRT-Model-Optimizer">NVIDIA TensorRT Model Optimizer</a> team has published checkpoints that additionally quantize the wo module in attention layers to FP4 on HuggingFace:</p>
+<ul class="simple">
+<li><p>https://huggingface.co/nvidia/DeepSeek-R1-FP4-v2</p></li>
+<li><p>https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2</p></li>
+</ul>
+<p>In TensorRT LLM, this is supported by <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/6393">PR 6393</a>. To utilize the checkpoints, simply use the LLM API or <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> to load them. Refer to <a class="reference external" href="https://huggingface.co/nvidia/DeepSeek-R1-FP4-v2#deploy-with-tensorrt-llm">deploy-with-tensorrt-llm</a> for more details.</p>
+</section>
+<section id="low-precision-alltoall">
+<h3>Low precision <code class="docutils literal notranslate"><span class="pre">AlltoAll</span></code><a class="headerlink" href="#low-precision-alltoall" title="Link to this heading">#</a></h3>
+<p>In wide-EP MoE, the combine phase (after experts finish FC2) performs an all-to-all to return each token’s expert outputs to its origin rank, followed by a per-token reduce over top-k experts.</p>
+<p>This step is typically bandwidth-bound when FC2 outputs are in BF16 or FP16. We introduce a low-precision AlltoAll that transmits these combine payloads in NVFP4 instead of BF16/FP16, then dequantizes back on the receiver before the local reduction.</p>
+<p>During combine, we temporarily quantize the per-token expert outputs to NVFP4 (e2m1 values with per-16-element E4M3 scale factors plus a global scale) inside shared memory, send the compact representation across GPUs, and dequantize back to the original dtype on the receiving side. Indices and routing-related small tensors remain in their native types.</p>
+<p>Since we quantize only for transport and outputs are dequantized back to the working dtype before the per-token reduction, we observe negligible accuracy impact; tolerances comparable to a quant-dequant roundtrip are sufficient. This feature is supported by <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/7155">PR 7155</a> and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/7898">PR 7898</a>.</p>
+</section>
+<section id="fp8-context-fmha-support">
+<h3>FP8 context FMHA support<a class="headerlink" href="#fp8-context-fmha-support" title="Link to this heading">#</a></h3>
+<p>FP8 context FMHA is a technique that uses the FP8 data format to accelerate the FMHA/MLA computation during the context phase of a model. This combination is designed to improve TTFT and prefill throughput, particularly when processing long contexts, without significantly sacrificing accuracy.</p>
+<p>In the context phase, the K and V can be stored in FP8 format, which is often referred to as FP8 KV Cache. Using FP8 KV cache can significantly save GPU memory, which is especially beneficial for long input sequences.
+However, since Q is in BF16 format, FMHA will also be performed in BF16 format, which cannot benefit from FP8 Tensor Core.</p>
+<p>With FP8 context FMHA, we first quantize Q into FP8 format, which aligns with FP8 K and V, and then leverage FP8 Tensor Core for FMHA/MLA. Since the context phase is compute-bound and Tensor Core has much higher FP8 FLOPS than BF16 FLOPS, the speed-up becomes more pronounced as the input sequence length grows.</p>
+<p>Since FP8 context FMHA can maintain accuracy very close to the BF16 baseline, we enable it automatically when users use FP8 KV cache on Hopper or Blackwell. This is supported by <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/7610">PR 7610</a> and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/7612">PR 7612</a>.</p>
+</section>
+</section>
+<section id="rethink-network-structure">
+<h2>Rethink network structure<a class="headerlink" href="#rethink-network-structure" title="Link to this heading">#</a></h2>
+<section id="mtp-lm-head-tensor-parallelism">
+<h3>MTP LM head tensor parallelism<a class="headerlink" href="#mtp-lm-head-tensor-parallelism" title="Link to this heading">#</a></h3>
+<p>The LM (language modeling) head is responsible for converting the <code class="docutils literal notranslate"><span class="pre">hidden_states</span></code> computed by previous decode layers to <code class="docutils literal notranslate"><span class="pre">logits</span></code>. It’s a linear layer with weights in the shape of <code class="docutils literal notranslate"><span class="pre">(vocab_size,</span> <span class="pre">hidden_size)</span></code>, outputting logits with the shape of <code class="docutils literal notranslate"><span class="pre">(batch_size,</span> <span class="pre">seqlen,</span> <span class="pre">vocab_size)</span></code>. We are primarily interested in the logits corresponding to the last token of the input sequence, so the logits will finally be <code class="docutils literal notranslate"><span class="pre">(batch_size,</span> <span class="pre">vocab_size)</span></code>.</p>
+<p>When MTP is enabled, the number of tokens that MTP layers handle will be equal to the batch size, while the main model will handle <code class="docutils literal notranslate"><span class="pre">(1</span> <span class="pre">+</span> <span class="pre">MTP)</span> <span class="pre">*</span> <span class="pre">batch_size</span></code> tokens, which makes the LM head computation on MTP layers easier to fall into the memory-bound range, and 256 tokens is the empirical boundary between memory-bound and math-bound. This leads to an optimization idea: if we keep the calculation memory-bound but reduce the size of weights that need to be loaded, there could be performance benefits.</p>
+<p>Based on this analysis, we conducted experiments on the following scenario: a DeepSeek R1 EP32 case with attention DP and MTP-3 enabled, where the local per-rank batch size is 32. Before the optimization, there is 32-way data parallelism, so each MTP module on each rank processes 32 tokens for LM head calculation.</p>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog14_MTP_parallel_1.png" width="500">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 2: MTP LM head computation before optimization</em></sub></p>
+<p>In the optimization, we first perform an <code class="docutils literal notranslate"><span class="pre">AllGather</span></code> on every 4 GPUs, so that each GB200 node has all tokens prepared for the following TP4 calculation. Then, we split LM head weights on the token dimension to fit those 4 GPUs and perform 4-way TP. Afterwards, we collect the local argmax logits on each TP rank, do a round of <code class="docutils literal notranslate"><span class="pre">AllGather</span></code> to collect that, and find the global argmax logits across all TP ranks. Collecting the local argmax logits firstly helps with minimizing communication and argmax computation overheads. Finally, we split logits to guarantee correctness.</p>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog14_MTP_parallel_2.png" width="500">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 3: MTP LM head computation after applying tensor parallelism</em></sub></p>
+<p><em>Some layers are omitted in the diagrams above to keep the example simple.</em></p>
+<p>Note that we can expand the TP to 8-way to utilize multi-node NVLink, as long as we still achieve performance gains from reducing weight loading time in memory-bound scenarios.</p>
+<p>This feature is supported by <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/7571">PR 7571</a> and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/7891">PR 7891</a>.</p>
+</section>
+<section id="context-phase-q-k-v-concat-optimization">
+<h3>Context phase Q/K/V <code class="docutils literal notranslate"><span class="pre">concat</span></code> optimization<a class="headerlink" href="#context-phase-q-k-v-concat-optimization" title="Link to this heading">#</a></h3>
+<p>In the standard attention mechanism, Q/K/V are derived from the same hidden states through <code class="docutils literal notranslate"><span class="pre">GEMM_Q</span></code>/<code class="docutils literal notranslate"><span class="pre">GEMM_K</span></code>/<code class="docutils literal notranslate"><span class="pre">GEMM_V</span></code> operations, and TensorRT LLM typically merges the weights of these three GEMMs in advance, executing a single <code class="docutils literal notranslate"><span class="pre">GEMM_QKV</span></code> to obtain a large contiguous tensor QKV, which is then used as the input to the attention kernels.</p>
+<p>However, DeepSeek’s MLA is a special attention module where Q/K/V are obtained by applying different downsampling-upsampling processes to the hidden states. Additionally, Q and K are divided into two parts: with RoPE and without RoPE, so a contiguous QKV tensor cannot be obtained directly.</p>
+<p>In the initial implementation of context MLA, due to input format constraints of the attention kernels, TensorRT LLM had to explicitly concatenate the Q/K/V tensors into one contiguous QKV tensor, resulting in extra memory and time overhead, which became more significant in wide EP scenarios.</p>
+<p>Recently, we introduced a new input format for the context MLA kernels called “separate qkv”. As the name implies, these attention kernels now support three separate Q/K/V tensors as direct inputs. <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/6538">PR 6538</a> refactors the MLA process to eliminate the need for concatenating Q/K/V, saving copy operations and significantly improving prefill latency in wide EP scenarios.</p>
+</section>
+</section>
+<section id="more-kernel-overlap-fusion-and-optimization">
+<h2>More kernel overlap, fusion and optimization<a class="headerlink" href="#more-kernel-overlap-fusion-and-optimization" title="Link to this heading">#</a></h2>
+<p>The team has implemented aggressive kernel fusion, overlap, and optimization to reduce kernel launch overheads and overall kernel duration. This includes overlapping kernels using PDL, fusing several <code class="docutils literal notranslate"><span class="pre">AlltoAll</span></code> kernels through refactoring, fusing sparse exp and shared exp <code class="docutils literal notranslate"><span class="pre">add</span></code> into local reduction, fusing <code class="docutils literal notranslate"><span class="pre">memset</span></code> into <code class="docutils literal notranslate"><span class="pre">expandinputrow</span></code>, fusing <code class="docutils literal notranslate"><span class="pre">finalizeMoeRouting</span></code> into FC2, and removing the <code class="docutils literal notranslate"><span class="pre">swizzle</span></code> kernel after <code class="docutils literal notranslate"><span class="pre">AlltoAll</span></code>. The following three representative examples demonstrate the common ideas behind these optimizations.</p>
+<section id="overlap-kernels-using-programmatic-dependent-launch-pdl">
+<h3>Overlap kernels using programmatic dependent launch (PDL)<a class="headerlink" href="#overlap-kernels-using-programmatic-dependent-launch-pdl" title="Link to this heading">#</a></h3>
+<p>The Programmatic Dependent Launch (PDL) mechanism allows a dependent secondary kernel to launch before the primary kernel it depends on in the same CUDA stream has finished executing. Refer to the <a class="reference external" href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization">official documentation</a> for more details. TensorRT LLM has been utilizing this feature to optimize end-to-end performance.</p>
+<p>We have introduced this feature to the kernels used by the wide EP workflow as well. The implementation is in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/7977">PR 7977</a>. We inserted the <code class="docutils literal notranslate"><span class="pre">cudaTriggerProgrammaticLaunchCompletion</span></code> API with all thread blocks in the primary kernel, which signals that it’s ready for the secondary kernel to launch, and then call the <code class="docutils literal notranslate"><span class="pre">cudaGridDependencySynchronize</span></code> API in the secondary kernel, which blocks until all primary kernels the secondary kernel depends on have completed and flushed results to global memory. The following example from the <a class="reference external" href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#api-description">official documentation</a> demonstrates how PDL is supported in TensorRT LLM, the only difference is that we inserted <code class="docutils literal notranslate"><span class="pre">cudaTriggerProgrammaticLaunchCompletion</span></code> and <code class="docutils literal notranslate"><span class="pre">cudaGridDependencySynchronize</span></code> to the same kernel so that it can both overlap with the front and subsequent kernels.</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="n">__global__</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="n">primary_kernel</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">   </span><span class="c1">// Initial work that should finish before starting secondary kernel</span>
+
+<span class="w">   </span><span class="c1">// Trigger the secondary kernel</span>
+<span class="w">   </span><span class="n">cudaTriggerProgrammaticLaunchCompletion</span><span class="p">();</span>
+
+<span class="w">   </span><span class="c1">// Work that can coincide with the secondary kernel</span>
+<span class="p">}</span>
+
+<span class="n">__global__</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="n">secondary_kernel</span><span class="p">()</span>
+<span class="p">{</span>
+<span class="w">   </span><span class="c1">// Independent work</span>
+
+<span class="w">   </span><span class="c1">// Will block until all primary kernels the secondary kernel is dependent on have completed and flushed results to global memory</span>
+<span class="w">   </span><span class="n">cudaGridDependencySynchronize</span><span class="p">();</span>
+
+<span class="w">   </span><span class="c1">// Dependent work</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>We have verified the accuracy after the modification to ensure that computation results are not affected by incorrect memory reads and writes. With this premise, we made those kernels overlap as much as possible for performance considerations. In TensorRT LLM, PDL can be enabled by setting the environment variable <code class="docutils literal notranslate"><span class="pre">TRTLLM_ENABLE_PDL</span></code> to <code class="docutils literal notranslate"><span class="pre">1</span></code>, and we may introduce this as an official API in the future.</p>
+<p>The effect of enabling PDL can be clearly observed using <a class="reference external" href="https://developer.nvidia.com/nsight-systems">NVIDIA Nsight Systems</a>. Taking <code class="docutils literal notranslate"><span class="pre">moeComputeRouteKernel</span></code>, <code class="docutils literal notranslate"><span class="pre">computeCountAndIndiceDevice</span></code> and <code class="docutils literal notranslate"><span class="pre">computeCumsumDevice</span></code> kernels as an example, they are executed in order when disabling PDL:</p>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog14_pdloff.png" width="1000">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 4: The profiling results of disabling PDL.</em></sub></p>
+<p>The following profiling results show how the three kernels overlap after enabling PDL.</p>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog14_pdlon.png" width="1000">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 5: The profiling results of enabling PDL.</em></sub></p>
+<p><em>The above profiles were generated by using commit <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/84d2f1281857fbb1662b14603d3123cf327ac94f">84d2f12</a> on the main branch. They may change in future versions.</em></p>
+<p>For tips on using Nsys to profile and analyze TensorRT LLM performance, refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/perf-analysis.md#coordinating-with-nvidia-nsight-systems-launch">Coordinating with NVIDIA Nsight Systems Launch</a>.</p>
+</section>
+<section id="fuse-several-alltoall-kernels">
+<h3>Fuse several <code class="docutils literal notranslate"><span class="pre">AlltoAll</span></code> kernels<a class="headerlink" href="#fuse-several-alltoall-kernels" title="Link to this heading">#</a></h3>
+<p>To better support communication fusion—including <code class="docutils literal notranslate"><span class="pre">hiddenStates</span></code> during dispatch, low-precision ScalingFactor, MoE’s <code class="docutils literal notranslate"><span class="pre">tokenSelectedExpert</span></code> and scales, as well as supporting low-precision communication during dispatch and handling potential non-alignment issues in original data, we redesigned and reimplemented <code class="docutils literal notranslate"><span class="pre">AlltoAll</span></code>.</p>
+<p>Taking the dispatch of four fields as an example, the data flow is shown in Figure 6.</p>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog14_alltoall_dataflow.png" width="800">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 6: The data flow of new Alltoall kernel</em></sub></p>
+<p>The sending process is as follows:</p>
+<ul class="simple">
+<li><p>The first step loads the original data according to the data alignment in global memory, using TMA to load into shared memory as <code class="docutils literal notranslate"><span class="pre">unAlignedData</span></code>.</p></li>
+<li><p>Next, in shared memory, all fields are aligned to 16-byte boundaries and different fields are concatenated together to form <code class="docutils literal notranslate"><span class="pre">alignedData</span></code>.</p></li>
+<li><p>If low-precision communication is needed, the aligned data is quantized into low-precision <code class="docutils literal notranslate"><span class="pre">lowPrecisionData</span></code>. Currently, quantization is only supported for a single field.</p></li>
+<li><p>Next, corresponding encoding is performed according to the protocol. For example, with LL128, each 128 bytes contains 120 bytes of valid data and 8 bytes of flags. To avoid bank conflicts during encoding in shared memory, we select different flag positions for different packets, and the final encoded data is stored in <code class="docutils literal notranslate"><span class="pre">protoPackedData+Flag</span></code>.</p></li>
+<li><p>Finally, the proto-encoded <code class="docutils literal notranslate"><span class="pre">protoPackedData+Flag</span></code> is written to the remote GPU’s workspace.</p></li>
+</ul>
+<p>For the receiver, it only needs to check the flag at the corresponding position in the workspace to confirm whether the data is ready. If ready, the original data is decoded in the reverse manner of sending and written to the corresponding tensors.</p>
+<p>Through this approach, we can support sending and receiving multiple arbitrarily aligned fields in a fused manner and support low-precision communication during the combine process. This feature was implemented in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/6973">PR 6973</a>.</p>
+</section>
+<section id="fuse-add-sparse-exp-and-shared-exp-into-local-reduction">
+<h3>Fuse <code class="docutils literal notranslate"><span class="pre">add</span></code> (sparse exp and shared exp) into local reduction<a class="headerlink" href="#fuse-add-sparse-exp-and-shared-exp-into-local-reduction" title="Link to this heading">#</a></h3>
+<p>To reduce the number of kernel launches and achieve better overlap at the tail of the MoE module, we’ve fused the shared-expert add into the local reduction kernel that aggregates top-k experts. This removes the extra add operator without increasing the reduce operator’s overhead. It also achieves single write-out and lower bandwidth occupancy.</p>
+<p>The optimization is compatible with NVFP4 combine without requiring any API changes and brings no accuracy impact. It was added by <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/7422">PR 7422</a>.</p>
+</section>
+<section id="optimize-pytorch-native-copy-and-concat-using-torch-compile">
+<h3>Optimize PyTorch native <code class="docutils literal notranslate"><span class="pre">copy</span></code> and <code class="docutils literal notranslate"><span class="pre">concat</span></code> using <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code><a class="headerlink" href="#optimize-pytorch-native-copy-and-concat-using-torch-compile" title="Link to this heading">#</a></h3>
+<p>We have observed several inefficient <code class="docutils literal notranslate"><span class="pre">copy</span></code> and <code class="docutils literal notranslate"><span class="pre">concat</span></code> operations on context phase in wide EP scenarios, and one significant case is copying <code class="docutils literal notranslate"><span class="pre">k_nope</span></code> in the MLA module. As mentioned in previous section, Q and K are divided into two parts in DeepSeek MLA: with RoPE and without RoPE. In context phase, head size of nope will be 128, and that of rope will be 64, which adds up to 192 head size. However, the FMHA kernel will directly read Q and K with head size 192, which means that we have to prepare the full Q and K using <code class="docutils literal notranslate"><span class="pre">copy</span></code> and <code class="docutils literal notranslate"><span class="pre">concat</span></code>.</p>
+<p>On ISL/OSL 8k/1k, batch size 1 cases, on context phase, we observed that the <code class="docutils literal notranslate"><span class="pre">copy</span></code> operation takes 306us, which is clearly suboptimal. If we try to calculate a theoretical duration, considering 8 TB/sec HBM3e bandwidth, the formula would roughly be:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="p">(</span> <span class="n">ISL</span> <span class="mi">8192</span> <span class="o">*</span> <span class="n">k_nope_size</span> <span class="mi">128</span> <span class="o">*</span> <span class="n">num_heads</span> <span class="mi">128</span> <span class="o">*</span> <span class="mi">2</span> <span class="nb">bytes</span> <span class="o">*</span> <span class="n">read</span><span class="o">/</span><span class="n">write</span> <span class="mi">2</span> <span class="p">)</span> <span class="o">/</span> <span class="p">(</span> <span class="mi">8</span> <span class="n">TB</span><span class="o">/</span><span class="n">sec</span> <span class="o">*</span> <span class="n">efficiency</span> <span class="mf">0.8</span> <span class="p">)</span> <span class="o">=</span> <span class="mi">80</span> <span class="n">us</span>
+</pre></div>
+</div>
+<p>To optimize the operator, we simply added <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> decorator to the operation, and the kernel duration directly drops to 107us, which is greatly reduced and already on a promising level. <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/8044">PR 8044</a> implemented the changes. This is an outstanding example demonstrating the power of <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code>, and showing the process of analyzing and optimizing without heavily hand-crafting kernels.</p>
+</section>
+</section>
+<section id="end-to-end-performance">
+<h2>End-to-End Performance<a class="headerlink" href="#end-to-end-performance" title="Link to this heading">#</a></h2>
+<p>After applying the optimizations above, the network structure is cleaner. For example, <code class="docutils literal notranslate"><span class="pre">o_proj</span></code> and <code class="docutils literal notranslate"><span class="pre">A2A</span> <span class="pre">tokens</span></code> now compute in lower precision, and operators like <code class="docutils literal notranslate"><span class="pre">add</span></code> of sparse‑expert and shared‑expert is now fused into the <code class="docutils literal notranslate"><span class="pre">reduction</span></code>. The optimized parts are marked in <strong>bold</strong>.</p>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog14_overview_after_opt.png" width="600">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 7: Network structure overview after optimization</em></sub></p>
+<p>We measured one round of performance and compared it with the baseline (main branch in July). With the optimizations mentioned above, we can see a significant performance improvement.</p>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog14_perf.png" width="600">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 8: End-to-End Performance on Aug 31st</em></sub></p>
+<p><em>Note: The numbers were collected on August 31st. Some optimizations mentioned above were not yet added at that time.</em></p>
+<p>To review how wide EP helps with Blackwell’s leading inference benchmarks, also read these recent blog posts:</p>
+<ul class="simple">
+<li><p><a class="reference external" href="https://developer.nvidia.com/blog/nvidia-blackwell-leads-on-new-semianalysis-inferencemax-benchmarks/">NVIDIA Blackwell Leads on SemiAnalysis InferenceMAX™ v1 Benchmarks</a></p></li>
+<li><p><a class="reference external" href="https://blogs.nvidia.com/blog/blackwell-inferencemax-benchmark-results/">NVIDIA Blackwell Raises Bar in New InferenceMAX Benchmarks, Delivering Unmatched Performance and Efficiency</a></p></li>
+</ul>
+</section>
+<section id="acknowledgements">
+<h2>Acknowledgements<a class="headerlink" href="#acknowledgements" title="Link to this heading">#</a></h2>
+<p>This is a great continuation of previous work on TensorRT-LLM wide EP and another demonstration of excellent teamwork. It stems from brilliant performance optimization ideas, solid performance analysis and benchmarking, and rapid engineering support and implementation. By sharing these experiences, we hope to help more people who are interested in deploying large-scale LLM models on NVIDIA GPUs to run AI faster.</p>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Inference Time Compute Implementation in TensorRT LLM</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#table-of-contents">Table of Contents</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#overview">Overview</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#lower-precision">Lower precision</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#wo-gemm-fp4-quantization">wo GEMM FP4 quantization</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#low-precision-alltoall">Low precision <code class="docutils literal notranslate"><span class="pre">AlltoAll</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#fp8-context-fmha-support">FP8 context FMHA support</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#rethink-network-structure">Rethink network structure</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mtp-lm-head-tensor-parallelism">MTP LM head tensor parallelism</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#context-phase-q-k-v-concat-optimization">Context phase Q/K/V <code class="docutils literal notranslate"><span class="pre">concat</span></code> optimization</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#more-kernel-overlap-fusion-and-optimization">More kernel overlap, fusion and optimization</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#overlap-kernels-using-programmatic-dependent-launch-pdl">Overlap kernels using programmatic dependent launch (PDL)</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#fuse-several-alltoall-kernels">Fuse several <code class="docutils literal notranslate"><span class="pre">AlltoAll</span></code> kernels</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#fuse-add-sparse-exp-and-shared-exp-into-local-reduction">Fuse <code class="docutils literal notranslate"><span class="pre">add</span></code> (sparse exp and shared exp) into local reduction</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#optimize-pytorch-native-copy-and-concat-using-torch-compile">Optimize PyTorch native <code class="docutils literal notranslate"><span class="pre">copy</span></code> and <code class="docutils literal notranslate"><span class="pre">concat</span></code> using <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#end-to-end-performance">End-to-End Performance</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#acknowledgements">Acknowledgements</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on November 05, 2025.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/3111682">3111682</a>.</p>
+  
+</div></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

@@ -1,0 +1,1091 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Torch Compile &amp; Piecewise CUDA Graph &#8212; TensorRT LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=65e89d2a"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../_static/togglebutton.js?v=4a39c7ea"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'features/torch_compile_and_piecewise_cuda_graph';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc2';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <link rel="icon" href="../_static/favicon.png"/>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="Architecture Overview" href="../developer-guide/overview.html" />
+    <link rel="prev" title="Ray Orchestrator (Prototype)" href="ray-orchestrator.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="1.2.0rc2" />
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../installation/containers.html">Pre-built release container images on NGC</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_sparse_attention.html">Sparse Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client.html">Genai Perf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../models/supported-models.html">Supported Models</a></li>
+
+<li class="toctree-l1"><a class="reference internal" href="../models/adding-new-model.html">Adding a New Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-bench.html">trtllm-bench</a></li>
+
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-eval.html">trtllm-eval</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">LLM API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="feature-combination-matrix.html">Feature Combination Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="long-sequence.html">Long Sequences</a></li>
+<li class="toctree-l1"><a class="reference internal" href="lora.html">LoRA (Low-Rank Adaptation)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="overlap-scheduler.html">Overlap Scheduler</a></li>
+<li class="toctree-l1"><a class="reference internal" href="paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="speculative-decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Torch Compile &amp; Piecewise CUDA Graph</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-analysis.html">Performance Analysis</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog5_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog6_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog7_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog8_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog9_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.html">How to get best performance on DeepSeek-R1 in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Quick Links</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">Releases</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../legacy/tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Torch Compile &amp; Piecewise CUDA Graph</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section class="tex2jax_ignore mathjax_ignore" id="torch-compile-piecewise-cuda-graph">
+<h1>Torch Compile &amp; Piecewise CUDA Graph<a class="headerlink" href="#torch-compile-piecewise-cuda-graph" title="Link to this heading">#</a></h1>
+<p>In this guide, we show how to enable torch.compile and Piecewise CUDA Graph in TensorRT LLM. TensorRT LLM uses torch.compile for lightweight vertical fusion and Piecewise CUDA Graph.</p>
+<p>Piecewise CUDA Graph is a technique that runs cudagraph-unsupported components (primarily attention) in eager mode while capturing and replaying the supported parts with CUDA Graph to reduce context-phase launch overhead. We implement this on top of torch.compile because partitioning a model between CUDA Graph and eager execution—and managing graphs in pure eager mode—is cumbersome.</p>
+<section id="table-of-contents">
+<h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><a class="reference internal" href="#torch-compile-piecewise-cuda-graph">Torch Compile &amp; Piecewise CUDA Graph</a></p>
+<ul>
+<li><p><a class="reference internal" href="#table-of-contents">Table of Contents</a></p></li>
+<li><p><a class="reference internal" href="#usage">Usage</a></p></li>
+<li><p><a class="reference internal" href="#tips-for-piecewise-cuda-graph">Tips for Piecewise CUDA Graph</a></p>
+<ul>
+<li><p><a class="reference internal" href="#piecewise-cuda-graph-generation-only-cuda-graph">Piecewise CUDA Graph &amp; Generation Only CUDA Graph</a></p></li>
+<li><p><a class="reference internal" href="#piecewise-cuda-graph-padding">Piecewise CUDA Graph Padding</a></p></li>
+<li><p><a class="reference internal" href="#performance-tuning">Performance Tuning</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#known-issue">Known Issue</a></p></li>
+<li><p><a class="reference internal" href="#development-guide">Development Guide</a></p>
+<ul>
+<li><p><a class="reference internal" href="#background-knowledge">Background Knowledge</a></p>
+<ul>
+<li><p><a class="reference internal" href="#custom-op">Custom Op</a></p></li>
+<li><p><a class="reference internal" href="#current-status">Current Status</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#tensorrt-llm-custom-backend">TensorRT LLM Custom Backend</a></p>
+<ul>
+<li><p><a class="reference internal" href="#torch-ir-optimization">Torch IR Optimization</a></p></li>
+<li><p><a class="reference internal" href="#aten-ir-optimization">ATen IR Optimization</a></p>
+<ul>
+<li><p><a class="reference internal" href="#operation-fusion"><span class="xref myst">Operation Fusion</span></a></p></li>
+<li><p><a class="reference internal" href="#re-inplace-optimization"><span class="xref myst">Re-inplace Optimization</span></a></p></li>
+<li><p><a class="reference internal" href="#auto-multi-stream"><span class="xref myst">Auto Multi-stream</span></a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#piecewise-cuda-graph">Piecewise CUDA Graph</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#common-trace-failure">Common Trace Failure</a></p></li>
+<li><p><a class="reference internal" href="#graph-break">Graph Break</a></p></li>
+<li><p><a class="reference internal" href="#recompilation">Recompilation</a></p></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+</section>
+<section id="usage">
+<h2>Usage<a class="headerlink" href="#usage" title="Link to this heading">#</a></h2>
+<p>To enable torch.compile and Piecewise CUDA Graph, add the following configuration to <code class="docutils literal notranslate"><span class="pre">extra_config.yml</span></code>. Typically, the <code class="docutils literal notranslate"><span class="pre">extra_config.yml</span></code> can be used by adding launching args <code class="docutils literal notranslate"><span class="pre">--extra_llm_api_options</span> <span class="pre">extra_config.yml</span></code> to <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> or <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code>.</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nn">...</span><span class="w"> </span><span class="c1"># Other extra config</span>
+<span class="nt">torch_compile_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">capture_num_tokens</span><span class="p">:</span><span class="w"> </span><span class="s">&#39;${capture_num_tokens}&#39;</span><span class="w"> </span><span class="c1"># List of num tokens to capture. e.g., [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, ..., 3072]</span>
+<span class="w">  </span><span class="nt">enable_userbuffers</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
+<span class="w">  </span><span class="nt">enable_piecewise_cuda_graph</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+</pre></div>
+</div>
+</section>
+<section id="tips-for-piecewise-cuda-graph">
+<h2>Tips for Piecewise CUDA Graph<a class="headerlink" href="#tips-for-piecewise-cuda-graph" title="Link to this heading">#</a></h2>
+<section id="piecewise-cuda-graph-generation-only-cuda-graph">
+<h3>Piecewise CUDA Graph &amp; Generation Only CUDA Graph<a class="headerlink" href="#piecewise-cuda-graph-generation-only-cuda-graph" title="Link to this heading">#</a></h3>
+<p>Piecewise CUDA Graph only handles context-only and mixed context+generation iterations, while the generation-only CUDA Graph only handles pure generation iterations. Users need to specify the number of tokens to capture for each type of CUDA Graph separately in the extra config. Currently, the default value for <code class="docutils literal notranslate"><span class="pre">capture_num_tokens</span></code> is <code class="docutils literal notranslate"><span class="pre">[2**i</span> <span class="pre">for</span> <span class="pre">i</span> <span class="pre">in</span> <span class="pre">range(8)]</span> <span class="pre">+</span> <span class="pre">[i</span> <span class="pre">for</span> <span class="pre">i</span> <span class="pre">in</span> <span class="pre">range(256,</span> <span class="pre">3073,</span> <span class="pre">256)]</span></code>. However, this configuration should be tuned based on specific hardware, model, and parallel strategy. For guidance on tuning these values, see the <a class="reference internal" href="#performance-tuning">Performance Tuning</a> section below.</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">cuda_graph_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">enable_padding</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">  </span><span class="nt">max_batch_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1024</span><span class="w"> </span><span class="c1"># Specify max capture batch size for generation only cuda graph. By default, TensorRT LLM will generate a capture list based on it. </span>
+
+<span class="nt">torch_compile_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">capture_num_tokens</span><span class="p">:</span><span class="w"> </span><span class="s">&#39;${capture_num_tokens}&#39;</span><span class="w"> </span><span class="c1"># Specify capture_num_tokens for piecewise cuda graph</span>
+<span class="w">  </span><span class="nt">enable_userbuffers</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
+<span class="w">  </span><span class="nt">enable_piecewise_cuda_graph</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+</pre></div>
+</div>
+</section>
+<section id="piecewise-cuda-graph-padding">
+<h3>Piecewise CUDA Graph Padding<a class="headerlink" href="#piecewise-cuda-graph-padding" title="Link to this heading">#</a></h3>
+<p>Padding means that, at runtime, the token count is padded to the next captured token count. Unlike the generation-only CUDA Graph, padding is mandatory for Piecewise CUDA Graph because context-phase token counts vary widely, making it impractical to capture graphs for every possible length.</p>
+</section>
+<section id="performance-tuning">
+<h3>Performance Tuning<a class="headerlink" href="#performance-tuning" title="Link to this heading">#</a></h3>
+<p>Piecewise CUDA Graph uses a token-count–based capture strategy: it captures a CUDA graph for each user-specified token count and, at runtime, selects and replays the graph that matches the iteration’s token count(or can be padded to the next captured token count graph) in a single forward pass.</p>
+<p>Piecewise CUDA Graph primarily benefit host-bound iterations in the context phase. Within a single iteration, larger token counts reduce exposure to host-side overhead. However, capturing a broader set of token counts increases GPU memory usage and can reduce achievable concurrency. We recommend manually tuning <code class="docutils literal notranslate"><span class="pre">capture_num_tokens</span></code> to balance latency, memory footprint, and concurrency for your workload.</p>
+<p>Guidelines for <code class="docutils literal notranslate"><span class="pre">capture_num_tokens</span></code>:</p>
+<ul class="simple">
+<li><p>Define bounds:</p>
+<ul>
+<li><p>Lower bound: base it on typical context lengths. In low-latency workflows with KV-cache reuse, it can be as small as &lt;10 tokens.</p></li>
+<li><p>Upper bound: set by hardware and model configuration—choose the largest token count that still provides a measurable benefit from Piecewise CUDA Graph even after padding.</p></li>
+</ul>
+</li>
+<li><p>Choose step size: Choose step sizes that balance coverage and memory overhead. Use denser steps in a smaller number of token ranges, and a fixed step (e.g., 256) for larger ranges.</p></li>
+<li><p>Manage trade-offs: more capture points reduce padding but increase memory use and can lower max concurrency; fewer points save memory but increase padding and compute cost.</p></li>
+</ul>
+<p>Even with Piecewise CUDA Graph enabled, you may still observe bubbles in the context (prefill) phase, primarily due to the attention operator’s substantial host-side overhead.</p>
+</section>
+</section>
+<section id="known-issue">
+<h2>Known Issue<a class="headerlink" href="#known-issue" title="Link to this heading">#</a></h2>
+<p>Torch compile cannot work with multi-ModelEngine config.</p>
+<ol class="arabic simple">
+<li><p>Speculative Decoding in Two-Model Style</p></li>
+</ol>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">speculative_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">decoding_type</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;MTP&quot;</span>
+<span class="w">  </span><span class="nt">mtp_eagle_one_model</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">False</span><span class="w"> </span><span class="c1"># Not supported</span>
+
+<span class="nt">speculative_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">decoding_type</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;Eagle&quot;</span>
+<span class="w">  </span><span class="nt">eagle3_one_model</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">False</span><span class="w"> </span><span class="c1"># Not supported</span>
+</pre></div>
+</div>
+<ol class="arabic simple" start="2">
+<li><p>Multimodal Model Family</p></li>
+</ol>
+</section>
+<section id="development-guide">
+<h2>Development Guide<a class="headerlink" href="#development-guide" title="Link to this heading">#</a></h2>
+<section id="background-knowledge">
+<h3>Background Knowledge<a class="headerlink" href="#background-knowledge" title="Link to this heading">#</a></h3>
+<p>Currently, TRT-LLM mainly relies on torch.compile <strong>fullgraph</strong> mode to enable Piecewise CUDA Graph feature, which means all the operations in the model must be recognized by torch.compile.</p>
+<section id="custom-op">
+<h4>Custom Op<a class="headerlink" href="#custom-op" title="Link to this heading">#</a></h4>
+<p>For ops that cannot be represented by a torch native op, developers need to wrap them into a custom op so that they can work properly with torch.compile. A custom op mainly contains two parts: Op forward implementation &amp; Fake kernel.</p>
+<ol class="arabic simple">
+<li><p>Op forward implementation: Define how this op does forward calculation. Including custom CUDA kernel, etc.</p></li>
+<li><p>Fake kernel: Help torch.compile to do the output tensor dtype/shape inference.</p></li>
+</ol>
+<p>After wrapping the op into a torch custom op, the implementation is a completely <strong>black box</strong> for torch compile. Instead, torch.compile will fully rely on a fake kernel to do the tracing.</p>
+<p>Below is a simple example of flashinfer op’s fake kernel.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@torch</span><span class="o">.</span><span class="n">library</span><span class="o">.</span><span class="n">custom_op</span><span class="p">(</span><span class="s2">&quot;trtllm::flashinfer_silu_and_mul&quot;</span><span class="p">,</span> <span class="n">mutates_args</span><span class="o">=</span><span class="p">())</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">flashinfer_silu_and_mul</span><span class="p">(</span><span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+    <span class="k">return</span> <span class="n">silu_and_mul</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">enable_pdl</span><span class="o">=</span><span class="n">ENABLE_PDL</span><span class="p">)</span>
+
+<span class="nd">@flashinfer_silu_and_mul</span><span class="o">.</span><span class="n">register_fake</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_</span><span class="p">(</span><span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+    <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty_like</span><span class="p">(</span><span class="n">x</span><span class="p">)</span><span class="o">.</span><span class="n">chunk</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)[</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+</pre></div>
+</div>
+<p>For more examples, please refer to <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/custom_ops</span></code>.</p>
+</section>
+<section id="current-status">
+<h4>Current Status<a class="headerlink" href="#current-status" title="Link to this heading">#</a></h4>
+<p>For hot models like deepseek/qwen/lllama, we’ve already wrapped some large modules into a custom op to avoid trace failure/graph breaks and exclude output projection &amp; MTP from torch.compile’s scope.</p>
+<p>This means developing the inside attention custom op part, the MoE routed export part, and the MPT part don’t need to worry about complex torch.compile constraints since they are treated as a black box for Torch compile. Developers should only make sure the fake kernels of attention custom op, and routed expert are aligned with the actual implementation.</p>
+<div align="center">
+<img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/media/current_model_definition_ds.svg" alt="Current Model Status" width=50% height=50% />
+</div>
+<p align="center"><sub><em>Figure 1. The current model definition for DeepSeek</em></sub></p>
+<p>Reasons to wrap attention into a large custom op:</p>
+<ol class="arabic simple">
+<li><p>The C++ attention op interface is too complex. The argument number exceeds the torch custom op’s limitation</p></li>
+<li><p>MLA has a slice to dispatch the MLA ctx &amp; gen kernel. This introduces dynamic shapes, which may introduce recompilation in the real inference</p></li>
+<li><p>Clear the boundary of attention so that it can be easily recognized by Piecewise CUDA Graph</p></li>
+<li><p>Use some operators that will cause a graph break and are hard to avoid</p></li>
+</ol>
+<p>Reasons to wrap MoE into a large custom op:</p>
+<ol class="arabic simple">
+<li><p>Use a lot of deepep ops that didn’t wrap into custom ops</p></li>
+<li><p>Hard to support chunked MoE since it uses loops with data-dependent iteration counts, which forces Dynamo to unroll extensively and significantly slows compilation</p></li>
+</ol>
+<p>For the op outside of attention and MLP, the developer should obey the torch.compile constraints. E.g., layernorm, allreduce, etc…</p>
+</section>
+</section>
+<section id="tensorrt-llm-custom-backend">
+<h3>TensorRT LLM Custom Backend<a class="headerlink" href="#tensorrt-llm-custom-backend" title="Link to this heading">#</a></h3>
+<div align="center">
+<img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/media/custom_backend_overview.svg" alt="Custom Backend Overview"/>
+</div>
+<p align="center"><sub><em>Figure 2. TensorRT LLM Custom torch.compile Backend Overview</em></sub></p>
+<p>Above is the overview of the TensorRT LLM custom backend for <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code>.</p>
+<section id="torch-ir-optimization">
+<h4>Torch IR Optimization<a class="headerlink" href="#torch-ir-optimization" title="Link to this heading">#</a></h4>
+<p>Torch IR is the Fx graph that is directly traced by Torch Dynamo. It has several important features for us to do some graph rewriting and get information:</p>
+<ol class="arabic simple">
+<li><p>Preserve the operations as is: We can easily find a specific operation and then transform it to arbitrary operations. No need to deal with <code class="docutils literal notranslate"><span class="pre">auto_functionalize</span></code>, etc.</p></li>
+<li><p>Preserve original variable tensor name in the Fx graph: For Piecewise CUDA Graph, it needs to find the correct <code class="docutils literal notranslate"><span class="pre">SymInt</span></code> which represents the token number. Hence, we rely on the <code class="docutils literal notranslate"><span class="pre">input_ids</span></code>’s shape to make it find the <code class="docutils literal notranslate"><span class="pre">SymInt</span></code> correctly.</p></li>
+</ol>
+</section>
+<section id="aten-ir-optimization">
+<h4>ATen IR Optimization<a class="headerlink" href="#aten-ir-optimization" title="Link to this heading">#</a></h4>
+<p>We get ATen IR after explicitly calling <code class="docutils literal notranslate"><span class="pre">aot_module_simplified</span></code> on the Fx graph. ATen IR is</p>
+<ol class="arabic simple">
+<li><p>In SSA format (no input mutations)</p></li>
+<li><p>Strict subset of aten op (&lt;250): In Torch IR, Python native add op, <code class="docutils literal notranslate"><span class="pre">torch.Tensor().add()</span></code>, <code class="docutils literal notranslate"><span class="pre">torch.aten.add.Tensor</span></code> could be three different ops. After the transform, they will be the same op.</p></li>
+<li><p>Guaranteed metadata information, e.g., dtype and shape propagation</p></li>
+</ol>
+<p>On this IR level, TensorRT LLM will do the following optimization</p>
+<section id="operation-fusion">
+<h5>Operation Fusion<a class="headerlink" href="#operation-fusion" title="Link to this heading">#</a></h5>
+<p>All fusions are located in <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/compilation/patterns</span></code> and implemented using torch.compile’s <a class="reference external" href="https://docs.pytorch.org/tutorials/intermediate/torch_compile_conv_bn_fuser.html">pattern matcher</a>. Unlike the official approach, we write source patterns directly in a lower-level IR instead of relying on tracing. This avoids:</p>
+<ol class="arabic simple">
+<li><p>Inadequate handling of scalars and lists:</p>
+<ul class="simple">
+<li><p>Scalars get specialized into the traced pattern, forcing one pattern per value—impractical and non-general.</p></li>
+<li><p>Lists are flattened, turning elements into separate input arguments, making it impossible to match the original operation.</p></li>
+</ul>
+</li>
+<li><p>Trace-driven pitfalls: Because it’s trace-based, the generated source patterns may not meet our needs and can introduce additional issues as we expand pattern coverage.</p></li>
+</ol>
+<p>We mainly do the operation fusion for AllReduce &amp; RMSNorm.</p>
+<ol class="arabic simple">
+<li><p>AllReduce related fusion: Fuse the following operations into one AllReduce op.</p>
+<ul class="simple">
+<li><p>AllReduce + Residual + RMSNorm</p></li>
+<li><p>AllReduce + Residual + RMSNorm + FP8 Quantization</p></li>
+<li><p>AllReduce + Residual + RMSNorm + FP4 Quantization</p></li>
+</ul>
+</li>
+<li><p>AllReduce with User Buffer: Converts AllReduce operations to use userbuffers to avoid extra copy overhead.</p></li>
+</ol>
+<p>We enable these fusions in torch.compile because they’re difficult to express in eager mode. For the AllReduce + RMSNorm fusion, which is cross-module, implementing it in eager mode would require moving code between modules, leading to redundant, complex, and hard-to-maintain logic.</p>
+<p>For user buffers, torch.compile provides a global, flattened view of the model, making it easy for us to manage user buffers.</p>
+</section>
+<section id="re-inplace-optimization">
+<h5>Re-inplace Optimization<a class="headerlink" href="#re-inplace-optimization" title="Link to this heading">#</a></h5>
+<p>Because ATen IR is SSA, in-place operations are rewritten as out-of-place via a mutation wrapper (<code class="docutils literal notranslate"><span class="pre">auto_functionalize</span></code> or <code class="docutils literal notranslate"><span class="pre">auto_functionalize_v2</span></code> ). That wrapper can introduce an extra tensor copy on mutates args. In a TorchInductor pipeline, later passes typically eliminate this copy, but TensorRT LLM relies on custom ops and does not use Inductor. To avoid the redundant overhead, we remove the wrapper ourselves and preserve the intended in-place update.</p>
+</section>
+<section id="auto-multi-stream">
+<h5>Auto Multi-stream<a class="headerlink" href="#auto-multi-stream" title="Link to this heading">#</a></h5>
+<p>Currently torch.compile won’t create a subgraph for user user-defined CUDA stream. Instead, it will convert it to <code class="docutils literal notranslate"><span class="pre">set_stream</span></code>. The set_stream op doesn’t have any consumers, so it will be removed in the Torch IR to ATen IR transformation, thus losing all the multi-stream scheduling.</p>
+<p>To address this, we implemented an auto multi-stream scheduler:</p>
+<ol class="arabic">
+<li><p>Builds a DAG of the FX graph with explicit dependencies, including special handling for in-place ops</p></li>
+<li><p>Computes a critical path using a rough cost model</p></li>
+<li><p>Schedules nodes onto up to <code class="docutils literal notranslate"><span class="pre">max_num_streams</span></code> specified by user config</p></li>
+<li><p>Insert multi-stream related custom op: since the Fx graph executes operators in list order, so we insert streaming-control operators directly into the graph. Moreover, as these operators have no users, we cannot perform dead-code elimination after multi-stream scheduling. Below is an example of multi-stream, which <code class="docutils literal notranslate"><span class="pre">trtllm.dsv3_router_gemm_op.default</span></code> and <code class="docutils literal notranslate"><span class="pre">trtllm.silu_and_mul.default</span></code> + <code class="docutils literal notranslate"><span class="pre">trtllm.fp4_quantize.default</span></code> execute in parallel.</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">call_function</span>  <span class="n">record_event</span>                             <span class="n">trtllm</span><span class="o">.</span><span class="n">record_event</span>                          <span class="p">(</span><span class="mi">1</span><span class="p">,)</span>                                                                                   <span class="p">{}</span>
+<span class="n">call_function</span>  <span class="n">fp4_quantize_2</span>                           <span class="n">trtllm</span><span class="o">.</span><span class="n">fp4_quantize</span><span class="o">.</span><span class="n">default</span>                  <span class="p">(</span><span class="n">mm_1</span><span class="p">,</span> <span class="n">arg18_1</span><span class="p">,</span> <span class="mi">16</span><span class="p">)</span>                                                                    <span class="p">{}</span>
+<span class="n">call_function</span>  <span class="n">getitem_9</span>                                <span class="o">&lt;</span><span class="n">built</span><span class="o">-</span><span class="ow">in</span> <span class="n">function</span> <span class="n">getitem</span><span class="o">&gt;</span>                  <span class="p">(</span><span class="n">fp4_quantize_2</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>                                                                    <span class="p">{}</span>
+<span class="n">call_function</span>  <span class="n">getitem_10</span>                               <span class="o">&lt;</span><span class="n">built</span><span class="o">-</span><span class="ow">in</span> <span class="n">function</span> <span class="n">getitem</span><span class="o">&gt;</span>                  <span class="p">(</span><span class="n">fp4_quantize_2</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>                                                                    <span class="p">{}</span>
+<span class="n">call_function</span>  <span class="n">nvfp4_gemm_2</span>                             <span class="n">trtllm</span><span class="o">.</span><span class="n">nvfp4_gemm</span><span class="o">.</span><span class="n">default</span>                    <span class="p">(</span><span class="n">getitem_9</span><span class="p">,</span> <span class="n">arg19_1</span><span class="p">,</span> <span class="n">getitem_10</span><span class="p">,</span> <span class="n">arg20_1</span><span class="p">,</span> <span class="n">arg21_1</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>                     <span class="p">{}</span>
+<span class="n">call_function</span>  <span class="n">permute_2</span>                                <span class="n">aten</span><span class="o">.</span><span class="n">permute</span><span class="o">.</span><span class="n">default</span>                         <span class="p">(</span><span class="n">arg17_1</span><span class="p">,</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">])</span>                                                                      <span class="p">{}</span>
+<span class="n">call_function</span>  <span class="n">record_event_1</span>                           <span class="n">trtllm</span><span class="o">.</span><span class="n">record_event</span>                          <span class="p">(</span><span class="mi">0</span><span class="p">,)</span>                                                                                   <span class="p">{}</span>
+<span class="n">call_function</span>  <span class="n">silu_and_mul_1</span>                           <span class="n">trtllm</span><span class="o">.</span><span class="n">silu_and_mul</span><span class="o">.</span><span class="n">default</span>                  <span class="p">(</span><span class="n">nvfp4_gemm_2</span><span class="p">,)</span>                                                                        <span class="p">{}</span>
+<span class="n">call_function</span>  <span class="n">fp4_quantize_3</span>                           <span class="n">trtllm</span><span class="o">.</span><span class="n">fp4_quantize</span><span class="o">.</span><span class="n">default</span>                  <span class="p">(</span><span class="n">silu_and_mul_1</span><span class="p">,</span> <span class="n">arg22_1</span><span class="p">,</span> <span class="mi">16</span><span class="p">)</span>                                                          <span class="p">{}</span>
+<span class="n">call_function</span>  <span class="n">getitem_11</span>                               <span class="o">&lt;</span><span class="n">built</span><span class="o">-</span><span class="ow">in</span> <span class="n">function</span> <span class="n">getitem</span><span class="o">&gt;</span>                  <span class="p">(</span><span class="n">fp4_quantize_3</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>                                                                    <span class="p">{}</span>
+<span class="n">call_function</span>  <span class="n">record_event_2</span>                           <span class="n">trtllm</span><span class="o">.</span><span class="n">record_event</span>                          <span class="p">(</span><span class="mi">4</span><span class="p">,)</span>                                                                                   <span class="p">{}</span>
+<span class="n">call_function</span>  <span class="n">getitem_12</span>                               <span class="o">&lt;</span><span class="n">built</span><span class="o">-</span><span class="ow">in</span> <span class="n">function</span> <span class="n">getitem</span><span class="o">&gt;</span>                  <span class="p">(</span><span class="n">fp4_quantize_3</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>                                                                    <span class="p">{}</span>
+<span class="n">call_function</span>  <span class="n">record_event_3</span>                           <span class="n">trtllm</span><span class="o">.</span><span class="n">record_event</span>                          <span class="p">(</span><span class="mi">3</span><span class="p">,)</span>                                                                                   <span class="p">{}</span>
+<span class="n">call_function</span>  <span class="n">set_stream</span>                               <span class="n">trtllm</span><span class="o">.</span><span class="n">set_stream</span>                            <span class="p">(</span><span class="mi">1</span><span class="p">,)</span>                                                                                   <span class="p">{}</span>
+<span class="n">call_function</span>  <span class="n">wait_event</span>                               <span class="n">trtllm</span><span class="o">.</span><span class="n">wait_event</span>                            <span class="p">(</span><span class="mi">0</span><span class="p">,)</span>                                                                                   <span class="p">{}</span>
+<span class="n">call_function</span>  <span class="n">wait_event_1</span>                             <span class="n">trtllm</span><span class="o">.</span><span class="n">wait_event</span>                            <span class="p">(</span><span class="mi">1</span><span class="p">,)</span>                                                                                   <span class="p">{}</span>
+<span class="n">call_function</span>  <span class="n">dsv3_router_gemm_op</span>                      <span class="n">trtllm</span><span class="o">.</span><span class="n">dsv3_router_gemm_op</span><span class="o">.</span><span class="n">default</span>           <span class="p">(</span><span class="n">mm_1</span><span class="p">,</span> <span class="n">permute_2</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>                                                 <span class="p">{}</span>
+<span class="n">call_function</span>  <span class="n">record_stream</span>                            <span class="n">trtllm</span><span class="o">.</span><span class="n">record_stream</span>                         <span class="p">(</span><span class="n">permute_2</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>                                                                         <span class="p">{}</span>
+<span class="n">call_function</span>  <span class="n">record_stream_1</span>                          <span class="n">trtllm</span><span class="o">.</span><span class="n">record_stream</span>                         <span class="p">(</span><span class="n">mm_1</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>                                                                              <span class="p">{}</span>
+<span class="n">call_function</span>  <span class="n">record_event_4</span>                           <span class="n">trtllm</span><span class="o">.</span><span class="n">record_event</span>                          <span class="p">(</span><span class="mi">2</span><span class="p">,)</span>                                                                                   <span class="p">{}</span>
+<span class="n">call_function</span>  <span class="n">set_stream_1</span>                             <span class="n">trtllm</span><span class="o">.</span><span class="n">set_stream</span>                            <span class="p">(</span><span class="mi">0</span><span class="p">,)</span>                                                                                   <span class="p">{}</span>
+<span class="n">call_function</span>  <span class="n">wait_event_2</span>                             <span class="n">trtllm</span><span class="o">.</span><span class="n">wait_event</span>                            <span class="p">(</span><span class="mi">2</span><span class="p">,)</span>                        
+</pre></div>
+</div>
+</li>
+</ol>
+</section>
+</section>
+<section id="piecewise-cuda-graph">
+<h4>Piecewise CUDA Graph<a class="headerlink" href="#piecewise-cuda-graph" title="Link to this heading">#</a></h4>
+<p>We implement Piecewise CUDA Graph execution on top of torch.compile: non-capturable regions run in eager mode, while the rest of the model is captured and replayed as CUDA Graph segments.</p>
+<p>In the current design, we assume the attention block is the only non-capturable component. To maintain stable input pointers across segment boundaries, we convert attention to an in-place variant. Instead of allocating its own output, attention writes results into a tensor preallocated by the preceding CUDA Graph segment. This guarantees that each segment’s inputs are allocated by CUDA Graph and, therefore, stable for that segment’s capture.</p>
+<div align="center">
+<img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/media/piecewise_runner.svg" alt="Piecewise Runner" width=35% height=35% />
+</div>
+<p align="center"><sub><em>Figure 3. Piecewise Runner</em></sub></p>
+<p>Notes:</p>
+<ol class="arabic simple">
+<li><p>Attention <strong>MUST NOT</strong> have any output. The output tensor should be allocated by CUDA Graph.</p></li>
+<li><p>Each sub-cudagraph <strong>MUST</strong> have at least one input tensor that contains the number of tokens in the shape.</p></li>
+<li><p>Only allow dynamic shape for <code class="docutils literal notranslate"><span class="pre">num_of_tokens</span></code> dim.</p></li>
+</ol>
+</section>
+</section>
+<section id="common-trace-failure">
+<h3>Common Trace Failure<a class="headerlink" href="#common-trace-failure" title="Link to this heading">#</a></h3>
+<ol class="arabic simple">
+<li><p>Custom op fake kernel: For every custom op, developers must implement a correct fake kernel. <strong>Make sure to update the corresponding fake kernel when the custom op is changed</strong></p></li>
+<li><p>Dynamic Iteration Number Loop: This is technically not a trace failure, but it will introduce long-time tracing that is generally not acceptable. When torch.compile tries to convert PyTorch modeling code to Fx graph, it will try to unroll the loop. For a loop that has a large and dynamic loop number with a large loop body, the tracing process will take a long time to do the unrolling.</p>
+<ol class="arabic simple">
+<li><p>If the IO of the loop can be easily written into a custom op format, try to replace it with a custom op</p></li>
+<li><p>If the loop num is unchanged during the whole inference service lifetime, then it is ok to leave the loop as is. (e.g., Model decoder layer loop)</p></li>
+</ol>
+</li>
+</ol>
+</section>
+<section id="graph-break">
+<h3>Graph Break<a class="headerlink" href="#graph-break" title="Link to this heading">#</a></h3>
+<ol class="arabic">
+<li><p>Use unsupported operators</p>
+<ul class="simple">
+<li><p>python native operators: <code class="docutils literal notranslate"><span class="pre">print</span></code>, <code class="docutils literal notranslate"><span class="pre">sys.intern()</span></code>, etc.</p></li>
+<li><p>pybind/nanobind operators</p>
+<ul>
+<li><p><strong>Solution:</strong> Wrap them to torch’s custom op. For complex operators like attention that exceed the argument limit of PyTorch’s custom-op interface, wrap them in a higher-level module to reduce the argument count.</p></li>
+</ul>
+</li>
+<li><p>Some of the torch operators:</p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">torch.nonzeros()</span></code>: Produce data-dependent dynamic shape tensor</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">torch.sym_min</span></code>: <code class="docutils literal notranslate"><span class="pre">SymInt</span></code> aware min</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">torch.Tensor.tolist()</span></code>, <code class="docutils literal notranslate"><span class="pre">torch.Tensor.item()</span></code></p></li>
+<li><p><strong>Solution:</strong> Use them inside a custom op if these operators don’t get involved in producing the custom op’s output tensor.</p></li>
+</ul>
+</li>
+</ul>
+</li>
+<li><p>Use a custom object’s method: For a class like mapping config, we cannot directly use its method like has_pp() in the model forward.</p>
+<ul class="simple">
+<li><p><strong>Solution</strong>: We should convert it to a bool in the model init and use the bool.</p></li>
+</ul>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">Mapping</span><span class="p">(</span><span class="nb">object</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+        <span class="o">...</span>
+      
+    <span class="k">def</span><span class="w"> </span><span class="nf">has_pp</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span> <span class="c1"># Cannot use this method in torch.compile</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">pp_size</span> <span class="o">&gt;</span> <span class="mi">1</span>
+</pre></div>
+</div>
+</li>
+<li><p>Data Dependent Control(DDC) flow involved in code</p>
+<ul class="simple">
+<li><p><strong>Solution</strong>: Try to avoid DDC in the code. Try to pre-compute the result outside of torch.compile’s scope. For the following example, try to pre-compute the <code class="docutils literal notranslate"><span class="pre">torch.sum(data)</span></code> at the data preparation stage, and pass the result to the <code class="docutils literal notranslate"><span class="pre">forward</span></code>.</p></li>
+</ul>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">TestCase</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+
+ <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">data</span><span class="p">):</span>
+     <span class="n">y</span> <span class="o">=</span> <span class="n">x</span> <span class="o">**</span> <span class="mi">2</span>
+     <span class="k">if</span> <span class="n">torch</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">data</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="mi">4</span><span class="p">:</span> <span class="c1"># Data Dependent Control Here!</span>
+         <span class="n">t</span> <span class="o">=</span>  <span class="n">y</span>
+     <span class="k">else</span><span class="p">:</span>
+         <span class="n">t</span> <span class="o">=</span> <span class="n">y</span> <span class="o">/</span> <span class="mi">2</span>
+     <span class="n">t</span> <span class="o">=</span> <span class="n">t</span> <span class="o">+</span> <span class="mi">10</span>
+     <span class="k">return</span> <span class="n">t</span>
+
+<span class="n">test_case</span> <span class="o">=</span> <span class="n">TestCase</span><span class="p">()</span>
+<span class="n">test_case</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">test_case</span><span class="p">,</span> <span class="n">backend</span><span class="o">=</span><span class="n">Backend</span><span class="p">())</span>
+<span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">5</span><span class="p">)</span><span class="o">.</span><span class="n">cuda</span><span class="p">()</span>
+<span class="n">data</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">ones</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
+<span class="n">data</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="mi">2</span>
+<span class="n">data</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">=</span> <span class="mi">2</span>
+<span class="n">test_case</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">data</span><span class="p">)</span>
+</pre></div>
+</div>
+</li>
+</ol>
+</section>
+<section id="recompilation">
+<h3>Recompilation<a class="headerlink" href="#recompilation" title="Link to this heading">#</a></h3>
+<ol class="arabic">
+<li><p>Try not to use data-dependent dynamic shapes in the model forward. (e.g., slice the tensor based on input value). This will introduce 0/1 specialization to the model and will possibly introduce recompile.</p>
+<ol class="arabic simple">
+<li><p><strong>0/1 specialization</strong>: torch.compile will recompile the model if a dynamic tensor’s dim equals 0 or 1. In the worst case, it will recompile 3 times for 1 dimension: 0,1, &gt;2</p></li>
+</ol>
+</li>
+<li><p>For an int argument that would change during runtime, use <code class="docutils literal notranslate"><span class="pre">SymInt</span></code> rather than int in the C++ custom op definition. Otherwise, it will trigger a recompile when the value changes.</p>
+<div class="highlight-c++ notranslate"><div class="highlight"><pre><span></span><span class="n">TORCH_LIBRARY_FRAGMENT</span><span class="p">(</span><span class="n">trtllm</span><span class="p">,</span><span class="w"> </span><span class="n">m</span><span class="p">)</span>
+<span class="p">{</span><span class="w">    </span>
+<span class="w">    </span><span class="n">m</span><span class="p">.</span><span class="n">def</span><span class="p">(</span><span class="s">&quot;allgather(Tensor input, SymInt[]? sizes, int[] group) -&gt; Tensor&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="n">m</span><span class="p">.</span><span class="n">def</span><span class="p">(</span><span class="s">&quot;allgather_list(Tensor[] input_list, SymInt[]? sizes, int[] group) -&gt; Tensor[]&quot;</span><span class="p">);</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+</li>
+<li><p>Some recompiles that are hard to aware:</p>
+<ol class="arabic">
+<li><p>python native <code class="docutils literal notranslate"><span class="pre">min(list)</span></code>, <code class="docutils literal notranslate"><span class="pre">max(list)</span></code>: it will recompile when the list elements changes</p></li>
+<li><p>Control Flow based on dynamic shape</p></li>
+<li><p>Next power of two: Previously, we used <code class="docutils literal notranslate"><span class="pre">bit_length()</span></code> to implement the next power of 2 function. However, it will cause a recompile for every int value. Now rewrite the code to be torch.compile-friendly.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">next_positive_power_of_2</span><span class="p">(</span><span class="n">x</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+    <span class="k">if</span> <span class="n">x</span> <span class="o">&lt;</span> <span class="mi">1</span><span class="p">:</span>
+        <span class="k">return</span> <span class="mi">1</span>
+
+    <span class="c1"># Following code is equivalent to 1 &lt;&lt; (x - 1).bit_length()</span>
+    <span class="c1"># But this impl does not contain bit_length(), so it can be used by torch compile.</span>
+    <span class="c1"># It can correctly handle 64-bit numbers, which should be enough for now.</span>
+    <span class="n">n</span> <span class="o">=</span> <span class="n">x</span> <span class="o">-</span> <span class="mi">1</span>
+    <span class="n">n</span> <span class="o">|=</span> <span class="n">n</span> <span class="o">&gt;&gt;</span> <span class="mi">1</span>
+    <span class="n">n</span> <span class="o">|=</span> <span class="n">n</span> <span class="o">&gt;&gt;</span> <span class="mi">2</span>
+    <span class="n">n</span> <span class="o">|=</span> <span class="n">n</span> <span class="o">&gt;&gt;</span> <span class="mi">4</span>
+    <span class="n">n</span> <span class="o">|=</span> <span class="n">n</span> <span class="o">&gt;&gt;</span> <span class="mi">8</span>
+    <span class="n">n</span> <span class="o">|=</span> <span class="n">n</span> <span class="o">&gt;&gt;</span> <span class="mi">16</span>
+    <span class="n">n</span> <span class="o">|=</span> <span class="n">n</span> <span class="o">&gt;&gt;</span> <span class="mi">32</span>
+    <span class="k">return</span> <span class="n">n</span> <span class="o">+</span> <span class="mi">1</span>
+</pre></div>
+</div>
+</li>
+</ol>
+</li>
+</ol>
+</section>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="ray-orchestrator.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Ray Orchestrator (Prototype)</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="../developer-guide/overview.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Architecture Overview</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#table-of-contents">Table of Contents</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#usage">Usage</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tips-for-piecewise-cuda-graph">Tips for Piecewise CUDA Graph</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#piecewise-cuda-graph-generation-only-cuda-graph">Piecewise CUDA Graph &amp; Generation Only CUDA Graph</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#piecewise-cuda-graph-padding">Piecewise CUDA Graph Padding</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#performance-tuning">Performance Tuning</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#known-issue">Known Issue</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#development-guide">Development Guide</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#background-knowledge">Background Knowledge</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#custom-op">Custom Op</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#current-status">Current Status</a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt-llm-custom-backend">TensorRT LLM Custom Backend</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#torch-ir-optimization">Torch IR Optimization</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aten-ir-optimization">ATen IR Optimization</a><ul class="nav section-nav flex-column">
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#operation-fusion">Operation Fusion</a></li>
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#re-inplace-optimization">Re-inplace Optimization</a></li>
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#auto-multi-stream">Auto Multi-stream</a></li>
+</ul>
+</li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#piecewise-cuda-graph">Piecewise CUDA Graph</a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#common-trace-failure">Common Trace Failure</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#graph-break">Graph Break</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#recompilation">Recompilation</a></li>
+</ul>
+</li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on November 05, 2025.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/3111682">3111682</a>.</p>
+  
+</div></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>
