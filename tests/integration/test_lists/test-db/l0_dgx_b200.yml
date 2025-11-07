@@ -70,7 +70,7 @@ l0_dgx_b200:
         - '*b200*'
       linux_distribution_name: ubuntu*
     terms:
-      stage: pre_merge
+      stage: post_merge
       backend: pytorch
       orchestrator: ray
   tests:
@@ -94,7 +94,7 @@ l0_dgx_b200:
       linux_distribution_name: ubuntu*
       cpu: x86_64
     terms:
-      stage: pre_merge
+      stage: post_merge
       backend: pytorch
       orchestrator: mpi
   tests:
