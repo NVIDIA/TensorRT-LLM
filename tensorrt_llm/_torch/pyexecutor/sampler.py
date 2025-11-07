@@ -86,7 +86,7 @@ T = TypeVar("T")
 
 @dataclass(kw_only=True)
 class SampleStateTensors:
-    new_tokens: torch.Tensor | futures.Future[torch.Tensor]
+    new_tokens: torch.Tensor
     log_probs: torch.Tensor | None = None
 
     def values(self):
@@ -627,7 +627,7 @@ class AsyncWorkerMixin:
             self._async_worker.shutdown(wait=True)
             self._async_worker = None
 
-    def _async_worker_run(self, ready, func, /, *args, **kwargs):
+    def _async_worker_run(self, ready: torch.cuda.Event, func, /, *args, **kwargs):
         # Make sure the async work takes place after all prior operations on
         # the primary stream. synchronize() is intentionally chosen instead of
         # wait() here; otherwise, blocking copies will stall subsequent CUDA
@@ -635,14 +635,7 @@ class AsyncWorkerMixin:
         ready.synchronize()
 
         # Do the work
-        result = func(*args, **kwargs)
-
-        # work submitted to the async worker is expected to block at the end,
-        # consistent with the semantics of futures; make sure that we wait for
-        # everything to complete
-        torch.cuda.current_stream().synchronize()
-
-        return result
+        return func(*args, **kwargs)
 
     def _async_worker_submit(self, func, /, *args, **kwargs):
         if self._async_worker_active():
@@ -654,6 +647,29 @@ class AsyncWorkerMixin:
         else:
             # If the async worker is not in use, just execute the function
             return func(*args, **kwargs)
+
+    def _copy_to_host(self, src: torch.Tensor, pin_memory=False) -> torch.Tensor:
+        dest = torch.empty_like(src, device="cpu", pin_memory=pin_memory)
+        self._async_worker_submit(dest.copy_, src, non_blocking=True)
+        return dest
+
+    def _sampler_event_get(self) -> torch.cuda.Event | futures.Future[torch.cuda.Event]:
+        def _get_sampler_event() -> torch.cuda.Event:
+            sampler_event = torch.cuda.Event()
+            sampler_event.record()
+            return sampler_event
+
+        return self._async_worker_submit(_get_sampler_event)
+
+    @staticmethod
+    def _sampler_event_synchronize(
+        sampler_event: torch.cuda.Event | futures.Future[torch.cuda.Event] | None,
+    ):
+        if sampler_event:
+            if isinstance(sampler_event, futures.Future):
+                sampler_event.result().synchronize()
+            else:
+                sampler_event.synchronize()
 
 
 class TorchSampler(Sampler, AsyncWorkerMixin):
@@ -680,7 +696,7 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         max_beam_width: int
         max_total_draft_tokens: int
         disable_flash_infer_sampling: bool = False
-        enable_async_worker: Optional[bool] = False
+        enable_async_worker: bool = False
 
     def __init__(self, args: Args):
         self.max_seq_len = args.max_seq_len
@@ -812,17 +828,8 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         count: int,
     ):
         if request.py_return_log_probs:
-            if self._async_worker_active():
-                # These should be futures if we used the async worker
-                assert isinstance(request.py_topk_logprobs_values, futures.Future)
-                assert isinstance(request.py_topk_logprobs_vals, futures.Future)
-                topk_log_probs_vals = request.py_topk_logprobs_vals.result()
-                topk_log_probs_indices = request.py_topk_logprobs_indices.result()
-            else:
-                topk_log_probs_vals = request.py_topk_logprobs_vals
-                topk_log_probs_indices = request.py_topk_logprobs_indices
-            topk_log_probs_vals = topk_log_probs_vals[:count]
-            topk_log_probs_indices = topk_log_probs_indices[:count]
+            topk_log_probs_vals = request.py_topk_logprobs_vals[:count]
+            topk_log_probs_indices = request.py_topk_logprobs_indices[:count]
 
             token_log_probs = [
                 {
@@ -1026,9 +1033,7 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
             new_draft_tokens_cuda.transpose(0, 1).to(torch.int, non_blocking=True).unsqueeze(dim=-1)
         )
 
-        new_draft_tokens_host = self._async_worker_submit(
-            int_new_draft_tokens.to, "cpu", non_blocking=True
-        )
+        new_draft_tokens_host = self._copy_to_host(int_new_draft_tokens)
 
         return new_draft_tokens_host
 
@@ -1145,16 +1150,10 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         resource_manager: Optional[ResourceManager] = None,
     ) -> None:
         assert isinstance(state, SampleStateTorch)
-        if state.sampler_event:
-            state.sampler_event.synchronize()
+        self._sampler_event_synchronize(state.sampler_event)
 
         assert state.host is not None
-
-        if self._async_worker_active():
-            assert isinstance(state.host.new_tokens, futures.Future)
-            new_tokens = state.host.new_tokens.result()
-        else:
-            new_tokens = state.host.new_tokens
+        new_tokens = state.host.new_tokens
         finish_reasons = state.host.finish_reasons_list()
 
         new_tokens_list = new_tokens.tolist()
@@ -1234,8 +1233,7 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         )
         finish_reasons_host = finish_reasons.to(device="cpu", non_blocking=True)
 
-        sampler_event = torch.cuda.Event()
-        sampler_event.record()
+        sampler_event = self._sampler_event_get()
         return SampleStateTorch(
             scheduled_requests=scheduled_requests,
             device=SampleStateTensors(new_tokens=new_tokens),
@@ -1495,7 +1493,7 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         new_tokens_cuda.view(-1, *new_tokens_cuda.shape[2:])[:, beam, ...].scatter_(
             0, batch_dest_indices_1d_cuda, batch_next_tokens_cuda_int
         )
-        new_tokens_host = self._async_worker_submit(new_tokens_cuda.to, "cpu", non_blocking=True)
+        new_tokens_host = self._copy_to_host(new_tokens_cuda)
 
         return new_tokens_host
 
@@ -1855,39 +1853,23 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
             topk_vals_cuda, topk_indices_cuda = torch.topk(
                 logprobs_cuda, k=max(req.py_num_logprobs for req in requests), dim=-1
             )
-
-            def _copy_log_probs(
-                requests, req_num_steps, logprobs_req_indices, topk_vals_cuda, topk_indices_cuda
+            # Use a single D2H copy to reduce overheads
+            topk_vals = self._copy_to_host(topk_vals_cuda, pin_memory=True)
+            topk_indices = self._copy_to_host(topk_indices_cuda, pin_memory=True)
+            current_offset = 0
+            for req_id, steps in zip(
+                logprobs_req_indices, req_num_steps[logprobs_req_indices].tolist()
             ):
-                # Use a single D2H copy to reduce overheads
-                topk_vals = torch.empty_like(topk_vals_cuda, device="cpu", pin_memory=True)
-                topk_indices = torch.empty_like(topk_indices_cuda, device="cpu", pin_memory=True)
-                topk_vals.copy_(topk_vals_cuda, non_blocking=True)
-                topk_indices.copy_(topk_indices_cuda, non_blocking=True)
-                current_offset = 0
-                for req_id, steps in zip(
-                    logprobs_req_indices, req_num_steps[logprobs_req_indices].tolist()
-                ):
-                    req = requests[req_id]
-                    next_offset = current_offset + steps
-                    # NB: Assigning views on memory which is being filled
-                    # asynchronously
-                    req.py_topk_logprobs_vals = topk_vals[
-                        current_offset:next_offset, : req.py_num_logprobs
-                    ]
-                    req.py_topk_logprobs_indices = topk_indices[
-                        current_offset:next_offset, : req.py_num_logprobs
-                    ]
-                    current_offset = next_offset
-
-            self._async_worker_submit(
-                _copy_log_probs,
-                requests,
-                req_num_steps,
-                logprobs_req_indices,
-                topk_vals_cuda,
-                topk_indices_cuda,
-            )
+                req = requests[req_id]
+                next_offset = current_offset + steps
+                # NB: Assigning views on memory which is being filled asynchronously
+                req.py_topk_logprobs_vals = topk_vals[
+                    current_offset:next_offset, : req.py_num_logprobs
+                ]
+                req.py_topk_logprobs_indices = topk_indices[
+                    current_offset:next_offset, : req.py_num_logprobs
+                ]
+                current_offset = next_offset
 
         # Perform sampling in batches
         batched_sampling_result = self._sample_batched_by_strategy(
@@ -1949,9 +1931,7 @@ class SampleStateTensorsHostTRTLLM(SampleStateTensors):
 class SampleStateTRTLLM(SampleState):
     finalize_events: dict[str, CudaEvent] | None = None
     """`Optional` to accommodate `_forward_step_inter_pp` which creates a `SampleState` without `finalize_events`"""
-    host: Optional[SampleStateTensorsHostTRTLLM | futures.Future[SampleStateTensorsHostTRTLLM]] = (
-        None
-    )
+    host: Optional[SampleStateTensorsHostTRTLLM] = None
 
 
 class TRTLLMSampler(Sampler, AsyncWorkerMixin):
@@ -1974,7 +1954,7 @@ class TRTLLMSampler(Sampler, AsyncWorkerMixin):
         max_beam_width: int,
         decoding_config: Optional[DecodingConfig] = None,
         kv_cache_config: Optional[KvCacheConfig] = None,
-        enable_async_worker: Optional[bool] = False,
+        enable_async_worker: bool = False,
     ):
         vocab_size = model.config.vocab_size
         num_hidden_layers = model.config.num_hidden_layers
@@ -2173,10 +2153,9 @@ class TRTLLMSampler(Sampler, AsyncWorkerMixin):
         )
 
         finalize_events = {}
-        gather_ids = False
-        decoder_state = self.store["decoder_state"]
+        gathered_ids = None
         if beam_width > 1:
-            finished_sum_device = decoder_state.finished_sum
+            finished_sum_device = self.store["decoder_state"].finished_sum
 
             for request in scheduled_requests.all_requests():
                 if request.is_context_init_state:
@@ -2185,41 +2164,31 @@ class TRTLLMSampler(Sampler, AsyncWorkerMixin):
                     finalize_events[request.request_id] = self._finalize_request(request, False)
                 elif request.streaming:
                     finalize_events[request.request_id] = self._finalize_request(request, True)
-            gather_ids = True
+            gathered_ids = self._copy_to_host(self.store["decoder_state"].gathered_ids)
+        new_output_tokens = self._copy_to_host(self.store["decoder_state"].all_new_tokens)
+        finished_sum = self._copy_to_host(self.store["decoder_state"].finished_sum)
+        finish_reasons = self._copy_to_host(self.store["decoder_state"].finish_reasons)
+        sequence_lengths = self._copy_to_host(self.store["decoder_state"].sequence_lengths)
 
-        device = SampleStateTensors(new_tokens=decoder_state.all_new_tokens)
+        log_probs = None
+        cum_log_probs = None
+        if any(request.py_return_log_probs for request in scheduled_requests.all_requests()):
+            log_probs = self._copy_to_host(self.store["decoder_state"].log_probs)
+            cum_log_probs = self._copy_to_host(self.store["decoder_state"].cum_log_probs)
 
-        def _copy_tensors_to_host(gather_ids, scheduled_requests, decoder_state):
-            gathered_ids = None
-            if gather_ids:
-                gathered_ids = decoder_state.gathered_ids.to("cpu", non_blocking=True)
-            new_output_tokens = decoder_state.all_new_tokens.to("cpu", non_blocking=True)
-            finished_sum = decoder_state.finished_sum.to("cpu", non_blocking=True)
-            finish_reasons = decoder_state.finish_reasons.to("cpu", non_blocking=True)
-            sequence_lengths = decoder_state.sequence_lengths.to("cpu", non_blocking=True)
+        device = SampleStateTensors(new_tokens=self.store["decoder_state"].all_new_tokens)
 
-            log_probs = None
-            cum_log_probs = None
-            if any(request.py_return_log_probs for request in scheduled_requests.all_requests()):
-                log_probs = decoder_state.log_probs.to("cpu", non_blocking=True)
-                cum_log_probs = decoder_state.cum_log_probs.to("cpu", non_blocking=True)
-
-            return SampleStateTensorsHostTRTLLM(
-                new_tokens=new_output_tokens,
-                finished_sum=finished_sum,
-                finish_reasons=finish_reasons,
-                sequence_lengths=sequence_lengths,
-                log_probs=log_probs,
-                cum_log_probs=cum_log_probs,
-                gathered_ids=gathered_ids,
-            )
-
-        host = self._async_worker_submit(
-            _copy_tensors_to_host, gather_ids, scheduled_requests, decoder_state
+        host = SampleStateTensorsHostTRTLLM(
+            new_tokens=new_output_tokens,
+            finished_sum=finished_sum,
+            finish_reasons=finish_reasons,
+            sequence_lengths=sequence_lengths,
+            log_probs=log_probs,
+            cum_log_probs=cum_log_probs,
+            gathered_ids=gathered_ids,
         )
 
-        sampler_event = torch.cuda.Event()
-        sampler_event.record()
+        sampler_event = self._sampler_event_get()
 
         self.micro_batch_idx = (self.micro_batch_idx + 1) % self.num_micro_batches
 
@@ -2243,13 +2212,7 @@ class TRTLLMSampler(Sampler, AsyncWorkerMixin):
         if state.scheduled_requests.batch_size == 0:
             return
 
-        if state.sampler_event:
-            state.sampler_event.synchronize()
-
-        if self._async_worker_active():
-            # Wait for and "unpack" the host tensors
-            assert isinstance(state.host, futures.Future)
-            state.host = state.host.result()
+        self._sampler_event_synchronize(state.sampler_event)
 
         beam_width = self.beam_width(state.scheduled_requests.all_requests())
 
