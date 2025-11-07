@@ -781,7 +781,7 @@ class TestBatchedSampling:
             type_to_constrain = TopK
             mixed_params_list = None
             for constraint_value in [
-                None,  # all sub-batches have a least two requests
+                None,  # all sub-batches have at least two requests
                 0,  # one sub-batch omitted
                 1,  # one size-1 sub-batch
                 OneContinguous(),  # one contiguous sub-batch, rest shuffled
