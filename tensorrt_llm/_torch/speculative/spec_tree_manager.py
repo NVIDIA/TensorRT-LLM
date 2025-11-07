@@ -1,5 +1,5 @@
 import math
-from typing import List, Optional
+from typing import List
 
 import torch
 
@@ -15,25 +15,25 @@ class SpecTreeManager:
     # The top k  list for each draft layer.
     top_k_list = []
     # The user input eagle choices, only available when using static tree.
-    eagle_choices: Optional[List[List[int]]] = None
+    eagle_choices: List[List[int]] = None
     # If dynamice tree, each request has their own tree. If static tree, all requests share the same tree.
-    num_trees: Optional[int] = None
+    num_trees: int = None
 
     # Convert the choice to a path. Each path is an array of indices from the root to other nodes in the tree.
     # shape: [num_trees, max_total_draft_tokens + 1, max_draft_len + 1]
-    eagle_paths: Optional[torch.Tensor] = None
+    eagle_paths: torch.Tensor = None
 
     # The spec decoding mask. Include the root node.
     # shape: [num_trees, max_total_draft_tokens + 1, max_total_draft_tokens + 1], device tensor.
-    spec_dec_mask_matrix: Optional[torch.Tensor] = None
+    spec_dec_mask_matrix: torch.Tensor = None
 
     # The packed decoding mask for the target model to verify the draft tokens. Pad the 0-1 matrix to int32 vector.
     # shape: [num_trees, max_total_draft_tokens + 1], device tensor.
-    spec_dec_packed_mask: Optional[torch.Tensor] = None
+    spec_dec_packed_mask: torch.Tensor = None
 
     # The spec position offsets for the target model to verify the draft tokens.
     # shape: [num_trees, max_total_draft_tokens + 1], device tensor.
-    spec_dec_position_offsets: Optional[torch.Tensor] = None
+    spec_dec_position_offsets: torch.Tensor = None
 
     # TODO: Optimized together with the subsequent dynamic tree.
     # Auxiliary buffers for the static tree.
@@ -251,14 +251,14 @@ class SpecTreeManager:
         # 11) Compute the spec_dec_packed_mask_for_drafter_model
         self.spec_dec_packed_mask_for_drafter_model = []
         for cur_gather_idx in self.tokens_gather_idx:
-            tmp_mast_matrix = self.spec_dec_mask_matrix[0][
+            tmp_mask_matrix = self.spec_dec_mask_matrix[0][
                 cur_gather_idx, :][:, cur_gather_idx]
             tmp_packed_mask = torch.zeros(
                 (1, cur_gather_idx.shape[0],
                  math.ceil((self.max_total_draft_tokens + 1) / 32)),
                 dtype=torch.int32,
                 device='cuda')
-            self.compute_spec_dec_packed_mask(tmp_mast_matrix.unsqueeze(0),
+            self.compute_spec_dec_packed_mask(tmp_mask_matrix.unsqueeze(0),
                                               tmp_packed_mask)
             self.spec_dec_packed_mask_for_drafter_model.append(
                 tmp_packed_mask.squeeze(0))

@@ -47,7 +47,7 @@ from ..modules.fused_moe.moe_load_balancer import (MoeLoadBalancer,
 from ..speculative import (SpecMetadata, get_num_extra_kv_tokens,
                            get_spec_metadata,
                            update_spec_config_from_model_config)
-from ..speculative.drafting_loops import ChainDrafter
+from ..speculative.drafting_loops import BaseDraftingLoopWrapper
 from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
 from ..speculative.mtp import SampleStateTensorsMTP
 from ..speculative.utils import SpecDecodingTensor
@@ -776,7 +776,7 @@ class PyTorchModelEngine(ModelEngine):
 
     def _get_num_extra_decoding_steps(self) -> int:
         """Determines extra decoding steps needed for fused drafting loops."""
-        if isinstance(self.model, ChainDrafter):
+        if isinstance(self.model, BaseDraftingLoopWrapper):
             return self.model.max_total_draft_tokens
         else:
             assert not self.model_is_wrapped, (
