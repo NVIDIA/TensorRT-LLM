@@ -1556,7 +1556,8 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                        weight_vec_size,
                        block_scales_dtype,
                        block_scales_vec_size,
-                       scaling_vector_size=16):
+                       scaling_vector_size=16,
+                       bias_dtype: Optional[torch.dtype] = None):
 
         module.scaling_vector_size = scaling_vector_size
         # Divide by 16 because we use int64 to pack 16 fp4 values
@@ -1606,8 +1607,11 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                                  requires_grad=False)
         module.register_parameter("fc2_alpha", fc2_alpha)
 
-        super().create_weights(module, weight_dtype, w3_w1_weight_shape,
-                               w2_weight_shape)
+        super().create_weights(module,
+                               weight_dtype,
+                               w3_w1_weight_shape,
+                               w2_weight_shape,
+                               bias_dtype=bias_dtype)
 
         self.setup_quant_scales(module)
 
@@ -1902,8 +1906,12 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
         weight_vec_size = torch.iinfo(self.weight_dtype).bits // 4
         block_scales_vec_size = 1
 
-        super().create_weights(module, self.weight_dtype, weight_vec_size,
-                               self.block_scales_dtype, block_scales_vec_size)
+        super().create_weights(module,
+                               self.weight_dtype,
+                               weight_vec_size,
+                               self.block_scales_dtype,
+                               block_scales_vec_size,
+                               bias_dtype=torch.float32)
 
         fc31_scale_c = nn.Parameter(torch.ones(module.expert_size_per_partition,
                                                dtype=torch.float32),
