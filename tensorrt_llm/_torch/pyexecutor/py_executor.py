@@ -1113,7 +1113,6 @@ class PyExecutor:
                     else:
                         self.ctx_in_transmission_requests[req.py_request_id] = (
                             request, block_id, counter - 1)
-                    break
 
     def _kv_connector_wait_for_save(self):
         if self.kv_connector_manager is not None:
