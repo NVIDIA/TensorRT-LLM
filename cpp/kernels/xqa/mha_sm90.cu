@@ -2753,21 +2753,22 @@ __device__ inline void storeGemm0AccToShm(
 #if CACHE_ELEM_ENUM == 0
     uint32_t const idxRow = lane % 8;
     barConsumed.arrive_and_wait();
-    // todo: change to stmatrix_4x
 #pragma unroll
     for (uint32_t m = 0; m < Gemm0Acc::rows; m++)
     {
 #pragma unroll
         for (uint32_t i = 0; i < GmmaAccCoreMat::rows; i++)
         {
+            static_assert(Gemm0Acc::cols % 4 == 0);
 #pragma unroll
-            for (uint32_t n = 0; n < Gemm0Acc::cols; n++)
+            for (uint32_t nPartIdx = 0; nPartIdx < Gemm0Acc::cols / 4; nPartIdx++)
             {
-                Vec<CacheElem, 2> f16data{acc(m, n)(i, 0), acc(m, n)(i, 1)};
-                auto const dstAddr = lane < 8
-                    ? &smemX[m].template at<true>(gmma::instM * m + 16 * warpRank + 8 * i + idxRow, n)
-                    : nullptr;
-                stmatrix<false>(dstAddr, reinterpret_cast<Vec<uint32_t, 1> const&>(f16data));
+                Vec<CacheElem, 8> f16data{acc(m, 4 * nPartIdx + 0)(i, 0), acc(m, 4 * nPartIdx + 0)(i, 1),
+                    acc(m, 4 * nPartIdx + 1)(i, 0), acc(m, 4 * nPartIdx + 1)(i, 1), acc(m, 4 * nPartIdx + 2)(i, 0),
+                    acc(m, 4 * nPartIdx + 2)(i, 1), acc(m, 4 * nPartIdx + 3)(i, 0), acc(m, 4 * nPartIdx + 3)(i, 1)};
+                auto const dstAddr = &smemX[m].template at<true>(
+                    gmma::instM * m + 16 * warpRank + 8 * i + idxRow, 4 * nPartIdx + lane / 8);
+                stmatrix<false, 4>(dstAddr, reinterpret_cast<Vec<uint32_t, 4> const&>(f16data));
             }
         }
     }
@@ -3264,14 +3265,17 @@ __device__ inline void finalizeAndWriteOut_sync(uint32_t warpRank, DstHead* dst,
 #pragma unroll
         for (uint32_t i = 0; i < GmmaAccCoreMat::rows; i++)
         {
+            static_assert(Gemm1Acc::cols % 4 == 0);
 #pragma unroll
-            for (uint32_t n = 0; n < Gemm1Acc::cols; n++)
+            for (uint32_t nPartIdx = 0; nPartIdx < Gemm1Acc::cols / 4; nPartIdx++)
             {
-                Vec<DstElem, 2> data = convert<DstElem>(Vec<float, 2>{acc(m, n)(i, 0), acc(m, n)(i, 1)});
-                auto const dstAddr = lane < 8
-                    ? &swizzleBuf.template at<true>(gmma::instM * m + 16 * warpRank + 8 * i + idxRow, n)
-                    : nullptr;
-                stmatrix<false>(
+                Vec<DstElem, 8> data = convert<DstElem>(Vec<float, 8>{acc(m, 4 * nPartIdx + 0)(i, 0),
+                    acc(m, 4 * nPartIdx + 0)(i, 1), acc(m, 4 * nPartIdx + 1)(i, 0), acc(m, 4 * nPartIdx + 1)(i, 1),
+                    acc(m, 4 * nPartIdx + 2)(i, 0), acc(m, 4 * nPartIdx + 2)(i, 1), acc(m, 4 * nPartIdx + 3)(i, 0),
+                    acc(m, 4 * nPartIdx + 3)(i, 1)});
+                auto const dstAddr = &swizzleBuf.template at<true>(
+                    gmma::instM * m + 16 * warpRank + 8 * i + idxRow, 4 * nPartIdx + lane / 8);
+                stmatrix<false, 4>(
                     dstAddr, reinterpret_cast<Vec<uint32_t, exactDiv(sizeof(data), sizeof(uint32_t))> const&>(data));
             }
         }
