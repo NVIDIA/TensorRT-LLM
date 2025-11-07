@@ -213,6 +213,17 @@ class CutlassFusedMoE(MoE):
         ) and not self.quant_config.layer_quant_mode.has_per_group_scaling()
 
     def select_alltoall_method_type(self) -> AlltoallMethodType:
+        # If no attention DP, no need to use AlltoAll.
+        if self.mapping.dp_size == 1:
+            return AlltoallMethodType.NotEnabled
+
+        # AlltoAll cannot support MoE TP.
+        if self.mapping.moe_tp_size != 1:
+            return AlltoallMethodType.NotEnabled
+
+        if not MnnvlMemory.supports_mnnvl():
+            return AlltoallMethodType.NotEnabled
+
         all2all_method_type = os.environ.get("TRTLLM_FORCE_ALLTOALL_METHOD")
         if all2all_method_type is not None:
             if AlltoallMethodType[all2all_method_type] in [
@@ -224,18 +235,7 @@ class CutlassFusedMoE(MoE):
                 )
             return AlltoallMethodType[all2all_method_type]
 
-        # If no attention DP, no need to use AlltoAll.
-        if self.mapping.dp_size == 1:
-            return AlltoallMethodType.NotEnabled
-
-        # AlltoAll cannot support MoE TP.
-        if self.mapping.moe_tp_size != 1:
-            return AlltoallMethodType.NotEnabled
-
         if os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") == "1":
-            return AlltoallMethodType.NotEnabled
-
-        if not MnnvlMemory.supports_mnnvl():
             return AlltoallMethodType.NotEnabled
 
         # TODO: We found that MNNVL performs better than NCCL AllGather/ReduceScatter,
