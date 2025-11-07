@@ -76,8 +76,26 @@ def _quantize_fp8(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return (x / scale).clamp(FP8_MIN, FP8_MAX).to(torch.float8_e4m3fn)
 
 
-@torch.library.custom_op("auto_deploy::trtllm_quant_fp8moe_fused", mutates_args=())
-def trtllm_quant_fp8moe_fused(
+def _validate_mlp_style_and_act_fn(mlp_style: str, act_fn: str) -> None:
+    supported_combinations = {
+        "gated_mlp": ["silu"],
+        "mlp": ["relu2"],
+    }
+    supported_act_fns = [
+        act_fn for act_fn_list in supported_combinations.values() for act_fn in act_fn_list
+    ]
+    assert mlp_style in supported_combinations.keys(), (
+        f"Unknown mlp_style '{mlp_style}'. Use {supported_combinations.keys()}."
+    )
+    assert act_fn in supported_act_fns, f"Unknown act_fn '{act_fn}'. Use {supported_act_fns}."
+    assert act_fn in supported_combinations[mlp_style], (
+        f"Unsupported combination: mlp_style='{mlp_style}', act_fn='{act_fn}'. "
+        f"Supported combinations: {supported_combinations}"
+    )
+
+
+@torch.library.custom_op("auto_deploy::trtllm_quant_fp8_moe_fused", mutates_args=())
+def trtllm_quant_fp8_moe_fused(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
@@ -110,21 +128,27 @@ def trtllm_quant_fp8moe_fused(
         w3_weight_scale: Weight scales for w3 [E]
         mlp_style: "gated_mlp" or "mlp"
         act_fn: "silu" for gated_mlp, "relu2" for mlp
+
+    Non-Gated MLP:
+        activation_fn(expert_inputs @ w1_expert.t())@ w2_expert.t()
+
+    Gated MLP:
+        activation_fn(expert_inputs @ w1_expert.t()) * (expert_inputs @ w3_expert.t()) @ w2_expert.t()
     """
 
-    # if mlp_style != "gated_mlp":
-    #     raise NotImplementedError("FlashInfer FP8 MoE currently only supports gated_mlp")
+    _validate_mlp_style_and_act_fn(mlp_style, act_fn)
 
     # Store original shape and flatten to 2D
     x_shape = x.shape
     x2d = x.view(-1, x_shape[-1])
-    x_q_fp8 = _quantize_fp8(x2d, w1_input_scale)
+    # Quantize input
+    x_q_fp8 = _quantize_fp8(x2d, w1_input_scale[0])
 
     # Scales are stored in float32
     w1_weight_scale = w1_weight_scale.to(torch.float32)
     w2_weight_scale = w2_weight_scale.to(torch.float32)
-    w1_input_scale = w1_input_scale.to(torch.float32)
-    w2_input_scale = w2_input_scale.to(torch.float32)
+    w1_input_scale = w1_input_scale.to(torch.float32)[0]
+    w2_input_scale = w2_input_scale.to(torch.float32)[0]
 
     # Prepare quant_scales for TensorRT-LLM FP8 format:
     # [gemm1_dequant_scale, gemm2_act_quant_scale, gemm2_dequant_scale, gemm1_input_dequant_scale]
@@ -136,7 +160,7 @@ def trtllm_quant_fp8moe_fused(
 
     # Compute combined scales
     gemm1_dequant = (w1_weight_scale * w1_input_scale).contiguous().squeeze()
-    gemm2_act_quant = (1.0 / w2_input_scale).contiguous().to(torch.float32)  # [E]
+    gemm2_act_quant = (1.0 / w2_input_scale).contiguous().to(torch.float32)
     gemm2_dequant = (w2_weight_scale * w2_input_scale).contiguous().squeeze()
     gemm1_input_dequant = w1_input_scale.contiguous()
 
@@ -145,7 +169,7 @@ def trtllm_quant_fp8moe_fused(
     quant_scales = [gemm1_dequant, gemm2_act_quant, gemm2_dequant, gemm1_input_dequant]
 
     # Ensure contiguous tensors
-    selected_experts = selected_experts.contiguous()
+    selected_experts = selected_experts.int().contiguous()
     routing_weights = routing_weights.contiguous()
 
     # Todo: refactor this repeating code block
@@ -194,8 +218,8 @@ def trtllm_quant_fp8moe_fused(
     return output[0].view(x_shape)
 
 
-@trtllm_quant_fp8moe_fused.register_fake
-def trtllm_quant_fp8moe_fused_fake(
+@trtllm_quant_fp8_moe_fused.register_fake
+def trtllm_quant_fp8_moe_fused_fake(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
@@ -208,7 +232,7 @@ def trtllm_quant_fp8moe_fused_fake(
     w1_weight_scale: torch.Tensor,
     w2_weight_scale: torch.Tensor,
     w3_weight_scale: torch.Tensor,
-    mlp_style: str = "gated_mlp",
-    act_fn: str = "silu",
+    mlp_style: str,
+    act_fn: str,
 ) -> torch.Tensor:
     return torch.empty_like(x)
