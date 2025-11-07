@@ -133,7 +133,7 @@ inline std::string toString(AllReduceStrategyType op)
 }
 
 // Helper function to determine if a strategy should skip topology detection
-// These strategies manage connectivity internally or are designed for specific hardware
+// These strategies manage connectivity internally
 inline bool shouldSkipTopologyDetection(AllReduceStrategyType strategy)
 {
     return (strategy == AllReduceStrategyType::NCCL || strategy == AllReduceStrategyType::NCCL_SYMMETRIC

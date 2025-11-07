@@ -824,6 +824,12 @@ int AllreducePlugin::initialize() noexcept
     {
         initGroupTopology();
     }
+    else
+    {
+        // For strategies that skip topology detection, assume connectivity is supported
+        mIsP2PSupported = true;
+        mIsNVLINKSupported = true;
+    }
 
     TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
     return 0;
