@@ -21,7 +21,8 @@ from ..distributed.communicator import pp_recv, pp_send
 from ..model_config import ModelConfig, TConfig
 from ..modules.attention import Attention
 from ..modules.embedding import Embedding, LMHead
-from ..modules.fused_moe import MoE, VanillaMoE
+from ..modules.fused_moe import (MoE, MoeOffloadManager, MoeOffloadProxy,
+                                 VanillaMoE)
 from ..modules.linear import Linear, TensorParallelMode, WeightMode
 from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
@@ -239,6 +240,43 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
         self.prologue = []
         self.epilogue = []
         self.keep_embed_tokens = False
+
+    # Helper function for moe models to retrieve moe layer patterns
+    @staticmethod
+    def _moe_layer_pattern(_model_config: ModelConfig):
+        # default: all layers' MLP are moe
+        moe_layer_freq = 1
+        first_k_dense_replace = 0
+        moe_layer_offset = 0
+
+        return moe_layer_freq, first_k_dense_replace, moe_layer_offset
+
+    def __moe_offload_init__(self, model_config: ModelConfig):
+        self.use_moe_offload = False
+        self.moe_offload_manager = None
+        self.moe_offload_proxy_list = [
+            None
+            for _ in range(model_config.pretrained_config.num_hidden_layers)
+        ]
+        if model_config.moe_offload_config is not None:
+            self.use_moe_offload = True
+
+            # calculate moe layer indices
+            moe_layer_freq, first_k_dense_replace, moe_layer_offset = self._moe_layer_pattern(
+                model_config)
+            num_hidden_layers = model_config.pretrained_config.num_hidden_layers
+            moe_layer_indices = [
+                i for i in range(num_hidden_layers)
+                if i >= first_k_dense_replace and (i + moe_layer_offset) %
+                moe_layer_freq == 0
+            ]
+
+            self.moe_offload_manager = MoeOffloadManager(
+                moe_layer_indices, model_config.moe_offload_config.capacity,
+                model_config.moe_offload_config.stride)
+            for layer_idx in self.moe_offload_manager.offload_layer_indices:
+                self.moe_offload_proxy_list[layer_idx] = MoeOffloadProxy(
+                    layer_idx, self.moe_offload_manager)
 
     def forward(
         self,

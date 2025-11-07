@@ -16,6 +16,7 @@ from .fused_moe_vanilla import VanillaMoE
 from .fused_moe_wide_ep import WideEPMoE
 from .interface import MoE, MoEWeightLoadingMode
 from .moe_load_balancer import get_moe_load_balancer
+from .moe_offload_manager import MoeOffloadProxy
 from .routing import BaseMoeRoutingMethod
 
 
@@ -74,6 +75,7 @@ def create_moe(
     swiglu_alpha: Optional[torch.Tensor] = None,
     swiglu_beta: Optional[torch.Tensor] = None,
     swiglu_limit: Optional[torch.Tensor] = None,
+    moe_offload_proxy: Optional[MoeOffloadProxy] = None,
 ) -> MoE:
     moe_cls = get_moe_cls(model_config, override_quant_config)
 
@@ -112,6 +114,7 @@ def create_moe(
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
+            moe_offload_proxy=moe_offload_proxy,
         )
     elif moe_cls == CutlassFusedMoE:
         return moe_cls(
@@ -130,6 +133,7 @@ def create_moe(
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
+            moe_offload_proxy=moe_offload_proxy,
         )
     elif moe_cls == WideEPMoE:
         return moe_cls(

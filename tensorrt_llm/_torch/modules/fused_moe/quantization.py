@@ -174,16 +174,29 @@ class FusedMoEMethodBase(ABC):
         w3_w1_bias_shape: Optional[tuple[int, int]] = None,
         w2_bias_shape: Optional[tuple[int, int]] = None,
     ):
-        # Fused gate_up_proj (column parallel)
-        w3_w1_weight = nn.Parameter(torch.empty(w3_w1_weight_shape,
-                                                dtype=weight_dtype),
-                                    requires_grad=False)
-        module.register_parameter("w3_w1_weight", w3_w1_weight)
+        if module.use_offload:
+            w3_w1_weight = nn.Parameter(torch.empty(
+                w3_w1_weight_shape,
+                dtype=weight_dtype,
+                device=torch.device("cpu")).pin_memory(),
+                                        requires_grad=False)
+            w2_weight = nn.Parameter(
+                torch.empty(w2_weight_shape,
+                            dtype=weight_dtype,
+                            device=torch.device("cpu")).pin_memory(),
+                requires_grad=False)
+            module.offload_proxy.register_weight(w3_w1_weight, w2_weight)
+        else:
+            # Fused gate_up_proj (column parallel)
+            w3_w1_weight = nn.Parameter(torch.empty(w3_w1_weight_shape,
+                                                    dtype=weight_dtype),
+                                        requires_grad=False)
+            # down_proj (row parallel)
+            w2_weight = nn.Parameter(torch.empty(w2_weight_shape,
+                                                 dtype=weight_dtype),
+                                     requires_grad=False)
 
-        # down_proj (row parallel)
-        w2_weight = nn.Parameter(torch.empty(w2_weight_shape,
-                                             dtype=weight_dtype),
-                                 requires_grad=False)
+        module.register_parameter("w3_w1_weight", w3_w1_weight)
         module.register_parameter("w2_weight", w2_weight)
 
         # bias
@@ -1874,7 +1887,10 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
                                  w3_weight: torch.Tensor,
                                  dst_w3_w1_weight: torch.Tensor):
         device = dst_w3_w1_weight.device
-        assert device.type == "cuda"
+        if module.use_offload:
+            assert (device.type == "cpu" and dst_w3_w1_weight.is_pinned())
+        else:
+            assert device.type == "cuda"
         w1_weight_shard = load_weight_shard(w1_weight,
                                             module.tp_size,
                                             module.tp_rank,
@@ -1913,7 +1929,10 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
                               w2_weight: torch.Tensor,
                               dst_w2_weight: torch.Tensor):
         device = dst_w2_weight.device
-        assert device.type == "cuda"
+        if module.use_offload:
+            assert (device.type == "cpu" and dst_w2_weight.is_pinned())
+        else:
+            assert device.type == "cuda"
         w2_weight_shard = load_weight_shard(w2_weight,
                                             module.tp_size,
                                             module.tp_rank,

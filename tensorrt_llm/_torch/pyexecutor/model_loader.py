@@ -308,6 +308,7 @@ class ModelLoader:
             moe_backend=self.llm_args.moe_config.backend,
             moe_disable_finalize_fusion=self.llm_args.moe_config.
             disable_finalize_fusion,
+            moe_offload_config=self.llm_args.moe_config.offload_config,
             use_low_precision_moe_combine=self.llm_args.moe_config.
             use_low_precision_moe_combine)
 

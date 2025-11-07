@@ -17,7 +17,8 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (is_nemotron_hybrid,
 from tensorrt_llm._utils import get_sm_version, torch_dtype_to_binding
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
-from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
+from tensorrt_llm.llmapi.llm_args import (DeepSeekSparseAttentionConfig,
+                                          MoeOffloadConfig)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -124,6 +125,7 @@ class ModelConfig(Generic[TConfig]):
     spec_config: Optional["DecodingBaseConfig"] = None
     lora_config: Optional["LoraConfig"] = None
     sparse_attention_config: Optional["SparseAttentionConfig"] = None
+    moe_offload_config: Optional[MoeOffloadConfig] = None
 
     is_generation: bool = True
     max_num_tokens: int = 8192

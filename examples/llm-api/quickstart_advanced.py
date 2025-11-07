@@ -4,8 +4,8 @@ from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import (AttentionDpConfig, AutoDecodingConfig,
                                  CudaGraphConfig, DraftTargetDecodingConfig,
                                  EagleDecodingConfig, KvCacheConfig, MoeConfig,
-                                 MTPDecodingConfig, NGramDecodingConfig,
-                                 TorchCompileConfig)
+                                 MoeOffloadConfig, MTPDecodingConfig,
+                                 NGramDecodingConfig, TorchCompileConfig)
 
 example_prompts = [
     "Hello, my name is",
@@ -115,6 +115,11 @@ def add_llm_args(parser):
     parser.add_argument('--apply_chat_template',
                         default=False,
                         action='store_true')
+    parser.add_argument(
+        '--use_moe_offload',
+        default=False,
+        action='store_true',
+        help='Enable MoE weight offloading to reduce GPU memory usage')
 
     # Sampling
     parser.add_argument("--max_tokens", type=int, default=64)
@@ -248,7 +253,9 @@ def setup_llm(args, **kwargs):
             enable_piecewise_cuda_graph= \
                 args.use_piecewise_cuda_graph)
         if args.use_torch_compile else None,
-        moe_config=MoeConfig(backend=args.moe_backend, use_low_precision_moe_combine=args.use_low_precision_moe_combine),
+        moe_config=MoeConfig(backend=args.moe_backend,
+                             use_low_precision_moe_combine=args.use_low_precision_moe_combine,
+                             offload_config=MoeOffloadConfig() if args.use_moe_offload else None),
         sampler_type=args.sampler_type,
         max_seq_len=args.max_seq_len,
         max_batch_size=args.max_batch_size,
