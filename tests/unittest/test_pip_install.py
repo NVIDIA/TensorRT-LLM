@@ -150,6 +150,41 @@ def install_tensorrt_llm():
     subprocess.check_call(install_command, shell=True)
 
 
+# NOTE: This routine is copied from from tests/unittests/utils/llm_data.py
+def llm_models_root(check=False) -> Optional[Path]:
+    root = Path("/home/scratch.trt_llm_data/llm-models/")
+
+    if "LLM_MODELS_ROOT" in os.environ:
+        root = Path(os.environ.get("LLM_MODELS_ROOT"))
+
+    if not root.exists():
+        root = Path("/scratch.trt_llm_data/llm-models/")
+
+    if check:
+        assert root.exists(), (
+            "You shall set LLM_MODELS_ROOT env or be able to access /home/scratch.trt_llm_data to run this test"
+        )
+
+    return root if root.exists() else None
+
+
+def create_link_for_models():
+    models_root = llm_models_root()
+    if not models_root.exists():
+        print(f"ERROR: Models root {models_root} does not exist")
+        exit(1)
+    src_dst_dict = {
+        # TinyLlama-1.1B-Chat-v1.0
+        f"{models_root}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0":
+        f"{os.getcwd()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+
 def test_pip_install():
     parser = argparse.ArgumentParser(description="Check Pip Install")
     parser.add_argument("--wheel_path",
@@ -178,6 +213,10 @@ def test_pip_install():
         shell=True)
     print("##########  Verify license files  ##########")
     verify_license_files()
+
+    print("##########  Create link for models  ##########")
+    create_link_for_models()
+
     print("##########  Test quickstart example  ##########")
     subprocess.check_call(
         "python3 ../../examples/llm-api/quickstart_example.py", shell=True)
