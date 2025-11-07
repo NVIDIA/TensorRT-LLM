@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Integration test for build_and_run_flux.py with multiple quantization formats."""
+
+import importlib.util
 import os
 import subprocess
 import sys
@@ -21,25 +23,22 @@ from pathlib import Path
 import pytest
 import torch
 
-# Import CLIP for similarity validation - check availability
-try:
-    CLIP_AVAILABLE = True
-except ImportError:
-    CLIP_AVAILABLE = False
-
-# Add examples/auto_deploy to path
-EXAMPLES_AUTO_DEPLOY = Path(
-    __file__).parent.parent.parent.parent.parent / "examples" / "auto_deploy"
-sys.path.insert(0, str(EXAMPLES_AUTO_DEPLOY))
-
-from build_and_run_flux import clip_model as load_clip_model
-from build_and_run_flux import compute_clip_similarity
-
+from examples.auto_deploy.build_and_run_flux import clip_model as load_clip_model
+from examples.auto_deploy.build_and_run_flux import compute_clip_similarity
 from tensorrt_llm._torch.auto_deploy.utils.logger import ad_logger
+
+# Set up paths
+EXAMPLES_AUTO_DEPLOY = (
+    Path(__file__).parent.parent.parent.parent.parent / "examples" / "auto_deploy"
+)
+
+# Check if CLIP is available
+CLIP_AVAILABLE = importlib.util.find_spec("transformers") is not None
 
 
 class FluxTestConfig:
     """Configuration for Flux integration test."""
+
     MODEL_ID = os.environ.get("FLUX_MODEL_ID", "black-forest-labs/FLUX.1-dev")
     PROMPT = "a photo of an astronaut riding a horse on mars"
     MIN_CLIP_SIMILARITY = 0.25
@@ -61,8 +60,7 @@ def clip_model():
     return load_clip_model()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(),
-                    reason="CUDA required for Flux model")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for Flux model")
 @pytest.mark.slow  # Mark as slow test
 class TestFluxIntegration:
     """Integration tests for Flux model with different quantization formats."""
@@ -76,23 +74,28 @@ class TestFluxIntegration:
                 FluxTestConfig.FP8_CHECKPOINT,
                 marks=pytest.mark.skipif(
                     FluxTestConfig.FP8_CHECKPOINT is None
-                    or not (FluxTestConfig.FP8_CHECKPOINT
-                            and os.path.exists(FluxTestConfig.FP8_CHECKPOINT)),
-                    reason="FP8 checkpoint not available"),
+                    or not (
+                        FluxTestConfig.FP8_CHECKPOINT
+                        and os.path.exists(FluxTestConfig.FP8_CHECKPOINT)
+                    ),
+                    reason="FP8 checkpoint not available",
+                ),
             ),
             pytest.param(
                 "fp4",
                 FluxTestConfig.FP4_CHECKPOINT,
                 marks=pytest.mark.skipif(
                     FluxTestConfig.FP4_CHECKPOINT is None
-                    or not (FluxTestConfig.FP4_CHECKPOINT
-                            and os.path.exists(FluxTestConfig.FP4_CHECKPOINT)),
-                    reason="FP4 checkpoint not available"),
+                    or not (
+                        FluxTestConfig.FP4_CHECKPOINT
+                        and os.path.exists(FluxTestConfig.FP4_CHECKPOINT)
+                    ),
+                    reason="FP4 checkpoint not available",
+                ),
             ),
         ],
     )
-    def test_flux_e2e_with_clip_validation(self, precision, checkpoint_path,
-                                           clip_model, tmp_path):
+    def test_flux_e2e_with_clip_validation(self, precision, checkpoint_path, clip_model, tmp_path):
         """End-to-end test for Flux model with CLIP similarity validation.
 
         Tests:
@@ -130,25 +133,19 @@ class TestFluxIntegration:
         if result.returncode != 0:
             ad_logger.error(f"Script stdout:\n{result.stdout}")
             ad_logger.error(f"Script stderr:\n{result.stderr}")
-            pytest.fail(
-                f"build_and_run_flux.py failed with return code {result.returncode}"
-            )
+            pytest.fail(f"build_and_run_flux.py failed with return code {result.returncode}")
 
         # Verify image was generated
-        assert output_image.exists(
-        ), f"Output image not found at {output_image}"
+        assert output_image.exists(), f"Output image not found at {output_image}"
 
         # Compute CLIP similarity
-        similarity = compute_clip_similarity(str(output_image),
-                                             FluxTestConfig.PROMPT, clip_model)
-        ad_logger.info(
-            f"CLIP similarity score for {precision}: {similarity:.4f}")
+        similarity = compute_clip_similarity(str(output_image), FluxTestConfig.PROMPT, clip_model)
+        ad_logger.info(f"CLIP similarity score for {precision}: {similarity:.4f}")
 
         # Assert similarity is above threshold
         assert similarity >= FluxTestConfig.MIN_CLIP_SIMILARITY, (
             f"CLIP similarity {similarity:.4f} is below threshold {FluxTestConfig.MIN_CLIP_SIMILARITY}. "
-            f"Image may not match prompt: '{FluxTestConfig.PROMPT}'")
-
-        ad_logger.info(
-            f"✓ Test passed for {precision}: CLIP similarity = {similarity:.4f}"
+            f"Image may not match prompt: '{FluxTestConfig.PROMPT}'"
         )
+
+        ad_logger.info(f"✓ Test passed for {precision}: CLIP similarity = {similarity:.4f}")
