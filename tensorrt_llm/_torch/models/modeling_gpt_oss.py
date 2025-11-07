@@ -660,6 +660,72 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
             module_weights = filter_weights(name, weights)
 
             if isinstance(module, MoE):
+                # Fast-path: NVFP4 HF ckpt for fused gate_up MoE
+                if getattr(module, "quant_config", None) is not None and \
+                   module.quant_config.quant_mode.has_nvfp4():
+                    gate_up = module_weights.get('gate_up_proj', None)
+                    down = module_weights.get('down_proj', None)
+                    gate_up_bias = module_weights.get('gate_up_proj_bias', None)
+                    down_bias = module_weights.get('down_proj_bias', None)
+
+                    # Optional deinterleave for checkpoints that interleave gate/up
+                    if gate_up is not None and gate_up.dim() == 3:
+                        try:
+                            g, u = gate_up[:, :, ::2], gate_up[:, :, 1::2]
+                            gate_up = torch.cat([g, u], dim=-1)
+                            if gate_up_bias is not None:
+                                gb, ub = gate_up_bias[:, ::
+                                                      2], gate_up_bias[:, 1::2]
+                                gate_up_bias = torch.cat([gb, ub], dim=-1)
+                        except Exception:
+                            pass
+
+                    moe_weights = {}
+                    if gate_up is not None:
+                        moe_weights['gate_up_proj'] = [
+                            gate_up[i, :, :].transpose(0, 1)
+                            for i in range(num_expert)
+                        ]
+                    if down is not None:
+                        moe_weights['down_proj'] = [
+                            down[i, :, :].transpose(0, 1)
+                            for i in range(num_expert)
+                        ]
+                    if gate_up_bias is not None:
+                        moe_weights['gate_up_proj.bias'] = [
+                            gate_up_bias[i, :] for i in range(num_expert)
+                        ]
+                    if down_bias is not None:
+                        moe_weights['down_proj.bias'] = [
+                            down_bias[i, :] for i in range(num_expert)
+                        ]
+
+                    # Per-expert block scales (transpose to expected layout)
+                    if 'gate_up_proj_weight_scale' in module_weights:
+                        gu_ws = module_weights['gate_up_proj_weight_scale']
+                        moe_weights['gate_up_proj_weight_scale'] = [
+                            gu_ws[i, :, :].transpose(0, 1)
+                            for i in range(num_expert)
+                        ]
+                    if 'down_proj_weight_scale' in module_weights:
+                        dp_ws = module_weights['down_proj_weight_scale']
+                        moe_weights['down_proj_weight_scale'] = [
+                            dp_ws[i, :, :].transpose(0, 1)
+                            for i in range(num_expert)
+                        ]
+
+                    # Module-level globals for NVFP4 loaders
+                    for src_key in [
+                            'gate_up_proj_weight_scale_2',
+                            'down_proj_weight_scale_2',
+                            'gate_up_proj_input_scale',
+                            'down_proj_input_scale',
+                    ]:
+                        if src_key in module_weights:
+                            moe_weights[src_key] = module_weights[src_key]
+
+                    module.load_weights(weights=[moe_weights])
+                    continue
                 try:
                     # For BF16 ckpt.
                     # Deinterleave for gate and up.
