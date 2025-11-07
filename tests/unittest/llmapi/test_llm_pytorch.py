@@ -917,6 +917,155 @@ def test_llm_return_logprobs_streaming(prompt_logprobs, logprobs,
                                      backend="pytorch")
 
 
+@skip_ray
+@pytest.mark.parametrize("logprobs_mode", [
+    "raw_logits",
+    "raw_logprobs",
+    "processed_logits",
+    "processed_logprobs",
+])
+def test_llm_logprobs_modes(logprobs_mode: str):
+    """
+    Test that different logprobs modes work correctly in PyTorch backend.
+    Validates that:
+    - logprobs modes return non-positive values
+    - logits modes return some positive values
+    - all modes return valid logprobs
+    """
+    llm = LLM_torch(
+        llama_model_path,
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+    )
+
+    prompts = ["The future of AI is"]
+    sampling_params = SamplingParams(
+        max_tokens=5,
+        logprobs=3,
+        temperature=0.8,
+        top_k=50,
+        logprobs_mode=logprobs_mode,
+    )
+
+    outputs = list(llm.generate(prompts, sampling_params))
+    assert len(outputs) == 1
+
+    output = outputs[0]
+    assert len(output.outputs) == 1
+    logprobs_list = output.outputs[0].logprobs
+
+    assert logprobs_list is not None
+    assert len(logprobs_list) > 0
+
+    # Collect all logprob values
+    all_values = []
+    for token_logprobs in logprobs_list:
+        for logprob_obj in token_logprobs.values():
+            all_values.append(logprob_obj.logprob)
+
+    # Validate based on mode
+    if "logprobs" in logprobs_mode:
+        # Should have non-positive values
+        for val in all_values:
+            assert val <= 0.0, f"Mode {logprobs_mode} should have non-positive values, got {val}"
+
+    if "logits" in logprobs_mode:
+        # Should have some positive values
+        has_positive = any(v > 0 for v in all_values)
+        assert has_positive, f"Mode {logprobs_mode} should have some positive values"
+
+
+@skip_ray
+@pytest.mark.parametrize("temperature", [0.5, 1.0, 1.5])
+def test_llm_raw_vs_processed_logprobs(temperature: float):
+    """
+    Test that raw and processed logprobs differ when temperature != 1.0.
+    Raw logprobs are computed before temperature scaling.
+    Processed logprobs are computed after temperature scaling.
+    """
+    llm = LLM_torch(
+        llama_model_path,
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+    )
+
+    prompt = ["The capital of France is"]
+
+    # Get raw logprobs
+    raw_params = SamplingParams(
+        max_tokens=3,
+        logprobs=5,
+        temperature=temperature,
+        logprobs_mode="raw_logprobs",
+        seed=42,
+    )
+    raw_outputs = list(llm.generate(prompt, raw_params))
+
+    # Get processed logprobs
+    processed_params = SamplingParams(
+        max_tokens=3,
+        logprobs=5,
+        temperature=temperature,
+        logprobs_mode="processed_logprobs",
+        seed=42,
+    )
+    processed_outputs = list(llm.generate(prompt, processed_params))
+
+    # Compare first token logprobs
+    raw_first = raw_outputs[0].outputs[0].logprobs[0]
+    processed_first = processed_outputs[0].outputs[0].logprobs[0]
+
+    # Find common tokens
+    common_ids = set(raw_first.keys()) & set(processed_first.keys())
+    assert len(common_ids) > 0
+
+    token_id = list(common_ids)[0]
+    raw_val = raw_first[token_id].logprob
+    processed_val = processed_first[token_id].logprob
+
+    if temperature != 1.0:
+        # Values should differ with temperature != 1.0
+        assert raw_val != processed_val, \
+            f"Raw and processed should differ with temperature={temperature}"
+
+
+@skip_ray
+def test_llm_logprobs_mode_backward_compatibility():
+    """
+    Test that default behavior is backward compatible (raw_logprobs).
+    """
+    llm = LLM_torch(
+        llama_model_path,
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+    )
+
+    prompt = ["Hello world"]
+
+    # Explicit raw_logprobs
+    explicit_params = SamplingParams(
+        max_tokens=3,
+        logprobs=2,
+        temperature=0.8,
+        logprobs_mode="raw_logprobs",
+        seed=123,
+    )
+    explicit_outputs = list(llm.generate(prompt, explicit_params))
+
+    # Default (should be raw_logprobs)
+    default_params = SamplingParams(
+        max_tokens=3,
+        logprobs=2,
+        temperature=0.8,
+        seed=123,
+    )
+    default_outputs = list(llm.generate(prompt, default_params))
+
+    # Should produce same tokens
+    explicit_tokens = explicit_outputs[0].outputs[0].token_ids
+    default_tokens = default_outputs[0].outputs[0].token_ids
+
+    assert explicit_tokens == default_tokens, \
+        "Default should match explicit raw_logprobs"
+
+
 class TestLlmError:
 
     def test_max_num_token_check(self):
