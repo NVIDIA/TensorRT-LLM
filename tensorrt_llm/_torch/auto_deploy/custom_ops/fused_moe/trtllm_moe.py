@@ -4,7 +4,7 @@ from tensorrt_llm._torch.custom_ops.torch_custom_ops import ActivationType
 
 
 @torch.library.custom_op("auto_deploy::trtllm_moe_fused", mutates_args=())
-def trtllm_fused_moe(
+def trtllm_moe_fused(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
@@ -55,8 +55,8 @@ def trtllm_fused_moe(
     )[0].view(x_shape)
 
 
-@trtllm_fused_moe.register_fake
-def trtllm_fused_moe(
+@trtllm_moe_fused.register_fake
+def trtllm_moe_fused_fake(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
