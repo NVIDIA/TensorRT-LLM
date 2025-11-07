@@ -113,6 +113,16 @@ def merge_params_with_priority(
             # 2. CLI value equals the default (not explicitly set by user)
             if cli_value is None or (default_value is not None and cli_value == default_value):
                 merged[cli_key] = scenario_value
+                logger.info(
+                    f"Using recipe value for --{cli_key}: {scenario_value} "
+                    f"(from scenario.{scenario_key})"
+                )
+            else:
+                # CLI value was explicitly set - it overrides scenario
+                logger.warning(
+                    f"CLI flag --{cli_key}={cli_value} overrides recipe value "
+                    f"scenario.{scenario_key}={scenario_value}"
+                )
 
     return merged
 
@@ -287,10 +297,19 @@ def process_recipe_scenario(
     from tensorrt_llm.bench.benchmark import get_general_cli_options
 
     # Extract scenario from recipe
-    # Priority: --recipe > --extra_llm_api_options
+    # Priority: --extra_llm_api_options > --recipe
     recipe_path = params.get("recipe")
     extra_llm_api_options_path = params.get("extra_llm_api_options")
-    config_path = recipe_path if recipe_path else extra_llm_api_options_path
+    config_path = extra_llm_api_options_path if extra_llm_api_options_path else recipe_path
+
+    # Warn if both are provided
+    if recipe_path and extra_llm_api_options_path:
+        logger.warning(
+            f"Both --recipe and --extra_llm_api_options provided. "
+            f"Using --extra_llm_api_options ({extra_llm_api_options_path}) "
+            f"which overrides --recipe ({recipe_path})"
+        )
+
     scenario = extract_scenario_from_recipe(config_path)
 
     if not scenario:

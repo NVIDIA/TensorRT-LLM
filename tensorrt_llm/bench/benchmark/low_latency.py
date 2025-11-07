@@ -62,8 +62,8 @@ from tensorrt_llm.sampling_params import SamplingParams
     type=str,
     default=None,
     help=
-    "Path to a YAML file that overwrites the parameters specified by trtllm-bench. "
-    "(Deprecated: Use --recipe instead for full scenario support)")
+    "Path to a YAML file that overwrites the parameters specified by trtllm-bench."
+)
 @optgroup.option(
     "--backend",
     type=click.Choice(ALL_SUPPORTED_BACKENDS),
@@ -300,10 +300,10 @@ def latency_command(
     exec_settings["performance_options"]["multi_block_mode"] = True
 
     # Process recipe format if detected - extract llm_api_options only
-    # Priority: --recipe > --extra_llm_api_options
+    # Priority: --extra_llm_api_options > --recipe
     recipe_path = params.get("recipe", None)
     extra_llm_api_options_path = params.get("extra_llm_api_options", None)
-    config_path = recipe_path if recipe_path else extra_llm_api_options_path
+    config_path = extra_llm_api_options_path if extra_llm_api_options_path else recipe_path
     # Convert Path to string if needed
     if config_path is not None:
         config_path = str(config_path)
