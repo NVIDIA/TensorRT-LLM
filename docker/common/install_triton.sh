@@ -5,7 +5,7 @@ set -ex
 CUDA_VER="13"
 
 if [ -n "${GITHUB_MIRROR}" ]; then
-  BOOST_URL="${GITHUB_MIRROR%github-go-remote}sw-dl-triton-generic-local/triton/ci-cd/binaries/boost/1.80.0/boost_1_80_0.tar.gz"
+  BOOST_URL="https://urm.nvidia.com/artifactory/sw-dl-triton-generic-local/triton/ci-cd/binaries/boost/1.80.0/boost_1_80_0.tar.gz"
 else
   BOOST_URL="https://archives.boost.io/release/1.80.0/source/boost_1_80_0.tar.gz"
 fi
