@@ -518,12 +518,12 @@ class PyExecutor:
         start_event_2 = None
         end_event_2 = torch.cuda.Event(enable_timing=True)
         prev_device_step_time = None
-
-        torch_trace_path = os.environ.get(PROFILE_TRACE_ENV_VAR_NAME, None)
+        
+        self.torch_trace_path = os.environ.get(PROFILE_TRACE_ENV_VAR_NAME, None)
         profile_start_stop = os.environ.get(PROFILE_START_STOP_ENV_VAR_NAME,
                                             None)
-        enable_torch_trace = bool(torch_trace_path and profile_start_stop)
-        if torch_trace_path and profile_start_stop is None:
+        enable_torch_trace = bool(self.torch_trace_path and profile_start_stop)
+        if self.torch_trace_path and profile_start_stop is None:
             logger.warning(
                 f"{PROFILE_START_STOP_ENV_VAR_NAME} environment variable "
                 "needs to be set to enable the torch trace. Example to profile "
@@ -546,7 +546,16 @@ class PyExecutor:
                 assert enabled, "Inconsistent CUDA profiling state"
                 if enable_torch_trace:
                     torch_profiler.stop()
+                    
+                    rank = getattr(self.dist, "rank", 0)
+                    if osp.isdir(self.torch_trace_path):
+                        torch_trace_path = osp.join(self.torch_trace_path, f"trace_{rank}.json")
+                    else:
+                        base, ext = osp.splitext(self.torch_trace_path)
+                        torch_trace_path = f"{base}_{rank}{ext or '.json'}"
+
                     torch_profiler.export_chrome_trace(torch_trace_path)
+
                     logger.info(f"Profiling stopped at iteration {it}, "
                                 f"trace saved to {torch_trace_path}")
                 torch.cuda.cudart().cudaProfilerStop()
@@ -612,7 +621,16 @@ class PyExecutor:
                 # Stop on early exit / exception
                 if enable_torch_trace:
                     torch_profiler.stop()
+                    
+                    rank = getattr(self.dist, "rank", 0)
+                    if osp.isdir(self.torch_trace_path):
+                        torch_trace_path = osp.join(self.torch_trace_path, f"trace_{rank}.json")
+                    else:
+                        base, ext = osp.splitext(self.torch_trace_path)
+                        torch_trace_path = f"{base}_{rank}{ext or '.json'}"
+
                     torch_profiler.export_chrome_trace(torch_trace_path)
+                    
                     logger.info(f"Profiling stopped at iteration {it}, "
                                 f"trace saved to {torch_trace_path}")
                 torch.cuda.cudart().cudaProfilerStop()
