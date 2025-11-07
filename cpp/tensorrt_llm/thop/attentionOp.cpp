@@ -24,7 +24,6 @@
 #include "tensorrt_llm/runtime/utils/debugUtils.h"
 #include "tensorrt_llm/thop/attentionOp.h"
 #include "tensorrt_llm/thop/thUtils.h"
-#include <assert.h>
 #include <cstdint>
 #include <functional>
 #include <torch/extension.h>

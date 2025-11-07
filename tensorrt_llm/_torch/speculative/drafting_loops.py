@@ -32,6 +32,7 @@ def save_metadata_state(attn_metadata: AttentionMetadata,
     if attn_metadata.is_cuda_graph:
         assert spec_metadata.is_cuda_graph
         num_tokens = spec_metadata.num_tokens
+        gather_ids = spec_metadata.gather_ids
         if isinstance(spec_metadata, Eagle3SpecMetadata):
             read_indices = spec_metadata.hidden_states_read_indices[:
                                                                     batch_size].clone(
@@ -48,6 +49,7 @@ def save_metadata_state(attn_metadata: AttentionMetadata,
         attn_metadata.on_update()
         if attn_metadata.is_cuda_graph:
             spec_metadata.num_tokens = num_tokens
+            spec_metadata.gather_ids = gather_ids
             if isinstance(spec_metadata, Eagle3SpecMetadata):
                 spec_metadata.hidden_states_read_indices[:batch_size].copy_(
                     read_indices)
@@ -450,11 +452,13 @@ class ChainDrafter(torch.nn.Module):
                 d2t = self.draft_model.model.d2t.data
                 return tokens + d2t[tokens]
         else:
-            max_topk_list = spec_tree_manager.max_top_k_list_cuda[
-                draft_layer_idx]
-            indices = torch.topk(logits, k=max_topk_list, dim=-1).indices
-            top_k_list = spec_tree_manager.top_k_list_cuda[draft_layer_idx]
-            top_k_list = top_k_list.repeat(batch_size)
+            indices = torch.topk(logits, k=spec_tree_manager.max_top_k,
+                                 dim=-1).indices  # [num_logits, max_top_k]
+            top_k_list = spec_tree_manager.top_k_list_cuda[
+                draft_layer_idx]  # [num_tokens_has_children]
+            top_k_list = top_k_list.repeat(
+                batch_size
+            )  # [batch_size * num_tokens_has_children] (num_logits == batch_size * num_tokens_has_children)
             rows = torch.arange(top_k_list.shape[0],
                                 dtype=torch.int32,
                                 device=logits.device)

@@ -47,8 +47,8 @@ class SpecTreeManager:
     # The top k value for each draft layer. Device tensor.
     top_k_list_cuda: list[torch.Tensor] = None
 
-    # The max top k value for each draft layer. Device tensor.
-    max_top_k_list_cuda: list[torch.Tensor] = None
+    # The max top k value for all draft layers. Which is used for torch.topk and cuda graph.
+    max_top_k = -1
 
     # Gather the required draft tokens from all currently generated draft tokens as the input of the next draft layer.
     # Only the nodes has child(s) this layer and all their parents nodes will be gathered.
@@ -202,10 +202,10 @@ class SpecTreeManager:
         self.top_k_list_cuda = []
         for i in range(self.max_draft_len):
             self.top_k_list_cuda.append(self.top_k_list[i].to(device='cuda'))
-        self.max_top_k_list_cuda = torch.tensor(
-            [max(top_k_list) for top_k_list in self.top_k_list_cuda],
-            dtype=torch.int32,
-            device='cuda')
+        # Compute the max top k value for all draft layers
+        self.max_top_k = -1
+        for top_k_list in self.top_k_list_cuda:
+            self.max_top_k = max(self.max_top_k, top_k_list.max().item())
 
         # 9) Compute the tokens_gather_idx, include the root node
         self.tokens_gather_idx = []
@@ -366,7 +366,7 @@ class SpecTreeManager:
     def dump_tree_info(self):
         print(f"TopK list: {self.top_k_list}")
         if not self.use_dynamic_tree:
-            print(f"Max top k list cuda: {self.max_top_k_list_cuda}")
+            print(f"Max top k list cuda: {self.max_top_k}")
             print(f"Static tree: {self.eagle_paths}")
             print(f"Index mapping set: {self.index_mapping_set}")
             print(f"Nodes list per layer: {self.nodes_list_per_layer}")
