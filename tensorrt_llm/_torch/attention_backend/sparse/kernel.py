@@ -1108,6 +1108,21 @@ def rocket_paged_kt_cache_bmm_kernel(
 
     output_offset = tl.load(output_offsets_ptr + batch_idx)
 
+    dim_indices = tl.arange(0, DIM_BLOCK_SIZE)
+    dim_mask = dim_indices < head_dim
+
+    q_indices = q_base + dim_indices
+    q_values = tl.load(q_ptr + q_indices, mask=dim_mask, other=0.0)
+    q_values = tl.broadcast_to(q_values[None, :],
+                               (KT_BLOCK_SIZE, DIM_BLOCK_SIZE))
+
+    dim_pos_indices = dim_pos_base + dim_indices
+    dim_pos_values = tl.load(dim_pos_ptr + dim_pos_indices,
+                             mask=dim_mask,
+                             other=0)
+    dim_pos_values = tl.broadcast_to(dim_pos_values[None, :],
+                                     (KT_BLOCK_SIZE, DIM_BLOCK_SIZE))
+
     for kt_block_idx_start in tl.range(0, num_kt_tokens, KT_BLOCK_SIZE):
         kt_token_indices = kt_block_idx_start + tl.arange(0, KT_BLOCK_SIZE)
         kt_token_mask = kt_token_indices < num_kt_tokens
@@ -1123,44 +1138,25 @@ def rocket_paged_kt_cache_bmm_kernel(
             (block_indices * tokens_per_block + token_indices_in_block) *
             num_kv_heads * 2 * head_dim + kv_head_idx * 2 * head_dim)
 
-        results = tl.zeros([KT_BLOCK_SIZE], dtype=tl.float32)
+        combined_mask = dim_mask[
+            None, :] & kt_token_mask[:,
+                                     None]  # Shape: [KT_BLOCK_SIZE, DIM_BLOCK_SIZE]
 
-        for dim_block_start in tl.range(0, head_dim, DIM_BLOCK_SIZE):
-            dim_offsets = tl.arange(0, DIM_BLOCK_SIZE)
-            dim_indices = dim_block_start + dim_offsets
-            dim_mask = dim_indices < head_dim
+        kt_cache_indices_min = cache_bases[:, None] + dim_indices[None, :]
+        kt_cache_indices_max = kt_cache_indices_min + head_dim
+        kt_cache_values_min = tl.load(kt_cache_tensor_ptr +
+                                      kt_cache_indices_min,
+                                      mask=combined_mask,
+                                      other=0.0)
+        kt_cache_values_max = tl.load(kt_cache_tensor_ptr +
+                                      kt_cache_indices_max,
+                                      mask=combined_mask,
+                                      other=0.0)
 
-            combined_mask = dim_mask[
-                None, :] & kt_token_mask[:,
-                                         None]  # Shape: [KT_BLOCK_SIZE, DIM_BLOCK_SIZE]
+        kt_cache_values = tl.where(dim_pos_values > 0, kt_cache_values_max,
+                                   kt_cache_values_min)
 
-            q_indices = q_base + dim_indices
-            q_values = tl.load(q_ptr + q_indices, mask=dim_mask, other=0.0)
-            q_values = tl.broadcast_to(q_values[None, :],
-                                       (KT_BLOCK_SIZE, DIM_BLOCK_SIZE))
-
-            dim_pos_indices = dim_pos_base + dim_indices
-            dim_pos_values = tl.load(dim_pos_ptr + dim_pos_indices,
-                                     mask=dim_mask,
-                                     other=0)
-            dim_pos_values = tl.broadcast_to(dim_pos_values[None, :],
-                                             (KT_BLOCK_SIZE, DIM_BLOCK_SIZE))
-
-            kt_cache_indices_min = cache_bases[:, None] + dim_indices[None, :]
-            kt_cache_indices_max = kt_cache_indices_min + head_dim
-            kt_cache_values_min = tl.load(kt_cache_tensor_ptr +
-                                          kt_cache_indices_min,
-                                          mask=combined_mask,
-                                          other=0.0)
-            kt_cache_values_max = tl.load(kt_cache_tensor_ptr +
-                                          kt_cache_indices_max,
-                                          mask=combined_mask,
-                                          other=0.0)
-
-            kt_cache_values = tl.where(dim_pos_values > 0, kt_cache_values_max,
-                                       kt_cache_values_min)
-
-            results += tl.sum(q_values * kt_cache_values, axis=1)
+        results = tl.sum(q_values * kt_cache_values, axis=1)
 
         output_indices = global_head_idx * total_kt_tokens + output_offset + kt_token_indices
         tl.store(output_ptr + output_indices,
@@ -1212,6 +1208,14 @@ def triton_rocket_paged_kt_cache_bmm(
 
     grid = lambda meta: (num_gen_tokens, total_num_heads)
 
+    KT_BLOCK_SIZE = 128
+    if head_dim <= 128:
+        DIM_BLOCK_SIZE = 128
+    elif head_dim <= 256:
+        DIM_BLOCK_SIZE = 256
+    else:
+        assert False, f"Unsupported head_dim: {head_dim}"
+
     rocket_paged_kt_cache_bmm_kernel[grid](
         q,
         kt_cache_tensor,
@@ -1229,8 +1233,8 @@ def triton_rocket_paged_kt_cache_bmm(
         max_kt_blocks_per_seq,
         total_kt_tokens,
         sm_scale,
-        KT_BLOCK_SIZE=128,
-        DIM_BLOCK_SIZE=128,
+        KT_BLOCK_SIZE=KT_BLOCK_SIZE,
+        DIM_BLOCK_SIZE=DIM_BLOCK_SIZE,
     )
 
     return output
@@ -1424,18 +1428,194 @@ def argsort(x,
 
 
 @triton.jit
-def extract_bin_idx(values, NUM_BINS: tl.constexpr):
+def convert_to_sortable_uint16(values):
     values_fp16 = values.to(tl.float16)
     values_u16 = values_fp16.to(tl.uint16, bitcast=True)
+    # For negative numbers, flip all bits; for positive, flip sign bit
     values_u16 = tl.where(values < 0.0, ~values_u16 & 0xffff,
                           values_u16 | 0x8000)
-    if NUM_BINS == 1024:
-        bin_indices = 1023 - (values_u16 >> 6)
-    elif NUM_BINS == 512:
-        bin_indices = 511 - (values_u16 >> 7)
+    return values_u16
+
+
+@triton.jit
+def extract_bin_idx(values_u16, step: tl.constexpr):
+    if step == 0:
+        return 255 - (values_u16 >> 8)
     else:
-        tl.device_assert(False, "Invalid number of bins")
-    return bin_indices
+        return 255 - (values_u16 & 0xff)
+
+
+@triton.jit
+def is_partial_match(values_u16, pattern, step: tl.constexpr,
+                     BLOCK_SIZE: tl.constexpr):
+    if step == 0:
+        return tl.full((BLOCK_SIZE, ), True, dtype=tl.int1)
+    else:
+        values_high = values_u16 >> 8
+        pattern_high = tl.full((BLOCK_SIZE, ), pattern >> 8, dtype=tl.uint16)
+        return values_high == pattern_high
+
+
+@triton.jit
+def process_histogram_step(
+    input_ptr,
+    input_base,
+    input_len,
+    output_indices_ptr,
+    temp_values_ptr,
+    temp_indices_ptr,
+    output_base,
+    temp_base,
+    topk,
+    step: tl.constexpr,
+    pattern,
+    found_topk_values,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_BINS: tl.constexpr,
+    FINAL_SIZE: tl.constexpr,
+):
+    """
+    Process one histogram step.
+    Returns: (continue_next_step, new_pattern, threshold_bin_size, found_topk_values)
+    """
+    if step == 0:
+        pass
+    else:  # step == 1
+        pass
+
+    # Build histogram
+    histogram = tl.zeros((NUM_BINS, ), dtype=tl.int32)
+
+    for i in tl.range(0, input_len, BLOCK_SIZE):
+        block_offsets = i + tl.arange(0, BLOCK_SIZE)
+        block_mask = block_offsets < input_len
+        values = tl.load(input_ptr + input_base + block_offsets,
+                         mask=block_mask,
+                         other=-1e10)
+
+        values_u16 = convert_to_sortable_uint16(values)
+
+        # Only count values matching the pattern
+        pattern_match = is_partial_match(values_u16, pattern, step, BLOCK_SIZE)
+
+        bin_indices = extract_bin_idx(values_u16, step).to(tl.int32)
+
+        # Apply pattern mask
+        bin_indices_masked = tl.where(pattern_match & block_mask, bin_indices,
+                                      NUM_BINS - 1)
+
+        histogram += tl.histogram(bin_indices_masked, NUM_BINS)
+
+    # Find threshold bin via cumsum
+    cum_hist = tl.cumsum(histogram)
+
+    bin_range = tl.arange(0, NUM_BINS)
+    crosses_threshold = cum_hist >= topk - found_topk_values
+
+    threshold_indices = tl.where(crosses_threshold, bin_range, NUM_BINS)
+    threshold_bin_idx = tl.min(threshold_indices)
+
+    threshold_bin_size = tl.sum(
+        tl.where(bin_range == threshold_bin_idx, histogram, 0))
+
+    if step == 0:
+        new_pattern = (255 - threshold_bin_idx) << 8
+    else:
+        new_pattern = pattern | (255 - threshold_bin_idx)
+
+    # Collect elements
+    base_offset = found_topk_values
+    final_offset = 0
+
+    for i in tl.range(0, input_len, BLOCK_SIZE):
+        block_offsets = i + tl.arange(0, BLOCK_SIZE)
+        block_mask = block_offsets < input_len
+        values = tl.load(input_ptr + input_base + block_offsets,
+                         mask=block_mask,
+                         other=-1e10)
+
+        values_u16 = convert_to_sortable_uint16(values)
+
+        pattern_match = is_partial_match(values_u16, pattern, step, BLOCK_SIZE)
+
+        bin_indices = extract_bin_idx(values_u16, step).to(tl.int32)
+
+        # Elements smaller than threshold bin are guaranteed top-k
+        guaranteed_mask = (bin_indices
+                           < threshold_bin_idx) & pattern_match & block_mask
+
+        guaranteed_int = guaranteed_mask.to(tl.int32)
+        write_positions = tl.cumsum(guaranteed_int, axis=0) - guaranteed_int
+        num_guaranteed = tl.sum(guaranteed_int)
+
+        guaranteed_write_offsets = base_offset + output_base + write_positions
+        tl.store(output_indices_ptr + guaranteed_write_offsets,
+                 block_offsets,
+                 mask=guaranteed_mask)
+
+        base_offset += num_guaranteed
+
+        # Write candidate elements to temp storage (only if threshold bin is small)
+        # Then we can directly sort the temp storage
+        if threshold_bin_size <= FINAL_SIZE:
+            candidate_mask = (bin_indices
+                              == threshold_bin_idx) & pattern_match & block_mask
+            candidate_int = candidate_mask.to(tl.int32)
+            candidate_positions = tl.cumsum(candidate_int,
+                                            axis=0) - candidate_int
+            num_candidates = tl.sum(candidate_int)
+
+            candidate_write_offsets = final_offset + temp_base + candidate_positions
+            candidate_write_mask = (final_offset + candidate_positions
+                                    < FINAL_SIZE) & candidate_mask
+
+            tl.store(temp_values_ptr + candidate_write_offsets,
+                     values,
+                     mask=candidate_write_mask)
+            tl.store(temp_indices_ptr + candidate_write_offsets,
+                     block_offsets,
+                     mask=candidate_write_mask)
+
+            final_offset += num_candidates
+
+    if step == 1 and threshold_bin_size > FINAL_SIZE:
+        # Elements in the bin have the same logits
+        for i in tl.range(0, input_len, BLOCK_SIZE):
+            block_offsets = i + tl.arange(0, BLOCK_SIZE)
+            block_mask = block_offsets < input_len
+            values = tl.load(input_ptr + input_base + block_offsets,
+                             mask=block_mask,
+                             other=-1e10)
+
+            values_u16 = convert_to_sortable_uint16(values)
+
+            pattern_match = is_partial_match(values_u16, pattern, step,
+                                             BLOCK_SIZE)
+
+            bin_indices = extract_bin_idx(values_u16, step).to(tl.int32)
+
+            candidate_mask = (bin_indices
+                              == threshold_bin_idx) & pattern_match & block_mask
+
+            candidate_int = candidate_mask.to(tl.int32)
+            candidate_positions = tl.cumsum(candidate_int,
+                                            axis=0) - candidate_int
+            num_candidates = tl.sum(candidate_int)
+
+            candidate_write_offsets = base_offset + output_base + candidate_positions
+            candidate_write_mask = (base_offset + candidate_positions
+                                    < topk) & candidate_mask
+
+            tl.store(output_indices_ptr + candidate_write_offsets,
+                     block_offsets,
+                     mask=candidate_write_mask)
+
+            base_offset += num_candidates
+
+    # Decide if we need next step
+    continue_next_step = threshold_bin_size > FINAL_SIZE
+
+    return continue_next_step, new_pattern, threshold_bin_size, base_offset, final_offset
 
 
 @triton.jit
@@ -1455,6 +1635,11 @@ def topk_kernel(
     NUM_BINS: tl.constexpr,
     FINAL_SIZE: tl.constexpr,
 ):
+    """
+    Two-stage histogram-based top-k kernel.
+    Stage 0: Process high 8 bits (256 bins)
+    Stage 1: Process low 8 bits (256 bins)
+    """
     batch_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
 
@@ -1485,118 +1670,68 @@ def topk_kernel(
                      mask=block_mask)
         return
 
-    histogram = tl.zeros((NUM_BINS, ), dtype=tl.int32)
-    for i in tl.range(0, input_len, BLOCK_SIZE):
-        block_offsets = i + tl.arange(0, BLOCK_SIZE)
-        block_mask = block_offsets < input_len
-        values = tl.load(input_ptr + input_base + block_offsets,
-                         mask=block_mask,
-                         other=-1e10)
+    pattern = 0
+    found_topk_values = 0
 
-        # Extract bin indices from values
-        bin_indices = extract_bin_idx(values, NUM_BINS).to(tl.int32)
+    continue_step, pattern, threshold_bin_size, found_topk_values, final_offset = \
+        process_histogram_step(
+            input_ptr, input_base, input_len,
+            output_indices_ptr, temp_values_ptr, temp_indices_ptr,
+            output_base, temp_base, topk,
+            step=0,
+            pattern=pattern,
+            found_topk_values=found_topk_values,
+            BLOCK_SIZE=BLOCK_SIZE,
+            NUM_BINS=NUM_BINS,
+            FINAL_SIZE=FINAL_SIZE,
+        )
 
-        histogram += tl.histogram(bin_indices, num_bins=NUM_BINS)
+    if continue_step:
+        continue_step, pattern, threshold_bin_size, found_topk_values, final_offset = \
+            process_histogram_step(
+                input_ptr, input_base, input_len,
+                output_indices_ptr, temp_values_ptr, temp_indices_ptr,
+                output_base, temp_base, topk,
+                step=1,
+                pattern=pattern,
+                found_topk_values=found_topk_values,
+                BLOCK_SIZE=BLOCK_SIZE,
+                NUM_BINS=NUM_BINS,
+                FINAL_SIZE=FINAL_SIZE,
+            )
 
-    cum_hist = tl.cumsum(histogram)
+    # Sort the final candidates
+    if not continue_step and final_offset > 0:
+        final_offsets = tl.arange(0, FINAL_SIZE)
+        final_mask = final_offsets < final_offset
+        final_values = tl.load(temp_values_ptr + temp_base + final_offsets,
+                               mask=final_mask,
+                               other=-1e10)
+        final_indices = tl.load(temp_indices_ptr + temp_base + final_offsets,
+                                mask=final_mask,
+                                other=-1)
 
-    # Find threshold bin
-    bin_range = tl.arange(0, NUM_BINS)
-    crosses_threshold = cum_hist >= topk
+        _, final_sorted_indices = argsort(final_values,
+                                          final_indices,
+                                          dim=0,
+                                          descending=True)
 
-    threshold_indices = tl.where(crosses_threshold, bin_range, NUM_BINS)
-    threshold_bin_idx = tl.min(threshold_indices)
+        remain_num = topk - found_topk_values
 
-    base_offset = 0
-    final_offset = 0
+        write_offsets = tl.arange(0, FINAL_SIZE)
+        write_mask = write_offsets < remain_num
 
-    final_values = tl.full((FINAL_SIZE, ), -1e10, dtype=tl.float32)
-    final_indices = tl.zeros((FINAL_SIZE, ), dtype=tl.int32)
-
-    for i in tl.range(0, input_len, BLOCK_SIZE):
-        block_offsets = i + tl.arange(0, BLOCK_SIZE)
-        block_mask = block_offsets < input_len
-        values = tl.load(input_ptr + input_base + block_offsets,
-                         mask=block_mask,
-                         other=-1e10)
-        bin_indices = extract_bin_idx(values, NUM_BINS)
-
-        # Create masks for guaranteed and candidate elements
-        guaranteed_mask = (bin_indices < threshold_bin_idx) & block_mask
-        candidate_mask = (bin_indices == threshold_bin_idx) & block_mask
-
-        # Use cumsum to compute write positions for guaranteed elements
-        guaranteed_int = guaranteed_mask.to(tl.int32)
-        write_positions = tl.cumsum(guaranteed_int, axis=0) - guaranteed_int
-        num_guaranteed = tl.sum(guaranteed_int)
-
-        candidate_int = candidate_mask.to(tl.int32)
-        candidate_positions = tl.cumsum(candidate_int, axis=0) - candidate_int
-        num_candidates = tl.sum(candidate_int)
-
-        # Vectorized write for guaranteed elements
-        guaranteed_write_offsets = base_offset + write_positions
-        tl.store(output_indices_ptr + output_base + guaranteed_write_offsets,
-                 block_offsets,
-                 mask=guaranteed_mask)
-
-        base_offset += num_guaranteed
-
-        tl.device_assert(final_offset + num_candidates < FINAL_SIZE,
-                         "Final offset is out of bounds")
-
-        # Vectorized write for candidates
-        candidate_write_offsets = final_offset + temp_base + candidate_positions
-        # NOTE: WAR to avoid out of bounds access, but may cause performance regression
-        candidate_write_mask = (final_offset + candidate_positions
-                                < FINAL_SIZE) & candidate_mask
-        tl.store(temp_values_ptr + candidate_write_offsets,
-                 values,
-                 mask=candidate_write_mask)
-        tl.store(temp_indices_ptr + candidate_write_offsets,
-                 block_offsets,
-                 mask=candidate_write_mask)
-
-        final_offset += num_candidates
-
-    final_offsets = tl.arange(0, FINAL_SIZE)
-    final_mask = final_offsets < final_offset
-    final_values = tl.load(temp_values_ptr + temp_base + final_offsets,
-                           mask=final_mask,
-                           other=-1e10)
-    final_indices = tl.load(temp_indices_ptr + temp_base + final_offsets,
-                            mask=final_mask,
-                            other=-1)
-
-    final_sorted_values, final_sorted_indices = argsort(final_values,
-                                                        final_indices,
-                                                        dim=0,
-                                                        descending=True)
-
-    remain_num = topk - base_offset
-
-    write_offsets = tl.arange(0, FINAL_SIZE)
-    write_mask = write_offsets < remain_num
-
-    tl.store(output_indices_ptr + output_base + base_offset + write_offsets,
-             final_sorted_indices,
-             mask=write_mask)
+        tl.store(output_indices_ptr + output_base + found_topk_values +
+                 write_offsets,
+                 final_sorted_indices,
+                 mask=write_mask)
 
 
 def triton_topk(input_tensor: torch.Tensor, input_offsets: torch.Tensor,
                 output_offsets: torch.Tensor, total_output_tokens: int,
                 topk: int) -> torch.Tensor:
     """
-    Perform topk operation on input tensor.
-    The core idea: divide elements into bins and use argsort to find the topk elements.
-
-    NOTE: This kernel may cause OOM when the input tensor is too large (e.g. 8k+ tokens).
-        Because it's possible to have all elements in the same bin.
-        Argsort is too slow in this case.
-    TODO: Consider some other algorithms to resolve this issue.
-        Maybe we can map fp32 values to fp8, or fetch lower bits
-        due to feature of softmax results (0~1 values)
-
+    Perform topk operation on input tensor using two-stage histogram algorithm.
     Args:
         input_tensor: Input scores [num_kv_heads, total_tokens]
         input_offsets: Input offsets [batch_size + 1]
@@ -1619,9 +1754,9 @@ def triton_topk(input_tensor: torch.Tensor, input_offsets: torch.Tensor,
 
     grid = (batch_size, num_kv_heads)
 
-    BLOCK_SIZE = 512
-    NUM_BINS = 512
-    FINAL_SIZE = 1024
+    BLOCK_SIZE = 256
+    NUM_BINS = 256
+    FINAL_SIZE = 256
 
     temp_values = torch.empty((num_kv_heads, batch_size, FINAL_SIZE),
                               dtype=torch.float32,
