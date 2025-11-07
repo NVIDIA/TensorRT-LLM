@@ -216,7 +216,7 @@ To enable mixed precision serving, you'll need:
 
 ### Example (BF 16 Gen, FP 8 Ctx)
 
-A quantized checkpoint can be created `--kv_cache_qformat none`.
+A quantized checkpoint can be created using `--kv_cache_qformat none`.
 
 ```bash
 python $MODELOPT_ROOT/examples/llm_ptq/hf_ptq.py \
