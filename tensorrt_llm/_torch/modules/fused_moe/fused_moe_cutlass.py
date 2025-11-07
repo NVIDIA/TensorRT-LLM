@@ -758,25 +758,15 @@ class CutlassFusedMoE(MoE):
         use_dp_padding: Optional[bool] = None,
         **kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
-        if not self.enable_alltoall:
-            return super().forward_fake(
-                x,
-                router_logits,
-                do_finalize=do_finalize,
-                output_dtype=output_dtype,
-                all_rank_num_tokens=all_rank_num_tokens,
-                use_dp_padding=use_dp_padding,
-                **kwargs,
-            )
-        else:
-            is_nvfp4_input = isinstance(x, Fp4QuantizedTensor)
-            data_type = output_dtype if is_nvfp4_input else x.dtype
-            num_tokens = all_rank_num_tokens[
-                self.parallel_rank] if all_rank_num_tokens else x.shape[0]
-            hidden_size = x.shape[1] * (2 if is_nvfp4_input else 1)
-            top_k = self.routing_method.experts_per_token
-            return x.new_empty((num_tokens, top_k, hidden_size),
-                               dtype=data_type)
+        return super().forward_fake(
+            x,
+            router_logits,
+            do_finalize=do_finalize,
+            output_dtype=output_dtype,
+            all_rank_num_tokens=all_rank_num_tokens,
+            use_dp_padding=use_dp_padding,
+            **kwargs,
+        )
 
     def load_weights(self, weights: List[Dict]):
         assert self._weights_created
