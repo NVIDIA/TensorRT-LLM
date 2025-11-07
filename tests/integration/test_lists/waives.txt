@@ -405,3 +405,7 @@ llmapi/test_llm_examples.py::test_llmapi_example_multilora SKIP (https://nvbugs/
 unittest/_torch/modules SKIP (https://nvbugs/5637012,https://nvbugs/5637037)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[cutlass] SKIP (https://nvbugs/5636916)
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16_4gpus[tp4-attn_backend=TRTLLM-torch_compile=False] SKIP (https://nvbugs/5616182)
+accuracy/test_llm_api_pytorch.py::TestLlama3_1NemotronNano8Bv1::test_fp8_prequantized SKIP (https://nvbugs/5569696)
+accuracy/test_llm_api_pytorch.py::TestNemotronH_47B_Base::test_auto_dtype[tp8ep4-cuda_graph=True] SKIP (https://nvbugs/5569696)
+accuracy/test_llm_api_pytorch.py::TestNemotronH_47B_Base::test_reasoning_fp8_prequantized[tp8ep8-cuda_graph=True] SKIP (https://nvbugs/5569696)
+accuracy/test_llm_api_pytorch.py::TestQwQ_32B::test_auto_dtype_tp4 SKIP (https://nvbugs/5569696)
