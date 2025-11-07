@@ -192,6 +192,11 @@ static_assert(CACHE_ELEM_ENUM != 0);
 #define IS_SPEC_DEC_TREE 1 // by default SPEC_DEC expect tree-based draft token structure
 #endif
 
+// enable 2 cta per sm, use warp specialization to reduce register pressure
+#ifndef USE_H100_WARP_SPECIALIZED_2CTA_PER_SM
+#define USE_H100_WARP_SPECIALIZED_2CTA_PER_SM 0
+#endif
+
 #define DBG_BATCH_SIZE 2
 #define DBG_SEQ_LEN 256 * 4 + 3
 #define DBG_NB_CTAS_PER_SEQ 8

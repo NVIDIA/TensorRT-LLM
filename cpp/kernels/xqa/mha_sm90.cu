@@ -268,7 +268,7 @@ CUBIN_EXPORT __device__ constexpr uint32_t smemSize = sizeof(SharedMem);
 static_assert(smemSize < kMAX_SMEM_SIZE);
 #endif
 
-constexpr uint32_t nbQLdWarps = needInputCvt ? nbIOWarps - 2 : 1;
+constexpr uint32_t nbQLdWarps = (needInputCvt || (swapAB && CACHE_ELEM_ENUM == 0)) ? nbIOWarps - 2 : 1;
 constexpr uint32_t nbQLdThrds = warp_size * nbQLdWarps;
 
 #if CACHE_ELEM_ENUM == 0 || CACHE_ELEM_ENUM == 2
@@ -668,6 +668,8 @@ CUBIN_EXPORT __global__
 #ifdef NDEBUG
 #if !OPTIMIZE_FOR_LATENCY
     __launch_bounds__(128 * 3, headElems* ctaNbQHeads <= 128 * 16 ? 3 : 2)
+#elif USE_H100_WARP_SPECIALIZED_2CTA_PER_SM
+    __launch_bounds__(128 * 3, 2)
 #else
     __launch_bounds__(128 * 3)
 #endif
@@ -869,6 +871,10 @@ CUBIN_EXPORT __global__
 
     if (warpIdx.z == 0)
     {
+#if USE_H100_WARP_SPECIALIZED_2CTA_PER_SM
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(64));
+#endif
+
 #if SPEC_DEC
         SpecDec const specDec{specDecParams, idxReq, idxInputSubSeq, cacheSeqLen};
 #endif
@@ -1097,6 +1103,9 @@ CUBIN_EXPORT __global__
     }
     else if (warpIdx.z == 1)
     {
+#if USE_H100_WARP_SPECIALIZED_2CTA_PER_SM
+        asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(104));
+#endif
         // XV GEMM
         for (auto& b : smem.vBar)
         {
@@ -1442,6 +1451,9 @@ CUBIN_EXPORT __global__
     }
     else
     {
+#if USE_H100_WARP_SPECIALIZED_2CTA_PER_SM
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(72));
+#endif
         // IO warps
         static_assert(beamWidth == 1);
 #if ENABLE_PDL
@@ -1680,6 +1692,22 @@ CUBIN_EXPORT __global__
         }
     }
     __syncthreads();
+
+#if USE_H100_WARP_SPECIALIZED_2CTA_PER_SM
+    if (warpIdx.z == 0)
+    {
+        asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(80));
+    }
+    else if (warpIdx.z == 1)
+    {
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(80));
+    }
+    else
+    {
+        asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(80));
+    }
+#endif
+
     uint32_t const nbBarriers = &smem.gemm1WarpGrpBar - &smem.qBar.produced + 1;
     uint32_t const tid = threadIdx.x + blockDim.x * threadIdx.y + blockDim.x * blockDim.y * threadIdx.z;
     assert(nbBarriers <= blockDim.x * blockDim.y * blockDim.z);
