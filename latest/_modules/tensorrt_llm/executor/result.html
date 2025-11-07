@@ -58,7 +58,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -68,7 +68,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc1" />
+  <meta name="docsearch:version" content="1.2.0rc2" />
 
 
   </head>
@@ -357,11 +357,11 @@
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-gpt-oss-on-trtllm.html">Quick Start Recipe for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-qwen3-next-on-trtllm.html">Quick Start Recipe for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 </ul>
 </details></li>
 </ul>
@@ -391,7 +391,7 @@
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../features/disagg-serving.html">Disaggregated Serving (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -401,10 +401,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -414,6 +416,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/api-change.html">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -503,6 +506,7 @@
 <span></span><span class="kn">import</span><span class="w"> </span><span class="nn">asyncio</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">threading</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">weakref</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">queue</span><span class="w"> </span><span class="kn">import</span> <span class="n">Empty</span><span class="p">,</span> <span class="n">Queue</span>
@@ -512,6 +516,8 @@
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch.nn.functional</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">F</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">tracing</span>
 
 <span class="k">try</span><span class="p">:</span>
     <span class="kn">import</span><span class="w"> </span><span class="nn">ray</span>
@@ -773,6 +779,7 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">avg_decoded_tokens_per_iter</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_done</span> <span class="o">=</span> <span class="kc">False</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">metrics_dict</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">trace_headers</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
 
         <span class="k">if</span> <span class="n">ray_queue</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">if</span> <span class="n">has_event_loop</span><span class="p">():</span>
@@ -941,6 +948,7 @@
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                     <span class="sa">f</span><span class="s2">&quot;Unknown finish reason: </span><span class="si">{</span><span class="n">finish_reasons</span><span class="p">[</span><span class="n">src_idx</span><span class="p">]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">record_stats</span><span class="p">(</span><span class="n">output</span><span class="p">,</span> <span class="n">req_perf_metrics_dict</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">do_tracing</span><span class="p">(</span><span class="n">output</span><span class="p">,</span> <span class="n">req_perf_metrics_dict</span><span class="p">)</span>
 
     <span class="nd">@print_traceback_on_error</span>
     <span class="nd">@nvtx_range_debug</span><span class="p">(</span><span class="s2">&quot;handle_response&quot;</span><span class="p">,</span>
@@ -977,7 +985,7 @@
                 <span class="bp">self</span><span class="o">.</span><span class="n">_outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">disaggregated_params</span> <span class="o">=</span> <span class="n">disaggregated_params</span>
 
             <span class="k">if</span> <span class="n">response</span><span class="o">.</span><span class="n">metrics</span><span class="p">:</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">metrics_dict</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">metrics</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">metrics_dict</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">metrics</span><span class="p">)</span>
 
             <span class="k">if</span> <span class="n">response</span><span class="o">.</span><span class="n">error</span><span class="p">:</span>
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_background_error_handler</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="p">(</span>
@@ -1075,7 +1083,110 @@
             <span class="n">stats</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">output</span><span class="o">.</span><span class="n">token_ids</span><span class="p">),</span> <span class="bp">self</span><span class="o">.</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">n</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">processed_metrics_stat</span><span class="p">:</span>
             <span class="n">metrics_stats</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">processed_metrics_stat</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">metrics_dict</span> <span class="o">=</span> <span class="n">metrics_stats</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">metrics_dict</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">metrics_stats</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">do_tracing</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">output</span><span class="p">:</span> <span class="n">CompletionOutput</span><span class="p">,</span>
+        <span class="n">req_perf_metrics_dict</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">float</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Perform distributed tracing for the generation request.</span>
+
+<span class="sd">        Args:</span>
+<span class="sd">            output (CompletionOutput): The output of the generation result.</span>
+<span class="sd">            req_perf_metrics_dict (Optional[dict[str, float]]): Request performance metrics. Defaults to None.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">tracing</span><span class="o">.</span><span class="n">global_otlp_tracer</span><span class="p">():</span>
+            <span class="k">return</span>
+
+        <span class="n">metrics_dict</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">metrics_dict</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">metrics_dict</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">req_perf_metrics_dict</span><span class="p">:</span>
+            <span class="c1"># Insufficient request metrics available; trace generation aborted.</span>
+            <span class="n">tracing</span><span class="o">.</span><span class="n">insufficient_request_metrics_warning</span><span class="p">()</span>
+            <span class="k">return</span>
+
+        <span class="n">trace_context</span> <span class="o">=</span> <span class="n">tracing</span><span class="o">.</span><span class="n">extract_trace_context</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">trace_headers</span><span class="p">)</span>
+        <span class="n">sampling_params</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">sampling_params</span>
+
+        <span class="c1"># Since arrival_time and other timing metrics are based on different time origins,</span>
+        <span class="c1"># we need to apply corrections to align them with absolute timestamps</span>
+        <span class="n">time_correction</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span> <span class="o">-</span> <span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()</span>
+        <span class="n">arrival_time</span> <span class="o">=</span> <span class="n">req_perf_metrics_dict</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
+            <span class="n">RequestEventTiming</span><span class="o">.</span><span class="n">ARRIVAL_TIME</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+
+        <span class="k">with</span> <span class="n">tracing</span><span class="o">.</span><span class="n">global_otlp_tracer</span><span class="p">()</span><span class="o">.</span><span class="n">start_as_current_span</span><span class="p">(</span>
+                <span class="s2">&quot;llm_request&quot;</span><span class="p">,</span>
+                <span class="n">kind</span><span class="o">=</span><span class="n">tracing</span><span class="o">.</span><span class="n">SpanKind</span><span class="o">.</span><span class="n">SERVER</span><span class="p">,</span>
+                <span class="n">context</span><span class="o">=</span><span class="n">trace_context</span><span class="p">,</span>
+                <span class="n">start_time</span><span class="o">=</span><span class="nb">int</span><span class="p">((</span><span class="n">arrival_time</span> <span class="o">+</span> <span class="n">time_correction</span><span class="p">)</span> <span class="o">*</span> <span class="mf">1e9</span><span class="p">),</span>
+        <span class="p">)</span> <span class="k">as</span> <span class="n">span</span><span class="p">:</span>
+
+            <span class="k">def</span><span class="w"> </span><span class="nf">safe_set_attr</span><span class="p">(</span><span class="n">span</span><span class="p">,</span> <span class="n">attr</span><span class="p">,</span> <span class="n">value</span><span class="p">):</span>
+                <span class="k">if</span> <span class="n">value</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="n">span</span><span class="o">.</span><span class="n">set_attribute</span><span class="p">(</span><span class="n">attr</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
+
+            <span class="n">safe_set_attr</span><span class="p">(</span><span class="n">span</span><span class="p">,</span>
+                          <span class="n">tracing</span><span class="o">.</span><span class="n">SpanAttributes</span><span class="o">.</span><span class="n">GEN_AI_REQUEST_TEMPERATURE</span><span class="p">,</span>
+                          <span class="n">sampling_params</span><span class="o">.</span><span class="n">temperature</span><span class="p">)</span>
+            <span class="n">safe_set_attr</span><span class="p">(</span><span class="n">span</span><span class="p">,</span> <span class="n">tracing</span><span class="o">.</span><span class="n">SpanAttributes</span><span class="o">.</span><span class="n">GEN_AI_REQUEST_TOP_P</span><span class="p">,</span>
+                          <span class="n">sampling_params</span><span class="o">.</span><span class="n">top_p</span><span class="p">)</span>
+            <span class="n">safe_set_attr</span><span class="p">(</span><span class="n">span</span><span class="p">,</span> <span class="n">tracing</span><span class="o">.</span><span class="n">SpanAttributes</span><span class="o">.</span><span class="n">GEN_AI_REQUEST_TOP_K</span><span class="p">,</span>
+                          <span class="n">sampling_params</span><span class="o">.</span><span class="n">top_k</span><span class="p">)</span>
+            <span class="n">safe_set_attr</span><span class="p">(</span>
+                <span class="n">span</span><span class="p">,</span>
+                <span class="n">tracing</span><span class="o">.</span><span class="n">SpanAttributes</span><span class="o">.</span><span class="n">GEN_AI_REQUEST_MAX_TOKENS</span><span class="p">,</span>
+                <span class="n">sampling_params</span><span class="o">.</span><span class="n">max_tokens</span><span class="p">,</span>
+            <span class="p">)</span>
+            <span class="n">safe_set_attr</span><span class="p">(</span><span class="n">span</span><span class="p">,</span> <span class="n">tracing</span><span class="o">.</span><span class="n">SpanAttributes</span><span class="o">.</span><span class="n">GEN_AI_REQUEST_N</span><span class="p">,</span>
+                          <span class="n">sampling_params</span><span class="o">.</span><span class="n">n</span><span class="p">)</span>
+            <span class="n">safe_set_attr</span><span class="p">(</span><span class="n">span</span><span class="p">,</span> <span class="n">tracing</span><span class="o">.</span><span class="n">SpanAttributes</span><span class="o">.</span><span class="n">GEN_AI_REQUEST_ID</span><span class="p">,</span>
+                          <span class="bp">self</span><span class="o">.</span><span class="n">id</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">prompt_token_ids</span> <span class="o">:=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">&quot;prompt_token_ids&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">):</span>
+                <span class="n">safe_set_attr</span><span class="p">(</span><span class="n">span</span><span class="p">,</span>
+                              <span class="n">tracing</span><span class="o">.</span><span class="n">SpanAttributes</span><span class="o">.</span><span class="n">GEN_AI_USAGE_PROMPT_TOKENS</span><span class="p">,</span>
+                              <span class="nb">len</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="p">))</span>
+            <span class="n">safe_set_attr</span><span class="p">(</span><span class="n">span</span><span class="p">,</span>
+                          <span class="n">tracing</span><span class="o">.</span><span class="n">SpanAttributes</span><span class="o">.</span><span class="n">GEN_AI_USAGE_COMPLETION_TOKENS</span><span class="p">,</span>
+                          <span class="n">output</span><span class="o">.</span><span class="n">length</span><span class="p">)</span>
+            <span class="n">safe_set_attr</span><span class="p">(</span>
+                <span class="n">span</span><span class="p">,</span> <span class="n">tracing</span><span class="o">.</span><span class="n">SpanAttributes</span><span class="o">.</span><span class="n">GEN_AI_LATENCY_TIME_TO_FIRST_TOKEN</span><span class="p">,</span>
+                <span class="n">metrics_dict</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">MetricNames</span><span class="o">.</span><span class="n">TTFT</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">))</span>
+            <span class="n">safe_set_attr</span><span class="p">(</span><span class="n">span</span><span class="p">,</span> <span class="n">tracing</span><span class="o">.</span><span class="n">SpanAttributes</span><span class="o">.</span><span class="n">GEN_AI_LATENCY_E2E</span><span class="p">,</span>
+                          <span class="n">metrics_dict</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">MetricNames</span><span class="o">.</span><span class="n">E2E</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">))</span>
+            <span class="n">safe_set_attr</span><span class="p">(</span><span class="n">span</span><span class="p">,</span>
+                          <span class="n">tracing</span><span class="o">.</span><span class="n">SpanAttributes</span><span class="o">.</span><span class="n">GEN_AI_LATENCY_TIME_IN_QUEUE</span><span class="p">,</span>
+                          <span class="n">metrics_dict</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">MetricNames</span><span class="o">.</span><span class="n">REQUEST_QUEUE_TIME</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">))</span>
+            <span class="n">safe_set_attr</span><span class="p">(</span>
+                <span class="n">span</span><span class="p">,</span> <span class="n">tracing</span><span class="o">.</span><span class="n">SpanAttributes</span><span class="o">.</span><span class="n">GEN_AI_RESPONSE_FINISH_REASONS</span><span class="p">,</span>
+                <span class="n">json</span><span class="o">.</span><span class="n">dumps</span><span class="p">([</span><span class="n">output</span><span class="o">.</span><span class="n">finish_reason</span><span class="p">])</span>
+                <span class="k">if</span> <span class="n">output</span><span class="o">.</span><span class="n">finish_reason</span> <span class="k">else</span> <span class="kc">None</span><span class="p">)</span>
+            <span class="n">safe_set_attr</span><span class="p">(</span>
+                <span class="n">span</span><span class="p">,</span>
+                <span class="n">tracing</span><span class="o">.</span><span class="n">SpanAttributes</span><span class="o">.</span><span class="n">GEN_AI_LATENCY_KV_CACHE_TRANSFER_TIME</span><span class="p">,</span>
+                <span class="n">req_perf_metrics_dict</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
+                    <span class="n">RequestEventTiming</span><span class="o">.</span><span class="n">KV_CACHE_TRANSFER_END</span><span class="p">,</span> <span class="mf">0.0</span><span class="p">)</span> <span class="o">-</span>
+                <span class="n">req_perf_metrics_dict</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
+                    <span class="n">RequestEventTiming</span><span class="o">.</span><span class="n">KV_CACHE_TRANSFER_START</span><span class="p">,</span> <span class="mf">0.0</span><span class="p">))</span>
+
+            <span class="k">if</span> <span class="n">req_perf_metrics_dict</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
+                    <span class="n">RequestEventTiming</span><span class="o">.</span><span class="n">KV_CACHE_TRANSFER_START</span><span class="p">,</span>
+                    <span class="mi">0</span><span class="p">)</span> <span class="ow">and</span> <span class="n">req_perf_metrics_dict</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
+                        <span class="n">RequestEventTiming</span><span class="o">.</span><span class="n">KV_CACHE_TRANSFER_END</span><span class="p">,</span> <span class="mi">0</span><span class="p">):</span>
+                <span class="n">tracing</span><span class="o">.</span><span class="n">add_event</span><span class="p">(</span>
+                    <span class="n">tracing</span><span class="o">.</span><span class="n">SpanEvents</span><span class="o">.</span><span class="n">KV_CACHE_TRANSFER_START</span><span class="p">,</span>
+                    <span class="n">timestamp</span><span class="o">=</span><span class="nb">int</span><span class="p">((</span><span class="n">req_perf_metrics_dict</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
+                        <span class="n">RequestEventTiming</span><span class="o">.</span><span class="n">KV_CACHE_TRANSFER_START</span><span class="p">,</span> <span class="mf">0.0</span><span class="p">)</span> <span class="o">+</span>
+                                   <span class="n">time_correction</span><span class="p">)</span> <span class="o">*</span> <span class="mf">1e9</span><span class="p">))</span>
+                <span class="n">tracing</span><span class="o">.</span><span class="n">add_event</span><span class="p">(</span>
+                    <span class="n">tracing</span><span class="o">.</span><span class="n">SpanEvents</span><span class="o">.</span><span class="n">KV_CACHE_TRANSFER_END</span><span class="p">,</span>
+                    <span class="n">attributes</span><span class="o">=</span><span class="p">{</span>
+                        <span class="s2">&quot;kv_cache_size&quot;</span><span class="p">:</span>
+                        <span class="n">req_perf_metrics_dict</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
+                            <span class="n">RequestEventTiming</span><span class="o">.</span><span class="n">KV_CACHE_SIZE</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+                    <span class="p">},</span>
+                    <span class="n">timestamp</span><span class="o">=</span><span class="nb">int</span><span class="p">((</span><span class="n">req_perf_metrics_dict</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
+                        <span class="n">RequestEventTiming</span><span class="o">.</span><span class="n">KV_CACHE_TRANSFER_END</span><span class="p">,</span> <span class="mf">0.0</span><span class="p">)</span> <span class="o">+</span>
+                                   <span class="n">time_correction</span><span class="p">)</span> <span class="o">*</span> <span class="mf">1e9</span><span class="p">))</span>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">DetokenizedGenerationResultBase</span><span class="p">(</span><span class="n">GenerationResultBase</span><span class="p">):</span>
@@ -1193,6 +1304,7 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">disaggregated_params</span> <span class="o">=</span> <span class="n">disaggregated_params</span>
         <span class="c1"># minimal sampling params needed for logprob calculation</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_logprob_params</span> <span class="o">=</span> <span class="n">logprob_params</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">trace_headers</span> <span class="o">=</span> <span class="n">generation_request</span><span class="o">.</span><span class="n">trace_headers</span>
 
         <span class="c1"># for aborting the request</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">weakref</span><span class="o">.</span><span class="n">ReferenceType</span><span class="p">[</span>
@@ -1591,9 +1703,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 19, 2025.</p>
+  <p>Last updated on November 05, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/796891b">796891b</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/3111682">3111682</a>.</p>
   
 </div></div>
       

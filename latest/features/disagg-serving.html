@@ -9,7 +9,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>Disaggregated Serving (Beta) &#8212; TensorRT LLM</title>
+    <title>Disaggregated Serving &#8212; TensorRT LLM</title>
   
   
   
@@ -59,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -71,7 +71,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc1" />
+  <meta name="docsearch:version" content="1.2.0rc2" />
 
 
   </head>
@@ -364,11 +364,11 @@
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-gpt-oss-on-trtllm.html">Quick Start Recipe for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-qwen3-next-on-trtllm.html">Quick Start Recipe for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 </ul>
 </details></li>
 </ul>
@@ -398,7 +398,7 @@
 <ul class="current nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
-<li class="toctree-l1 current active"><a class="current reference internal" href="#">Disaggregated Serving (Beta)</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -408,10 +408,12 @@
 <li class="toctree-l1"><a class="reference internal" href="parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -421,6 +423,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -486,7 +489,7 @@
         <i class="fa-solid fa-home"></i>
       </a>
     </li>
-    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Disaggregated Serving (Beta)</span></li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Disaggregated Serving</span></li>
   </ul>
 </nav>
 </div>
@@ -503,13 +506,8 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section class="tex2jax_ignore mathjax_ignore" id="disaggregated-serving-beta">
-<h1>Disaggregated Serving (Beta)<a class="headerlink" href="#disaggregated-serving-beta" title="Link to this heading">#</a></h1>
-<div class="admonition note">
-<p class="admonition-title">Note</p>
-<p>Note:
-This feature is currently in beta, and the related APIs are subjected to change in future versions.</p>
-</div>
+  <section class="tex2jax_ignore mathjax_ignore" id="disaggregated-serving">
+<h1>Disaggregated Serving<a class="headerlink" href="#disaggregated-serving" title="Link to this heading">#</a></h1>
 <ul class="simple">
 <li><p><a class="reference internal" href="ray-orchestrator.html#motivation"><span class="std std-ref">Motivation</span></a></p></li>
 <li><p><a class="reference internal" href="#KV-Cache-Exchange"><span class="xref myst">KV Cache Exchange</span></a></p>
@@ -521,8 +519,8 @@ This feature is currently in beta, and the related APIs are subjected to change 
 </li>
 <li><p><a class="reference internal" href="../torch/features/overlap_scheduler.html#usage"><span class="std std-ref">Usage</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#trtllm-serve">trtllm-serve</a></p></li>
 <li><p><a class="reference internal" href="#dynamo"><span class="std std-ref">Dynamo</span></a></p></li>
+<li><p><a class="reference internal" href="#trtllm-serve">trtllm-serve</a></p></li>
 </ul>
 </li>
 <li><p><a class="reference internal" href="#Environment-Variables"><span class="xref myst">Environment Variables</span></a></p></li>
@@ -588,9 +586,22 @@ This feature is currently in beta, and the related APIs are subjected to change 
 </section>
 <section id="usage">
 <h2>Usage<a class="headerlink" href="#usage" title="Link to this heading">#</a></h2>
+<section id="dynamo">
+<h3>Dynamo<a class="headerlink" href="#dynamo" title="Link to this heading">#</a></h3>
+<p>The first approach involves the use of <a class="reference external" href="https://github.com/ai-dynamo/dynamo">Dynamo</a>, a data center-scale inference server developed specifically for LLM workloads. Dynamo introduces several advanced features not present in the other methods, including decoupled pre- and post-processing workers, which are particularly beneficial under high concurrency conditions. The disaggregated LLM inference workflow with Dynamo is illustrated in Figure 7.</p>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture4.png" width="800" height="auto">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 7. Dynamo integration with disaggregated service</em></sub></p>
+<p>In the Dynamo workflow, requests are initially processed by pre- and post-processing workers, which then query a smart router to determine the optimal decode worker to route the requests to. Depending on the availability of KV cache blocks, the decoder worker may bypass the prefill stage or forward the request to the prefill worker. Once the prefill worker is done processing the prompt, the KV cache blocks can be sent from the prefill worker to the decoder worker, using the metadata referred to as ctx_params in the figure above.</p>
+<p>Dynamo also includes built-in support for Kubernetes deployment, monitoring, and metrics collection. The development team is actively working on enabling dynamic instance scaling, further enhancing its suitability for production environments.</p>
+<p>For more information on how to use Dynamo with TensorRT-LLM, please refer to <a class="reference external" href="https://docs.nvidia.com/dynamo/latest/examples/trtllm.html">this documentation</a>.</p>
+</section>
 <section id="trtllm-serve">
 <h3>trtllm-serve<a class="headerlink" href="#trtllm-serve" title="Link to this heading">#</a></h3>
-<p>The first approach to do disaggregated LLM inference with TensorRT LLM involves launching a separate OpenAI-compatible server per context and generation instance using <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code>. An additional server, referred to as the “disaggregated” server, is also launched with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> and acts as an orchestrator which receives client requests and dispatches them to the appropriate context and generation servers via OpenAI REST API. Figure 6 below illustrates the disaggregated serving workflow when using this approach. When a context instance is done generating the KV blocks associated with the prompt, it returns a response to the disaggregated server. This response includes the prompt tokens, the first generated token and metadata associated with the context request and context instance. This metadata is referred to as context parameters (<code class="docutils literal notranslate"><span class="pre">ctx_params</span></code> in Figure 6). These parameters are then used by the generation instances to establish communication with the context instance and retrieve the KV cache blocks associated with the request.</p>
+<p>The second approach to evaluate disaggregated LLM inference with TensorRT LLM involves launching a separate OpenAI-compatible server per context and generation instance using <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code>. An additional server, referred to as the “disaggregated” server, is also launched with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> and acts as an orchestrator which receives client requests and dispatches them to the appropriate context and generation servers via OpenAI REST API. Figure 6 below illustrates the disaggregated serving workflow when using this approach. When a context instance is done generating the KV blocks associated with the prompt, it returns a response to the disaggregated server. This response includes the prompt tokens, the first generated token and metadata associated with the context request and context instance. This metadata is referred to as context parameters (<code class="docutils literal notranslate"><span class="pre">ctx_params</span></code> in Figure 6). These parameters are then used by the generation instances to establish communication with the context instance and retrieve the KV cache blocks associated with the request.</p>
 <div align="center">
 <figure>
   <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture3.png" width="800" height="auto">
@@ -662,19 +673,6 @@ when routing requests to the generation servers, the disaggregated server will m
 <h4>Launching disaggregated servers on SLURM clusters<a class="headerlink" href="#launching-disaggregated-servers-on-slurm-clusters" title="Link to this heading">#</a></h4>
 <p>Please refer to <a class="reference internal" href="#../../../examples/disaggregated/slurm"><span class="xref myst">Disaggregated Inference Benchmark Scripts</span></a>.</p>
 </section>
-</section>
-<section id="dynamo">
-<h3>Dynamo<a class="headerlink" href="#dynamo" title="Link to this heading">#</a></h3>
-<p>The second approach involves the use of <a class="reference external" href="https://github.com/ai-dynamo/dynamo">Dynamo</a>, a data center-scale inference server developed specifically for LLM workloads. Dynamo introduces several advanced features not present in the other methods, including decoupled pre- and post-processing workers, which are particularly beneficial under high concurrency conditions. The disaggregated LLM inference workflow with Dynamo is illustrated in Figure 7.</p>
-<div align="center">
-<figure>
-  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture4.png" width="800" height="auto">
-</figure>
-</div>
-<p align="center"><sub><em>Figure 7. Dynamo integration with disaggregated service</em></sub></p>
-<p>In the Dynamo workflow, requests are initially processed by pre- and post-processing workers, which then query a smart router to determine the optimal decode worker to route the requests to. Depending on the availability of KV cache blocks, the decoder worker may bypass the prefill stage or forward the request to the prefill worker. Once the prefill worker is done processing the prompt, the KV cache blocks can be sent from the prefill worker to the decoder worker, using the metadata referred to as ctx_params in the figure above.</p>
-<p>Dynamo also includes built-in support for Kubernetes deployment, monitoring, and metrics collection. The development team is actively working on enabling dynamic instance scaling, further enhancing its suitability for production environments.</p>
-<p>For more information on how to use Dynamo with TensorRT-LLM, please refer to <a class="reference external" href="https://docs.nvidia.com/dynamo/latest/examples/trtllm.html">this documentation</a>.</p>
 </section>
 </section>
 <section id="environment-variables">
@@ -791,11 +789,11 @@ when routing requests to the generation servers, the disaggregated server will m
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#usage">Usage</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#dynamo">Dynamo</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-serve">trtllm-serve</a><ul class="nav section-nav flex-column">
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#launching-disaggregated-servers-on-slurm-clusters">Launching disaggregated servers on SLURM clusters</a></li>
 </ul>
 </li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#dynamo">Dynamo</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#environment-variables">Environment Variables</a></li>
@@ -898,9 +896,9 @@ when routing requests to the generation servers, the disaggregated server will m
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 19, 2025.</p>
+  <p>Last updated on November 05, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/796891b">796891b</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/3111682">3111682</a>.</p>
   
 </div></div>
       

@@ -58,7 +58,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -68,7 +68,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc1" />
+  <meta name="docsearch:version" content="1.2.0rc2" />
 
 
   </head>
@@ -357,11 +357,11 @@
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-gpt-oss-on-trtllm.html">Quick Start Recipe for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-qwen3-next-on-trtllm.html">Quick Start Recipe for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 </ul>
 </details></li>
 </ul>
@@ -391,7 +391,7 @@
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../features/disagg-serving.html">Disaggregated Serving (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -401,10 +401,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -414,6 +416,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/api-change.html">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -518,7 +521,7 @@
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.logger</span><span class="w"> </span><span class="kn">import</span> <span class="n">logger</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">.._utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">global_mpi_rank</span><span class="p">,</span> <span class="n">mpi_barrier</span><span class="p">,</span> <span class="n">mpi_rank</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">print_colored</span><span class="p">,</span> <span class="n">print_colored_debug</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">logger_debug</span><span class="p">,</span> <span class="n">print_colored</span>
 
 <span class="k">if</span> <span class="n">ENABLE_MULTI_DEVICE</span><span class="p">:</span>
     <span class="kn">import</span><span class="w"> </span><span class="nn">mpi4py</span>
@@ -550,6 +553,10 @@
 <span class="sd">    &#39;&#39;&#39;</span>
 
     <span class="n">state</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># Global MPICommExecutor instance to be reused across multiple MpiCommSession instances</span>
+    <span class="c1"># This is necessary because MPICommExecutor can only be created once per MPI process</span>
+    <span class="n">_global_comm_executor</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">_global_mpi_pool</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="nd">@staticmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">is_initialized</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
@@ -689,6 +696,7 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">n_workers</span> <span class="o">=</span> <span class="n">n_workers</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">thread_pool</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">ThreadPoolExecutor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">mpi_pool</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">MPIPoolExecutor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">owns_mpi_pool</span> <span class="o">=</span> <span class="kc">False</span>  <span class="c1"># Track if this instance owns the mpi_pool</span>
 
         <span class="k">if</span> <span class="n">n_workers</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
@@ -748,9 +756,11 @@
 <div class="viewcode-block" id="MpiCommSession.shutdown">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.MpiCommSession.shutdown">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">shutdown</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">wait</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mpi_pool</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># Only shutdown the mpi_pool if this instance created it</span>
+        <span class="c1"># For shared global mpi_pool, we don&#39;t shut it down</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mpi_pool</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">owns_mpi_pool</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">mpi_pool</span><span class="o">.</span><span class="n">shutdown</span><span class="p">(</span><span class="n">wait</span><span class="o">=</span><span class="n">wait</span><span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">mpi_pool</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">mpi_pool</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">thread_pool</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">thread_pool</span><span class="o">.</span><span class="n">shutdown</span><span class="p">(</span><span class="n">wait</span><span class="o">=</span><span class="n">wait</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">thread_pool</span> <span class="o">=</span> <span class="kc">None</span></div>
@@ -766,8 +776,36 @@
         <span class="k">assert</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">mpi_pool</span><span class="p">,</span> <span class="s1">&#39;MPI session already started&#39;</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">thread_pool</span> <span class="o">=</span> <span class="n">ThreadPoolExecutor</span><span class="p">(</span><span class="n">max_workers</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span>
-        <span class="n">comm_executor</span> <span class="o">=</span> <span class="n">MPICommExecutor</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">comm</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">mpi_pool</span> <span class="o">=</span> <span class="n">comm_executor</span><span class="o">.</span><span class="fm">__enter__</span><span class="p">()</span>
+
+        <span class="c1"># Use global MPICommExecutor if using COMM_WORLD</span>
+        <span class="c1"># This is necessary because MPICommExecutor can only be created once per MPI process</span>
+        <span class="n">logger_debug</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">&quot;_start_mpi_pool: ENABLE_MULTI_DEVICE=</span><span class="si">{</span><span class="n">ENABLE_MULTI_DEVICE</span><span class="si">}</span><span class="s2">, self.comm=</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">comm</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;grey&quot;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">ENABLE_MULTI_DEVICE</span><span class="p">:</span>
+            <span class="n">logger_debug</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;_start_mpi_pool: Checking if self.comm == mpi4py.MPI.COMM_WORLD: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">comm</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">mpi4py</span><span class="o">.</span><span class="n">MPI</span><span class="o">.</span><span class="n">COMM_WORLD</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;grey&quot;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">ENABLE_MULTI_DEVICE</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">comm</span> <span class="o">==</span> <span class="n">mpi4py</span><span class="o">.</span><span class="n">MPI</span><span class="o">.</span><span class="n">COMM_WORLD</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">MPINodeState</span><span class="o">.</span><span class="n">_global_comm_executor</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">logger_debug</span><span class="p">(</span><span class="s2">&quot;Creating global MPICommExecutor for COMM_WORLD</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
+                             <span class="s2">&quot;yellow&quot;</span><span class="p">)</span>
+                <span class="n">MPINodeState</span><span class="o">.</span><span class="n">_global_comm_executor</span> <span class="o">=</span> <span class="n">MPICommExecutor</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">comm</span><span class="p">)</span>
+                <span class="n">MPINodeState</span><span class="o">.</span><span class="n">_global_mpi_pool</span> <span class="o">=</span> <span class="n">MPINodeState</span><span class="o">.</span><span class="n">_global_comm_executor</span><span class="o">.</span><span class="fm">__enter__</span><span class="p">(</span>
+                <span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">logger_debug</span><span class="p">(</span><span class="s2">&quot;Reusing global MPICommExecutor for COMM_WORLD</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
+                             <span class="s2">&quot;yellow&quot;</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">mpi_pool</span> <span class="o">=</span> <span class="n">MPINodeState</span><span class="o">.</span><span class="n">_global_mpi_pool</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">owns_mpi_pool</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">logger_debug</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;_start_mpi_pool: Creating new MPICommExecutor (not COMM_WORLD or ENABLE_MULTI_DEVICE=False)</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;grey&quot;</span><span class="p">)</span>
+            <span class="c1"># For non-COMM_WORLD communicators, create a new executor</span>
+            <span class="n">comm_executor</span> <span class="o">=</span> <span class="n">MPICommExecutor</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">comm</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">mpi_pool</span> <span class="o">=</span> <span class="n">comm_executor</span><span class="o">.</span><span class="fm">__enter__</span><span class="p">()</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">owns_mpi_pool</span> <span class="o">=</span> <span class="kc">True</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__del__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">shutdown_abort</span><span class="p">()</span>
@@ -787,19 +825,46 @@
 <span class="k">class</span><span class="w"> </span><span class="nc">RemoteMpiCommSessionClient</span><span class="p">(</span><span class="n">MpiSession</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&#39;&#39;&#39;</span>
 <span class="sd">    RemoteMpiCommSessionClient is a variant of MpiCommSession that is used to connect to a remote MPI pool.</span>
+
+<span class="sd">    Note: This class uses a global singleton pattern because ZeroMQ PAIR sockets only support</span>
+<span class="sd">    one connection at a time. Multiple LLM instances will reuse the same client connection.</span>
 <span class="sd">    &#39;&#39;&#39;</span>
+    <span class="n">_global_instance</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">_global_instance_lock</span> <span class="o">=</span> <span class="n">threading</span><span class="o">.</span><span class="n">Lock</span><span class="p">()</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__new__</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">addr</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">hmac_key</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bytes</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+        <span class="c1"># Implement singleton pattern to reuse the same client connection</span>
+        <span class="c1"># for multiple LLM instances, since PAIR sockets only support one connection</span>
+        <span class="k">with</span> <span class="bp">cls</span><span class="o">.</span><span class="n">_global_instance_lock</span><span class="p">:</span>
+            <span class="k">if</span> <span class="bp">cls</span><span class="o">.</span><span class="n">_global_instance</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="bp">cls</span><span class="o">.</span><span class="n">_global_instance</span><span class="o">.</span><span class="n">addr</span> <span class="o">!=</span> <span class="n">addr</span><span class="p">:</span>
+                <span class="n">logger_debug</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">&quot;Creating new global RemoteMpiCommSessionClient for </span><span class="si">{</span><span class="n">addr</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
+                    <span class="s2">&quot;yellow&quot;</span><span class="p">)</span>
+                <span class="n">instance</span> <span class="o">=</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__new__</span><span class="p">(</span><span class="bp">cls</span><span class="p">)</span>
+                <span class="bp">cls</span><span class="o">.</span><span class="n">_global_instance</span> <span class="o">=</span> <span class="n">instance</span>
+                <span class="n">instance</span><span class="o">.</span><span class="n">_initialized</span> <span class="o">=</span> <span class="kc">False</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">logger_debug</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">&quot;Reusing existing global RemoteMpiCommSessionClient for </span><span class="si">{</span><span class="n">addr</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
+                    <span class="s2">&quot;yellow&quot;</span><span class="p">)</span>
+            <span class="k">return</span> <span class="bp">cls</span><span class="o">.</span><span class="n">_global_instance</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">addr</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">hmac_key</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bytes</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+        <span class="c1"># Only initialize once</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_initialized</span><span class="p">:</span>
+            <span class="k">return</span>
+
         <span class="c1"># FIXME: this is a hack to avoid circular import, resolve later</span>
         <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.executor.ipc</span><span class="w"> </span><span class="kn">import</span> <span class="n">ZeroMqQueue</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">addr</span> <span class="o">=</span> <span class="n">addr</span>
-        <span class="n">print_colored_debug</span><span class="p">(</span>
-            <span class="sa">f</span><span class="s2">&quot;RemoteMpiCommSessionClient connecting to </span><span class="si">{</span><span class="n">addr</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span> <span class="s2">&quot;yellow&quot;</span><span class="p">)</span>
+        <span class="n">logger_debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;RemoteMpiCommSessionClient connecting to </span><span class="si">{</span><span class="n">addr</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
+                     <span class="s2">&quot;yellow&quot;</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">queue</span> <span class="o">=</span> <span class="n">ZeroMqQueue</span><span class="p">((</span><span class="n">addr</span><span class="p">,</span> <span class="n">hmac_key</span><span class="p">),</span>
                                  <span class="n">is_server</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                                  <span class="n">socket_type</span><span class="o">=</span><span class="n">zmq</span><span class="o">.</span><span class="n">PAIR</span><span class="p">,</span>
                                  <span class="n">use_hmac_encryption</span><span class="o">=</span><span class="nb">bool</span><span class="p">(</span><span class="n">hmac_key</span><span class="p">))</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_is_shutdown</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_initialized</span> <span class="o">=</span> <span class="kc">True</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">submit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                <span class="n">task</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="n">T</span><span class="p">],</span>
@@ -808,10 +873,10 @@
                <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&#39;&#39;&#39; Submit a task to the remote MPI pool. &#39;&#39;&#39;</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_is_shutdown</span><span class="p">:</span>
-            <span class="n">print_colored_debug</span><span class="p">(</span>
-                <span class="s2">&quot;RemoteMpiCommSessionClient is already shut down</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span> <span class="s2">&quot;yellow&quot;</span><span class="p">)</span>
+            <span class="n">logger_debug</span><span class="p">(</span><span class="s2">&quot;RemoteMpiCommSessionClient is already shut down</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
+                         <span class="s2">&quot;yellow&quot;</span><span class="p">)</span>
             <span class="k">return</span> <span class="p">[]</span>
-        <span class="n">print_colored_debug</span><span class="p">(</span>
+        <span class="n">logger_debug</span><span class="p">(</span>
             <span class="sa">f</span><span class="s2">&quot;RemoteMpiCommSessionClient [rank</span><span class="si">{</span><span class="n">global_mpi_rank</span><span class="p">()</span><span class="si">}</span><span class="s2">] sending task </span><span class="si">{</span><span class="n">task</span><span class="si">}</span><span class="s2"> to </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">addr</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
             <span class="s2">&quot;yellow&quot;</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="n">RemoteTask</span><span class="p">(</span><span class="n">task</span><span class="p">,</span> <span class="n">args</span><span class="p">,</span> <span class="n">kwargs</span><span class="p">,</span> <span class="n">sync</span><span class="o">=</span><span class="n">sync</span><span class="p">))</span>
@@ -824,11 +889,10 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">submit</span><span class="p">(</span><span class="n">task</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="n">sync</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
 
         <span class="k">while</span> <span class="ow">not</span> <span class="p">((</span><span class="n">res</span> <span class="o">:=</span> <span class="bp">self</span><span class="o">.</span><span class="n">poll</span><span class="p">())</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">_is_shutdown</span><span class="p">):</span>
-            <span class="n">print_colored_debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Waiting for task completion... </span><span class="si">{</span><span class="n">res</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
-                                <span class="s2">&quot;grey&quot;</span><span class="p">)</span>
+            <span class="n">logger_debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Waiting for task completion... </span><span class="si">{</span><span class="n">res</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span> <span class="s2">&quot;grey&quot;</span><span class="p">)</span>
             <span class="n">time</span><span class="o">.</span><span class="n">sleep</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">SYNC_IDLE_INTERVAL</span><span class="p">)</span>
 
-        <span class="n">print_colored_debug</span><span class="p">(</span>
+        <span class="n">logger_debug</span><span class="p">(</span>
             <span class="sa">f</span><span class="s2">&quot;rank</span><span class="si">{</span><span class="n">global_mpi_rank</span><span class="p">()</span><span class="si">}</span><span class="s2"> RemoteMpiCommSessionClient.send_sync received results: </span><span class="si">{</span><span class="n">res</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
             <span class="s2">&quot;green&quot;</span><span class="p">)</span>
 
@@ -853,10 +917,16 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">shutdown</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">wait</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
-        <span class="k">pass</span>
+        <span class="c1"># NOTE: We do NOT close the queue or mark as shutdown for the singleton instance.</span>
+        <span class="c1"># The RemoteMpiCommSessionClient is a global singleton that&#39;s reused across multiple</span>
+        <span class="c1"># LLM instances. Marking it as shutdown would prevent subsequent LLM instances from</span>
+        <span class="c1"># using it. The connection stays open for the entire lifetime of the mgmn setup.</span>
+        <span class="n">logger_debug</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">&quot;RemoteMpiCommSessionClient.shutdown() called (no-op for singleton)</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;grey&quot;</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">shutdown_abort</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">grace</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mi">60</span><span class="p">,</span> <span class="n">reason</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
-        <span class="k">pass</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">RemoteMpiCommSessionServer</span><span class="p">():</span>
@@ -890,10 +960,10 @@
 
     <span class="nd">@staticmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">task_wrapper</span><span class="p">(</span><span class="n">task</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="n">T</span><span class="p">],</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">T</span><span class="p">:</span>
-        <span class="n">print_colored_debug</span><span class="p">(</span>
+        <span class="n">logger_debug</span><span class="p">(</span>
             <span class="sa">f</span><span class="s2">&quot;MpiCommSession rank</span><span class="si">{</span><span class="n">mpi_rank</span><span class="p">()</span><span class="si">}</span><span class="s2"> with world_size </span><span class="si">{</span><span class="n">mpi_world_size</span><span class="p">()</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
             <span class="s2">&quot;green&quot;</span><span class="p">)</span>
-        <span class="n">print_colored_debug</span><span class="p">(</span>
+        <span class="n">logger_debug</span><span class="p">(</span>
             <span class="sa">f</span><span class="s2">&quot;MpiCommSession rank</span><span class="si">{</span><span class="n">mpi_rank</span><span class="p">()</span><span class="si">}</span><span class="s2"> start task [</span><span class="si">{</span><span class="n">task</span><span class="si">}</span><span class="s2">] with args: </span><span class="si">{</span><span class="n">args</span><span class="si">}</span><span class="s2"> and kwargs: </span><span class="si">{</span><span class="n">kwargs</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
             <span class="s2">&quot;green&quot;</span><span class="p">)</span>
 
@@ -909,24 +979,43 @@
             <span class="n">traceback</span><span class="o">.</span><span class="n">print_exc</span><span class="p">()</span>
             <span class="k">raise</span> <span class="n">e</span>
         <span class="k">finally</span><span class="p">:</span>
-            <span class="n">print_colored_debug</span><span class="p">(</span>
+            <span class="n">logger_debug</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">&quot;MpiCommSession rank</span><span class="si">{</span><span class="n">mpi_rank</span><span class="p">()</span><span class="si">}</span><span class="s2"> task [</span><span class="si">{</span><span class="n">task</span><span class="si">}</span><span class="s2">] finished</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
                 <span class="s2">&quot;green&quot;</span><span class="p">)</span>
             <span class="n">mpi_barrier</span><span class="p">()</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">serve</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-        <span class="n">print_colored_debug</span><span class="p">(</span>
-            <span class="sa">f</span><span class="s2">&quot;RemoteMpiCommSessionServer listening on </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">addr</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span> <span class="s2">&quot;yellow&quot;</span><span class="p">)</span>
+        <span class="n">logger_debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;RemoteMpiCommSessionServer listening on </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">addr</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
+                     <span class="s2">&quot;yellow&quot;</span><span class="p">)</span>
+        <span class="n">pending_futures</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="k">while</span> <span class="kc">True</span><span class="p">:</span>
+            <span class="c1"># Wait for any pending futures from previous tasks to complete</span>
+            <span class="c1"># This ensures all ranks are ready before accepting the next task</span>
+            <span class="k">if</span> <span class="n">pending_futures</span><span class="p">:</span>
+                <span class="n">logger_debug</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">&quot;RemoteMpiCommSessionServer waiting for </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">pending_futures</span><span class="p">)</span><span class="si">}</span><span class="s2"> pending futures to complete</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
+                    <span class="s2">&quot;grey&quot;</span><span class="p">)</span>
+                <span class="k">for</span> <span class="n">future</span> <span class="ow">in</span> <span class="n">pending_futures</span><span class="p">:</span>
+                    <span class="k">try</span><span class="p">:</span>
+                        <span class="n">future</span><span class="o">.</span><span class="n">result</span><span class="p">()</span>  <span class="c1"># Wait for completion</span>
+                    <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+                        <span class="n">print_colored</span><span class="p">(</span>
+                            <span class="sa">f</span><span class="s2">&quot;RemoteMpiCommSessionServer future failed with exception: </span><span class="si">{</span><span class="n">e</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
+                            <span class="s2">&quot;red&quot;</span><span class="p">)</span>
+                <span class="n">pending_futures</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
+                <span class="n">logger_debug</span><span class="p">(</span>
+                    <span class="s2">&quot;RemoteMpiCommSessionServer all pending futures completed</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
+                    <span class="s2">&quot;grey&quot;</span><span class="p">)</span>
+
             <span class="n">message</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">RemoteTask</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">get</span><span class="p">()</span>
             <span class="k">if</span> <span class="n">message</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="n">print_colored_debug</span><span class="p">(</span>
+                <span class="n">logger_debug</span><span class="p">(</span>
                     <span class="sa">f</span><span class="s2">&quot;RemoteMpiCommSessionServer [rank</span><span class="si">{</span><span class="n">global_mpi_rank</span><span class="p">()</span><span class="si">}</span><span class="s2">] received shutdown signal</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
                     <span class="s2">&quot;green&quot;</span><span class="p">)</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">session</span><span class="o">.</span><span class="n">shutdown_abort</span><span class="p">()</span>
                 <span class="k">break</span>
             <span class="k">else</span><span class="p">:</span>
-                <span class="n">print_colored_debug</span><span class="p">(</span>
+                <span class="n">logger_debug</span><span class="p">(</span>
                     <span class="sa">f</span><span class="s2">&quot;RemoteMpiCommSessionServer [rank</span><span class="si">{</span><span class="n">global_mpi_rank</span><span class="p">()</span><span class="si">}</span><span class="s2">] received task [</span><span class="si">{</span><span class="n">message</span><span class="o">.</span><span class="n">task</span><span class="si">}</span><span class="s2">] from </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">addr</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
                     <span class="s2">&quot;green&quot;</span><span class="p">)</span>
                 <span class="n">futures</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">session</span><span class="o">.</span><span class="n">submit</span><span class="p">(</span>
@@ -934,15 +1023,16 @@
                     <span class="o">*</span><span class="n">message</span><span class="o">.</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">message</span><span class="o">.</span><span class="n">kwargs</span><span class="p">)</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">num_results</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">session</span><span class="o">.</span><span class="n">n_workers</span>
                 <span class="k">assert</span> <span class="nb">len</span><span class="p">(</span><span class="n">futures</span><span class="p">)</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_results</span> <span class="o">==</span> <span class="n">mpi_world_size</span><span class="p">()</span>
+                <span class="c1"># Store futures to wait for them before the next task</span>
+                <span class="n">pending_futures</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">futures</span><span class="p">)</span>
                 <span class="k">if</span> <span class="n">message</span><span class="o">.</span><span class="n">sync</span><span class="p">:</span>
                     <span class="k">for</span> <span class="n">future</span> <span class="ow">in</span> <span class="n">futures</span><span class="p">:</span>
                         <span class="n">future</span><span class="o">.</span><span class="n">add_done_callback</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">mpi_future_callback</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">mpi_future_callback</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">future</span><span class="p">):</span>
-        <span class="n">print_colored_debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;rank</span><span class="si">{</span><span class="n">global_mpi_rank</span><span class="p">()</span><span class="si">}</span><span class="s2"> got future: </span><span class="si">{</span><span class="n">future</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
-                            <span class="s2">&quot;red&quot;</span><span class="p">)</span>
+        <span class="n">logger_debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;rank</span><span class="si">{</span><span class="n">global_mpi_rank</span><span class="p">()</span><span class="si">}</span><span class="s2"> got future: </span><span class="si">{</span><span class="n">future</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span> <span class="s2">&quot;red&quot;</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">future</span><span class="o">.</span><span class="n">exception</span><span class="p">()</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">print_colored_debug</span><span class="p">(</span>
+            <span class="n">logger_debug</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">&quot;mpi_future got exception: </span><span class="si">{</span><span class="n">future</span><span class="o">.</span><span class="n">exception</span><span class="p">()</span><span class="si">}</span><span class="s2">, quitting</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
                 <span class="s2">&quot;red&quot;</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="n">future</span><span class="o">.</span><span class="n">exception</span><span class="p">())</span>
@@ -950,11 +1040,11 @@
 
         <span class="n">result</span> <span class="o">=</span> <span class="n">future</span><span class="o">.</span><span class="n">result</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">results</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">result</span><span class="p">)</span>
-        <span class="n">print_colored_debug</span><span class="p">(</span>
+        <span class="n">logger_debug</span><span class="p">(</span>
             <span class="sa">f</span><span class="s2">&quot;RemoteMpiCommSessionServer working status: </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">results</span><span class="p">)</span><span class="si">}</span><span class="s2">/</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">num_results</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
             <span class="s2">&quot;grey&quot;</span><span class="p">)</span>
         <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">results</span><span class="p">)</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_results</span><span class="p">:</span>
-            <span class="n">print_colored_debug</span><span class="p">(</span>
+            <span class="n">logger_debug</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">&quot;RemoteMpiCommSessionServer received all results, sending to client</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
                 <span class="s2">&quot;green&quot;</span><span class="p">)</span>
             <span class="k">try</span><span class="p">:</span>
@@ -966,8 +1056,8 @@
                 <span class="k">else</span><span class="p">:</span>
                     <span class="k">raise</span> <span class="n">e</span>
 
-            <span class="n">print_colored_debug</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">&quot;RemoteMpiCommSessionServer sent results to client</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span> <span class="s2">&quot;green&quot;</span><span class="p">)</span>
+            <span class="n">logger_debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;RemoteMpiCommSessionServer sent results to client</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
+                         <span class="s2">&quot;green&quot;</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">results</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
 
 
@@ -1141,9 +1231,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 19, 2025.</p>
+  <p>Last updated on November 05, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/796891b">796891b</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/3111682">3111682</a>.</p>
   
 </div></div>
       

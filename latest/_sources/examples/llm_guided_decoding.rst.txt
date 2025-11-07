@@ -1,6 +1,6 @@
 Generate text with guided decoding
 ==================================
-Source https://github.com/NVIDIA/TensorRT-LLM/blob/796891ba2a6959bad58c0da9645416c7264349e9/examples/llm-api/llm_guided_decoding.py.
+Source https://github.com/NVIDIA/TensorRT-LLM/blob/31116825b39f4e6a6a1e127001f5204b73d1dc32/examples/llm-api/llm_guided_decoding.py.
 
 .. literalinclude:: ../../../examples/llm-api/llm_guided_decoding.py
     :lines: 4-47

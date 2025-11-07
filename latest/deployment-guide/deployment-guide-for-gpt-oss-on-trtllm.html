@@ -9,7 +9,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>Quick Start Recipe for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware &#8212; TensorRT LLM</title>
+    <title>Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware &#8212; TensorRT LLM</title>
   
   
   
@@ -55,23 +55,23 @@
     <script src="../_static/togglebutton.js?v=4a39c7ea"></script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
-    <script>DOCUMENTATION_OPTIONS.pagename = 'deployment-guide/quick-start-recipe-for-qwen3-next-on-trtllm';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'deployment-guide/deployment-guide-for-gpt-oss-on-trtllm';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
     <link rel="icon" href="../_static/favicon.png"/>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="Supported Models" href="../models/supported-models.html" />
-    <link rel="prev" title="Quick Start Recipe for GPT-OSS on TensorRT-LLM - Blackwell Hardware" href="quick-start-recipe-for-gpt-oss-on-trtllm.html" />
+    <link rel="next" title="Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware" href="deployment-guide-for-qwen3-next-on-trtllm.html" />
+    <link rel="prev" title="Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware" href="deployment-guide-for-llama4-scout-on-trtllm.html" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc1" />
+  <meta name="docsearch:version" content="1.2.0rc2" />
 
 
   </head>
@@ -364,11 +364,11 @@
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
 <li class="toctree-l1 current active has-children"><a class="reference internal" href="index.html">Model Recipes</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
-<li class="toctree-l2"><a class="reference internal" href="quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quick-start-recipe-for-gpt-oss-on-trtllm.html">Quick Start Recipe for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
-<li class="toctree-l2 current active"><a class="current reference internal" href="#">Quick Start Recipe for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2 current active"><a class="current reference internal" href="#">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 </ul>
 </details></li>
 </ul>
@@ -398,7 +398,7 @@
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -408,10 +408,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -421,6 +423,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -489,7 +492,7 @@
     
     <li class="breadcrumb-item"><a href="index.html" class="nav-link">Model Recipes</a></li>
     
-    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Quick Start Recipe for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</span></li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</span></li>
   </ul>
 </nav>
 </div>
@@ -506,16 +509,17 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section class="tex2jax_ignore mathjax_ignore" id="quick-start-recipe-for-qwen3-next-on-tensorrt-llm-blackwell-hopper-hardware">
-<h1>Quick Start Recipe for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware<a class="headerlink" href="#quick-start-recipe-for-qwen3-next-on-tensorrt-llm-blackwell-hopper-hardware" title="Link to this heading">#</a></h1>
+  <section class="tex2jax_ignore mathjax_ignore" id="deployment-guide-for-gpt-oss-on-tensorrt-llm-blackwell-hardware">
+<h1>Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware<a class="headerlink" href="#deployment-guide-for-gpt-oss-on-tensorrt-llm-blackwell-hardware" title="Link to this heading">#</a></h1>
 <section id="introduction">
 <h2>Introduction<a class="headerlink" href="#introduction" title="Link to this heading">#</a></h2>
-<p>This is a functional quick-start guide for running the Qwen3-Next model on TensorRT LLM. It focuses on a working setup with recommended defaults. Additional performance optimizations and support will be rolled out in future updates.</p>
+<p>This deployment guide provides step-by-step instructions for running the GPT-OSS model using TensorRT-LLM, optimized for NVIDIA GPUs. It covers the complete setup required; from accessing model weights and preparing the software environment to configuring TensorRT-LLM parameters, launching the server, and validating inference output.</p>
+<p>The guide is intended for developers and practitioners seeking high-throughput or low-latency inference using NVIDIA’s accelerated stack—starting with the PyTorch container from NGC, then installing TensorRT-LLM for model serving.</p>
 </section>
 <section id="prerequisites">
 <h2>Prerequisites<a class="headerlink" href="#prerequisites" title="Link to this heading">#</a></h2>
 <ul class="simple">
-<li><p>GPU: NVIDIA Blackwell or Hopper Architecture</p></li>
+<li><p>GPU: NVIDIA Blackwell Architecture</p></li>
 <li><p>OS: Linux</p></li>
 <li><p>Drivers: CUDA Driver 575 or Later</p></li>
 <li><p>Docker with NVIDIA Container Toolkit installed</p></li>
@@ -525,109 +529,180 @@
 <section id="models">
 <h2>Models<a class="headerlink" href="#models" title="Link to this heading">#</a></h2>
 <ul class="simple">
-<li><p>BF16 model: <a class="reference external" href="https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Thinking">Qwen3-Next-80B-A3B-Thinking</a></p></li>
+<li><p>MXFP4 model: <a class="reference external" href="https://huggingface.co/openai/gpt-oss-120b">GPT-OSS-120B</a></p></li>
 </ul>
+</section>
+<section id="moe-backend-support-matrix">
+<h2>MoE Backend Support Matrix<a class="headerlink" href="#moe-backend-support-matrix" title="Link to this heading">#</a></h2>
+<p>There are multiple MOE backends inside TensorRT LLM. Here are the support matrix of the MOE backends.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Device</p></th>
+<th class="head"><p>Activation Type</p></th>
+<th class="head"><p>MoE Weights Type</p></th>
+<th class="head"><p>MoE Backend</p></th>
+<th class="head"><p>Use Case</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>B200/GB200/B300/GB300</p></td>
+<td><p>MXFP8</p></td>
+<td><p>MXFP4</p></td>
+<td><p>TRTLLM</p></td>
+<td><p>Low Latency and Max Throughput</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The default moe backend is <code class="docutils literal notranslate"><span class="pre">CUTLASS</span></code>, so for the best possible perf, one must set the <code class="docutils literal notranslate"><span class="pre">moe_config.backend</span></code> explicitly to run the model.
+<code class="docutils literal notranslate"><span class="pre">CUTLASS</span></code> was better for max throughput at first but now we have optimized <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> moe to be universally faster.</p>
 </section>
 <section id="deployment-steps">
 <h2>Deployment Steps<a class="headerlink" href="#deployment-steps" title="Link to this heading">#</a></h2>
 <section id="run-docker-container">
 <h3>Run Docker Container<a class="headerlink" href="#run-docker-container" title="Link to this heading">#</a></h3>
-<p>Build and run the docker container. See the <span class="xref myst">Docker guide</span> for details.</p>
-<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">cd</span> <span class="n">TensorRT</span><span class="o">-</span><span class="n">LLM</span>
-
-<span class="n">make</span> <span class="o">-</span><span class="n">C</span> <span class="n">docker</span> <span class="n">release_build</span> <span class="n">IMAGE_TAG</span><span class="o">=</span><span class="n">qwen3</span><span class="o">-</span><span class="nb">next</span><span class="o">-</span><span class="n">local</span>
-
-<span class="n">make</span> <span class="o">-</span><span class="n">C</span> <span class="n">docker</span> <span class="n">release_run</span> <span class="n">IMAGE_NAME</span><span class="o">=</span><span class="n">tensorrt_llm</span> <span class="n">IMAGE_TAG</span><span class="o">=</span><span class="n">qwen3</span><span class="o">-</span><span class="nb">next</span><span class="o">-</span><span class="n">local</span> <span class="n">LOCAL_USER</span><span class="o">=</span><span class="mi">1</span>
+<p>Run the docker container using the TensorRT-LLM NVIDIA NGC image.</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>-it<span class="w"> </span><span class="se">\</span>
+--ipc<span class="o">=</span>host<span class="w"> </span><span class="se">\</span>
+--gpus<span class="w"> </span>all<span class="w"> </span><span class="se">\</span>
+-p<span class="w"> </span><span class="m">8000</span>:8000<span class="w"> </span><span class="se">\</span>
+-v<span class="w"> </span>~/.cache:/root/.cache:rw<span class="w"> </span><span class="se">\</span>
+--name<span class="w"> </span>tensorrt_llm<span class="w"> </span><span class="se">\</span>
+nvcr.io/nvidia/tensorrt-llm/release:1.2.0rc2<span class="w"> </span><span class="se">\</span>
+/bin/bash
 </pre></div>
 </div>
+<p>Note:</p>
+<ul class="simple">
+<li><p>The command mounts your user <code class="docutils literal notranslate"><span class="pre">.cache</span></code> directory to save the downloaded model checkpoints which are saved to <code class="docutils literal notranslate"><span class="pre">~/.cache/huggingface/hub/</span></code> by default. This prevents having to redownload the weights each time you rerun the container. If the <code class="docutils literal notranslate"><span class="pre">~/.cache</span></code> directory doesn’t exist please create it using <code class="docutils literal notranslate"><span class="pre">$</span> <span class="pre">mkdir</span> <span class="pre">~/.cache</span></code>.</p></li>
+<li><p>You can mount additional directories and paths using the <code class="docutils literal notranslate"><span class="pre">-v</span> <span class="pre">&lt;host_path&gt;:&lt;container_path&gt;</span></code> flag if needed, such as mounting the downloaded weight paths.</p></li>
+<li><p>The command also maps port <code class="docutils literal notranslate"><span class="pre">8000</span></code> from the container to your host so you can access the LLM API endpoint from your host</p></li>
+<li><p>See the <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags">https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags</a> for all the available containers. The containers published in the main branch weekly have <code class="docutils literal notranslate"><span class="pre">rcN</span></code> suffix, while the monthly release with QA tests has no <code class="docutils literal notranslate"><span class="pre">rcN</span></code> suffix. Use the <code class="docutils literal notranslate"><span class="pre">rc</span></code> release to get the latest model and feature support.</p></li>
+</ul>
+<p>If you want to use latest main branch, you can choose to build from source to install TensorRT-LLM, the steps refer to <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html">https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html</a>.</p>
 </section>
-<section id="creating-the-tensorrt-llm-server-config">
-<h3>Creating the TensorRT LLM Server config<a class="headerlink" href="#creating-the-tensorrt-llm-server-config" title="Link to this heading">#</a></h3>
-<p>We create a YAML configuration file <code class="docutils literal notranslate"><span class="pre">/tmp/config.yml</span></code> for the TensorRT LLM Server with the following content:</p>
+<section id="recommended-performance-settings">
+<h3>Recommended Performance Settings<a class="headerlink" href="#recommended-performance-settings" title="Link to this heading">#</a></h3>
+<p>We maintain YAML configuration files with recommended performance settings in the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/configs"><code class="docutils literal notranslate"><span class="pre">examples/configs</span></code></a> directory. These config files are present in the TensorRT LLM container at the path <code class="docutils literal notranslate"><span class="pre">/app/tensorrt_llm/examples/configs</span></code>. You can use these out-of-the-box, or adjust them to your specific use case.</p>
+<p>For low-latency use cases:</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nv">TRTLLM_DIR</span><span class="o">=</span>/app/tensorrt_llm<span class="w"> </span><span class="c1"># change as needed to match your environment</span>
+<span class="nv">EXTRA_LLM_API_FILE</span><span class="o">=</span><span class="si">${</span><span class="nv">TRTLLM_DIR</span><span class="si">}</span>/examples/configs/gpt-oss-120b-latency.yaml
+</pre></div>
+</div>
+<p>Note: if you don’t have access to the source code locally, you can manually create the YAML config file using the code in the dropdown below.</p>
+<div class="dropdown admonition">
+<p class="admonition-title">Show code</p>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nv">EXTRA_LLM_API_FILE</span><span class="o">=</span>/tmp/config.yml
 
 cat<span class="w"> </span><span class="s">&lt;&lt; EOF &gt; ${EXTRA_LLM_API_FILE}</span>
+
+<span class="s">max_batch_size: 720</span>
+<span class="s">max_num_tokens: 16384</span>
+<span class="s">kv_cache_free_gpu_memory_fraction: 0.9</span>
+<span class="s">tensor_parallel_size: 8</span>
+<span class="s">moe_expert_parallel_size: 8</span>
+<span class="s">trust_remote_code: true</span>
 <span class="s">enable_attention_dp: false</span>
 <span class="s">cuda_graph_config:</span>
 <span class="s">  enable_padding: true</span>
 <span class="s">  max_batch_size: 720</span>
 <span class="s">moe_config:</span>
-<span class="s">    backend: TRTLLM</span>
+<span class="s">  backend: TRTLLM</span>
 <span class="s">stream_interval: 20</span>
 <span class="s">num_postprocess_workers: 4</span>
-<span class="s">kv_cache_config:</span>
-<span class="s">    enable_block_reuse: false</span>
-<span class="s">    free_gpu_memory_fraction: 0.6</span>
 <span class="s">EOF</span>
 </pre></div>
+</div>
+</div>
+<p>For max-throughput use cases:</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nv">TRTLLM_DIR</span><span class="o">=</span>/app/tensorrt_llm<span class="w"> </span><span class="c1"># change as needed to match your environment</span>
+<span class="nv">EXTRA_LLM_API_FILE</span><span class="o">=</span><span class="si">${</span><span class="nv">TRTLLM_DIR</span><span class="si">}</span>/examples/configs/gpt-oss-120b-throughput.yaml
+</pre></div>
+</div>
+<p>Note: if you don’t have access to the source code locally, you can manually create the YAML config file using the code in the dropdown below.</p>
+<div class="dropdown admonition">
+<p class="admonition-title">Show code</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nv">EXTRA_LLM_API_FILE</span><span class="o">=</span>/tmp/config.yml
+
+cat<span class="w"> </span><span class="s">&lt;&lt; EOF &gt; ${EXTRA_LLM_API_FILE}</span>
+
+<span class="s">max_batch_size: 720</span>
+<span class="s">max_num_tokens: 16384</span>
+<span class="s">kv_cache_free_gpu_memory_fraction: 0.9</span>
+<span class="s">tensor_parallel_size: 8</span>
+<span class="s">moe_expert_parallel_size: 8</span>
+<span class="s">trust_remote_code: true</span>
+<span class="s">enable_attention_dp: true</span>
+<span class="s">cuda_graph_config:</span>
+<span class="s">  enable_padding: true</span>
+<span class="s">  max_batch_size: 720</span>
+<span class="s">moe_config:</span>
+<span class="s">  backend: TRTLLM</span>
+<span class="s">stream_interval: 20</span>
+<span class="s">num_postprocess_workers: 4</span>
+<span class="s">attention_dp_config:</span>
+<span class="s">  enable_balance: true</span>
+<span class="s">  batching_wait_iters: 50</span>
+<span class="s">  timeout_iters: 1</span>
+<span class="s">EOF</span>
+</pre></div>
+</div>
 </div>
 </section>
 <section id="launch-the-tensorrt-llm-server">
 <h3>Launch the TensorRT LLM Server<a class="headerlink" href="#launch-the-tensorrt-llm-server" title="Link to this heading">#</a></h3>
-<p>Below is an example command to launch the TensorRT LLM server with the Qwen3-Next model from within the container.</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span>Qwen/Qwen3-Next-80B-A3B-Thinking<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--host<span class="w"> </span><span class="m">0</span>.0.0.0<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--port<span class="w"> </span><span class="m">8000</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--max_batch_size<span class="w"> </span><span class="m">16</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--max_num_tokens<span class="w"> </span><span class="m">4096</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--tp_size<span class="w"> </span><span class="m">4</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--pp_size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--ep_size<span class="w"> </span><span class="m">4</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--trust_remote_code<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--extra_llm_api_options<span class="w"> </span><span class="si">${</span><span class="nv">EXTRA_LLM_API_FILE</span><span class="si">}</span>
+<p>Below is an example command to launch the TensorRT LLM server with the GPT-OSS model from within the container. The command is specifically configured for the 1024/1024 Input/Output Sequence Length test. The explanation of each flag is shown in the “LLM API Options (YAML Configuration)” section.</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span>openai/gpt-oss-120b<span class="w"> </span>--host<span class="w"> </span><span class="m">0</span>.0.0.0<span class="w"> </span>--port<span class="w"> </span><span class="m">8000</span><span class="w"> </span>--extra_llm_api_options<span class="w"> </span><span class="si">${</span><span class="nv">EXTRA_LLM_API_FILE</span><span class="si">}</span>
 </pre></div>
 </div>
 <p>After the server is set up, the client can now send prompt requests to the server and receive results.</p>
 </section>
-<section id="configs-and-parameters">
-<h3>Configs and Parameters<a class="headerlink" href="#configs-and-parameters" title="Link to this heading">#</a></h3>
-<p>These options are used directly on the command line when you start the <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> process.</p>
-<section id="tp-size">
-<h4><code class="docutils literal notranslate"><span class="pre">--tp_size</span></code><a class="headerlink" href="#tp-size" title="Link to this heading">#</a></h4>
+<section id="llm-api-options-yaml-configuration">
+<h3>LLM API Options (YAML Configuration)<a class="headerlink" href="#llm-api-options-yaml-configuration" title="Link to this heading">#</a></h3>
+<!-- TODO: this section is duplicated across the deployment guides; they should be consolidated to a central file and imported as needed, or we can remove this and link to LLM API reference -->
+<p>These options provide control over TensorRT LLM’s behavior and are set within the YAML file passed to the <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> command via the <code class="docutils literal notranslate"><span class="pre">--extra_llm_api_options</span></code> argument.</p>
+<section id="tensor-parallel-size">
+<h4><code class="docutils literal notranslate"><span class="pre">tensor_parallel_size</span></code><a class="headerlink" href="#tensor-parallel-size" title="Link to this heading">#</a></h4>
 <ul class="simple">
 <li><p><strong>Description:</strong> Sets the <strong>tensor-parallel size</strong>. This should typically match the number of GPUs you intend to use for a single model instance.</p></li>
 </ul>
 </section>
-<section id="ep-size">
-<h4><code class="docutils literal notranslate"><span class="pre">--ep_size</span></code><a class="headerlink" href="#ep-size" title="Link to this heading">#</a></h4>
+<section id="moe-expert-parallel-size">
+<h4><code class="docutils literal notranslate"><span class="pre">moe_expert_parallel_size</span></code><a class="headerlink" href="#moe-expert-parallel-size" title="Link to this heading">#</a></h4>
 <ul class="simple">
-<li><p><strong>Description:</strong> Sets the <strong>expert-parallel size</strong> for Mixture-of-Experts (MoE) models. Like <code class="docutils literal notranslate"><span class="pre">tp_size</span></code>, this should generally match the number of GPUs you’re using. This setting has no effect on non-MoE models.</p></li>
+<li><p><strong>Description:</strong> Sets the <strong>expert-parallel size</strong> for Mixture-of-Experts (MoE) models. Like <code class="docutils literal notranslate"><span class="pre">tensor_parallel_size</span></code>, this should generally match the number of GPUs you’re using. This setting has no effect on non-MoE models.</p></li>
 </ul>
 </section>
 <section id="kv-cache-free-gpu-memory-fraction">
-<h4><code class="docutils literal notranslate"><span class="pre">--kv_cache_free_gpu_memory_fraction</span></code><a class="headerlink" href="#kv-cache-free-gpu-memory-fraction" title="Link to this heading">#</a></h4>
+<h4><code class="docutils literal notranslate"><span class="pre">kv_cache_free_gpu_memory_fraction</span></code><a class="headerlink" href="#kv-cache-free-gpu-memory-fraction" title="Link to this heading">#</a></h4>
 <ul class="simple">
 <li><p><strong>Description:</strong> A value between <code class="docutils literal notranslate"><span class="pre">0.0</span></code> and <code class="docutils literal notranslate"><span class="pre">1.0</span></code> that specifies the fraction of free GPU memory to reserve for the KV cache after the model is loaded. Since memory usage can fluctuate, this buffer helps prevent out-of-memory (OOM) errors.</p></li>
 <li><p><strong>Recommendation:</strong> If you experience OOM errors, try reducing this value to <code class="docutils literal notranslate"><span class="pre">0.7</span></code> or lower.</p></li>
 </ul>
 </section>
 <section id="max-batch-size">
-<h4><code class="docutils literal notranslate"><span class="pre">--max_batch_size</span></code><a class="headerlink" href="#max-batch-size" title="Link to this heading">#</a></h4>
+<h4><code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code><a class="headerlink" href="#max-batch-size" title="Link to this heading">#</a></h4>
 <ul class="simple">
 <li><p><strong>Description:</strong> The maximum number of user requests that can be grouped into a single batch for processing. The actual max batch size that can be achieved depends on total sequence length (input + output).</p></li>
 </ul>
 </section>
 <section id="max-num-tokens">
-<h4><code class="docutils literal notranslate"><span class="pre">--max_num_tokens</span></code><a class="headerlink" href="#max-num-tokens" title="Link to this heading">#</a></h4>
+<h4><code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code><a class="headerlink" href="#max-num-tokens" title="Link to this heading">#</a></h4>
 <ul class="simple">
 <li><p><strong>Description:</strong> The maximum total number of tokens (across all requests) allowed inside a single scheduled batch.</p></li>
 </ul>
 </section>
 <section id="max-seq-len">
-<h4><code class="docutils literal notranslate"><span class="pre">--max_seq_len</span></code><a class="headerlink" href="#max-seq-len" title="Link to this heading">#</a></h4>
+<h4><code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code><a class="headerlink" href="#max-seq-len" title="Link to this heading">#</a></h4>
 <ul class="simple">
-<li><p><strong>Description:</strong> The maximum possible sequence length for a single request, including both input and generated output tokens. We won’t specifically set it. It will be inferred from model config.</p></li>
+<li><p><strong>Description:</strong> The maximum possible sequence length for a single request, including both input and generated output tokens. If not set, it will be inferred from model config.</p></li>
 </ul>
 </section>
 <section id="trust-remote-code">
-<h4><code class="docutils literal notranslate"><span class="pre">--trust_remote_code</span></code><a class="headerlink" href="#trust-remote-code" title="Link to this heading">#</a></h4>
+<h4><code class="docutils literal notranslate"><span class="pre">trust_remote_code</span></code><a class="headerlink" href="#trust-remote-code" title="Link to this heading">#</a></h4>
 <ul class="simple">
-<li><p><strong>Description:</strong> Allows TensorRT LLM to download models and tokenizers from Hugging Face. This flag is passed directly to the Hugging Face API.</p></li>
+<li><p><strong>Description:</strong> Allows TensorRT-LLM to download models and tokenizers from Hugging Face. This flag is passed directly to the Hugging Face API.</p></li>
 </ul>
-</section>
-<section id="extra-llm-api-options-yaml-configuration">
-<h4>Extra LLM API Options (YAML Configuration)<a class="headerlink" href="#extra-llm-api-options-yaml-configuration" title="Link to this heading">#</a></h4>
-<p>These options provide finer control over performance and are set within a YAML file passed to the <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> command via the <code class="docutils literal notranslate"><span class="pre">--extra_llm_api_options</span></code> argument.</p>
 </section>
 <section id="cuda-graph-config">
 <h4><code class="docutils literal notranslate"><span class="pre">cuda_graph_config</span></code><a class="headerlink" href="#cuda-graph-config" title="Link to this heading">#</a></h4>
@@ -665,7 +740,7 @@ cat<span class="w"> </span><span class="s">&lt;&lt; EOF &gt; ${EXTRA_LLM_API_FIL
 <h2>Testing API Endpoint<a class="headerlink" href="#testing-api-endpoint" title="Link to this heading">#</a></h2>
 <section id="basic-test">
 <h3>Basic Test<a class="headerlink" href="#basic-test" title="Link to this heading">#</a></h3>
-<p>Start a new terminal on the host to test the TensorRT LLM server you just launched.</p>
+<p>Start a new terminal on the host to test the TensorRT-LLM server you just launched.</p>
 <p>You can query the health/readiness of the server using:</p>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>-s<span class="w"> </span>-o<span class="w"> </span>/dev/null<span class="w"> </span>-w<span class="w"> </span><span class="s2">&quot;Status: %{http_code}\n&quot;</span><span class="w"> </span><span class="s2">&quot;http://localhost:8000/health&quot;</span>
 </pre></div>
@@ -673,7 +748,7 @@ cat<span class="w"> </span><span class="s">&lt;&lt; EOF &gt; ${EXTRA_LLM_API_FIL
 <p>When the <code class="docutils literal notranslate"><span class="pre">Status:</span> <span class="pre">200</span></code> code is returned, the server is ready for queries. Note that the very first query may take longer due to initialization and compilation.</p>
 <p>After the TensorRT LLM server is set up and shows Application startup complete, you can send requests to the server.</p>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>http://localhost:8000/v1/chat/completions<span class="w"> </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
-<span class="s1">    &quot;model&quot;: &quot;Qwen/Qwen3-Next-80B-A3B-Thinking&quot;,</span>
+<span class="s1">    &quot;model&quot;: &quot;openai/gpt-oss-120b&quot;,</span>
 <span class="s1">    &quot;messages&quot;: [</span>
 <span class="s1">        {</span>
 <span class="s1">            &quot;role&quot;: &quot;user&quot;,</span>
@@ -685,8 +760,9 @@ cat<span class="w"> </span><span class="s">&lt;&lt; EOF &gt; ${EXTRA_LLM_API_FIL
 <span class="s1">}&#39;</span><span class="w"> </span>-w<span class="w"> </span><span class="s2">&quot;\n&quot;</span>
 </pre></div>
 </div>
-<p>Here is an example response:</p>
-<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="p">{</span><span class="s2">&quot;id&quot;</span><span class="p">:</span><span class="s2">&quot;chatcmpl-64ac201c77bf46a7a3a4eca7759b1fd8&quot;</span><span class="p">,</span><span class="s2">&quot;object&quot;</span><span class="p">:</span><span class="s2">&quot;chat.completion&quot;</span><span class="p">,</span><span class="s2">&quot;created&quot;</span><span class="p">:</span><span class="mi">1759022940</span><span class="p">,</span><span class="s2">&quot;model&quot;</span><span class="p">:</span><span class="s2">&quot;Qwen/Qwen3-Next-80B-A3B-Thinking&quot;</span><span class="p">,</span><span class="s2">&quot;choices&quot;</span><span class="p">:[{</span><span class="s2">&quot;index&quot;</span><span class="p">:</span><span class="mi">0</span><span class="p">,</span><span class="s2">&quot;message&quot;</span><span class="p">:{</span><span class="s2">&quot;role&quot;</span><span class="p">:</span><span class="s2">&quot;assistant&quot;</span><span class="p">,</span><span class="s2">&quot;content&quot;</span><span class="p">:</span><span class="s2">&quot;Okay, the user is asking </span><span class="se">\&quot;</span><span class="s2">Where is New York?</span><span class="se">\&quot;</span><span class="s2"> Hmm, this seems straightforward but I need to be careful. New York could mean different things—maybe they&#39;re confused about the city versus the state. </span><span class="se">\n\n</span><span class="s2">First thought: Are they a tourist planning a trip? Or maybe a student doing homework? Could even be someone国外 who&#39;s only heard </span><span class="se">\&quot;</span><span class="s2">New York</span><span class="se">\&quot;</span><span class="s2"> in movies and isn&#39;t sure if it&#39;s a city or state. </span><span class="se">\n\n</span><span class="s2">I should clarify both possibilities immediately. People often mix them up. Like, if someone says </span><span class="se">\&quot;</span><span class="s2">I&#39;m going to New York</span><span class="se">\&quot;</span><span class="s2"> they&#39;re probably talking about NYC, but technically New York State is bigger. </span><span class="se">\n\n</span><span class="s2">Let me break it down: </span><span class="se">\n</span><span class="s2">- New York City (NYC) is the famous one—Manhattan, skyscrapers, Times Square. </span><span class="se">\n</span><span class="s2">- Then New York State (NY) is the whole state, which includes NYC but also upstate areas like Albany (the capital), Buffalo, and even the Adirondacks. </span><span class="se">\n\n</span><span class="s2">Wait, should I mention that NYC is in New York State? Yeah, that&#39;s crucial. Otherwise they might think it&#39;s two separate things. Also, where is the state located? Northeast US, borders other states like Pennsylvania, New Jersey... maybe name a few neighbors for context. </span><span class="se">\n\n</span><span class="s2">Oh! And the city vs state confusion is super common. Like, people say </span><span class="se">\&quot;</span><span class="s2">New York</span><span class="se">\&quot;</span><span class="s2"> for the city but forget it&#39;s part of a larger state. Should I give examples? </span><span class="se">\n</span><span class="s2">- </span><span class="se">\&quot;</span><span class="s2">If someone says &#39;hot dogs in New York&#39; they mean NYC</span><span class="se">\&quot;</span><span class="s2"> </span><span class="se">\n</span><span class="s2">- But </span><span class="se">\&quot;</span><span class="s2">the New York State Police</span><span class="se">\&quot;</span><span class="s2"> covers the whole state</span><span class="se">\&quot;</span><span class="s2"> </span><span class="se">\n\n</span><span class="s2">...Maybe add a fun fact? Like how NYC is just one city within the state? Or that the state capital isn&#39;t NYC but Albany? Yeah, that&#39;ll help clear confusion. </span><span class="se">\n\n</span><span class="s2">Also—should I ask if they meant the city or the state? Nah, better to cover both upfront. Keep it simple but precise. No jargon. They might not know terms like </span><span class="se">\&quot;</span><span class="s2">metropolitan area</span><span class="se">\&quot;</span><span class="s2"> or </span><span class="se">\&quot;</span><span class="s2">boroughs,</span><span class="se">\&quot;</span><span class="s2"> so explain </span><span class="se">\&quot;</span><span class="s2">boroughs</span><span class="se">\&quot;</span><span class="s2"> as neighborhoods (Manhattan, Brooklyn etc.). </span><span class="se">\n\n</span><span class="s2">Coordinates: 40.7°N, 74°W? Maybe overkill unless they&#39;re into geography. But for the state, roughly 42°N to 45°N latitude? Hmm, probably unnecessary. Stick to landmarks: borders Lake Erie, Atlantic coast... </span><span class="se">\n\n</span><span class="s2">Wait—user might be asking literally for GPS coordinates? Unlikely, but just in case I can add: </span><span class="se">\&quot;</span><span class="s2">Geographically, New York City is at approximately 40.7°N latitude and 74.0°W longitude...</span><span class="se">\&quot;</span><span class="s2"> but only if the answer feels too dry otherwise. </span><span class="se">\n\n</span><span class="s2">Priority: Clear, simple, correct. No assuming prior knowledge. Say </span><span class="se">\&quot;</span><span class="s2">New York can refer to...</span><span class="se">\&quot;</span><span class="s2"> then split into two cases. End with </span><span class="se">\&quot;</span><span class="s2">Most people mean the city when they say &#39;New York&#39; in casual talk.</span><span class="se">\&quot;</span><span class="s2"> That’s the key takeaway. </span><span class="se">\n\n</span><span class="s2">...Double-check: Is Albany really the capital? Yes. And NYC is the largest city but not capital. Got it. Also, New York State is the 27th largest by area? Maybe not relevant. Stick to basics. </span><span class="se">\n\n</span><span class="s2">Final structure: </span><span class="se">\n</span><span class="s2">1. </span><span class="se">\&quot;</span><span class="s2">New York can mean two things: the city or the state.</span><span class="se">\&quot;</span><span class="s2"> </span><span class="se">\n</span><span class="s2">2. For city: </span><span class="se">\n</span><span class="s2">   - Where it is (Northeast US) </span><span class="se">\n</span><span class="s2">   - Inside New York State </span><span class="se">\n</span><span class="s2">   - Famous parts (Manhattan etc.) </span><span class="se">\n</span><span class="s2">3. For state: </span><span class="se">\n</span><span class="s2">   - Larger area, includes city </span><span class="se">\n</span><span class="s2">   - Borders (PA, NJ, CT, MA, VT, Canada) </span><span class="se">\n</span><span class="s2">   - Capital is Albany (not NYC!) </span><span class="se">\n</span><span class="s2">4. Clear summary: </span><span class="se">\&quot;</span><span class="s2">In everyday talk, &#39;New York&#39; usually means NYC.</span><span class="se">\&quot;</span><span class="s2"> </span><span class="se">\n\n</span><span class="s2">Yeah. That covers it without overwhelming them. No markdown, just plain English. Keep it warm—add a </span><span class="se">\&quot;</span><span class="s2">hope that helps!</span><span class="se">\&quot;</span><span class="s2"> at the end.</span><span class="se">\n</span><span class="s2">&lt;/think&gt;</span><span class="se">\n\n</span><span class="s2">That&#39;s a common point of confusion! **</span><span class="se">\&quot;</span><span class="s2">New York</span><span class="se">\&quot;</span><span class="s2"> can refer to two different things**, and it&#39;s important to distinguish between them:</span><span class="se">\n\n</span><span class="s2">### 1. **New York City (NYC)**  </span><span class="se">\n</span><span class="s2">   - **What it is**: The largest and most famous city in the United States, known for landmarks like Times Square, Central Park, the Statue of Liberty, and Wall Street.  </span><span class="se">\n</span><span class="s2">   - **Where it is**:  </span><span class="se">\n</span><span class="s2">     - Located in the **northeastern United States**.  </span><span class="se">\n</span><span class="s2">     - Situated at the mouth of the **Hudson River**, where it meets the **Atlantic Ocean**.  </span><span class="se">\n</span><span class="s2">     - Part of **New York State** (see below).  </span><span class="se">\n</span><span class="s2">   - **Geographic details**:  </span><span class="se">\n</span><span class="s2">     - Coordinates: Approximately **40.7° N latitude, 74.0° W longitude**.  </span><span class="se">\n</span><span class="s2">     - Composed of **5 boroughs**: Manhattan (the </span><span class="se">\&quot;</span><span class="s2">city</span><span class="se">\&quot;</span><span class="s2"> most people picture), Brooklyn, Queens, The Bronx, and Staten Island.  </span><span class="se">\n</span><span class="s2">     - Panoramic view of NYC (including Brooklyn and New Jersey skyline):&quot;</span><span class="p">,</span><span class="s2">&quot;reasoning_content&quot;</span><span class="p">:</span><span class="n">null</span><span class="p">,</span><span class="s2">&quot;reasoning&quot;</span><span class="p">:</span><span class="n">null</span><span class="p">,</span><span class="s2">&quot;tool_calls&quot;</span><span class="p">:[]},</span><span class="s2">&quot;logprobs&quot;</span><span class="p">:</span><span class="n">null</span><span class="p">,</span><span class="s2">&quot;finish_reason&quot;</span><span class="p">:</span><span class="s2">&quot;length&quot;</span><span class="p">,</span><span class="s2">&quot;stop_reason&quot;</span><span class="p">:</span><span class="n">null</span><span class="p">,</span><span class="s2">&quot;mm_embedding_handle&quot;</span><span class="p">:</span><span class="n">null</span><span class="p">,</span><span class="s2">&quot;disaggregated_params&quot;</span><span class="p">:</span><span class="n">null</span><span class="p">,</span><span class="s2">&quot;avg_decoded_tokens_per_iter&quot;</span><span class="p">:</span><span class="mf">1.0</span><span class="p">}],</span><span class="s2">&quot;usage&quot;</span><span class="p">:{</span><span class="s2">&quot;prompt_tokens&quot;</span><span class="p">:</span><span class="mi">15</span><span class="p">,</span><span class="s2">&quot;total_tokens&quot;</span><span class="p">:</span><span class="mi">1039</span><span class="p">,</span><span class="s2">&quot;completion_tokens&quot;</span><span class="p">:</span><span class="mi">1024</span><span class="p">},</span><span class="s2">&quot;prompt_token_ids&quot;</span><span class="p">:</span><span class="n">null</span><span class="p">}</span>
+<p>Here is an example response, showing that the TensorRT LLM server reasons and answers the questions.</p>
+<p>TODO: Use Chat Compeletions API / Responses API as the example after the PR is merged.</p>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span><span class="nt">&quot;id&quot;</span><span class="p">:</span><span class="s2">&quot;chatcmpl-c5bf51b5cab94e10ba5da5266d12ee59&quot;</span><span class="p">,</span><span class="nt">&quot;object&quot;</span><span class="p">:</span><span class="s2">&quot;chat.completion&quot;</span><span class="p">,</span><span class="nt">&quot;created&quot;</span><span class="p">:</span><span class="mi">1755815898</span><span class="p">,</span><span class="nt">&quot;model&quot;</span><span class="p">:</span><span class="s2">&quot;openai/gpt-oss-120b&quot;</span><span class="p">,</span><span class="nt">&quot;choices&quot;</span><span class="p">:[{</span><span class="nt">&quot;index&quot;</span><span class="p">:</span><span class="mi">0</span><span class="p">,</span><span class="nt">&quot;message&quot;</span><span class="p">:{</span><span class="nt">&quot;role&quot;</span><span class="p">:</span><span class="s2">&quot;assistant&quot;</span><span class="p">,</span><span class="nt">&quot;content&quot;</span><span class="p">:</span><span class="s2">&quot;analysisThe user asks: \&quot;Where is New York?\&quot; Likely they want location info. Provide answer: New York State in northeastern US, New York City on the east coast, coordinates, etc. Provide context.assistantfinal**New York** can refer to two related places in the United States:\n\n| What it is | Where it is | Approx. coordinates | How to picture it |\n|------------|------------|--------------------|-------------------|\n| **New York State** | The northeastern corner of the United States, bordered by **Vermont, Massachusetts, Connecticut, New Jersey, Pennsylvania, and the Canadian provinces of Ontario and Quebec**. | 42.7° N, 75.5° W (roughly the state’s geographic centre) | A roughly rectangular state that stretches from the Atlantic Ocean in the southeast to the Adirondack Mountains and the Great Lakes region in the north. |\n| **New York City (NYC)** | The largest city in the state, located on the **southern tip of the state** where the **Hudson River meets the Atlantic Ocean**. It occupies five boroughs: Manhattan, Brooklyn, Queens, The Bronx, and Staten Island. | 40.7128° N, 74.0060° W | A dense, world‑famous metropolis that sits on a series of islands (Manhattan, Staten Island, parts of the Bronx) and the mainland (Brooklyn and Queens). |\n\n### Quick geographic context\n- **On a map of the United States:** New York State is in the **Northeast** region, just east of the Great Lakes and north of Pennsylvania.  \n- **From Washington, D.C.:** Travel roughly **225 mi (360 km) northeast**.  \n- **From Boston, MA:** Travel about **215 mi (350 km) southwest**.  \n- **From Toronto, Canada:** Travel about **500 mi (800 km) southeast**.\n\n### Travel tips\n- **By air:** Major airports include **John F. Kennedy International (JFK)**, **LaGuardia (LGA)**, and **Newark Liberty International (EWR)** (the latter is actually in New Jersey but serves the NYC metro area).  \n- **By train:** Amtrak’s **Northeast Corridor** runs from **Boston → New York City → Washington, D.C.**  \n- **By car:** Interstates **I‑87** (north‑south) and **I‑90** (east‑west) are the primary highways crossing the state.\n\n### Fun fact\n- The name “**New York**” was given by the English in 1664, honoring the Duke of York (later King James II). The city’s original Dutch name was **“New Amsterdam.”**\n\nIf you need more specific directions (e.g., how to get to a particular neighborhood, landmark, or the state capital **Albany**), just let me know!&quot;</span><span class="p">,</span><span class="nt">&quot;reasoning_content&quot;</span><span class="p">:</span><span class="kc">null</span><span class="p">,</span><span class="nt">&quot;tool_calls&quot;</span><span class="p">:[]},</span><span class="nt">&quot;logprobs&quot;</span><span class="p">:</span><span class="kc">null</span><span class="p">,</span><span class="nt">&quot;finish_reason&quot;</span><span class="p">:</span><span class="s2">&quot;stop&quot;</span><span class="p">,</span><span class="nt">&quot;stop_reason&quot;</span><span class="p">:</span><span class="kc">null</span><span class="p">,</span><span class="nt">&quot;mm_embedding_handle&quot;</span><span class="p">:</span><span class="kc">null</span><span class="p">,</span><span class="nt">&quot;disaggregated_params&quot;</span><span class="p">:</span><span class="kc">null</span><span class="p">,</span><span class="nt">&quot;avg_decoded_tokens_per_iter&quot;</span><span class="p">:</span><span class="mf">1.0</span><span class="p">}],</span><span class="nt">&quot;usage&quot;</span><span class="p">:{</span><span class="nt">&quot;prompt_tokens&quot;</span><span class="p">:</span><span class="mi">72</span><span class="p">,</span><span class="nt">&quot;total_tokens&quot;</span><span class="p">:</span><span class="mi">705</span><span class="p">,</span><span class="nt">&quot;completion_tokens&quot;</span><span class="p">:</span><span class="mi">633</span><span class="p">},</span><span class="nt">&quot;prompt_token_ids&quot;</span><span class="p">:</span><span class="kc">null</span><span class="p">}</span>
 </pre></div>
 </div>
 </section>
@@ -700,24 +776,71 @@ cat<span class="w"> </span><span class="s">&lt;&lt; EOF &gt; ${EXTRA_LLM_API_FIL
 <li><p>For connection issues, make sure the server port (<code class="docutils literal notranslate"><span class="pre">8000</span></code> in this guide) is not being used by another application.</p></li>
 </ul>
 </section>
+<section id="running-evaluations-to-verify-accuracy-optional">
+<h3>Running Evaluations to Verify Accuracy (Optional)<a class="headerlink" href="#running-evaluations-to-verify-accuracy-optional" title="Link to this heading">#</a></h3>
+<p>We use OpenAI’s official evaluation tool to test the model’s accuracy. For more information see <a class="reference internal" href="#gpt-oss-eval"><span class="xref myst">https://github.com/openai/gpt-oss/tree/main/gpt_oss/evals</span></a>.
+With the added support of Chat Completions and Responses API in <code class="docutils literal notranslate"><span class="pre">trtllm-serve,</span></code> <code class="docutils literal notranslate"><span class="pre">gpt_oss.evals</span></code> works directly without any modifications.</p>
+<p>You need to set <code class="docutils literal notranslate"><span class="pre">enable_attention_dp</span></code>, <code class="docutils literal notranslate"><span class="pre">tp_size</span></code>, <code class="docutils literal notranslate"><span class="pre">ep_size</span></code>, <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> and <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code> when launching the trtllm server and set <code class="docutils literal notranslate"><span class="pre">reasoning-effort</span></code> when launching evaluation in gpt-oss. Below are some reference configurations for accuracy evaluation on B200.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p><strong>reasoning-effort</strong></p></th>
+<th class="head text-center"><p><strong>parallel configuration</strong></p></th>
+<th class="head text-center"><p><strong>max_batch_size</strong></p></th>
+<th class="head text-center"><p><strong>max_num_tokens</strong></p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p>low/medium</p></td>
+<td class="text-center"><p>DEP8 / DEP4</p></td>
+<td class="text-center"><p>128</p></td>
+<td class="text-center"><p>32768</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>high</p></td>
+<td class="text-center"><p>DEP8 / DEP4</p></td>
+<td class="text-center"><p>2</p></td>
+<td class="text-center"><p>133120</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>low/medium</p></td>
+<td class="text-center"><p>TP8 / TP4</p></td>
+<td class="text-center"><p>1024</p></td>
+<td class="text-center"><p>32768</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>high</p></td>
+<td class="text-center"><p>TP8 / TP4</p></td>
+<td class="text-center"><p>720</p></td>
+<td class="text-center"><p>133120</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Below is an example command for evaluating the accuracy of gpt-oss-120b with low and medium reasoning-effort on GPQA and AIME2025.</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="c1"># execute this command in gpt-oss</span>
+python<span class="w"> </span>-m<span class="w"> </span>gpt_oss.evals<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--sampler<span class="w"> </span>chat_completions<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--eval<span class="w"> </span>gpqa,aime25<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model<span class="w"> </span>gpt-oss-120b<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--reasoning-effort<span class="w"> </span>low,medium
+</pre></div>
+</div>
+</section>
 </section>
 <section id="benchmarking-performance">
 <h2>Benchmarking Performance<a class="headerlink" href="#benchmarking-performance" title="Link to this heading">#</a></h2>
-<p>To benchmark the performance of your TensorRT LLM server you can leverage the built-in <code class="docutils literal notranslate"><span class="pre">benchmark_serving.py</span></code> script. To do this first creating a wrapper <code class="docutils literal notranslate"><span class="pre">bench.sh</span></code> script.</p>
+<p>To benchmark the performance of your TensorRT-LLM server you can leverage the built-in <code class="docutils literal notranslate"><span class="pre">benchmark_serving.py</span></code> script. To do this first creating a wrapper <code class="docutils literal notranslate"><span class="pre">bench.sh</span></code> script.</p>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>cat<span class="w"> </span><span class="s">&lt;&lt;&#39;EOF&#39; &gt; bench.sh</span>
 <span class="s">#!/usr/bin/env bash</span>
 <span class="s">set -euo pipefail</span>
 
-<span class="s">concurrency_list=&quot;1 2 4 8 16 32 64 128 256&quot;</span>
+<span class="s">concurrency_list=&quot;32 64 128 256 512 1024 2048 4096&quot;</span>
 <span class="s">multi_round=5</span>
 <span class="s">isl=1024</span>
 <span class="s">osl=1024</span>
-<span class="s">result_dir=/tmp/qwen3_output</span>
+<span class="s">result_dir=/tmp/gpt_oss_output</span>
 
 <span class="s">for concurrency in ${concurrency_list}; do</span>
 <span class="s">    num_prompts=$((concurrency * multi_round))</span>
 <span class="s">    python -m tensorrt_llm.serve.scripts.benchmark_serving \</span>
-<span class="s">        --model Qwen/Qwen3-Next-80B-A3B-Thinking \</span>
+<span class="s">        --model openai/gpt-oss-120b \</span>
 <span class="s">        --backend openai \</span>
 <span class="s">        --dataset-name &quot;random&quot; \</span>
 <span class="s">        --random-input-len ${isl} \</span>
@@ -746,6 +869,87 @@ chmod<span class="w"> </span>+x<span class="w"> </span>bench.sh
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>./bench.sh
 </pre></div>
 </div>
+<p>Sample TensorRT-LLM serving benchmark output. Your results may vary due to ongoing software optimizations.</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="o">============</span> <span class="n">Serving</span> <span class="n">Benchmark</span> <span class="n">Result</span> <span class="o">============</span>
+<span class="n">Successful</span> <span class="n">requests</span><span class="p">:</span>                      <span class="mi">16</span>
+<span class="n">Benchmark</span> <span class="n">duration</span> <span class="p">(</span><span class="n">s</span><span class="p">):</span>                   <span class="mf">17.66</span>
+<span class="n">Total</span> <span class="nb">input</span> <span class="n">tokens</span><span class="p">:</span>                       <span class="mi">16384</span>
+<span class="n">Total</span> <span class="n">generated</span> <span class="n">tokens</span><span class="p">:</span>                   <span class="mi">16384</span>
+<span class="n">Request</span> <span class="n">throughput</span> <span class="p">(</span><span class="n">req</span><span class="o">/</span><span class="n">s</span><span class="p">):</span>               <span class="p">[</span><span class="n">result</span><span class="p">]</span>
+<span class="n">Output</span> <span class="n">token</span> <span class="n">throughput</span> <span class="p">(</span><span class="n">tok</span><span class="o">/</span><span class="n">s</span><span class="p">):</span>          <span class="p">[</span><span class="n">result</span><span class="p">]</span>
+<span class="n">Total</span> <span class="n">Token</span> <span class="n">throughput</span> <span class="p">(</span><span class="n">tok</span><span class="o">/</span><span class="n">s</span><span class="p">):</span>           <span class="p">[</span><span class="n">result</span><span class="p">]</span>
+<span class="n">User</span> <span class="n">throughput</span> <span class="p">(</span><span class="n">tok</span><span class="o">/</span><span class="n">s</span><span class="p">):</span>                  <span class="p">[</span><span class="n">result</span><span class="p">]</span>
+<span class="o">---------------</span><span class="n">Time</span> <span class="n">to</span> <span class="n">First</span> <span class="n">Token</span><span class="o">----------------</span>
+<span class="n">Mean</span> <span class="n">TTFT</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                           <span class="p">[</span><span class="n">result</span><span class="p">]</span>
+<span class="n">Median</span> <span class="n">TTFT</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                         <span class="p">[</span><span class="n">result</span><span class="p">]</span>
+<span class="n">P99</span> <span class="n">TTFT</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                            <span class="p">[</span><span class="n">result</span><span class="p">]</span>
+<span class="o">-----</span><span class="n">Time</span> <span class="n">per</span> <span class="n">Output</span> <span class="n">Token</span> <span class="p">(</span><span class="n">excl</span><span class="o">.</span> <span class="mi">1</span><span class="n">st</span> <span class="n">token</span><span class="p">)</span><span class="o">------</span>
+<span class="n">Mean</span> <span class="n">TPOT</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                           <span class="p">[</span><span class="n">result</span><span class="p">]</span>
+<span class="n">Median</span> <span class="n">TPOT</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                         <span class="p">[</span><span class="n">result</span><span class="p">]</span>
+<span class="n">P99</span> <span class="n">TPOT</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                            <span class="p">[</span><span class="n">result</span><span class="p">]</span>
+<span class="o">---------------</span><span class="n">Inter</span><span class="o">-</span><span class="n">token</span> <span class="n">Latency</span><span class="o">----------------</span>
+<span class="n">Mean</span> <span class="n">ITL</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                            <span class="p">[</span><span class="n">result</span><span class="p">]</span>
+<span class="n">Median</span> <span class="n">ITL</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                          <span class="p">[</span><span class="n">result</span><span class="p">]</span>
+<span class="n">P99</span> <span class="n">ITL</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                             <span class="p">[</span><span class="n">result</span><span class="p">]</span>
+<span class="o">----------------</span><span class="n">End</span><span class="o">-</span><span class="n">to</span><span class="o">-</span><span class="n">end</span> <span class="n">Latency</span><span class="o">----------------</span>
+<span class="n">Mean</span> <span class="n">E2EL</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                           <span class="p">[</span><span class="n">result</span><span class="p">]</span>
+<span class="n">Median</span> <span class="n">E2EL</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                         <span class="p">[</span><span class="n">result</span><span class="p">]</span>
+<span class="n">P99</span> <span class="n">E2EL</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                            <span class="p">[</span><span class="n">result</span><span class="p">]</span>
+<span class="o">==================================================</span>
+</pre></div>
+</div>
+<section id="key-metrics">
+<h3>Key Metrics<a class="headerlink" href="#key-metrics" title="Link to this heading">#</a></h3>
+<section id="time-to-first-token-ttft">
+<h4>Time to First Token (TTFT)<a class="headerlink" href="#time-to-first-token-ttft" title="Link to this heading">#</a></h4>
+<ul class="simple">
+<li><p>The typical time elapsed from when a request is sent until the first output token is generated.</p></li>
+</ul>
+</section>
+<section id="time-per-output-token-tpot-and-inter-token-latency-itl">
+<h4>Time Per Output Token (TPOT) and Inter-Token Latency (ITL)<a class="headerlink" href="#time-per-output-token-tpot-and-inter-token-latency-itl" title="Link to this heading">#</a></h4>
+<ul class="simple">
+<li><p>TPOT is the typical time required to generate each token <em>after</em> the first one.</p></li>
+<li><p>ITL is the typical time delay between the completion of one token and the completion of the next.</p></li>
+<li><p>Both TPOT and ITL ignore TTFT.</p></li>
+</ul>
+<p>For a single request, ITLs are the time intervals between tokens, while TPOT is the average of those intervals:</p>
+<div class="highlight-math notranslate"><div class="highlight"><pre><span></span>\text{TPOT (1\ request)} = \text{Avg(ITL)} = \frac{\text{E2E\ latency} - \text{TTFT}}{\text{\#Output\ Tokens} - 1}
+</pre></div>
+</div>
+<p>Across different requests, <strong>average TPOT</strong> is the mean of each request’s TPOT (all requests weighted equally), while <strong>average ITL</strong> is token-weighted (all tokens weighted equally):</p>
+<div class="highlight-math notranslate"><div class="highlight"><pre><span></span>\text{Avg TPOT (N requests)} = \frac{\text{TPOT}_1 + \text{TPOT}_2 + \cdots + \text{TPOT}_N}{N}
+</pre></div>
+</div>
+<div class="highlight-math notranslate"><div class="highlight"><pre><span></span>\text{Avg ITL (N requests)} = \frac{\text{Sum of all ITLs across requests}}{\text{\#Output Tokens across requests}}
+</pre></div>
+</div>
+</section>
+<section id="end-to-end-e2e-latency">
+<h4>End-to-End (E2E) Latency<a class="headerlink" href="#end-to-end-e2e-latency" title="Link to this heading">#</a></h4>
+<ul class="simple">
+<li><p>The typical total time from when a request is submitted until the final token of the response is received.</p></li>
+</ul>
+</section>
+<section id="total-token-throughput">
+<h4>Total Token Throughput<a class="headerlink" href="#total-token-throughput" title="Link to this heading">#</a></h4>
+<ul class="simple">
+<li><p>The combined rate at which the system processes both input (prompt) tokens and output (generated) tokens.</p></li>
+</ul>
+<div class="highlight-math notranslate"><div class="highlight"><pre><span></span>\text{Total\ TPS} = \frac{\text{\#Input\ Tokens}+\text{\#Output\ Tokens}}{T_{last} - T_{first}}
+</pre></div>
+</div>
+</section>
+<section id="tokens-per-second-tps-or-output-token-throughput">
+<h4>Tokens Per Second (TPS) or Output Token Throughput<a class="headerlink" href="#tokens-per-second-tps-or-output-token-throughput" title="Link to this heading">#</a></h4>
+<ul class="simple">
+<li><p>how many output tokens the system generates each second.</p></li>
+</ul>
+<div class="highlight-math notranslate"><div class="highlight"><pre><span></span>\text{TPS} = \frac{\text{\#Output\ Tokens}}{T_{last} - T_{first}}
+</pre></div>
+</div>
+</section>
+</section>
 </section>
 </section>
 
@@ -760,20 +964,20 @@ chmod<span class="w"> </span>+x<span class="w"> </span>bench.sh
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="quick-start-recipe-for-gpt-oss-on-trtllm.html"
+       href="deployment-guide-for-llama4-scout-on-trtllm.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">Quick Start Recipe for GPT-OSS on TensorRT-LLM - Blackwell Hardware</p>
+        <p class="prev-next-title">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</p>
       </div>
     </a>
     <a class="right-next"
-       href="../models/supported-models.html"
+       href="deployment-guide-for-qwen3-next-on-trtllm.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">Supported Models</p>
+        <p class="prev-next-title">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -801,19 +1005,19 @@ chmod<span class="w"> </span>+x<span class="w"> </span>bench.sh
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#introduction">Introduction</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prerequisites">Prerequisites</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#models">Models</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#moe-backend-support-matrix">MoE Backend Support Matrix</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#deployment-steps">Deployment Steps</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#run-docker-container">Run Docker Container</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#creating-the-tensorrt-llm-server-config">Creating the TensorRT LLM Server config</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#recommended-performance-settings">Recommended Performance Settings</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#launch-the-tensorrt-llm-server">Launch the TensorRT LLM Server</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#configs-and-parameters">Configs and Parameters</a><ul class="nav section-nav flex-column">
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#tp-size"><code class="docutils literal notranslate"><span class="pre">--tp_size</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#ep-size"><code class="docutils literal notranslate"><span class="pre">--ep_size</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#kv-cache-free-gpu-memory-fraction"><code class="docutils literal notranslate"><span class="pre">--kv_cache_free_gpu_memory_fraction</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#max-batch-size"><code class="docutils literal notranslate"><span class="pre">--max_batch_size</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#max-num-tokens"><code class="docutils literal notranslate"><span class="pre">--max_num_tokens</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#max-seq-len"><code class="docutils literal notranslate"><span class="pre">--max_seq_len</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#trust-remote-code"><code class="docutils literal notranslate"><span class="pre">--trust_remote_code</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#extra-llm-api-options-yaml-configuration">Extra LLM API Options (YAML Configuration)</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#llm-api-options-yaml-configuration">LLM API Options (YAML Configuration)</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#tensor-parallel-size"><code class="docutils literal notranslate"><span class="pre">tensor_parallel_size</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#moe-expert-parallel-size"><code class="docutils literal notranslate"><span class="pre">moe_expert_parallel_size</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#kv-cache-free-gpu-memory-fraction"><code class="docutils literal notranslate"><span class="pre">kv_cache_free_gpu_memory_fraction</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#max-batch-size"><code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#max-num-tokens"><code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#max-seq-len"><code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#trust-remote-code"><code class="docutils literal notranslate"><span class="pre">trust_remote_code</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#cuda-graph-config"><code class="docutils literal notranslate"><span class="pre">cuda_graph_config</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#moe-config"><code class="docutils literal notranslate"><span class="pre">moe_config</span></code></a></li>
 </ul>
@@ -823,9 +1027,20 @@ chmod<span class="w"> </span>+x<span class="w"> </span>bench.sh
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#testing-api-endpoint">Testing API Endpoint</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#basic-test">Basic Test</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#troubleshooting-tips">Troubleshooting Tips</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#running-evaluations-to-verify-accuracy-optional">Running Evaluations to Verify Accuracy (Optional)</a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#benchmarking-performance">Benchmarking Performance</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#benchmarking-performance">Benchmarking Performance</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#key-metrics">Key Metrics</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#time-to-first-token-ttft">Time to First Token (TTFT)</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#time-per-output-token-tpot-and-inter-token-latency-itl">Time Per Output Token (TPOT) and Inter-Token Latency (ITL)</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#end-to-end-e2e-latency">End-to-End (E2E) Latency</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#total-token-throughput">Total Token Throughput</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#tokens-per-second-tps-or-output-token-throughput">Tokens Per Second (TPS) or Output Token Throughput</a></li>
+</ul>
+</li>
+</ul>
+</li>
 </ul>
   </nav></div>
 
@@ -920,9 +1135,9 @@ chmod<span class="w"> </span>+x<span class="w"> </span>bench.sh
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 19, 2025.</p>
+  <p>Last updated on November 05, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/796891b">796891b</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/3111682">3111682</a>.</p>
   
 </div></div>
       
