@@ -679,7 +679,7 @@ class TorchSampler(Sampler):
         if resource_manager is None:
             return None
         spec_resource_manager = resource_manager.get_resource_manager(
-            ResourceManagerType.SPEC_RESOURCE_MANAGER.value
+            ResourceManagerType.SPEC_RESOURCE_MANAGER
         )
         if spec_resource_manager is None or not hasattr(spec_resource_manager, "spec_tree_manager"):
             return None
