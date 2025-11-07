@@ -4,7 +4,9 @@ from collections import abc
 import modelopt.torch.opt as mto
 import torch
 from diffusers import DiffusionPipeline
+from PIL import Image
 from tqdm import tqdm
+from transformers import CLIPModel, CLIPProcessor
 
 from tensorrt_llm._torch.auto_deploy.compile import CompileBackendRegistry
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
@@ -43,6 +45,48 @@ class TransformerWrapper(torch.nn.Module):
         return noop_context()
 
 
+def clip_model():
+    """Load CLIP model for image-text similarity evaluation."""
+    model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+    processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+    model.eval()
+    if torch.cuda.is_available():
+        model = model.to("cuda")
+    return model, processor
+
+
+def compute_clip_similarity(image_path: str, prompt: str, clip_model_and_processor) -> float:
+    """Compute CLIP similarity score between generated image and text prompt.
+
+    Args:
+        image_path: Path to the generated image
+        prompt: Text prompt used to generate the image
+        clip_model_and_processor: Tuple of (CLIP model, CLIP processor)
+
+    Returns:
+        Similarity score between 0 and 1
+    """
+    model, processor = clip_model_and_processor
+    image = Image.open(image_path).convert("RGB")
+    inputs = processor(text=[prompt], images=image, return_tensors="pt", padding=True)
+
+    if torch.cuda.is_available():
+        inputs = {k: v.to("cuda") for k, v in inputs.items()}
+    with torch.no_grad():
+        outputs = model(**inputs)
+        image_embeds = outputs.image_embeds
+        text_embeds = outputs.text_embeds
+
+        # Normalize embeddings
+        image_embeds = image_embeds / image_embeds.norm(p=2, dim=-1, keepdim=True)
+        text_embeds = text_embeds / text_embeds.norm(p=2, dim=-1, keepdim=True)
+
+        # Compute cosine similarity
+        similarity = (image_embeds @ text_embeds.T).squeeze().item()
+
+    return similarity
+
+
 @torch.inference_mode()
 def generate_image(pipe: DiffusionPipeline, prompt: str, image_name: str) -> None:
     """Generate an image using the given pipeline and prompt."""
@@ -67,7 +111,7 @@ def benchmark_backbone_standalone(
     dummy_inputs = _gen_dummy_inp_flux(backbone)
 
     # Warmup
-    print(f"Warming up: {num_warmup} iterations")
+    ad_logger.info(f"Warming up: {num_warmup} iterations")
     for _ in tqdm(range(num_warmup), desc="Warmup"):
         _ = backbone(**dummy_inputs)
 
@@ -76,13 +120,15 @@ def benchmark_backbone_standalone(
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
 
-    print(f"Benchmarking: {num_benchmark} iterations")
+    ad_logger.info(f"Benchmarking: {num_benchmark} iterations")
     times = []
     for _ in tqdm(range(num_benchmark), desc="Benchmark"):
+        torch.cuda.profiler.cudart().cudaProfilerStart()
         start_event.record()
         _ = backbone(**dummy_inputs)
         end_event.record()
         torch.cuda.synchronize()
+        torch.cuda.profiler.cudart().cudaProfilerStop()
         times.append(start_event.elapsed_time(end_event))
 
     avg_latency = sum(times) / len(times)
@@ -91,11 +137,11 @@ def benchmark_backbone_standalone(
     p95 = times[int(len(times) * 0.95)]
     p99 = times[int(len(times) * 0.99)]
 
-    print(f"\nBackbone-only inference latency ({model_dtype}):")
-    print(f"  Average: {avg_latency:.2f} ms")
-    print(f"  P50: {p50:.2f} ms")
-    print(f"  P95: {p95:.2f} ms")
-    print(f"  P99: {p99:.2f} ms")
+    ad_logger.info(f"\nBackbone-only inference latency ({model_dtype}):")
+    ad_logger.info(f"  Average: {avg_latency:.2f} ms")
+    ad_logger.info(f"  P50: {p50:.2f} ms")
+    ad_logger.info(f"  P95: {p95:.2f} ms")
+    ad_logger.info(f"  P99: {p99:.2f} ms")
 
     return avg_latency
 
@@ -205,11 +251,21 @@ def main():
     pipe = DiffusionPipeline.from_pretrained(args.model, torch_dtype=torch.bfloat16)
     pipe.to("cuda")
 
+    # Load CLIP model for similarity evaluation if generating images
+    clip_model_processor = None
+    if not args.skip_image_generation:
+        ad_logger.info("Loading CLIP model for similarity evaluation")
+        clip_model_processor = clip_model()
+
     if args.hf_inference:
         if not args.skip_image_generation:
             ad_logger.info("Generating image with the torch pipeline")
             hf_image_path = f"hf_{args.image_path}"
             generate_image(pipe, args.prompt, hf_image_path)
+
+            # Compute CLIP similarity score
+            similarity = compute_clip_similarity(hf_image_path, args.prompt, clip_model_processor)
+            ad_logger.info(f"CLIP similarity score (HF): {similarity:.4f}")
         if args.benchmark:
             ad_logger.info("Benchmarking HuggingFace model")
             latency = benchmark_backbone_standalone(pipe, model_dtype="BFloat16")
@@ -274,6 +330,10 @@ def main():
     if not args.skip_image_generation:
         ad_logger.info("Generating image with the exported auto-deploy model")
         generate_image(pipe, args.prompt, args.image_path)
+
+        # Compute CLIP similarity score
+        similarity = compute_clip_similarity(args.image_path, args.prompt, clip_model_processor)
+        ad_logger.info(f"CLIP similarity score (AutoDeploy): {similarity:.4f}")
 
     if args.benchmark:
         ad_logger.info("Benchmarking AutoDeploy model")
