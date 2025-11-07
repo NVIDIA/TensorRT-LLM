@@ -880,6 +880,7 @@ class VilaInputProcessor(BaseMultimodalInputProcessor,
                          trust_remote_code=trust_remote_code,
                          **kwargs)
         self._config = config
+        self._model_path = model_path
         llm_path, vision_tower_path, mm_projector_path = _get_model_paths(
             self.config)
         self._dtype = self.config.model_dtype
@@ -911,6 +912,9 @@ class VilaInputProcessor(BaseMultimodalInputProcessor,
     @property
     def dtype(self) -> torch.dtype:
         return self._dtype
+
+    def model_path(self) -> str:
+        return self._model_path
 
     @nvtx_range("[Vision] preprocess")
     def _preprocess(self,
