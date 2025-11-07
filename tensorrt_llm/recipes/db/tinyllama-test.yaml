@@ -17,7 +17,7 @@ scenario:
 env:
   TLLM_WORKER_USE_SINGLE_PROCESS: 1
 
-llm_api_config:
+llm_api_options:
   tensor_parallel_size: 1
   max_batch_size: 256
   max_num_tokens: 4096

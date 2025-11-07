@@ -41,11 +41,11 @@ def extract_scenario_from_recipe(recipe_path: Optional[str]) -> Optional[Dict[st
         with open(recipe_path, "r") as f:
             loaded_data = yaml.safe_load(f)
 
-        # Check if this is a recipe format (has 'scenario' and 'llm_api_config' keys)
+        # Check if this is a recipe format (has 'scenario' and 'llm_api_options' keys)
         if (
             isinstance(loaded_data, dict)
             and "scenario" in loaded_data
-            and "llm_api_config" in loaded_data
+            and "llm_api_options" in loaded_data
         ):
             return loaded_data["scenario"]
 
@@ -162,13 +162,13 @@ def validate_scenario_params(scenario: Dict[str, Any]) -> None:
             raise ValueError(f"num_requests must be positive, got: {scenario['num_requests']}")
 
 
-def prepare_llm_api_config_for_recipe(
+def prepare_llm_api_options_for_recipe(
     extra_llm_api_options_path: Optional[str], scenario: Optional[Dict[str, Any]]
 ) -> Optional[str]:
-    """Prepare llm_api_config for LLM constructor when using recipe format.
+    """Prepare llm_api_options for LLM constructor when using recipe format.
 
     When a recipe format is detected (scenario is not None), this function extracts
-    only the llm_api_config section and writes it to a temporary file. This prevents
+    only the llm_api_options section and writes it to a temporary file. This prevents
     the scenario section from being passed to the LLM constructor, which would cause
     an "invalid argument" error.
 
@@ -177,13 +177,13 @@ def prepare_llm_api_config_for_recipe(
         scenario: Scenario dict from recipe (None if not recipe format)
 
     Returns:
-        Path to temporary file with llm_api_config (if recipe format), or
+        Path to temporary file with llm_api_options (if recipe format), or
         original path (if not recipe format), or None (if no path provided)
 
     Example:
         >>> scenario = extract_scenario_from_recipe("recipe.yaml")
-        >>> config_path = prepare_llm_api_config_for_recipe("recipe.yaml", scenario)
-        # config_path now points to temp file with only llm_api_config section
+        >>> config_path = prepare_llm_api_options_for_recipe("recipe.yaml", scenario)
+        # config_path now points to temp file with only llm_api_options section
     """
     if extra_llm_api_options_path is None:
         return None
@@ -192,26 +192,26 @@ def prepare_llm_api_config_for_recipe(
     if scenario is None:
         return extra_llm_api_options_path
 
-    # Recipe format detected - extract llm_api_config only
-    logger.info("Recipe format detected - extracting llm_api_config for LLM constructor")
+    # Recipe format detected - extract llm_api_options only
+    logger.info("Recipe format detected - extracting llm_api_options for LLM constructor")
 
     try:
         with open(extra_llm_api_options_path, "r") as f:
             full_recipe = yaml.safe_load(f)
 
-        # Extract only the llm_api_config section
-        llm_api_config_only = full_recipe.get("llm_api_config", {})
+        # Extract only the llm_api_options section
+        llm_api_options_only = full_recipe.get("llm_api_options", {})
 
-        # Create temporary file with only llm_api_config
+        # Create temporary file with only llm_api_options
         temp_fd, temp_path = tempfile.mkstemp(suffix=".yaml", text=True)
         with os.fdopen(temp_fd, "w") as f:
-            yaml.safe_dump(llm_api_config_only, f)
+            yaml.safe_dump(llm_api_options_only, f)
 
-        logger.info(f"Created temporary config file with llm_api_config at: {temp_path}")
+        logger.info(f"Created temporary config file with llm_api_options at: {temp_path}")
         return temp_path
 
     except (FileNotFoundError, yaml.YAMLError, KeyError) as e:
-        logger.warning(f"Failed to process recipe file for llm_api_config: {e}")
+        logger.warning(f"Failed to process recipe file for llm_api_options: {e}")
         return extra_llm_api_options_path
 
 
@@ -319,8 +319,11 @@ def process_recipe_scenario(
     from tensorrt_llm.bench.benchmark import get_general_cli_options
 
     # Extract scenario from recipe
+    # Priority: --recipe > --extra_llm_api_options
+    recipe_path = params.get("recipe")
     extra_llm_api_options_path = params.get("extra_llm_api_options")
-    scenario = extract_scenario_from_recipe(extra_llm_api_options_path)
+    config_path = recipe_path if recipe_path else extra_llm_api_options_path
+    scenario = extract_scenario_from_recipe(config_path)
 
     if not scenario:
         return params, options, None
@@ -334,15 +337,12 @@ def process_recipe_scenario(
     params.update(merged_params)
 
     # Auto-generate dataset if not provided
-    if params.get("dataset") is None and scenario.get(
-            'target_isl') and scenario.get('target_osl'):
-        logger.info(
-            "No dataset provided, auto-generating from scenario parameters")
+    if params.get("dataset") is None and scenario.get("target_isl") and scenario.get("target_osl"):
+        logger.info("No dataset provided, auto-generating from scenario parameters")
         workspace = Path.cwd() / ".trtllm_bench_workspace"
-        auto_dataset_path = auto_generate_dataset(scenario,
-                                                  workspace,
-                                                  tokenizer=str(
-                                                      options.checkpoint_path))
+        auto_dataset_path = auto_generate_dataset(
+            scenario, workspace, tokenizer=str(options.checkpoint_path)
+        )
         params["dataset"] = auto_dataset_path
         logger.info(f"Generated dataset at {auto_dataset_path}")
 

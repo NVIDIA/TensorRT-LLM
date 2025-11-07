@@ -1763,7 +1763,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 self._benchmark_script, f"--model={model_name}",
                 f"--model_path={model_path}", "throughput",
                 f"--dataset={dataset_path}", f"--report_json={report_path}",
-                f"--extra_llm_api_options={recipe_path}"
+                f"--recipe={recipe_path}"
             ]
             return benchmark_cmd
 

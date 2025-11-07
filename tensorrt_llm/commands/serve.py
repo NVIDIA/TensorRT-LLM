@@ -18,8 +18,6 @@ from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.auto_deploy.llm import LLM as AutoDeployLLM
 from tensorrt_llm._utils import mpi_rank
-# Import configure command
-from tensorrt_llm.commands.configure import configure
 from tensorrt_llm.executor.utils import LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
@@ -401,14 +399,14 @@ def serve(
         with open(extra_llm_api_options, 'r') as f:
             loaded_data = yaml.safe_load(f)
 
-            # Detect recipe format (has 'scenario' and 'llm_api_config' keys)
+            # Detect recipe format (has 'scenario' and 'llm_api_options' keys)
             if isinstance(
                     loaded_data, dict
-            ) and 'scenario' in loaded_data and 'llm_api_config' in loaded_data:
-                # Recipe format - extract llm_api_config section for LLM args
-                llm_args_extra_dict = loaded_data['llm_api_config']
+            ) and 'scenario' in loaded_data and 'llm_api_options' in loaded_data:
+                # Recipe format - extract llm_api_options section for LLM args
+                llm_args_extra_dict = loaded_data['llm_api_options']
 
-                # TODO: Add llm_api_config validation once PR #8331 merges
+                # TODO: Add llm_api_options validation once PR #8331 merges
                 # (standardizes LlmArgs with Pydantic - validation will happen automatically)
 
                 # Set environment variables from 'env' section (if not already set)
