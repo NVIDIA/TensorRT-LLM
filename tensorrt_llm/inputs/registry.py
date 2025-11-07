@@ -3,7 +3,7 @@ import random
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import (Any, Callable, Dict, List, Optional, Protocol, Tuple, Type,
-                    TypeVar)
+                    TypeVar, Union)
 
 import torch
 from PIL import Image
@@ -320,17 +320,17 @@ class BaseMultimodalDummyInputsBuilder(ABC):
     @property
     @abstractmethod
     def tokenizer(self) -> PreTrainedTokenizerBase:
-        pass
+        ...
 
     @property
     @abstractmethod
     def config(self) -> PretrainedConfig:
-        pass
+        ...
 
     @property
     @abstractmethod
     def model_path(self) -> str:
-        pass
+        ...
 
     def get_dummy_image(self, max_width: int, max_height: int) -> Image.Image:
         image = Image.new("RGB", (max_width, max_height),
@@ -558,7 +558,7 @@ def create_input_processor(
     model_path_or_dir: str,
     tokenizer,
     checkpoint_format: Optional[str] = "HF",
-) -> InputProcessor:
+) -> Union[InputProcessor, BaseMultimodalInputProcessor]:
     """Create an input processor for a specific model.
 
     Args:
