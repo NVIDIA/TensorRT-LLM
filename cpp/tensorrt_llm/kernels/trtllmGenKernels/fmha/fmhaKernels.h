@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,9 +30,7 @@
 #include "fmhaRunnerParams.h"
 #include "kernelParams.h"
 #include "prepareCustomMask.h"
-#include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
-#include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 
 namespace tc = tensorrt_llm::common;
 
@@ -528,15 +526,9 @@ private:
         {
             if (params.is_spec_dec_tree)
             {
-
-                if (params.mNumHeadsQPerKv <= 16 && (params.mHeadDimQk == 64 || params.mHeadDimQk == 128))
-                {
-                    kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
-                }
-                else
-                {
-                    kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
-                }
+                kernelType = (params.mNumHeadsQPerKv <= 16 && (params.mHeadDimQk == 64 || params.mHeadDimQk == 128))
+                    ? FmhaKernelType::KeepsMmaAbForGeneration
+                    : FmhaKernelType::SwapsMmaAbForGeneration;
             }
             else
             {

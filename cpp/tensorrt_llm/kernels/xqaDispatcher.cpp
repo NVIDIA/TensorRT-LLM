@@ -259,6 +259,11 @@ bool XqaDispatcher::isSupported()
             TLLM_LOG_WARNING("Unsupported data type combination.");
             return false;
         }
+        if (mFixedParams.isSpecDecoding && mFixedParams.isMLA)
+        {
+            TLLM_LOG_WARNING("TRTLLM-GEN does not support Speculative decoding with MLA.");
+            return false;
+        }
         if (mFixedParams.hasAlibi)
         {
             TLLM_LOG_WARNING("TRTLLM-GEN does not support ALiBi.");
@@ -269,14 +274,8 @@ bool XqaDispatcher::isSupported()
         TllmGenFmhaRunnerParams tllmRunnerParams;
         memset(&tllmRunnerParams, 0, sizeof(tllmRunnerParams));
         tllmRunnerParams.mQkvLayout = mFixedParams.isPagedKv ? QkvLayout::PagedKv : QkvLayout::ContiguousKv;
-        if (mFixedParams.isSpecDecoding)
-        {
-            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Custom;
-        }
-        else
-        {
-            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
-        }
+        tllmRunnerParams.mMaskType
+            = mFixedParams.isSpecDecoding ? TrtllmGenAttentionMaskType::Custom : TrtllmGenAttentionMaskType::Dense;
         tllmRunnerParams.is_spec_dec_tree = mFixedParams.isSpecDecoding;
         tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
         tllmRunnerParams.mTileScheduler = TileScheduler::Static;
@@ -490,14 +489,8 @@ void XqaDispatcher::runImpl(
         tllmRunnerParams.stream = params.stream;
         tllmRunnerParams.mSfStartTokenIdx = params.start_token_idx_sf;
         tllmRunnerParams.is_spec_dec_tree = params.is_spec_dec_tree && params.multi_query_tokens;
-        if (tllmRunnerParams.is_spec_dec_tree)
-        {
-            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Custom;
-        }
-        else
-        {
-            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
-        }
+        tllmRunnerParams.mMaskType = tllmRunnerParams.is_spec_dec_tree ? TrtllmGenAttentionMaskType::Custom
+                                                                       : TrtllmGenAttentionMaskType::Dense;
         tllmRunnerParams.layer_idx = params.layer_idx;
         tllmRunnerParams.spec_decoding_generation_lengths = params.spec_decoding_generation_lengths;
         tllmRunnerParams.generalPackedCustoMaskPtr = params.spec_decoding_packed_mask;

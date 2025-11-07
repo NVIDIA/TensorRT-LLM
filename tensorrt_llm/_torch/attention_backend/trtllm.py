@@ -1079,7 +1079,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def compute_max_num_custom_mask_tiles_kv_upper_bound(
             self, max_seq_len_kv, min_first_sparse_mask_offset_kv,
-            tile_size_kv_per_cta):
+            tile_size_kv_per_cta) -> int:
         """
         Compute the conservative upper bound of numCustomMaskTilesKv.
 
@@ -1093,7 +1093,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         max_num_custom_mask_tiles_kv = num_tiles_kv_total - first_sparse_tile_offset
         return max_num_custom_mask_tiles_kv
 
-    def spec_decoding_param_prepare_for_blackwell(self):
+    def spec_decoding_param_prepare_for_blackwell(self) -> None:
+        """
+        Prepare the blackwell parameters for the speculative decoding (Medusa and Eagle) generation-phase attention kernels.
+        """
         self.spec_decoding_bl_tree_mask_offset = torch.zeros(
             [self.max_num_requests],
             dtype=torch.int64,
@@ -1143,7 +1146,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         is_spec_dec_dynamic_tree,
         max_draft_tokens,
         spec_decoding_tensor: Optional['SpecDecodingTensor'] = None,
-    ):
+    ) -> None:
 
         if spec_decoding_tensor is not None:
             spec_decoding_position_offsets = spec_decoding_tensor.position_offsets
