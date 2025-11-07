@@ -33,13 +33,13 @@ else:
     from typing_extensions import override
 
 
-TemperatureOnly = tuple[Literal["temperature"], float]
-TopK = tuple[Literal["top_k"], int, float]
-TopP = tuple[Literal["top_p"], float, float]
-TopKTopP = tuple[Literal["top_k_top_p"], int, float, float]
-Greedy = tuple[Literal["greedy"], None]
+TemperatureOnly: TypeAlias = tuple[Literal["temperature"], float]
+TopK: TypeAlias = tuple[Literal["top_k"], int, float]
+TopP: TypeAlias = tuple[Literal["top_p"], float, float]
+TopKTopP: TypeAlias = tuple[Literal["top_k_top_p"], int, float, float]
+Greedy: TypeAlias = tuple[Literal["greedy"], None]
 GREEDY: Greedy = ("greedy", None)
-Strategy = TopK | TopP | Greedy | TopKTopP | TemperatureOnly
+Strategy: TypeAlias = TopK | TopP | Greedy | TopKTopP | TemperatureOnly
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -258,7 +258,10 @@ def sample(
     match strategy:
         case ("top_k", top_k, temperature):
             tokens, softmax = top_k_sampling_batch(
-                logits, top_k=top_k, temperature=temperature, generator=generator
+                logits,
+                top_k=top_k,
+                temperature=temperature,
+                generator=generator,
             )
         case ("top_p", top_p, temperature):
             tokens, softmax = top_p_sampling_batch(
@@ -292,7 +295,7 @@ GenericStrategyKeyType = TypeVar("GenericStrategyKeyType")
 class GroupedStrategySampler(Generic[GenericStrategyKeyType], abc.ABC):
     @staticmethod
     @abc.abstractmethod
-    def strategy_grouping_key(strategy: Strategy) -> GenericStrategyKeyType:
+    def strategy_grouping_key(strategy: Strategy, return_probs: bool) -> GenericStrategyKeyType:
         raise NotImplementedError
 
     @staticmethod
@@ -314,7 +317,7 @@ class SimpleGroupedStrategySampler(GroupedStrategySampler[Strategy]):
 
     @override
     @staticmethod
-    def strategy_grouping_key(strategy: Strategy) -> STRATEGY_KEY_TYPE:
+    def strategy_grouping_key(strategy: Strategy, return_probs: bool) -> STRATEGY_KEY_TYPE:
         return strategy
 
     @override
