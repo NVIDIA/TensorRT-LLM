@@ -1167,6 +1167,7 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
             f"  Chunk {i}: Q[{chunk.token_start}:{chunk.token_end}] ({num_q} tokens), "
             f"K[{chunk.k_token_start}:{chunk.k_token_end}] ({num_k} tokens)")
 
+    indexer._update_k_cache(k_fp8, k_scale, metadata_chunked)
     topk_indices_chunked = indexer.sparse_attn_indexer(metadata_chunked,
                                                        hidden_states, q_fp8,
                                                        k_fp8, k_scale, weights)
@@ -1198,6 +1199,7 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
             f"✓ Created {num_baseline_chunks} chunk(s) (effectively non-chunked)"
         )
 
+    indexer._update_k_cache(k_fp8, k_scale, metadata_baseline)
     topk_indices_baseline = indexer.sparse_attn_indexer(metadata_baseline,
                                                         hidden_states, q_fp8,
                                                         k_fp8, k_scale, weights)
