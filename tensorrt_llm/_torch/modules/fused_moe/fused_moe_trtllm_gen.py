@@ -509,7 +509,8 @@ class TRTLLMGenFusedMoE(MoE):
 
         moe_output: Optional[torch.Tensor] = None
         use_workspace_output = False
-        if self.enable_alltoall and self.moe_alltoall_backend == "mnnvlthroughput":
+        # TODO: use_workspace_output only supports w4a8_mxfp4_mxfp8 (gpt-oss) for now
+        if self.enable_alltoall and self.moe_alltoall_backend == "mnnvlthroughput" and self.has_w4a8_mxfp4_mxfp8:
             moe_output = self.moe_a2a.get_combine_payload_tensor_in_workspace(
                 runtime_max_tokens_per_rank, self.hidden_size, torch.bfloat16)
             use_workspace_output = True
