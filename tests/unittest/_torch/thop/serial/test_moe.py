@@ -559,7 +559,7 @@ def run_moe_reference_fp4(args):
                                     gemm2_weights_dequant,
                                     args.permute_info,
                                     args.use_routing_scales_on_input,
-                                    gemm1_bias=None,
+                                    gemm1_bias=args.gemm1_bias,
                                     gemm1_alpha=args.gemm1_alpha,
                                     gemm1_beta=args.gemm1_beta,
                                     gemm1_clamp_limit=args.gemm1_clamp_limit,
@@ -1670,7 +1670,7 @@ class TestMoeFp4:
                         gemm2_scales_global,
                         permute_info,
                         False,
-                        gemm1_bias=None,
+                        gemm1_bias=gemm1_bias,
                         gemm1_alpha=swiglu_alpha_tensor,
                         gemm1_beta=swiglu_beta_tensor,
                         gemm1_clamp_limit=swiglu_limit_tensor,
@@ -1688,12 +1688,16 @@ class TestMoeFp4:
         # Reorder rows of W1 and scales for fused gated activation
         gemm1_weights_fp4_interleaved = []
         gemm1_scales_fp4_interleaved = []
+        gemm1_bias_interleaved = []
         for i in range(num_experts):
             gemm1_weights_fp4_interleaved.append(
                 reorder_rows_for_gated_act_gemm(gemm1_weights_fp4[i].clone()))
             gemm1_scales_fp4_interleaved.append(
                 reorder_rows_for_gated_act_gemm(
                     gemm1_scales_linear_fp4[i].clone()))
+            gemm1_bias_interleaved.append(
+                reorder_rows_for_gated_act_gemm(gemm1_bias[i].clone().reshape(
+                    -1, 1)))
 
         # Stack weights and scales for all experts
         gemm1_weights_fp4_interleaved = torch.stack(
@@ -1708,6 +1712,7 @@ class TestMoeFp4:
         # Shuffle weights and scaling factors for transposed mma output
         gemm1_weights_fp4_shuffled = []
         gemm1_scales_fp4_shuffled = []
+        gemm1_bias_shuffled = []
         gemm2_weights_fp4_shuffled = []
         gemm2_scales_fp4_shuffled = []
         for i in range(num_experts):
@@ -1719,6 +1724,8 @@ class TestMoeFp4:
                 shuffle_matrix_sf_a(
                     gemm1_scales_fp4_interleaved[i].view(torch.uint8),
                     epilogue_tile_m))
+            gemm1_bias_shuffled.append(
+                shuffle_matrix_a(gemm1_bias_interleaved[i], epilogue_tile_m))
 
             gemm2_weights_fp4_shuffled.append(
                 shuffle_matrix_a(gemm2_weights_fp4[i].view(torch.uint8),
@@ -1739,11 +1746,16 @@ class TestMoeFp4:
             torch.float8_e4m3fn).reshape(num_experts, hidden_size,
                                          intermediate_size // 16)
 
+        gemm1_bias_shuffled = torch.stack(gemm1_bias_shuffled).reshape(
+            num_experts, -1)
+
         # NOTE: correct the beta and clamp to account for the global scale factor
         # Check cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/GemmGatedActOptions.h
         # for more details
         swiglu_beta_tensor = swiglu_beta_tensor * args.gemm1_scales_global * args.hidden_states_scale_global
         swiglu_limit_tensor = swiglu_limit_tensor * args.gemm1_scales_global * args.hidden_states_scale_global
+        gemm1_bias_shuffled = gemm1_bias_shuffled * args.gemm1_scales_global[:,
+                                                                             None] * args.hidden_states_scale_global
 
         #
         # Run the TRT-LLM kernel
@@ -1771,6 +1783,7 @@ class TestMoeFp4:
                 hidden_states_scale_linear_fp4,
                 gemm1_weights_fp4_shuffled,
                 gemm1_scales_fp4_shuffled,
+                gemm1_bias_shuffled,
                 swiglu_alpha_tensor,
                 swiglu_beta_tensor,
                 swiglu_limit_tensor,
