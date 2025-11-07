@@ -7,12 +7,18 @@ from typing import Callable
 
 import pytest
 import torch
+from _torch_test_utils import fp8_compatible, trtllm_ops_available  # noqa: F401
 from torch.nn import functional as F
 
+import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import ActivationType
 
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 FP8_DTYPE = torch.float8_e4m3fn
+
+
+def _is_hopper_or_later():
+    return torch.cuda.get_device_capability(0) >= (8, 9)
 
 
 def dynamic_per_tensor_fp8_quant(x: torch.tensor) -> tuple[torch.tensor, torch.tensor]:
@@ -179,6 +185,10 @@ F16_TEST_DTYPES = [
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
 @pytest.mark.parametrize("itype, otype, wtype", F16_TEST_DTYPES)
 @pytest.mark.parametrize("activation_func", ["silu", "relu2"])
+@pytest.mark.skipif(
+    not _is_hopper_or_later() or not trtllm_ops_available(),
+    reason="Requires Hopper or later and trtllm support",
+)
 def test_trtllm_fused_moe(
     batch_size,
     hidden_size,
@@ -286,6 +296,10 @@ FP8_TEST_DTYPES = [
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
 @pytest.mark.parametrize("itype, otype, wtype", FP8_TEST_DTYPES)
 @pytest.mark.parametrize("activation_func", ["silu", "relu2"])
+@pytest.mark.skipif(
+    not fp8_compatible() or not trtllm_ops_available(),
+    reason="Requires fp8 and trtllm support",
+)
 def test_trtllm_fused_fp8moe(
     batch_size,
     hidden_size,
