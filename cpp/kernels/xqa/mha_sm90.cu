@@ -54,6 +54,7 @@ static_assert(SWAP_AB && USE_PAGED_KV_CACHE && !SPEC_DEC && BEAM_WIDTH == 1, "SK
 #endif
 
 #define IS_SUPPORTED_F16_CASE (CACHE_ELEM_ENUM == 0 && !USE_INPUT_KV && !LOW_PREC_OUTPUT)
+#define DISABLE_VT_FOR_FP16_NO_SWAP_AB 1
 
 inline constexpr bool swapAB = SWAP_AB;
 
@@ -180,7 +181,7 @@ struct alignas(128) SharedMem
         {
             XBuffer x;
             VBuffer v;
-#if !SWAP_AB && CACHE_ELEM_ENUM != 0
+#if !SWAP_AB && !(CACHE_ELEM_ENUM == 0 && DISABLE_VT_FOR_FP16_NO_SWAP_AB)
             VTBuffer vt;
 #endif
             // @fixme: also put xColMax and xColSum here
@@ -201,7 +202,7 @@ struct alignas(128) SharedMem
     {
         return reusedXVOutSwizzleBuf[i].xv.v;
     }
-#if !SWAP_AB && CACHE_ELEM_ENUM != 0
+#if !SWAP_AB && !(CACHE_ELEM_ENUM == 0 && DISABLE_VT_FOR_FP16_NO_SWAP_AB)
     __device__ inline VTBuffer& vtBuf(uint32_t i)
     {
         return reusedXVOutSwizzleBuf[i].xv.vt;
@@ -243,7 +244,7 @@ struct alignas(128) SharedMem
     CtaBarrierPair qBar;
     CtaBarrierPair kBar[nbKBuf];
     CtaBarrierPair vBar[nbVBuf];
-#if !SWAP_AB && CACHE_ELEM_ENUM != 0
+#if !SWAP_AB && !(CACHE_ELEM_ENUM == 0 && DISABLE_VT_FOR_FP16_NO_SWAP_AB)
     CtaBarrierPair vtBar[nbVBuf];
 #endif
     CtaBarrierPair xBar[nbXBuf];
@@ -836,7 +837,7 @@ CUBIN_EXPORT __global__
                 smem.vBar[wid].initialize(gemm1NbThrds, gemm1NbThrds + warp_size);
 #endif
 
-#if !SWAP_AB && CACHE_ELEM_ENUM != 0
+#if !SWAP_AB && !(CACHE_ELEM_ENUM == 0 && DISABLE_VT_FOR_FP16_NO_SWAP_AB)
                 smem.vtBar[wid].initialize(gemm1NbThrds * 2, gemm1NbThrds * 2);
 #endif
                 smem.xBar[wid].initialize(gemm0NbThrds + gemm1NbThrds, gemm0NbThrds + gemm1NbThrds);
@@ -1101,7 +1102,7 @@ CUBIN_EXPORT __global__
         {
             unused(b.consumed.arrive());
         }
-#if !SWAP_AB && CACHE_ELEM_ENUM != 0
+#if !SWAP_AB && !(CACHE_ELEM_ENUM == 0 && DISABLE_VT_FOR_FP16_NO_SWAP_AB)
         for (auto& b : smem.vtBar)
         {
             unused(b.consumed.arrive());
@@ -1156,7 +1157,7 @@ CUBIN_EXPORT __global__
 #endif
             {
                 arrive_tx_and_wait(vBar.produced, exactDiv(sizeof(SharedMem::VBuffer), gemm1NbThrds));
-#if !SWAP_AB && CACHE_ELEM_ENUM != 0
+#if !SWAP_AB && !(CACHE_ELEM_ENUM == 0 && DISABLE_VT_FOR_FP16_NO_SWAP_AB)
                 CtaBarrierPair& vtBar = smem.vtBar[idxVBuf];
                 auto& vtBuf = smem.vtBuf(idxVBuf);
                 vtBar.consumed.arrive_and_wait();
@@ -1332,7 +1333,7 @@ CUBIN_EXPORT __global__
                     gmma::wait_group<0>();
                 }
 #else
-#if CACHE_ELEM_ENUM == 2
+#if !(CACHE_ELEM_ENUM == 0 && DISABLE_VT_FOR_FP16_NO_SWAP_AB)
                 auto const descVTBase = gmma::makeMatDesc(
                     nullptr, 0, SharedMem::VTBuffer::rowBytes * 8, gmma::getSwizzleMode<true>(SharedMem::VTBuffer{}))
                                             .raw();
@@ -1352,7 +1353,7 @@ CUBIN_EXPORT __global__
                         auto const descX = addAddr(descXBase,
                             &xBuf[kOffsetInGrains.template divBy<SharedMem::XBuffer::Elem::cols>().get()](
                                 gmma::instM * m, kOffsetInGrains.template mod<SharedMem::XBuffer::Elem::cols>().get()));
-#if CACHE_ELEM_ENUM == 0
+#if CACHE_ELEM_ENUM == 0 && DISABLE_VT_FOR_FP16_NO_SWAP_AB
 #pragma unroll
                         for (uint32_t cachePartIdx = 0; cachePartIdx < cacheHeadNbParts; cachePartIdx++)
                         {
@@ -1363,7 +1364,7 @@ CUBIN_EXPORT __global__
                                     acc(m, cachePartIdx * exactDiv(cacheHeadPartElems, gmma::instNBase))),
                                 descX, descV, true);
                         }
-#elif CACHE_ELEM_ENUM == 2
+#else
                         auto const descVT = addAddr(
                             descVTBase, &vtBuf(0, kOffsetInGrains.template mod<SharedMem::VTBuffer::cols>().get()));
                         gmma::mma_async_shmA<MathElem, headElems>(
@@ -1432,7 +1433,7 @@ CUBIN_EXPORT __global__
                 }
             }
             unused(xBar.consumed.arrive());
-#if SWAP_AB || CACHE_ELEM_ENUM == 0
+#if SWAP_AB || (CACHE_ELEM_ENUM == 0 && DISABLE_VT_FOR_FP16_NO_SWAP_AB)
             unused(vBar.consumed.arrive());
 #else
             unused(vtBar.consumed.arrive());
@@ -2849,7 +2850,8 @@ __device__ inline void transposeVTile(
             auto const srcAddr
                 = lane < 16 ? &src[idxPart].template at<true>(warpRank * 16 + 8 * idxMat + idxRow, n) : nullptr;
             Vec<uint32_t, 2> const a = ldmatrix<true, 2>(srcAddr);
-            auto const dstAddr = lane < 16 ? &dst.template at<true>(n * 8 + idxRow, warpRank * 2 + idxMat) : nullptr;
+            auto const dstAddr
+                = lane < 16 ? &dst.template at<true>(m * gmma::instM + n * 8 + idxRow, warpRank * 2 + idxMat) : nullptr;
             stmatrix<false, 2>(dstAddr, a);
         }
     }
