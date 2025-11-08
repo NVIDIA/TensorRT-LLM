@@ -320,7 +320,7 @@ class FP8BlockScaleMoeRunner : public torch::CustomClassHolder
 
 public:
     explicit FP8BlockScaleMoeRunner()
-        : mSupportedTileN{8, 16, 32, 64}
+        : mSupportedTileN{8, 16, 32, 64, 128}
     {
         for (int tileN : mSupportedTileN)
         {

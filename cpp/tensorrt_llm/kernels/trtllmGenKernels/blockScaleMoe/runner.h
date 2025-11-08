@@ -141,13 +141,16 @@ public:
     size_t getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts,
         int32_t numTokens, int32_t configIndex) const;
 
-    [[nodiscard]] int32_t getDefaultValidConfigIndex(
-        int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts, int32_t numTokens) const;
+    [[nodiscard]] int32_t getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
+        int32_t numExperts, int32_t numTokens, int32_t validHiddenSize = -1, int32_t validIntermediateSize = -1) const;
 
     [[nodiscard]] bool isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hiddenSize,
-        int32_t intermediateSize, int32_t numExperts, int32_t numTokens) const;
+        int32_t intermediateSize, int32_t numExperts, int32_t numTokens, int32_t validHiddenSize = -1,
+        int32_t validIntermediateSize = -1) const;
 
     [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const;
+
+    [[nodiscard]] std::string getKernelNameFromConfigIndex(int32_t configIndex) const;
 
     void run(void* hiddenState, void* hiddenStateScale, void* weight, void* weightScale, void* expertWeights,
         float* outputScalesScalar, float* outputScalesGateScalar, float* ptrBias, float* ptrSwiGluAlpha,
@@ -155,7 +158,7 @@ public:
         int32_t intermediateSize, int32_t numExperts, int32_t numTokens, int32_t* permutedIdxToTokenIdx,
         int32_t* ptrNumNonExitingCtas, int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
         int32_t* ptrCtaIdxXyToMnLimit, void* bmm1Workspace, bool useRoutingScalesOnInput, int device,
-        cudaStream_t stream, int32_t configIndex);
+        cudaStream_t stream, int32_t configIndex, int32_t validHiddenSize = -1, int32_t validIntermediateSize = -1);
 
 private:
     batchedGemm::trtllm::gen::Dtype mDtypeAct;
@@ -176,19 +179,23 @@ public:
     size_t getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts,
         int32_t numTokens, int32_t configIndex) const;
 
-    [[nodiscard]] int32_t getDefaultValidConfigIndex(
-        int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts, int32_t numTokens) const;
+    [[nodiscard]] int32_t getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
+        int32_t numExperts, int32_t numTokens, int32_t validHiddenSize = -1, int32_t validIntermediateSize = -1) const;
 
     [[nodiscard]] bool isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hiddenSize,
-        int32_t intermediateSize, int32_t numExperts, int32_t numTokens) const;
+        int32_t intermediateSize, int32_t numExperts, int32_t numTokens, int32_t validHiddenSize = -1,
+        int32_t validIntermediateSize = -1) const;
 
     [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const;
+
+    [[nodiscard]] std::string getKernelNameFromConfigIndex(int32_t configIndex) const;
 
     void run(void* permutedHiddenState, void* permutedHiddenStateScale, void* weight, void* weightScale,
         float* outputScalesScalar, float* ptrBias, void* output, void* outputScale, int32_t topK, int32_t hiddenSize,
         int32_t intermediateSize, int32_t numExperts, int32_t numTokens, int32_t* ptrNumNonExitingCtas,
         int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit,
-        void* bmm2Workspace, int device, cudaStream_t stream, int32_t configIndex);
+        void* bmm2Workspace, int device, cudaStream_t stream, int32_t configIndex, int32_t validHiddenSize = -1,
+        int32_t validIntermediateSize = -1);
 
 private:
     batchedGemm::trtllm::gen::Dtype mDtypeAct;
@@ -233,15 +240,15 @@ struct MoERunnerArgs
     int32_t num_experts{0};
     // Hidden dimension input of MoE block. It might be padded.
     int32_t hidden_size{0};
-    // Hidden dimension output of MoE block. It is not padded.
-    // If not provided it is the same as hidden_size.
-    std::optional<int32_t> hidden_size_output;
+    // Hidden dimension output of MoE block. It might be padded.
+    std::optional<int32_t> output_hidden_size{std::nullopt};
     // TODO: only compiled routing kernel supports top_k = 8
     int32_t top_k{0};
     int32_t n_group{0};
     // TODO: only compiled routing kernel supports topk_group = 4
     int32_t topk_group{0};
     float routed_scaling_factor{0.0f};
+    // Intermediate dimension output of MoE block. It might be padded.
     int32_t intermediate_size{0};
     int32_t local_expert_offset{0};
     int32_t local_num_experts{0};
@@ -249,6 +256,9 @@ struct MoERunnerArgs
     btg::Dtype mDtypeElt{btg::Dtype::Void};
     btg::Dtype mDtypeExpW{btg::Dtype::Bfloat16};
     btg::Dtype mDtypeOut{btg::Dtype::Bfloat16};
+    // Unpadded dimensions.
+    std::optional<int32_t> valid_intermediate_size{std::nullopt};
+    std::optional<int32_t> valid_hidden_size{std::nullopt};
 
     // Apply routing scale factors to input activations
     bool mUseRoutingScalesOnInput{false};
@@ -333,11 +343,13 @@ public:
     [[nodiscard]] std::tuple<int32_t, int32_t> getWorkspaceSizeInBytes(
         MoERunnerArgs const& args, int64_t configIndex) const;
 
-    [[nodiscard]] std::vector<int64_t> getValidConfigIndices(
-        int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numLocalExperts, int32_t numTokens) const;
+    [[nodiscard]] std::vector<int64_t> getValidConfigIndices(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
+        int32_t numLocalExperts, int32_t numTokens, int32_t validHiddenSize = -1,
+        int32_t validIntermediateSize = -1) const;
 
-    [[nodiscard]] int64_t getDefaultValidConfigIndex(
-        int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numLocalExperts, int32_t numTokens) const;
+    [[nodiscard]] int64_t getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
+        int32_t numLocalExperts, int32_t numTokens, int32_t validHiddenSize = -1,
+        int32_t validIntermediateSize = -1) const;
 
 private:
     void setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace, moe::dev::convertsf::Data& convertSfData,
