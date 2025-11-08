@@ -504,6 +504,15 @@ class PyExecutor:
         return self.is_shutdown and len(self.active_requests) == 0 and \
             self.executor_request_queue.get_waiting_queue_size() == 0
 
+    def _get_ranked_trace_path(self):
+        """Return a per-rank torch trace path based on TLLM_TORCH_PROFILE_TRACE."""
+        rank = getattr(self.dist, "rank", 0)
+        trace_path = self.torch_trace_path
+        if os.path.isdir(trace_path):
+            return os.path.join(trace_path, f"trace_{rank}.json")
+        base, ext = os.path.splitext(trace_path)
+        return f"{base}_{rank}{ext or '.json'}"
+
     @contextmanager
     def _profiler(self):
         it = -1
@@ -539,15 +548,6 @@ class PyExecutor:
             torch_profiler = torch.profiler.profile(activities=activities,
                                                     record_shapes=True,
                                                     with_modules=True)
-
-        def _get_ranked_trace_path(self):
-            """Return a per-rank torch trace path based on TLLM_TORCH_PROFILE_TRACE."""
-            rank = getattr(self.dist, "rank", 0)
-            trace_path = self.torch_trace_path
-            if os.path.isdir(trace_path):
-                return os.path.join(trace_path, f"trace_{rank}.json")
-            base, ext = os.path.splitext(trace_path)
-            return f"{base}_{rank}{ext or '.json'}"
 
         def profile_step():
             nonlocal it, enabled, start_time, start_event_1, end_event_1, start_event_2, end_event_2, prev_device_step_time
