@@ -94,13 +94,19 @@ class SampleStateTensors:
 
 
 @dataclass(kw_only=True)
+class SamplerEvent:
+    cuda_event: torch.cuda.Event
+    worker_futures: Optional[list[futures.Future[Any]]] = None
+
+
+@dataclass(kw_only=True)
 class SampleState:
     scheduled_requests: ScheduledRequests
 
     device: Optional[SampleStateTensors] = None
     host: Optional[SampleStateTensors] = None
 
-    sampler_event: Optional[torch.cuda.Event] = None
+    sampler_event: Optional[SamplerEvent] = None
 
 
 class Sampler(ABC):
@@ -597,12 +603,15 @@ class AsyncWorkerMixin:
     operations will seamlessly run on the main thread
     """
 
+    MAX_WORKERS = 1
+
     def _async_worker_active(self) -> bool:
         return self._async_worker is not None
 
     def _async_worker_init(self, enable_async_worker: bool):
         self.enable_async_worker = enable_async_worker
         self._async_worker = None
+        self._async_worker_futures: list[futures.Future[any]] = []
 
     def async_worker_start(self):
         assert self.enable_async_worker
@@ -617,7 +626,7 @@ class AsyncWorkerMixin:
             torch.cuda.set_stream(torch.cuda.Stream())
 
         self._async_worker = futures.ThreadPoolExecutor(
-            max_workers=1,
+            max_workers=self.MAX_WORKERS,
             initializer=_async_worker_initializer,
             initargs=(torch.cuda.current_device(),),
         )
@@ -635,7 +644,14 @@ class AsyncWorkerMixin:
         ready.synchronize()
 
         # Do the work
-        return func(*args, **kwargs)
+        result = func(*args, **kwargs)
+
+        # Work submitted to the async worker is expected to block at the end,
+        # consistent with the semantics of futures; make sure that we wait for
+        # everything to complete
+        torch.cuda.current_stream().synchronize()
+
+        return result
 
     def _async_worker_submit(self, func, /, *args, **kwargs):
         if self._async_worker_active():
@@ -643,33 +659,39 @@ class AsyncWorkerMixin:
             # synchronize with on the worker thread/stream
             ready = torch.cuda.Event()
             ready.record()
-            return self._async_worker.submit(self._async_worker_run, ready, func, *args, **kwargs)
+
+            # Submit the async work
+            result = self._async_worker.submit(self._async_worker_run, ready, func, *args, **kwargs)
+
+            # Save the future, so that we can await it later
+            self._async_worker_futures.append(result)
+
+            return result
         else:
             # If the async worker is not in use, just execute the function
             return func(*args, **kwargs)
 
-    def _copy_to_host(self, src: torch.Tensor, pin_memory=False) -> torch.Tensor:
-        dest = torch.empty_like(src, device="cpu", pin_memory=pin_memory)
+    def _copy_to_host(self, src: torch.Tensor) -> torch.Tensor:
+        dest = torch.empty_like(src, device="cpu", pin_memory=True)
         self._async_worker_submit(dest.copy_, src, non_blocking=True)
         return dest
 
-    def _sampler_event_get(self) -> torch.cuda.Event | futures.Future[torch.cuda.Event]:
-        def _get_sampler_event() -> torch.cuda.Event:
-            sampler_event = torch.cuda.Event()
-            sampler_event.record()
-            return sampler_event
+    def _sampler_event_get(self) -> SamplerEvent:
+        cuda_event = torch.cuda.Event()
+        cuda_event.record()
 
-        return self._async_worker_submit(_get_sampler_event)
+        # Transfer ownership to worker_futures and re-initialize
+        worker_futures = self._async_worker_futures
+        self._async_worker_futures = []
+
+        return SamplerEvent(cuda_event=cuda_event, worker_futures=worker_futures)
 
     @staticmethod
-    def _sampler_event_synchronize(
-        sampler_event: torch.cuda.Event | futures.Future[torch.cuda.Event] | None,
-    ):
+    def _sampler_event_synchronize(sampler_event: SamplerEvent):
         if sampler_event:
-            if isinstance(sampler_event, futures.Future):
-                sampler_event.result().synchronize()
-            else:
-                sampler_event.synchronize()
+            if sampler_event.worker_futures:
+                futures.wait(sampler_event.worker_futures)
+            sampler_event.cuda_event.synchronize()
 
 
 class TorchSampler(Sampler, AsyncWorkerMixin):
@@ -1231,7 +1253,7 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         self._write_finish_reasons(
             requests, finish_reasons=finish_reasons, seq_slots=seq_slots, new_tokens=new_tokens
         )
-        finish_reasons_host = finish_reasons.to(device="cpu", non_blocking=True)
+        finish_reasons_host = self._copy_to_host(finish_reasons)
 
         sampler_event = self._sampler_event_get()
         return SampleStateTorch(
@@ -1854,8 +1876,8 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
                 logprobs_cuda, k=max(req.py_num_logprobs for req in requests), dim=-1
             )
             # Use a single D2H copy to reduce overheads
-            topk_vals = self._copy_to_host(topk_vals_cuda, pin_memory=True)
-            topk_indices = self._copy_to_host(topk_indices_cuda, pin_memory=True)
+            topk_vals = self._copy_to_host(topk_vals_cuda)
+            topk_indices = self._copy_to_host(topk_indices_cuda)
             current_offset = 0
             for req_id, steps in zip(
                 logprobs_req_indices, req_num_steps[logprobs_req_indices].tolist()
