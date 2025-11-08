@@ -438,8 +438,8 @@ def test_attention_backend(s: Scenario):
     flashinfer_kv_cache = torch.randn(num_layers,
                                       s.max_num_pages,
                                       2,
-                                      page_size,
                                       num_kv_heads,
+                                      page_size,
                                       head_dim,
                                       device="cuda").to(s.kvcache_dtype)
     ref_kv_cache = flashinfer_kv_cache.transpose(1, 2).contiguous().view(
@@ -588,8 +588,8 @@ def test_attention_backend_ifb(s: PagedScenario):
     flashinfer_kv_cache = torch.randn(num_layers,
                                       s.max_num_pages,
                                       2,
-                                      page_size,
                                       num_kv_heads,
+                                      page_size,
                                       head_dim,
                                       device="cuda").to(s.kvcache_dtype)
     ref_kv_cache = flashinfer_kv_cache.transpose(1, 2).contiguous().view(

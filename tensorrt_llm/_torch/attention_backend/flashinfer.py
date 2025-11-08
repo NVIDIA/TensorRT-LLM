@@ -56,7 +56,10 @@ class FlashInferWrappers:
 class FlashInferAttentionMetadata(AttentionMetadata):
     workspace_buffer: Optional[torch.Tensor] = None
 
-    kv_layout: Literal["NHD", "HND"] = "NHD"
+    # cache concat/split kernels when using PD disaggregation
+    # expects KV cache in [max_num_pages, 2, num_kv_heads, page_size, head_dim] layout,
+    # so set kv_layout as "NHD" here
+    kv_layout: Literal["NHD", "HND"] = "HND"
 
     paged_kv_indptr_decode: torch.Tensor = field(init=False)
     paged_kv_indptr_prefill: torch.Tensor = field(init=False)
@@ -506,7 +509,8 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         q = q.view(-1, self.num_heads, self.head_dim)
 
         # Key and Value
-        kv_cache = metadata.kv_cache_manager.get_buffers(self.layer_idx)
+        kv_cache = metadata.kv_cache_manager.get_buffers(
+            self.layer_idx, kv_layout=metadata.kv_layout)
 
         if k is not None and v is not None:
             k = k.view(-1, self.num_kv_heads, self.head_dim)
