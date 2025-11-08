@@ -65,10 +65,6 @@ def load_buffers_and_params(
                 v_new = nn.Parameter(v_new, requires_grad=False)
         else:
             v_new = state_dict[k]
-            # Check if the original attribute is a Parameter and wrap accordingly
-            original_attr = getattr(submod, name, None)
-            if isinstance(original_attr, nn.Parameter) and not isinstance(v_new, nn.Parameter):
-                v_new = nn.Parameter(v_new, requires_grad=False)
         setattr(submod, name, v_new)
 
 
