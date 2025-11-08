@@ -53,7 +53,8 @@
             "mmaM": 256,
             "clusterDimX": 2,
             "sfLayoutB": "128x4",
-            "sfLayoutC": "128x4"
+            "sfLayoutC": "128x4",
+            "biasType": "m"
         },
 
         "BatchedGemmPerTensorScalingFp8Base": {

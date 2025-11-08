@@ -16,12 +16,13 @@
  */
 #pragma once
 
-#include "Enums.h"
-#include "trtllm/gen/CommonUtils.h"
-#include "trtllm/gen/DtypeDecl.h"
-#include "trtllm/gen/MmaDecl.h"
 #include <cassert>
 #include <stdexcept>
+#include <cstdio>
+#include "trtllm/gen/DtypeDecl.h"
+#include "trtllm/gen/CommonUtils.h"
+#include "trtllm/gen/MmaDecl.h"
+#include "Enums.h"
 
 namespace batchedGemm
 {
@@ -162,7 +163,7 @@ private:
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-int getNumSmemBitsPerElt(tg::Dtype dtype, tg::MmaKind mmaKind)
+inline int getNumSmemBitsPerElt(tg::Dtype dtype, tg::MmaKind mmaKind)
 {
     if (mmaKind == tg::MmaKind::Auto)
     {
@@ -191,9 +192,12 @@ public:
         tg::Dtype dtypeMmaB, tg::MmaKind mmaKind, int32_t mmaK, int32_t tileM, int32_t tileN, int32_t tileK,
         int32_t epilogueTileM, int32_t epilogueTileN, int32_t numStages, int32_t numStagesMma,
         int32_t numSlicesForSplitK, int32_t numSlicesForSliceK, SplitK splitK, bool useTmaStore,
-        bool transposeMmaOutput, AllReduceAlgo allReduceAlgo, bool usePersistentScheduler, bool useDeepSeekFp8,
-        bool usePerTokenSfA, bool usePerTokenSfB, bool useTwoCtas, BiasType biasType)
+        bool transposeMmaOutput, AllReduceAlgo allReduceAlgo, bool fuseUtccpWithUtcmma, bool useMaxTmemOverlap,
+        int32_t numEpilogueWarps, bool usePersistentScheduler, bool useDeepSeekFp8, bool usePerTokenSfA,
+        bool usePerTokenSfB, bool useTwoCtas, BiasType biasType)
         : mMmaKind{mmaKind}
+        , mFuseUtccpWithUtcmma{fuseUtccpWithUtcmma}
+        , mUseMaxTmemOverlap{useMaxTmemOverlap}
     {
         //
         // SMEM
@@ -305,6 +309,11 @@ public:
                     extraGmemCMultiplier = 0;
                 }
 
+                if (numEpilogueWarps)
+                {
+                    extraGmemCMultiplier *= numEpilogueWarps / 4;
+                }
+
                 // Number of bytes to store the output in smem.
                 auto const numBytesSmemStoreC = usesSmemForGmemC ? extraGmemCMultiplier * epilogueTileM * epilogueTileN
                         * tg::dtypeGetNumBits(dtypeSmemC) / 8 /* bits */
@@ -314,6 +323,7 @@ public:
                 // gmemC reuses loadAb memory for split-K in DSMEM.
                 // Epilogue1 does not reuse and continues after the memory allocated Epilogue0
                 // NOTE: we can always reuse loadAb SMEM as long as we don't have persistent scheduler.
+
                 auto const reuseFirstChunksSmemStoreC
                     = doesSplitKUseDsmem(splitK) && resIdx == 0 && !usePersistentScheduler;
 
@@ -454,8 +464,11 @@ public:
             std::vector<std::string> tmemChunkNames;
             // Matrix D
             {
+                // Two set of TMEM resources for D share epilogueTileN columns,
+                //  | set0:epiTileN0 | set0:epiTileN1/set1:epiTileN0 | set1:epiTileN1 |
+                auto const numCols = mUseMaxTmemOverlap ? 2 * tileN - epilogueTileN : tileN;
                 // Number of columns for accumulators.
-                auto const numTmemColsD = numSlicesForSliceK * tileN * numStagesMma * tg::dtypeGetNumBits(dtypeAcc)
+                auto const numTmemColsD = numSlicesForSliceK * numCols * numStagesMma * tg::dtypeGetNumBits(dtypeAcc)
                     / tg::dtypeGetNumBits(tg::Dtype::UInt32);
                 // Number of columns for D alignment.
                 auto const numColsAlignmentD = 2;
@@ -496,7 +509,9 @@ public:
                 // Number of columns for scaling factors of A.
                 auto const numTmemColsSfA = useConstSfA
                     ? tg::roundUp((tileK / 64) * tg::getTmemColStridePerGroup(tileM, mmaK), 4)
-                    : (useBlockScalingA ? ((tileK / 64) * tg::getTmemColStridePerGroup(tileM, mmaK)) * numStages : 0);
+                    : (useBlockScalingA ? ((tileK / 64) * tg::getTmemColStridePerGroup(tileM, mmaK))
+                                * (mFuseUtccpWithUtcmma ? 1 : numStages)
+                                        : 0);
                 // Number of columns for Sf alignment.
                 auto const numColsAlignmentSfA = 4;
                 // No need to reuse TMEM.
@@ -517,7 +532,9 @@ public:
                 // Number of columns for scaling factors of B.
                 auto const numTmemColsSfB = useConstSfB
                     ? tg::roundUp((tileK / 64) * tg::getTmemColStridePerGroup(tileN, mmaK), 4)
-                    : (useBlockScalingB ? ((tileK / 64) * tg::getTmemColStridePerGroup(tileN, mmaK)) * numStages : 0);
+                    : (useBlockScalingB ? ((tileK / 64) * tg::getTmemColStridePerGroup(tileN, mmaK))
+                                * (mFuseUtccpWithUtcmma ? 1 : numStages)
+                                        : 0);
                 // Number of columns for Sf alignment.
                 auto const numColsAlignmentSfB = 4;
                 // No need to reuse TMEM.
@@ -538,6 +555,10 @@ public:
 public:
     // The MMA kind.
     tg::MmaKind mMmaKind;
+    // Whether fuse Utccp into the MMA task.
+    bool mFuseUtccpWithUtcmma;
+    // Whether use the max TMEM overlap trick.
+    bool mUseMaxTmemOverlap;
     // Helper for SMEM allocation.
     MemAllocatorHelper mSmemAllocatorHelper;
     // Helper for TMEM allocation.
