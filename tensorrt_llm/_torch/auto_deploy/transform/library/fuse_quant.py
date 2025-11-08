@@ -291,8 +291,8 @@ class FuseFP8Linear(BaseTransform):
         info = TransformInfo(
             skipped=(cnt == 0),
             num_matches=cnt,
-            is_clean=False,
-            has_valid_shapes=False,
+            is_clean=cnt == 0,
+            has_valid_shapes=cnt == 0,
         )
         return gm, info
 
@@ -333,7 +333,7 @@ class FuseNVFP4Linear(BaseTransform):
         info = TransformInfo(
             skipped=(cnt == 0),
             num_matches=cnt,
-            is_clean=False,
-            has_valid_shapes=False,
+            is_clean=(cnt == 0),
+            has_valid_shapes=(cnt == 0),
         )
         return gm, info

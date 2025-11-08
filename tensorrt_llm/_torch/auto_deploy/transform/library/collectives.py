@@ -112,6 +112,9 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
         num_matches = patterns.apply(gm.graph)
 
         info = TransformInfo(
-            skipped=False, num_matches=num_matches, is_clean=False, has_valid_shapes=False
+            skipped=False,
+            num_matches=num_matches,
+            is_clean=num_matches == 0,
+            has_valid_shapes=num_matches == 0,
         )
         return gm, info

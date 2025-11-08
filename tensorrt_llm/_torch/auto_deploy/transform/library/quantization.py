@@ -550,7 +550,7 @@ class FP8BMMQuantizationFromConfig(Quantization):
                 cnt += 1
 
         return gm, TransformInfo(
-            skipped=False, num_matches=cnt, is_clean=False, has_valid_shapes=True
+            skipped=False, num_matches=cnt, is_clean=cnt == 0, has_valid_shapes=True
         )
 
 
@@ -581,7 +581,7 @@ class FP8QuantizationFromGraph(FP8LinearQuantizationFromConfig):
 
         remove_output_quantizers(gm)
         return gm, TransformInfo(
-            skipped=False, num_matches=cnt, is_clean=False, has_valid_shapes=True
+            skipped=False, num_matches=cnt, is_clean=cnt == 0, has_valid_shapes=True
         )
 
 
@@ -610,7 +610,8 @@ class NVFP4QuantizationFromGraph(NVFP4LinearQuantizationFromConfig):
                 self._insert_quantized_linear(gm, n, is_quantized_graph=True)
                 cnt += 1
 
+        # if cnt > 0:
         remove_output_quantizers(gm)
         return gm, TransformInfo(
-            skipped=False, num_matches=cnt, is_clean=False, has_valid_shapes=True
+            skipped=False, num_matches=cnt, is_clean=cnt == 0, has_valid_shapes=True
         )

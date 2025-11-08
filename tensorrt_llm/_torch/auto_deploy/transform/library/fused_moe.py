@@ -510,7 +510,10 @@ class MatchMoePattern(BaseTransform):
             num_moe_patterns += 1
 
         info = TransformInfo(
-            skipped=False, num_matches=num_moe_patterns, is_clean=False, has_valid_shapes=False
+            skipped=False,
+            num_matches=num_moe_patterns,
+            is_clean=num_moe_patterns == 0,
+            has_valid_shapes=num_moe_patterns == 0,
         )
         return gm, info
 
@@ -754,7 +757,10 @@ class FuseMoe(BaseTransform):
             fused_key_counter = _insert_fused_moe_ops(gm)
 
         info = TransformInfo(
-            skipped=False, num_matches=fused_key_counter, is_clean=False, has_valid_shapes=False
+            skipped=False,
+            num_matches=fused_key_counter,
+            is_clean=fused_key_counter == 0,
+            has_valid_shapes=fused_key_counter == 0,
         )
         return gm, info
 
@@ -779,7 +785,7 @@ class FuseFP8Moe(BaseTransform):
         info = TransformInfo(
             skipped=(fused_key_counter == 0),
             num_matches=fused_key_counter,
-            is_clean=False,
-            has_valid_shapes=False,
+            is_clean=fused_key_counter == 0,
+            has_valid_shapes=fused_key_counter == 0,
         )
         return gm, info

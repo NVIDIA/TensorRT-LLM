@@ -215,7 +215,10 @@ class QuantizationFusionMixin(ABC):
 
         torch.cuda.empty_cache()
         return gm, TransformInfo(
-            skipped=False, num_matches=num_matches, is_clean=False, has_valid_shapes=False
+            skipped=False,
+            num_matches=num_matches,
+            is_clean=num_matches == 0,
+            has_valid_shapes=num_matches == 0,
         )
 
 
@@ -252,7 +255,10 @@ class FuseGemms(BaseTransform):
         torch.cuda.empty_cache()
 
         info = TransformInfo(
-            skipped=False, num_matches=num_matches, is_clean=False, has_valid_shapes=False
+            skipped=False,
+            num_matches=num_matches,
+            is_clean=num_matches == 0,
+            has_valid_shapes=num_matches == 0,
         )
         return gm, info
 
