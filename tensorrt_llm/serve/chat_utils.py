@@ -197,9 +197,3 @@ def parse_chat_messages_coroutines(
 
     return conversation, mm_data_tracker.retrieve_all_async(
     ), mm_placeholder_counts
-
-
-def check_multiple_response(n: int, backend: Optional[str]):
-    if n > 1 and backend == "pytorch":
-        raise ValueError(
-            "Multiple response is not supported in PyTorch workflow")
