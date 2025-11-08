@@ -112,6 +112,7 @@ def _cuda_cached_causal_conv1d(
     dilation: int,
     groups: int,
     padding_mode: str,
+    activation: Optional[str],
 ) -> torch.Tensor:
     """Flattened cached causal conv that respects slot-indexed state caches (CUDA backend).
 
@@ -175,7 +176,7 @@ def _cuda_cached_causal_conv1d(
             cache_indices=cache_indices,
             has_initial_state=has_initial_state,
             conv_states=conv_state_cache,
-            activation=None,
+            activation=activation,
             pad_slot_id=PAD_SLOT_ID,
         )  # (dim, total_prefill_tokens)
 
@@ -194,7 +195,7 @@ def _cuda_cached_causal_conv1d(
             conv_state_cache,
             w2d,
             bias,
-            activation=None,
+            activation=activation,
             cache_seqlens=None,
             conv_state_indices=slot_idx[num_prefill:].to(torch.int32),
             pad_slot_id=PAD_SLOT_ID,
@@ -229,6 +230,7 @@ def _cuda_cached_causal_conv1d_fake(
     dilation: int,
     groups: int,
     padding_mode: str,
+    activation: Optional[str],
 ):
     return torch.empty(
         input.shape[0], input.shape[1], weight.shape[0], device=input.device, dtype=input.dtype
@@ -295,4 +297,9 @@ class CudaBackendCausalConv(AttentionDescriptor):
         stride, padding, dilation, groups, padding_mode = extract_op_args(
             source_attn_node, "stride", "padding", "dilation", "groups", "padding_mode"
         )
-        return [stride, padding, dilation, groups, padding_mode]
+        # activation parameter may not exist in the source node (added by fusion later)
+        try:
+            activation = extract_op_args(source_attn_node, "activation")[0]
+        except (RuntimeError, IndexError):
+            activation = None
+        return [stride, padding, dilation, groups, padding_mode, activation]

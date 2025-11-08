@@ -165,6 +165,8 @@ transforms:
   ############################################################################################
   # COMPILE MODEL
   ############################################################################################
+  fuse_causal_conv_activation:
+    stage: compile
   compile_model:
     stage: compile
     run_per_gm: false
