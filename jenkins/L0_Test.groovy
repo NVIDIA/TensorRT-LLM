@@ -2688,8 +2688,9 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["b200-trtllm", "l0_dgx_b200", 1, 1, 4, 1, true],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["b300-x4", "l0_dgx_b300", 1, 1, 4],
         // Perf sanity post merge test
-        "DGX_B200-4_GPUs-PyTorch-Perf-Sanity-Post-Merge-1": ["b200-x4", "perf_sanity_l0_dgx_b200", 1, 1, 4],
-        "DGX_B300-4_GPUs-PyTorch-Perf-Sanity-Post-Merge-1": ["b300-x4", "perf_sanity_l0_dgx_b300", 1, 1, 4],
+        // Disable perf stages due to https://nvbugs/5643646
+        // "DGX_B200-4_GPUs-PyTorch-Perf-Sanity-Post-Merge-1": ["b200-x4", "perf_sanity_l0_dgx_b200", 1, 1, 4],
+        // "DGX_B300-4_GPUs-PyTorch-Perf-Sanity-Post-Merge-1": ["b300-x4", "perf_sanity_l0_dgx_b300", 1, 1, 4],
     ]
     fullSet += x86SlurmTestConfigs.keySet()
 
