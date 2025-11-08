@@ -74,4 +74,3 @@ nvidia-cutlass-dsl==4.2.1; python_version >= "3.10"
 plotly
 numexpr<2.14.0 # WAR for attempted use of nonexistent numpy.typing
 partial_json_parser
-tqdm

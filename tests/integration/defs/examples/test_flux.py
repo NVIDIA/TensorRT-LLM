@@ -16,21 +16,13 @@
 
 import importlib.util
 import os
-import subprocess
-import sys
-from pathlib import Path
 
 import pytest
 import torch
+from build_and_run_flux import clip_model as load_clip_model
+from build_and_run_flux import compute_clip_similarity, main
 
-from examples.auto_deploy.build_and_run_flux import clip_model as load_clip_model
-from examples.auto_deploy.build_and_run_flux import compute_clip_similarity
 from tensorrt_llm._torch.auto_deploy.utils.logger import ad_logger
-
-# Set up paths
-EXAMPLES_AUTO_DEPLOY = (
-    Path(__file__).parent.parent.parent.parent.parent / "examples" / "auto_deploy"
-)
 
 # Check if CLIP is available
 CLIP_AVAILABLE = importlib.util.find_spec("transformers") is not None
@@ -99,41 +91,31 @@ class TestFluxIntegration:
         """End-to-end test for Flux model with CLIP similarity validation.
 
         Tests:
-        1. Call build_and_run_flux.py script
+        1. Call build_and_run_flux.py main function
         2. Validate generated image quality using CLIP similarity
         """
         output_image = tmp_path / f"flux_{precision}_output.png"
 
-        # Build command to run the script
-        cmd = [
-            sys.executable,
-            str(EXAMPLES_AUTO_DEPLOY / "build_and_run_flux.py"),
+        # Build arguments for main function
+        args = [
             "--model",
             FluxTestConfig.MODEL_ID,
             "--prompt",
             FluxTestConfig.PROMPT,
             "--image_path",
             str(output_image),
-            "--backend",
-            FluxTestConfig.BACKEND,
             "--max_batch_size",
             str(FluxTestConfig.MAX_BATCH_SIZE),
         ]
 
         # Add checkpoint if provided
         if checkpoint_path:
-            cmd.extend(["--restore_from", checkpoint_path])
+            args.extend(["--restore_from", checkpoint_path])
 
-        ad_logger.info(f"Running command for {precision}: {' '.join(cmd)}")
+        ad_logger.info(f"Running main with args for {precision}: {' '.join(args)}")
 
-        # Run the script
-        result = subprocess.run(cmd, capture_output=True, text=True)
-
-        # Check if script ran successfully
-        if result.returncode != 0:
-            ad_logger.error(f"Script stdout:\n{result.stdout}")
-            ad_logger.error(f"Script stderr:\n{result.stderr}")
-            pytest.fail(f"build_and_run_flux.py failed with return code {result.returncode}")
+        # Call main function directly with args
+        main(args)
 
         # Verify image was generated
         assert output_image.exists(), f"Output image not found at {output_image}"

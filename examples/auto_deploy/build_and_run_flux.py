@@ -221,7 +221,7 @@ def execution_device_setter(self, value):
     self.__dict__["_execution_device"] = torch.device("cuda")
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--model",
@@ -271,7 +271,7 @@ def main():
         default=os.path.join(os.path.dirname(__file__), "flux_transforms.yaml"),
         help="Path to YAML config file for export, optimizer, and compile settings (default: flux_transforms.yaml)",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     # Validate max_batch_size
     if args.max_batch_size <= 0:
