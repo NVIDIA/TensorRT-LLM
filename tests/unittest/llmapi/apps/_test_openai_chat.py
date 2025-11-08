@@ -68,6 +68,8 @@ def server(model_name: str, backend: str, extra_llm_api_options: bool,
            temp_extra_llm_api_options_file: str, num_postprocess_workers: int):
     model_path = get_model_path(model_name)
     args = ["--backend", f"{backend}"]
+    args.extend(["--kv_cache_free_gpu_memory_fraction",
+                 "0.2"])  # for co-existence with other servers
     if backend == "trt":
         args.extend(["--max_beam_width", "4"])
     if extra_llm_api_options:
@@ -79,8 +81,31 @@ def server(model_name: str, backend: str, extra_llm_api_options: bool,
 
 
 @pytest.fixture(scope="module")
+def server_with_beam_search(model_name: str, backend: str,
+                            extra_llm_api_options: bool,
+                            temp_extra_llm_api_options_file: str,
+                            num_postprocess_workers: int):
+    model_path = get_model_path(model_name)
+    args = ["--backend", f"{backend}"]
+    args.extend(["--kv_cache_free_gpu_memory_fraction",
+                 "0.2"])  # for co-existence with other servers
+    args.extend(["--max_beam_width", "2"])
+    if extra_llm_api_options:
+        args.extend(
+            ["--extra_llm_api_options", temp_extra_llm_api_options_file])
+    args.extend(["--num_postprocess_workers", f"{num_postprocess_workers}"])
+    with RemoteOpenAIServer(model_path, args) as remote_server:
+        yield remote_server
+
+
+@pytest.fixture(scope="module")
 def client(server: RemoteOpenAIServer):
     return server.get_client()
+
+
+@pytest.fixture(scope="module")
+def client_with_beam_search(server_with_beam_search: RemoteOpenAIServer):
+    return server_with_beam_search.get_client()
 
 
 @pytest.fixture(scope="module")
@@ -180,7 +205,33 @@ def test_multiple_responses(client: openai.OpenAI, model_name: str,
                             backend: str):
     if backend == "pytorch":
         pytest.skip(
-            "Multiple responses are not supported in PyTorch backend yet")
+            "'n' not allowed with temperature=0 unless TLLM_ALLOW_N_GREEDY_DECODING=1"
+        )
+    messages = [{
+        "role": "system",
+        "content": "you are a helpful assistant"
+    }, {
+        "role": "user",
+        "content": "what is 1+1?"
+    }]
+    # test n and best_of
+    chat_completion = client.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        max_completion_tokens=10,
+        n=2,
+        temperature=0.0,
+        extra_body=dict(best_of=4),
+    )
+    assert len(chat_completion.choices) == 2
+
+
+def test_multiple_responses_and_beam_search(client: openai.OpenAI,
+                                            model_name: str, backend: str):
+    if backend == "pytorch":
+        pytest.skip(
+            "Mixing beam search and regular requests is not supported in PyTorch backend"
+        )
 
     messages = [{
         "role": "system",
@@ -202,6 +253,7 @@ def test_multiple_responses(client: openai.OpenAI, model_name: str,
     assert chat_completion.choices[
         0].message.content != chat_completion.choices[
             1].message.content, "beam search should be different"
+
     # test n and best_of
     chat_completion = client.chat.completions.create(
         model=model_name,
@@ -212,6 +264,30 @@ def test_multiple_responses(client: openai.OpenAI, model_name: str,
         extra_body=dict(best_of=4),
     )
     assert len(chat_completion.choices) == 2
+
+
+def test_multiple_responses_with_beam_search(
+        client_with_beam_search: openai.OpenAI, model_name: str):
+    messages = [{
+        "role": "system",
+        "content": "you are a helpful assistant"
+    }, {
+        "role": "user",
+        "content": "what is 1+1?"
+    }]
+    # test beam search
+    chat_completion = client_with_beam_search.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        max_completion_tokens=10,
+        n=2,
+        temperature=0.0,
+        extra_body=dict(use_beam_search=True),
+    )
+    assert len(chat_completion.choices) == 2
+    assert chat_completion.choices[
+        0].message.content != chat_completion.choices[
+            1].message.content, "beam search should be different"
 
 
 @pytest.mark.asyncio(loop_scope="module")

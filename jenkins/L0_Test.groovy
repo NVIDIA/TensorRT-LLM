@@ -2733,7 +2733,7 @@ def launchTestJobs(pipeline, testFilter)
         // "GB200-8_GPUs-2_Nodes-PyTorch-5": ["gb200-trtllm", "l0_gb200_multi_nodes", 5, 5, 8, 2],
     // ]
     multiNodesSBSAConfigs = [:]
-    def numMultiNodeTests = 9
+    def numMultiNodeTests = 3
     multiNodesSBSAConfigs += (1..numMultiNodeTests).collectEntries { i ->
         ["GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-${i}".toString(), ["gb200-trtllm", "l0_gb200_multi_nodes", i, numMultiNodeTests, 8, 2]]
     }

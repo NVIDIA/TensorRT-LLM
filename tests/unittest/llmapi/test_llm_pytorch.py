@@ -1,13 +1,15 @@
 import random
+import time
 from contextlib import contextmanager, nullcontext
 from typing import Optional
 
 import pytest
 
 from tensorrt_llm import LLM
+from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.executor import GenerationExecutorWorker
 from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
-from tensorrt_llm.llmapi import KvCacheConfig
+from tensorrt_llm.llmapi import CacheTransceiverConfig, KvCacheConfig
 from tensorrt_llm.llmapi.llm_args import NGramDecodingConfig, PeftCacheConfig
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.metrics import MetricNames
@@ -961,3 +963,72 @@ async def test_llm_rpc_streaming():
             outputs.append(output.outputs[0].text)
         "".join(outputs)
         print(f"get result: {outputs}")
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.part0
+@skip_ray
+def test_llm_context_only_timed_out():
+    tp_size = 1
+    use_overlap = False
+    enable_iter_req_stats = False
+
+    llm_args_extra = {}
+
+    llm_args_extra.update(
+        dict(enable_iter_perf_stats=True,
+             enable_iter_req_stats=enable_iter_req_stats,
+             disable_overlap_scheduler=not use_overlap))
+
+    llm = LLM(model=llama_model_path,
+              kv_cache_config=global_kvcache_config,
+              tensor_parallel_size=tp_size,
+              cache_transceiver_config=CacheTransceiverConfig(
+                  backend="DEFAULT", kv_transfer_timeout_ms=1000),
+              **llm_args_extra)
+
+    max_tokens = 1
+    sampling_params = SamplingParams(max_tokens=max_tokens)
+
+    disaggregated_params = DisaggregatedParams(request_type="context_only")
+
+    prompts0 = [
+        "What is your name?",
+    ]
+    prompts1 = [
+        "Nvidia is awesome because",
+    ]
+
+    # Send context-only request
+    for output in llm.generate(prompts1,
+                               sampling_params=sampling_params,
+                               disaggregated_params=disaggregated_params):
+        print(output)
+
+    max_retries = 10
+    for _ in range(max_retries):
+        results = llm.get_stats(2)
+        if len(results) == 1:
+            break
+        time.sleep(1)
+    else:
+        pytest.fail(
+            f"Failed to get stats with len==1 after {max_retries} retries")
+
+    assert len(results) == 1
+    context_only_used_num_blocks = results[0]["kvCacheStats"]["usedNumBlocks"]
+    print(f"Context only used num blocks: {context_only_used_num_blocks}")
+
+    # Sleep 5 seconds to allow context only request to time out
+    time.sleep(5)
+
+    # Send regular request
+    for output in llm.generate(prompts0, sampling_params=sampling_params):
+        print(output)
+
+    # Get number of allocated blocks
+    results = llm.get_stats(2)
+    assert len(results) == 1
+    final_used_num_blocks = results[0]["kvCacheStats"]["usedNumBlocks"]
+
+    assert final_used_num_blocks == 0
