@@ -432,6 +432,18 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
+        self.kv_lens_expanded_cuda = self.get_empty(
+            self.cuda_graph_buffers,
+            (self.max_num_sequences * (1 + self.max_draft_tokens), ),
+            cache_name="kv_lens_expanded_cuda",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        self.kv_lens_expanded_host = torch.zeros_like(
+            self.kv_lens_expanded_cuda,
+            device='cpu',
+            pin_memory=True,
+        )
 
     def prepare(self):
         super().prepare()
@@ -534,6 +546,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 non_blocking=True)
         else:
             self.max_gen_seq_len = 0
+
+        # Expand kv_lens_cuda for draft tokens (only generation)
+        gen_kv_lens = kv_lens[self.num_contexts:self.num_seqs]
+        self.kv_lens_expanded_host = torch.cat([gen_kv_lens] * (1+self.max_draft_tokens), dim=0)
 
         # Prepare metadata for indexer
         Indexer.prepare(metadata=self)
@@ -1053,9 +1069,15 @@ class Indexer(nn.Module):
             # Reshape q for decode phase: [num_gen_tokens, ...] -> [batch_size, next_n, ...]
             q_decode = q_fp8[num_ctx_tokens:num_ctx_tokens + num_gen_tokens,
                              ...]
-            q_decode = q_decode.view(num_generations, -1, *q_fp8.shape[1:])
-            batch_size = q_decode.shape[0]
-            next_n = q_decode.shape[1]
+            batch_size = num_generations
+            next_n = num_gen_tokens // num_generations
+            if next_n <= 2:
+                q_decode = q_decode.view(num_generations, -1, *q_fp8.shape[1:])
+                context_lens = metadata.kv_lens_cuda_runtime[num_contexts:num_contexts +
+                                                             num_generations]
+            else:
+                q_decode = q_decode.view(-1, 1, *q_fp8.shape[1:])
+
             assert num_gen_tokens == batch_size * next_n
             weights_decode = weights[num_ctx_tokens:num_ctx_tokens +
                                      num_gen_tokens, ...]

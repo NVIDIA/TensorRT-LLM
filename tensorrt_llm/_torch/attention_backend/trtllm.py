@@ -597,6 +597,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     is_spec_decoding_enabled: bool = False
     # use_spec_decoding determines if the attention layer should be run in spec-dec mode at the specific step / layer.
     use_spec_decoding: bool = False
+    # max number of draft tokens
+    max_draft_tokens: int = 0
 
     # if spec-dec tree is a tree or a chain (linear tree)
     is_spec_dec_tree: bool = False
@@ -1067,7 +1069,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         max_draft_tokens,
         spec_decoding_tensor: Optional['SpecDecodingTensor'] = None,
     ):
-
+        self.max_draft_tokens = max_draft_tokens
         if spec_decoding_tensor is not None:
             spec_decoding_position_offsets = spec_decoding_tensor.position_offsets
             spec_decoding_packed_mask = spec_decoding_tensor.packed_mask
