@@ -2948,6 +2948,7 @@ def launchTestJobs(pipeline, testFilter)
                         }
                         // WAR force install tensorrt 10.13.3.9 rather than 10.13.3.9.post1
                         echo "###### Force install tensorrt 10.13.3.9 ######"
+                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install nvidia-cuda-runtime-cu13==0.0.0a0")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install tensorrt==10.13.3.9")
                         echo "###### Check pip install Start ######"
                         withEnv(libEnv) {
