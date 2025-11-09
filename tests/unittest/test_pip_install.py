@@ -105,6 +105,61 @@ def download_wheel(args):
                           shell=True)
 
 
+def install_tensorrt_llm():
+    """
+    Installs the tensorrt_llm wheel, dynamically creating a torch constraint
+    if running on Ubuntu 22.04 and torch is already installed.
+    """
+    print("##########  Install tensorrt_llm package  ##########")
+
+    install_command = "pip3 install tensorrt_llm-*.whl"
+
+    # 1. Check if the OS is Ubuntu 22.04
+    try:
+        result = subprocess.run(['lsb_release', '-d'], capture_output=True, text=True, check=True)
+        if 'Ubuntu 22.04' not in result.stdout:
+            print("OS is not Ubuntu 22.04, proceeding with standard installation.")
+            subprocess.check_call(install_command, shell=True)
+            return
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        print("Could not determine OS version, proceeding with standard installation.")
+        subprocess.check_call(install_command, shell=True)
+        return
+
+    print("Detected Ubuntu 22.04. Checking for existing torch installation.")
+    
+    # 2. Check which torch version is installed.
+    try:
+        torch_version_result = subprocess.run(
+            ['python3', '-c', 'import torch; print(torch.__version__)'],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        torch_version = torch_version_result.stdout.strip()
+
+        if torch_version:
+            print(f"Found installed torch version: {torch_version}")
+            constraint_filename = "torch-constraint.txt"
+
+            # 3. Put the proper line into "torch-constraint.txt"
+            with open(constraint_filename, "w") as f:
+                f.write(f"torch=={torch_version}\n")
+            print(f"Created {constraint_filename} to constrain torch to version {torch_version}.")
+
+            # Modify the install command to use the constraint
+            install_command += f" -c {constraint_filename}"
+        else:
+             print("Could not determine installed torch version. Installing without constraint.")
+
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # This handles cases where `python3` fails or `import torch` raises an error.
+        print("Torch is not installed. Proceeding without constraint.")
+
+    # Execute the final installation command
+    subprocess.check_call(install_command, shell=True)
+
+
 def test_pip_install():
     parser = argparse.ArgumentParser(description="Check Pip Install")
     parser.add_argument("--wheel_path",
@@ -125,8 +180,8 @@ def test_pip_install():
                           shell=True)
 
     download_wheel(args)
-    print("##########  Install tensorrt_llm package  ##########")
-    subprocess.check_call("pip3 install tensorrt_llm-*.whl", shell=True)
+    install_tensorrt_llm()
+
     print("##########  Test import tensorrt_llm  ##########")
     subprocess.check_call(
         'python3 -c "import tensorrt_llm; print(tensorrt_llm.__version__)"',
