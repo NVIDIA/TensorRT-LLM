@@ -50,6 +50,7 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         self.main_loop_task_obj = None
         self.main_loop = None
         self.main_loop_started = threading.Event()
+        self._fetch_responses_loop_started = threading.Event()
 
         # Create RPC client without event loop first (it will create its own)
         self.rpc_client = RPCClient(self.rpc_addr)
@@ -78,6 +79,10 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
 
         # Setup main loop after engine is ready
         self.setup_mainloop()
+        # Wait for fetch_responses_loop to start
+        if not self._fetch_responses_loop_started.wait(timeout=5.0):
+            raise RuntimeError(
+                "Fetch responses loop failed to start within timeout")
 
     def launch_workers(self):
         logger.debug(f"Launching workers")
@@ -110,6 +115,7 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
             raise
 
     async def _fetch_responses_loop_async(self):
+        self._fetch_responses_loop_started.set()  # Signal that loop has started
         await self._generic_fetch_loop_async(
             fetch_method_name="fetch_responses_loop_async",
             handler_method=self.handle_responses,
@@ -171,8 +177,35 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
                     self.main_loop.run_until_complete(self.main_loop_task_obj)
                 except asyncio.CancelledError:
                     pass  # Task cancellation is expected during shutdown
+                except RuntimeError as e:
+                    # This can happen if the event loop is stopped while task is running
+                    error_str = str(e)
+                    if "Event loop stopped before Future completed" in error_str:
+                        # This is expected during shutdown - ignore it
+                        logger.debug(
+                            f"[proxy] Expected shutdown error: {error_str}")
+                    else:
+                        # This is an unexpected RuntimeError - log and re-raise
+                        logger.error(
+                            f"[proxy] Unexpected RuntimeError in main loop: {error_str}"
+                        )
+                        raise
                 finally:
-                    self.main_loop.close()
+                    # Ensure all pending tasks are cancelled before closing
+                    try:
+                        pending = asyncio.all_tasks(self.main_loop)
+                        for task in pending:
+                            if not task.done():
+                                task.cancel()
+                    except Exception as e:
+                        logger.debug(
+                            f"[proxy] Error cancelling pending tasks: {e}")
+
+                    # Close the event loop
+                    try:
+                        self.main_loop.close()
+                    except Exception as e:
+                        logger.debug(f"[proxy] Error closing event loop: {e}")
 
             self.main_loop_thread = threading.Thread(target=_run_main_loop_task,
                                                      daemon=True)
@@ -357,7 +390,9 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
 
     def shutdown_remote(self):
         logger_debug(f"[proxy] Shutting down rpc remote", color="yellow")
-        self.rpc_client.shutdown().remote()
+        # WAR: the server's event_loop may stop before sending the response back.
+        # The MpiPoolSession will wait for the server to shutdown before shutting down the mpi session.
+        self.rpc_client.shutdown().remote(need_response=False)
 
     def abort_request(self, request_id: int) -> None:
         return self.rpc_client.abort_request(request_id).remote()
