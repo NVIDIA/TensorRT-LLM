@@ -1,5 +1,5 @@
-import torch
 import pytest
+import torch
 
 from tensorrt_llm._torch.hostfunc import HOSTFUNC_USER_DATA_HANDLES, hostfunc
 
