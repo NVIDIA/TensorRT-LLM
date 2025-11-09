@@ -2946,6 +2946,10 @@ def launchTestJobs(pipeline, testFilter)
                             libEnv += ["LD_LIBRARY_PATH+tensorrt=/usr/local/tensorrt/lib"]
                             libEnv += ["LD_LIBRARY_PATH+nvrtc=/usr/local/lib/python${pyver}/dist-packages/nvidia/cuda_nvrtc/lib"]
                         }
+                        // WAR force install tensorrt 10.13.3.9 rather than 10.13.3.9.post1
+                        echo "###### Force install tensorrt 10.13.3.9 ######"
+                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget https://files.pythonhosted.org/packages/77/88/5d4cac975abb19654a6589ce7cd06fab15f6299382b67ba876b9e2438d1f/tensorrt-10.13.3.9.tar.gz")
+                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install tensorrt-10.13.3.9.tar.gz")
                         echo "###### Check pip install Start ######"
                         withEnv(libEnv) {
                             // Retry 2 times if timeout occurs.
