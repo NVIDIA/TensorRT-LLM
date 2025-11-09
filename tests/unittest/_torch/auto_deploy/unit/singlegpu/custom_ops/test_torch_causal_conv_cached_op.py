@@ -78,7 +78,6 @@ def test_generate_only_with_slot_mapping(conv_env):
         d,
         g,
         pm,
-        None,
     )
 
     assert y.shape == (batch, seq, c_out)
@@ -139,7 +138,6 @@ def test_context_flattened_and_state_writeback(conv_env):
         d,
         g,
         pm,
-        None,
     )
 
     assert y.shape == (batch, seq, c_out)

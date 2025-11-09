@@ -69,7 +69,6 @@ def _bamba_mixer_torch_forward(
                 self.conv1d.dilation[0],
                 self.conv1d.groups,
                 self.conv1d.padding_mode,
-                None,
             )
         )
     else:
