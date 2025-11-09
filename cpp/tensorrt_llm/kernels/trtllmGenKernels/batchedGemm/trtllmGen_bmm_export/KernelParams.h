@@ -503,6 +503,8 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
         if (options.mUseTmaStore)
         {
             // Shape/stride for gmem tensor C.
+            // NOTE: Output is *always* sanitized across the whole MNK range. This ensures maximum compatibility with
+            // the next BMM where unwritten part of the output could be polluted by NaNs.
             auto [shapeC, strideC, tileShapeC] = makeTmaShapeStrideAbc(options, options.mM, ctaOffset * options.mTileN,
                 options.mK, options.mTileM, options.mTileN, options.mTileK, MatrixType::MatrixC);
             // Build tma descriptor for C.
@@ -583,6 +585,8 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
         if (options.mUseTmaStore)
         {
             // Shape/stride for gmem tensor C.
+            // NOTE: Output is *always* sanitized across the whole MNK range. This ensures maximum compatibility with
+            // the next BMM where unwritten part of the output could be polluted by NaNs.
             auto [shapeC, strideC, tileShapeC] = makeTmaShapeStrideAbc(options, ctaOffset * options.mTileM, options.mN,
                 options.mK, options.mTileM, options.mTileN, options.mTileK, MatrixType::MatrixC);
             // Build tma descriptor for C.
