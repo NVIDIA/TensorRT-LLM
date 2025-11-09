@@ -27,6 +27,7 @@ namespace torch_ext
 namespace btg = batchedGemm::trtllm::gen;
 using tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::RoutingMethodType;
 using MoeRunnerType = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner;
+using tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::computeSelectedTileN;
 
 std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch::Tensor> const& routing_logits,
     torch::optional<torch::Tensor> const& routing_bias, torch::Tensor const& hidden_states,
@@ -419,6 +420,11 @@ public:
         std::vector<std::vector<int64_t>> tactics;
         for (auto& [tileN, runner] : mRunners)
         {
+            auto chosen = computeSelectedTileN(mSupportedTileN, numTokens, topK, numLocalExperts);
+            if (chosen.find(tileN) == chosen.end())
+            {
+                continue;
+            }
             auto config_indices_per_runner
                 = runner->getValidConfigIndices(topK, hiddenSize, intermediateSize, numLocalExperts, numTokens);
             for (auto cfg : config_indices_per_runner)
@@ -500,6 +506,11 @@ public:
         std::vector<std::vector<int64_t>> tactics;
         for (auto& [tileN, runner] : mRunners)
         {
+            auto chosen = computeSelectedTileN(mSupportedTileN, numTokens, topK, numLocalExperts);
+            if (chosen.find(tileN) == chosen.end())
+            {
+                continue;
+            }
             auto config_indices_per_runner
                 = runner->getValidConfigIndices(topK, hiddenSize, intermediateSize, numLocalExperts, numTokens);
             for (auto cfg : config_indices_per_runner)
