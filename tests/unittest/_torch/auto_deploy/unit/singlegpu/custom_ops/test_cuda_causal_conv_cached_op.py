@@ -82,6 +82,7 @@ def test_generate_only_with_slot_mapping_cuda(conv_env):
         d,
         g,
         pm,
+        None,
     )
 
     assert y.shape == (batch, seq, c)
