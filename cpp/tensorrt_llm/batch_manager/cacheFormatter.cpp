@@ -47,6 +47,9 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest 
 {
     auto poolNum = cacheManager->getBlockManager().getNumPools(
         /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
+
+    // Note: When recv side has CP, the requested seqLen is lesser than seqLen on the sender side as seqLen is
+    // distributed among CP ranks. So, we transfer all blocks from send side.
     if (poolNum > 1 || !cacheManager->isEnableBlockReuse() || lastBlockKey.uniqueTokens.size() == 0 || recvSideHasCP)
     {
         // disable reuse path, and vwsa don't support reuse.

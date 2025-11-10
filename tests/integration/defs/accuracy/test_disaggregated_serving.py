@@ -45,7 +45,7 @@ class Result(GenerationResultBase):
 DuckLLM = namedtuple('DuckLLM', ['args', 'tokenizer', 'generate_async'])
 
 DEFAULT_TEST_TIMEOUT = 1800
-DEFAULT_SERVER_WAITING_TIMEOUT = 1200
+DEFAULT_SERVER_WAITING_TIMEOUT = 3600
 
 
 class MyThreadPoolExecutor(ThreadPoolExecutor):

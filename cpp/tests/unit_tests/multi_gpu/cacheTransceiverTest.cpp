@@ -1022,7 +1022,8 @@ protected:
         }
         int kvFactor = mCacheState->getAttentionConfig().mKvFactor;
         int tokensPerBlock = mCacheState->getModelConfig().mTokensPerBlock;
-        int startTokenId = (blockId * mCpSize + mCpRank) * tokensPerBlock;
+        // We don't account for CP here because contextCP is always 1 currently.
+        int startTokenId = blockId * tokensPerBlock;
         int sizePerHead;
         if (isIndexerKCache)
         {
@@ -1117,7 +1118,8 @@ protected:
         }
         int kvFactor = mCacheState->getAttentionConfig().mKvFactor;
         int tokensPerBlock = mCacheState->getModelConfig().mTokensPerBlock;
-        int startTokenId = (blockId * mCpSize + mCpRank) * tokensPerBlock;
+        // We don't account for CP here because contextCP is always 1 currently.
+        int startTokenId = blockId * tokensPerBlock;
         int sizePerHead;
         if (isIndexerKCache)
         {
