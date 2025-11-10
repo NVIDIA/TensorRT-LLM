@@ -2,8 +2,7 @@
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
 ARG TRITON_IMAGE=nvcr.io/nvidia/tritonserver
 ARG BASE_TAG=25.10-py3
-# [TODO] Update to NVIDIA Triton 25.10 when it's available
-ARG TRITON_BASE_TAG=25.09-py3
+ARG TRITON_BASE_TAG=25.10-py3
 ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE}:${BASE_TAG} AS base
