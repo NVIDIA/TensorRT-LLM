@@ -2344,7 +2344,7 @@ class PyTorchModelEngine(ModelEngine):
                 scheduled_requests, resource_manager,
                 self.runtime_draft_len) as padded_requests:
 
-            maybe_graph, maybe_attn_metadata, maybe_spec_metadata, key = self.cuda_graph_runner.maybe_get_cuda_graph(
+            maybe_attn_metadata, maybe_spec_metadata, key = self.cuda_graph_runner.maybe_get_cuda_graph(
                 padded_requests,
                 iter_counter=self.iter_counter,
                 enable_spec_decode=self.enable_spec_decode,
@@ -2354,7 +2354,8 @@ class PyTorchModelEngine(ModelEngine):
                 if self.is_spec_decode else None,
                 spec_resource_manager=spec_resource_manager,
             )
-            if maybe_graph:
+            can_run_graph = key is not None
+            if can_run_graph:
                 attn_metadata = maybe_attn_metadata
                 spec_metadata = maybe_spec_metadata
             else:
@@ -2370,7 +2371,7 @@ class PyTorchModelEngine(ModelEngine):
 
             self.iter_counter += 1
             with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
-                if not maybe_graph:
+                if not can_run_graph:
                     # Fallback to eager execution if graph was not used
                     with MoeLoadBalancerIterContext(moe_load_balancer):
                         outputs = self._forward_step(inputs, gather_ids,

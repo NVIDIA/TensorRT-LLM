@@ -27,6 +27,34 @@ CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 64) - 1
 class CUDAGraphRunnerConfig:
     """Configuration for the CUDAGraphRunner, passed from the ModelEngine."""
     use_cuda_graph: bool
+    """
+    Master switch controlling the model's execution path.
+
+    This flag determines one of three distinct execution paths for the
+    model engine:
+
+    1.  **`False` (Pure Eager Path):**
+        * Forces all execution to be in eager mode.
+        * The `CUDAGraphRunner` instance is mostly dormant
+        * Methods like `maybe_get_cuda_graph` and `pad_batch`
+            will return immediately, signaling the model engine to
+            run in eager mode.
+
+    2.  **`True` (Eager Fallback Path):**
+        * The runner is active and checks for graph eligibility.
+        * If a batch is ineligible (e.g., it's a prefill batch,
+            stats collection is on, or it's an unsupported batch size),
+            the runner signals a fallback to eager mode for that batch.
+
+    3.  **`True` (CUDA Graph Path):**
+        * The runner finds an eligible batch and a matching graph.
+        * The graph is then captured (if new) or replayed.
+
+    Note: As of this implementation, the model engine *always* calls
+    `cuda_graph_runner.pad_batch` and `cuda_graph_runner.maybe_get_cuda_graph`
+    even when this is `False`. This could be refactored in the future
+    so that the engine bypasses the `CUDAGraphRunner` entirely in Case 1.
+    """
     cuda_graph_padding_enabled: bool
     cuda_graph_batch_sizes: list[int]
     max_cuda_graph_batch_size: int
@@ -142,20 +170,18 @@ class CUDAGraphRunner:
         spec_metadata: Optional[Any] = None,
         draft_tokens_cuda: Optional[torch.Tensor] = None,
         spec_resource_manager: Optional[BaseResourceManager] = None,
-    ) -> Tuple[bool, Optional[Any], Optional[Any], Optional[Tuple[int, int,
-                                                                  bool]]]:
+    ) -> Tuple[Optional[Any], Optional[Any], Optional[Tuple[int, int, bool]]]:
         """
         Determines if the current batch can be run with a CUDA graph.
 
         Returns a tuple containing:
-        - A boolean indicating if a graph can be used.
         - The attn_metadata for the graph, if applicable.
         - The spec_metadata for the graph, if applicable.
-        - The key for the graph.
+        - The key for the graph, if applicable.
         """
         # disable when doing statistic
         if ExpertStatistic.set_iter(iter_counter):
-            return False, None, None, None
+            return None, None, None
 
         can_run_cuda_graph = batch.can_run_cuda_graph
         batch_size = batch.batch_size
@@ -169,18 +195,18 @@ class CUDAGraphRunner:
                 for all_gen_only in all_can_graph_batch)
 
             if not is_all_gen_only or not all_batch_size_equal:
-                return False, None, None, None
+                return None, None, None
 
         if not self.enabled or not can_run_cuda_graph:
-            return False, None, None, None
+            return None, None, None
         key = self.get_graph_key(batch, spec_resource_manager)
 
         if key in self.graphs:
-            return True, self.graph_metadata[key][
+            return self.graph_metadata[key][
                 "attn_metadata"], self.graph_metadata[key]["spec_metadata"], key
 
         if batch_size not in self.supported_batch_sizes:
-            return False, None, None, None
+            return None, None, None
 
         num_sequences_in_batch = batch_size * self.max_beam_width
         graph_attn_metadata = attn_metadata.create_cuda_graph_metadata(
@@ -193,7 +219,7 @@ class CUDAGraphRunner:
             graph_spec_metadata.draft_tokens = draft_tokens_cuda
         else:
             graph_spec_metadata = None
-        return True, graph_attn_metadata, graph_spec_metadata, key
+        return graph_attn_metadata, graph_spec_metadata, key
 
     def needs_capture(self, key: Tuple[int, int, int]):
         return key not in self.graph_outputs
