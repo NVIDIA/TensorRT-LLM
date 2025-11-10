@@ -355,9 +355,5 @@ class TorchBackendCausalConv(AttentionDescriptor):
         stride, padding, dilation, groups, padding_mode = extract_op_args(
             source_attn_node, "stride", "padding", "dilation", "groups", "padding_mode"
         )
-        # activation parameter may not exist in the source node (added by fusion later)
-        try:
-            activation = extract_op_args(source_attn_node, "activation")[0]
-        except (RuntimeError, IndexError):
-            activation = None
-        return [stride, padding, dilation, groups, padding_mode, activation]
+        # None is for activation parameter, which may not exist in the source node (added by fusion later)
+        return [stride, padding, dilation, groups, padding_mode, None]
