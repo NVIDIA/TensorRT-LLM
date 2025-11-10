@@ -187,7 +187,7 @@ template <typename T, int BLOCK_SIZE, int K_DIM, int ROPE_DIM, typename KVCacheB
 __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* q_pe, T* k_ptr, T const* fuse_buf,
     KVCacheBuffer kv_cache, int q_pe_ld, int q_pe_stride, float2 const* cos_sin_cache, size_t head_num, int head_size,
     int c_k, int* cu_q_seqlens, int32_t const* kv_cache_lengths, uint32_t max_input_seq_len, KvCacheDataType cache_type,
-    float const* quant_scale_kv, bool absorption_mode)
+    float const* quant_scale_kv, int32_t const* helix_position_offsets, bool absorption_mode)
 {
 
     // Constants.
@@ -237,7 +237,8 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* q_pe, T* k
             local_token_idx = std::min(local_token_idx, cache_seq_len - 1);
             int const global_token_idx = local_token_idx + global_token_offset;
 
-            auto const position_id = local_token_idx;
+            auto const position_id
+                = helix_position_offsets ? helix_position_offsets[global_token_idx] : local_token_idx;
             float2 const* rotary_coef_cache_buffer
                 = cos_sin_cache + static_cast<size_t>(ROPE_DIM) * position_id + (head_dim_idx / 2);
 
@@ -949,7 +950,7 @@ void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, c
         params.q_pe, params.k_buf, params.latent_cache, kv_cache_buffer, params.q_pe_ld, params.q_pe_stride,
         params.cos_sin_cache, params.head_num, head_size, params.meta.kv_lora_rank, params.cu_q_seqlens,
         params.cache_seq_lens, params.max_input_seq_len, params.cache_type, params.quant_scale_kv,
-        params.absorption_mode);
+        params.helix_position_offsets, params.absorption_mode);
 }
 
 template <typename T>

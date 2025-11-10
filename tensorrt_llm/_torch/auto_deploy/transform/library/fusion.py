@@ -13,7 +13,7 @@ from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
 from ...utils.logger import ad_logger
-from ...utils.node_utils import extract_param_names_from_lin_node, is_linear_op, is_op
+from ...utils.node_utils import extract_param_names_from_node, is_linear_op, is_op
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 
@@ -36,7 +36,7 @@ def _insert_fused_gemm(gm: GraphModule, idx: int, parent_node: Node, linear_node
     y2 = y[:, out1:out1+out2]
     """
     # some info we need
-    keys_unfused = [extract_param_names_from_lin_node(n)[0] for n in linear_nodes]
+    keys_unfused = [extract_param_names_from_node(n)[0] for n in linear_nodes]
     params_unfused = [gm.get_parameter(k) for k in keys_unfused]
     sizes_unfused = [p.size(0) for p in params_unfused]
     key_fused = f"fused_weight_{idx}"
@@ -128,7 +128,7 @@ class QuantizationFusionMixin(ABC):
     def _insert_fused_quant_gemm(
         self, gm: GraphModule, idx: int, parent_node: Node, linear_nodes: List[Node]
     ):
-        keys_unfused = [extract_param_names_from_lin_node(n)[0] for n in linear_nodes]
+        keys_unfused = [extract_param_names_from_node(n)[0] for n in linear_nodes]
         params_unfused = [gm.get_parameter(k) for k in keys_unfused]
         sizes_unfused = [p.size(0) for p in params_unfused]
         key_fused = f"fused_weight_{idx}"

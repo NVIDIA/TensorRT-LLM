@@ -529,7 +529,7 @@ def test_processor_get_num_tokens_per_image(
     ) as mocked_auto_processor:
         input_processor = modeling_mistral.Mistral3InputProcessor(
             model_path=str(tmp_path),
-            model_config=mistral_3_config,
+            config=mistral_3_config,
             tokenizer=mock.MagicMock(),
         )
 

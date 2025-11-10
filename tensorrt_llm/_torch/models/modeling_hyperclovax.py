@@ -15,8 +15,9 @@ from transformers.models.auto import CONFIG_MAPPING
 
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
-from ...inputs import (BaseMultimodalInputProcessor, ExtraProcessedInputs,
-                       InputProcessor, MultimodalPlaceholderMetadata,
+from ...inputs import (BaseMultimodalDummyInputsBuilder,
+                       BaseMultimodalInputProcessor, ExtraProcessedInputs,
+                       MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...logger import logger
@@ -564,33 +565,54 @@ class HCXVisionCAbstractor(nn.Module):
         return nn.Sequential(*layers)
 
 
-class HCXVisionInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
+class HCXVisionInputProcessor(BaseMultimodalDummyInputsBuilder,
+                              BaseMultimodalInputProcessor):
 
     def __init__(self,
                  model_path: str,
-                 model_config: PretrainedConfig,
+                 config: PretrainedConfig,
                  tokenizer: AutoTokenizer,
                  trust_remote_code: bool = True):
-
-        self.pretrained_config = model_config
-        self.tokenizer = tokenizer
-        self.use_fast = True
-        if self.tokenizer is None:
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                model_path,
-                trust_remote_code=trust_remote_code,
-                use_fast=self.use_fast)
-        self.processor = AutoProcessor.from_pretrained(
+        super().__init__()
+        self._config = config
+        self._tokenizer = tokenizer if tokenizer is not None else AutoTokenizer.from_pretrained(
             model_path,
             trust_remote_code=trust_remote_code,
             use_fast=self.use_fast)
-        self.tllm_multimodal_token_id = self.pretrained_config.language_config[
+        self._processor = AutoProcessor.from_pretrained(
+            model_path,
+            trust_remote_code=trust_remote_code,
+            use_fast=self.use_fast)
+        self._model_path = model_path
+        self._dtype = self.config.torch_dtype
+
+        self.tllm_multimodal_token_id = self.config.language_config[
             "vocab_size"] + 1
         self.vision_query_lengths = None
         self._vision_query_generator = None
 
+    @property
+    def config(self) -> PretrainedConfig:
+        return self._config
+
+    @property
+    def tokenizer(self) -> AutoTokenizer:
+        return self._tokenizer
+
+    @property
+    def model_path(self) -> str:
+        return self._model_path
+
+    @property
+    def processor(self) -> AutoProcessor:
+        return self._processor
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._dtype
+
     def get_vocab_size(self):
-        return self.pretrained_config.language_config["vocab_size"]
+        return self.config.language_config["vocab_size"]
 
     def get_num_tokens_per_image(
         self,
@@ -656,8 +678,7 @@ class HCXVisionInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
         vision_query_lengths = preprocessed_image.get("vision_query_lengths",
                                                       None)
         non_vision_query_lengths = determine_non_vision_query_lengths(
-            input_ids, self.tokenizer.pad_token_id,
-            self.pretrained_config.img_start_id)
+            input_ids, self.tokenizer.pad_token_id, self.config.img_start_id)
         batch_size = input_ids.size(0)
 
         len_inputs_embeds = max([
@@ -666,11 +687,10 @@ class HCXVisionInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
                 non_vision_query_lengths, vision_query_lengths)
         ])
 
-        len_inputs_embeds = min(self.pretrained_config.decoder_max_length,
+        len_inputs_embeds = min(self.config.decoder_max_length,
                                 len_inputs_embeds)
 
-        image_cnts = (input_ids == self.pretrained_config.img_start_id).sum(
-            dim=1).tolist()
+        image_cnts = (input_ids == self.config.img_start_id).sum(dim=1).tolist()
 
         fused_input_ids = torch.zeros([batch_size, len_inputs_embeds],
                                       dtype=input_ids.dtype)
@@ -678,7 +698,7 @@ class HCXVisionInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
             non_vision_query_length = non_vision_query_lengths[batch_idx]
             sample = sample[:non_vision_query_length + image_cnts[batch_idx]]
 
-            mask = (sample == self.pretrained_config.img_start_id)
+            mask = (sample == self.config.img_start_id)
             img_start_ids = mask.nonzero()
             input_start, temp_start = 0, 0
 
@@ -779,7 +799,7 @@ class HCXVisionModel(nn.Module):
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__()
         self.model_config = model_config
-        self.pretrained_config = model_config.pretrained_config
+        self.config = model_config.pretrained_config
         siglip_model_config = copy.deepcopy(self.model_config)
         siglip_model_config.pretrained_config = self.model_config.pretrained_config.vision_config
         self.visual_token_idx = 0 if "siglip" in self.model_config.pretrained_config.vision_config.model_type else 1
@@ -787,24 +807,22 @@ class HCXVisionModel(nn.Module):
         self.vision_model = SiglipVisionModel(siglip_model_config).to(
             self.dtype)
         self.mm_projector = HCXVisionCAbstractor(
-            num_queries=self.pretrained_config.num_queries_vis_abstractor,
-            num_input_tokens=(
-                self.pretrained_config.vision_config.image_size //
-                self.pretrained_config.vision_config.patch_size)**2,
-            encoder_hidden_size=self.pretrained_config.vision_config.
-            hidden_size,
-            hidden_size=self.pretrained_config.vision_config.hidden_size,
-            output_hidden_size=self.pretrained_config.hidden_size,
-            pos_emb=self.pretrained_config.proj_pos_emb,
-            prenorm=self.pretrained_config.proj_prenorm,
+            num_queries=self.config.num_queries_vis_abstractor,
+            num_input_tokens=(self.config.vision_config.image_size //
+                              self.config.vision_config.patch_size)**2,
+            encoder_hidden_size=self.config.vision_config.hidden_size,
+            hidden_size=self.config.vision_config.hidden_size,
+            output_hidden_size=self.config.hidden_size,
+            pos_emb=self.config.proj_pos_emb,
+            prenorm=self.config.proj_prenorm,
         ).to(self.dtype)
         self.image_newline = nn.Parameter(torch.empty(
-            self.pretrained_config.hidden_size, ),
+            self.config.hidden_size, ),
                                           requires_grad=False).to(self.dtype)
 
-        self.unpad = self.pretrained_config.unpad
-        self.use_nth_layer = self.pretrained_config.use_nth_layer
-        self.anyres = self.pretrained_config.anyres
+        self.unpad = self.config.unpad
+        self.use_nth_layer = self.config.use_nth_layer
+        self.anyres = self.config.anyres
         self.possible_resolutions = self._init_possible_resolutions()
         self.post_config()
 
@@ -814,18 +832,18 @@ class HCXVisionModel(nn.Module):
 
     def _init_possible_resolutions(self):
         possible_resolutions = []
-        if self.pretrained_config.anyres:
-            assert self.pretrained_config.max_num_grids > 0
-            for i in range(1, self.pretrained_config.max_num_grids + 1):
-                for j in range(1, self.pretrained_config.max_num_grids + 1):
-                    if i == 1 and j == 1 and not self.pretrained_config.use_1x1_grid:
+        if self.config.anyres:
+            assert self.config.max_num_grids > 0
+            for i in range(1, self.config.max_num_grids + 1):
+                for j in range(1, self.config.max_num_grids + 1):
+                    if i == 1 and j == 1 and not self.config.use_1x1_grid:
                         continue
-                    if i * j <= self.pretrained_config.max_num_grids:
+                    if i * j <= self.config.max_num_grids:
                         possible_resolutions.append([i, j])
 
             possible_resolutions = [[
-                ys * self.pretrained_config.vision_config.image_size,
-                xs * self.pretrained_config.vision_config.image_size
+                ys * self.config.vision_config.image_size,
+                xs * self.config.vision_config.image_size
             ] for ys, xs in possible_resolutions]
         return possible_resolutions
 

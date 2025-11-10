@@ -195,6 +195,10 @@ methods:
         annotation: Optional[str]
         default: null
         status: prototype
+      enable_sleep:
+        annotation: bool
+        default: False
+        status: prototype
     return_annotation: None
   generate:
     parameters:

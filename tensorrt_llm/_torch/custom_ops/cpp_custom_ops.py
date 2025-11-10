@@ -74,16 +74,15 @@ def _register_fake():
         return allreduce(input, residual, norm_weight, scale, bias, workspace,
                          group, strategy, op, eps, trigger_completion_at_end)
 
-    #MNNVL Allreduce
-    @torch.library.register_fake("trtllm::mnnvl_twoshot_allreduce")
-    def _(input, buffer, buffer_flags, buffer_size, wait_for_results):
+    # MNNVL Allreduce
+    @torch.library.register_fake("trtllm::mnnvl_fusion_allreduce")
+    def _(input, residual, gamma, epsilon, buffer, buffer_flags,
+          rmsnorm_fusion):
         output = input.new_empty(input.shape)
-        return output
-
-    @torch.library.register_fake("trtllm::mnnvl_twoshot_rmsnorm")
-    def _(comm_buf, gamma, eps, residual, buffer_flags, buffer_size):
-        output = residual.new_empty(residual.shape)
-        residual_out = residual.new_empty(residual.shape)
+        if rmsnorm_fusion:
+            residual_out = residual.new_empty(residual.shape)
+        else:
+            residual_out = None
         return [output, residual_out]
 
     @torch.library.register_fake("trtllm::moe_allreduce")
@@ -560,6 +559,10 @@ def _register_fake():
             for i in range(0, len(input_list), num_ranks)
         ]
 
+    @torch.library.register_fake("trtllm::helix_post_process")
+    def _(gathered_o, gathered_stats, scale):
+        return gathered_o.new_empty(*gathered_o.shape[1:])
+
     @torch.library.register_fake("trtllm::tinygemm2")
     def _(input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
         # input [M, K], weight [N, K], bias [N]
@@ -582,3 +585,49 @@ def _register_fake():
         m = mat_a.shape[0]
         n = mat_b.shape[0]
         return mat_a.new_empty((m, n), dtype=out_dtype)
+
+    @torch.library.register_fake("trtllm::mla_rope_generation")
+    def _(
+        fused_q: torch.Tensor,
+        q_pe: torch.Tensor,
+        latent_cache: torch.Tensor,
+        rotary_cos_sin: Optional[torch.Tensor],
+        cu_q_seqlens: torch.Tensor,
+        cu_kv_seqlens: torch.Tensor,
+        fmha_scheduler_counter: torch.Tensor,
+        mla_bmm1_scale: Optional[torch.Tensor],
+        mla_bmm2_scale: Optional[torch.Tensor],
+        quant_q_buffer: Optional[torch.Tensor],
+        sequence_length: torch.Tensor,
+        host_past_key_value_lengths: torch.Tensor,
+        host_context_lengths: torch.Tensor,
+        num_contexts: int,
+        kv_cache_block_offsets: Optional[torch.Tensor],
+        host_kv_cache_block_offsets: Optional[torch.Tensor],
+        host_kv_cache_pool_pointers: Optional[torch.Tensor],
+        host_kv_cache_pool_mapping: Optional[torch.Tensor],
+        kv_scale_orig_quant: Optional[torch.Tensor],
+        kv_scale_quant_orig: Optional[torch.Tensor],
+        out_scale: Optional[torch.Tensor],
+        block_ids_per_seq: Optional[torch.Tensor],
+        mla_tensor_params: List[Optional[torch.Tensor]],
+        predicted_tokens_per_seq: int,
+        layer_idx: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_size: int,
+        tokens_per_block: int,
+        attention_window_size: int,
+        sink_token_length: int,
+        beam_width: int,
+        quant_mode: int,
+        q_scaling: float,
+        q_lora_rank: int,
+        kv_lora_rank: int,
+        qk_nope_head_dim: int,
+        qk_rope_head_dim: int,
+        v_head_dim: int,
+    ) -> None:
+        # This is a fake implementation for shape inference
+        # The actual operation modifies fused_q and q_pe in-place
+        return None

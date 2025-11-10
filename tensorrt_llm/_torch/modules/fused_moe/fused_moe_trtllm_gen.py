@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe
+from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 
@@ -122,11 +123,26 @@ class TRTLLMGenFusedMoE(MoE):
             self.use_low_precision_combine = model_config.use_low_precision_moe_combine
 
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
-                MnnvlMemory.initialize()
-                self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
-                    model_config.mapping)
-                self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
-                    model_config.mapping)
+                if self.moe_alltoall_backend == "mnnvllatency":
+                    MnnvlMemory.initialize()
+                    self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
+                        model_config.mapping)
+                    self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
+                        model_config.mapping)
+                elif self.moe_alltoall_backend == "mnnvlthroughput":
+                    workspace_mb = int(
+                        os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB", "512"))
+                    self.moe_a2a = MoeAlltoAll(
+                        mapping=self.mapping,
+                        max_num_tokens=model_config.max_num_tokens,
+                        top_k=self.routing_method.experts_per_token,
+                        num_experts=self.num_experts,
+                        workspace_size_per_rank=workspace_mb * 1024 * 1024,
+                    )
+                else:
+                    raise ValueError(
+                        f"Unsupported moe alltoall backend: {self.moe_alltoall_backend}"
+                    )
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP or self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
                 raise NotImplementedError(
                     "DeepEP and DeepEPLowLatency are not supported for TRTLLMGenFusedMoE yet"
@@ -172,6 +188,12 @@ class TRTLLMGenFusedMoE(MoE):
         """ enable_alltoall (bool): whether to enable alltoall instead of allgather/reducescatter
         """
         return self.alltoall_method_type != AlltoallMethodType.NotEnabled
+
+    @cached_property
+    def moe_alltoall_backend(self):
+        # "mnnvllatency" (default) or "mnnvlthroughput"
+        return os.environ.get("TRTLLM_MOE_ALLTOALL_BACKEND",
+                              "mnnvllatency").strip().lower()
 
     def _check_configs(self):
         assert self.has_deepseek_fp8_block_scales \
@@ -331,7 +353,7 @@ class TRTLLMGenFusedMoE(MoE):
         if self.enable_alltoall:
             assert all_rank_num_tokens is not None, "all_rank_num_tokens required for alltoall"
 
-            max_num_token = max(
+            runtime_max_tokens_per_rank = max(
                 all_rank_num_tokens) if all_rank_num_tokens else token_count
 
             if token_final_scales is None:
@@ -340,45 +362,90 @@ class TRTLLMGenFusedMoE(MoE):
             else:
                 token_final_scales = token_final_scales.to(torch.float32)
 
-            assert self.alltoall_prepare_workspace is not None, "alltoall_prepare_workspace should be initialized"
-            alltoall_info, _ = MnnvlMoe.mnnvl_moe_alltoallv_prepare_without_allgather(
-                token_selected_experts,
-                None,
-                self.alltoall_prepare_workspace,
-                max_num_token,
-                self.ep_rank,
-                self.ep_size,
-                self.num_experts,
-                self.num_slots,
-                top_k,
-            )
+            if self.moe_alltoall_backend == "mnnvllatency":
+                assert self.alltoall_prepare_workspace is not None, "alltoall_prepare_workspace should be initialized"
+                alltoall_info, _ = MnnvlMoe.mnnvl_moe_alltoallv_prepare_without_allgather(
+                    token_selected_experts,
+                    None,
+                    self.alltoall_prepare_workspace,
+                    runtime_max_tokens_per_rank,
+                    self.ep_rank,
+                    self.ep_size,
+                    self.num_experts,
+                    self.num_slots,
+                    top_k,
+                )
 
-            if x_sf is not None:
-                x_sf = x_sf.view(x_row, ceil_div(x_col,
-                                                 self.scaling_vector_size))
+                if x_sf is not None:
+                    x_sf = x_sf.view(x_row,
+                                     ceil_div(x_col, self.scaling_vector_size))
 
-            x, x_sf, token_selected_experts, token_final_scales = MnnvlMoe.mnnvl_moe_alltoallv(
-                [x, x_sf, token_selected_experts, token_final_scales],
-                alltoall_info,
-                self.alltoall_workspace,
-                self.ep_rank,
-                self.ep_size,
-            )
+                x, x_sf, token_selected_experts, token_final_scales = MnnvlMoe.mnnvl_moe_alltoallv(
+                    [x, x_sf, token_selected_experts, token_final_scales],
+                    alltoall_info,
+                    self.alltoall_workspace,
+                    self.ep_rank,
+                    self.ep_size,
+                )
 
-            torch.ops.trtllm.memset_expert_ids(
-                token_selected_experts,
-                alltoall_info.recv_rank_count_cumsum,
-                max_num_token,
-                top_k,
-                -1,  # Trtllm Gen uses -1 as invalid expert id
-                self.ep_size,
-            )
+                torch.ops.trtllm.memset_expert_ids(
+                    token_selected_experts,
+                    alltoall_info.recv_rank_count_cumsum,
+                    runtime_max_tokens_per_rank,
+                    top_k,
+                    -1,  # Caution: TRTLLM-Gen uses -1 as invalid token expert id
+                    self.ep_size,
+                )
 
-            if x_sf is not None:
-                x_sf = x_sf.flatten()
+                if x_sf is not None:
+                    x_sf = x_sf.flatten()
 
-            if token_final_scales is not None:
-                token_final_scales = token_final_scales.to(torch.bfloat16)
+                if token_final_scales is not None:
+                    token_final_scales = token_final_scales.to(torch.bfloat16)
+            elif self.moe_alltoall_backend == "mnnvlthroughput":
+                if x_sf is not None:
+                    x_sf = x_sf.view(x_row,
+                                     ceil_div(x_col, self.scaling_vector_size))
+
+                payloads = []
+                payloads.append(x)
+                if x_sf is not None:
+                    payloads.append(x_sf)
+                    expert_id_payload_index = 2
+                else:
+                    expert_id_payload_index = 1
+                payloads.append(token_selected_experts)
+                payloads.append(token_final_scales)
+
+                recv_tensors = self.moe_a2a.dispatch(
+                    token_selected_experts,
+                    payloads,
+                    runtime_max_tokens_per_rank,
+                    invalid_token_expert_id=
+                    -1,  # Caution: TRTLLM-Gen uses -1 as invalid token expert id
+                    expert_id_payload_index=expert_id_payload_index,
+                )
+
+                if x_sf is not None:
+                    x_recv, x_sf_recv, token_selected_experts_recv, token_final_scales_recv = recv_tensors
+                    x_sf = x_sf_recv.view(-1, x_sf_recv.shape[-1])
+                else:
+                    x_recv, token_selected_experts_recv, token_final_scales_recv = recv_tensors
+                x = x_recv.view(-1, x_recv.shape[-1])
+                token_selected_experts = token_selected_experts_recv.view(
+                    -1, token_selected_experts_recv.shape[-1])
+                token_final_scales = token_final_scales_recv.view(
+                    -1, token_final_scales_recv.shape[-1])
+
+                if x_sf is not None:
+                    x_sf = x_sf.flatten()
+
+                if token_final_scales is not None:
+                    token_final_scales = token_final_scales.to(torch.bfloat16)
+            else:
+                raise ValueError(
+                    f"Unsupported moe alltoall backend: {self.moe_alltoall_backend}"
+                )
 
         elif run_post_quant_allgather:
             if x_sf is not None:
@@ -397,6 +464,13 @@ class TRTLLMGenFusedMoE(MoE):
 
         router_logits_arg = router_logits if not post_quant_comm else None
         routing_bias_arg = routing_bias if not post_quant_comm else None
+
+        moe_output: Optional[torch.Tensor] = None
+        use_workspace_output = False
+        if self.enable_alltoall and self.moe_alltoall_backend == "mnnvlthroughput":
+            moe_output = self.moe_a2a.get_combine_payload_tensor_in_workspace(
+                runtime_max_tokens_per_rank, self.hidden_size, torch.bfloat16)
+            use_workspace_output = True
 
         # TODO: since routing kernel is integrated into moe_runner for fp8,
         #       here we just route the I/Os for moe_runner
@@ -635,6 +709,7 @@ class TRTLLMGenFusedMoE(MoE):
                 0,  # act_type
                 token_final_scales,
                 token_selected_experts,
+                output=moe_output,
             )
         else:
             raise NotImplementedError(
@@ -642,17 +717,45 @@ class TRTLLMGenFusedMoE(MoE):
             )
 
         # Combine results if using alltoall
-        if self.enable_alltoall and alltoall_info is not None:
-            final_hidden_states = MnnvlMoe.mnnvl_moe_alltoallv_combine(
-                final_hidden_states,
-                alltoall_info,
-                self.alltoall_workspace,
-                ep_rank=self.ep_rank,
-                ep_size=self.ep_size,
-                top_k=top_k,
-                use_low_precision_combine=self.use_low_precision_combine,
-                token_count=token_count,
-            )
+        if self.enable_alltoall:
+            if self.moe_alltoall_backend == "mnnvllatency":
+                if alltoall_info is not None:
+                    final_hidden_states = MnnvlMoe.mnnvl_moe_alltoallv_combine(
+                        final_hidden_states,
+                        alltoall_info,
+                        self.alltoall_workspace,
+                        ep_rank=self.ep_rank,
+                        ep_size=self.ep_size,
+                        top_k=top_k,
+                        use_low_precision_combine=self.
+                        use_low_precision_combine,
+                        token_count=token_count,
+                    )
+            elif self.moe_alltoall_backend == "mnnvlthroughput":
+                # If use_workspace_output=True, the MoE result is already in workspace
+                # Otherwise, we need to reshape and pass it
+                if use_workspace_output:
+                    # Workspace payload is returned as 2D [ep_size * max_tokens, hidden]; reshape to 3D.
+                    hidden = final_hidden_states.shape[-1]
+                    payload = moe_output.view(self.ep_size,
+                                              runtime_max_tokens_per_rank,
+                                              hidden)
+                    final_hidden_states = self.moe_a2a.combine(
+                        payload,
+                        runtime_max_tokens_per_rank,
+                        payload_in_workspace=True)
+                else:
+                    hidden = final_hidden_states.shape[-1]
+                    payload = final_hidden_states.view(
+                        self.ep_size, runtime_max_tokens_per_rank, hidden)
+                    final_hidden_states = self.moe_a2a.combine(
+                        payload,
+                        runtime_max_tokens_per_rank,
+                        payload_in_workspace=False)
+            else:
+                raise ValueError(
+                    f"Unsupported moe alltoall backend: {self.moe_alltoall_backend}"
+                )
 
         final_hidden_states = self.reducescatter_or_allreduce(
             final_hidden_states,

@@ -403,13 +403,6 @@ class LlmArgs(AutoDeployConfig, BaseLlmArgs, BaseSettings):
         """Skip tokenizer initialization in config. We do this in the AutoDeploy LLM class."""
         return self
 
-    ### UTILITY METHODS ############################################################################
-    # TODO: Remove this after the PyTorch backend is fully migrated to LlmArgs from ExecutorConfig
-    def get_pytorch_backend_config(self) -> "LlmArgs":
-        """Return the LlmArgs (self) object."""
-        # TODO: can we just pass through self directly??
-        return type(self)(**self.to_llm_kwargs())
-
     def to_dict(self) -> Dict:
         """Convert model to a dictionary such that cls(**self.to_dict()) == self."""
         self_dict = super().to_dict()

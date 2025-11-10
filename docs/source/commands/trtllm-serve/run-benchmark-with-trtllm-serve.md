@@ -5,7 +5,7 @@ A complete reference for the API is available in the [OpenAI API Reference](http
 
 This step-by-step tutorial covers the following topics for running online serving benchmarking with Llama 3.1 70B and Qwen2.5-VL-7B for multimodal models:
  * Methodology Introduction
- * Launch the OpenAI-Compatibale Server with NGC container
+ * Launch the OpenAI-Compatible Server with NGC container
  * Run the performance benchmark
  * Using `extra_llm_api_options`
  * Multimodal Serving and Benchmarking

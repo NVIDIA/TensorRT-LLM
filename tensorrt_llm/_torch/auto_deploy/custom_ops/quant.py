@@ -52,6 +52,101 @@ def _to_fp8(x, scale):
     return (x / scale).clamp(FP8_MIN, FP8_MAX).to(torch.float8_e4m3fn)
 
 
+@torch.library.custom_op("auto_deploy::trtllm_quant_fp8_linear", mutates_args=())
+def trtllm_quant_fp8_linear(
+    input: torch.Tensor,
+    weight_fp8: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    input_scale: Optional[torch.Tensor] = None,
+    weight_scale: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """FP8 linear op similar to torch.nn.linear using TensorRT-LLM FP8 operations.
+
+    Args:
+        input: unquantized input tensor
+        weight_fp8: pre-quantized weight tensor, with dtype torch.float8_e4m3fn
+        input_scale: (Optional) pre-computed scalar tensor for static quantization.
+        weight_scale: scalar tensor for weight dequantization.
+
+    Returns:
+        The linear output with the original dtype as the input.
+    """
+    input_shape = input.shape
+    input_dtype = input.dtype
+
+    n = weight_fp8.shape[0]  # out_features
+    k = weight_fp8.shape[1]  # in_features
+
+    # Verify dimensions match
+    assert input_shape[-1] == k, f"Input last dim {input_shape[-1]} must match weight last dim {k}"
+
+    input = input.reshape(-1, k)
+
+    # Calculate padding needed to reach next multiple of 16
+    k_pad = (16 - k % 16) % 16  # Amount to pad K dimension
+    n_pad = (16 - n % 16) % 16  # Amount to pad N dimension
+
+    if k_pad != 0:
+        # Pad input on the last dimension (K dimension)
+        input = torch.nn.functional.pad(input, (0, k_pad), mode="constant", value=0).contiguous()
+        # Pad weight on the last dimension (K dimension)
+        weight_fp8 = torch.nn.functional.pad(
+            weight_fp8, (0, k_pad), mode="constant", value=0
+        ).contiguous()
+
+    if n_pad != 0:
+        # Pad weight on the first dimension (N dimension)
+        weight_fp8 = torch.nn.functional.pad(
+            weight_fp8, (0, 0, 0, n_pad), mode="constant", value=0
+        ).contiguous()
+
+    # Use TensorRT-LLM FP8 per-tensor quantization
+    assert input_scale is not None
+    input_fp8, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(input, input_scale)
+
+    # Use TensorRT-LLM FP8 scaled matrix multiply
+    # Choose between CUDA core (for small M) and cuBLAS (for large M) implementations
+    if input_fp8.shape[0] <= 8:  # NOTE: this kernel work with n % 2 == 0 as well??
+        # Use CUDA core for small M dimension (better for small batch sizes)
+        output = torch.ops.trtllm.cuda_scaled_mm(
+            input_fp8,
+            weight_fp8.t(),
+            scale_a=input_scale,
+            scale_b=weight_scale,
+            bias=None,
+            out_dtype=input_dtype,
+        )
+    else:
+        # Use cuBLAS for large M dimension
+        output = torch.ops.trtllm.cublas_scaled_mm(
+            input_fp8,
+            weight_fp8.t(),
+            scale_a=input_scale,
+            scale_b=weight_scale,
+            bias=None,
+            out_dtype=input_dtype,
+        )
+
+    # Remove padding from output if needed
+    if n_pad != 0:
+        output = output[..., :n]
+
+    if bias is not None:
+        output = output + bias
+    return output.reshape(*input_shape[:-1], n)
+
+
+@trtllm_quant_fp8_linear.register_fake
+def trtllm_quant_fp8_linear_fake(
+    input: torch.Tensor,
+    weight_fp8: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    input_scale: Optional[torch.Tensor] = None,
+    weight_scale: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    return torch.ops.aten.linear(input, weight_fp8.to(input.dtype), bias)
+
+
 @torch.library.custom_op("auto_deploy::torch_quant_fp8_linear", mutates_args=())
 @torch.compile(dynamic=True)
 def fp8_linear(
@@ -72,26 +167,58 @@ def fp8_linear(
     Returns:
         The linear output with the original dtype as the input.
     """
-    assert input.shape[-1] % 16 == 0
-    assert weight_fp8.shape[-1] % 16 == 0
-
     input_shape = input.shape
     weight_shape = weight_fp8.shape
+
+    # Original dimensions
+    n = weight_shape[0]  # out_features
+    k = weight_shape[1]  # in_features
+
+    # Verify dimensions match
+    assert input_shape[-1] == k, f"Input last dim {input_shape[-1]} must match weight last dim {k}"
+
+    # Calculate padding needed to reach next multiple of 16
+    k_pad = (16 - k % 16) % 16  # Amount to pad K dimension
+    n_pad = (16 - n % 16) % 16  # Amount to pad N dimension
+
+    if k_pad != 0:
+        # Pad input on the last dimension (K dimension)
+        input = torch.nn.functional.pad(input, (0, k_pad), mode="constant", value=0).contiguous()
+        # Pad weight on the last dimension (K dimension)
+        weight_fp8 = torch.nn.functional.pad(
+            weight_fp8, (0, k_pad), mode="constant", value=0
+        ).contiguous()
+
+    if n_pad != 0:
+        # Pad weight on the first dimension (N dimension)
+        weight_fp8 = torch.nn.functional.pad(
+            weight_fp8, (0, 0, 0, n_pad), mode="constant", value=0
+        ).contiguous()
 
     # Cuda graph compatibility
     assert input_scale is not None
     input_fp8 = _to_fp8(input, input_scale)
 
-    weight_fp8_t = weight_fp8.reshape(-1, weight_shape[-1]).t()
+    weight_fp8_t = weight_fp8.reshape(-1, weight_fp8.shape[-1]).t()
+
+    # If we have N padding, don't add bias in addmm (it won't match dimensions)
+    # We'll add it after removing padding
     output = addmm_float8_unwrapped(
-        input_fp8.reshape(-1, input_shape[-1]),
+        input_fp8.reshape(-1, input.shape[-1]),
         input_scale,
         weight_fp8_t,
         weight_scale,
         input.dtype,
-        bias=bias,
+        bias=None if n_pad != 0 else bias,
         use_fast_accum=True,
     )
+
+    # Remove padding from output if needed
+    if n_pad != 0:
+        output = output[..., :n]
+        # Add bias after removing padding
+        if bias is not None:
+            output = output + bias
 
     return output.reshape(*input_shape[:-1], output.shape[-1])
 

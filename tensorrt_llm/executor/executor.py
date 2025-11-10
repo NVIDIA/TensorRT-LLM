@@ -368,6 +368,7 @@ class GenerationExecutor(ABC):
         is_llm_executor: bool,
         tp_size: int,
     ):
+        logger.warning(f"Orchestrator is creating Ray executor")
         from .ray_executor import RayExecutor
 
         return RayExecutor(worker_kwargs,
@@ -386,6 +387,7 @@ class GenerationExecutor(ABC):
     ):
         """Create RPC-based executor (GenerationExecutorRpcProxy)."""
         from .rpc_proxy import GenerationExecutorRpcProxy
+        logger.warning(f"Orchestrator is creating RPC executor")
         return GenerationExecutorRpcProxy(
             worker_kwargs,
             model_world_size=model_world_size,
@@ -408,6 +410,7 @@ class GenerationExecutor(ABC):
             use_worker: If True, creates GenerationExecutorWorker (single process).
                        If False, creates GenerationExecutorProxy (multi-process with IPC).
         """
+        logger.warning(f"Orchestrator is creating IPC executor")
         if use_worker:
             from .worker import GenerationExecutorWorker
             return GenerationExecutorWorker(**worker_kwargs,
