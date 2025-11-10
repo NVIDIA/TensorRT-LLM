@@ -151,7 +151,7 @@ class CutlassFusedMoE(MoE):
                         model_config.mapping)
                 elif self.moe_alltoall_backend == "mnnvlthroughput":
                     workspace_mb = int(
-                        os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB", "512"))
+                        os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB", "2048"))
                     self.moe_a2a = MoeAlltoAll(
                         mapping=self.mapping,
                         max_num_tokens=model_config.max_num_tokens,
