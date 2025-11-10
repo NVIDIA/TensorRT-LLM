@@ -1967,7 +1967,7 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(
 
     return numMatchedTokens;
 }
-    
+
 void BlockManager::syncTransferManagerWithBufferManager()
 {
     for (auto& [_, manager] : mWindowBlockManagers)
