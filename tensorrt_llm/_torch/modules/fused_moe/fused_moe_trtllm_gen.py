@@ -133,7 +133,7 @@ class TRTLLMGenFusedMoE(MoE):
                         mapping=self.mapping,
                         max_num_tokens=model_config.max_num_tokens,
                         top_k=self.routing_method.experts_per_token,
-                        num_experts=self.num_experts,
+                        num_experts=self.num_slots,
                         workspace_size_per_rank=workspace_mb * 1024 * 1024,
                     )
                 else:

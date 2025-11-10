@@ -156,7 +156,7 @@ class CutlassFusedMoE(MoE):
                         mapping=self.mapping,
                         max_num_tokens=model_config.max_num_tokens,
                         top_k=self.routing_method.experts_per_token,
-                        num_experts=self.num_experts,
+                        num_experts=self.num_slots,
                         workspace_size_per_rank=workspace_mb * 1024 * 1024,
                     )
                 else:
@@ -702,7 +702,7 @@ class CutlassFusedMoE(MoE):
             # Postpone reduce-scatter/all-reduce to the next iteration to achieve better overlap
             for idx_chunk, (x, router_logits) in enumerate(
                     zip(x_list, router_logits_list)):
-                if not (self.moe_alltoall_backend == "mnnvllatency"):
+                if not (self.alltoall_method_type == AlltoallMethodType.MNNVL):
                     if idx_chunk % 2 == 0:
                         with torch.cuda.stream(self.aux_stream):
                             outputs = _forward_chunk(x, router_logits,
@@ -720,7 +720,7 @@ class CutlassFusedMoE(MoE):
 
                 outputs_list.append(outputs)
 
-            if not (self.moe_alltoall_backend == "mnnvllatency"):
+            if not (self.alltoall_method_type == AlltoallMethodType.MNNVL):
                 if num_chunks % 2 == 0:
                     outputs_list[-1] = _reducescatter_or_allreduce(
                         outputs_list[-1], -1)
