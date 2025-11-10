@@ -368,8 +368,10 @@ class ModelConfig(Generic[TConfig]):
                 'block.*.attn.out', 'block.*.mlp.gate', 'block.*.attn.qkv',
                 'embedding', 'unembedding'
             ]
+        # FP8 per-tensor checkpoints.
         elif hf_quant_config.get("quant_method") == "fp8":
             quant_config.quant_algo = QuantAlgo.FP8
+        # W4A8_AWQ checkpoints.
         elif hf_quant_config.get("quant_method") == "w4a8_awq":
             quant_config.quant_algo = QuantAlgo.W4A8_AWQ
             quant_config.group_size = hf_quant_config.get(
