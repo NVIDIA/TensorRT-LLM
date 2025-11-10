@@ -23,7 +23,7 @@ TensorRT LLM delivers breakthrough performance on the latest NVIDIA GPUs:
 
 ### 🎯 **Comprehensive Model Support**
 
-TensorRT LLM supports the latest and most popular LLM architectures:
+TensorRT LLM supports the latest and most popular LLM [architectures](https://nvidia.github.io/TensorRT-LLM/models/supported-models.html).
 
 ### FP4 Support
 [NVIDIA B200 GPUs](https://www.nvidia.com/en-us/data-center/dgx-b200/) , when used with TensorRT LLM, enable seamless loading of model weights in the new [FP4 format](https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/#what_is_nvfp4), allowing you to automatically leverage optimized FP4 kernels for efficient and accurate low-precision inference.
