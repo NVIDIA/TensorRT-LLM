@@ -218,7 +218,7 @@ class RPCServer:
         while asyncio.get_event_loop().time() < end_time:
             try:
                 req: RPCRequest = await asyncio.wait_for(
-                    self._client_socket.get_async_noblock(), timeout=0.1)
+                    self._client_socket.get_async_noblock(), timeout=2)
                 drained_count += 1
                 logger_debug(f"[server] Draining request after shutdown: {req}")
 
@@ -322,9 +322,11 @@ class RPCServer:
 
         while not self._shutdown_event.is_set():
             try:
+                logger_debug(f"[server] Worker waiting for request",
+                             color="green")
                 # Read request directly from socket with timeout
                 req: RPCRequest = await asyncio.wait_for(
-                    self._client_socket.get_async_noblock(), timeout=0.5)
+                    self._client_socket.get_async_noblock(), timeout=2)
                 logger_debug(f"[server] Worker got request: {req}",
                              color="green")
             except asyncio.TimeoutError:

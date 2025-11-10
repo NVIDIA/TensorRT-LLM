@@ -78,6 +78,15 @@ class RemoteCall:
 class RPCClient:
     """
     An RPC Client that connects to the RPCServer.
+
+    Design contract: **all ZeroMQ socket I/O is performed from a single
+    dedicated asyncio event-loop (self._loop) that lives in its own
+    background thread**.  Synchronous helpers marshal work onto that loop via
+    run_coroutine_threadsafe(); asynchronous streaming helpers submit the
+    actual socket operation to the loop and then yield results in the caller’s
+    loop.  Violating this invariant (i.e. touching self._client_socket from
+    multiple event-loops) leads to rare hangs / message loss because pyzmq
+    sockets are not thread-safe.
     """
 
     def __init__(self,
@@ -114,6 +123,16 @@ class RPCClient:
         self._reader_asyncio_task = None  # Track the asyncio task for proper cancellation
         self._loop_lock = threading.Lock(
         )  # Lock to protect event loop initialization
+
+        # Eagerly create the background event loop so that all subsequent
+        # RPC calls (sync or streaming) can assume it exists.  This removes a
+        # race between the first streaming call (which previously created the
+        # loop lazily) and immediate fire-and-forget calls like `submit()`.
+        self._ensure_event_loop()
+
+        # Start the response reader eagerly to avoid race conditions with streaming
+        # This ensures the reader is processing responses before any RPC calls
+        self._start_response_reader_eagerly()
 
         logger_debug(f"RPC Client initialized. Connected to {self._address}")
 
@@ -290,7 +309,7 @@ class RPCClient:
         while True:
             try:
                 # Short timeout allows periodic checks for cancellation
-                return await self._client_socket.get_async_noblock(timeout=0.5)
+                return await self._client_socket.get_async_noblock(timeout=2)
             except asyncio.TimeoutError:
                 # Check if we should exit due to cancellation
                 if self._closed or (self._reader_asyncio_task
@@ -305,6 +324,11 @@ class RPCClient:
         self._reader_asyncio_task = asyncio.current_task()
 
         try:
+            # Add initial delay to ensure socket is fully connected
+            # This helps prevent race conditions during initialization
+            await asyncio.sleep(0.1)
+            logger_debug("Response reader ready to process messages")
+
             with customized_gc_thresholds(10000):
                 while not self._closed:
                     with nvtx_range_debug("response_reader",
@@ -312,6 +336,8 @@ class RPCClient:
                                           category="RPC"):
                         try:
                             response = await self._wait_for_response()
+                            logger_debug(
+                                f"[client] Received response: {response}")
 
                             nvtx_mark_debug(
                                 f"RPC.response.{'streaming' if response.is_streaming else 'sync'}",
@@ -346,7 +372,39 @@ class RPCClient:
             self._reader_task = None
             self._reader_asyncio_task = None
 
+    def _start_response_reader_eagerly(self):
+        """Start the response reader immediately during initialization.
+
+        This ensures the reader is ready before any RPC calls are made,
+        preventing race conditions with streaming responses.
+        """
+        if self._reader_task is not None and not self._reader_task.done():
+            return  # Already running
+
+        try:
+            if self._loop and self._loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(
+                    self._response_reader(), self._loop)
+                self._reader_task = future
+                # Wait a bit to ensure the reader is actually processing
+                time.sleep(0.2)
+                logger_debug(
+                    "Response reader started eagerly during initialization")
+            else:
+                raise RuntimeError(
+                    "Event loop not running when trying to start response reader"
+                )
+        except Exception as e:
+            logger.error(f"Failed to start response reader eagerly: {e}")
+            self._reader_task = None
+            raise
+
     def _start_response_reader_lazily(self):
+        """Start the response reader task if not already running.
+
+        This method ensures the response reader is started on the private event loop.
+        It will wait briefly to ensure the reader is actually processing before returning.
+        """
         if self._reader_task is None or self._reader_task.done():
             try:
                 # Ensure we have a persistent background loop
@@ -356,13 +414,20 @@ class RPCClient:
                     future = asyncio.run_coroutine_threadsafe(
                         self._response_reader(), self._loop)
                     self._reader_task = future
+                    # Give the response reader a moment to start processing
+                    # This helps avoid race conditions where streaming requests
+                    # are sent before the reader is ready
+                    time.sleep(0.1)
+                    logger_debug("Response reader started successfully")
                 else:
-                    logger_debug(
-                        "Event loop not running yet, deferring reader start")
+                    # This should not happen with eager loop creation
+                    raise RuntimeError(
+                        "Event loop not running when trying to start response reader"
+                    )
             except Exception as e:
-                logger_debug(f"Error starting response reader: {e}")
-                # Don't raise here, let it retry on next call
+                logger.error(f"Error starting response reader: {e}")
                 self._reader_task = None
+                raise
 
     async def _call_async(self, method_name, *args, **kwargs):
         """Async version of RPC call.
@@ -432,27 +497,29 @@ class RPCClient:
         This method is thread-safe and ensures only one event loop is created
         even when called from multiple threads simultaneously.
         """
-        # Fast path: check without lock first
+        # Fast path: if the loop exists and is running, we're done.
         if self._loop is not None and self._loop.is_running():
             return
 
-        # Slow path: need to create/start loop
+        # Slow path: create/start loop under lock to prevent duplicates.
         with self._loop_lock:
-            # Double-check after acquiring lock
-            if self._loop is None or not self._loop.is_running():
-                self._loop = asyncio.new_event_loop()
+            if self._loop is not None and self._loop.is_running():
+                return
 
-                def run_loop():
-                    asyncio.set_event_loop(self._loop)
-                    self._loop.run_forever()
+            self._loop = asyncio.new_event_loop()
 
-                self._loop_thread = threading.Thread(target=run_loop,
-                                                     daemon=True,
-                                                     name="rpc_client_loop")
-                self._loop_thread.start()
+            def run_loop():
+                asyncio.set_event_loop(self._loop)
+                self._loop.run_forever()
 
-                # Give the loop a moment to start
-                time.sleep(0.2)
+            self._loop_thread = threading.Thread(target=run_loop,
+                                                 daemon=True,
+                                                 name="rpc_client_loop")
+            self._loop_thread.start()
+
+            # Give the loop a short moment to start to avoid races where the
+            # caller immediately schedules a coroutine onto it.
+            time.sleep(0.2)
 
     def _call_sync(self, method_name, *args, **kwargs):
         """Synchronous version of RPC call."""
@@ -495,13 +562,9 @@ class RPCClient:
         """
         Call a remote async generator method and get streaming results.
 
-        Args:
-            name: Method name to call
-            *args: Positional arguments
-            **kwargs: Keyword arguments
-
-        Yields:
-            Results from the remote async generator
+        Implementation note: The outgoing request is sent on the RPCClient’s
+        private event-loop to obey the single-loop rule.  The returned items
+        are yielded in the caller’s loop via AsyncQueue, which is thread-safe.
         """
         nvtx_mark_debug(f"RPC.streaming.{name}", color="red", category="RPC")
 
@@ -509,6 +572,9 @@ class RPCClient:
             raise RPCCancelled("Server is shutting down, request cancelled")
 
         self._start_response_reader_lazily()
+        # Ensure the dedicated background loop is created **before** we schedule
+        # any coroutine onto it.  This call is cheap if the loop already exists.
+        self._ensure_event_loop()
         rpc_params = kwargs.pop("__rpc_params", RPCParams())
         timeout = rpc_params.timeout if rpc_params.timeout is not None else self._timeout
 
@@ -516,21 +582,34 @@ class RPCClient:
         # Use AsyncQueue to ensure proper cross-thread communication
         queue = AsyncQueue()
         # Recreate sync_q with the current running loop for proper cross-thread communication
-        # This ensures the background _response_reader thread can properly notify this event loop
         queue._sync_q = _SyncQueue(queue, asyncio.get_running_loop())
         self._streaming_queues[request_id] = queue
 
-        try:
-            # Send streaming request
-            request = RPCRequest(request_id,
-                                 method_name=name,
-                                 args=args,
-                                 kwargs=kwargs,
-                                 need_response=True,
-                                 timeout=timeout,
-                                 is_streaming=True)
-            await self._client_socket.put_async(request)
+        # Build the RPCRequest object here – it's pickle-able and small – but
+        # *do not* touch the ZeroMQ socket from this (caller) event-loop.
+        request = RPCRequest(request_id,
+                             method_name=name,
+                             args=args,
+                             kwargs=kwargs,
+                             need_response=True,
+                             timeout=timeout,
+                             is_streaming=True)
 
+        # Send the request on the RPCClient's dedicated loop to guarantee that
+        # **all** socket I/O happens from exactly one thread / loop.
+        async def _send_streaming_request(req: RPCRequest):
+            """Private helper executed in the client loop to put the request."""
+            await self._client_socket.put_async(req)
+
+        send_future = asyncio.run_coroutine_threadsafe(
+            _send_streaming_request(request), self._loop)
+
+        # Wait until the request is actually on the wire before entering the
+        # user-visible streaming loop. We wrap the concurrent.futures.Future so
+        # we can await it in the caller's asyncio context.
+        await asyncio.wrap_future(send_future)
+
+        try:
             # Read streaming responses
             while True:
                 if timeout is None:

@@ -3,6 +3,7 @@ import atexit
 import concurrent.futures
 import json
 import threading
+import time
 from typing import Optional
 
 from .._utils import nvtx_range_debug
@@ -83,6 +84,8 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         if not self._fetch_responses_loop_started.wait(timeout=5.0):
             raise RuntimeError(
                 "Fetch responses loop failed to start within timeout")
+
+        time.sleep(4)
 
     def launch_workers(self):
         logger.debug(f"Launching workers")

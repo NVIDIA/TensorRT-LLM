@@ -111,11 +111,6 @@ class RpcWorker(BaseWorker):
 
     async def fetch_responses_async(self,
                                     timeout: Optional[float] = None) -> list:
-        # A really async version of fetch_responses
-        logger_debug(
-            f"[worker] RpcWorker {mpi_rank()} is fetching responses async",
-            color="yellow")
-
         # First, await any pending responses without blocking the event loop
         loop = asyncio.get_event_loop()
         responses = await loop.run_in_executor(

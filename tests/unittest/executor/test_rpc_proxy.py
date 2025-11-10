@@ -62,12 +62,14 @@ class TestRpcProxy:
         max_tokens = 8
 
         with self.create_proxy(tp_size=1) as proxy:
+            logger_debug(f"[Test] Proxy created", color="green")
             sampling_params = SamplingParams(max_tokens=max_tokens)
             for _ in range(num_reqs):
+                logger_debug(f"[Test] Generating {_}th", color="green")
                 result = proxy.generate(prompt_token_ids, sampling_params)
                 assert similar(tokenizer.decode(result.outputs[0].token_ids),
                                'E F G H I J K L')
-                logger_debug(f"req {_} get result: {result}", color="yellow")
+                logger_debug(f"req {_} get result: {result}", color="green")
 
             #stats = proxy.get_stats(timeout=2)
             #assert stats
