@@ -440,10 +440,7 @@ class ModelDrafter(Drafter):
                 draft_position - 1] = req.get_last_tokens(0)
             target_model_req.py_draft_logits = req.py_result.generation_logits  # forwards Nones
 
-            # Check against the accumulator length instead
-            accumulated_tokens_count = len(
-                self.draft_tokens_accumulator[req.py_request_id])
-            if req.state != LlmRequestState.GENERATION_COMPLETE and accumulated_tokens_count < target_model_req.py_draft_pages_allocated:
+            if req.state != LlmRequestState.GENERATION_COMPLETE and draft_position < target_model_req.py_draft_pages_allocated:
                 new_requests.append(req)
             else:
                 if cleanup_resources:

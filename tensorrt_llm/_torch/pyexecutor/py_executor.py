@@ -35,12 +35,10 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.runtime.generation import CUASSERT
 
-from ..attention_backend.trtllm import TrtllmAttention
 from ..distributed import Distributed
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.decoder_layer import DecoderLayer
 from ..speculative.drafter import Drafter
-from ..speculative.model_drafter import ModelDrafter
 from ..speculative.mtp import SampleStateTensorsMTP
 from ..speculative.speculation_gate import SpeculationGate
 from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
@@ -278,23 +276,8 @@ class PyExecutor:
 
         if self.dist.pp_size > 1:
             self.event_loop = self._executor_loop_pp
-        elif self.disable_overlap_scheduler:
-            self.event_loop = self._executor_loop
         else:
-            # TODO: Overlap scheduler is not supported for below cases:
-            # 1. non-CDL is used
-            # 2. non-TrtllmAttention attention backend is used
-            overlap_not_supported = self.drafter is not None and isinstance(
-                self.drafter, ModelDrafter) and (
-                    not self.drafter.use_static_draft_loop or not issubclass(
-                        self.draft_model_engine.attn_backend, TrtllmAttention))
-
-            if overlap_not_supported:
-                logger.warning(
-                    "Overlap scheduler is disabled for draft model engine with non-CDL or non-TrtllmAttention attention backend."
-                )
-                self.disable_overlap_scheduler = True
-            self.event_loop = self._executor_loop_overlap if not overlap_not_supported else self._executor_loop
+            self.event_loop = self._executor_loop if self.disable_overlap_scheduler else self._executor_loop_overlap
         if is_trace_enabled("TLLM_TRACE_EXECUTOR_LOOP"):
             self.event_loop = trace_func(self.event_loop)
 
@@ -1529,7 +1512,7 @@ class PyExecutor:
         num_accepted_tokens = torch.zeros(batch_size,
                                           dtype=torch.int32,
                                           device=device)
-        # Handle case where there are no draft tokens
+
         if has_draft_tokens:
             # Draft tokens exist, compute acceptance
             draft_tokens = target_inputs.next_draft_tokens  # [batch_size, max_draft_len]
