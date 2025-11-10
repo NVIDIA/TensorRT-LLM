@@ -2332,6 +2332,40 @@ def test_ptp_quickstart_advanced_multi_gpus(llm_root, llm_venv, model_name,
                              gpu_count)
 
 
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize("cuda_graph", [False, True])
+@pytest.mark.parametrize("tp_size, pp_size", [
+    pytest.param(2, 2, marks=pytest.mark.skip_less_device(4)),
+    pytest.param(2, 4, marks=pytest.mark.skip_less_device(8)),
+])
+@pytest.mark.parametrize("model_name,model_path", [
+    pytest.param('Llama3.3-70B-FP8',
+                 'llama-3.3-models/Llama-3.3-70B-Instruct-FP8',
+                 marks=skip_pre_hopper),
+])
+def test_ptp_quickstart_advanced_pp_enabled(llm_root, llm_venv, model_name,
+                                            model_path, cuda_graph, tp_size,
+                                            pp_size):
+    print(f"Testing {model_name} on 8 GPUs.")
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
+    cmd = [
+        str(example_root / "quickstart_advanced.py"),
+        "--enable_chunked_prefill",
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        f"--tp_size={tp_size}",
+        f"--pp_size={pp_size}",
+        "--moe_ep_size=1",
+        "--kv_cache_fraction=0.5",
+    ]
+    if cuda_graph:
+        cmd.extend([
+            "--use_cuda_graph",
+            "--cuda_graph_padding_enabled",
+        ])
+    llm_venv.run_cmd(cmd)
+
+
 @skip_pre_hopper
 @pytest.mark.skip_less_device(8)
 @pytest.mark.parametrize("cuda_graph", [False, True])

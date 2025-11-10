@@ -83,11 +83,14 @@ def submit_job(config):
     # Create base log directory path
     log_base = os.path.join(env_config['work_dir'], f"{isl}-{osl}")
 
+    # Get eplb num_slots for gen worker
+    eplb_num_slots = (config['worker_config']['gen'].get('moe_config', {}).get(
+        'load_balancer', {}).get('num_slots', 0))
     # Determine directory suffix based on attention_dp
     if gen_enable_attention_dp:
-        dir_suffix = f"ctx{ctx_num}_gen{gen_num}_dep{gen_tp_size}_batch{gen_batch_size}_eplb{config['worker_config']['gen']['moe_config']['load_balancer']['num_slots']}_mtp{mtp_size}"
+        dir_suffix = f"ctx{ctx_num}_gen{gen_num}_dep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}_mtp{mtp_size}"
     else:
-        dir_suffix = f"ctx{ctx_num}_gen{gen_num}_tep{gen_tp_size}_batch{gen_batch_size}_eplb{config['worker_config']['gen']['moe_config']['load_balancer']['num_slots']}_mtp{mtp_size}"
+        dir_suffix = f"ctx{ctx_num}_gen{gen_num}_tep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}_mtp{mtp_size}"
 
     # Create full log directory path
     log_dir = os.path.join(log_base, dir_suffix)

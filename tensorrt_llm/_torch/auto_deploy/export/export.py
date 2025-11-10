@@ -172,7 +172,7 @@ def _add_load_hook_for_aliased_params(gm: fx.GraphModule, model: nn.Module) -> N
     gm._register_load_state_dict_pre_hook(aliasing_load_pre_hook)
 
 
-def _clean_up_assertions(gm: fx.GraphModule):
+def _clean_up_assertions_and_guards(gm: fx.GraphModule):
     """This transformations removes shape checks and assertions from the graph."""
     check_ops = {
         torch.ops.aten._assert_scalar,
@@ -183,11 +183,26 @@ def _clean_up_assertions(gm: fx.GraphModule):
         # torch.ops.aten._functional_sym_constrain_range_for_size
     }
     graph: fx.Graph = gm.graph
+    removed = False
     for node in reversed(graph.nodes):
         if len(node.users) > 0 or not is_op(node, check_ops):
             continue
         graph.erase_node(node)
-    canonicalize_graph(gm)
+        removed = True
+    for node in reversed(graph.nodes):
+        if node.op == "call_module" and (
+            str(node.target) == "_guards_fn" or str(node.target).startswith("_guards")
+        ):
+            # there's typically no users of the guards, but if there are, we route through the first arg
+            if len(node.users) > 0 and len(node.args) >= 1:
+                node.replace_all_uses_with(node.args[0])
+            graph.erase_node(node)
+            removed = True
+
+    if removed and hasattr(gm, "_guards_fn"):
+        delattr(gm, "_guards_fn")
+    if removed:
+        canonicalize_graph(gm)
 
 
 def run_forward_for_capture(
@@ -308,7 +323,7 @@ def torch_export_to_gm(
     _clean_up_device_info(egm)
 
     # clean up checks --> generally the sanity checks are overly conservative and we can remove them
-    _clean_up_assertions(egm)
+    _clean_up_assertions_and_guards(egm)
 
     # show exported graph
     ad_logger.debug("exported graph: " + str(egm))

@@ -16,12 +16,12 @@ import os
 
 import pytest
 import torch
-from defs.conftest import get_sm_version
+from defs.conftest import get_sm_version, is_sm_100f
 
 from tensorrt_llm import LLM
+from tensorrt_llm._torch.model_config import MoeLoadBalancerConfig
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import \
     IS_TRITON_KERNELS_AVAILABLE
-from tensorrt_llm._torch.pyexecutor.config import MoeLoadBalancerConfig
 from tensorrt_llm.llmapi import (AutoDecodingConfig, CudaGraphConfig,
                                  EagleDecodingConfig, KvCacheConfig, MoeConfig,
                                  MTPDecodingConfig, NGramDecodingConfig,
@@ -1076,11 +1076,74 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    def test_auto_dtype_vswa_without_reuse_low_memory_available(self):
+        # NOTE: Test with VSWA kv cache config.
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=False,
+            enable_partial_reuse=False,
+            max_attention_window=[512, 512, 512, 512, 512, 32768],
+            free_gpu_memory_fraction=0.1,
+        )
+
+        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
     def test_auto_dtype_vswa_reuse(self):
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=True,
             max_attention_window=[512, 512, 512, 512, 512, 32768],
+        )
+
+        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    def test_auto_dtype_vswa_reuse_partial_reuse(self):
+        # NOTE: Test with VSWA kv cache config.
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=True,
+            enable_partial_reuse=True,
+            max_attention_window=[512, 512, 512, 512, 512, 32768],
+        )
+
+        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    def test_auto_dtype_vswa_reuse_low_memory_available_no_partial_reuse(self):
+        # NOTE: Test with VSWA kv cache config.
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=True,
+            enable_partial_reuse=False,
+            max_attention_window=[512, 512, 512, 512, 512, 32768],
+            free_gpu_memory_fraction=0.1,
+        )
+
+        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip(
+        reason=
+        "Currently failing due to accuracy drop, https://nvbugspro.nvidia.com/bug/5625990"
+    )
+    def test_auto_dtype_vswa_reuse_low_memory_available_partial_reuse(self):
+        # NOTE: Test with VSWA kv cache config.
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=True,
+            enable_partial_reuse=True,
+            max_attention_window=[512, 512, 512, 512, 512, 32768],
+            free_gpu_memory_fraction=0.1,
         )
 
         with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
@@ -2214,7 +2277,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
     def test_fp8_blockscale(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                             attention_dp, cuda_graph, overlap_scheduler,
                             max_batch_size, moe_backend):
-        if get_sm_version() == 100 or get_sm_version() == 103:
+        if is_sm_100f():
             moe_backend = "DEEPGEMM" if moe_backend == "_DEFAULT" else moe_backend
             moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
             kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
@@ -2264,7 +2327,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                                             mtp_nextn, fp8kv, attention_dp,
                                             cuda_graph, overlap_scheduler,
                                             max_batch_size):
-        if get_sm_version() == 100:
+        if is_sm_100f():
             moe_config = MoeConfig(backend="DEEPGEMM", max_num_tokens=16384)
             kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
         else:
@@ -2310,14 +2373,16 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_mpi_world_size(8)
     @skip_pre_hopper
+    @pytest.mark.skip_less_device_memory(140000)
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
         [
             (8, 1, 8, 0, False, True, True, True, 24, "_DEFAULT"),
             (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT"),
             (8, 1, 8, 0, True, True, True, True, 24, "_DEFAULT"),
+            (8, 1, 8, 1, False, False, True, True, 1, "TRTLLM"),
         ],
-        ids=["baseline", "baseline_mtp1", "baseline_fp8kv"])
+        ids=["baseline", "baseline_mtp1", "baseline_fp8kv", "latency"])
     def test_fp8_blockscale(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                             attention_dp, cuda_graph, overlap_scheduler,
                             max_batch_size, moe_backend):
@@ -2344,6 +2409,10 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
         )
 
         if fp8kv:
+            if get_sm_version() < 100:
+                pytest.skip(
+                    "FP8 KV cache is not supported on pre-Blackwell architectures"
+                )
             kv_cache_config.dtype = "fp8"
 
         mtp_config = None
@@ -2376,11 +2445,12 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
         [
-            (8, 1, 8, 0, False, True, True, True, 24, "TRTLLM"),
-            (8, 1, 8, 1, False, True, True, True, 24, "TRTLLM"),
-            (8, 1, 8, 0, True, True, True, True, 24, "TRTLLM"),
+            (8, 1, 8, 0, False, True, True, True, 24, "CUTLASS"),
+            (8, 1, 8, 1, False, True, True, True, 24, "CUTLASS"),
+            (8, 1, 8, 0, True, True, True, True, 24, "CUTLASS"),
+            (8, 1, 8, 1, False, False, True, True, 1, "TRTLLM"),
         ],
-        ids=["baseline", "baseline_mtp1", "baseline_fp8kv"])
+        ids=["baseline", "baseline_mtp1", "baseline_fp8kv", "latency"])
     def test_nvfp4_multi_gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                               attention_dp, cuda_graph, overlap_scheduler,
                               max_batch_size, moe_backend):
@@ -3528,10 +3598,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     def test_w4_4gpus(self, kv_cache_dtype, moe_backend, tp_size, pp_size,
                       ep_size, attention_dp, cuda_graph, overlap_scheduler,
                       mocker):
-        if get_sm_version() < 100:
-            pytest.skip(
-                "https://nvbugs/5596343: Skip Hopper due to accuracy issue.")
-
         if moe_backend == "TRITON":
             if not IS_TRITON_KERNELS_AVAILABLE:
                 pytest.skip("Triton kernels are not available")
