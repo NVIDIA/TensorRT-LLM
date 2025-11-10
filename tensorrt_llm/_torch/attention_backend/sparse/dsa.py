@@ -444,6 +444,28 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             device='cpu',
             pin_memory=True,
         )
+        self.block_table_expanded = self.get_empty(
+            self.cuda_graph_buffers,
+            [
+                self.max_num_sequences * (1 + self.max_draft_tokens),
+                self.kv_cache_manager.max_blocks_per_seq
+            ],
+            cache_name="block_table_expanded",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        self.host_block_table_expanded = torch.zeros_like(
+            self.block_table_expanded,
+            device='cpu',
+            pin_memory=True,
+        )
+        self.scheduler_metadata_buffer_expanded = self.get_empty(
+            self.cuda_graph_buffers,
+            (self.num_sms + 1, 2),
+            cache_name="scheduler_metadata_buffer_expanded",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
 
     def prepare(self):
         super().prepare()
@@ -547,9 +569,38 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         else:
             self.max_gen_seq_len = 0
 
-        # Expand kv_lens_cuda for draft tokens (only generation)
-        gen_kv_lens = kv_lens[self.num_contexts:self.num_seqs]
-        self.kv_lens_expanded_host = torch.cat([gen_kv_lens] * (1+self.max_draft_tokens), dim=0)
+        # Because the fp8_paged_mqa_logits only supports seq_len == 1 or 2, so it cannot support
+        # MTP > 1. To haddle this, when MTP > 1, we flatten the q tensor and expand the kv_lens and
+        # block_table for to use the fp8_paged_mqa_logits.
+        if self.max_draft_tokens > 1:
+            # Expand kv_lens_cuda (only generation)
+            num_tokens = self.num_generations * (1 + self.max_draft_tokens)
+            gen_kv_lens = kv_lens[self.num_contexts:self.num_seqs]
+            gen_kv_lens_expanded = torch.stack([gen_kv_lens] *
+                                               (1 + self.max_draft_tokens),
+                                               dim=0)
+            gen_kv_lens_expanded = gen_kv_lens_expanded.transpose(
+                0, 1).contiguous().flatten()
+            self.kv_lens_expanded_host[:num_tokens].copy_(gen_kv_lens_expanded)
+            self.kv_lens_expanded_cuda[:num_tokens].copy_(
+                self.kv_lens_expanded_host[:num_tokens], non_blocking=True)
+
+            # Expand indexer_k_cache_block_offsets (only generation)
+            if self.kv_cache_manager is not None:
+                block_ids = self.kv_cache_manager.get_batch_cache_indices(
+                    self.request_ids)
+                for i in range(self.num_contexts, len(block_ids)):
+                    for j in range(1 + self.max_draft_tokens):
+                        self.host_block_table_expanded[
+                            (i - self.num_contexts) *
+                            (1 + self.max_draft_tokens) +
+                            j, :len(block_ids[i])].copy_(
+                                torch.tensor(block_ids[i],
+                                             dtype=torch.int32,
+                                             device='cpu'))
+                self.block_table_expanded[:num_tokens].copy_(
+                    self.host_block_table_expanded[:num_tokens],
+                    non_blocking=True)
 
         # Prepare metadata for indexer
         Indexer.prepare(metadata=self)
@@ -821,6 +872,15 @@ class Indexer(nn.Module):
                 gen_seq_lens, tokens_per_block, metadata.num_sms)
             metadata.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer,
                                                      non_blocking=True)
+            if metadata.max_draft_tokens > 1:
+                # Expand schedule metadata buffer (only generation)
+                num_tokens = metadata.num_generations * (
+                    1 + metadata.max_draft_tokens)
+                kv_lens_expanded = metadata.kv_lens_expanded_cuda[:num_tokens]
+                scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
+                    kv_lens_expanded, tokens_per_block, metadata.num_sms)
+                metadata.scheduler_metadata_buffer_expanded.copy_(
+                    scheduler_metadata_buffer_expanded, non_blocking=True)
 
         # Compute slot_mapping for all requests (both context and generation)
         # This maps each token to its flat cache position for vectorized KV cache updates
@@ -1071,12 +1131,21 @@ class Indexer(nn.Module):
                              ...]
             batch_size = num_generations
             next_n = num_gen_tokens // num_generations
+            # Because fp8_paged_mqa_logits cannot support next_n > 2, we need to flatten the q_decode tensor
+            # and expand the corresponding metadata.
             if next_n <= 2:
                 q_decode = q_decode.view(num_generations, -1, *q_fp8.shape[1:])
-                context_lens = metadata.kv_lens_cuda_runtime[num_contexts:num_contexts +
-                                                             num_generations]
+                context_lens = metadata.kv_lens_cuda_runtime[
+                    num_contexts:num_contexts + num_generations]
+                block_table = metadata.indexer_k_cache_block_offsets[
+                    num_contexts:num_contexts + num_generations]
+                scheduler_metadata_buffer = metadata.scheduler_metadata_buffer
             else:
                 q_decode = q_decode.view(-1, 1, *q_fp8.shape[1:])
+                num_tokens = num_generations * (1 + metadata.max_draft_tokens)
+                context_lens = metadata.kv_lens_expanded_cuda[:num_tokens]
+                block_table = metadata.block_table_expanded[:num_tokens]
+                scheduler_metadata_buffer = metadata.scheduler_metadata_buffer_expanded
 
             assert num_gen_tokens == batch_size * next_n
             weights_decode = weights[num_ctx_tokens:num_ctx_tokens +
@@ -1086,18 +1155,11 @@ class Indexer(nn.Module):
             # [num_blocks, tokens_per_block, 1, head_dim + scale_size]
             k_cache = metadata.kv_cache_manager.get_indexer_k_cache_buffers(
                 self.layer_idx)
-            logits_decode = fp8_paged_mqa_logits(
-                q_decode,
-                k_cache,
-                weights_decode,
-                metadata.kv_lens_cuda_runtime[
-                    num_contexts:num_contexts +
-                    num_generations],  # context_lens prepared in prepare()
-                metadata.indexer_k_cache_block_offsets[
-                    num_contexts:num_contexts +
-                    num_generations],  # Only pass generation request block tables
-                metadata.scheduler_metadata_buffer,
-                max_seq_len)
+            logits_decode = fp8_paged_mqa_logits(q_decode, k_cache,
+                                                 weights_decode, context_lens,
+                                                 block_table,
+                                                 scheduler_metadata_buffer,
+                                                 max_seq_len)
 
             if use_custom_topk:
                 # Kernel expects kv_lens (total cache length), not seq_lens (new tokens)
