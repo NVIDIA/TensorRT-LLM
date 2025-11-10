@@ -1,8 +1,10 @@
+import pytest
 import torch
 
 from tensorrt_llm._torch.hostfunc import HOSTFUNC_USER_DATA_HANDLES, hostfunc
 
 
+@pytest.mark.skip(reason="https://nvbugs/5643631")
 def test_hostfunc():
 
     @hostfunc
