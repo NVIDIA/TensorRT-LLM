@@ -45,14 +45,17 @@ All API schemas are:
 Argument names should describe what the argument represents, not how it is used internally.
 
 ✅ **Good**: `max_new_tokens` (clear meaning)
+
 ❌ **Bad**: `num` (ambiguous)
 
 **Reflect Argument Type and Granularity**
 
 - For **boolean** knobs, prefix with verbs like `enable_` and so on.
+
   Examples: `enable_cache`, `enable_flash_attention`
 
 - For **numerical threshold** knobs, suffix with `_limit`, `_size`, `_count`, `_len_` or `_ratio`
+
   Examples: `max_seq_len`, `prefill_batch_size`
 
 **Avoid Redundant Prefixes**
@@ -60,6 +63,7 @@ Argument names should describe what the argument represents, not how it is used 
 Example (in `MoeConfig`):
 
 ✅ **Good**: `backend`
+
 ❌ **Bad**: `moe_backend` (redundant since it's already in `MoeConfig`)
 
 **Use Specific Names for Narrow Scenarios**
@@ -69,6 +73,7 @@ When adding knobs for specific use cases, make the name convey the restriction c
 Example (argument to the LLM class):
 
 ✅ **Good**: `rope_scaling_factor` → clearly indicates it's for RoPE
+
 ❌ **Bad**: `scaling_factor` → too generic and prone to misuse
 
 ### 2. Hierarchical Configuration
@@ -78,12 +83,15 @@ Organize complex or hierarchical arguments into **dedicated configuration datacl
 **Guidelines**
 
 - Use the `XxxConfig` suffix consistently
+
   Examples: `ModelConfig`, `ParallelConfig`, `MoeConfig`
 
 - **Reflect conceptual hierarchy**
+
   The dataclass name should represent a coherent functional unit, not an arbitrary grouping
 
 - **Avoid over-nesting**
+
   Use only one level of configuration hierarchy whenever possible (e.g., `LlmArgs → ParallelConfig`) to balance readability and modularity
 
 ### 3. Prefer `LlmArgs` Over Environment Variables
