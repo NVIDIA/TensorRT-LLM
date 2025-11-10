@@ -1,5 +1,6 @@
 import asyncio
 import concurrent.futures
+import os
 import threading
 import time
 import uuid
@@ -104,11 +105,20 @@ class RPCClient:
         '''
         self._address = address
         self._timeout = timeout
+
+        # Check if PAIR mode is enabled via environment variable
+        use_pair_mode = os.environ.get('TLLM_LLMAPI_ZMQ_PAIR', '0') != '0'
+        socket_type = zmq.PAIR if use_pair_mode else zmq.DEALER
+
+        if use_pair_mode:
+            logger_debug(
+                "[client] Using zmq.PAIR socket type for RPC communication")
+
         self._client_socket = ZeroMqQueue(address=(address, hmac_key),
                                           is_server=False,
                                           is_async=True,
                                           use_hmac_encryption=False,
-                                          socket_type=zmq.DEALER,
+                                          socket_type=socket_type,
                                           name="rpc_client")
         self._pending_futures = {}
         # map request_id to the queue for streaming responses

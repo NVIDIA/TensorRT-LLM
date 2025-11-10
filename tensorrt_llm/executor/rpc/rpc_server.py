@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import os
 import threading
 import time
 import traceback
@@ -95,11 +96,20 @@ class RPCServer:
             address (str): The ZMQ address to bind the client-facing socket.
         """
         self._address = address
+
+        # Check if PAIR mode is enabled via environment variable
+        use_pair_mode = os.environ.get('TLLM_LLMAPI_ZMQ_PAIR', '0') != '0'
+        socket_type = zmq.PAIR if use_pair_mode else zmq.ROUTER
+
+        if use_pair_mode:
+            logger_debug(
+                "[server] Using zmq.PAIR socket type for RPC communication")
+
         self._client_socket = ZeroMqQueue(address=(address, self._hmac_key),
                                           is_server=True,
                                           is_async=True,
                                           use_hmac_encryption=False,
-                                          socket_type=zmq.ROUTER,
+                                          socket_type=socket_type,
                                           name="rpc_server")
         logger.info(f"RPCServer is bound to {self._address}")
 

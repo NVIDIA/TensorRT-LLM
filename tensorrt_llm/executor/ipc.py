@@ -244,8 +244,46 @@ class ZeroMqQueue:
         return await self._recv_data_async()
 
     async def get_async_noblock(self, timeout: float = 0.5) -> Any:
+        """Get data with timeout using polling to avoid message drops.
+
+        This method uses ZMQ's NOBLOCK flag with polling instead of asyncio.wait_for
+        to prevent cancelling recv operations which can cause message drops.
+
+        Args:
+            timeout: Timeout in seconds
+
+        Returns:
+            The received object
+
+        Raises:
+            asyncio.TimeoutError: If timeout is reached without receiving data
+        """
+        self.setup_lazily()
         self._check_thread_safety()
-        return await asyncio.wait_for(self.get_async(), timeout)
+
+        # Use polling loop instead of asyncio.wait_for to avoid cancelling recv
+        # which can cause message drops
+        deadline = asyncio.get_event_loop().time() + timeout
+        while True:
+            try:
+                # Try non-blocking receive
+                if self.socket_type == zmq.ROUTER:
+                    identity, data = await self.socket.recv_multipart(
+                        flags=zmq.NOBLOCK)
+                    self._last_identity = identity
+                    return self._parse_data(data)
+                else:
+                    if self.use_hmac_encryption:
+                        data = await self.socket.recv(flags=zmq.NOBLOCK)
+                        return self._parse_data(data)
+                    else:
+                        return await self.socket.recv_pyobj(flags=zmq.NOBLOCK)
+            except zmq.Again:
+                # No message available yet
+                if asyncio.get_event_loop().time() >= deadline:
+                    raise asyncio.TimeoutError()
+                # Short sleep to avoid busy-waiting
+                await asyncio.sleep(0.01)
 
     def close(self):
         if self.socket:
