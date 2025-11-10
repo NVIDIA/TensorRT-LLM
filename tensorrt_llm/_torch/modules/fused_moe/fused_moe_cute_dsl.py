@@ -11,7 +11,7 @@ from ...model_config import ModelConfig
 from ...utils import AuxStreamType, Fp4QuantizedTensor, ceil_div
 from .fused_moe_cutlass import CutlassFusedMoE
 from .quantization import MoEWeightLoadingMode
-from .routing import BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod
+from .routing import BaseMoeRoutingMethod
 
 
 @torch.compile(options={"max-autotune": True})
@@ -362,31 +362,15 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 dim=0,
                 sizes=None if use_dp_padding else all_rank_num_tokens)
 
-        # DeepSeekV3 style routing
-        if isinstance(self.routing_method, DeepSeekV3MoeRoutingMethod):
-            top_k = self.routing_method.routing_impl.top_k
-            n_group = self.routing_method.routing_impl.n_group
-            topk_group = self.routing_method.routing_impl.topk_group
-            routed_scaling_factor = self.routing_method.routing_impl.routed_scaling_factor
-        else:
-            top_k = self.routing_method.top_k
-            n_group = None
-            topk_group = None
-            routed_scaling_factor = None
-
         tile_size = 128
         tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_tiles = torch.ops.trtllm.moe_sort(
             token_selected_experts=token_selected_experts,
             token_final_scales=token_final_scales,
             num_experts=self.num_slots,
-            top_k=top_k,
-            n_group=n_group,
-            topk_group=topk_group,
+            top_k=self.routing_method.experts_per_token,
             local_expert_offset=self.slot_start,
             local_num_experts=self.expert_size_per_partition,
-            routed_scaling_factor=routed_scaling_factor,
             tile_tokens_dim=tile_size,
-            routing_method_type=self.routing_method.routing_method_type,
         )
 
         permuted_x, permuted_sf = torch.ops.trtllm.moe_permute(
@@ -396,7 +380,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
             num_non_exiting_tiles=num_non_exiting_tiles,
             tile_tokens_dim=tile_size,
-            top_k=top_k,
+            top_k=self.routing_method.experts_per_token,
         )
         h1 = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_blackwell(
             input=permuted_x.view(torch.float4_e2m1fn_x2),

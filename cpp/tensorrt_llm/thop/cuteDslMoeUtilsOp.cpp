@@ -30,7 +30,7 @@ std::vector<torch::Tensor> moe_topk_sort_impl(torch::optional<torch::Tensor> con
     torch::optional<torch::Tensor> const& token_final_scales, int64_t const num_experts, int64_t const top_k,
     std::optional<int64_t> const n_group, std::optional<int64_t> const topk_group, int64_t const local_expert_offset,
     int64_t const local_num_experts, std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim,
-    int64_t const routing_method_type)
+    RoutingMethodType const routing_method_type)
 {
     int64_t const num_tokens
         = token_selected_experts.has_value() ? token_selected_experts->size(0) : routing_logits->size(0);
@@ -80,7 +80,7 @@ std::vector<torch::Tensor> moe_topk_sort_impl(torch::optional<torch::Tensor> con
         num_tokens_per_expert.data_ptr<int>(), tile_idx_to_expert_idx.data_ptr<int>(),
         tile_idx_to_mn_limit.data_ptr<int>(), num_non_exiting_tiles.data_ptr<int>(),
         batchedGemm::trtllm::gen::Dtype::Void /* dtypeElt */, false /* use_routing_scales_on_input */,
-        false /* use_deep_seek_fp8 */, static_cast<RoutingMethodType>(routing_method_type), stream);
+        false /* use_deep_seek_fp8 */, routing_method_type, stream);
 
     std::vector<torch::Tensor> results{tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx,
         permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_tiles};
@@ -106,14 +106,12 @@ std::vector<torch::Tensor> moe_topk_sort(torch::Tensor const& routing_logits,
     }
     return moe_topk_sort_impl(routing_logits, routing_bias, std::nullopt, std::nullopt, num_experts, top_k, n_group,
         topk_group, local_expert_offset, local_num_experts, routed_scaling_factor, tile_tokens_dim,
-        routing_method_type);
+        static_cast<RoutingMethodType>(routing_method_type));
 }
 
 std::vector<torch::Tensor> moe_sort(torch::Tensor const& token_selected_experts,
     torch::Tensor const& token_final_scales, int64_t const num_experts, int64_t const top_k,
-    std::optional<int64_t> const n_group, std::optional<int64_t> const topk_group, int64_t const local_expert_offset,
-    int64_t const local_num_experts, std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim,
-    int64_t const routing_method_type)
+    int64_t const local_expert_offset, int64_t const local_num_experts, int64_t const tile_tokens_dim)
 {
     TORCH_CHECK(token_selected_experts.dim() == 2, "token_selected_experts must be 2D.");
     int64_t const num_tokens = token_selected_experts.size(0);
@@ -122,8 +120,8 @@ std::vector<torch::Tensor> moe_sort(torch::Tensor const& token_selected_experts,
     TORCH_CHECK(token_final_scales.size(0) == num_tokens, "token_final_scales.size(0) must be num_tokens.");
     TORCH_CHECK(token_final_scales.size(1) == top_k, "token_final_scales.size(1) must be top_k.");
     return moe_topk_sort_impl(std::nullopt, std::nullopt, token_selected_experts, token_final_scales, num_experts,
-        top_k, n_group, topk_group, local_expert_offset, local_num_experts, routed_scaling_factor, tile_tokens_dim,
-        routing_method_type);
+        top_k, std::nullopt, std::nullopt, local_expert_offset, local_num_experts, std::nullopt, tile_tokens_dim,
+        RoutingMethodType::Renormalize);
 }
 
 // Permute
@@ -259,9 +257,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int? topk_group, int local_expert_offset, int local_num_experts, float? routed_scaling_factor, int "
         "tile_tokens_dim, int routing_method_type) -> Tensor[]");
     m.def(
-        "moe_sort(Tensor token_selected_experts, Tensor token_final_scales, int num_experts, int top_k, int? n_group, "
-        "int? topk_group, int local_expert_offset, int local_num_experts, float? routed_scaling_factor, int "
-        "tile_tokens_dim, int routing_method_type) -> Tensor[]");
+        "moe_sort(Tensor token_selected_experts, Tensor token_final_scales, int num_experts, int top_k, "
+        "int local_expert_offset, int local_num_experts, int tile_tokens_dim) -> Tensor[]");
     m.def(
         "moe_permute(Tensor input, Tensor? input_sf, Tensor tile_idx_to_mn_limit, Tensor permuted_idx_to_expanded_idx, "
         "Tensor num_non_exiting_tiles, int tile_tokens_dim, int top_k) -> (Tensor, Tensor?)");
