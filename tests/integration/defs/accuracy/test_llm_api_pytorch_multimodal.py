@@ -80,8 +80,8 @@ class TestNano_V2_VLM(LlmapiAccuracyTestHarness):
 
 
 class TestLlava_V1_6_Mistral_7B(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "llava-hf/llava-v1.6-mistral-7b"
-    MODEL_PATH = f"{llm_models_root()}/llava-v1.6-mistral-7b"
+    MODEL_NAME = "llava-hf/llava-v1.6-mistral-7b-hf"
+    MODEL_PATH = f"{llm_models_root()}/llava-v1.6-mistral-7b-hf"
     MAX_NUM_TOKENS = 16384
 
     # NOTE: MMMU adds <|endoftext|> to the stop token.

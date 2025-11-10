@@ -2658,7 +2658,7 @@ def test_ptp_quickstart_multimodal_kv_cache_reuse(llm_root, llm_venv,
                 ],
             ] * num_same_requests,
         },
-        "phi4-multimodal-instruct-fp8": {
+        "phi4-multimodal-instruct": {
             "image": [
                 [
                     "image", "depicts", "natural", "environment", "ocean",
