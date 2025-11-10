@@ -5,8 +5,10 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+import torch
 import yaml
 from click.testing import CliRunner
+from utils.cpp_paths import llm_root  # noqa: F401
 
 from tensorrt_llm.commands.bench import main
 
@@ -43,7 +45,7 @@ def timeout(seconds):
 
 
 @pytest.fixture(scope="module")
-def shared_dataset(llm_root):
+def shared_dataset(llm_root):  # noqa: F811
     """Prepare dataset once for all tests in this module."""
     model_name = "meta-llama/Llama-3.1-8B"
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -102,14 +104,15 @@ def _prepare_dataset(root_dir: str, temp_dir: str, model_path_or_name: str, num_
         "NCCL",
     ],
 )
-def test_allreduce_strategies(llm_root, shared_dataset, allreduce_strategy):
+def test_allreduce_strategies(llm_root, shared_dataset, allreduce_strategy):  # noqa: F811
     """Test different allreduce strategies with multi-GPU configuration.
 
-    This test validates that all allreduce strategies work correctly with TP=4.
+    This test validates that all allreduce strategies work correctly with TP=2.
     Note: TWOSHOT strategy will automatically fall back to ONESHOT when sequence
     length is smaller than TP size during initialization.
 
     Test has a 300 second timeout to prevent indefinite hangs.
+    Test will be skipped if fewer than 2 GPUs are available.
 
     Args:
         llm_root: Root directory fixture
@@ -120,9 +123,12 @@ def test_allreduce_strategies(llm_root, shared_dataset, allreduce_strategy):
     TEST_TIMEOUT_SECONDS = 300
 
     model_name = "meta-llama/Llama-3.1-8B"
-    tp_size = 4
+    tp_size = 2
     max_batch_size = 256
     max_num_tokens = 8192
+
+    if not torch.cuda.is_available() or torch.cuda.device_count() < tp_size:
+        pytest.skip(f"Allreduce strategy test requires at least {tp_size} GPUs, skipping")
 
     with tempfile.TemporaryDirectory() as temp_dir:
         # Write shared dataset to temp location
