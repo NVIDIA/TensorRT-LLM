@@ -502,7 +502,14 @@ class BaseWorker(GenerationExecutor):
                     f"`default_max_tokens` ({default_max_tokens}), using default_max_tokens instead."
                 )
                 return default_max_tokens
-            return max_tokens
+            elif max_tokens <= 0:
+                logger.warning(
+                    f"User-specified `max_tokens` ({max_tokens}) is less than 0, "
+                    f"using `default_max_tokens` ({default_max_tokens}) instead."
+                )
+                return default_max_tokens
+            else:
+                return max_tokens
 
         try:
             executor_request = tllm.Request(
