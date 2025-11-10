@@ -1871,7 +1871,7 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(
                 {
                     // Somebody else is using block or this is full attention and block is not a leaf, copy reusable
                     // tokens
-                    // TODO: Consider whether non-leaf blocks should be reuse instead of copied for SWA layers.
+                    // TODO: Consider whether non-leaf blocks should be reused instead of copied for SWA layers.
                     auto newBlock
                         = getFreeBlock(matchingBlock->getPriority(), matchingBlock->getDurationMs(), mode, directory);
                     mTransferManager->onboard(matchingBlock, newBlock, mPools, numMatched, mode, directory);
@@ -1883,10 +1883,9 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(
                         sequence.getRequestId());
                     if (!matchingBlock->hasRefs())
                     {
-                        // Release the matching block
-                        // TODO: Pending copy of matchingBlock to newBlock. Can releasing it cause race condition?
-                        // TODO: Is the entire offload/onboard logic sound? In situations with low free block count, do
-                        // we know that multiple offload/onboard to same block don't trample?
+                        // Release the matching block.
+                        // Transfer manager keeps track of all block copies and make sure that new block
+                        // copies will wait until pending ones have finished.
                         mEvictionPolicy->releaseBlock(matchingBlock);
                     }
                     matchingBlock = newBlock;
