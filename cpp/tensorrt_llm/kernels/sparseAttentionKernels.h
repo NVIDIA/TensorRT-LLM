@@ -51,12 +51,6 @@ struct SparseAttentionParams
            << "sparse_attn_indices_stride: " << this->sparse_attn_indices_stride << std::endl;
         return ss.str();
     }
-
-    auto data() const
-    {
-        return std::make_tuple(sparse_kv_indices, sparse_attn_indices, sparse_kv_offsets, sparse_attn_offsets,
-            sparse_mla_topk, sparse_mla_kv_cache_pool, sparse_attn_indices_block_size, sparse_attn_indices_stride);
-    }
 };
 
 struct Pair
