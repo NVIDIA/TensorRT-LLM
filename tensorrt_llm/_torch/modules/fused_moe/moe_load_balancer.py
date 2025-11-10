@@ -243,7 +243,7 @@ class HostMoeTensorSharer:
     def add_raw_host_weight_for_unmap(self,
                                       raw_weight_tensors: List[torch.Tensor]):
         """
-        Add a raw weight (mmapped Tensor) to HostMoeTensorSharer for later madvise to save host memory.
+        Add a raw weight (mmapped Tensor) to HostMoeTensorSharer for later `madvise` to save host memory.
 
         Args:
             raw_weight_tensors: A list of raw weight tensors
@@ -505,7 +505,7 @@ class SingleLayerMoeLoadBalancer:
     def _add_raw_host_weight_for_unmap(self,
                                        raw_weight_tensors: List[torch.Tensor]):
         """
-        Add a raw weight (mmapped Tensor) to LoadBalancer for later madvise to save host memory.
+        Add a raw weight (mmapped Tensor) to LoadBalancer for later `madvise` to save host memory.
 
         Args:
             raw_weight_tensors: A list of raw weight tensors
