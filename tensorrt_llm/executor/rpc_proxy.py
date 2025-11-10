@@ -145,8 +145,8 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
                 # Let user fetch stats via RPC is much simpler and more reliable
                 # self._fetch_stats_loop_async()
             ]
-            if self._iter_kv_events_result is not None:
-                tasks.append(self._fetch_kv_cache_events_loop_async())
+            # if self._iter_kv_events_result is not None:
+            #tasks.append(self._fetch_kv_cache_events_loop_async())
             await asyncio.gather(*tasks)
 
         # Check if there's already a running event loop in the current thread

@@ -322,8 +322,7 @@ class RPCServer:
 
         while not self._shutdown_event.is_set():
             try:
-                logger_debug(f"[server] Worker waiting for request",
-                             color="green")
+                #logger_debug(f"[server] Worker waiting for request", color="green")
                 # Read request directly from socket with timeout
                 req: RPCRequest = await asyncio.wait_for(
                     self._client_socket.get_async_noblock(), timeout=2)
@@ -520,6 +519,8 @@ class RPCServer:
                 async def stream_with_timeout():
                     nonlocal chunk_index
                     async for result in func(*req.args, **req.kwargs):
+                        if not result:
+                            continue  # WAR
                         # Check if shutdown was triggered
                         if self._shutdown_event.is_set():
                             raise RPCCancelled(
@@ -548,6 +549,8 @@ class RPCServer:
             else:
                 # No timeout specified, stream normally
                 async for result in func(*req.args, **req.kwargs):
+                    if not result:
+                        continue  # WAR
                     # Check if shutdown was triggered
                     if self._shutdown_event.is_set():
                         raise RPCCancelled(
