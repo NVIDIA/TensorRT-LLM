@@ -1577,6 +1577,18 @@ class BaseLlmArgs(StrictBaseModel):
         default=None,
         description="The expert parallel size for MoE models's expert weights.")
 
+    allreduce_strategy: Optional[Literal[
+        'AUTO', 'NCCL', 'UB', 'MINLATENCY', 'ONESHOT', 'TWOSHOT',
+        'LOWPRECISION', 'MNNVL', 'NCCL_SYMMETRIC']] = Field(
+            default='AUTO',
+            description=
+            "AllReduce strategy for distributed inference. Options: AUTO (automatic selection), "
+            "NCCL (NCCL-based), ONESHOT (single-phase fusion kernel), TWOSHOT (two-phase fusion kernel), "
+            "MIN_LATENCY (minimum latency heuristic), LOWPRECISION (low precision allreduce), "
+            "UB (unified buffer), MNNVL (multi-node NVLINK), NCCL_SYMMETRIC (NCCL symmetric). "
+            "AUTO is recommended for most use cases.",
+            status="beta")
+
     enable_attention_dp: bool = Field(
         default=False,
         description="Enable attention data parallel.",
@@ -2531,12 +2543,6 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
-    allreduce_strategy: Optional[Literal[
-        'AUTO', 'NCCL', 'UB', 'MINLATENCY', 'ONESHOT', 'TWOSHOT',
-        'LOWPRECISION', 'MNNVL',
-        'NCCL_SYMMETRIC']] = Field(default='AUTO',
-                                   description="Allreduce strategy to use.",
-                                   status="beta")
     checkpoint_loader: Optional[object] = Field(
         default=None,
         description=
