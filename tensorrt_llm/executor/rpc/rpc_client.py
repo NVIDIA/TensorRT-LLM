@@ -396,6 +396,7 @@ class RPCClient:
                              need_response=need_response,
                              timeout=timeout)
         await self._client_socket.put_async(request)
+        logger_debug(f"RPC Client sent request: {request}")
 
         if not need_response:
             return None

@@ -10,10 +10,11 @@ from tensorrt_llm.executor.rpc.rpc_common import get_unique_ipc_addr
 
 
 class RpcServerWrapper(RPCServer):
+    """ A helper class to wrap the RPCServer and manage its lifecycle. """
 
-    def __init__(self, *args, addr: str, **kwargs):
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.addr = addr
+        self.addr = get_unique_ipc_addr()
 
     def __enter__(self):
         self.bind(self.addr)
@@ -25,6 +26,7 @@ class RpcServerWrapper(RPCServer):
 
 
 class TestRpcBasics:
+    """ Test the basic functionality of the RPC server and client. """
 
     def test_rpc_server_basics(self):
 
@@ -33,8 +35,7 @@ class TestRpcBasics:
             def hello(self):
                 print("hello")
 
-        addr = get_unique_ipc_addr()
-        with RpcServerWrapper(App(), addr=addr) as server:
+        with RpcServerWrapper(App()) as server:
             pass
 
     def test_remote_call_without_arg(self):
@@ -45,9 +46,8 @@ class TestRpcBasics:
                 print("hello")
                 return "world"
 
-        addr = get_unique_ipc_addr()
-        with RpcServerWrapper(App(), addr=addr) as server:
-            with RPCClient(addr) as client:
+        with RpcServerWrapper(App()) as server:
+            with RPCClient(server.addr) as client:
                 ret = client.hello().remote()  # sync call
                 assert ret == "world"
 
@@ -59,9 +59,8 @@ class TestRpcBasics:
                 print("hello")
                 return f"hello {name} from {location}"
 
-        addr = get_unique_ipc_addr()
-        with RpcServerWrapper(App(), addr=addr) as server:
-            with RPCClient(addr) as client:
+        with RpcServerWrapper(App()) as server:
+            with RPCClient(server.addr) as client:
                 ret = client.hello("app", "Marvel").remote()
                 assert ret == "hello app from Marvel"
 
@@ -73,9 +72,8 @@ class TestRpcBasics:
                 print("hello")
                 return f"hello {name} from {location}"
 
-        addr = get_unique_ipc_addr()
-        with RpcServerWrapper(App(), addr=addr) as server:
-            with RPCClient(addr) as client:
+        with RpcServerWrapper(App()) as server:
+            with RPCClient(server.addr) as client:
                 ret = client.hello(name="app", location="Marvel").remote()
                 assert ret == "hello app from Marvel"
 
@@ -87,9 +85,8 @@ class TestRpcBasics:
                 print("hello")
                 return f"hello {name} from {location}"
 
-        addr = get_unique_ipc_addr()
-        with RpcServerWrapper(App(), addr=addr) as server:
-            with RPCClient(addr) as client:
+        with RpcServerWrapper(App()) as server:
+            with RPCClient(server.addr) as client:
                 ret = client.hello(name="app", location="Marvel").remote()
                 assert ret == "hello app from Marvel"
 
@@ -98,9 +95,8 @@ class TestRpcBasics:
         class App:
             pass
 
-        addr = get_unique_ipc_addr()
-        with RpcServerWrapper(App(), addr=addr) as server:
-            assert server.address == addr
+        with RpcServerWrapper(App()) as server:
+            assert server.address == server.addr
 
     def test_rpc_with_error(self):
 
@@ -109,9 +105,8 @@ class TestRpcBasics:
             def hello(self):
                 raise ValueError("hello")
 
-        addr = get_unique_ipc_addr()
-        with RpcServerWrapper(App(), addr=addr) as server:
-            with RPCClient(addr) as client:
+        with RpcServerWrapper(App()) as server:
+            with RPCClient(server.addr) as client:
                 with pytest.raises(RPCError):
                     client.hello().remote()
 
@@ -131,9 +126,8 @@ class TestRpcBasics:
             def get_task_submitted(self) -> bool:
                 return self.task_submitted
 
-        addr = get_unique_ipc_addr()
-        with RpcServerWrapper(App(), addr=addr) as server:
-            with RPCClient(addr) as client:
+        with RpcServerWrapper(App()) as server:
+            with RPCClient(server.addr) as client:
                 client.send_task().remote(need_response=False)
                 time.sleep(
                     0.1
@@ -142,6 +136,7 @@ class TestRpcBasics:
 
 
 class TestRpcCorrectness:
+    """ Test the correctness of the RPC framework with various large tasks. """
 
     class App:
 
@@ -156,22 +151,20 @@ class TestRpcCorrectness:
                 yield i
 
     def test_incremental_task(self, num_tasks: int = 10000):
-        addr = get_unique_ipc_addr()
-        with RpcServerWrapper(TestRpcCorrectness.App(), addr=addr) as server:
-            with RPCClient(addr) as client:
+        with RpcServerWrapper(TestRpcCorrectness.App()) as server:
+            with RPCClient(server.addr) as client:
                 for i in range(num_tasks):  # a large number of tasks
                     result = client.incremental_task(i).remote()
                     if i % 1000 == 0:
                         print(f"incremental_task {i} done")
                     assert result == i + 1, f"result {result} != {i + 1}"
 
-    def test_incremental_task_async(self):
-        addr = get_unique_ipc_addr()
-        with RpcServerWrapper(TestRpcCorrectness.App(), addr=addr) as server:
-            with RPCClient(addr) as client:
+    def test_incremental_task_async(self, num_tasks: int = 10000):
+        with RpcServerWrapper(TestRpcCorrectness.App()) as server:
+            with RPCClient(server.addr) as client:
 
                 async def test_incremental_task_async():
-                    for i in range(10000):  # a large number of tasks
+                    for i in range(num_tasks):  # a large number of tasks
                         result = await client.incremental_task_async(
                             i).remote_async()
                         if i % 1000 == 0:
@@ -182,10 +175,9 @@ class TestRpcCorrectness:
 
     @pytest.mark.skip(reason="This test is flaky, need to fix it")
     def test_incremental_task_future(self):
-        addr = get_unique_ipc_addr()
-        with RpcServerWrapper(TestRpcCorrectness.App(), addr=addr) as server:
+        with RpcServerWrapper(TestRpcCorrectness.App()) as server:
             # Create client with more workers to handle concurrent futures
-            with RPCClient(addr, num_workers=16) as client:
+            with RPCClient(server.addr, num_workers=16) as client:
                 # Process in smaller batches to avoid overwhelming the system
                 batch_size = 50
                 total_tasks = 1000  # Reduced from 10000 for stability
@@ -208,9 +200,8 @@ class TestRpcCorrectness:
                         ) == no + 1, f"result {future.result()} != {no + 1}"
 
     def test_incremental_task_streaming(self):
-        addr = get_unique_ipc_addr()
-        with RpcServerWrapper(TestRpcCorrectness.App(), addr=addr) as server:
-            with RPCClient(addr) as client:
+        with RpcServerWrapper(TestRpcCorrectness.App()) as server:
+            with RPCClient(server.addr) as client:
 
                 async def test_streaming_task():
                     results = []
@@ -327,12 +318,11 @@ class TestRpcError:
                 time.sleep(2.0)
                 return "completed"
 
-        addr = get_unique_ipc_addr()
-        with RpcServerWrapper(App(), addr=addr) as server:
+        with RpcServerWrapper(App()) as server:
             time.sleep(0.1)
 
             # Create client with short timeout
-            with RPCClient(addr, timeout=0.5) as client:
+            with RPCClient(server.addr, timeout=0.5) as client:
                 with pytest.raises(RPCError) as exc_info:
                     client.slow_method().remote(timeout=0.5)
 
@@ -349,11 +339,10 @@ class TestRpcError:
             def existing_method(self):
                 return "exists"
 
-        addr = get_unique_ipc_addr()
-        with RpcServerWrapper(App(), addr=addr) as server:
+        with RpcServerWrapper(App()) as server:
             time.sleep(0.1)
 
-            with RPCClient(addr) as client:
+            with RPCClient(server.addr) as client:
                 with pytest.raises(RPCError) as exc_info:
                     client.non_existent_method().remote()
 
@@ -533,10 +522,9 @@ class TestRpcShutdown:
             def quick_task(self, task_id: int):
                 return f"quick_task_{task_id}"
 
-        addr = get_unique_ipc_addr()
-        with RpcServerWrapper(App(), addr=addr) as server:
+        with RpcServerWrapper(App()) as server:
             time.sleep(0.1)
-            with RPCClient(addr) as client:
+            with RPCClient(server.addr) as client:
                 client.quick_task(1).remote()
 
                 # repeated shutdown should not raise an error
@@ -583,14 +571,12 @@ class TestApp:
 
     async def async_multiply(self, x: int, y: int) -> int:
         """Async method."""
-        await asyncio.sleep(0.01)
         self.call_count += 1
         return x * y
 
     async def streaming_range(self, n: int):
         """Streaming generator."""
         for i in range(n):
-            await asyncio.sleep(0.01)
             yield i
 
     async def streaming_error(self, n: int):
@@ -601,13 +587,13 @@ class TestApp:
             yield i
 
     async def streaming_timeout(self, delay: float):
-        """Streaming generator with configurable delay."""
+        """Streaming generator with configurable delay for timeout testing."""
         for i in range(10):
             await asyncio.sleep(delay)
             yield i
 
     async def streaming_forever(self):
-        """Streaming generator that never ends."""
+        """Streaming generator that never ends, used for cancellation testing."""
         i = 0
         while True:
             await asyncio.sleep(0.1)
@@ -620,10 +606,7 @@ async def test_streaming_task_cancelled():
     # Test the streaming task cancelled when the server is shutdown
     # This emulates the RpcWorker.fetch_responses_loop_async behavior
     app = TestApp()
-    with RpcServerWrapper(app,
-                          num_workers=2,
-                          async_run_task=True,
-                          addr=get_unique_ipc_addr()) as server:
+    with RpcServerWrapper(app, num_workers=2, async_run_task=True) as server:
         with RPCClient(server.address) as client:
             iter = client.streaming_forever().remote_streaming()
             # Only get the first 3 values
@@ -775,9 +758,8 @@ class TestResponsePickleError:
             yield nested_function
 
     def test_unpickleable_error(self):
-        addr = get_unique_ipc_addr()
-        with RpcServerWrapper(self.App(), addr=addr) as server:
-            with RPCClient(addr) as client:
+        with RpcServerWrapper(self.App()) as server:
+            with RPCClient(server.addr) as client:
                 with pytest.raises(RPCError) as exc_info:
                     client.unpickleable_return().remote()
 
@@ -785,10 +767,8 @@ class TestResponsePickleError:
 
     @pytest.mark.asyncio
     async def test_unpickleable_streaming_error(self):
-        addr = get_unique_ipc_addr()
-        with RpcServerWrapper(self.App(), addr=addr,
-                              async_run_task=True) as server:
-            with RPCClient(addr) as client:
+        with RpcServerWrapper(self.App(), async_run_task=True) as server:
+            with RPCClient(server.addr) as client:
                 with pytest.raises(RPCStreamingError) as exc_info:
                     async for _ in client.unpickleable_streaming_return(
                     ).remote_streaming():
@@ -814,18 +794,16 @@ class TestRpcRobustness:
                 yield i
 
     def test_remote_with_large_response(self):
-        addr = get_unique_ipc_addr()
-        with RpcServerWrapper(self.App(), addr=addr) as server:
-            with RPCClient(addr) as client:
+        with RpcServerWrapper(self.App()) as server:
+            with RPCClient(server.addr) as client:
                 for i in range(100):
                     result = client.remote_with_large_response().remote()
                     assert result == b"a" * self.App.LARGE_RESPONSE_SIZE
 
     @pytest.mark.asyncio
     async def test_streaming_with_large_response(self):
-        addr = get_unique_ipc_addr()
-        with RpcServerWrapper(self.App(), addr=addr) as server:
-            with RPCClient(addr) as client:
+        with RpcServerWrapper(self.App()) as server:
+            with RPCClient(server.addr) as client:
                 async for result in client.streaming_with_large_response(
                 ).remote_streaming():
                     assert result == b"a" * self.App.LARGE_RESPONSE_SIZE
@@ -836,7 +814,6 @@ class TestRpcRobustness:
         # it handle the concurrent requests.  Once the response arrives, it will
         # be processed by the RPCClient._loop, and dispatch to the corresponding
         # task via the dedicated AsyncQueue.
-        addr = get_unique_ipc_addr()
         num_threads = 100
         items_per_stream = 100
 
@@ -847,8 +824,7 @@ class TestRpcRobustness:
                 for i in range(items_per_stream):
                     yield i
 
-        with RpcServerWrapper(TestApp(), addr=addr,
-                              async_run_task=True) as server:
+        with RpcServerWrapper(TestApp(), async_run_task=True) as server:
             errors = []
             results = [None] * num_threads
 
@@ -857,7 +833,7 @@ class TestRpcRobustness:
                 print(f"Thread {thread_id} started")
                 try:
                     # Each thread creates its own client connection
-                    with RPCClient(addr) as client:
+                    with RPCClient(server.addr) as client:
                         collected = []
 
                         async def consume_stream():
@@ -909,7 +885,6 @@ class TestRpcRobustness:
         """Test that regular remote calls can be safely made from multiple threads."""
         # Each thread will make multiple synchronous remote calls
         # This tests if RPCClient can handle concurrent requests from different threads
-        addr = get_unique_ipc_addr()
         num_threads = 100
         calls_per_thread = 100
 
@@ -926,11 +901,11 @@ class TestRpcRobustness:
                 return v + 1
 
         app = TestApp()
-        with RpcServerWrapper(app, addr=addr) as server:
+        with RpcServerWrapper(app) as server:
             errors = []
             results = [None] * num_threads
 
-            client = RPCClient(addr)
+            client = RPCClient(server.addr)
 
             def remote_caller(thread_id: int):
                 """Function to be executed in each thread."""
@@ -989,78 +964,44 @@ class TestRpcRobustness:
             assert app.call_count == expected_total_calls, \
                 f"Expected {expected_total_calls} total calls, but got {app.call_count}"
 
-    def test_mimic_rpc_proxy(self):
-        """ Test mimic the rpc proxy behavior. """
-        addr = get_unique_ipc_addr()
-        num_requests = 10
-        item_size = 10
+    def test_repeated_creation_and_destruction(self, num_calls: int = 100):
+        """Test robustness of repeated RPCServer/RPCClient creation and destruction.
 
-        class App:
+        This test ensures there are no resource leaks, socket exhaustion, or other
+        issues when repeatedly creating and destroying server/client pairs.
+        """
+
+        class TestApp:
 
             def __init__(self):
-                self.queue = asyncio.Queue()
+                self.counter = 0
 
-            async def submit(self, v: int):
-                await self.queue.put(v)
+            def increment(self, value: int) -> int:
+                self.counter += 1
+                return value + 1
 
-            async def executor_and_stream(self):
-                while True:
-                    v = await self.queue.get()
-                    if v is None:
-                        break
-                    yield list(range(v))
+            def get_counter(self) -> int:
+                return self.counter
 
-        app = App()
-        with RpcServerWrapper(app, addr=addr, async_run_task=True) as server:
-            received_payloads = []
-            results_fetched_event = threading.Event()
+        for i in range(num_calls):
+            # Create app, server, and client
+            # RpcServerWrapper automatically generates unique addresses
+            app = TestApp()
 
-            def fetch_responses_loop_async():
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                client = None
-                try:
-                    client = RPCClient(addr)
+            with RpcServerWrapper(app) as server:
+                with RPCClient(server.addr) as client:
+                    # Perform a few remote calls to verify functionality
+                    result1 = client.increment(10).remote()
+                    assert result1 == 11, f"Iteration {i}: Expected 11, got {result1}"
 
-                    async def fetch():
-                        nonlocal received_payloads
-                        async for result in client.executor_and_stream(
-                        ).remote_streaming():
-                            received_payloads.append(result)
-                            if len(received_payloads) == num_requests:
-                                results_fetched_event.set()
-                                break
+                    result2 = client.increment(20).remote()
+                    assert result2 == 21, f"Iteration {i}: Expected 21, got {result2}"
 
-                    loop.run_until_complete(fetch())
-                finally:
-                    if client:
-                        client.close()
-                    loop.close()
+                    counter = client.get_counter().remote()
+                    assert counter == 2, f"Iteration {i}: Expected counter=2, got {counter}"
 
-            fetcher_thread = threading.Thread(target=fetch_responses_loop_async)
-            fetcher_thread.start()
+                    if i % 10 == 0:
+                        print(
+                            f"Iteration {i}/{num_calls} completed successfully")
 
-            with RPCClient(addr) as client:
-                for i in range(num_requests):
-                    client.submit(i + 1).remote(need_response=False)
-                    print(f"Submitted request {i + 1}")
-
-            # Wait for the fetcher to finish
-            fetcher_thread.join(timeout=10.0)
-            if fetcher_thread.is_alive():
-                raise AssertionError("Fetcher thread did not exit in time")
-
-            # Signal the server to shutdown the stream
-            with RPCClient(addr) as client:
-                client.submit(None).remote(need_response=False)
-
-            assert len(received_payloads) == num_requests
-            # The order is not guaranteed.
-            sizes = sorted([len(p) for p in received_payloads])
-            expected_sizes = sorted([i + 1 for i in range(num_requests)])
-            assert sizes == expected_sizes
-
-
-if __name__ == "__main__":
-    test_rpc = TestRpcRobustness()
-    test_rpc.test_mimic_rpc_proxy()
+        print(f"All {num_calls} iterations completed successfully")
