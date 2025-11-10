@@ -90,6 +90,7 @@ FROM ${TRITON_IMAGE}:${TRITON_BASE_TAG} AS triton
 
 FROM devel AS tritondevel
 
+ARG GITHUB_MIRROR=""
 COPY --from=triton /opt/tritonserver/backends/python /opt/tritonserver/backends/python
 COPY --from=triton /opt/tritonserver/lib /opt/tritonserver/lib
 COPY --from=triton /opt/tritonserver/include /opt/tritonserver/include
@@ -100,7 +101,7 @@ COPY --from=triton /opt/tritonserver/caches /opt/tritonserver/caches
 COPY docker/common/install_triton.sh \
      ./
 
-RUN bash ./install_triton.sh && rm install_triton.sh
+RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install_triton.sh && rm install_triton.sh
 
 FROM ${DEVEL_IMAGE} AS wheel
 WORKDIR /src/tensorrt_llm

@@ -109,7 +109,7 @@ transforms:
     enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
   fuse_fp8_linear:
     stage: post_load_fusion
-    backend: torch
+    backend: trtllm
   fuse_nvfp4_linear:
     stage: post_load_fusion
     backend: trtllm

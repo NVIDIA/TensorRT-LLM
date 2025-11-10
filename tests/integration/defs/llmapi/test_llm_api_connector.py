@@ -42,15 +42,16 @@ def model_with_connector():
         )
 
         def model_fn(*args, **kwargs):
-            return LLM(
-                *args,
-                **kwargs,
-                model=f"{llm_models_root()}/Qwen2-0.5B",
-                backend="pytorch",
-                kv_connector_config=kv_connector_config,
-                cuda_graph_config=None,
-                kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1),
-            )
+
+            default_kwargs = {
+                "model": f"{llm_models_root()}/Qwen2-0.5B",
+                "backend": "pytorch",
+                "kv_connector_config": kv_connector_config,
+                "cuda_graph_config": None,
+                "kv_cache_config": KvCacheConfig(free_gpu_memory_fraction=0.1)
+            }
+
+            return LLM(*args, **{**default_kwargs, **kwargs})
 
         yield model_fn, mock_scheduler, mock_worker
 
@@ -399,3 +400,27 @@ def test_connector_disagg_prefill(enforce_single_worker, model_with_connector,
     assert len(req.new_tokens) == 48
 
     assert scheduler.request_finished.call_count == 1
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_connector_multi_request(enforce_single_worker, model_with_connector):
+    model_fn, scheduler, worker = model_with_connector
+
+    model = model_fn(disable_overlap_scheduler=True,
+                     kv_cache_config=KvCacheConfig(max_tokens=120))
+
+    sampling_params = SamplingParams(ignore_eos=True, max_tokens=4)
+
+    scheduler.get_num_new_matched_tokens.return_value = 0, False
+    scheduler.request_finished.return_value = True
+    worker.get_finished.side_effect = lambda finished_gen, load_async: (
+        finished_gen, load_async)
+
+    model.generate([[0] * 48, [1] * 48],
+                   sampling_params=[
+                       SamplingParams(ignore_eos=True, max_tokens=4),
+                       SamplingParams(ignore_eos=True, max_tokens=3)
+                   ])
+
+    # The KV cache of both prior requests should be freed, allowing the third request to run.
+    model.generate([2] * 110, sampling_params=sampling_params)

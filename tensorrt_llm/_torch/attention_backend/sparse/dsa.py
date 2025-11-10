@@ -872,24 +872,12 @@ class Indexer(nn.Module):
         k_scale_bytes = k_scale_flat.view(torch.uint8).view(
             num_tokens, scale_size)
 
-        # Scatter FP8 data
+        # Use CUDA kernel to scatter FP8 and scale bytes into cache
         flat_indices_fp8 = metadata.slot_mapping_fp8[:num_tokens]
-        byte_offsets = torch.arange(head_dim, device=k_cache.device).unsqueeze(
-            0)  # [1, head_dim]
-        scatter_indices_fp8 = flat_indices_fp8.unsqueeze(
-            1) + byte_offsets  # [num_tokens, head_dim]
-        scatter_indices_fp8 = _unravel_indices(scatter_indices_fp8,
-                                               k_cache.shape)
-        k_cache[scatter_indices_fp8] = k_fp8_bytes
-
         flat_indices_scale = metadata.slot_mapping_scale[:num_tokens]
-        byte_offsets = torch.arange(
-            scale_size, device=k_cache.device).unsqueeze(0)  # [1, scale_size]
-        scatter_indices_scale = flat_indices_scale.unsqueeze(
-            1) + byte_offsets  # [num_tokens, scale_size]
-        scatter_indices_scale = _unravel_indices(scatter_indices_scale,
-                                                 k_cache.shape)
-        k_cache[scatter_indices_scale] = k_scale_bytes
+        torch.ops.trtllm.indexer_k_cache_scatter_op(k_fp8_bytes, k_scale_bytes,
+                                                    k_cache, flat_indices_fp8,
+                                                    flat_indices_scale)
 
     def _gather_k_cache_for_chunk(
         self,
