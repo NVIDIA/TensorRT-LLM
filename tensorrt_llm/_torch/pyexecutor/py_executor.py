@@ -455,7 +455,8 @@ class PyExecutor:
             for key in keys:
                 del self.virtual_memory_pools[key]
         # Stop the sampler's async worker, if it was used
-        if isinstance(self.sampler, AsyncWorkerMixin):
+        if (isinstance(self.sampler, AsyncWorkerMixin)
+                and self.sampler.async_worker_enabled()):
             self.sampler.async_worker_stop()
 
     def can_enqueue_requests(self) -> bool:

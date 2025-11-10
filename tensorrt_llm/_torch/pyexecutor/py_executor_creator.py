@@ -198,7 +198,8 @@ def update_sampler_max_seq_len(max_seq_len, sampler):
 
 
 def maybe_start_sampler_async_worker(sampler):
-    if isinstance(sampler, AsyncWorkerMixin) and sampler.enable_async_worker:
+    if (isinstance(sampler, AsyncWorkerMixin)
+            and sampler.async_worker_enabled()):
         sampler.async_worker_start()
 
 

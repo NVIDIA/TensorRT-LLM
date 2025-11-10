@@ -692,12 +692,15 @@ class AsyncWorkerMixin:
         return self._async_worker is not None
 
     def _async_worker_init(self, enable_async_worker: bool):
-        self.enable_async_worker = enable_async_worker
+        self._enable_async_worker = enable_async_worker
         self._async_worker = None
         self._async_worker_futures: list[futures.Future[any]] = []
 
+    def async_worker_enabled(self):
+        return hasattr(self, "_enable_async_worker") and self._enable_async_worker
+
     def async_worker_start(self):
-        assert self.enable_async_worker
+        assert self.async_worker_enabled()
         assert not self._async_worker_active()
 
         def _async_worker_initializer(device_id):
@@ -715,10 +718,12 @@ class AsyncWorkerMixin:
         )
 
     def async_worker_stop(self):
+        assert self.async_worker_enabled()
         if self._async_worker_active():
             self._async_worker.shutdown(wait=True)
             self._async_worker = None
 
+    @torch.inference_mode()
     def _async_worker_run(self, ready: torch.cuda.Event, func, /, *args, **kwargs):
         # Make sure the async work takes place after all prior operations on
         # the primary stream. synchronize() is intentionally chosen instead of
