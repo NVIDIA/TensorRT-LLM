@@ -14,13 +14,13 @@ import pytest
 import yaml
 from llmapi.apps.openai_server import RemoteOpenAIServer
 from llmapi.test_llm import get_model_path
-from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import \
-    ExportTraceServiceResponse
+from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceResponse
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2_grpc import (
-    TraceServiceServicer, add_TraceServiceServicer_to_server)
+    TraceServiceServicer,
+    add_TraceServiceServicer_to_server,
+)
 from opentelemetry.proto.common.v1.common_pb2 import AnyValue, KeyValue
-from opentelemetry.sdk.environment_variables import \
-    OTEL_EXPORTER_OTLP_TRACES_INSECURE
+from opentelemetry.sdk.environment_variables import OTEL_EXPORTER_OTLP_TRACES_INSECURE
 
 from tensorrt_llm.llmapi.tracing import SpanAttributes
 
@@ -30,7 +30,6 @@ logger = logging.getLogger(__name__)
 
 
 class FakeTraceService(TraceServiceServicer):
-
     def __init__(self):
         self.request = None
         self.evt = threading.Event()
@@ -44,9 +43,9 @@ class FakeTraceService(TraceServiceServicer):
 # The trace service binds a free port at runtime and exposes its address via the fixture.
 @pytest.fixture(scope="module")
 def trace_service() -> Generator[FakeTraceService, None, None]:
-    """Fixture to set up a fake gRPC trace service"""
     executor = futures.ThreadPoolExecutor(max_workers=1)
     import grpc
+
     server = grpc.server(executor)
     service = FakeTraceService()
     add_TraceServiceServicer_to_server(service, server)
@@ -83,14 +82,11 @@ def temp_extra_llm_api_options_file(request):
     try:
         extra_llm_api_options_dict = {
             "enable_chunked_prefill": False,
-            "kv_cache_config": {
-                "enable_block_reuse": False,
-                "max_tokens": 40000
-            },
+            "kv_cache_config": {"enable_block_reuse": False, "max_tokens": 40000},
             "return_perf_metrics": True,
         }
 
-        with open(temp_file_path, 'w') as f:
+        with open(temp_file_path, "w") as f:
             yaml.dump(extra_llm_api_options_dict, f)
 
         yield temp_file_path
@@ -100,8 +96,13 @@ def temp_extra_llm_api_options_file(request):
 
 
 @pytest.fixture(scope="module")
-def server(model_name: str, backend: str, temp_extra_llm_api_options_file: str,
-           num_postprocess_workers: int, trace_service: FakeTraceService):
+def server(
+    model_name: str,
+    backend: str,
+    temp_extra_llm_api_options_file: str,
+    num_postprocess_workers: int,
+    trace_service: FakeTraceService,
+):
     model_path = get_model_path(model_name)
     args = ["--backend", f"{backend}"]
     if backend == "trt":
@@ -116,8 +117,7 @@ def server(model_name: str, backend: str, temp_extra_llm_api_options_file: str,
         yield remote_server
 
 
-FieldName = Literal["bool_value", "string_value", "int_value", "double_value",
-                    "array_value"]
+FieldName = Literal["bool_value", "string_value", "int_value", "double_value", "array_value"]
 
 
 def decode_value(value: AnyValue):
@@ -126,8 +126,7 @@ def decode_value(value: AnyValue):
         "string_value": (lambda v: v.string_value),
         "int_value": (lambda v: v.int_value),
         "double_value": (lambda v: v.double_value),
-        "array_value":
-        (lambda v: [decode_value(item) for item in v.array_value.values]),
+        "array_value": (lambda v: [decode_value(item) for item in v.array_value.values]),
     }
     for field, decoder in field_decoders.items():
         if value.HasField(field):
@@ -150,15 +149,11 @@ def async_client(server: RemoteOpenAIServer):
 
 
 @pytest.mark.threadleak(enabled=False)
-def test_tracing(client: openai.OpenAI, model_name: str,
-                 trace_service: FakeTraceService):
-    messages = [{
-        "role": "system",
-        "content": "you are a helpful assistant"
-    }, {
-        "role": "user",
-        "content": "what is 1+1?"
-    }]
+def test_tracing(client: openai.OpenAI, model_name: str, trace_service: FakeTraceService):
+    messages = [
+        {"role": "system", "content": "you are a helpful assistant"},
+        {"role": "user", "content": "what is 1+1?"},
+    ]
 
     temperature = 0.9
     top_p = 0.9
@@ -176,34 +171,34 @@ def test_tracing(client: openai.OpenAI, model_name: str,
     timeout = 10
     if not trace_service.evt.wait(timeout):
         raise TimeoutError(
-            f"The fake trace service didn't receive a trace within "
-            f"the {timeout} seconds timeout")
+            f"The fake trace service didn't receive a trace within the {timeout} seconds timeout"
+        )
 
     request = trace_service.request
-    assert len(
-        request.resource_spans) == 1, (f"Expected 1 resource span, "
-                                       f"but got {len(request.resource_spans)}")
+    assert len(request.resource_spans) == 1, (
+        f"Expected 1 resource span, but got {len(request.resource_spans)}"
+    )
     assert len(request.resource_spans[0].scope_spans) == 1, (
-        f"Expected 1 scope span, "
-        f"but got {len(request.resource_spans[0].scope_spans)}")
+        f"Expected 1 scope span, but got {len(request.resource_spans[0].scope_spans)}"
+    )
     assert len(request.resource_spans[0].scope_spans[0].spans) == 1, (
-        f"Expected 1 span, "
-        f"but got {len(request.resource_spans[0].scope_spans[0].spans)}")
+        f"Expected 1 span, but got {len(request.resource_spans[0].scope_spans[0].spans)}"
+    )
 
-    attributes = decode_attributes(
-        request.resource_spans[0].scope_spans[0].spans[0].attributes)
+    attributes = decode_attributes(request.resource_spans[0].scope_spans[0].spans[0].attributes)
 
-    assert (attributes.get(SpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS) ==
-            chat_completion.usage.completion_tokens)
-    assert (attributes.get(SpanAttributes.GEN_AI_USAGE_PROMPT_TOKENS) ==
-            chat_completion.usage.prompt_tokens)
-    assert (attributes.get(
-        SpanAttributes.GEN_AI_REQUEST_MAX_TOKENS) == max_completion_tokens)
+    assert (
+        attributes.get(SpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS)
+        == chat_completion.usage.completion_tokens
+    )
+    assert (
+        attributes.get(SpanAttributes.GEN_AI_USAGE_PROMPT_TOKENS)
+        == chat_completion.usage.prompt_tokens
+    )
+    assert attributes.get(SpanAttributes.GEN_AI_REQUEST_MAX_TOKENS) == max_completion_tokens
     assert attributes.get(SpanAttributes.GEN_AI_REQUEST_TOP_P) == top_p
-    assert attributes.get(
-        SpanAttributes.GEN_AI_REQUEST_TEMPERATURE) == temperature
+    assert attributes.get(SpanAttributes.GEN_AI_REQUEST_TEMPERATURE) == temperature
     assert attributes.get(SpanAttributes.GEN_AI_LATENCY_TIME_TO_FIRST_TOKEN) > 0
     assert attributes.get(SpanAttributes.GEN_AI_LATENCY_E2E) > 0
     assert attributes.get(SpanAttributes.GEN_AI_LATENCY_TIME_IN_QUEUE) > 0
-    assert len(attributes.get(
-        SpanAttributes.GEN_AI_RESPONSE_FINISH_REASONS)) > 0
+    assert len(attributes.get(SpanAttributes.GEN_AI_RESPONSE_FINISH_REASONS)) > 0
