@@ -46,9 +46,7 @@ def test_draft_token_static_tree_prepare_for_generation():
         input_num_accepted_draft_tokens,
         input_hidden_states_write_indices,
         input_hidden_states_read_indices,
-        input_draft_tokens,
         input_position_ids,
-        ref_inputs_ids,
         ref_position_ids,
         ref_attn_metadata,
         ref_spec_metadata,
@@ -71,7 +69,11 @@ def test_draft_token_static_tree_prepare_for_generation():
             device="cuda",
         )
         attn_metadata.spec_decoding_packed_mask = torch.zeros(
-            [max_batch_size, max_total_draft_tokens + 1, math.ceil(max_total_draft_tokens / 32)],
+            [
+                max_batch_size,
+                max_total_draft_tokens + 1,
+                math.ceil((max_total_draft_tokens + 1) / 32),
+            ],
             dtype=torch.int,
             device="cuda",
         )
@@ -138,15 +140,14 @@ def test_draft_token_static_tree_prepare_for_generation():
 
         # 3) Create TreeDraftingLoopWrapper
         tree_drafting_loop_wrapper = TreeDraftingLoopWrapper(
+            max_batch_size=max_batch_size,
             max_draft_len=max_draft_len,
             max_total_draft_tokens=max_total_draft_tokens,
             draft_model=DummyModel(),
         )
 
         # 3) Run the function
-        output_input_ids, output_position_ids = tree_drafting_loop_wrapper.prepare_for_generation(
-            prepare_for_layer_idx=prepare_for_layer_idx,
-            new_draft_tokens=input_draft_tokens,
+        tree_drafting_loop_wrapper.prepare_for_generation(
             attn_metadata=attn_metadata,
             spec_metadata=spec_metadata,
             spec_tree_manager=spec_tree_manager,
@@ -154,9 +155,9 @@ def test_draft_token_static_tree_prepare_for_generation():
         )
 
         # Compare input_ids and position_ids
-        print(f"output_input_ids: {output_input_ids}, ref_output_input_ids: {ref_inputs_ids}")
         print(
-            f"output_position_ids: {output_position_ids}, ref_output_position_ids: {ref_position_ids}"
+            f"tree_drafting_loop_wrapper.position_ids_buffer: {tree_drafting_loop_wrapper.position_ids_buffer}, \
+            ref_output_position_ids: {ref_position_ids}"
         )
 
         # Compare the attention metadata
@@ -199,10 +200,6 @@ def test_draft_token_static_tree_prepare_for_generation():
             ref_spec_metadata.num_tokens: {ref_spec_metadata['num_tokens']}"
         )
         print(
-            f"spec_metadata.gather_ids: {spec_metadata.gather_ids}, \
-            ref_spec_metadata.gather_ids: {ref_spec_metadata['gather_ids']}"
-        )
-        print(
             f"spec_metadata.hidden_states_read_indices: {spec_metadata.hidden_states_read_indices}, \
             ref_spec_metadata.hidden_states_read_indices: {ref_spec_metadata['hidden_states_read_indices']}"
         )
@@ -211,8 +208,7 @@ def test_draft_token_static_tree_prepare_for_generation():
             ref_spec_metadata.hidden_states_write_indices: {ref_spec_metadata['hidden_states_write_indices']}"
         )
 
-        assert torch.all(output_input_ids == ref_inputs_ids)
-        assert torch.all(output_position_ids == ref_position_ids)
+        assert torch.all(tree_drafting_loop_wrapper.position_ids_buffer == ref_position_ids)
         assert torch.all(attn_metadata.kv_lens_cuda == ref_attn_metadata["kv_lens_cuda"])
         assert torch.all(attn_metadata._seq_lens == ref_attn_metadata["_seq_lens"])
         assert torch.all(attn_metadata._seq_lens_cuda == ref_attn_metadata["_seq_lens_cuda"])
@@ -227,34 +223,32 @@ def test_draft_token_static_tree_prepare_for_generation():
             attn_metadata.spec_decoding_generation_lengths
             == ref_attn_metadata["spec_decoding_generation_lengths"]
         )
-        total_process_tokens = attn_metadata.spec_decoding_generation_lengths.sum()
-        print(f"total_process_tokens: {total_process_tokens}")
         assert torch.all(
-            attn_metadata.spec_decoding_position_offsets.reshape(-1)[:total_process_tokens]
-            == ref_attn_metadata["spec_decoding_position_offsets"][:total_process_tokens]
+            attn_metadata.spec_decoding_position_offsets[:max_batch_size, :].reshape(-1)
+            == ref_attn_metadata["spec_decoding_position_offsets"].reshape(-1)
         )
         assert torch.all(
-            attn_metadata.spec_decoding_packed_mask.reshape(
-                -1, attn_metadata.spec_decoding_packed_mask.size(-1)
-            )[:total_process_tokens, :]
-            == ref_attn_metadata["spec_decoding_packed_mask"][:total_process_tokens, :]
+            attn_metadata.spec_decoding_packed_mask[:max_batch_size, :, :].reshape(-1)
+            == ref_attn_metadata["spec_decoding_packed_mask"].reshape(-1)
         )
-
         assert torch.all(
             torch.tensor(spec_metadata.num_tokens) == torch.tensor(ref_spec_metadata["num_tokens"])
         )
-        assert torch.all(spec_metadata.gather_ids == ref_spec_metadata["gather_ids"])
+
+        output_hidden_states_read_indices = spec_metadata.hidden_states_read_indices[
+            : max_batch_size * (max_total_draft_tokens + 1)
+        ].reshape(max_batch_size, max_total_draft_tokens + 1)
         assert torch.all(
-            spec_metadata.hidden_states_read_indices[
-                : ref_spec_metadata["hidden_states_read_indices"].shape[0]
-            ]
-            == ref_spec_metadata["hidden_states_read_indices"]
+            # We do not compare the last element of the hidden_states_read_indices, because it is padding.
+            output_hidden_states_read_indices[:, :-1]
+            == ref_spec_metadata["hidden_states_read_indices"][:, :-1]
         )
+
+        output_hidden_states_write_indices = spec_metadata.hidden_states_write_indices[
+            : max_batch_size * (max_total_draft_tokens + 1)
+        ].reshape(max_batch_size, max_total_draft_tokens + 1)
         assert torch.all(
-            spec_metadata.hidden_states_write_indices[
-                : ref_spec_metadata["hidden_states_write_indices"].shape[0]
-            ]
-            == ref_spec_metadata["hidden_states_write_indices"]
+            output_hidden_states_write_indices == ref_spec_metadata["hidden_states_write_indices"]
         )
 
     ##### CASE 1 static tree, batch size = 1, prefill, prepare_for_layer_idx = 1 #############
@@ -278,14 +272,9 @@ def test_draft_token_static_tree_prepare_for_generation():
     ]
 
     prompt_len_1 = 15
-
-    input_draft_tokens = [
-        torch.tensor([20, 21, 22], dtype=torch.int32, device="cuda").reshape(1, 3)
-    ]
     input_position_ids = torch.arange(prompt_len_1, dtype=torch.int32, device="cuda").reshape(
         1, prompt_len_1
     )
-
     input_seq_lens_cuda = torch.tensor([prompt_len_1], dtype=torch.int32, device="cuda")
     input_kv_lens_cuda = torch.tensor([prompt_len_1], dtype=torch.int32, device="cuda")
     input_num_accepted_draft_tokens = torch.tensor(
@@ -301,34 +290,40 @@ def test_draft_token_static_tree_prepare_for_generation():
         [max_new_tokens], dtype=torch.long, device="cuda"
     )
 
-    ref_inputs_ids = torch.tensor([20, 21, 22], dtype=torch.int32, device="cuda")
-    ref_position_ids = torch.tensor([15, 15, 15], dtype=torch.int32, device="cuda")
+    ref_position_ids = torch.tensor(
+        [[15, 15, 15, 16, 16, 16, 16, 16, 16, 17, 17, 17, 0]], dtype=torch.int32, device="cuda"
+    )
 
     ref_attn_metadata = {}
-    ref_attn_metadata["kv_lens_cuda"] = torch.tensor([18], dtype=torch.int32, device="cuda")
-    ref_attn_metadata["_seq_lens"] = torch.tensor([3], dtype=torch.int32, device="cpu")
-    ref_attn_metadata["_seq_lens_cuda"] = torch.tensor([3], dtype=torch.int32, device="cuda")
+    # prompt_len_1 + max_total_draft_tokens + 1
+    ref_attn_metadata["kv_lens_cuda"] = torch.tensor([28], dtype=torch.int32, device="cuda")
+
+    # max_total_draft_tokens + 1
+    ref_attn_metadata["_seq_lens"] = torch.tensor([13], dtype=torch.int32, device="cpu")
+
+    # max_total_draft_tokens + 1
+    ref_attn_metadata["_seq_lens_cuda"] = torch.tensor([13], dtype=torch.int32, device="cuda")
+
     ref_attn_metadata["host_request_types"] = torch.tensor([0], dtype=torch.int32, device="cuda")
     ref_attn_metadata["num_contexts"] = 0
     ref_attn_metadata["spec_decoding_position_offsets"] = torch.tensor(
-        [0, 0, 0], dtype=torch.int32, device="cuda"
-    )
+        [0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2, 0], dtype=torch.int32, device="cuda"
+    ).repeat(max_batch_size)  # [max_batch_size * (max_total_draft_tokens + 1)]
     ref_attn_metadata["spec_decoding_packed_mask"] = torch.tensor(
-        [1, 2, 4], dtype=torch.int32, device="cuda"
-    ).unsqueeze(1)
+        [1, 2, 4, 9, 17, 33, 66, 130, 260, 521, 1041, 2114, 0], dtype=torch.int32, device="cuda"
+    ).repeat(max_batch_size)  # [max_batch_size * (max_total_draft_tokens + 1) * 1]
     ref_attn_metadata["spec_decoding_generation_lengths"] = torch.tensor(
-        [3], dtype=torch.int32, device="cuda"
+        [13], dtype=torch.int32, device="cuda"
     )
 
     ref_spec_metadata = {}
-    ref_spec_metadata["num_tokens"] = 3
-    ref_spec_metadata["gather_ids"] = torch.tensor([0, 1, 2], dtype=torch.int32, device="cuda")
+    ref_spec_metadata["num_tokens"] = 13
     ref_spec_metadata["hidden_states_read_indices"] = torch.tensor(
-        [14, 14, 14], dtype=torch.int32, device="cuda"
-    )
+        [[14, 14, 14, 15, 15, 15, 16, 16, 17, 18, 19, 21, 0]], dtype=torch.int32, device="cuda"
+    )  # [max_batch_size, max_total_draft_tokens + 1]
     ref_spec_metadata["hidden_states_write_indices"] = torch.tensor(
-        [15, 16, 17], dtype=torch.int32, device="cuda"
-    )
+        [[15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]], dtype=torch.int32, device="cuda"
+    )  # [max_batch_size, max_total_draft_tokens + 1]
 
     run_test(
         max_batch_size,
@@ -341,118 +336,13 @@ def test_draft_token_static_tree_prepare_for_generation():
         input_num_accepted_draft_tokens,
         input_hidden_states_write_indices,
         input_hidden_states_read_indices,
-        input_draft_tokens,
         input_position_ids,
-        ref_inputs_ids,
         ref_position_ids,
         ref_attn_metadata,
         ref_spec_metadata,
     )
 
-    ##### CASE 2 static tree, batch size = 2, both prefill, prepare_for_layer_idx = 1 #############
-    max_batch_size = 2
-    prepare_for_layer_idx = 1
-    max_total_draft_tokens = 12
-    max_draft_len = 3
-    eagle_choices = [
-        [0],
-        [1],
-        [2],
-        [0, 0],
-        [0, 1],
-        [0, 2],
-        [1, 0],
-        [1, 1],
-        [2, 0],
-        [0, 0, 0],
-        [0, 1, 1],
-        [1, 0, 0],
-    ]
-
-    prompt_len_1 = 15
-    prompt_len_2 = 10
-
-    input_draft_tokens = [
-        torch.tensor([20, 21, 22, 30, 31, 32], dtype=torch.int32, device="cuda").reshape(2, 3)
-    ]
-    input_position_ids_1 = torch.arange(prompt_len_1, dtype=torch.int32, device="cuda").reshape(
-        1, prompt_len_1
-    )
-    input_position_ids_2 = torch.arange(prompt_len_2, dtype=torch.int32, device="cuda").reshape(
-        1, prompt_len_2
-    )
-    input_position_ids = torch.cat([input_position_ids_1, input_position_ids_2], dim=1)
-
-    input_seq_lens_cuda = torch.tensor(
-        [prompt_len_1, prompt_len_2], dtype=torch.int32, device="cuda"
-    )
-    input_kv_lens_cuda = torch.tensor(
-        [prompt_len_1, prompt_len_2], dtype=torch.int32, device="cuda"
-    )
-    input_num_accepted_draft_tokens = torch.tensor(
-        [prompt_len_1 - 1, prompt_len_2 - 1], dtype=torch.int32, device="cuda"
-    )
-    input_hidden_states_write_indices = torch.zeros(
-        [max_new_tokens], dtype=torch.long, device="cuda"
-    )
-    input_hidden_states_write_indices[: prompt_len_1 + prompt_len_2] = torch.arange(
-        prompt_len_1 + prompt_len_2, dtype=torch.long, device="cuda"
-    )
-    input_hidden_states_read_indices = torch.zeros(
-        [max_new_tokens], dtype=torch.long, device="cuda"
-    )
-
-    ref_inputs_ids = torch.tensor([20, 21, 22, 30, 31, 32], dtype=torch.int32, device="cuda")
-    ref_position_ids = torch.tensor([15, 15, 15, 10, 10, 10], dtype=torch.int32, device="cuda")
-
-    ref_attn_metadata = {}
-    ref_attn_metadata["kv_lens_cuda"] = torch.tensor([18, 13], dtype=torch.int32, device="cuda")
-    ref_attn_metadata["_seq_lens"] = torch.tensor([3, 3], dtype=torch.int32, device="cpu")
-    ref_attn_metadata["_seq_lens_cuda"] = torch.tensor([3, 3], dtype=torch.int32, device="cuda")
-    ref_attn_metadata["host_request_types"] = torch.tensor([0, 0], dtype=torch.int32, device="cuda")
-    ref_attn_metadata["num_contexts"] = 0
-    ref_attn_metadata["spec_decoding_position_offsets"] = torch.tensor(
-        [0, 0, 0, 0, 0, 0], dtype=torch.int32, device="cuda"
-    )
-    ref_attn_metadata["spec_decoding_packed_mask"] = torch.tensor(
-        [1, 2, 4, 1, 2, 4], dtype=torch.int32, device="cuda"
-    ).unsqueeze(1)
-    ref_attn_metadata["spec_decoding_generation_lengths"] = torch.tensor(
-        [3, 3], dtype=torch.int32, device="cuda"
-    )
-
-    ref_spec_metadata = {}
-    ref_spec_metadata["num_tokens"] = 6
-    ref_spec_metadata["gather_ids"] = torch.tensor(
-        [0, 1, 2, 3, 4, 5], dtype=torch.int32, device="cuda"
-    )
-    ref_spec_metadata["hidden_states_read_indices"] = torch.tensor(
-        [14, 14, 14, 24, 24, 24], dtype=torch.int32, device="cuda"
-    )
-    ref_spec_metadata["hidden_states_write_indices"] = torch.tensor(
-        [15, 16, 17, 25, 26, 27], dtype=torch.int32, device="cuda"
-    )
-
-    run_test(
-        max_batch_size,
-        prepare_for_layer_idx,
-        max_total_draft_tokens,
-        max_draft_len,
-        eagle_choices,
-        input_seq_lens_cuda,
-        input_kv_lens_cuda,
-        input_num_accepted_draft_tokens,
-        input_hidden_states_write_indices,
-        input_hidden_states_read_indices,
-        input_draft_tokens,
-        input_position_ids,
-        ref_inputs_ids,
-        ref_position_ids,
-        ref_attn_metadata,
-        ref_spec_metadata,
-    )
-
-    ##### CASE 3 static tree, batch size = 2, one prefill, one decode, prepare_for_layer_idx = 1 #####
+    ##### CASE 2 static tree, batch size = 2, one prefill, one decode, prepare_for_layer_idx = 1 #####
     max_batch_size = 2
     prepare_for_layer_idx = 1
     max_total_draft_tokens = 12
@@ -478,9 +368,6 @@ def test_draft_token_static_tree_prepare_for_generation():
         3 + 1
     )  # accepted 2 draft tokens. For the 0-th drafter layer, the sequence length will be pad to max_draft_len + 1
 
-    input_draft_tokens = [
-        torch.tensor([20, 21, 22, 30, 31, 32], dtype=torch.int32, device="cuda").reshape(2, 3)
-    ]  # sample from the 0-th drafter layer
     input_position_ids_1 = torch.arange(prompt_len_1, dtype=torch.int32, device="cuda").reshape(
         1, prompt_len_1
     )
@@ -505,36 +392,48 @@ def test_draft_token_static_tree_prepare_for_generation():
     input_hidden_states_read_indices = torch.zeros(
         [max_new_tokens], dtype=torch.long, device="cuda"
     )
-
-    ref_inputs_ids = torch.tensor([20, 21, 22, 30, 31, 32], dtype=torch.int32, device="cuda")
-    ref_position_ids = torch.tensor([15, 15, 15, 21, 21, 21], dtype=torch.int32, device="cuda")
+    ref_position_ids = torch.tensor(
+        [
+            [15, 15, 15, 16, 16, 16, 16, 16, 16, 17, 17, 17, 0],
+            [21, 21, 21, 22, 22, 22, 22, 22, 22, 23, 23, 23, 0],
+        ],
+        dtype=torch.int32,
+        device="cuda",
+    )
 
     ref_attn_metadata = {}
-    ref_attn_metadata["kv_lens_cuda"] = torch.tensor([18, 24], dtype=torch.int32, device="cuda")
-    ref_attn_metadata["_seq_lens"] = torch.tensor([3, 3], dtype=torch.int32, device="cpu")
-    ref_attn_metadata["_seq_lens_cuda"] = torch.tensor([3, 3], dtype=torch.int32, device="cuda")
+    ref_attn_metadata["kv_lens_cuda"] = torch.tensor([28, 34], dtype=torch.int32, device="cuda")
+    ref_attn_metadata["_seq_lens"] = torch.tensor([13, 13], dtype=torch.int32, device="cpu")
+    ref_attn_metadata["_seq_lens_cuda"] = torch.tensor([13, 13], dtype=torch.int32, device="cuda")
     ref_attn_metadata["host_request_types"] = torch.tensor([0, 0], dtype=torch.int32, device="cuda")
     ref_attn_metadata["num_contexts"] = 0
     ref_attn_metadata["spec_decoding_position_offsets"] = torch.tensor(
-        [0, 0, 0, 0, 0, 0], dtype=torch.int32, device="cuda"
-    )
+        [0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2, 0], dtype=torch.int32, device="cuda"
+    ).repeat(max_batch_size)
     ref_attn_metadata["spec_decoding_packed_mask"] = torch.tensor(
-        [1, 2, 4, 1, 2, 4], dtype=torch.int32, device="cuda"
-    ).unsqueeze(1)
+        [1, 2, 4, 9, 17, 33, 66, 130, 260, 521, 1041, 2114, 0], dtype=torch.int32, device="cuda"
+    ).repeat(max_batch_size)
     ref_attn_metadata["spec_decoding_generation_lengths"] = torch.tensor(
-        [3, 3], dtype=torch.int32, device="cuda"
+        [13, 13], dtype=torch.int32, device="cuda"
     )
 
     ref_spec_metadata = {}
-    ref_spec_metadata["num_tokens"] = 6
-    ref_spec_metadata["gather_ids"] = torch.tensor(
-        [0, 1, 2, 3, 4, 5], dtype=torch.int32, device="cuda"
-    )
+    ref_spec_metadata["num_tokens"] = 26
     ref_spec_metadata["hidden_states_read_indices"] = torch.tensor(
-        [14, 14, 14, 17, 17, 17], dtype=torch.int32, device="cuda"
+        [
+            [14, 14, 14, 15, 15, 15, 16, 16, 17, 18, 19, 21, 0],
+            [17, 17, 17, 18, 18, 18, 19, 19, 20, 21, 22, 24, 0],
+        ],
+        dtype=torch.int32,
+        device="cuda",
     )
     ref_spec_metadata["hidden_states_write_indices"] = torch.tensor(
-        [15, 16, 17, 18, 19, 20], dtype=torch.int32, device="cuda"
+        [
+            [15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27],
+            [18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30],
+        ],
+        dtype=torch.int32,
+        device="cuda",
     )
 
     run_test(
@@ -548,214 +447,7 @@ def test_draft_token_static_tree_prepare_for_generation():
         input_num_accepted_draft_tokens,
         input_hidden_states_write_indices,
         input_hidden_states_read_indices,
-        input_draft_tokens,
         input_position_ids,
-        ref_inputs_ids,
-        ref_position_ids,
-        ref_attn_metadata,
-        ref_spec_metadata,
-    )
-
-    ##### CASE 4 static tree, batch size = 1, one prefill, prepare_for_layer_idx = 2 #############
-    max_batch_size = 1
-    prepare_for_layer_idx = 2
-    max_total_draft_tokens = 12
-    max_draft_len = 3
-    eagle_choices = [
-        [0],
-        [1],
-        [2],
-        [0, 0],
-        [0, 1],
-        [0, 2],
-        [1, 0],
-        [1, 1],
-        [2, 0],
-        [0, 0, 0],
-        [0, 1, 1],
-        [1, 0, 0],
-    ]
-
-    prompt_len_1 = 15
-
-    input_draft_tokens = [
-        torch.tensor([20, 21, 22], dtype=torch.int32, device="cuda").reshape(
-            1, 3
-        ),  # sample after the 0-th drafter layer
-        torch.tensor([30, 31, 32, 33, 34, 35], dtype=torch.int32, device="cuda").reshape(
-            1, 6
-        ),  # sample after the 1-th drafter layer
-    ]
-    input_position_ids = torch.tensor([15, 15, 15], dtype=torch.int32, device="cuda").unsqueeze(0)
-    input_seq_lens_cuda = torch.tensor([3], dtype=torch.int32, device="cuda")
-    input_kv_lens_cuda = torch.tensor([18], dtype=torch.int32, device="cuda")
-    input_num_accepted_draft_tokens = torch.tensor(
-        [prompt_len_1 - 1], dtype=torch.int32, device="cuda"
-    )
-
-    input_hidden_states_read_indices = torch.zeros(
-        [max_new_tokens], dtype=torch.long, device="cuda"
-    )
-    input_hidden_states_read_indices[:3] = torch.tensor(
-        [14, 14, 14], dtype=torch.long, device="cuda"
-    )
-    input_hidden_states_write_indices = torch.zeros(
-        [max_new_tokens], dtype=torch.long, device="cuda"
-    )
-    input_hidden_states_write_indices[:3] = torch.tensor(
-        [15, 16, 17], dtype=torch.long, device="cuda"
-    )
-
-    ref_inputs_ids = torch.tensor([20, 21, 30, 31, 33], dtype=torch.int32, device="cuda")
-    ref_position_ids = torch.tensor([15, 15, 16, 16, 16], dtype=torch.int32, device="cuda")
-
-    ref_attn_metadata = {}
-    ref_attn_metadata["kv_lens_cuda"] = torch.tensor([20], dtype=torch.int32, device="cuda")
-    ref_attn_metadata["_seq_lens"] = torch.tensor([5], dtype=torch.int32, device="cpu")
-    ref_attn_metadata["_seq_lens_cuda"] = torch.tensor([5], dtype=torch.int32, device="cuda")
-    ref_attn_metadata["host_request_types"] = torch.tensor([0], dtype=torch.int32, device="cuda")
-    ref_attn_metadata["num_contexts"] = 0
-    ref_attn_metadata["spec_decoding_position_offsets"] = torch.tensor(
-        [0, 0, 1, 1, 1], dtype=torch.int32, device="cuda"
-    )
-    ref_attn_metadata["spec_decoding_packed_mask"] = torch.tensor(
-        [1, 2, 5, 9, 18], dtype=torch.int32, device="cuda"
-    ).unsqueeze(1)
-    ref_attn_metadata["spec_decoding_generation_lengths"] = torch.tensor(
-        [5], dtype=torch.int32, device="cuda"
-    )
-
-    ref_spec_metadata = {}
-    ref_spec_metadata["num_tokens"] = 5
-    ref_spec_metadata["gather_ids"] = torch.tensor([2, 3, 4], dtype=torch.int32, device="cuda")
-    ref_spec_metadata["hidden_states_read_indices"] = torch.tensor(
-        [14, 14, 15, 15, 16], dtype=torch.int32, device="cuda"
-    )
-    ref_spec_metadata["hidden_states_write_indices"] = torch.tensor(
-        [15, 16, 18, 19, 21], dtype=torch.int32, device="cuda"
-    )
-
-    run_test(
-        max_batch_size,
-        prepare_for_layer_idx,
-        max_total_draft_tokens,
-        max_draft_len,
-        eagle_choices,
-        input_seq_lens_cuda,
-        input_kv_lens_cuda,
-        input_num_accepted_draft_tokens,
-        input_hidden_states_write_indices,
-        input_hidden_states_read_indices,
-        input_draft_tokens,
-        input_position_ids,
-        ref_inputs_ids,
-        ref_position_ids,
-        ref_attn_metadata,
-        ref_spec_metadata,
-    )
-
-    ##### CASE 5 static tree, batch size = 2, one prefill, one decode, prepare_for_layer_idx = 2 #############
-    max_batch_size = 2
-    prepare_for_layer_idx = 2
-    max_total_draft_tokens = 12
-    max_draft_len = 3
-    eagle_choices = [
-        [0],
-        [1],
-        [2],
-        [0, 0],
-        [0, 1],
-        [0, 2],
-        [1, 0],
-        [1, 1],
-        [2, 0],
-        [0, 0, 0],
-        [0, 1, 1],
-        [1, 0, 0],
-    ]
-
-    prompt_len_1 = 15
-    prompt_len_2 = 18  # decode
-
-    input_draft_tokens = [
-        torch.tensor([20, 21, 22, 23, 24, 25], dtype=torch.int32, device="cuda").reshape(
-            2, 3
-        ),  # sample after the 0-th drafter layer
-        torch.tensor(
-            [30, 31, 32, 33, 34, 35, 40, 41, 42, 43, 44, 45], dtype=torch.int32, device="cuda"
-        ).reshape(2, 6),  # sample after the 1-th drafter layer
-    ]
-    input_position_ids = torch.tensor(
-        [15, 15, 15, 21, 21, 21], dtype=torch.int32, device="cuda"
-    ).unsqueeze(0)
-    input_seq_lens_cuda = torch.tensor([3, 3], dtype=torch.int32, device="cuda")
-    input_kv_lens_cuda = torch.tensor([18, 24], dtype=torch.int32, device="cuda")
-    input_num_accepted_draft_tokens = torch.tensor(
-        [prompt_len_1 - 1, 2], dtype=torch.int32, device="cuda"
-    )
-
-    input_hidden_states_read_indices = torch.zeros(
-        [max_new_tokens], dtype=torch.long, device="cuda"
-    )
-    input_hidden_states_read_indices[:6] = torch.tensor(
-        [14, 14, 14, 26, 26, 26], dtype=torch.long, device="cuda"
-    )
-    input_hidden_states_write_indices = torch.zeros(
-        [max_new_tokens], dtype=torch.long, device="cuda"
-    )
-    input_hidden_states_write_indices[:6] = torch.tensor(
-        [15, 16, 17, 27, 28, 29], dtype=torch.long, device="cuda"
-    )
-
-    ref_inputs_ids = torch.tensor(
-        [20, 21, 30, 31, 33, 23, 24, 40, 41, 43], dtype=torch.int32, device="cuda"
-    )
-    ref_position_ids = torch.tensor(
-        [15, 15, 16, 16, 16, 21, 21, 22, 22, 22], dtype=torch.int32, device="cuda"
-    )
-
-    ref_attn_metadata = {}
-    ref_attn_metadata["kv_lens_cuda"] = torch.tensor([20, 26], dtype=torch.int32, device="cuda")
-    ref_attn_metadata["_seq_lens"] = torch.tensor([5, 5], dtype=torch.int32, device="cpu")
-    ref_attn_metadata["_seq_lens_cuda"] = torch.tensor([5, 5], dtype=torch.int32, device="cuda")
-    ref_attn_metadata["host_request_types"] = torch.tensor([0], dtype=torch.int32, device="cuda")
-    ref_attn_metadata["num_contexts"] = 0
-    ref_attn_metadata["spec_decoding_position_offsets"] = torch.tensor(
-        [0, 0, 1, 1, 1, 0, 0, 1, 1, 1], dtype=torch.int32, device="cuda"
-    )
-    ref_attn_metadata["spec_decoding_packed_mask"] = torch.tensor(
-        [1, 2, 5, 9, 18, 1, 2, 5, 9, 18], dtype=torch.int32, device="cuda"
-    ).unsqueeze(1)
-    ref_attn_metadata["spec_decoding_generation_lengths"] = torch.tensor(
-        [5, 5], dtype=torch.int32, device="cuda"
-    )
-
-    ref_spec_metadata = {}
-    ref_spec_metadata["num_tokens"] = 10
-    ref_spec_metadata["gather_ids"] = torch.tensor(
-        [2, 3, 4, 7, 8, 9], dtype=torch.int32, device="cuda"
-    )
-    ref_spec_metadata["hidden_states_read_indices"] = torch.tensor(
-        [14, 14, 15, 15, 16, 26, 26, 27, 27, 28], dtype=torch.int32, device="cuda"
-    )
-    ref_spec_metadata["hidden_states_write_indices"] = torch.tensor(
-        [15, 16, 18, 19, 21, 27, 28, 30, 31, 33], dtype=torch.int32, device="cuda"
-    )
-
-    run_test(
-        max_batch_size,
-        prepare_for_layer_idx,
-        max_total_draft_tokens,
-        max_draft_len,
-        eagle_choices,
-        input_seq_lens_cuda,
-        input_kv_lens_cuda,
-        input_num_accepted_draft_tokens,
-        input_hidden_states_write_indices,
-        input_hidden_states_read_indices,
-        input_draft_tokens,
-        input_position_ids,
-        ref_inputs_ids,
         ref_position_ids,
         ref_attn_metadata,
         ref_spec_metadata,

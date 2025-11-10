@@ -202,7 +202,6 @@ class TreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
         self.max_draft_len = max_draft_len
         self.max_total_draft_tokens = max_total_draft_tokens
         self.max_batch_size = max_batch_size
-        self.vocab_size = self.draft_model.vocab_size_padded
 
         self.draft_tokens_buffer = torch.zeros(
             (max_batch_size, max_total_draft_tokens + 1),
@@ -212,7 +211,6 @@ class TreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
             (max_batch_size, max_total_draft_tokens + 1),
             dtype=torch.int64,
             device='cuda')
-        # self.draft_logits_buffer = torch.empty((max_batch_size, max_total_draft_tokens + 1, self.vocab_size), dtype=torch.float, device='cuda')
 
     def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor,
                 attn_metadata: AttentionMetadata, spec_metadata: SpecMetadata,
@@ -233,15 +231,15 @@ class TreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
         logits = logits[spec_metadata.gather_ids]  # [batch_size, vocab_size]
 
         # new_draft_tokens: [batch_size * max_top_k]
-        new_draft_tokens = self.sample(draft_layer_idx=0,
-                                       batch_size=batch_size,
-                                       logits=logits,
-                                       spec_tree_manager=spec_tree_manager)
+        new_draft_tokens = self.sample(logits=logits,
+                                       max_top_k=spec_tree_manager.max_top_k)
 
-        self.extract_real_draft_tokens(cur_draft_idx=0,
-                                       new_draft_tokens=new_draft_tokens,
-                                       attn_metadata=attn_metadata,
-                                       spec_tree_manager=spec_tree_manager)
+        self.extract_real_draft_tokens(
+            cur_draft_idx=0,
+            batch_size=batch_size,
+            new_draft_tokens=new_draft_tokens,
+            use_cuda_graph=attn_metadata.is_cuda_graph,
+            spec_tree_manager=spec_tree_manager)
 
         return_draft_logits = None
         with save_metadata_state(attn_metadata, spec_metadata):
@@ -267,15 +265,13 @@ class TreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
 
                 # new_draft_tokens: [batch_size * (max_total_draft_tokens + 1) * max_top_k]
                 new_draft_tokens = self.sample(
-                    draft_layer_idx=layer_idx,
-                    batch_size=batch_size,
-                    logits=logits,
-                    spec_tree_manager=spec_tree_manager)
+                    logits=logits, max_top_k=spec_tree_manager.max_top_k)
                 # Keep updating
                 self.extract_real_draft_tokens(
                     cur_draft_idx=layer_idx,
+                    batch_size=batch_size,
                     new_draft_tokens=new_draft_tokens,
-                    attn_metadata=attn_metadata,
+                    use_cuda_graph=attn_metadata.is_cuda_graph,
                     spec_tree_manager=spec_tree_manager)
 
                 if layer_idx == self.max_draft_len - 1:
@@ -302,15 +298,13 @@ class TreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
             "draft_logits": return_draft_logits
         }
 
-    def sample(self, draft_layer_idx: int, batch_size: int,
-               logits: torch.Tensor,
-               spec_tree_manager: SpecTreeManager) -> torch.Tensor:
+    def sample(self, logits: torch.Tensor, max_top_k: int) -> torch.Tensor:
         # TODO: inject the sampler here so we can support non-greedy
 
         # for draft_layer_idx == 0, logits is of shape [batch_size, vocab_size]
         # for draft_layer_idx > 0, logits is of shape [batch_size * (max_total_draft_tokens + 1), vocab_size]
         indices = torch.topk(
-            logits, k=spec_tree_manager.max_top_k, dim=-1
+            logits, k=max_top_k, dim=-1
         ).indices  # [batch_size, max_top_k] or [batch_size * max_total_draft_tokens, max_top_k]
         tokens = indices.reshape(-1)
 
@@ -320,14 +314,13 @@ class TreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
 
         return tokens
 
-    def extract_real_draft_tokens(self, cur_draft_idx: int,
+    def extract_real_draft_tokens(self, cur_draft_idx: int, batch_size: int,
                                   new_draft_tokens: torch.Tensor,
-                                  attn_metadata: AttentionMetadata,
+                                  use_cuda_graph: bool,
                                   spec_tree_manager: SpecTreeManager):
         '''
         Extract the real draft tokens from the new draft tokens to self.draft_tokens_buffer.
         '''
-        batch_size = attn_metadata.num_seqs
         # After the first drafter layer, new_draft_tokens: [batch_size * max_top_k]
         # For other drafter layers, new_draft_tokens: [batch_size * (max_total_draft_tokens + 1) * max_top_k]
         if cur_draft_idx == 0:
@@ -343,7 +336,7 @@ class TreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
                                                     spec_tree_manager.max_top_k)
 
         # If using cuda graph, we need to use a torch op to implement this logic
-        if attn_metadata.is_cuda_graph:
+        if use_cuda_graph:
             torch.ops.trtllm.extract_real_draft_tokens_op(
                 new_draft_tokens, self.draft_tokens_buffer, spec_tree_manager.
                 tokens_gather_idx_for_drafter_model[cur_draft_idx],
