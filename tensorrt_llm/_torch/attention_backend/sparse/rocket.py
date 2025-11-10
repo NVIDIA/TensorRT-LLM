@@ -24,7 +24,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .kernel import (triton_bmm, triton_flatten_to_batch, triton_index_gather,
-                     triton_interleave, triton_rocket_batch_to_flatten,
+                     triton_rocket_batch_to_flatten,
                      triton_rocket_paged_kt_cache_bmm, triton_rocket_qk_split,
                      triton_rocket_reduce_scores,
                      triton_rocket_update_kt_cache_ctx,
@@ -44,10 +44,6 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.window_size = self.sparse_attention_config.window_size
         self.page_size = self.sparse_attention_config.page_size
         self.topk = self.sparse_attention_config.topk
-        self.use_interleave = self.sparse_attention_config.use_interleave
-
-        if not self.use_interleave:
-            self.topk = (self.topk + self.page_size - 1) // self.page_size
 
         self.context_lens_cuda = torch.empty(
             self.max_num_sequences,
@@ -134,15 +130,6 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.cum_kt_lens_cuda = torch.empty_like(self.cum_kt_lens,
                                                  device='cuda',
                                                  dtype=torch.int32)
-
-        self.cum_kv_gen_lens = torch.zeros(
-            self.max_num_sequences + 1,
-            device='cpu',
-            dtype=torch.int32,
-        )
-        self.cum_kv_gen_lens_cuda = torch.empty_like(self.cum_kv_gen_lens,
-                                                     device='cuda',
-                                                     dtype=torch.int32)
 
         self.sparse_offsets_gen = torch.zeros(
             self.max_num_sequences + 1,
@@ -263,25 +250,11 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.cum_kt_lens[:self.num_generations + 1], non_blocking=True)
 
         self.total_kt_tokens = self.num_generations * self.max_kt_tokens
-        self.total_kv_tokens = self.num_generations * self.max_seq_len
-
-        self.cum_kv_gen_lens[1:self.num_generations + 1] = torch.cumsum(
-            self.kv_lens_cuda_runtime[self.num_contexts:self.num_seqs], dim=0)
-        self.cum_kv_gen_lens_cuda[:self.num_generations + 1].copy_(
-            self.cum_kv_gen_lens[:self.num_generations + 1], non_blocking=True)
 
         topk_tensor = torch.tensor(self.topk, dtype=torch.int32)
 
-        sparse_counts_gen = torch.zeros(self.num_generations,
-                                        dtype=torch.int32,
-                                        device='cpu')
-        if self.use_interleave:
-            sparse_counts_gen[:self.num_generations] = torch.minimum(
-                topk_tensor,
-                self.kv_lens_cuda_runtime[self.num_contexts:self.num_seqs])
-        else:
-            sparse_counts_gen[:self.num_generations] = torch.minimum(
-                topk_tensor, self.num_kt_tokens[:self.num_generations])
+        sparse_counts_gen = torch.minimum(
+            topk_tensor, self.num_kt_tokens[:self.num_generations])
 
         self.sparse_offsets_gen[1:self.num_generations + 1] = torch.cumsum(
             sparse_counts_gen[:self.num_generations], dim=0)
@@ -529,26 +502,10 @@ class RocketTrtllmAttention(TrtllmAttention):
                                                                num_generations +
                                                                1]
 
-        # Select sparse attention indices with optional interleaving
-        if metadata.use_interleave:
-            # Interleave kt tokens to kv tokens
-            interleaved_scores = triton_interleave(
-                scores, metadata.cum_kt_lens_cuda,
-                metadata.cum_kv_gen_lens_cuda, metadata.total_kv_tokens,
-                metadata.num_generations, metadata.page_size)
-
-            # Use interleaved scores with kv_lens
-            selected_indices = triton_topk(interleaved_scores,
-                                           metadata.cum_kv_gen_lens_cuda,
-                                           sparse_attn_offsets,
-                                           metadata.total_sparse_gen_indices,
-                                           metadata.topk)
-        else:
-            # Use original kt scores directly
-            selected_indices = triton_topk(scores, metadata.cum_kt_lens_cuda,
-                                           sparse_attn_offsets,
-                                           metadata.total_sparse_gen_indices,
-                                           metadata.topk)
+        selected_indices = triton_topk(scores, metadata.cum_kt_lens_cuda,
+                                       sparse_attn_offsets,
+                                       metadata.total_sparse_gen_indices,
+                                       metadata.topk)
 
         return selected_indices, sparse_attn_offsets
 

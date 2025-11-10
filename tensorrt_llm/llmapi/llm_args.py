@@ -233,8 +233,6 @@ class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
     prompt_budget: Optional[int] = Field(default=1266,
                                          description="Prompt budget")
     page_size: Optional[int] = Field(default=3, description="Page size")
-    use_interleave: Optional[bool] = Field(
-        default=False, description="Whether to use interleave")
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -244,10 +242,7 @@ class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
         return backend == "pytorch"
 
     def get_indices_block_size(self) -> int:
-        if self.use_interleave:
-            return 1
-        else:
-            return self.page_size
+        return self.page_size
 
 
 class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):

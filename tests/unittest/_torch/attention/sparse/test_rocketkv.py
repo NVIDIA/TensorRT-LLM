@@ -344,15 +344,15 @@ def test_sparse_kv_predict(batch_size, num_contexts):
 
 
 @pytest.mark.parametrize(
-    "batch_size,num_contexts,use_interleave",
+    "batch_size,num_contexts",
     [
-        (1, 0, True),  # bs=1, generation only (1 generation)
-        (2, 0, True),  # bs=2, generation only (2 generations)
-        (5, 3, True),  # bs=5, mixed (3 contexts + 2 generations)
-        (3, 0, False),  # bs=3, generation only, no interleave
-        (6, 2, False),  # bs=6, mixed (2 ctx + 4 gen), no interleave
+        (1, 0),  # bs=1, generation only (1 generation)
+        (2, 0),  # bs=2, generation only (2 generations)
+        (3, 0),  # bs=3, generation only (3 generations)
+        (5, 3),  # bs=5, mixed (3 contexts + 2 generations)
+        (6, 2),  # bs=6, mixed (2 ctx + 4 gen)
     ])
-def test_sparse_attn_predict(batch_size, num_contexts, use_interleave):
+def test_sparse_attn_predict(batch_size, num_contexts):
     """Test sparse_attn_predict against vanilla _rocketkv_selection."""
     num_generations = batch_size - num_contexts
 
@@ -363,14 +363,21 @@ def test_sparse_attn_predict(batch_size, num_contexts, use_interleave):
     device = torch.device('cuda')
     dtype = torch.bfloat16
 
-    sparse_attn_config = RocketSparseAttentionConfig(
+    sparse_attn_config_vanilla = RocketSparseAttentionConfig(
         window_size=32,
         kernel_size=3,
         prompt_budget=256,
         page_size=3,
         topk=128,
         topr=96,
-        use_interleave=use_interleave,
+    )
+    sparse_attn_config_trtllm = RocketSparseAttentionConfig(
+        window_size=32,
+        kernel_size=3,
+        prompt_budget=256,
+        page_size=3,
+        topk=43,
+        topr=96,
     )
 
     # Create sequence lengths
@@ -403,10 +410,10 @@ def test_sparse_attn_predict(batch_size, num_contexts, use_interleave):
 
     trtllm_kv_cache_manager = create_rocket_kv_cache_manager(
         num_layers, num_kv_heads, head_dim, tokens_per_block, max_seq_len,
-        batch_size, kv_cache_dtype, sparse_attn_config)
+        batch_size, kv_cache_dtype, sparse_attn_config_trtllm)
     vanilla_kv_cache_manager = create_rocket_kv_cache_manager(
         num_layers, num_kv_heads, head_dim, vanilla_tokens_per_block,
-        max_seq_len, batch_size, kv_cache_dtype, sparse_attn_config)
+        max_seq_len, batch_size, kv_cache_dtype, sparse_attn_config_vanilla)
 
     # Add dummy requests to both cache managers
     token_nums = [
@@ -421,7 +428,7 @@ def test_sparse_attn_predict(batch_size, num_contexts, use_interleave):
         num_heads=num_heads,
         head_dim=head_dim,
         num_kv_heads=num_kv_heads,
-        sparse_attention_config=sparse_attn_config,
+        sparse_attention_config=sparse_attn_config_trtllm,
     )
 
     vanilla_attn = RocketVanillaAttention(
@@ -429,18 +436,18 @@ def test_sparse_attn_predict(batch_size, num_contexts, use_interleave):
         num_heads=num_heads,
         head_dim=head_dim,
         num_kv_heads=num_kv_heads,
-        sparse_attention_config=sparse_attn_config,
+        sparse_attention_config=sparse_attn_config_vanilla,
     )
 
     trtllm_metadata = create_test_metadata(seq_lens, num_contexts,
                                            past_seen_tokens, request_ids,
                                            trtllm_kv_cache_manager,
-                                           sparse_attn_config,
+                                           sparse_attn_config_trtllm,
                                            RocketTrtllmAttentionMetadata)
     vanilla_metadata = create_test_metadata(seq_lens, num_contexts,
                                             past_seen_tokens, request_ids,
                                             vanilla_kv_cache_manager,
-                                            sparse_attn_config,
+                                            sparse_attn_config_vanilla,
                                             RocketVanillaAttentionMetadata)
 
     total_tokens = sum(seq_lens)
@@ -466,8 +473,9 @@ def test_sparse_attn_predict(batch_size, num_contexts, use_interleave):
         for req_idx in range(num_contexts, batch_size):
             # Get the number of KT tokens for this request
             past_token = past_seen_tokens[req_idx]
-            num_kt_tokens = (past_token + 1 + sparse_attn_config.page_size -
-                             1) // sparse_attn_config.page_size
+            num_kt_tokens = (past_token + 1 +
+                             sparse_attn_config_trtllm.page_size -
+                             1) // sparse_attn_config_trtllm.page_size
 
             # Get block offsets for this request
             trtllm_blocks = trtllm_block_offsets[req_idx]
@@ -530,37 +538,36 @@ def test_sparse_attn_predict(batch_size, num_contexts, use_interleave):
             vanilla_sparse_attn_indices_list, dim=0).transpose(0,
                                                                1).contiguous()
 
-        if not sparse_attn_config.use_interleave:
-            # Apply interleave operation to trtllm indices
-            # For each head, multiply indices by page_size and expand to include all tokens in each page
-            page_size = sparse_attn_config.page_size
-            num_kv_heads, total_indices = trtllm_sparse_attn_indices.shape
+        # Apply interleave operation to trtllm indices
+        # For each head, multiply indices by page_size and expand to include all tokens in each page
+        page_size = sparse_attn_config_trtllm.page_size
+        num_kv_heads, total_indices = trtllm_sparse_attn_indices.shape
 
-            interleaved_indices_list = []
-            for head_idx in range(num_kv_heads):
-                head_indices = trtllm_sparse_attn_indices[
-                    head_idx]  # Shape: [total_indices]
+        interleaved_indices_list = []
+        for head_idx in range(num_kv_heads):
+            head_indices = trtllm_sparse_attn_indices[
+                head_idx]  # Shape: [total_indices]
 
-                page_starts = head_indices * page_size  # Shape: [total_indices]
+            page_starts = head_indices * page_size  # Shape: [total_indices]
 
-                expanded_indices = []
-                for page_start in page_starts:
-                    page_indices = torch.arange(page_start,
-                                                page_start + page_size,
-                                                device=page_starts.device)
-                    expanded_indices.append(page_indices)
+            expanded_indices = []
+            for page_start in page_starts:
+                page_indices = torch.arange(page_start,
+                                            page_start + page_size,
+                                            device=page_starts.device)
+                expanded_indices.append(page_indices)
 
-                head_interleaved = torch.cat(expanded_indices, dim=0)
+            head_interleaved = torch.cat(expanded_indices, dim=0)
 
-                # Slice to match vanilla shape
-                target_length = vanilla_sparse_attn_indices.shape[1]
-                head_interleaved = head_interleaved[:target_length]
+            # Slice to match vanilla shape
+            target_length = vanilla_sparse_attn_indices.shape[1]
+            head_interleaved = head_interleaved[:target_length]
 
-                interleaved_indices_list.append(head_interleaved)
+            interleaved_indices_list.append(head_interleaved)
 
-            # Stack all heads
-            trtllm_sparse_attn_indices = torch.stack(interleaved_indices_list,
-                                                     dim=0)
+        # Stack all heads
+        trtllm_sparse_attn_indices = torch.stack(interleaved_indices_list,
+                                                 dim=0)
 
         assert trtllm_sparse_attn_indices.shape == vanilla_sparse_attn_indices.shape, \
             f"Shape mismatch: {trtllm_sparse_attn_indices.shape} vs {vanilla_sparse_attn_indices.shape}"
@@ -609,7 +616,7 @@ def test_sparse_attn_predict(batch_size, num_contexts, use_interleave):
         print(f"Average overlap ratio: {avg_overlap_ratio:.4f}")
         print(f"Per-batch average: {batch_overlap_details}")
 
-        threshold = 0.94 if not use_interleave else 0.97
+        threshold = 0.94
         assert avg_overlap_ratio >= threshold, \
             f"Indices overlap ratio {avg_overlap_ratio:.4f} is too low (< {threshold})"
     else:
@@ -632,10 +639,8 @@ if __name__ == '__main__':
 
     # Unit tests for sparse_attn_predict
     print("\n=== Testing sparse_attn_predict ===")
-    test_sparse_attn_predict(1, 0, True)  # bs=1, generation only
-    test_sparse_attn_predict(2, 0, True)  # bs=2, generation only
-    test_sparse_attn_predict(5, 3, True)  # bs=5, mixed (3 ctx + 2 gen)
-    test_sparse_attn_predict(3, 0,
-                             False)  # bs=3, generation only, no interleave
-    test_sparse_attn_predict(
-        6, 2, False)  # bs=6, mixed (2 ctx + 4 gen), no interleave
+    test_sparse_attn_predict(1, 0)  # bs=1, generation only
+    test_sparse_attn_predict(2, 0)  # bs=2, generation only
+    test_sparse_attn_predict(3, 0)  # bs=3, generation only
+    test_sparse_attn_predict(5, 3)  # bs=5, mixed (3 ctx + 2 gen)
+    test_sparse_attn_predict(6, 2)  # bs=6, mixed (2 ctx + 4 gen)
