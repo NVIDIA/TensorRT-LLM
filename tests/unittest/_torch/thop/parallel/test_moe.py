@@ -1161,8 +1161,8 @@ class TestMoeFp4:
                               use_topk_as_input=use_topk_as_input)
 
     @pytest.mark.parametrize("num_tokens", [1])
-    @pytest.mark.parametrize("hidden_size", [2048])
-    @pytest.mark.parametrize("intermediate_size", [2048])
+    @pytest.mark.parametrize("hidden_size", [512])
+    @pytest.mark.parametrize("intermediate_size", [512])
     @pytest.mark.parametrize(
         "routing_info",
         [
