@@ -2,7 +2,6 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import cute_dsl_nvfp4_grouped_gemm_ref
-from tensorrt_llm._torch.modules.fused_moe.routing import RoutingMethodType
 from tensorrt_llm._torch.utils import unswizzle_sf
 from tensorrt_llm._utils import get_sm_version
 
@@ -45,13 +44,9 @@ def test_moe_sort(num_tokens: int, top_k: int, ep_size: int, tile_size: int):
         token_final_scales=token_final_scales,
         num_experts=num_experts,
         top_k=top_k,
-        n_group=1,
-        topk_group=1,
         local_expert_offset=0,
         local_num_experts=num_local_experts,
-        routed_scaling_factor=1.0,
         tile_tokens_dim=tile_size,
-        routing_method_type=RoutingMethodType.DeepSeekV3,
     )
 
     num_tokens_per_expert = torch.bincount(token_selected_experts.flatten(), minlength=num_experts)
