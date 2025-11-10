@@ -908,11 +908,18 @@ class PyTorchModelEngine(ModelEngine):
                 self.attn_runtime_features.cache_reuse
                 or self.attn_runtime_features.chunked_prefill)
         cache_indirection = self.cache_indirection_attention if self.attn_backend.Metadata is TrtllmAttentionMetadata else None
-        if self.model.model_config.pretrained_config.num_attention_heads is not None:
-            if self.model.model_config.pretrained_config.num_key_value_heads is not None:
-                num_heads_per_kv = self.model.model_config.pretrained_config.num_attention_heads // self.model.model_config.pretrained_config.num_key_value_heads
+        num_attention_heads = getattr(self.model.model_config.pretrained_config,
+                                      'num_attention_heads', None)
+        if num_attention_heads is not None:
+            num_key_value_heads = getattr(
+                self.model.model_config.pretrained_config,
+                'num_key_value_heads', None)
+            if num_key_value_heads is not None:
+                num_heads_per_kv = num_attention_heads // num_key_value_heads
             else:
                 num_heads_per_kv = 1
+        else:
+            num_heads_per_kv = 1
         if kv_cache_manager is None:
             return self.attn_backend.Metadata(
                 max_num_requests=self.batch_size,
