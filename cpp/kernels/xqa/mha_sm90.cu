@@ -268,7 +268,7 @@ CUBIN_EXPORT __device__ constexpr uint32_t smemSize = sizeof(SharedMem);
 static_assert(smemSize < kMAX_SMEM_SIZE);
 #endif
 
-constexpr uint32_t nbQLdWarps = (needInputCvt || (swapAB && CACHE_ELEM_ENUM == 0)) ? nbIOWarps - 2 : 1;
+constexpr uint32_t nbQLdWarps = (needInputCvt || (!swapAB && CACHE_ELEM_ENUM == 0)) ? nbIOWarps - 2 : 1;
 constexpr uint32_t nbQLdThrds = warp_size * nbQLdWarps;
 
 #if CACHE_ELEM_ENUM == 0 || CACHE_ELEM_ENUM == 2
