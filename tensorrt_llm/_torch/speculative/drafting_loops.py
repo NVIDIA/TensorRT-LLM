@@ -10,7 +10,6 @@ for speculation can be launched as a single CUDA graph.
 
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import List, Tuple
 
 import torch
 
@@ -195,13 +194,25 @@ class LinearDraftingLoopWrapper(BaseDraftingLoopWrapper):
 class TreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
 
     def __init__(self, max_draft_len: int, max_total_draft_tokens: int,
-                 draft_model: torch.nn.Module):
+                 max_batch_size: int, draft_model: torch.nn.Module):
         super().__init__()
         self.draft_model = draft_model
         self.config = self.draft_model.config
         self.model_config = self.draft_model.model_config
         self.max_draft_len = max_draft_len
         self.max_total_draft_tokens = max_total_draft_tokens
+        self.max_batch_size = max_batch_size
+        self.vocab_size = self.draft_model.vocab_size_padded
+
+        self.draft_tokens_buffer = torch.zeros(
+            (max_batch_size, max_total_draft_tokens + 1),
+            dtype=torch.int64,
+            device='cuda')
+        self.position_ids_buffer = torch.zeros(
+            (max_batch_size, max_total_draft_tokens + 1),
+            dtype=torch.int64,
+            device='cuda')
+        # self.draft_logits_buffer = torch.empty((max_batch_size, max_total_draft_tokens + 1, self.vocab_size), dtype=torch.float, device='cuda')
 
     def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor,
                 attn_metadata: AttentionMetadata, spec_metadata: SpecMetadata,
@@ -221,88 +232,70 @@ class TreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
         vocab_size = logits.shape[-1]
         logits = logits[spec_metadata.gather_ids]  # [batch_size, vocab_size]
 
-        new_draft_tokens = [
-            self.sample(draft_layer_idx=0,
-                        batch_size=batch_size,
-                        logits=logits,
-                        spec_tree_manager=spec_tree_manager)
-        ]
-        assert logits.shape == (batch_size, vocab_size)
-        # When using tree decoding, the first layer's draft tokens are all from the root node's logits.
-        # Therefore, we repeat the logits and collect them.
-        draft_logits = [
-            logits.repeat(spec_tree_manager.top_k_list_cuda[0],
-                          1).reshape(batch_size, -1, vocab_size)
-        ]
+        # new_draft_tokens: [batch_size * max_top_k]
+        new_draft_tokens = self.sample(draft_layer_idx=0,
+                                       batch_size=batch_size,
+                                       logits=logits,
+                                       spec_tree_manager=spec_tree_manager)
 
+        self.extract_real_draft_tokens(cur_draft_idx=0,
+                                       new_draft_tokens=new_draft_tokens,
+                                       attn_metadata=attn_metadata,
+                                       spec_tree_manager=spec_tree_manager)
+
+        return_draft_logits = None
         with save_metadata_state(attn_metadata, spec_metadata):
             batch_size = attn_metadata.num_seqs
 
-            new_input_ids, new_position_ids = self.prepare_for_generation(
-                prepare_for_layer_idx=
-                1,  # prepare for the 1st layer, start from the 0-th layer.
-                new_draft_tokens=new_draft_tokens,
-                attn_metadata=attn_metadata,
-                spec_metadata=spec_metadata,
-                spec_tree_manager=spec_tree_manager,
-                position_ids=position_ids)
+            self.prepare_for_generation(attn_metadata=attn_metadata,
+                                        spec_metadata=spec_metadata,
+                                        spec_tree_manager=spec_tree_manager,
+                                        position_ids=position_ids)
 
             for layer_idx in range(1, self.max_draft_len):
-                logits = self.draft_model.forward(input_ids=new_input_ids,
-                                                  position_ids=new_position_ids,
-                                                  attn_metadata=attn_metadata,
-                                                  spec_metadata=spec_metadata,
-                                                  return_context_logits=True)
-                if spec_tree_manager is not None:
-                    # if using tree decoding, only the last 'num_tokens_has_children' tokens need to be sampled.
-                    logits = logits[spec_metadata.gather_ids]
+                # input_ids: [batch_size * (max_total_draft_tokens + 1)]
+                # position_ids: [batch_size * (max_total_draft_tokens + 1)]
+                # logits: [batch_size * (max_total_draft_tokens + 1), vocab_size]
+                logits = self.draft_model.forward(
+                    input_ids=self.draft_tokens_buffer[:batch_size, :].reshape(
+                        -1),
+                    position_ids=self.position_ids_buffer[:batch_size, :].
+                    reshape(-1),
+                    attn_metadata=attn_metadata,
+                    spec_metadata=spec_metadata,
+                    return_context_logits=True)
 
-                new_draft_tokens.append(
-                    self.sample(draft_layer_idx=layer_idx,
-                                batch_size=batch_size,
-                                logits=logits,
-                                spec_tree_manager=spec_tree_manager))
+                # new_draft_tokens: [batch_size * (max_total_draft_tokens + 1) * max_top_k]
+                new_draft_tokens = self.sample(
+                    draft_layer_idx=layer_idx,
+                    batch_size=batch_size,
+                    logits=logits,
+                    spec_tree_manager=spec_tree_manager)
+                # Keep updating
+                self.extract_real_draft_tokens(
+                    cur_draft_idx=layer_idx,
+                    new_draft_tokens=new_draft_tokens,
+                    attn_metadata=attn_metadata,
+                    spec_tree_manager=spec_tree_manager)
 
-                # logits: [batch_size * num_tokens_has_children, vocab_size]
-                cur_top_k_list = spec_tree_manager.top_k_list_cuda[
-                    layer_idx]  # [num_tokens_has_children]
-                cur_top_k_list = cur_top_k_list.repeat(
-                    batch_size)  # [batch_size * num_tokens_has_children]
-                logits = torch.repeat_interleave(
-                    logits, repeats=cur_top_k_list,
-                    dim=0)  # [batch_size * num_tokens_has_children, vocab_size]
-                logits = logits.reshape(
-                    batch_size, -1, vocab_size
-                )  # [batch_size, next_layer_draft_tokens, vocab_size]
-                draft_logits.append(logits)
+                if layer_idx == self.max_draft_len - 1:
+                    return_draft_logits = logits
 
-                if layer_idx < spec_tree_manager.max_draft_len - 1:
-                    new_input_ids, new_position_ids = self.prepare_for_generation(
-                        prepare_for_layer_idx=layer_idx + 1,
-                        new_draft_tokens=new_draft_tokens,
-                        attn_metadata=attn_metadata,
-                        spec_metadata=spec_metadata,
-                        spec_tree_manager=spec_tree_manager,
-                        position_ids=new_position_ids)
-
-        # new_draft_tokens: List[torch.Tensor], each tensor is of shape [batch_size, num_draft_tokens_each_layers]
-        # len(new_draft_tokens) == max_draft_len
-        return_new_draft_tokens = torch.cat(
-            new_draft_tokens, dim=-1)  # [batch_size, max_total_draft_tokens]
+        # self.draft_tokens_buffer[:batch_size, :]: [batch_size, max_total_draft_tokens + 1]
+        # return_new_draft_tokens: [max_total_draft_tokens, batch_size]
         return_new_draft_tokens = torch.transpose(
-            return_new_draft_tokens, 0,
-            1)  # [max_total_draft_tokens, batch_size]
+            self.draft_tokens_buffer[:batch_size, :-1], 0, 1)
 
-        # draft_logits: List[torch.Tensor], each tensor is of shape [batch_size, num_draft_tokens_each_layers, vocab_size]
-        return_draft_logits = torch.cat(
-            draft_logits,
-            dim=1)  # [batch_size, max_total_draft_tokens, vocab_size]
-        return_draft_logits = torch.transpose(
-            return_draft_logits, 0,
-            1)  # [max_total_draft_tokens, batch_size, vocab_size]
+        # return_draft_logits: [batch_size, max_total_draft_tokens + 1, vocab_size] -> [max_total_draft_tokens, batch_size, vocab_size]
+        return_draft_logits = return_draft_logits.reshape(
+            batch_size, self.max_total_draft_tokens + 1, vocab_size)
+        return_draft_logits = torch.transpose(return_draft_logits[:, :-1, :], 0,
+                                              1)
 
-        assert return_new_draft_tokens.shape[0] == return_draft_logits.shape[0]
-        assert return_new_draft_tokens.shape[1] == return_draft_logits.shape[1]
+        assert return_new_draft_tokens.shape == (self.max_total_draft_tokens,
+                                                 batch_size)
+        assert return_draft_logits.shape == (self.max_total_draft_tokens,
+                                             batch_size, vocab_size)
 
         return {
             "new_draft_tokens": return_new_draft_tokens,
@@ -314,221 +307,209 @@ class TreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
                spec_tree_manager: SpecTreeManager) -> torch.Tensor:
         # TODO: inject the sampler here so we can support non-greedy
 
-        indices = torch.topk(logits, k=spec_tree_manager.max_top_k,
-                             dim=-1).indices  # [num_logits, max_top_k]
-        top_k_list = spec_tree_manager.top_k_list_cuda[
-            draft_layer_idx]  # [num_tokens_has_children]
-        top_k_list = top_k_list.repeat(
-            batch_size
-        )  # [batch_size * num_tokens_has_children] (num_logits == batch_size * num_tokens_has_children)
-        rows = torch.arange(top_k_list.shape[0],
-                            dtype=torch.int32,
-                            device=logits.device)
-        row_indices = torch.repeat_interleave(rows, repeats=top_k_list)
-        col_indices = torch.cat([torch.arange(c) for c in top_k_list])
-        tokens = indices[
-            row_indices,
-            col_indices]  # [batch_size * num_draft_tokens_this_layer]
+        # for draft_layer_idx == 0, logits is of shape [batch_size, vocab_size]
+        # for draft_layer_idx > 0, logits is of shape [batch_size * (max_total_draft_tokens + 1), vocab_size]
+        indices = torch.topk(
+            logits, k=spec_tree_manager.max_top_k, dim=-1
+        ).indices  # [batch_size, max_top_k] or [batch_size * max_total_draft_tokens, max_top_k]
+        tokens = indices.reshape(-1)
 
         if hasattr(self.draft_model.model, "d2t"):
             d2t = self.draft_model.model.d2t.data
             tokens = tokens + d2t[tokens]
 
-        # reshape, for better gather later.
-        tokens = tokens.reshape(batch_size,
-                                -1)  # [batch_size, num_draft_tokens_this_layer]
-
         return tokens
 
-    def prepare_for_generation(
-            self, prepare_for_layer_idx: int,
-            new_draft_tokens: List[torch.Tensor],
-            attn_metadata: AttentionMetadata, spec_metadata: SpecMetadata,
-            spec_tree_manager: SpecTreeManager,
-            position_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def extract_real_draft_tokens(self, cur_draft_idx: int,
+                                  new_draft_tokens: torch.Tensor,
+                                  attn_metadata: AttentionMetadata,
+                                  spec_tree_manager: SpecTreeManager):
         '''
-        Prepare the inputs for the next draft layer. What we need to prepare are:
-            1) inputs_ids
-            2) position_ids
-            3) attn_metadata
-                3.1) kv_lens_cuda
-                3.2) _seq_lens, _seq_lens_cuda
-                3.3) host_request_types
-                3.4) num_contexts
-                3.5) use_spec_decoding
-                3.6) spec_decoding_position_offsets
-                3.7) spec_decoding_packed_mask
-                3.8) spec_decoding_generation_lengths
-            4) spec_metadata
-                4.1) num_tokens
-                4.2) gather_ids
-                4.3) hidden_states_read_indices, hidden_states_write_indices
-                4.4) is_first_draft
-
+        Extract the real draft tokens from the new draft tokens to self.draft_tokens_buffer.
         '''
-
         batch_size = attn_metadata.num_seqs
-        next_layer_gen_len_per_req = spec_tree_manager.spec_dec_generation_lengths_for_drafter_model[
-            prepare_for_layer_idx - 1]
+        # After the first drafter layer, new_draft_tokens: [batch_size * max_top_k]
+        # For other drafter layers, new_draft_tokens: [batch_size * (max_total_draft_tokens + 1) * max_top_k]
+        if cur_draft_idx == 0:
+            assert new_draft_tokens.shape[0] == (batch_size *
+                                                 spec_tree_manager.max_top_k)
+        else:
+            assert new_draft_tokens.shape[0] == (
+                batch_size * (self.max_total_draft_tokens + 1) *
+                spec_tree_manager.max_top_k)
 
-        # 1) Prepare the inputs_ids
-        all_draft_tokens = torch.cat(
-            new_draft_tokens,
-            dim=-1)  # [batch_size, num_draft_tokens_has_been_generated]
-        cur_tokens_gather_idx = spec_tree_manager.tokens_gather_idx[
-            prepare_for_layer_idx -
-            1] - 1  # shape: [next_layer_gen_len_per_req]. -1 is toshift the root node
-        new_input_ids = all_draft_tokens[:, cur_tokens_gather_idx].reshape(
-            -1)  # [batch_size * next_layer_gen_len_per_req]
+        # reshape the new_draft_tokens to [batch_size, -1, spec_tree_manager.max_top_k]
+        new_draft_tokens = new_draft_tokens.reshape(batch_size, -1,
+                                                    spec_tree_manager.max_top_k)
 
+        # If using cuda graph, we need to use a torch op to implement this logic
+        if attn_metadata.is_cuda_graph:
+            torch.ops.trtllm.extract_real_draft_tokens_op(
+                new_draft_tokens, self.draft_tokens_buffer, spec_tree_manager.
+                tokens_gather_idx_for_drafter_model[cur_draft_idx],
+                spec_tree_manager.top_k_list_cuda[cur_draft_idx],
+                spec_tree_manager.draft_tokens_indices_cumsum, cur_draft_idx,
+                batch_size, self.max_draft_len, self.max_total_draft_tokens,
+                spec_tree_manager.max_top_k)
+        else:
+            # 1) Gather the real tokens processed by this layer
+            process_tokens = new_draft_tokens[:, spec_tree_manager.
+                                              tokens_gather_idx_for_drafter_model[
+                                                  cur_draft_idx], :]  # [batch_size, num_tokens_process_this_layer, max_top_k]
+            process_tokens = process_tokens.reshape(
+                -1, spec_tree_manager.max_top_k
+            )  # [batch_size * num_tokens_process_this_layer, max_top_k]
+
+            # 2) Gather the real draft tokens samples by these processed tokens' logits
+            top_k_list = spec_tree_manager.top_k_list_cuda[
+                cur_draft_idx].repeat(
+                    batch_size)  # [batch_size * num_tokens_process_this_layer]
+            assert top_k_list.shape[0] == process_tokens.shape[0]
+
+            # [batch_size * num_tokens_process_this_layer, spec_tree_manager.max_top_k]
+            col_indices = torch.arange(
+                spec_tree_manager.max_top_k,
+                device=new_draft_tokens.device).unsqueeze(0).repeat(
+                    top_k_list.shape[0], 1)
+
+            mask = col_indices < top_k_list.unsqueeze(
+                1
+            )  # [batch_size * num_tokens_process_this_layer, spec_tree_manager.max_top_k]
+
+            real_new_draft_tokens = process_tokens[
+                mask]  # [batch_size * sum(spec_tree_manager.top_k_list_cuda[cur_draft_idx])]
+            real_new_draft_tokens = real_new_draft_tokens.reshape(
+                batch_size, -1
+            )  # [batch_size, sum(spec_tree_manager.top_k_list_cuda[cur_draft_idx])]
+
+            self.draft_tokens_buffer[:batch_size, spec_tree_manager.
+                                     draft_tokens_indices_cumsum[cur_draft_idx]:
+                                     spec_tree_manager.
+                                     draft_tokens_indices_cumsum[
+                                         cur_draft_idx +
+                                         1]] = real_new_draft_tokens[:, :]
+
+    def prepare_for_generation(self, attn_metadata: AttentionMetadata,
+                               spec_metadata: SpecMetadata,
+                               spec_tree_manager: SpecTreeManager,
+                               position_ids: torch.Tensor):
+        '''
+        Prepare the inputs for the subsequent draft layers.
+        Note: Except for the 0th drafter layer, in each subsequent drafter layer,
+        we take 'max_total_drafter_tokens + 1' draft tokens as input.
+        Only the first part of the draft tokens is meaningful, and the later tokens can be regarded as padding
+        until we continuously write the correct value.
+
+        This introduces additional redundant computation, but it makes it compatible with cuda graphs.
+
+        What we need to prepare are:
+            1) position_ids
+            2) attn_metadata
+                2.1) kv_lens_cuda
+                2.2) _seq_lens, _seq_lens_cuda
+                2.3) host_request_types
+                2.4) num_contexts
+                2.5) use_spec_decoding
+                2.6) spec_decoding_position_offsets
+                2.7) spec_decoding_packed_mask
+                2.8) spec_decoding_generation_lengths
+            3) spec_metadata
+                3.1) num_tokens
+                3.2) hidden_states_read_indices, hidden_states_write_indices
+                3.3) is_first_draft
+        '''
+        batch_size = attn_metadata.num_seqs
+
+        # 1) Prepare the position_ids
         num_accepted_draft_tokens = spec_metadata.num_accepted_draft_tokens[:
                                                                             batch_size]
         seq_lens = attn_metadata.seq_lens_cuda[:batch_size]
-        last_tokens_idx = None
+        # Calculate last accepted token indices
+        last_tokens_idx = torch.cumsum(
+            seq_lens, dim=0,
+            dtype=torch.long) - seq_lens + num_accepted_draft_tokens
+        position_start_idx = position_ids[0,
+                                          last_tokens_idx] + 1  # [batch_size]
+        self.position_ids_buffer[:batch_size, :-1] = position_start_idx.unsqueeze(
+            1) + spec_tree_manager.spec_dec_position_offsets[0, 1:].unsqueeze(
+                0) - 1  # exclude the root node
 
-        # 2) Prepare the position_ids
-        if prepare_for_layer_idx == 1:
-            last_tokens_idx = torch.cumsum(
-                seq_lens, dim=0,
-                dtype=torch.long) - seq_lens + num_accepted_draft_tokens
-            new_position_ids = position_ids[0,
-                                            last_tokens_idx] + 1  # [batch_size]
-            assert new_position_ids.shape == (batch_size, )
-            # For the layer_idx == 1, the input tokens are both expanded from root node.
-            # Therefore, their position ids are the same.
-            new_position_ids = torch.repeat_interleave(
-                new_position_ids, repeats=next_layer_gen_len_per_req,
-                dim=0)  # [batch_size * next_layer_gen_len_per_req]
-        else:
-            position_ids = position_ids.reshape(batch_size, -1)
-            position_ids_start_idx = position_ids[:, 0]  # [batch_size]
-            assert position_ids_start_idx.shape == (batch_size, )
+        # 2) Prepare the attn_metadata
+        ## 2.1) kv_lens_cuda
+        attn_metadata.kv_lens_cuda[:
+                                   batch_size] -= seq_lens - num_accepted_draft_tokens - 1
+        attn_metadata.kv_lens_cuda[:batch_size] += (
+            self.max_total_draft_tokens + 1)
 
-            new_position_ids = spec_tree_manager.spec_dec_position_offsets_for_drafter_model[
-                prepare_for_layer_idx - 1].unsqueeze(0).repeat(
-                    batch_size, 1)  # [batch_size, num_next_layer_input_tokens]
-            new_position_ids = new_position_ids + position_ids_start_idx.unsqueeze(
-                1)  # [batch_size, num_next_layer_input_tokens]
-            new_position_ids = new_position_ids.reshape(
-                -1)  # [batch_size * num_next_layer_input_tokens]
-
-        assert new_position_ids.shape == new_input_ids.shape
-
-        # 3) Prepare the attn_metadata
-        ## 3.1) kv_lens_cuda
-        if prepare_for_layer_idx == 1:
-            attn_metadata.kv_lens_cuda[:
-                                       batch_size] -= seq_lens - num_accepted_draft_tokens - 1
-            attn_metadata.kv_lens_cuda[:
-                                       batch_size] += next_layer_gen_len_per_req
-        else:
-            prev_layer_gen_len_per_req = spec_tree_manager.spec_dec_generation_lengths_for_drafter_model[
-                prepare_for_layer_idx - 2]
-            attn_metadata.kv_lens_cuda[:
-                                       batch_size] -= prev_layer_gen_len_per_req  # reset to original length before the drafter loop.
-            attn_metadata.kv_lens_cuda[:
-                                       batch_size] += next_layer_gen_len_per_req
-
-        # FIXME, update without D2H
-        # Not updating kv_lens here has no effect on the calculation results, but only affects the calculation performance.
-        # attn_metadata.kv_lens[:batch_size] = attn_metadata.kv_lens_cuda[:batch_size].cpu()
-
-        ## 3.2) _seq_lens, _seq_lens_cuda
-        attn_metadata._seq_lens[:batch_size].fill_(next_layer_gen_len_per_req)
+        ## 2.2) _seq_lens, _seq_lens_cuda
+        attn_metadata._seq_lens[:batch_size].fill_(self.max_total_draft_tokens +
+                                                   1)
         attn_metadata._seq_lens_cuda[:batch_size].fill_(
-            next_layer_gen_len_per_req)
+            self.max_total_draft_tokens + 1)
         attn_metadata.on_update()
 
-        # Update once is enough
-        if prepare_for_layer_idx == 1:
-            ## 3.3) host_request_types
-            attn_metadata.host_request_types[:attn_metadata.num_contexts].fill_(
-                1)
-            ## 3.4) num_contexts
-            attn_metadata.num_contexts = 0
-            ## 3.5) use_spec_decoding
-            attn_metadata.use_spec_decoding = True
+        ## 2.3) host_request_types
+        attn_metadata.host_request_types[:attn_metadata.num_contexts].fill_(1)
 
-        # NOTE: For the spec_decoding_position_offsets, spec_decoding_packed_mask, spec_decoding_generation_lengths,
-        # They are stored contiguously without padding. This is why we need to reshape them here.
-        # They're initially allocated a size of [batch_size, max_total_draft_tokens + 1].
-        # However, within the drafter, the number of draft tokens input to each drafter layer is less than max_total_draft_tokens,
-        # so we only need to use part of the buffer. We need to store them contiguously.
-        ## 3.6) spec_decoding_position_offsets
-        attn_metadata.spec_decoding_position_offsets.reshape(
-            -1
-        )[:batch_size *
-          next_layer_gen_len_per_req] = spec_tree_manager.spec_dec_position_offsets_for_drafter_model[
-              prepare_for_layer_idx - 1].repeat(batch_size)
+        ## 2.4) num_contexts
+        attn_metadata.num_contexts = 0
 
-        ## 3.7) spec_decoding_packed_mask
-        attn_metadata.spec_decoding_packed_mask.reshape(
-            -1, attn_metadata.spec_decoding_packed_mask.size(-1)
-        )[:batch_size *
-          next_layer_gen_len_per_req, :] = spec_tree_manager.spec_dec_packed_mask_for_drafter_model[
-              prepare_for_layer_idx - 1].repeat(batch_size, 1)
+        ## 2.5) use_spec_decoding
+        attn_metadata.use_spec_decoding = True
 
-        ## 3.8) spec_decoding_generation_lengths
+        ## 2.6) spec_decoding_position_offsets
+        ### attn_metadata.spec_decoding_position_offsets: [max_num_requests, max_total_draft_tokens + 1]
+        attn_metadata.spec_decoding_position_offsets[:batch_size, :self.
+                                                     max_total_draft_tokens] = spec_tree_manager.spec_dec_position_offsets[
+                                                         0, 1:].unsqueeze(
+                                                             0
+                                                         ) - 1  # exclude the root node
+        attn_metadata.spec_decoding_position_offsets[:batch_size, self.
+                                                     max_total_draft_tokens] = 0  # padding
+
+        ## 2.7) spec_decoding_packed_mask
+        ### attn_metadata.spec_decoding_packed_mask: [max_num_requests, max_total_draft_tokens + 1, math.ceil((max_total_draft_tokens + 1) / 32)]
+        attn_metadata.spec_decoding_packed_mask[:
+                                                batch_size, :, :] = spec_tree_manager.spec_dec_packed_mask_for_drafter_model
+
+        ## 2.8) spec_decoding_generation_lengths
+        ### attn_metadata.spec_decoding_generation_lengths: [max_num_requests]
         attn_metadata.spec_decoding_generation_lengths[:
-                                                       batch_size] = next_layer_gen_len_per_req
+                                                       batch_size] = self.max_total_draft_tokens + 1
 
-        # 4) spec_metadata
-        ## 4.1) num_tokens
-        spec_metadata.num_tokens = batch_size * next_layer_gen_len_per_req
+        # 3) Update spec_metadata
+        ## 3.1) num_tokens
+        spec_metadata.num_tokens = batch_size * (self.max_total_draft_tokens +
+                                                 1)
+        ## 3.2) hidden_states_read_indices, hidden_states_write_indices
+        ### spec_metadata.hidden_states_read_indices: [self.max_num_tokens]
+        ### spec_metadata.hidden_states_write_indices: [self.max_num_tokens]
+        old_write_indices = spec_metadata.hidden_states_write_indices
+        start_idx = old_write_indices[
+            last_tokens_idx]  # [batch_size], already take the accepted tokens into account.
 
-        ## 4.2) gather_ids
-        offset = torch.arange(batch_size, device=position_ids.device
-                              ) * next_layer_gen_len_per_req  # [batch_size]
-        spec_metadata.gather_ids = spec_tree_manager.logits_gather_idx[
-            prepare_for_layer_idx - 1].unsqueeze(0).repeat(
-                batch_size, 1)  # [1, num_tokens_has_children]
-        spec_metadata.gather_ids = spec_metadata.gather_ids + offset.unsqueeze(
-            1)  # [batch_size, num_tokens_has_children]
-        spec_metadata.gather_ids = spec_metadata.gather_ids.reshape(
-            -1)  # [batch_size * num_tokens_has_children]
+        ### shape: [batch_size, self.max_total_draft_tokens + 1]
+        hidden_states_read_indices_offset = spec_tree_manager.hidden_states_read_indices_offset_for_drafter_model.repeat(
+            batch_size).reshape(batch_size, self.max_total_draft_tokens + 1)
+        hidden_states_read_indices_offset = hidden_states_read_indices_offset + start_idx.unsqueeze(
+            1)
+        spec_metadata.hidden_states_read_indices[:batch_size * (
+            self.max_total_draft_tokens +
+            1)] = hidden_states_read_indices_offset.reshape(-1)
 
-        ## 4.3) hidden_states_read_indices, hidden_states_write_indices
-        if isinstance(spec_metadata, Eagle3SpecMetadata):
-            start_idx = None
-            if prepare_for_layer_idx == 1:
-                old_write_indices = spec_metadata.hidden_states_write_indices
-                start_idx = old_write_indices[
-                    last_tokens_idx]  # [batch_size], already take the accepted tokens into account.
-            else:
-                prev_layer_gen_len_per_req = spec_tree_manager.spec_dec_generation_lengths_for_drafter_model[
-                    prepare_for_layer_idx - 2]
-                last_tokens_idx = torch.arange(
-                    batch_size,
-                    device=position_ids.device) * prev_layer_gen_len_per_req
-                old_read_indices = spec_metadata.hidden_states_read_indices
-                start_idx = old_read_indices[last_tokens_idx]  # [batch_size]
+        hidden_states_write_offset = torch.arange(
+            1, self.max_total_draft_tokens + 1 + 1,
+            device=position_ids.device).unsqueeze(0).repeat(
+                batch_size, 1) + start_idx.unsqueeze(1)
+        spec_metadata.hidden_states_write_indices[:batch_size * (
+            self.max_total_draft_tokens +
+            1)] = hidden_states_write_offset.reshape(-1)
 
-            start_idx = start_idx.unsqueeze(1)  # [batch_size, 1]
+        ## 3.3) is_first_draft
+        spec_metadata.eagle3_resource_manager.is_first_draft = False
+        spec_metadata.is_first_draft = False
 
-            start_read_idx = start_idx + spec_tree_manager.hidden_states_read_indices_offset_for_drafter_model[
-                prepare_for_layer_idx -
-                1]  # [batch_size, next_layer_gen_len_per_req]
-            spec_metadata.hidden_states_read_indices[:batch_size *
-                                                     next_layer_gen_len_per_req].copy_(
-                                                         start_read_idx.reshape(
-                                                             -1)
-                                                     )  # [batch_size * next_layer_gen_len_per_req]
-
-            start_write_idx = start_idx + spec_tree_manager.hidden_states_write_indices_offset_for_drafter_model[
-                prepare_for_layer_idx -
-                1]  # [batch_size, next_layer_gen_len_per_req]
-            spec_metadata.hidden_states_write_indices[:batch_size *
-                                                      next_layer_gen_len_per_req].copy_(
-                                                          start_write_idx.
-                                                          reshape(-1)
-                                                      )  # [batch_size * next_layer_gen_len_per_req]
-
-            if prepare_for_layer_idx == 1:
-                ## 4.4) is_first_draft
-                spec_metadata.eagle3_resource_manager.is_first_draft = False
-                spec_metadata.is_first_draft = False
-
-        return new_input_ids, new_position_ids
+        return
 
     def load_weights_from_target_model(self,
                                        target_model: torch.nn.Module) -> None:

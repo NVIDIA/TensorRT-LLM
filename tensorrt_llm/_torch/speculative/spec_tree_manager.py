@@ -53,29 +53,20 @@ class SpecTreeManager:
     # Gather the required draft tokens from all currently generated draft tokens as the input of the next draft layer.
     # Only the nodes has child(s) this layer and all their parents nodes will be gathered.
     # Device tensor. len(tokens_gather_idx) == max_draft_len - 1. Each element is a tensor with shape [num_tokens_for_next_layer].
-    tokens_gather_idx: list[torch.Tensor] = None
+    tokens_gather_idx_for_drafter_model: list[torch.Tensor] = None
 
     # Gather the required logits from all currently generated logits.
     # Device tensor. len(tokens_gather_idx) == max_draft_len - 1.
     logits_gather_idx: list[torch.Tensor] = None
 
     # The packed mask for the drafter model's attention (i.e., xqa).
-    # Device tensor. len(spec_dec_packed_mask_for_drafter_model) == max_draft_len - 1. Each element is a tensor with shape [max_total_draft_tokens + 1, math.ceil((self.max_total_draft_tokens + 1) / 32)].
-    spec_dec_packed_mask_for_drafter_model: list[torch.Tensor] = None
+    spec_dec_packed_mask_for_drafter_model: torch.Tensor = None
 
-    # The position offset for the drafter model's attention (i.e., xqa).
-    # Device tensor. len(spec_dec_position_offsets_for_drafter_model) == max_draft_len - 1. Each element is a tensor with shape [max_total_draft_tokens + 1].
-    spec_dec_position_offsets_for_drafter_model: list[torch.Tensor] = None
+    # The read indices offset for the drafter model.
+    hidden_states_read_indices_offset_for_drafter_model: torch.Tensor = None
 
-    # The generation length for the drafter model's attention (i.e., xqa).
-    # Device tensor. shape: [max_draft_len]
-    spec_dec_generation_lengths_for_drafter_model: torch.Tensor = None
-
-    # The read/write indices offset for the drafter model. len(hidden_states_write_indices_offset_for_drafter_model) == max_draft_len - 1. Each element is a tensor with shape [num_tokens_for_next_layer].
-    hidden_states_write_indices_offset_for_drafter_model: list[
-        torch.Tensor] = None
-    hidden_states_read_indices_offset_for_drafter_model: list[
-        torch.Tensor] = None
+    # The write back start indices for the drafter tokens between different draft layers.
+    draft_tokens_indices_cumsum: torch.Tensor = None
 
     def __init__(self, max_num_requests: int, use_dynamic_tree: bool,
                  max_total_draft_tokens: int, max_draft_len: int,
@@ -201,106 +192,66 @@ class SpecTreeManager:
         # 8) Copy top_k_list_cuda
         self.top_k_list_cuda = []
         for i in range(self.max_draft_len):
-            self.top_k_list_cuda.append(self.top_k_list[i].to(device='cuda'))
+            self.top_k_list_cuda.append(self.top_k_list[i].to(
+                device='cuda', dtype=torch.int32))
         # Compute the max top k value for all draft layers
         self.max_top_k = -1
         for top_k_list in self.top_k_list_cuda:
             self.max_top_k = max(self.max_top_k, top_k_list.max().item())
 
-        # 9) Compute the tokens_gather_idx, include the root node
-        self.tokens_gather_idx = []
+        # 9) Compute the tokens_gather_idx for the drafter model
+        self.tokens_gather_idx_for_drafter_model = []
+        self.tokens_gather_idx_for_drafter_model.append(
+            torch.tensor([0], dtype=torch.int32,
+                         device='cuda'))  # For the 1-st drafer layer
+
         for cur_layer_nodes in self.nodes_list_per_layer[1:]:
-            parents_set = set()
-            for node in cur_layer_nodes:
-                if len(child_nodes_list[node]) > 0:
-                    parents_set.update(
-                        self.spec_dec_mask_matrix[0][node].nonzero().reshape(
-                            -1)[1:].tolist())
-            self.tokens_gather_idx.append(
-                torch.tensor(list(parents_set),
-                             dtype=torch.int32,
-                             device='cuda'))
+            tmp_gather_list = [(node - 1) for node in cur_layer_nodes
+                               if len(child_nodes_list[node]) > 0]
+            self.tokens_gather_idx_for_drafter_model.append(
+                torch.tensor(tmp_gather_list, dtype=torch.int32, device='cuda'))
 
-        # 10) Compute the logits_gather_idx
-        self.logits_gather_idx = []
-        for nodes_per_layer, cur_gather_idx in zip(
-                self.nodes_list_per_layer[1:], self.tokens_gather_idx):
-            num_nodes_has_children = 0
-            for node in nodes_per_layer:
-                if len(child_nodes_list[node]) > 0:
-                    num_nodes_has_children += 1
-            cur_input_tokens_len = cur_gather_idx.shape[0]
-            assert cur_input_tokens_len >= num_nodes_has_children
-            self.logits_gather_idx.append(
-                torch.tensor(range(
-                    cur_input_tokens_len - num_nodes_has_children,
-                    cur_input_tokens_len),
-                             dtype=torch.int32,
-                             device='cuda'))
+        # 10) Compute the draft_tokens_indices_cumsum for the drafter model
+        num_nodes_per_layer = [0]
+        num_nodes_per_layer.extend(
+            [len(node_list) for node_list in self.nodes_list_per_layer[1:]])
+        from itertools import accumulate
+        self.draft_tokens_indices_cumsum = torch.tensor(list(
+            accumulate(num_nodes_per_layer)),
+                                                        dtype=torch.int32,
+                                                        device='cuda')
 
-        for cur_gather_idx in self.tokens_gather_idx:
-            tmp_logits_gather_idx = []
-            for idx, node in enumerate(cur_gather_idx.tolist()):
-                if len(child_nodes_list[node]) > 0:
-                    tmp_logits_gather_idx.append(idx)
-            self.logits_gather_idx.append(
-                torch.tensor(tmp_logits_gather_idx,
-                             dtype=torch.int32,
-                             device='cuda'))
-
-        # 11) Compute the spec_dec_packed_mask_for_drafter_model
-        self.spec_dec_packed_mask_for_drafter_model = []
-        for cur_gather_idx in self.tokens_gather_idx:
-            tmp_mask_matrix = self.spec_dec_mask_matrix[0][
-                cur_gather_idx, :][:, cur_gather_idx]
-            tmp_packed_mask = torch.zeros(
-                (1, cur_gather_idx.shape[0],
-                 math.ceil((self.max_total_draft_tokens + 1) / 32)),
-                dtype=torch.int32,
-                device='cuda')
-            self.compute_spec_dec_packed_mask(tmp_mask_matrix.unsqueeze(0),
-                                              tmp_packed_mask)
-            self.spec_dec_packed_mask_for_drafter_model.append(
-                tmp_packed_mask.squeeze(0))
-
-        # 12) Compute the spec_dec_position_offsets_for_drafter_model
-        self.spec_dec_position_offsets_for_drafter_model = []
-        for cur_gather_idx in self.tokens_gather_idx:
-            self.spec_dec_position_offsets_for_drafter_model.append(
-                torch.tensor(
-                    self.spec_dec_position_offsets[0][cur_gather_idx.tolist()] -
-                    1,  # shift the root node
-                    dtype=torch.int32,
-                    device='cuda'))
-
-        # 13) Compute the spec_dec_generation_lengths_for_drafter_model
-        self.spec_dec_generation_lengths_for_drafter_model = torch.tensor(
-            [
-                cur_gather_idx.shape[0]
-                for cur_gather_idx in self.tokens_gather_idx
-            ],
+        # 11) Compute the spec_dec_packed_mask_for_drafter_model for the drafter model
+        self.spec_dec_packed_mask_for_drafter_model = torch.zeros(
+            (1, self.max_total_draft_tokens + 1,
+             math.ceil((self.max_total_draft_tokens + 1) / 32)),
             dtype=torch.int32,
             device='cuda')
+        tmp_mask_matrix = torch.zeros_like(
+            self.spec_dec_mask_matrix[0]
+        ).unsqueeze(
+            0
+        )  # [1, self.max_total_draft_tokens + 1, self.max_total_draft_tokens + 1]
+        tmp_mask_matrix[0, :-1, :-1] = self.spec_dec_mask_matrix[0, 1:, 1:]
+        self.compute_spec_dec_packed_mask(
+            tmp_mask_matrix, self.spec_dec_packed_mask_for_drafter_model)
 
-        # 14) Compute the hidden_states_write_indices_for_drafter_model
-        self.hidden_states_write_indices_offset_for_drafter_model = []
-        for cur_gather_idx in self.tokens_gather_idx:
-            self.hidden_states_write_indices_offset_for_drafter_model.append(
-                torch.tensor(cur_gather_idx.tolist(),
-                             dtype=torch.int32,
-                             device='cuda'))
-
-        # 15) Compute the hidden_states_read_indices_for_drafter_model
-        self.hidden_states_read_indices_offset_for_drafter_model = []
-        for cur_gather_idx in self.tokens_gather_idx:
-            tmp_parent_nodes = []
-            for node in cur_gather_idx:
-                tmp_parent_nodes.append(
-                    self.spec_dec_mask_matrix[0][node].nonzero().reshape(
-                        -1).tolist()[-2])
-            self.hidden_states_read_indices_offset_for_drafter_model.append(
-                torch.tensor(tmp_parent_nodes, dtype=torch.int32,
-                             device='cuda'))
+        self.hidden_states_read_indices_offset_for_drafter_model = torch.zeros(
+            (self.max_total_draft_tokens + 1), dtype=torch.int32, device='cuda')
+        tmp_parent_nodes = []
+        for choice in self.eagle_choices:
+            if len(choice) == 1:
+                tmp_parent_nodes.append(0)
+            else:
+                tmp_parent_nodes.append(self.index_mapping_set[str(
+                    choice[:-1])])
+        self.hidden_states_read_indices_offset_for_drafter_model[:self.
+                                                                 max_total_draft_tokens] = torch.tensor(
+                                                                     tmp_parent_nodes,
+                                                                     dtype=torch
+                                                                     .int32,
+                                                                     device=
+                                                                     'cuda')
 
     # Get the eagle_paths
     def get_eagle_paths(self, tree_idx=0):
@@ -322,32 +273,30 @@ class SpecTreeManager:
 
     # Compute the packed mask according to the mask matrix
     def compute_spec_dec_packed_mask(self, mask_matrix, packed_mask):
-        # mask_matrix: shape: [num_trees, num_process_tokens, num_process_tokens]
-        # packed_mask: shape: [num_trees, num_process_tokens, math.ceil((max_total_draft_tokens + 1) / 32)]
+        # mask_matrix: shape: [num_trees, max_total_draft_tokens + 1, max_total_draft_tokens + 1]
+        # packed_mask: shape: [num_trees, max_total_draft_tokens + 1, math.ceil((max_total_draft_tokens + 1) / 32)]
         assert mask_matrix.ndim == 3
         assert packed_mask.ndim == 3
-        num_trees = mask_matrix.size(0)
-        num_process_tokens = mask_matrix.size(1)
-        assert mask_matrix.shape == (num_trees, num_process_tokens,
-                                     num_process_tokens)
-        assert packed_mask.shape == (num_trees, num_process_tokens,
+
+        num_trees = mask_matrix.shape[0]
+        assert mask_matrix.shape == (num_trees, self.max_total_draft_tokens + 1,
+                                     self.max_total_draft_tokens + 1)
+        assert packed_mask.shape == (num_trees, self.max_total_draft_tokens + 1,
                                      math.ceil(
                                          (self.max_total_draft_tokens + 1) /
                                          32))
-        if num_process_tokens == 0:
-            return
 
         num_blocks = math.ceil((self.max_total_draft_tokens + 1) / 32)
         int_tensor = mask_matrix.reshape(
-            -1, num_process_tokens
-        )  # shape: [num_trees * num_process_tokens, num_process_tokens]
+            -1, self.max_total_draft_tokens + 1
+        )  # shape: [num_trees * (self.max_total_draft_tokens + 1), self.max_total_draft_tokens + 1]
         packed_mask = packed_mask.reshape(
-            -1,
-            num_blocks)  # shape: [num_trees * num_process_tokens, num_blocks]
+            -1, num_blocks
+        )  # shape: [num_trees * (self.max_total_draft_tokens + 1), num_blocks]
 
         for block_idx in range(num_blocks):
             start_idx = block_idx * 32
-            end_idx = min(start_idx + 32, num_process_tokens)
+            end_idx = min(start_idx + 32, self.max_total_draft_tokens + 1)
             if end_idx < start_idx:
                 break
             block_bits = int_tensor[:, start_idx:end_idx]
@@ -359,7 +308,8 @@ class SpecTreeManager:
             block_value = torch.sum(block_bits * weight, dim=-1)
             packed_mask[:, block_idx] = block_value
 
-        packed_mask = packed_mask.reshape(num_trees, num_process_tokens,
+        packed_mask = packed_mask.reshape(num_trees,
+                                          self.max_total_draft_tokens + 1,
                                           num_blocks)
 
     # Print the tree info
@@ -376,19 +326,15 @@ class SpecTreeManager:
             print(f"Spec dec pack mask: {self.spec_dec_packed_mask}")
             print("Auxiliary buffers for the static tree.")
             print(f"TopK list cuda: {self.top_k_list_cuda}")
-            print(f"Tokens gather idx: {self.tokens_gather_idx}")
+            print(
+                f"Tokens gather idx for drafter model: {self.tokens_gather_idx_for_drafter_model}"
+            )
+            print(
+                f"Draft tokens indices cumsum: {self.draft_tokens_indices_cumsum}"
+            )
             print(f"Logits gather idx: {self.logits_gather_idx}")
             print(
                 f"Spec dec packed mask for drafter model: {self.spec_dec_packed_mask_for_drafter_model}"
-            )
-            print(
-                f"Spec dec position offsets for drafter model: {self.spec_dec_position_offsets_for_drafter_model}"
-            )
-            print(
-                f"Spec dec generation lengths for drafter model: {self.spec_dec_generation_lengths_for_drafter_model}"
-            )
-            print(
-                f"Hidden states write indices offset for drafter model: {self.hidden_states_write_indices_offset_for_drafter_model}"
             )
             print(
                 f"Hidden states read indices offset for drafter model: {self.hidden_states_read_indices_offset_for_drafter_model}"

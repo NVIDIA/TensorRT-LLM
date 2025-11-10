@@ -371,7 +371,8 @@ def create_py_executor(
                     if use_tree_drafter:
                         return TreeDraftingLoopWrapper(
                             spec_config.max_draft_len,
-                            spec_config.max_total_draft_tokens, model)
+                            spec_config.max_total_draft_tokens, max_batch_size,
+                            model)
                     else:
                         return LinearDraftingLoopWrapper(
                             spec_config.max_draft_len,
