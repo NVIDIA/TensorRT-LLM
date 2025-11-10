@@ -26,6 +26,7 @@ from tensorrt_llm.llmapi import (AutoDecodingConfig, CudaGraphConfig,
                                  EagleDecodingConfig, KvCacheConfig, MoeConfig,
                                  MTPDecodingConfig, NGramDecodingConfig,
                                  SamplingParams, TorchCompileConfig)
+from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (get_device_count, get_device_memory, llm_models_root,
@@ -33,7 +34,8 @@ from ..conftest import (get_device_count, get_device_memory, llm_models_root,
                         skip_post_blackwell, skip_pre_ada, skip_pre_blackwell,
                         skip_pre_hopper, skip_ray)
 from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
-                            JsonModeEval, LlmapiAccuracyTestHarness)
+                            JsonModeEval, LlmapiAccuracyTestHarness,
+                            LongBenchV2)
 
 
 class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
@@ -4016,3 +4018,126 @@ class TestSeedOss_36B(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=dict(
                               apply_chat_template=True,
                               chat_template_kwargs=chat_template_kwargs))
+
+
+@skip_pre_blackwell
+@pytest.mark.skip_less_device_memory(183000)
+@pytest.mark.timeout(28800)
+class TestDeepSeekR1LongBenchV2(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "DeepSeek-R1-0528"
+
+    @pytest.mark.skip_less_mpi_world_size(8)
+    def test_fp8_8gpus(self):
+        original_model_dir = f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-0528"
+        if not os.path.exists(original_model_dir):
+            pytest.skip(f"Model directory {original_model_dir} does not exist")
+
+        temp_dir = None
+        try:
+            # Create modified model directory using LongBenchV2 static method
+            temp_dir = LongBenchV2.create_modified_model_dir(original_model_dir)
+
+            # Configure model settings
+            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
+                                            enable_block_reuse=True,
+                                            enable_partial_reuse=False,
+                                            dtype="fp8")
+
+            cuda_graph_config = CudaGraphConfig(enable_padding=True,
+                                                max_batch_size=32)
+
+            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3)
+
+            moe_config = MoeConfig(backend='DEEPGEMM', max_num_tokens=32000)
+
+            pytorch_config = dict(cuda_graph_config=cuda_graph_config,
+                                  kv_cache_config=kv_cache_config,
+                                  speculative_config=mtp_config,
+                                  moe_config=moe_config,
+                                  enable_chunked_prefill=True,
+                                  enable_autotuner=True,
+                                  print_iter_log=True)
+
+            # Create LLM instance and evaluate
+            with LLM(temp_dir,
+                     tensor_parallel_size=8,
+                     moe_expert_parallel_size=8,
+                     max_num_tokens=32000,
+                     max_batch_size=32,
+                     **pytorch_config) as llm:
+
+                # Use LongBenchV2 task for evaluation
+                task = LongBenchV2(
+                    self.MODEL_NAME,
+                    dataset_path=f"{llm_models_root()}/zai-org/LongBench-v2",
+                    length="medium",
+                    max_len=1280000,
+                    max_input_length=1280000,
+                    max_output_length=32000)
+
+                sampling_params = SamplingParams(max_tokens=32000)
+
+                task.evaluate(llm, sampling_params=sampling_params)
+
+        finally:
+            # Cleanup temporary files
+            if temp_dir and os.path.exists(temp_dir):
+                import shutil
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                logger.info(f"Cleaned up temporary directory: {temp_dir}")
+
+    @pytest.mark.skip_less_mpi_world_size(4)
+    def test_nvfp4_4gpus(self):
+        original_model_dir = f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-0528-FP4"
+        temp_dir = None
+        try:
+            # Create modified model directory using LongBenchV2 static method
+            temp_dir = LongBenchV2.create_modified_model_dir(original_model_dir)
+
+            # Configure model settings (no MOE config for FP4 version)
+            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
+                                            enable_block_reuse=True,
+                                            enable_partial_reuse=False,
+                                            dtype="fp8")
+
+            cuda_graph_config = CudaGraphConfig(enable_padding=True,
+                                                max_batch_size=32)
+
+            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3)
+
+            pytorch_config = dict(cuda_graph_config=cuda_graph_config,
+                                  kv_cache_config=kv_cache_config,
+                                  speculative_config=mtp_config,
+                                  enable_chunked_prefill=True,
+                                  enable_autotuner=True,
+                                  print_iter_log=True)
+
+            # Create LLM instance and evaluate
+            with LLM(temp_dir,
+                     tensor_parallel_size=4,
+                     moe_expert_parallel_size=4,
+                     max_num_tokens=32000,
+                     max_batch_size=32,
+                     **pytorch_config) as llm:
+
+                assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+
+                # Use LongBenchV2 task for evaluation
+                task = LongBenchV2(
+                    "DeepSeek-R1-0528-FP4",
+                    dataset_path=f"{llm_models_root()}/zai-org/LongBench-v2",
+                    length="medium",
+                    max_len=1280000,
+                    max_input_length=1280000,
+                    max_output_length=32000)
+
+                sampling_params = SamplingParams(max_tokens=32000)
+
+                task.evaluate(llm, sampling_params=sampling_params)
+
+        finally:
+            # Cleanup temporary files
+            if temp_dir and os.path.exists(temp_dir):
+                import shutil
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                logger.info(f"Cleaned up temporary directory: {temp_dir}")
