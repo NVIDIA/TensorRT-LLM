@@ -121,8 +121,7 @@ def install_tensorrt_llm():
             ['python3', '-c', 'import torch; print(torch.__version__)'],
             capture_output=True,
             text=True,
-            check=True
-        )
+            check=True)
         torch_version = torch_version_result.stdout.strip()
 
         if torch_version:
@@ -130,13 +129,17 @@ def install_tensorrt_llm():
             constraint_filename = "torch-constraint.txt"
             with open(constraint_filename, "w") as f:
                 f.write(f"torch=={torch_version}\n")
-            print(f"Created {constraint_filename} to constrain torch to version {torch_version}.")
+            print(
+                f"Created {constraint_filename} to constrain torch to version {torch_version}."
+            )
 
             # Modify install command to use the constraint
             install_command += f" -c {constraint_filename}"
         else:
-             # This case is unlikely if the subprocess call succeeds
-             print("Could not determine installed torch version. Installing without constraint.")
+            # This case is unlikely if the subprocess call succeeds
+            print(
+                "Could not determine installed torch version. Installing without constraint."
+            )
 
     except (subprocess.CalledProcessError, FileNotFoundError):
         # This handles cases where python3 fails or 'import torch' raises an error.
