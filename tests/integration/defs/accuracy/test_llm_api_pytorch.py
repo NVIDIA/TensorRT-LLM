@@ -65,6 +65,7 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
         # When stream_interval < TLLM_STREAM_INTERVAL_THRESHOLD, hf incremental detokenization is used.
         # When stream_interval >= TLLM_STREAM_INTERVAL_THRESHOLD, trtllm implemented incremental detokenization is used.
         # The behavior is due to perf considerations, while both paths need to be tested.
+        pytest.fail("Emma Test")
         with LLM(f"{llm_models_root()}/nvfp4-quantized/Meta-Llama-3.1-8B",
                  stream_interval=stream_interval) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
