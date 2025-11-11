@@ -51,7 +51,6 @@ def save_metadata_state(attn_metadata: AttentionMetadata,
     if attn_metadata.is_cuda_graph:
         assert spec_metadata.is_cuda_graph
         num_tokens = spec_metadata.num_tokens
-        gather_ids = spec_metadata.gather_ids
         if isinstance(spec_metadata, Eagle3SpecMetadata):
             read_indices = spec_metadata.hidden_states_read_indices[:
                                                                     batch_size].clone(
@@ -68,7 +67,6 @@ def save_metadata_state(attn_metadata: AttentionMetadata,
         attn_metadata.on_update()
         if attn_metadata.is_cuda_graph:
             spec_metadata.num_tokens = num_tokens
-            spec_metadata.gather_ids = gather_ids
             if isinstance(spec_metadata, Eagle3SpecMetadata):
                 spec_metadata.hidden_states_read_indices[:batch_size].copy_(
                     read_indices)

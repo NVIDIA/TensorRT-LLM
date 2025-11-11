@@ -1122,26 +1122,28 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.is_spec_decoding_enabled:
             # These buffers are accessed more like removing input padding,
             # rather than using max_total_draft_tokens + 1 as the offset between different requests.
-            self.spec_decoding_position_offsets = torch.empty(
-                [self.max_num_requests, max_total_draft_tokens + 1],
-                dtype=torch.int,
-                device='cuda',
-            )
+            if self.spec_decoding_position_offsets is None:
+                self.spec_decoding_position_offsets = torch.empty(
+                    [self.max_num_requests, max_total_draft_tokens + 1],
+                    dtype=torch.int,
+                    device='cuda',
+                )
 
-            self.spec_decoding_packed_mask = torch.empty(
-                [
-                    self.max_num_requests, max_total_draft_tokens + 1,
-                    math.ceil((max_total_draft_tokens + 1) / 32)
-                ],
-                dtype=torch.int,
-                device='cuda',
-            )
-
-            self.spec_decoding_generation_lengths = torch.empty(
-                [self.max_num_requests],
-                dtype=torch.int,
-                device='cuda',
-            )
+            if self.spec_decoding_packed_mask is None:
+                self.spec_decoding_packed_mask = torch.empty(
+                    [
+                        self.max_num_requests, max_total_draft_tokens + 1,
+                        math.ceil((max_total_draft_tokens + 1) / 32)
+                    ],
+                    dtype=torch.int,
+                    device='cuda',
+                )
+            if self.spec_decoding_generation_lengths is None:
+                self.spec_decoding_generation_lengths = torch.empty(
+                    [self.max_num_requests],
+                    dtype=torch.int,
+                    device='cuda',
+                )
 
             is_target_model = not getattr(spec_metadata, 'is_draft_model',
                                           False)

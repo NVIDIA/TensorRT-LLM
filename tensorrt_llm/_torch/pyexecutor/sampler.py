@@ -823,78 +823,63 @@ class TorchSampler(Sampler):
             spec_tree_manager: SpecTreeManager. which contains the tree structure and other meta information
                                of the tree.
         """
-        # handle the drafter model request
-        # For the drafter model, we do not execute the tree verification logic,
-        # but only add the draft tokens of the previous layer.
-        if get_draft_token_length(request) == 0:
-            cur_draft_layer_idx = spec_tree_manager.cur_draft_layer_idx
+        # handle the target model request
+        # For the target model, we will do the tree verification logic.
+        seq_slot = request.py_seq_slot
+        assert seq_slot is not None
+        eagle_paths = spec_tree_manager.get_eagle_paths(seq_slot)
 
-            # TODO: For the last layer of the dynamic tree, we need to resampling all the draft tokens.
-            cur_layer_num_nodes = sum(spec_tree_manager.get_top_k_list(cur_draft_layer_idx))
-            for i in range(cur_layer_num_nodes):
-                add_token(request, new_tokens_list, beam=0, step=i)
-            return 0
-        else:
-            # handle the target model request
-            # For the target model, we will do the tree verification logic.
-            seq_slot = request.py_seq_slot
-            assert seq_slot is not None
-            eagle_paths = spec_tree_manager.get_eagle_paths(seq_slot)
+        all_draft_tokens = torch.tensor(request.py_draft_tokens)  # [max_total_draft_tokens]
+        all_target_tokens = new_tokens_tensor[:, seq_slot, :].squeeze(
+            -1
+        )  # [max_total_draft_tokens]
+        assert all_target_tokens.shape[0] == spec_tree_manager.max_total_draft_tokens + 1
 
-            all_draft_tokens = torch.tensor(request.py_draft_tokens)  # [max_total_draft_tokens]
-            all_target_tokens = new_tokens_tensor[:, seq_slot, :].squeeze(
-                -1
-            )  # [max_total_draft_tokens]
-            assert all_target_tokens.shape[0] == spec_tree_manager.max_total_draft_tokens + 1
+        longest_accepted_len = 0
+        longest_match_path_idx = -1
 
-            longest_accepted_len = 0
-            longest_match_path_idx = -1
+        for path_idx, path in enumerate(eagle_paths):
+            path_exclude_root = (
+                path[1:] - 1
+            )  # [max_draft_len], '[1:]' since the new_tokens does not contain the root node.
+            # '-1' is the index shift after exclude the root node.
+            draft_tokens_indices = path_exclude_root[path_exclude_root >= 0]  # [max_draft_len]
+            target_tokens_indices = path[path >= 0]  # [max_draft_len + 1]
 
-            for path_idx, path in enumerate(eagle_paths):
-                path_exclude_root = (
-                    path[1:] - 1
-                )  # [max_draft_len], '[1:]' since the new_tokens does not contain the root node.
-                # '-1' is the index shift after exclude the root node.
-                draft_tokens_indices = path_exclude_root[path_exclude_root >= 0]  # [max_draft_len]
-                target_tokens_indices = path[path >= 0]  # [max_draft_len + 1]
+            assert len(draft_tokens_indices) == len(target_tokens_indices) - 1
 
-                assert len(draft_tokens_indices) == len(target_tokens_indices) - 1
+            cur_draft_tokens = all_draft_tokens[draft_tokens_indices]
+            cur_target_tokens = all_target_tokens[target_tokens_indices]
 
-                cur_draft_tokens = all_draft_tokens[draft_tokens_indices]
-                cur_target_tokens = all_target_tokens[target_tokens_indices]
+            cur_accepted_len = torch.cumprod(
+                (cur_draft_tokens == cur_target_tokens[:-1]).int(), dim=-1
+            ).sum()
 
-                cur_accepted_len = torch.cumprod(
-                    (cur_draft_tokens == cur_target_tokens[:-1]).int(), dim=-1
-                ).sum()
+            # Accepted one more token from the target model.
+            cur_accepted_len += 1
 
-                # Accepted one more token from the target model.
-                cur_accepted_len += 1
+            if cur_accepted_len > longest_accepted_len:
+                longest_accepted_len = cur_accepted_len
+                longest_match_path_idx = path_idx
 
-                if cur_accepted_len > longest_accepted_len:
-                    longest_accepted_len = cur_accepted_len
-                    longest_match_path_idx = path_idx
+        assert longest_accepted_len >= 1
+        if longest_accepted_len == 1:
+            assert longest_match_path_idx == 0
 
-            request.py_num_accepted_draft_tokens_indices = []
-            if longest_accepted_len == 0:
-                # No draft tokens are accepted.
-                # Take the top-1 token of the first layer as the next new token.
-                add_token(request, new_tokens_list, beam=0, step=0)
-                return 0
-            else:
-                # Take the longest accepted path as the next new token.
-                num_accepted_draft_tokens = 0
-                for idx in eagle_paths[longest_match_path_idx][:longest_accepted_len]:
-                    add_token(request, new_tokens_list, beam=0, step=cast(int, idx.item()))
-                    num_accepted_draft_tokens += 1
-                    if self.finish_if_reason(
-                        request, finish_reasons, step=num_accepted_draft_tokens
-                    ):
-                        break
+        # Take the longest accepted path as the next new token.
+        num_accepted_draft_tokens = 0
+        for idx in eagle_paths[longest_match_path_idx][:longest_accepted_len]:
+            add_token(request, new_tokens_list, beam=0, step=cast(int, idx.item()))
+            num_accepted_draft_tokens += 1
+            if self.finish_if_reason(request, finish_reasons, step=num_accepted_draft_tokens):
+                break
 
-                request.py_num_accepted_draft_tokens_indices = eagle_paths[longest_match_path_idx][
-                    1:longest_accepted_len
-                ].tolist()  # exclude the root node
-                return num_accepted_draft_tokens - 1
+        assert num_accepted_draft_tokens <= longest_accepted_len
+
+        request.py_num_accepted_draft_tokens_indices = eagle_paths[longest_match_path_idx][
+            1:num_accepted_draft_tokens
+        ].tolist()  # exclude the root node
+        return num_accepted_draft_tokens - 1
 
     @torch.inference_mode()
     def _process_draft_tokens_rejection_sampling(
