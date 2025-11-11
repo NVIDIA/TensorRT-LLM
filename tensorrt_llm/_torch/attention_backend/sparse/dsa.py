@@ -570,8 +570,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.max_gen_seq_len = 0
 
         # Because the fp8_paged_mqa_logits only supports seq_len == 1 or 2, so it cannot support
-        # MTP > 1. To haddle this, when MTP > 1, we flatten the q tensor and expand the kv_lens and
+        # MTP > 1. To handle this, when MTP > 1, we flatten the q tensor and expand the kv_lens and
         # block_table for to use the fp8_paged_mqa_logits.
+        # TODO: remove this when fp8_paged_mqa_logits supports MTP > 1.
         if self.max_draft_tokens > 1:
             # Expand kv_lens_cuda (only generation)
             num_tokens = self.num_generations * (1 + self.max_draft_tokens)
@@ -589,18 +590,19 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             if self.kv_cache_manager is not None:
                 block_ids = self.kv_cache_manager.get_batch_cache_indices(
                     self.request_ids)
-                for i in range(self.num_contexts, len(block_ids)):
-                    for j in range(1 + self.max_draft_tokens):
-                        self.host_block_table_expanded[
-                            (i - self.num_contexts) *
-                            (1 + self.max_draft_tokens) +
-                            j, :len(block_ids[i])].copy_(
-                                torch.tensor(block_ids[i],
-                                             dtype=torch.int32,
-                                             device='cpu'))
-                self.block_table_expanded[:num_tokens].copy_(
-                    self.host_block_table_expanded[:num_tokens],
-                    non_blocking=True)
+                gen_block_ids = block_ids[self.num_contexts:]
+                if len(gen_block_ids) > 0:
+                    # Find max length and create padded tensor
+                    max_len = max(len(bid) for bid in gen_block_ids)
+                    gen_block_tensor = self.host_indexer_k_cache_block_offsets[
+                        self.num_contexts:self.num_seqs, :max_len]
+                    expanded_blocks = gen_block_tensor.repeat_interleave(
+                        1 + self.max_draft_tokens, dim=0)
+                    self.host_block_table_expanded[:num_tokens, :max_len].copy_(
+                        expanded_blocks, non_blocking=True)
+                    self.block_table_expanded[:num_tokens].copy_(
+                        self.host_block_table_expanded[:num_tokens],
+                        non_blocking=True)
 
         # Prepare metadata for indexer
         Indexer.prepare(metadata=self)
@@ -866,13 +868,14 @@ class Indexer(nn.Module):
         if num_generations > 0:
             # Prepare schedule metadata for fp8_paged_mqa_logits
             # This is a preprocessing step that computes scheduling information for the kernel
-            gen_seq_lens = metadata.kv_lens_cuda_runtime[
-                num_contexts:num_contexts + num_generations]
-            scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
-                gen_seq_lens, tokens_per_block, metadata.num_sms)
-            metadata.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer,
-                                                     non_blocking=True)
-            if metadata.max_draft_tokens > 1:
+            if metadata.max_draft_tokens <= 1:
+                gen_seq_lens = metadata.kv_lens_cuda_runtime[
+                    num_contexts:num_contexts + num_generations]
+                scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
+                    gen_seq_lens, tokens_per_block, metadata.num_sms)
+                metadata.scheduler_metadata_buffer.copy_(
+                    scheduler_metadata_buffer, non_blocking=True)
+            else:
                 # Expand schedule metadata buffer (only generation)
                 num_tokens = metadata.num_generations * (
                     1 + metadata.max_draft_tokens)
