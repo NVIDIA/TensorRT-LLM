@@ -40,6 +40,16 @@ environment:
   work_dir: /lustre/fsw/portfolios/coreai/users/fredric/tensorrt_llm/examples/disaggregated/slurm/benchmark
 profiling:
   nsys_on: false
+accuracy:
+  enable_accuracy_test: false  # Set to true to enable accuracy evaluation
+  model: "local-completions"  # Model type for lm_eval
+  tasks: "gsm8k"  # Evaluation tasks (comma-separated)
+  num_concurrent: 512  # Number of concurrent requests
+  max_retries: 3  # Maximum number of retries
+  tokenized_requests: false  # Whether to use tokenized requests
+  timeout: 1200  # Request timeout in seconds
+  max_gen_toks: 256  # Maximum generation tokens
+  max_length: 4096  # Maximum sequence length
 worker_config:
   eplb_num_slots: 0
   gen:
