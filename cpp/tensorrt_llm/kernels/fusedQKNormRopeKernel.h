@@ -42,7 +42,8 @@ void launchFusedQKNormRope(
     float low,    // threshold for high frequency
     float high,   // threshold for low frequency
     float attention_factor, // attention_factor applied on cos and sin
-    cudaStream_t stream);   // CUDA stream
+    cudaStream_t stream, // CUDA stream
+    bool is_qk_norm);   
 
 } // namespace kernels
 } // namespace tensorrt_llm
