@@ -22,7 +22,7 @@ from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from .runner_base import BalanceMethod
+from .runner_interface import BalanceMethod
 
 
 def ceil_div(a, b):

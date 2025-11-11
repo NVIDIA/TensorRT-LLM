@@ -12,7 +12,7 @@ from tensorrt_llm._utils import mpi_rank, mpi_world_size
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
 
-from .runner_base import BalanceMethod, RunnerBase
+from .runner_interface import BalanceMethod, RunnerBase
 from .runner_utils import RunnerMixin, ceil_div
 
 

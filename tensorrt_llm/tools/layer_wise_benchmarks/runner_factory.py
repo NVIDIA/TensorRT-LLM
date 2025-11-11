@@ -4,7 +4,7 @@ from .deepseekv3_runner import DeepSeekV3Runner
 from .qwen3_next_runner import Qwen3NextRunner
 
 
-def get_runner_cls(pretrained_model_name_or_path: str):
+def get_runner_cls(pretrained_model_name_or_path: str) -> type:
     pretrained_config = load_pretrained_config(pretrained_model_name_or_path)
     return {
         "deepseek_v3": DeepSeekV3Runner,

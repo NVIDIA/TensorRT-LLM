@@ -8,7 +8,7 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
 
-from .runner_base import RunnerBase
+from .runner_interface import RunnerBase
 from .runner_utils import RunnerMixin
 
 

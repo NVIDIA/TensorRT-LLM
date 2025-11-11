@@ -8,8 +8,7 @@ import yaml
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tensorrt_llm._utils import local_mpi_rank, mpi_rank, mpi_world_size
-from tensorrt_llm.tools.layer_wise_benchmarks.runner_base import BalanceMethod
-from tensorrt_llm.tools.layer_wise_benchmarks.runner_factory import get_runner_cls
+from tensorrt_llm.tools.layer_wise_benchmarks import BalanceMethod, get_runner_cls
 
 
 def comma_separated_ints(s):
