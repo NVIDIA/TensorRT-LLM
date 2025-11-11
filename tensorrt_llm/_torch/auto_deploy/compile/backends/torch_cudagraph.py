@@ -175,7 +175,7 @@ class CapturedGraph(nn.Module):
 
         # retrieve output from buffer, cut to batch size, and unflatten
         bs = args_batched[0].shape[0]
-        out_flat = [o_b[:bs].detach().clone() for o_b in self._out_buffer_flat]
+        out_flat = [o_b[:bs] for o_b in self._out_buffer_flat]
         return self._out_spec.unflatten(out_flat)
 
 

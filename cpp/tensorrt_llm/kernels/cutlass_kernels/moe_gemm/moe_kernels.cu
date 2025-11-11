@@ -2307,6 +2307,8 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                     decltype(block_scaling_type)::value>, // Geglu
                 &doActivationKernel<T, GemmOutputType, ScaleBiasType, SwigluBiasAdaptor,
                     decltype(block_scaling_type)::value>, // SwigluBias
+                &doActivationKernel<T, GemmOutputType, ScaleBiasType, IdentityAdaptor<cutlass::epilogue::thread::Relu2>,
+                    decltype(block_scaling_type)::value>, // Relu2
                 &doActivationKernel<T, GemmOutputType, ScaleBiasType,
                     IdentityAdaptor<cutlass::epilogue::thread::Identity>,
                     decltype(block_scaling_type)::value> // Identity

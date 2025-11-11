@@ -162,6 +162,7 @@ def prepare_flashinfer_metadata(
     pages_per_seq: torch.Tensor,
     slot_idx: torch.Tensor,
     page_size: int,
+    chunk_size: int,
 ) -> List[torch.Tensor]:
     """Prepare metadata for flashinfer attention.
 
@@ -213,7 +214,7 @@ def prepare_flashinfer_metadata(
 # As SequenceInfo._get_sanitized_num_sequences could break in fake mode
 @prepare_flashinfer_metadata.register_fake
 def prepare_flashinfer_metadata_fake(
-    position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size
+    position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size, chunk_size
 ):
     seq_len = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
     qo_indptr = torch.empty(len(seq_len) + 1, dtype=seq_len.dtype, device=seq_len.device)

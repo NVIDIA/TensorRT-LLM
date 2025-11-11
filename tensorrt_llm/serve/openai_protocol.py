@@ -396,6 +396,12 @@ ChatCompletionContentPartParam = Union[OpenAIChatCompletionContentPartParam,
 
 class CustomChatCompletionMessageParam(TypedDict, total=False):
     """Enables custom roles in the Chat Completion API."""
+
+    # This is so custom fields not in any of the `ChatCompletionMessage<XYZ>Param` defined by OpenAI
+    # are still allowed.
+    # Examples include: assistant messages with `reasoning` / `reasoning_content`.
+    __pydantic_config__ = ConfigDict(extra="allow")  # type: ignore
+
     role: Required[str]
     """The role of the message's author."""
 

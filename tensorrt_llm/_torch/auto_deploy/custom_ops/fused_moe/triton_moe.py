@@ -11,6 +11,8 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from tensorrt_llm._utils import nvtx_range
+
 
 @triton.jit
 def _write_zeros_to_output(
@@ -304,6 +306,7 @@ def _default_kernel_config(M: int, E: int, N: int, K: int, top_k: int) -> dict:
         }
 
 
+@nvtx_range("triton_moe_pack_routed_tokens")
 def _pack_routed_tokens(
     topk_ids: torch.Tensor,
     M: int,

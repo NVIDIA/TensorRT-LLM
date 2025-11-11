@@ -291,6 +291,7 @@ def prepare_fused_mha_metadata(
     pages_per_seq: torch.Tensor,
     slot_idx: torch.Tensor,
     page_size: int,
+    chunk_size: int,
 ) -> List[torch.Tensor]:
     # TODO: maybe use slot_idx instead of pages_per_seq??
     num_seq = SequenceInfo._get_sanitized_num_sequences(position_ids, seq_len)
@@ -308,7 +309,7 @@ def prepare_fused_mha_metadata(
 # SequenceInfo._get_sanitized_num_sequences could break in fake mode
 @prepare_fused_mha_metadata.register_fake
 def prepare_fused_mha_metadata_fake(
-    position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size
+    position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size, chunk_size
 ):
     num_seq = SequenceInfo._get_sanitized_num_sequences(position_ids, seq_len)
     return (

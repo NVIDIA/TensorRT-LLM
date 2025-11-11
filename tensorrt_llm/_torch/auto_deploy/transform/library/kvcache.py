@@ -8,7 +8,12 @@ import torch.nn as nn
 from pydantic import Field
 from torch.fx import GraphModule, Node
 
-from ...custom_ops.attention_interface import AttentionDescriptor, AttentionRegistry, Constant
+from ...custom_ops.attention_interface import (
+    AttentionDescriptor,
+    AttentionRegistry,
+    CacheConfig,
+    Constant,
+)
 from ...distributed.common import all_gather_object, get_world_size
 from ...distributed.common import is_initialized as is_distributed_initialized
 from ...models.factory import ModelFactory
@@ -66,6 +71,9 @@ class InsertCachedAttentionConfig(TransformConfig):
     """Configuration for the insert cached attention transform."""
 
     backend: Optional[str] = Field(default=None, description="The attention backend to use.")
+    cache_config: CacheConfig = Field(
+        default_factory=CacheConfig, description="The custom cache configuration to use."
+    )
 
 
 @TransformRegistry.register("insert_cached_attention")
@@ -137,7 +145,9 @@ class InsertCachedAttention(BaseTransform):
         """Replace uncached source attention node with corresponding cached attn node."""
         attn_descriptor = self.attn_descriptor
 
-        cache_config = factory.get_cache_config()
+        # run field-wise or to combine the cache config from the transform and the factory
+        # the transform config takes precedence over the factory config
+        cache_config = self.config.cache_config | factory.get_cache_config()
 
         # Get all attention nodes and their info objects
         source_op = attn_descriptor.get_source_attention_op()
