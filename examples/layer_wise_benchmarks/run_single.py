@@ -8,8 +8,9 @@ import yaml
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tensorrt_llm._utils import local_mpi_rank, mpi_rank, mpi_world_size
-from tensorrt_llm.tools.layer_wise_benchmarks.deepseekv3_runner import (
-    BalanceMethod, DeepSeekV3Runner)
+from tensorrt_llm.tools.layer_wise_benchmarks.runner_base import BalanceMethod
+from tensorrt_llm.tools.layer_wise_benchmarks.runner_factory import \
+    get_runner_cls
 
 
 def comma_separated_ints(s):
@@ -76,9 +77,9 @@ local_rank = local_mpi_rank()
 torch.cuda.set_device(local_rank)
 
 # Create KV cache manager
-mapping = DeepSeekV3Runner.create_mapping(
-    enable_attention_dp=args.enable_attention_dp)
-kv_cache_manager = DeepSeekV3Runner.create_kv_cache_manager(
+Runner = get_runner_cls(args.model)
+mapping = Runner.create_mapping(enable_attention_dp=args.enable_attention_dp)
+kv_cache_manager = Runner.create_kv_cache_manager(
     args.model,
     mapping,
     tokens_per_block=args.tokens_per_block,
@@ -92,15 +93,15 @@ AutoTuner.get().clear_cache()
 capture_stream = torch.cuda.Stream()
 
 # Create Runner
-runner = DeepSeekV3Runner(args.model,
-                          mapping,
-                          moe_backend=args.moe_backend,
-                          layer_indices=args.layer_indices,
-                          scaled_from=args.scaled_from,
-                          max_seq_len=args.max_seq_len,
-                          max_num_tokens=args.max_num_tokens,
-                          moe_max_num_tokens=args.moe_max_num_tokens,
-                          use_cuda_graph=args.use_cuda_graph)
+runner = Runner(args.model,
+                mapping,
+                moe_backend=args.moe_backend,
+                layer_indices=args.layer_indices,
+                scaled_from=args.scaled_from,
+                max_seq_len=args.max_seq_len,
+                max_num_tokens=args.max_num_tokens,
+                moe_max_num_tokens=args.moe_max_num_tokens,
+                use_cuda_graph=args.use_cuda_graph)
 
 # Warm up
 assert args.batch_size <= args.max_batch_size
