@@ -1063,7 +1063,7 @@ class TestBatchedSampling:
         new_tokens_tensors = []
         for sample_state in sample_states:
             assert sample_state.sampler_event is not None
-            sample_state.sampler_event.wait()
+            sample_state.sampler_event.synchronize()
             assert sample_state.host is not None
             new_tokens_tensors.append(sample_state.host.new_tokens.unsqueeze(-1))
         new_tokens = torch.cat(new_tokens_tensors, dim=-1)
