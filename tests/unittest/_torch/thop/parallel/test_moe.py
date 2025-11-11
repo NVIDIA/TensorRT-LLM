@@ -1201,7 +1201,6 @@ class TestMoeFp4:
     def test_online_eplb288_topk_input(self, num_tokens, hidden_size,
                                        intermediate_size, routing_info):
         # although we don't need to run router with num_expert 288, but we do need MoE run with num_slots 288 for EPLB with redundant experts.
-        pytest.skip("This test case will fail.")
         self.run_moe_fp4_test(num_tokens,
                               hidden_size,
                               intermediate_size,
