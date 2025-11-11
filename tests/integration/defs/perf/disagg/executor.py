@@ -87,10 +87,11 @@ class SlurmRunCommandBuilder:
                 ]
             elif install_mode == "wheel":
                 # Install TensorRT-LLM wheel first, then run simple_collect.py
+                # Note: Use --no-deps to avoid overwriting container's pre-installed packages (like torch)
                 install_cmd = f"""
                     cd {repo_dir}    
                     echo '📦 Step 1: Installing TensorRT-LLM wheel...'
-                    pip3 install {trtllm_wheel_path} || echo '⚠️  Wheel install failed, continuing...'
+                    pip3 install --no-deps {trtllm_wheel_path} || echo '⚠️  Wheel install failed, continuing...'
                     echo '✅ Wheel installation completed'
                     
                     echo '🚀 Step 2: Running simple_collect.py...'
