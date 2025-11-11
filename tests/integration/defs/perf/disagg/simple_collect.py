@@ -255,7 +255,13 @@ class TextWriter:
             if result.returncode == 0 and result.stdout.strip():
                 version_info = result.stdout.strip()
             else:
+                # Print error for debugging
+                print(f"TensorRT-LLM import failed (returncode={result.returncode}):")
+                if result.stderr:
+                    print(f"  stderr: {result.stderr[:500]}")  # Print first 500 chars
+                
                 # Try one more time with a simple sleep
+                print("Retrying after 10 seconds...")
                 time.sleep(10)
                 result = subprocess.run(
                     [
@@ -271,6 +277,11 @@ class TextWriter:
 
                 if result.returncode == 0 and result.stdout.strip():
                     version_info = result.stdout.strip()
+                    print("✅ TensorRT-LLM version retrieved on second attempt")
+                else:
+                    print(f"TensorRT-LLM import failed again (returncode={result.returncode}):")
+                    if result.stderr:
+                        print(f"  stderr: {result.stderr[:500]}")
 
         except Exception as e:
             print(f"Error getting TensorRT-LLM version: {e}")  # Keep default unknown version
