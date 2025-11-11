@@ -18,7 +18,7 @@ try:
         p_config = Mapping(world_size=world_size, tp_size=world_size, rank=rank)
         return allgather(tensor, p_config, dim=dim, sizes=sizes)
 
-    def trtllm_allreduce(tensor, op, all_reduce_params=None, strategy: str = "AUTO"):
+    def trtllm_allreduce(tensor, op, strategy: str, all_reduce_params=None):
         rank, world_size = get_rank_world_size()
         assert op == ReduceOp.SUM, "TRT-LLM all reduce only supports SUM op."
 
@@ -47,7 +47,11 @@ try:
         "dist::fused_allreduce_residual_rmsnorm", mutates_args=(), device_types="cuda"
     )
     def fused_allreduce_residual_rmsnorm(
-        tensor: torch.Tensor, residual: torch.Tensor, norm_weight: torch.Tensor, eps: float
+        tensor: torch.Tensor,
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+        strategy: str = "AUTO",
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Fusing allreduce, residual (add), and hf_rms_norm together."""
         all_reduce_params = AllReduceParams(
@@ -57,11 +61,17 @@ try:
             norm_weight=norm_weight,
             eps=eps,
         )
-        return trtllm_allreduce(tensor, ReduceOp.SUM, all_reduce_params=all_reduce_params)
+        return trtllm_allreduce(
+            tensor, ReduceOp.SUM, all_reduce_params=all_reduce_params, strategy=strategy
+        )
 
     @fused_allreduce_residual_rmsnorm.register_fake
     def fused_allreduce_residual_rmsnorm_fake(
-        tensor: torch.Tensor, residual: torch.Tensor, norm_weight: torch.Tensor, eps: float
+        tensor: torch.Tensor,
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+        strategy: str = "AUTO",
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return torch.empty_like(tensor), torch.empty_like(tensor)
 
@@ -71,7 +81,7 @@ except ImportError:
     def trtllm_allgather(tensor, dim, sizes=None):
         raise ImportError("TRT-LLM is not available.")
 
-    def trtllm_allreduce(tensor, op, all_reduce_params=None, strategy: str = "AUTO"):
+    def trtllm_allreduce(tensor, op, strategy: str, all_reduce_params=None):
         raise ImportError("TRT-LLM is not available.")
 
     TRTLLM_OP_AVAILABLE = False

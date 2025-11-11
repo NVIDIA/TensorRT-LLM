@@ -242,12 +242,13 @@ def fused_fp8_linear_all_reduce(
     bias: Optional[torch.Tensor] = None,
     input_scale: Optional[torch.Tensor] = None,
     weight_scale: Optional[torch.Tensor] = None,
+    strategy: str = "AUTO",
 ) -> torch.Tensor:
     out = torch.ops.auto_deploy.torch_quant_fp8_linear(
         input, weight_fp8, bias, input_scale, weight_scale
     )
     if trtllm_dist.is_trtllm_op_available():
-        return trtllm_dist.trtllm_allreduce(out, op=dist.ReduceOp.SUM)
+        return trtllm_dist.trtllm_allreduce(out, op=dist.ReduceOp.SUM, strategy=strategy)
     dist.all_reduce(out, op=dist.ReduceOp.SUM)
     return out
 
@@ -259,6 +260,7 @@ def fused_fp8_linear_all_reduce_fake(
     bias: Optional[torch.Tensor] = None,
     input_scale: Optional[torch.Tensor] = None,
     weight_scale: Optional[torch.Tensor] = None,
+    strategy: str = "AUTO",
 ) -> torch.Tensor:
     return torch.ops.auto_deploy.torch_quant_fp8_linear(
         input, weight_fp8, bias, input_scale, weight_scale
