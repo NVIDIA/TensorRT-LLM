@@ -125,6 +125,7 @@ def _triton_cached_ssm(
             dt_limit=(time_step_limit[0], time_step_limit[1]),
             return_final_states=False,
             return_varlen_states=True,
+            mamba_ssm_cache_dtype=ssm_state_cache.dtype,
         )
 
         y_flat[:total_prefill_tokens] = y_prefill[0].to(y_flat.dtype)
@@ -198,9 +199,7 @@ def _triton_cached_ssm_fake(
     )
 
 
-## Note: we reuse the existing metadata custom op and its registered fake from torch backend.
-
-
+# TODO: consider inheriting from TorchBackendSSM instead of redefining everything
 @AttentionRegistry.register("triton_ssm")
 class TritonBackendSSM(AttentionDescriptor):
     @classmethod
@@ -247,6 +246,9 @@ class TritonBackendSSM(AttentionDescriptor):
         else:
             ssm_state_size = max(1, B_fake.shape[-1])
 
+        # extract ssm_state_dtype from cache_config or hs_fake
+        ssm_state_dtype = cache_config.mamba_dtype or hs_fake.dtype
+
         def _get_ssm_cache(si: SequenceInfo):
             return torch.empty(
                 si.max_batch_size,
@@ -254,7 +256,7 @@ class TritonBackendSSM(AttentionDescriptor):
                 head_dim,
                 ssm_state_size,
                 device=si.device,
-                dtype=cache_config.dtype or hs_fake.dtype,
+                dtype=ssm_state_dtype,
             )
 
         return {"ssm_state_cache": _get_ssm_cache}
