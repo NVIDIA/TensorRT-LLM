@@ -1319,23 +1319,34 @@ class TorchSampler(Sampler):
         ]
         new_path = torch.zeros_like(current_path)
         if request.py_return_log_probs:
-            current_logprobs, current_logprobs_indices = self._get_logprobs_from_request(request)
-            # concatenate the newly generated logprobs and newly
-            # generated tokens to the current logprobs and logprobs indices
-            current_logprobs = torch.cat(
-                [
-                    current_logprobs,
-                    self.store.new_log_probs[request.py_seq_slot, :num_beams].view(-1, 1, 1),
-                ],
-                dim=1,
-            )
-            current_logprobs_indices = torch.cat(
-                [
-                    current_logprobs_indices,
-                    self.store.new_tokens[0, request.py_seq_slot, :num_beams].view(-1, 1, 1),
-                ],
-                dim=1,
-            )
+            # Check that logprobs are initialized in the request
+            if getattr(request.py_result._log_probs, "log_probs", None) is not None:
+                current_logprobs, current_logprobs_indices = self._get_logprobs_from_request(
+                    request
+                )
+                # concatenate the newly generated logprobs and newly
+                # generated tokens to the current logprobs and logprobs indices
+                current_logprobs = torch.cat(
+                    [
+                        current_logprobs,
+                        self.store.new_log_probs[request.py_seq_slot, :num_beams].view(-1, 1, 1),
+                    ],
+                    dim=1,
+                )
+                current_logprobs_indices = torch.cat(
+                    [
+                        current_logprobs_indices,
+                        self.store.new_tokens[0, request.py_seq_slot, :num_beams].view(-1, 1, 1),
+                    ],
+                    dim=1,
+                )
+            else:
+                current_logprobs = self.store.new_log_probs[request.py_seq_slot, :num_beams].view(
+                    -1, 1, 1
+                )
+                current_logprobs_indices = self.store.new_tokens[
+                    0, request.py_seq_slot, :num_beams
+                ].view(-1, 1, 1)
             # Initialize the buffers to store the results
             new_logprobs = torch.zeros_like(current_logprobs)
             new_logprobs_indices = torch.zeros_like(current_logprobs_indices)
