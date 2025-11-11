@@ -1,4 +1,5 @@
 import os
+from functools import cached_property
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -244,6 +245,12 @@ class WideEPMoE(MoE):
         """ enable_alltoall (bool): whether to enable alltoall instead of allgather/reducescatter
         """
         return self.alltoall_method_type != AlltoallMethodType.NotEnabled
+
+    @cached_property
+    def moe_alltoall_backend(self):
+        # "mnnvllatency" (default) or "mnnvlthroughput"
+        return os.environ.get("TRTLLM_MOE_ALLTOALL_BACKEND",
+                              "mnnvllatency").strip().lower()
 
     def calculate_num_chunks(self, all_rank_num_tokens: List[int]) -> int:
         num_rows = sum(all_rank_num_tokens)
