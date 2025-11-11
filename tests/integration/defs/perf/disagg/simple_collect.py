@@ -272,8 +272,8 @@ class TextWriter:
                 if result.returncode == 0 and result.stdout.strip():
                     version_info = result.stdout.strip()
 
-        except Exception:
-            pass  # Keep default unknown version
+        except Exception as e:
+            print(f"Error getting TensorRT-LLM version: {e}")  # Keep default unknown version
 
         trtllm_file = os.path.join(self.output_dir, "trtllm_version.txt")
         with open(trtllm_file, "w") as f:
