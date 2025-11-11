@@ -96,7 +96,10 @@ class TestDisaggBenchmark:
         except Exception as e:
             test_tracker.end_test_case()
             raise e
-
+    
+    def test_session_properties(self):
+        """Test session properties"""
+        print("test_session_properties")
 
 if __name__ == "__main__":
     """Run benchmark tests"""

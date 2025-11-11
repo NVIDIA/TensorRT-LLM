@@ -130,17 +130,34 @@ class SlurmRunCommandBuilder:
                 f"Currently supported: {SESSION_COLLECT_CMD_TYPE}"
             )
 
-    def run_job(self, cmd_type: str, job_name: str) -> Dict[str, Any]:
-        """Execute srun job."""
+    def run_job(self, cmd_type: str, job_name: str, log_file: str = None) -> Dict[str, Any]:
+        """Execute srun job.
+        
+        Args:
+            cmd_type: Type of command to execute
+            job_name: Name for the SLURM job
+            log_file: Optional path to save command output
+            
+        Returns:
+            Dict with status and message
+        """
         try:
             # Build complete command
             srun_prefix = self.build_srun_prefix(job_name)
             script_command = self.build_script_command(cmd_type)
             full_command = srun_prefix + script_command
 
-            # Execute
-            check_output(full_command, timeout=7200)  # 2 hours = 7200 seconds
-            return {"status": True, "msg": "Job executed successfully"}
+            # Execute with optional log file
+            if log_file:
+                print(f"   📝 Saving output to: {log_file}")
+                # Use shell to redirect output
+                shell_command = " ".join(full_command) + f" &> {log_file}"
+                output = check_output(["bash", "-c", shell_command], timeout=7200)
+                print(f"   ✅ Output saved to {log_file}")
+            else:
+                output = check_output(full_command, timeout=7200)
+            
+            return {"status": True, "msg": "Job executed successfully", "output": output}
         except Exception as e:
             print(f"Job execution failed: {e}")
             return {"status": False, "msg": str(e)}
