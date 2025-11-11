@@ -258,7 +258,7 @@ class TextWriter:
                 # Print error for debugging
                 print(f"TensorRT-LLM import failed (returncode={result.returncode}):")
                 if result.stderr:
-                    print(f"  stderr: {result.stderr[:500]}")  # Print first 500 chars
+                    print(f"  stderr:\n{result.stderr}")
                 
                 # Try one more time with a simple sleep
                 print("Retrying after 10 seconds...")
@@ -281,7 +281,7 @@ class TextWriter:
                 else:
                     print(f"TensorRT-LLM import failed again (returncode={result.returncode}):")
                     if result.stderr:
-                        print(f"  stderr: {result.stderr[:500]}")
+                        print(f"  stderr:\n{result.stderr}")
 
         except Exception as e:
             print(f"Error getting TensorRT-LLM version: {e}")  # Keep default unknown version
