@@ -100,6 +100,7 @@ class EnvManager:
         model_dir = EnvManager.get_model_dir()
         output_path = EnvManager.get_output_path()
         repo_dir = EnvManager.get_repo_dir()
+        trtllm_wheel_path = EnvManager.get_trtllm_wheel_path()
 
         mounts = [
             f"{work_dir}:{work_dir}",
@@ -111,6 +112,9 @@ class EnvManager:
         # Add repo_dir if available
         if repo_dir:
             mounts.append(f"{repo_dir}:{repo_dir}")
+        if trtllm_wheel_path:
+            trtllm_wheel_dir = os.path.dirname(trtllm_wheel_path)
+            mounts.append(f"{trtllm_wheel_dir}:{trtllm_wheel_dir}")
         return ",".join(mounts)
 
 
