@@ -877,14 +877,22 @@ class PyExecutor:
 
                             batch_outputs = self._forward_step(scheduled_batch)
 
+                            guided_decoder_failed_requests = None
                             if self.guided_decoder is not None:
                                 self.guided_decoder.add_batch(scheduled_batch)
-                                self.guided_decoder.execute(
+                                guided_decoder_failed_requests = self.guided_decoder.execute(
                                     batch_outputs['logits'])
 
                             sample_state = self._sample_async(
                                 scheduled_batch, batch_outputs)
                             assert sample_state is not None, "Sampling failed"
+
+                            # Handle guided decoder errors after _sample_async to avoid state conflicts.
+                            # If called before, failed requests would be marked as GENERATION_COMPLETE,
+                            # causing _sample_async to fail when accessing context_chunk_size property.
+                            self._handle_guided_decoder_errors(
+                                scheduled_batch, guided_decoder_failed_requests)
+
                             self._update_request_states(scheduled_batch)
 
                     if self.enable_iter_perf_stats:
@@ -1185,11 +1193,21 @@ class PyExecutor:
                                 self.guided_decoder.rollback_draft_tokens()
 
                     batch_outputs = self._forward_step(scheduled_batch)
+
+                    guided_decoder_failed_requests = None
                     if self.guided_decoder is not None:
-                        self.guided_decoder.execute(batch_outputs['logits'])
+                        guided_decoder_failed_requests = self.guided_decoder.execute(
+                            batch_outputs['logits'])
 
                     sample_state = self._sample_async(scheduled_batch,
                                                       batch_outputs)
+
+                    # Handle guided decoder errors after _sample_async to avoid state conflicts.
+                    # If called before, failed requests would be marked as GENERATION_COMPLETE,
+                    # causing _sample_async to fail when accessing context_chunk_size property.
+                    self._handle_guided_decoder_errors(
+                        scheduled_batch, guided_decoder_failed_requests)
+
                     if self.drafter is not None:
                         self.drafter.run_drafter_post(scheduled_batch,
                                                       self.resource_manager,
@@ -1435,14 +1453,22 @@ class PyExecutor:
                                             (req, block_id,
                                              self.ctx_in_transmission_counter))
 
+                    guided_decoder_failed_requests = None
                     if self.guided_decoder is not None:
                         # add_batch must be called again to have updated new tokens.
                         self.guided_decoder.add_batch(scheduled_batch)
-                        self.guided_decoder.execute(batch_outputs['logits'])
+                        guided_decoder_failed_requests = self.guided_decoder.execute(
+                            batch_outputs['logits'])
 
                     sample_state = self._sample_async(scheduled_batch,
                                                       batch_outputs)
                     assert sample_state is not None, "Sampling failed"
+
+                    # Handle guided decoder errors after _sample_async to avoid state conflicts.
+                    # If called before, failed requests would be marked as GENERATION_COMPLETE,
+                    # causing _sample_async to fail when accessing context_chunk_size property.
+                    self._handle_guided_decoder_errors(
+                        scheduled_batch, guided_decoder_failed_requests)
 
                     self._update_request_states(scheduled_batch)
 
@@ -2009,18 +2035,28 @@ class PyExecutor:
             self._handle_errors(error_msg)
 
     def _handle_errors(self,
-                       error_msg: Optional[str] = None,
+                       error_msg: Optional[Union[str, List[str]]] = None,
                        *,
                        requests: Optional[List[LlmRequest]] = None):
         error_responses: Dict[int, LlmResponse] = {}
-        error_msg = error_msg or "error"
         failed_requests = requests if requests is not None else self.active_requests
-        for request in failed_requests:
+
+        error_msg = error_msg or ["error"] * len(failed_requests)
+        if isinstance(error_msg, str):
+            error_msg = [error_msg] * len(failed_requests)
+        elif len(error_msg) != len(failed_requests):
+            logger.warning(
+                f"Length mismatch: error_msg has {len(error_msg)} items, "
+                f"but there are {len(failed_requests)} requests. "
+                f"Falling back to default error message.")
+            error_msg = ["error"] * len(failed_requests)
+
+        for request, err_msg in zip(failed_requests, error_msg):
             req_id = request.py_request_id
             request.state = LlmRequestState.GENERATION_COMPLETE
             error_responses[req_id] = LlmResponse(
                 request_id=req_id,
-                error_msg=error_msg,
+                error_msg=err_msg,
                 client_id=request.py_client_id)
         if requests is None:
             self.active_requests.clear()
@@ -2432,6 +2468,32 @@ class PyExecutor:
 
     def reset_prefix_cache(self):
         self.kv_cache_manager.reset_reuse_state()
+
+    def _handle_guided_decoder_errors(
+            self, scheduled_batch: ScheduledRequests,
+            failed_requests: Optional[List[Tuple[int, str]]]):
+        """Handle errors that occurred during guided decoding.
+
+        Args:
+            scheduled_batch: The current batch of scheduled requests
+            failed_requests: List of (request_id, error_message) tuples for failed requests,
+                           or None if no failures occurred
+        """
+        if not failed_requests:
+            return
+
+        failed_req_id_to_err = {req_id: err for req_id, err in failed_requests}
+        errors = []
+        failed_llm_requests = []
+
+        for request in scheduled_batch.all_requests():
+            if request.py_request_id not in failed_req_id_to_err:
+                continue
+            errors.append(failed_req_id_to_err[request.py_request_id])
+            failed_llm_requests.append(request)
+
+        if failed_llm_requests:
+            self._handle_errors(errors, requests=failed_llm_requests)
 
 
 class DisaggPPTerminationHandler:

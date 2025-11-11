@@ -204,7 +204,7 @@ class GuidedDecoder:
     def bitmask_size(self) -> int:
         return math.ceil(self.vocab_size_padded / 32)
 
-    def _build(self, requests: GuidedRequests) -> None:
+    def _build(self, requests: GuidedRequests) -> List[Tuple[int, str]]:
         """Build the bitmask for requests with guided decoding enabled.
 
         Specifically, this method:
@@ -212,65 +212,77 @@ class GuidedDecoder:
         - call the grammar matcher to fill the bitmask on CPU;
         - asynchronously copy the bitmask to GPU.
         """
+        failed_requests = []
         self.token_mask_host[:requests.num_bitmask_tokens].fill_(0)
 
         for req, offset in requests.valid_requests_with_offsets():
             slot = req.seq_slot
-            self.num_advanced_tokens[slot] = 0
-            self.num_guided_tokens[slot] = 0
+            try:
+                self.num_advanced_tokens[slot] = 0
+                self.num_guided_tokens[slot] = 0
 
-            matcher_init: bool = req.require_matcher_init()
-            matcher_advance: bool = req.require_matcher_advance()
-            if not (matcher_init or matcher_advance):
-                continue
-
-            if matcher_init:
-                matcher = self.grammar_matcher_factory.create(
-                    req.guided_decoding_params)
-                self.grammar_matchers[slot] = matcher
-
-            if matcher_advance:
-                matcher = self.grammar_matchers[slot]
-                # The last new token must be acceptable unless the matcher is terminated:
-                # 1. For the main model loop, when overlap scheduler is enabled, the matcher may have accepted the EOS token in the draft tokens at the previous iteration.
-                # 2. For the draft model loop, the matcher may have accepted the EOS token at the previous drafting iteration.
-                if matcher.is_terminated() or self.is_draft_terminated[slot]:
+                matcher_init: bool = req.require_matcher_init()
+                matcher_advance: bool = req.require_matcher_advance()
+                if not (matcher_init or matcher_advance):
                     continue
-                accepted = matcher.accept_token(req.new_token)
-                if not accepted:
-                    if req.is_draft:
-                        self.is_draft_terminated[slot] = True
-                        logger.debug(
-                            f"Draft request {req.request_id} at slot {slot} failed to accept last new token: {req.new_token}."
-                        )
+
+                if matcher_init:
+                    matcher = self.grammar_matcher_factory.create(
+                        req.guided_decoding_params)
+                    self.grammar_matchers[slot] = matcher
+
+                if matcher_advance:
+                    matcher = self.grammar_matchers[slot]
+                    # The last new token must be acceptable unless the matcher is terminated or None:
+                    # 1. For the main model loop, when overlap scheduler is enabled, the matcher may have accepted the EOS token in the draft tokens at the previous iteration.
+                    # 2. For the draft model loop, the matcher may have accepted the EOS token at the previous drafting iteration.
+                    # 3. The matcher can be None if there was an error during its creation.
+                    if matcher is None or matcher.is_terminated(
+                    ) or self.is_draft_terminated[slot]:
                         continue
-                    # TODO: Make this an error response.
-                    raise ValueError(
-                        f"Request {req.request_id} at slot {slot} failed to accept last new token: {req.new_token}."
-                    )
-
-            self.num_advanced_tokens[slot] += 1
-            if not matcher.is_terminated():
-                matcher.fill_next_token_bitmask(self.bitmask_host, offset)
-                self.token_mask_host[offset] = 1
-                self.num_guided_tokens[slot] += 1
-                # Process draft tokens
-                for i, tid in enumerate(req.draft_tokens, 1):
-                    accepted = matcher.accept_token(tid)
+                    accepted = matcher.accept_token(req.new_token)
                     if not accepted:
-                        break
-                    self.num_advanced_tokens[slot] += 1
-                    if matcher.is_terminated():
-                        break
-                    matcher.fill_next_token_bitmask(self.bitmask_host,
-                                                    offset + i)
-                    self.token_mask_host[offset + i] = 1
-                    self.num_guided_tokens[slot] += 1
+                        if req.is_draft:
+                            self.is_draft_terminated[slot] = True
+                            logger.debug(
+                                f"Draft request {req.request_id} at slot {slot} failed to accept last new token: {req.new_token}."
+                            )
+                            continue
+                        # TODO: Make this an error response.
+                        raise ValueError(
+                            f"Request {req.request_id} at slot {slot} failed to accept last new token: {req.new_token}."
+                        )
 
-            if req.is_draft:
-                assert len(req.draft_tokens) == 0
-                self.num_advanced_draft_tokens[
-                    slot] += self.num_advanced_tokens[slot]
+                self.num_advanced_tokens[slot] += 1
+                if not matcher.is_terminated():
+                    matcher.fill_next_token_bitmask(self.bitmask_host, offset)
+                    self.token_mask_host[offset] = 1
+                    self.num_guided_tokens[slot] += 1
+                    # Process draft tokens
+                    for i, tid in enumerate(req.draft_tokens, 1):
+                        accepted = matcher.accept_token(tid)
+                        if not accepted:
+                            break
+                        self.num_advanced_tokens[slot] += 1
+                        if matcher.is_terminated():
+                            break
+                        matcher.fill_next_token_bitmask(self.bitmask_host,
+                                                        offset + i)
+                        self.token_mask_host[offset + i] = 1
+                        self.num_guided_tokens[slot] += 1
+
+                if req.is_draft:
+                    assert len(req.draft_tokens) == 0
+                    self.num_advanced_draft_tokens[
+                        slot] += self.num_advanced_tokens[slot]
+            except Exception as e:
+                error_msg = f"Guided decoding error: {str(e)}"
+                failed_requests.append((req.request_id, error_msg))
+                logger.error(
+                    f"Request {req.request_id} at slot {slot} failed during guided decoding: {error_msg}",
+                    exc_info=True)
+
+        return failed_requests
 
     def _copy_bitmask(self,
                       requests: GuidedRequests,
@@ -306,8 +318,8 @@ class GuidedDecoder:
             scheduled_requests, self.max_num_draft_tokens)
 
     @nvtx_range("GuideDecoder.build")
-    def build(self) -> None:
-        self._build(self.requests)
+    def build(self) -> List[Tuple[int, str]]:
+        return self._build(self.requests)
 
     @nvtx_range("GuideDecoder.copy_bitmask")
     def copy_bitmask(self, num_bitmask_tokens: Optional[int] = None) -> None:
@@ -325,8 +337,8 @@ class GuidedDecoder:
 
     def execute(self,
                 logits: torch.Tensor,
-                d2t: Optional[torch.Tensor] = None) -> None:
-        self.build()
+                d2t: Optional[torch.Tensor] = None) -> List[Tuple[int, str]]:
+        failed_requests = self.build()
 
         with torch.cuda.stream(self.stream):
             torch.cuda.current_stream().wait_event(self.token_event)
@@ -336,6 +348,8 @@ class GuidedDecoder:
         torch.cuda.current_stream().wait_event(self.bitmask_event)
         self.apply_bitmask(logits, d2t=d2t)
         self.token_event.record()
+
+        return failed_requests
 
     def _rollback_rejected_tokens(self, requests: GuidedRequests) -> None:
         """Rollback the grammar matcher for rejected tokens.
@@ -460,22 +474,24 @@ class CapturableGuidedDecoder(GuidedDecoder):
                                                                )
 
     @hostfunc
-    def build(self) -> None:
-        self._build(self.requests_hostfunc)
+    def build(self) -> List[Tuple[int, str]]:
+        return self._build(self.requests_hostfunc)
 
     def execute(self,
                 logits: torch.Tensor,
-                d2t: Optional[torch.Tensor] = None) -> None:
+                d2t: Optional[torch.Tensor] = None) -> List[Tuple[int, str]]:
         with torch.cuda.stream(self.stream):
             torch.cuda.current_stream().wait_event(self.token_event)
             self.fetch_batch()
             self.init_disagg_gen_requests()
-            self.build()
+            failed_requests = self.build()
             self.copy_bitmask()
             self.bitmask_event.record()
 
         torch.cuda.current_stream().wait_event(self.bitmask_event)
         self.apply_bitmask(logits, d2t=d2t)
+
+        return failed_requests
 
     @hostfunc
     def rollback_rejected_tokens(self) -> None:
@@ -532,13 +548,13 @@ class CapturableGuidedDecoder(GuidedDecoder):
     def execute_draft_batch(self,
                             logits: torch.Tensor,
                             d2t: Optional[torch.Tensor] = None,
-                            draft_step: int = 0) -> None:
+                            draft_step: int = 0) -> List[Tuple[int, str]]:
         with torch.cuda.stream(self.stream):
             torch.cuda.current_stream().wait_event(self.token_event)
             self.fetch_draft_batch(draft_step=draft_step)
             if draft_step == 0:
                 self.rollback_rejected_tokens()
-            self.build()
+            failed_requests = self.build()
             if draft_step == self.max_num_draft_tokens - 1:
                 self.rollback_draft_tokens()
             # Overwrite num_bitmask_tokens since the request might not be updated on CUDA stream yet.
@@ -550,3 +566,5 @@ class CapturableGuidedDecoder(GuidedDecoder):
         self.apply_bitmask(logits,
                            d2t=d2t,
                            num_bitmask_tokens=len(self.requests))
+
+        return failed_requests
