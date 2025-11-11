@@ -91,7 +91,7 @@ class SlurmRunCommandBuilder:
                 install_cmd = f"""
                     cd {repo_dir}    
                     echo '📦 Step 1: Installing TensorRT-LLM wheel...'
-                    pip3 install --no-deps {trtllm_wheel_path} || echo '⚠️  Wheel install failed, continuing...'
+                    pip3 install {trtllm_wheel_path} || echo '⚠️  Wheel install failed, continuing...'
                     echo '✅ Wheel installation completed'
                     
                     echo '🚀 Step 2: Running simple_collect.py...'
