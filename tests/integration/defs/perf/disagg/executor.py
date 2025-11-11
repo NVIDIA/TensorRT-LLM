@@ -59,7 +59,8 @@ class SlurmRunCommandBuilder:
                 f"--job-name={job_name}",
                 "--time=02:00:00",
                 "--mpi=pmix",
-                "--overlap",
+                # Note: Removed --overlap to ensure GPU allocation for session_collect
+                # which runs after all test jobs have completed
                 "-N",
                 "1",
                 "-n",
@@ -150,10 +151,20 @@ class SlurmRunCommandBuilder:
             # Execute with optional log file
             if log_file:
                 print(f"   📝 Saving output to: {log_file}")
-                # Use shell to redirect output
-                shell_command = " ".join(full_command) + f" &> {log_file}"
-                output = check_output(["bash", "-c", shell_command], timeout=7200)
+                # Use Python file redirection to avoid shell quoting issues
+                import subprocess
+                with open(log_file, 'w') as f:
+                    result = subprocess.run(
+                        full_command,
+                        stdout=f,
+                        stderr=subprocess.STDOUT,
+                        timeout=7200,
+                        text=True
+                    )
+                    if result.returncode != 0:
+                        raise subprocess.CalledProcessError(result.returncode, full_command)
                 print(f"   ✅ Output saved to {log_file}")
+                output = ""  # Output is in file
             else:
                 output = check_output(full_command, timeout=7200)
             
