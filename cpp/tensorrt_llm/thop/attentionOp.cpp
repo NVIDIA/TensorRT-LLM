@@ -829,7 +829,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     }
     else
     {
-        TLLM_LOG_WARNING("Allocate new attention workspace with size %ld bytes", workspace_size);
+        TLLM_LOG_TRACE("Allocate new attention workspace with size %ld bytes", workspace_size);
         workspace = torch::empty({workspace_size}, torch::dtype(torch::kByte).device(qkv_or_q.device()));
     }
 
