@@ -2,8 +2,7 @@
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
 ARG TRITON_IMAGE=nvcr.io/nvidia/tritonserver
 ARG BASE_TAG=25.10-py3
-# [TODO] Update to NVIDIA Triton 25.10 when it's available
-ARG TRITON_BASE_TAG=25.09-py3
+ARG TRITON_BASE_TAG=25.10-py3
 ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE}:${BASE_TAG} AS base
@@ -78,6 +77,7 @@ FROM ${TRITON_IMAGE}:${TRITON_BASE_TAG} AS triton
 
 FROM devel AS tritondevel
 
+ARG GITHUB_MIRROR=""
 COPY --from=triton /opt/tritonserver/backends/python /opt/tritonserver/backends/python
 COPY --from=triton /opt/tritonserver/lib /opt/tritonserver/lib
 COPY --from=triton /opt/tritonserver/include /opt/tritonserver/include
@@ -91,7 +91,7 @@ COPY docker/common/install_triton.sh \
      docker/common/install_etcd.sh \
      ./
 
-RUN bash ./install_triton.sh && rm install_triton.sh
+RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install_triton.sh && rm install_triton.sh
 
 # Install UCX first
 RUN bash ./install_ucx.sh && rm install_ucx.sh
