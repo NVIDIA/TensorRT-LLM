@@ -67,3 +67,27 @@ def test_deepseek_r1_gen_scaled_from_16_dep(llm_root):
                    **os.environ,
                    "NP": "4",
                })
+
+
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+def test_qwen3_next_gen_tep(llm_root, tp_size):
+    if torch.cuda.device_count() < tp_size:
+        pytest.skip(f"needs {tp_size:d} GPUs to run this test")
+    model_root = llm_models_root(check=True)
+    check_call([
+        "./mpi_launch.sh",
+        "./run_single.sh",
+        "config_gen.yaml",
+        "--model",
+        model_root / "Qwen3" / "Qwen3-Next-80B-A3B-Instruct",
+        "--layer-indices=6,7",
+        "--no-enable-attention-dp",
+        "--moe-backend=TRTLLM",
+        "--balance-method=NotModified",
+    ],
+               cwd=llm_root / "examples" / "layer_wise_benchmarks",
+               env={
+                   **os.environ,
+                   "NP": f"{tp_size:d}",
+                   "TRTLLM_ENABLE_PDL": "1",
+               })
