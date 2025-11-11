@@ -15,9 +15,9 @@ from .modeling_llama import LlamaForCausalLM
 from .modeling_llava_next import LlavaNextModel
 from .modeling_mistral import Mistral3VLM, MistralForCausalLM
 from .modeling_mixtral import MixtralForCausalLM
-from .modeling_nanov2vlm import NemotronH_Nano_VL_V2
 from .modeling_nemotron import NemotronForCausalLM
 from .modeling_nemotron_h import NemotronHForCausalLM
+from .modeling_nemotron_nano import NemotronH_Nano_VL_V2
 from .modeling_nemotron_nas import NemotronNASForCausalLM
 from .modeling_phi3 import Phi3ForCausalLM
 from .modeling_phi4mm import Phi4MMForCausalLM
