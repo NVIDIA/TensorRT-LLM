@@ -627,9 +627,16 @@ def getAutoTriggerTagList(pipeline, testFilter, globalVars) {
         return autoTriggerTagList
     }
     def specialFileToTagMap = [
-        "tensorrt_llm/_torch/models/modeling_deepseekv3.py": ["-DeepSeek-"],
         "cpp/kernels/fmha_v2/": ["-FMHA-"],
+        "examples/layer_wise_benchmarks/config_ctx.yaml": ["DGX_B200-4_GPUs-PyTorch-Post-Merge"],
+        "examples/layer_wise_benchmarks/config_gen.yaml": ["DGX_B200-4_GPUs-PyTorch-Post-Merge"],
+        "examples/layer_wise_benchmarks/mpi_launch.sh": ["DGX_B200-4_GPUs-PyTorch-Post-Merge"],
+        "examples/layer_wise_benchmarks/run_single.py": ["DGX_B200-4_GPUs-PyTorch-Post-Merge"],
+        "examples/layer_wise_benchmarks/run_single.sh": ["DGX_B200-4_GPUs-PyTorch-Post-Merge"],
+        "tensorrt_llm/_torch/models/modeling_deepseekv3.py": ["-DeepSeek-"],
         "tensorrt_llm/_torch/models/modeling_gpt_oss.py": ["-GptOss-"],
+        "tensorrt_llm/tools/layer_wise_benchmarks/": ["DGX_B200-4_GPUs-PyTorch-Post-Merge"],
+        "tests/unittest/tools/test_layer_wise_benchmarks.py": ["DGX_B200-4_GPUs-PyTorch-Post-Merge"],
     ]
     for (file in changedFileList) {
         for (String key : specialFileToTagMap.keySet()) {
