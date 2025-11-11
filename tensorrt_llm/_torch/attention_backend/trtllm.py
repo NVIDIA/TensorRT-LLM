@@ -197,8 +197,8 @@ class TrtllmAttentionWrapper:
         sparse_kv_offsets: Optional[torch.Tensor] = None,
         sparse_attn_indices: Optional[torch.Tensor] = None,
         sparse_attn_offsets: Optional[torch.Tensor] = None,
-        sparse_mla_topk: int = 0,
         sparse_attn_indices_block_size: int = 1,
+        sparse_mla_topk: int = 0,
         **kwargs,
     ):
         """
@@ -242,6 +242,7 @@ class TrtllmAttentionWrapper:
             sparse_kv_offsets (torch.Tensor): The batch offsets for the sparse KV indices, with shape of (num_contexts + 1) on GPU.
             sparse_attn_indices (torch.Tensor): The sparse indices for the attention layer, with shape of (num_heads_kv, num_sparse_tokens) on GPU.
             sparse_attn_offsets (torch.Tensor): The batch offsets for the sparse attention indices, with shape of (num_generations + 1) on GPU.
+            sparse_attn_indices_block_size (int): The granularity of the sparse attention indices, used by block sparse attention.
             sparse_mla_topk (int): The topk for the sparse MLA, used by DSA attention.
         """
         self.layer_idx = layer_idx
@@ -284,8 +285,8 @@ class TrtllmAttentionWrapper:
         self.sparse_kv_offsets = sparse_kv_offsets
         self.sparse_attn_indices = sparse_attn_indices
         self.sparse_attn_offsets = sparse_attn_offsets
-        self.sparse_mla_topk = sparse_mla_topk
         self.sparse_attn_indices_block_size = sparse_attn_indices_block_size
+        self.sparse_mla_topk = sparse_mla_topk
         if max_sequence_length > self.rope_params.max_positions:
             self.rope_params.max_positions = max_sequence_length
             self.rotary_inv_freq, self.rotary_cos_sin = self.rope_params.create_rope_const_params(
@@ -527,6 +528,7 @@ class TrtllmAttentionWrapper:
             self.sparse_kv_offsets,
             self.sparse_attn_indices,
             self.sparse_attn_offsets,
+            self.sparse_attn_indices_block_size,
             self.sparse_mla_topk,
             cu_q_seqlens,
             cu_kv_seqlens,
@@ -534,7 +536,6 @@ class TrtllmAttentionWrapper:
             mla_bmm1_scale,
             mla_bmm2_scale,
             quant_q_buffer,
-            self.sparse_attn_indices_block_size,
         )
         # reset the planned states (especially tensors) to avoid memory leak
         self.plan()
@@ -1372,9 +1373,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             sparse_kv_offsets=sparse_kv_offsets,
             sparse_attn_indices=sparse_attn_indices,
             sparse_attn_offsets=sparse_attn_offsets,
+            sparse_attn_indices_block_size=sparse_attn_indices_block_size,
             sparse_mla_topk=metadata.sparse_mla_topk if hasattr(
                 metadata, 'sparse_mla_topk') else 0,
-            sparse_attn_indices_block_size=sparse_attn_indices_block_size,
         )
         out_dtype = None
         if out_scale is not None:
