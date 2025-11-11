@@ -215,7 +215,7 @@ def get_guided_decoding_config(guided_decoding_backend: str,
 
 def create_py_executor(
     llm_args: TorchLlmArgs,
-    checkpoint_dir: Optional[str] = None,
+    checkpoint_dir: str = None,
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
 ) -> PyExecutor:
