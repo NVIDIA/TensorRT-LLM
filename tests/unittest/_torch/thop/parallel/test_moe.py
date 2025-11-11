@@ -263,7 +263,7 @@ def routing_reference_no_aux(expert_logits,
 
 
 # TopK -> Softmax
-def routing_reference_renormalize(expert_logits, top_k, num_experts, padding):
+def routing_reference_renormalize(expert_logits, top_k, padding):
     topk_values, topk_idx = torch.topk(expert_logits, k=top_k, dim=-1)
     topk_values = torch.nn.functional.softmax(topk_values.float(), dim=-1)
 
@@ -279,8 +279,7 @@ def routing_reference_renormalize(expert_logits, top_k, num_experts, padding):
 
 
 # Softmax->TopK -> Normalize
-def routing_reference_renormalize_naive(expert_logits, top_k, num_experts,
-                                        padding):
+def routing_reference_renormalize_naive(expert_logits, top_k, padding):
     norm_topk_prob = True
     scores = torch.nn.functional.softmax(expert_logits.float(), dim=-1)
     topk_values, topk_idx = torch.topk(scores, k=top_k, dim=-1)
@@ -1002,7 +1001,6 @@ class TestMoeFp4:
                 {
                     "num_experts": 256,
                     "top_k": 8,
-                    "padding": 8,
                     "n_groups": 8,
                     "top_k_groups": 4,
                     "routed_scaling": 2.5,
@@ -1014,7 +1012,6 @@ class TestMoeFp4:
                 {
                     "num_experts": 72,
                     "top_k": 6,
-                    "padding": 8,
                     "n_groups": 1,
                     "top_k_groups": 1,
                     "routed_scaling": 2.5,
@@ -1026,7 +1023,6 @@ class TestMoeFp4:
                 {
                     "num_experts": 128,
                     "top_k": 8,
-                    "padding": 8,
                     "n_groups": None,
                     "top_k_groups": None,
                     "routed_scaling": None,
@@ -1038,7 +1034,6 @@ class TestMoeFp4:
                 {
                     "num_experts": 128,
                     "top_k": 4,
-                    "padding": 8,
                     "n_groups": None,
                     "top_k_groups": None,
                     "routed_scaling": None,
@@ -1050,7 +1045,6 @@ class TestMoeFp4:
                 {
                     "num_experts": 512,
                     "top_k": 10,
-                    "padding": 8,
                     "n_groups": None,
                     "top_k_groups": None,
                     "routed_scaling": None,
@@ -1080,7 +1074,6 @@ class TestMoeFp4:
                 {
                     "num_experts": 72,
                     "top_k": 6,
-                    "padding": 8,
                     "n_groups": 1,
                     "top_k_groups": 1,
                     "routed_scaling": 2.5,
@@ -1110,7 +1103,6 @@ class TestMoeFp4:
                 {
                     "num_experts": 256,
                     "top_k": 8,
-                    "padding": 8,
                     "n_groups": 8,
                     "top_k_groups": 4,
                     "routed_scaling": 2.5,
@@ -1122,7 +1114,6 @@ class TestMoeFp4:
                 {
                     "num_experts": 128,
                     "top_k": 4,
-                    "padding": 8,
                     "n_groups": None,
                     "top_k_groups": None,
                     "routed_scaling": None,
@@ -1134,7 +1125,6 @@ class TestMoeFp4:
                 {
                     "num_experts": 512,
                     "top_k": 10,
-                    "padding": 8,
                     "n_groups": None,
                     "top_k_groups": None,
                     "routed_scaling": None,
@@ -1166,7 +1156,6 @@ class TestMoeFp4:
                 {
                     "num_experts": 128,
                     "top_k": 4,
-                    "padding": 8,
                     "n_groups": None,
                     "top_k_groups": None,
                     "routed_scaling": None,
@@ -1305,10 +1294,10 @@ class TestMoeFp4:
                 routed_scaling, padding)
         elif routing_method_type == RoutingMethodType.Renormalize:
             permute_info, scores = routing_reference_renormalize(
-                expert_logits, top_k, num_experts, padding)
+                expert_logits, top_k, padding)
         elif routing_method_type == RoutingMethodType.RenormalizeNaive:
             permute_info, scores = routing_reference_renormalize_naive(
-                expert_logits, top_k, num_experts, padding)
+                expert_logits, top_k, padding)
 
         args = moe_args(num_tokens, num_experts, hidden_size, intermediate_size,
                         top_k, padding, hidden_states_fp4_bytes,
@@ -1552,10 +1541,10 @@ class TestMoeFp4:
                 routed_scaling, padding)
         elif routing_method_type == RoutingMethodType.Renormalize:
             permute_info, scores = routing_reference_renormalize(
-                expert_logits, top_k, num_experts, padding)
+                expert_logits, top_k, padding)
         elif routing_method_type == RoutingMethodType.RenormalizeNaive:
             permute_info, scores = routing_reference_renormalize_naive(
-                expert_logits, top_k, num_experts, padding)
+                expert_logits, top_k, padding)
 
         args = moe_args(num_tokens, num_experts, hidden_size, intermediate_size,
                         top_k, padding, hidden_states_fp8, None,
@@ -2028,10 +2017,10 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
                              sf_block_size)  # ue8m0 scaling factors
     if routing_method_type == RoutingMethodType.Renormalize:
         permute_info, scores = routing_reference_renormalize(
-            expert_logits, top_k, num_experts, padding)
+            expert_logits, top_k, padding)
     elif routing_method_type == RoutingMethodType.RenormalizeNaive:
         permute_info, scores = routing_reference_renormalize_naive(
-            expert_logits, top_k, num_experts, padding)
+            expert_logits, top_k, padding)
     else:
         raise ValueError("Invalid routing method type")
 

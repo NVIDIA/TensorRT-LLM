@@ -44,6 +44,7 @@ COPY docker/common/install.sh \
      docker/common/install_ucx.sh \
      docker/common/install_nixl.sh \
      docker/common/install_etcd.sh \
+     docker/common/install_mooncake.sh \
      ./
 
 RUN GITHUB_MIRROR=${GITHUB_MIRROR} \
@@ -102,6 +103,13 @@ COPY docker/common/install_triton.sh \
      ./
 
 RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install_triton.sh && rm install_triton.sh
+
+# Install Mooncake, after triton handles boost requirement
+RUN if [ -f /etc/redhat-release ]; then \
+        echo "Rocky8 detected, skipping mooncake installation"; \
+    else \
+        bash ./install_mooncake.sh; \
+    fi && rm install_mooncake.sh
 
 FROM ${DEVEL_IMAGE} AS wheel
 WORKDIR /src/tensorrt_llm

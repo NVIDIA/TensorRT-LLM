@@ -23,7 +23,7 @@ from ..distributed import AllReduceParams, alltoall_helix
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
-                     is_piecewise_running, is_torch_compiling)
+                     is_torch_compiling, maybe_compile)
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from .multi_stream_utils import maybe_execute_in_parallel
 from .rms_norm import RMSNorm
@@ -74,17 +74,6 @@ def extract_extra_attrs(layer_idx: str, attn_type: str):
         ), "Attention layer must be a subclass of Attention or an instance of Attention"
 
     return metadata, attn_layer
-
-
-def maybe_compile(func):
-
-    def wrapper(*args, **kwargs):
-        if is_piecewise_running():
-            # When piecewise running, we don't need to compile the function to avoid host overhead in attention op.
-            return func(*args, **kwargs)
-        return torch.compile(func)(*args, **kwargs)
-
-    return wrapper
 
 
 @maybe_compile
@@ -1969,10 +1958,10 @@ class MLA(nn.Module):
                 q, latent_cache, attn_metadata, is_generation=is_generation)
 
         num_tokens = q.shape[0]
-        q_nope, q_rope = q.view(-1, self.num_heads, self.qk_head_dim).split(
+        q_nope, q_rope = q.view(-1, self.num_heads_tp, self.qk_head_dim).split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         q_nope_out = torch.empty(
-            [num_tokens, self.num_heads, (self.kv_lora_rank)],
+            [num_tokens, self.num_heads_tp, (self.kv_lora_rank)],
             dtype=q.dtype,
             device=q.device,
         )
@@ -2011,23 +2000,23 @@ class MLA(nn.Module):
         # FlashMLA sparse kernel (bf16) requires num_heads=128 on sm100 or multiple of 64 on sm90
         if sm_version >= 100:
             padding = 128
-            assert self.num_heads <= padding, (
+            assert self.num_heads_tp <= padding, (
                 f"SM100 FlashMLA sparse kernel requires exactly {padding} heads, "
-                f"got {self.num_heads}. Padding from values > {padding} is not supported."
+                f"got {self.num_heads_tp}. Padding from values > {padding} is not supported."
             )
         else:  # SM90
-            padding = ((self.num_heads + 63) // 64) * 64  # multiple of 64
+            padding = ((self.num_heads_tp + 63) // 64) * 64  # multiple of 64
 
-        if self.num_heads != padding:
+        if self.num_heads_tp != padding:
             logger.warning_once(
-                f"Padding num_heads from {self.num_heads} to {padding} "
+                f"Padding num_heads from {self.num_heads_tp} to {padding} "
                 f"due to FlashMLA sparse attention kernel requirement",
                 key="sparse_mla_padding_warning")
 
             # Create padded tensor with zeros for extra heads
             q_padded = q_concat.new_empty(
                 (num_tokens, padding, q_concat.shape[2]))
-            q_padded[:, :self.num_heads, :] = q_concat
+            q_padded[:, :self.num_heads_tp, :] = q_concat
             q_concat = q_padded
 
         # Convert indices and return all-layer KV pool
@@ -2049,17 +2038,17 @@ class MLA(nn.Module):
                 "flash_mla_sparse_fwd not available. Please ensure FlashMLA module is built."
             )
 
-        # [seq, num_heads, kv_lora_rank]
-        attn_out_latent = attn_out_latent[:, :self.
-                                          num_heads, :]  # account for padding
+        # [seq, num_heads, kv_lora_rank], account for padding
+        attn_out_latent = attn_out_latent[:, :self.num_heads_tp, :]
         # TODO: seems we need .contiguous() here when padding enabled before pass to bmm?
         attn_out_latent = attn_out_latent.view(
-            [-1, self.num_heads, self.kv_lora_rank])
+            [-1, self.num_heads_tp, self.kv_lora_rank])
 
         assert (attn_out_latent.shape[0] == q.shape[0]
-                and attn_out_latent.shape[1] == self.num_heads)
+                and attn_out_latent.shape[1] == self.num_heads_tp)
 
-        attn_output = output.view([num_tokens, self.num_heads, self.v_head_dim])
+        attn_output = output.view(
+            [num_tokens, self.num_heads_tp, self.v_head_dim])
 
         if self.v_b_proj.dtype == torch.bfloat16:
             # [num_heads, seq, kv_lora_rank] x [num_heads, kv_lora_rank, v_head_dim]
