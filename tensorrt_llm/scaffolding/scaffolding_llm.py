@@ -34,7 +34,6 @@ class ScaffoldingLlm:
         self.task_queue = asyncio.Queue()
         self.main_loop_stop_event = asyncio.Event()
         self.shutdown_event = asyncio.Event()
-        self.streaming_event = asyncio.Event()
         if self.own_loop:
             self._run_main_loop_thread()
         else:
@@ -82,10 +81,10 @@ class ScaffoldingLlm:
         ]
         await asyncio.gather(*async_tasks)
         for task in tasks:
-            if getattr(task, 'streaming', False):
-                await request.result.set_output_async(task.result)
-                self.streaming_event.clear()
-                await self.streaming_event.wait()
+            if task.streaming_output_flag:
+                for output in task.streaming_output_list:
+                    request.result.set_output_streaming(output)
+                task.streaming_output_list = []
 
     async def _handle_parallel_process(self,
                                        tasks: ParallelProcess,
@@ -172,16 +171,22 @@ class ScaffoldingLlm:
         self.main_loop_thread.start()
 
     def generate_async(self, prompt: str) -> ScaffoldingResult:
-        result = ScaffoldingResult(self.streaming_event)
+        result = ScaffoldingResult()
 
         async def put_request():
-            request = ScaffoldingRequest(
-                prompt=prompt,
-                kwargs={},
-                result=result,
-                controller=self.prototype_controller.clone())
-
-            await self.task_queue.put(request)
+            try:
+                request = ScaffoldingRequest(
+                    prompt=prompt,
+                    kwargs={},
+                    result=result,
+                    controller=self.prototype_controller.clone())
+            except Exception as e:
+                self.task_queue.put(None)
+                print(
+                    f"Error: build ScaffoldingRequest failed: {e} \n {traceback.format_exc()}"
+                )
+            else:
+                await self.task_queue.put(request)
 
         asyncio.run_coroutine_threadsafe(put_request(), self.loop)
 
@@ -208,7 +213,7 @@ class ScaffoldingLlm:
 
     def shutdown(self, shutdown_workers=False):
 
-        def shutdown_workers():
+        def shutdown_workers_func():
             for worker in self.workers.values():
                 worker.shutdown()
 
@@ -228,4 +233,4 @@ class ScaffoldingLlm:
             self.shutdown_event.set()
 
         if shutdown_workers:
-            shutdown_workers()
+            shutdown_workers_func()

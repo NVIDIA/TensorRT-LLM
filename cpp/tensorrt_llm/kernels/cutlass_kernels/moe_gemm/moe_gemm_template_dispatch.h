@@ -73,9 +73,8 @@
 #include <sstream>
 #include <type_traits>
 
-namespace tensorrt_llm::kernels::cutlass_kernels
+namespace tensorrt_llm::kernels::cutlass_kernels_oss
 {
-using tensorrt_llm::kernels::cutlass_kernels_oss::sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass;
 
 // ============================= Variable batched Gemm things ===========================
 template <typename T, typename WeightType, typename GemmOutputType, typename arch, cutlass::WeightOnlyQuantOp QuantOp,
@@ -106,9 +105,9 @@ struct genericMoeGemmKernelLauncher
         static_assert(arch::kMinComputeCapability < 90, "Sm90+ architecture should use specialized kernels");
 
         // The cutlass type for the input elements. This is needed to convert to cutlass::half_t if necessary.
-        using ElementType = typename TllmToCutlassTypeAdapter<T>::type;
-        using CutlassGemmOutputType = typename TllmToCutlassTypeAdapter<GemmOutputType>::type;
-        using CutlassWeightType = typename TllmToCutlassTypeAdapter<WeightType>::type;
+        using ElementType = typename cutlass_kernels::TllmToCutlassTypeAdapter<T>::type;
+        using CutlassGemmOutputType = typename cutlass_kernels::TllmToCutlassTypeAdapter<GemmOutputType>::type;
+        using CutlassWeightType = typename cutlass_kernels::TllmToCutlassTypeAdapter<WeightType>::type;
         if (!inputs.use_fused_moe)
         {
             // We need separate config for each architecture since we will target different tensorcore instructions. For
@@ -246,17 +245,17 @@ static void dispatch(GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputT
     {
         // dispatch for quant op type
         auto* launcher
-            = tensorrt_llm::kernels::cutlass_kernels::genericMoeGemmKernelLauncher<T, WeightType, GemmOutputType, Arch,
-                cutlass::WeightOnlyQuantOp::UNDEFINED, EpilogueTag, ThreadblockShape, WarpShape, Stages>::call;
+            = tensorrt_llm::kernels::cutlass_kernels_oss::genericMoeGemmKernelLauncher<T, WeightType, GemmOutputType,
+                Arch, cutlass::WeightOnlyQuantOp::UNDEFINED, EpilogueTag, ThreadblockShape, WarpShape, Stages>::call;
         if (!std::is_same_v<WeightType, T> && inputs.groupwise_quant_group_size > 0)
         {
             launcher = inputs.zeros
-                ? tensorrt_llm::kernels::cutlass_kernels::genericMoeGemmKernelLauncher<T, WeightType, GemmOutputType,
-                    Arch, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS, EpilogueTag, ThreadblockShape,
-                    WarpShape, Stages>::call
-                : tensorrt_llm::kernels::cutlass_kernels::genericMoeGemmKernelLauncher<T, WeightType, GemmOutputType,
-                    Arch, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY, EpilogueTag, ThreadblockShape, WarpShape,
-                    Stages>::call;
+                ? tensorrt_llm::kernels::cutlass_kernels_oss::genericMoeGemmKernelLauncher<T, WeightType,
+                    GemmOutputType, Arch, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS, EpilogueTag,
+                    ThreadblockShape, WarpShape, Stages>::call
+                : tensorrt_llm::kernels::cutlass_kernels_oss::genericMoeGemmKernelLauncher<T, WeightType,
+                    GemmOutputType, Arch, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY, EpilogueTag,
+                    ThreadblockShape, WarpShape, Stages>::call;
         }
         launcher(inputs, sm_count_);
     }
@@ -474,6 +473,11 @@ void dispatchMoeGemmToCutlass(GroupedGemmInput<T, WeightType, GemmOutputType, Ge
     }
 }
 
+} // namespace tensorrt_llm::kernels::cutlass_kernels_oss
+
+namespace tensorrt_llm::kernels::cutlass_kernels
+{
+
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
 std::vector<cutlass_extensions::CutlassGemmConfig> MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getConfigs(
     bool supports_finalize_fusion) const
@@ -509,8 +513,8 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getAmpereConfigs(int sm
     auto config_type_param = static_cast<CutlassGemmConfig::CandidateConfigTypeParam>(
         weight_only_flag | simt_only_flag | grouped_gemm_flag | enable_hopper | fp8_only_flag);
 
-    if (!kernels::cutlass_kernels::isValidAmpereMOESpecialisation<T, WeightType>() || (use_w4afp8 && sm != 89)
-        || use_wfp4a16)
+    if (!tensorrt_llm::kernels::cutlass_kernels::isValidAmpereMOESpecialisation<T, WeightType>()
+        || (use_w4afp8 && sm != 89) || use_wfp4a16)
     {
         return {};
     }
@@ -537,8 +541,9 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getTmaWarpSpecializedCo
     static constexpr auto fp8_only_flag = use_fp8 ? CutlassGemmConfig::FP8_ONLY : CutlassGemmConfig::NONE;
     static constexpr auto fp4_only_flag
         = (use_fp4 || use_wfp4afp8) ? CutlassGemmConfig::FP4_ONLY : CutlassGemmConfig::NONE;
+    static constexpr auto fp8fp4_mixed_flag = use_wfp4afp8 ? CutlassGemmConfig::FP8FP4_MIXED : CutlassGemmConfig::NONE;
     auto config_type_param = static_cast<CutlassGemmConfig::CandidateConfigTypeParam>(weight_only_flag | simt_only_flag
-        | grouped_gemm_flag | enable_blackwell | enable_hopper | fp8_only_flag | fp4_only_flag);
+        | grouped_gemm_flag | enable_blackwell | enable_hopper | fp8_only_flag | fp4_only_flag | fp8fp4_mixed_flag);
     TLLM_CHECK_WITH_INFO(!(enable_blackwell && enable_hopper), "Blackwell and hopper flags are mutually exclusive");
 
     sm = use_wfp4afp8 && sm == 103 ? 100 : sm;
@@ -562,7 +567,8 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getTmaWarpSpecializedCo
     }
 
     std::vector<cutlass_extensions::CutlassGemmConfig> tma_ws_configs
-        = tensorrt_llm::kernels::cutlass_kernels::get_candidate_configs(sm, max_split_k, config_type_param);
+        = kernels::cutlass_kernels::get_candidate_configs(sm, max_split_k, config_type_param);
+
     if (sm == 103 && use_fp4)
     {
         // Explicitly select SM100 as well
@@ -570,6 +576,7 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getTmaWarpSpecializedCo
             = tensorrt_llm::kernels::cutlass_kernels::get_candidate_configs(100, max_split_k, config_type_param);
         std::copy(sm100_configs.begin(), sm100_configs.end(), std::back_inserter(tma_ws_configs));
     }
+
     if (supports_finalize_fusion)
     {
         // Duplicate the configs and set the epilogue fusion type to FINALIZE
@@ -587,7 +594,8 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getTmaWarpSpecializedCo
                                  {
                                      return config.epilogue_fusion_type
                                          == cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE
-                                         && config.epilogue_schedule != cutlass_extensions::EpilogueScheduleType::TMA;
+                                         && config.epilogue_schedule
+                                         == cutlass_extensions::EpilogueScheduleType::NO_SMEM;
                                  }),
             tma_ws_configs.end());
     }
@@ -623,9 +631,11 @@ bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::isTmaWarpSpecializ
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
 bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::supportsTmaWarpSpecialized(int sm)
 {
-    return (sm == 90 && kernels::cutlass_kernels::isValidHopperMOESpecialisation<T, WeightType>())
-        || (sm >= 100 && sm < 120 && kernels::cutlass_kernels::isValidBlackwellMOESpecialisation<T, WeightType>())
-        || ((sm == 120 || sm == 121) && kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType>());
+    return (sm == 90 && tensorrt_llm::kernels::cutlass_kernels::isValidHopperMOESpecialisation<T, WeightType>())
+        || (sm >= 100 && sm < 120
+            && tensorrt_llm::kernels::cutlass_kernels::isValidBlackwellMOESpecialisation<T, WeightType>())
+        || ((sm == 120 || sm == 121)
+            && tensorrt_llm::kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType>());
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
@@ -683,8 +693,8 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
     {
         if constexpr (!std::is_same_v<WeightType, __nv_fp4_e2m1>)
         {
-            dispatchMoeGemmToCutlass<T, WeightType, ScaleBiasType, cutlass::arch::Sm75, EpilogueTag>(
-                inputs, multi_processor_count_);
+            cutlass_kernels_oss::dispatchMoeGemmToCutlass<T, WeightType, ScaleBiasType, cutlass::arch::Sm75,
+                EpilogueTag>(inputs, multi_processor_count_);
         }
         else
         {
@@ -704,13 +714,13 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
 #endif
 
                 TLLM_CHECK_WITH_INFO(sm_ == 89, "For sm >= 80 and < 90, fp8 is only supported with sm == 89");
-                dispatchMoeGemmToCutlass<T, WeightType, ScaleBiasType, cutlass::arch::Sm89, EpilogueTag>(
-                    inputs, multi_processor_count_);
+                cutlass_kernels_oss::dispatchMoeGemmToCutlass<T, WeightType, ScaleBiasType, cutlass::arch::Sm89,
+                    EpilogueTag>(inputs, multi_processor_count_);
             }
             else
             {
-                dispatchMoeGemmToCutlass<T, WeightType, ScaleBiasType, cutlass::arch::Sm80, EpilogueTag>(
-                    inputs, multi_processor_count_);
+                cutlass_kernels_oss::dispatchMoeGemmToCutlass<T, WeightType, ScaleBiasType, cutlass::arch::Sm80,
+                    EpilogueTag>(inputs, multi_processor_count_);
             }
         }
         else
@@ -720,18 +730,19 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
     }
     else if (sm_ >= 90)
     {
-        // For SM120+ FP8 MoE, redirect to SM89 (Ada) FP8 kernel implementations.
-        if constexpr (use_fp8)
+        // For SM120+ pure FP8 MoE (not FP8 x FP4), redirect to SM89 (Ada) FP8 kernel implementations.
+        if constexpr (use_fp8 && !use_wfp4afp8)
         {
             if (sm_ >= 120)
             {
-                dispatchMoeGemmToCutlass<T, WeightType, ScaleBiasType, cutlass::arch::Sm89, EpilogueTag>(
-                    inputs, multi_processor_count_);
+                cutlass_kernels_oss::dispatchMoeGemmToCutlass<T, WeightType, ScaleBiasType, cutlass::arch::Sm89,
+                    EpilogueTag>(inputs, multi_processor_count_);
                 return;
             }
         }
 
-        if constexpr (kernels::cutlass_kernels::isValidTmaWarpSpecializedMOESpecialisation<T, WeightType, EpilogueTag>()
+        if constexpr (tensorrt_llm::kernels::cutlass_kernels::isValidTmaWarpSpecializedMOESpecialisation<T, WeightType,
+                          EpilogueTag>()
             && !use_w4_groupwise)
         {
             // We allow both tma warp specialized and SM80 configurations to coexist because for some cases with small
@@ -780,17 +791,17 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
             // EpilogueTag is ignored
             if (inputs.k % 512 == 0)
             {
-                sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass<T, WeightType, ScaleBiasType,
+                cutlass_kernels_oss::sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass<T, WeightType, ScaleBiasType,
                     cutlass_extensions::EpilogueOpDefault, 4>(inputs, hopper_inputs, multi_processor_count_, nullptr);
             }
             else if (inputs.k % 256 == 0)
             {
-                sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass<T, WeightType, ScaleBiasType,
+                cutlass_kernels_oss::sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass<T, WeightType, ScaleBiasType,
                     cutlass_extensions::EpilogueOpDefault, 2>(inputs, hopper_inputs, multi_processor_count_, nullptr);
             }
             else if (inputs.k % 128 == 0)
             {
-                sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass<T, WeightType, ScaleBiasType,
+                cutlass_kernels_oss::sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass<T, WeightType, ScaleBiasType,
                     cutlass_extensions::EpilogueOpDefault, 1>(inputs, hopper_inputs, multi_processor_count_, nullptr);
             }
             else
@@ -805,7 +816,7 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
             TLLM_CHECK_WITH_INFO(
                 inputs.gemm_config.is_tma_warp_specialized, "wfp4a16 is only supported for TMA warp specialization");
             // EpilogueTag is ignored
-            sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass<T, WeightType, ScaleBiasType,
+            cutlass_kernels_oss::sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass<T, WeightType, ScaleBiasType,
                 cutlass_extensions::EpilogueOpDefault, 1>(inputs, hopper_inputs, multi_processor_count_, nullptr);
             return;
         }
@@ -825,13 +836,13 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
                 "Using SM %d configuration for SM80 fallback implementation", inputs.gemm_config.sm_version);
             if constexpr (use_fp8)
             {
-                dispatchMoeGemmToCutlass<T, WeightType, ScaleBiasType, cutlass::arch::Sm89, EpilogueTag>(
-                    inputs, multi_processor_count_);
+                cutlass_kernels_oss::dispatchMoeGemmToCutlass<T, WeightType, ScaleBiasType, cutlass::arch::Sm89,
+                    EpilogueTag>(inputs, multi_processor_count_);
             }
             else
             {
-                dispatchMoeGemmToCutlass<T, WeightType, ScaleBiasType, cutlass::arch::Sm80, EpilogueTag>(
-                    inputs, multi_processor_count_);
+                cutlass_kernels_oss::dispatchMoeGemmToCutlass<T, WeightType, ScaleBiasType, cutlass::arch::Sm80,
+                    EpilogueTag>(inputs, multi_processor_count_);
             }
         }
         else
@@ -869,8 +880,8 @@ size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::calcMaxWorkspace
     {
         return 0;
     }
-    if constexpr (kernels::cutlass_kernels::isValidTmaWarpSpecializedMOESpecialisation<T, WeightType>() && !use_w4afp8
-        && !use_wfp4a16)
+    if constexpr (tensorrt_llm::kernels::cutlass_kernels::isValidTmaWarpSpecializedMOESpecialisation<T, WeightType>()
+        && !use_w4afp8 && !use_wfp4a16)
     {
         // Finalize fusion may not actually be supported by the kernel,
         // if they are not we will catch the error and skip them

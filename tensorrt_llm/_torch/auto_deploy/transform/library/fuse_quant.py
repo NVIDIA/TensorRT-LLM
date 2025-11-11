@@ -34,21 +34,6 @@ def _fp8_ref_pattern_1(
     )
 
 
-def _fp8_ref_repl_1(
-    x: torch.Tensor,
-    w_fp8: torch.Tensor,
-    input_scale: torch.Tensor,
-    weight_scale: torch.Tensor,
-):
-    return torch.ops.auto_deploy.torch_quant_fp8_linear(
-        x,
-        w_fp8,
-        None,
-        input_scale=input_scale,
-        weight_scale=weight_scale,
-    )
-
-
 # with bias!=None
 def _fp8_ref_pattern_2(
     x: torch.Tensor,
@@ -65,22 +50,6 @@ def _fp8_ref_pattern_2(
         weight_scale=[weight_scale],
         input_zp=[],
         weight_zp=[],
-    )
-
-
-def _fp8_ref_repl_2(
-    x: torch.Tensor,
-    w_fp8: torch.Tensor,
-    bias: torch.Tensor,
-    input_scale: torch.Tensor,
-    weight_scale: torch.Tensor,
-):
-    return torch.ops.auto_deploy.torch_quant_fp8_linear(
-        x,
-        w_fp8,
-        bias,
-        input_scale=input_scale,
-        weight_scale=weight_scale,
     )
 
 
@@ -158,10 +127,41 @@ def _fp4_ref_repl_2(
     )
 
 
-def _register_quant_fp8_linear_patterns(patterns: ADPatternMatcherPass) -> None:
+def _register_quant_fp8_linear_patterns(patterns: ADPatternMatcherPass, op) -> None:
     """
     Register FP8 linear patterns with robust dummy args and minimal ignores.
     """
+
+    # Define replacement functions that use the provided op
+    def _fp8_ref_repl_1(
+        x: torch.Tensor,
+        w_fp8: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+    ):
+        return op(
+            x,
+            w_fp8,
+            None,
+            input_scale=input_scale,
+            weight_scale=weight_scale,
+        )
+
+    def _fp8_ref_repl_2(
+        x: torch.Tensor,
+        w_fp8: torch.Tensor,
+        bias: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+    ):
+        return op(
+            x,
+            w_fp8,
+            bias,
+            input_scale=input_scale,
+            weight_scale=weight_scale,
+        )
+
     # FP8 dummy tensors
     x_fp8 = torch.randn(3, 16, device="meta", dtype=torch.float16)
     w_fp8 = torch.randn(32, 16, device="meta", dtype=torch.float16)
@@ -275,11 +275,17 @@ class FuseFP8Linear(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        if self.config.backend.lower() != "torch":
+        if self.config.backend.lower() not in ["torch", "trtllm"]:
             raise ValueError(f"Unsupported FP8 backend: {self.config.backend}")
 
         patterns = ADPatternMatcherPass()
-        _register_quant_fp8_linear_patterns(patterns)
+        op = (
+            torch.ops.auto_deploy.trtllm_quant_fp8_linear
+            if self.config.backend.lower() == "trtllm"
+            else torch.ops.auto_deploy.torch_quant_fp8_linear
+        )
+
+        _register_quant_fp8_linear_patterns(patterns, op)
         cnt = patterns.apply(gm.graph)
 
         info = TransformInfo(

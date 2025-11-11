@@ -23,11 +23,28 @@ class RMSNorm(torch.nn.Module):
         return self.weight * hidden_states.to(input_dtype)
 
 
+class NemotronH_RMSNorm(torch.nn.Module):
+    def __init__(self, hidden_size, eps=1e-6):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(hidden_size, device="cuda"))
+        self.eps = eps
+
+    def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
+        return (self.weight.to(torch.float32) * hidden_states).to(input_dtype)
+
+
 class TestModel(torch.nn.Module):
-    def __init__(self, eps: float = 1e-6):
+    def __init__(self, eps: float = 1e-6, use_nemotron_h: bool = False):
         super().__init__()
         self.linear1 = torch.nn.Linear(1024, 1024, device="cuda", dtype=torch.float16)
-        self.rms_norm = RMSNorm(1024, eps).to(torch.float16)
+        if use_nemotron_h:
+            self.rms_norm = NemotronH_RMSNorm(1024, eps).to(torch.float16)
+        else:
+            self.rms_norm = RMSNorm(1024, eps).to(torch.float16)
         self.linear2 = torch.nn.Linear(1024, 1024, device="cuda", dtype=torch.float16)
 
     def forward(self, x):
@@ -37,20 +54,10 @@ class TestModel(torch.nn.Module):
         return x
 
 
-@pytest.mark.parametrize("eps", [1e-2, 1e-6])
-@pytest.mark.parametrize(
-    "variant, op",
-    [
-        ("flashinfer", torch.ops.auto_deploy.flashinfer_rms_norm),
-        ("triton", torch.ops.auto_deploy.triton_rms_norm),
-        ("torch", torch.ops.auto_deploy.torch_rmsnorm),
-    ],
-)
-def test_rmsnorm_fusion(eps, variant, op):
+def _run_test(model, op, variant):
     def checker(gm):
         return any(is_op(n, op) for n in gm.graph.nodes)
 
-    model = TestModel(eps)
     x = torch.randn(2, 1024, device="cuda", dtype=torch.float16)
     dynamic_shapes = {0: Dim("batch_size", max=8)}
     gm = torch_export_to_gm(model, args=(x,), dynamic_shapes=(dynamic_shapes,), clone=True)
@@ -77,3 +84,22 @@ def test_rmsnorm_fusion(eps, variant, op):
     y_transformed = gm_transformed(new_input)
     y_model = model(new_input)
     torch.testing.assert_close(y_transformed, y_model, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize("eps", [1e-2, 1e-6])
+@pytest.mark.parametrize(
+    "variant, op",
+    [
+        ("flashinfer", torch.ops.auto_deploy.flashinfer_rms_norm),
+        ("torch", torch.ops.auto_deploy.torch_rmsnorm),
+    ],
+)
+def test_rmsnorm_fusion(eps, variant, op):
+    model = TestModel(eps)
+    _run_test(model, op, variant)
+
+
+def test_rmsnorm_fusion_nemotron_h():
+    # Only the triton backend supports the nemotron h rmsnorm
+    model = TestModel(eps=1e-6, use_nemotron_h=True)
+    _run_test(model, torch.ops.auto_deploy.triton_rms_norm, "triton")

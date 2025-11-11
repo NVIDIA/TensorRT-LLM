@@ -2,7 +2,6 @@
 Script that refits TRT-LLM engine(s) with weights in a TRT-LLM checkpoint.
 '''
 import argparse
-import copy
 import json
 import os
 import re
@@ -57,7 +56,7 @@ def refit_engine(engine_path: str, refit_engine_dir: str, checkpoint_dir: str,
 
     # There are weights preprocess during optimize model.
     tik = time.time()
-    build_config = copy.deepcopy(engine_config.build_config)
+    build_config = engine_config.build_config.model_copy(deep=True)
     optimize_model_with_config(model, build_config)
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))

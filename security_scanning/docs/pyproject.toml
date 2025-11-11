@@ -1,0 +1,23 @@
+[tool.poetry]
+name = "docs"
+version = "0.1.0"
+description = ""
+authors = ["TensorRT LLM [90828364+tensorrt-cicd@users.noreply.github.com]"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.13"
+sphinx = ">=7.0"
+sphinx-argparse = "^0.5.2"
+sphinx-click = "^6.1.0"
+nvidia-sphinx-theme = "^0.0.8"
+myst-parser = "^4.0.1"
+breathe = "^4.36.0"
+sphinx-copybutton = "^0.5.2"
+autodoc-pydantic = "^2.2.0"
+sphinx-togglebutton = "^0.3.2"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

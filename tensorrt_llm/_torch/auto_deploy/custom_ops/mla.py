@@ -175,15 +175,15 @@ def fused_flattened_mla_with_cache_fake(
     "auto_deploy::triton_attention_prepare_fused_mla_metadata", mutates_args=()
 )
 def prepare_fused_mla_metadata(
-    input_ids: torch.Tensor,
     position_ids: torch.Tensor,
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
     cache_loc: torch.Tensor,
     pages_per_seq: torch.Tensor,
+    slot_idx: torch.Tensor,
     page_size: int,
 ) -> List[torch.Tensor]:
-    num_seq = SequenceInfo._get_sanitized_num_sequences(input_ids, seq_len)
+    num_seq = SequenceInfo._get_sanitized_num_sequences(position_ids, seq_len)
     seq_start = torch.zeros_like(seq_len[:num_seq])
     seq_start[1:] = torch.cumsum(seq_len[: num_seq - 1], 0)
     return (
@@ -196,7 +196,7 @@ def prepare_fused_mla_metadata(
 
 @prepare_fused_mla_metadata.register_fake
 def prepare_fused_mla_metadata_fake(
-    input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, page_size
+    position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size
 ):
     return (
         torch.empty_like(seq_len),

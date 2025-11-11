@@ -1,0 +1,14 @@
+max_batch_size: 4
+tensor_parallel_size: 8
+moe_expert_parallel_size: 2
+max_num_tokens: 32768
+trust_remote_code: true
+kv_cache_free_gpu_memory_fraction: 0.75
+moe_backend: TRTLLM
+use_cuda_graph: true
+speculative_config:
+  decoding_type: MTP
+  num_nextn_predict_layers: 3
+  use_relaxed_acceptance_for_thinking: true
+  relaxed_topk: 10
+  relaxed_delta: 0.6

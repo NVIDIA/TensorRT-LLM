@@ -469,16 +469,17 @@ class TestTorchBackendAttention:
         batch_size, seq_len_val = 4, 8
         device = self.device
 
-        input_ids = torch.randint(0, 1000, (batch_size, seq_len_val), device=device)
+        # input_ids = torch.randint(0, 1000, (batch_size, seq_len_val), device=device)
         position_ids = torch.arange(seq_len_val, device=device).expand(batch_size, -1)
         seq_len = torch.full((batch_size,), seq_len_val, device=device, dtype=torch.int32)
         input_pos = torch.zeros(batch_size, device=device, dtype=torch.int32)
         cache_loc = torch.arange(batch_size, device=device, dtype=torch.int32)
         pages_per_seq = torch.ones(batch_size, device=device, dtype=torch.int32)
+        slot_idx = torch.arange(batch_size, device=device, dtype=torch.int32)
 
         # Test metadata preparation
         result = torch.ops.auto_deploy.torch_cached_attention_prepare_metadata(
-            input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, 128
+            position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, 128
         )
 
         # Verify result structure

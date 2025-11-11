@@ -284,15 +284,16 @@ def flattened_mha_fake(
     "auto_deploy::triton_attention_prepare_fused_mha_metadata", mutates_args=()
 )
 def prepare_fused_mha_metadata(
-    input_ids: torch.Tensor,
     position_ids: torch.Tensor,
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
     cache_loc: torch.Tensor,
     pages_per_seq: torch.Tensor,
+    slot_idx: torch.Tensor,
     page_size: int,
 ) -> List[torch.Tensor]:
-    num_seq = SequenceInfo._get_sanitized_num_sequences(input_ids, seq_len)
+    # TODO: maybe use slot_idx instead of pages_per_seq??
+    num_seq = SequenceInfo._get_sanitized_num_sequences(position_ids, seq_len)
     seq_start = torch.zeros_like(seq_len[:num_seq])
     seq_start[1:] = torch.cumsum(seq_len[: num_seq - 1], 0)
     return (
@@ -307,9 +308,9 @@ def prepare_fused_mha_metadata(
 # SequenceInfo._get_sanitized_num_sequences could break in fake mode
 @prepare_fused_mha_metadata.register_fake
 def prepare_fused_mha_metadata_fake(
-    input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, page_size
+    position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size
 ):
-    num_seq = SequenceInfo._get_sanitized_num_sequences(input_ids, seq_len)
+    num_seq = SequenceInfo._get_sanitized_num_sequences(position_ids, seq_len)
     return (
         torch.empty_like(seq_len[:num_seq]),
         torch.empty_like(input_pos[:num_seq]),
@@ -337,7 +338,7 @@ class TritonAttention(AttentionDescriptor):
 
     @classmethod
     def get_source_attention_op(cls) -> OpOverloadPacket:
-        return torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa
+        return torch.ops.auto_deploy.torch_attention
 
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
@@ -388,6 +389,21 @@ class TritonAttention(AttentionDescriptor):
 
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
+        # Sanity check: layout == "bsnd"
+        # Prefer kwargs; fall back to the final positional arg if it's a string.
+        layout = source_attn_node.kwargs.get("layout", None)
+        if (
+            layout is None
+            and len(source_attn_node.args) > 0
+            and isinstance(source_attn_node.args[-1], str)
+        ):
+            layout = source_attn_node.args[-1]
+        if layout != "bsnd":
+            raise RuntimeError(
+                f"Expected torch_attention layout='bsnd' but got {layout!r} "
+                f"for node: {source_attn_node.format_node()}"
+            )
+
         # retrieve head_dim from k_fake
         attn_mask, dropout_p, is_causal = extract_op_args(
             source_attn_node, "attn_mask", "dropout_p", "is_causal"
@@ -406,8 +422,8 @@ class TritonAttention(AttentionDescriptor):
 
         # do a sanity check on the scale if it is not None, we only support the default scale
         # of 1/sqrt(head_dim) and so we should do an approximate check for that one
-        if not isinstance(scale, float):
-            ad_logger.warning("Provided scale is not a float, Using default scale instead.")
+        if not (isinstance(scale, float) or scale is None):
+            ad_logger.warning(f"Provided {scale=} is not a float. Using default scale instead.")
             scale = None
         # Get sinks and sliding_window from args or kwargs
         sinks = extract_op_args(source_attn_node, "sinks")[0]

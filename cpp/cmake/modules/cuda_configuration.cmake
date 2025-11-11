@@ -116,7 +116,7 @@ function(setup_cuda_architectures)
     unset(CMAKE_CUDA_ARCHITECTURES_RAW)
     message(
       STATUS
-        "Setting CMAKE_CUDA_ARCHITECTURES to all enables all architectures TensorRT-LLM optimized for, "
+        "Setting CMAKE_CUDA_ARCHITECTURES to all enables all architectures TensorRT LLM optimized for, "
         "not all architectures CUDA compiler supports.")
   elseif(CMAKE_CUDA_ARCHITECTURES_RAW STREQUAL "all-major")
     message(

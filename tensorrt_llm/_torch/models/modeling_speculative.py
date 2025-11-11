@@ -48,6 +48,8 @@ class Eagle3Attention(Attention):
         )
 
         tp_size = model_config.mapping.tp_size
+        if model_config.mapping.enable_attention_dp:
+            tp_size = 1
         # Override the QKV projection. The number of input features
         # is twice as big for EAGLE3 draft models.
         self.qkv_proj = Linear(
@@ -55,7 +57,7 @@ class Eagle3Attention(Attention):
             tp_size * self.q_size + 2 * tp_size * self.kv_size,
             bias=config.attention_bias,
             dtype=config.torch_dtype,
-            mapping=model_config.mapping,
+            mapping=self.qkv_proj.mapping,
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             weights_loading_config=WeightsLoadingConfig(
                 weight_mode=WeightMode.FUSED_QKV_LINEAR),
@@ -89,6 +91,8 @@ class Eagle3DecoderLayer(DecoderLayer):
             bias=getattr(config, "mlp_bias", False),
             dtype=config.torch_dtype,
             config=model_config,
+            overridden_tp_size=1
+            if model_config.mapping.enable_attention_dp else None,
         )
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
@@ -182,14 +186,21 @@ class Eagle3DraftModel(DecoderModel):
                                     requires_grad=False)
 
         if self.hidden_size_in != config.hidden_size:
-            self.embed_tokens = Embedding(
-                config.vocab_size,
-                config.hidden_size,
-                dtype=config.torch_dtype,
-                mapping=model_config.mapping,
-                tensor_parallel_mode=TensorParallelMode.COLUMN,
-                gather_output=True,
-            )
+            if model_config.mapping.enable_attention_dp:
+                self.embed_tokens = Embedding(
+                    config.vocab_size,
+                    config.hidden_size,
+                    dtype=config.torch_dtype,
+                )
+            else:
+                self.embed_tokens = Embedding(
+                    config.vocab_size,
+                    config.hidden_size,
+                    dtype=config.torch_dtype,
+                    mapping=model_config.mapping,
+                    tensor_parallel_mode=TensorParallelMode.COLUMN,
+                    gather_output=True,
+                )
         else:
             # Shared with target model.
             self.embed_tokens = None

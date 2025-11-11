@@ -9,6 +9,7 @@ from tensorrt_llm import deep_gemm
 from tensorrt_llm._utils import nvtx_range
 
 from ...distributed import allgather
+from ...memory_buffer_utils import get_memory_buffers
 from ...model_config import ModelConfig
 from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from .fused_moe_cutlass import CutlassFusedMoE
@@ -365,6 +366,9 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
     3. moe_finalize_scale_op: finalize the scale of the output tensor.
     """
 
+    # To reuse pytorch memory segments allocated during graph capture.
+    buffers = get_memory_buffers()
+
     def __init__(
         self,
         *,
@@ -410,28 +414,34 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         )
 
     def get_workspace(self, m_max: int, group_size: int):
+        capture_graph = torch.cuda.is_current_stream_capturing()
         hidden_size = self.hidden_size
         intermediate_size = self.intermediate_size_per_partition
         num_experts = self.expert_size_per_partition
 
         # create workspace
         fp8_dim = max(hidden_size, intermediate_size)
-        workspace_0 = torch.empty((num_experts * m_max * fp8_dim),
-                                  dtype=torch.float8_e4m3fn,
-                                  device='cuda')
-        workspace_1 = torch.empty(
-            (num_experts * m_max * max(intermediate_size * 2, hidden_size)),
+        workspace_0 = DeepGemmFusedMoE.buffers.get_buffer(
+            (num_experts * m_max * fp8_dim, ),
+            dtype=torch.float8_e4m3fn,
+            buffer_name='workspace_0',
+            reserve_buffer=capture_graph)
+        workspace_1 = DeepGemmFusedMoE.buffers.get_buffer(
+            (num_experts * m_max * max(intermediate_size * 2, hidden_size), ),
             dtype=torch.bfloat16,
-            device='cuda')
+            buffer_name='workspace_1',
+            reserve_buffer=capture_graph)
 
         # create workspace for scaling factors
         m_padded = fp8_utils.align(m_max, 4)
         scale_k = fp8_utils.ceil_div(fp8_dim, group_size)
         scale_k_padded = fp8_utils.align(scale_k, 4)
-        workspace_sf = torch.empty(
-            (num_experts * (scale_k_padded // 4) * m_padded),
+
+        workspace_sf = DeepGemmFusedMoE.buffers.get_buffer(
+            (num_experts * (scale_k_padded // 4) * m_padded, ),
             dtype=torch.int32,
-            device='cuda')
+            buffer_name='workspace_sf',
+            reserve_buffer=capture_graph)
 
         workspace = {
             "workspace_0": workspace_0,

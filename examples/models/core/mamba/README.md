@@ -1,21 +1,21 @@
 # Mamba
 
-This document shows how to build and run a [Mamba](https://github.com/state-spaces/mamba) model in TensorRT-LLM on a single GPU.
+This document shows how to build and run a [Mamba](https://github.com/state-spaces/mamba) model in TensorRT LLM on a single GPU.
 
 - [Mamba](#mamba)
   - [Overview](#overview)
   - [Support Matrix](#support-matrix)
   - [Usage](#usage)
     - [1. Download weights from HuggingFace Transformers](#1-download-weights-from-huggingface-transformers)
-    - [2. Convert weights from HF Transformers to TensorRT-LLM format](#2-convert-dweights-from-hf-transformers-to-tensorrt-llm-format)
+    - [2. Convert weights from HF Transformers to TensorRT LLM format](#2-convert-dweights-from-hf-transformers-to-tensorrt-llm-format)
     - [3. Build TensorRT engine(s)](#3-build-tensorrt-engines)
     - [4. Run summarization task with the TensorRT engine(s)](#4-run-summarization-task-with-the-tensorrt-engines)
 
 ## Overview
 
-The TensorRT-LLM Mamba implementation can be found in [`tensorrt_llm/models/mamba/model.py`](../../../../tensorrt_llm/models/mamba/model.py). The TensorRT-LLM Mamba example code is located in [`examples/models/core/mamba`](./). There is one main file:
+The TensorRT LLM Mamba implementation can be found in [`tensorrt_llm/models/mamba/model.py`](../../../../tensorrt_llm/models/mamba/model.py). The TensorRT LLM Mamba example code is located in [`examples/models/core/mamba`](./). There is one main file:
 
-* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT-LLM format.
+* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT LLM format.
 
 In addition, there are two shared files in the parent folder [`examples`](../../../) for inference and evaluation:
 
@@ -30,12 +30,12 @@ In addition, there are two shared files in the parent folder [`examples`](../../
 |    Mamba1        |   Y   |   Y   |  N  |
 |    Mamba2        |   Y   |   Y   |  Y  |
 
-* Mamba2: TensorRT-LLM can only support the pure Mamba model for now, will support the hybrid models later.
+* Mamba2: TensorRT LLM can only support the pure Mamba model for now, will support the hybrid models later.
 
 ## Usage
 
 The next two sections describe how to convert the weights from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers)
-format to the TensorRT-LLM format.
+format to the TensorRT LLM format.
 
 ### 1. Download weights from HuggingFace Transformers
 
@@ -46,7 +46,7 @@ pip install -r requirements.txt
 git lfs install
 ```
 
-There are different HF checkpoints available. For Mamba1, TensorRT-LLM can support those Transformers compatible models. Here're some examples to fetch the checkpoint.
+There are different HF checkpoints available. For Mamba1, TensorRT LLM can support those Transformers compatible models. Here're some examples to fetch the checkpoint.
 
 ```bash
 # mamba-2.8b
@@ -72,8 +72,8 @@ Since mamba models use tokenizer from gpt-neox-20b model, use the following comm
 git clone https://huggingface.co/EleutherAI/gpt-neox-20b ./mamba_model/gpt-neox-20b
 ```
 
-### 2. Convert weights from HF Transformers to TensorRT-LLM format
-The [`convert_checkpoint.py`](./convert_checkpoint.py) script converts HF weights to TensorRT-LLM checkpoints.
+### 2. Convert weights from HF Transformers to TensorRT LLM format
+The [`convert_checkpoint.py`](./convert_checkpoint.py) script converts HF weights to TensorRT LLM checkpoints.
 
 For the Mamba2 models, if they can support tensor parallelism, you can run them with 1, 2, 4 or 8 GPUs. Here we use
 mamba-codestral-7B-v0.1 as an example.
@@ -112,7 +112,7 @@ python convert_checkpoint.py --model_dir ./mamba_model/mamba-codestral-7B-v0.1/ 
 ```
 
 ### 3. Build TensorRT engine(s)
-The `trtllm-build` command builds TensorRT-LLM engines from TensorRT-LLM checkpoints.
+The `trtllm-build` command builds TensorRT LLM engines from TensorRT LLM checkpoints.
 
 ```bash
 # mamba-2.8b
@@ -176,7 +176,7 @@ If `paged_state` is disabled, engine will be built with the contiguous stage cac
 
 ### 4. Run summarization task with the TensorRT engine(s)
 
-The following section describes how to run a TensorRT-LLM Mamba model to summarize the articles from the
+The following section describes how to run a TensorRT LLM Mamba model to summarize the articles from the
 [cnn_dailymail](https://huggingface.co/datasets/abisee/cnn_dailymail) dataset. For each summary, the script can compute the
 [ROUGE](https://en.wikipedia.org/wiki/ROUGE_(metric)) scores and use the `ROUGE-1` score to validate the implementation.
 

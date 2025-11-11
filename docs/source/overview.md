@@ -30,6 +30,13 @@ TensorRT LLM supports the latest and most popular LLM architectures:
 
 TensorRT LLM strives to support the most popular models on **Day 0**.
 
+### FP4 Support
+[NVIDIA B200 GPUs](https://www.nvidia.com/en-us/data-center/dgx-b200/) , when used with TensorRT LLM, enable seamless loading of model weights in the new [FP4 format](https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/#what_is_nvfp4), allowing you to automatically leverage optimized FP4 kernels for efficient and accurate low-precision inference.
+
+### FP8 Support
+
+TensorRT LLM strives to support the most popular models on **Day 0**.
+
 ### 🚀 **Advanced Optimization & Production Features**
 - **In-Flight Batching & Paged Attention**: {ref}`inflight-batching` eliminates wait times by dynamically managing request execution, processing context and generation phases together for maximum GPU utilization and reduced latency.
 - **Multi-GPU Multi-Node Inference**: Seamless distributed inference with tensor, pipeline, and expert parallelism across multiple GPUs and nodes through the Model Definition API.

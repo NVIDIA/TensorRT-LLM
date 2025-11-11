@@ -210,7 +210,14 @@ CacheTransBufferManager::CacheTransBufferManager(
         {
             auto poolIdx = mCacheManager->getBlockManager().getLayerPoolIdx(layerId);
             auto windowSize = static_cast<size_t>(mCacheManager->getBlockManager().getPoolWindowSize(poolIdx));
-            auto validTokenNum = (windowSize < maxNumTokens.value() ? windowSize : maxNumTokens.value());
+            auto alignedWindowSize = (windowSize + tokensPerBlock - 1) / tokensPerBlock * tokensPerBlock;
+            auto validTokenNum = (alignedWindowSize < maxNumTokens.value() ? alignedWindowSize : maxNumTokens.value());
+            if (common::getEnvKVCacheTransferAllBlocksForWindow())
+            {
+                validTokenNum = maxNumTokens.value();
+            }
+            validTokenNum += tokensPerBlock; // add one more block
+
             bufferSizeFromMaxNumToken += validTokenNum * kvCacheByteSizePerTokenPerLayer;
         }
     }
@@ -219,7 +226,7 @@ CacheTransBufferManager::CacheTransBufferManager(
         = maxNumTokens.has_value() ? bufferSizeFromMaxNumToken : common::getEnvMemSizeForKVCacheTransferBuffer();
     mOnlyUseDynamicBuffer = mTransferBufferSize == 0;
     mRecvBufferCount = common::getEnvRequestKVCacheConcurrent() ? common::getEnvKVCacheRecvBufferCount() : 1;
-    mSendBufferCount = common::getEnvParallelCacheSend() ? common::getEnvKVCacheSendMaxConcurrenceNum() : 1;
+    mSendBufferCount = common::getEnvKVCacheSendMaxConcurrenceNum();
     mUseFabricMemory = !(common::getEnvKVCacheTransferUseSyncBuffer() || common::getEnvKVCacheTransferUseAsyncBuffer())
         && FabricMemory::supportFbaricMemory();
     if (mUseFabricMemory)
@@ -238,7 +245,7 @@ CacheTransBufferManager::CacheTransBufferManager(
 }
 
 size_t CacheTransBufferManager::preAllocBufferSize(
-    std::map<SizeType32, SizeType32> const& cacheSizeBytesPerTokenPerWindow,
+    std::map<SizeType32, SizeType32> const& cacheSizeBytesPerTokenPerWindow, SizeType32 tokensPerBlock,
     std::optional<executor::CacheTransceiverConfig> const& cacheTransceiverConfig)
 {
     if (!cacheTransceiverConfig.has_value())
@@ -256,9 +263,15 @@ size_t CacheTransBufferManager::preAllocBufferSize(
         TransferBufferSize = 0;
         for (auto const& [windowSize, cacheSizeBytesPerToken] : cacheSizeBytesPerTokenPerWindow)
         {
-            auto validTokenNum
-                = (static_cast<size_t>(windowSize) < maxNumTokens.value() ? static_cast<size_t>(windowSize)
-                                                                          : maxNumTokens.value());
+            auto alignedWindowSize = (windowSize + tokensPerBlock - 1) / tokensPerBlock * tokensPerBlock;
+            auto validTokenNum = (static_cast<size_t>(alignedWindowSize) < maxNumTokens.value()
+                    ? static_cast<size_t>(alignedWindowSize)
+                    : maxNumTokens.value());
+            if (common::getEnvKVCacheTransferAllBlocksForWindow())
+            {
+                validTokenNum = maxNumTokens.value();
+            }
+            validTokenNum += tokensPerBlock; // add one more block
             TransferBufferSize += validTokenNum * cacheSizeBytesPerToken;
         }
     }
@@ -269,7 +282,7 @@ size_t CacheTransBufferManager::preAllocBufferSize(
         TransferBufferSize = FabricMemory::getAlignedSize(TransferBufferSize);
     }
     size_t RecvBufferCount = common::getEnvRequestKVCacheConcurrent() ? common::getEnvKVCacheRecvBufferCount() : 1;
-    size_t SendBufferCount = common::getEnvParallelCacheSend() ? common::getEnvKVCacheSendMaxConcurrenceNum() : 1;
+    size_t SendBufferCount = common::getEnvKVCacheSendMaxConcurrenceNum();
     size_t PreAllocBufferSize = TransferBufferSize * (RecvBufferCount + SendBufferCount);
     return PreAllocBufferSize;
 }

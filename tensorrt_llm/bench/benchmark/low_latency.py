@@ -35,7 +35,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 @click.command(name="latency")
 @optgroup.group("Engine run configuration",
-                help="Runtime settings for executing a TensorRT-LLM engine.")
+                help="Runtime settings for executing a TensorRT LLM engine.")
 @optgroup.option(
     "--engine_dir",
     type=click.Path(exists=True,
@@ -52,10 +52,11 @@ from tensorrt_llm.sampling_params import SamplingParams
     help=
     "Path to a YAML file that overwrites the parameters specified by trtllm-bench."
 )
-@optgroup.option("--backend",
-                 type=click.Choice(ALL_SUPPORTED_BACKENDS),
-                 default="pytorch",
-                 help="The backend to use when running benchmarking.")
+@optgroup.option(
+    "--backend",
+    type=click.Choice(ALL_SUPPORTED_BACKENDS),
+    default="pytorch",
+    help="The backend to use for benchmark. Default is pytorch backend.")
 @optgroup.option(
     "--kv_cache_free_gpu_mem_fraction",
     type=float,
@@ -150,7 +151,7 @@ from tensorrt_llm.sampling_params import SamplingParams
     "Desired concurrency rate (number of requests processing at the same time), <=0 for no concurrency limit.",
 )
 @optgroup.group("Speculative Decode Options",
-                help="Runtime settings for executing a TensorRT-LLM engine.")
+                help="Runtime settings for executing a TensorRT LLM engine.")
 @optgroup.option(
     "--medusa_choices",
     type=click.Path(exists=True,
@@ -244,9 +245,9 @@ def latency_command(
                 f"{metadata.max_sequence_length}. Please rebuild a new engine to"
                 "support this dataset.")
     else:
-        raise RuntimeError(
-            f"Invalid backend: {options.backend}, please use one of the following: "
-            f"{ALL_SUPPORTED_BACKENDS}")
+        raise click.BadParameter(
+            f"{options.backend} is not a known backend, check help for available options.",
+            param_hint="backend")
 
     exec_settings["model"] = options.model
     engine_tokens = exec_settings["settings_config"]["max_num_tokens"]

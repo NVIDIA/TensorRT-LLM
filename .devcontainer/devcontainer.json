@@ -36,9 +36,10 @@
             // "ms-vscode.makefile-tools",
             // "ms-vscode.cmake-tools",
             // Git & Github
-            // "GitHub.vscode-pull-request-github"
+            "GitHub.vscode-pull-request-github",
             "eamodio.gitlens",
             // Docs
+            "davidanson.vscode-markdownlint",
             "ms-vscode.live-server"
           ],
           "settings": {

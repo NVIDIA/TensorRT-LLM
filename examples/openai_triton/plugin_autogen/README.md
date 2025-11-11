@@ -20,7 +20,7 @@ There are three command-line arguments:
 
 1. `workspace`: This is the root directory to hold the temporary generation files. PluginGen should not alter anything outside of the workspace,
 2. `kernel_config`: This is a Python file that holds a variable called `KERNELS` of type `List[KernelMetaData]`. PluginGen can process one or more kernels at a time,
-3. `tensorrt_llm_include_path`: This is the path to the TensorRT-LLM include directory. It is used to include the TensorRT-LLM header files in the generated plugin.
+3. `tensorrt_llm_include_path`: This is the path to the TensorRT LLM include directory. It is used to include the TensorRT LLM header files in the generated plugin.
 
 You can refer to [./kernel_config.py](./kernel_config.py) for an example of `KernelMetaData` for the Fused Attention kernel. It contains several fields:
 
@@ -41,7 +41,7 @@ The user should provide the kernel configurations as well as the Triton kernel s
 4. Perform the compilation and generate `libtriton_plugins.so`.
 5. Generate a `functional.py` containing a Python wrapper for this plugin.
 
-After the generation, you should have `libtriton_plugins.so` and `functional.py` in the workspace. You can use them to integrate the Triton kernel by simply using the corresponding Python methods in the generated `functional.py` during the model-building stage, just like other layers located in the TensorRT-LLM built-in `functional.py`.
+After the generation, you should have `libtriton_plugins.so` and `functional.py` in the workspace. You can use them to integrate the Triton kernel by simply using the corresponding Python methods in the generated `functional.py` during the model-building stage, just like other layers located in the TensorRT LLM built-in `functional.py`.
 
 ## End-to-End Example for FHMA Kernel Integration
 
@@ -79,7 +79,7 @@ PluginGen will generate all the necessary files within the `./tmp` directory. Th
 
 ### Post-Stage: Use the Plugin
 
-To use the plugin in a TensorRT-LLM model, please refer to the generated `output/functional.py`. It should contain Python wrappers for all the plugins. To use the plugins, first import `functional.py` and then use the corresponding Python methods to build the model.
+To use the plugin in a TensorRT LLM model, please refer to the generated `output/functional.py`. It should contain Python wrappers for all the plugins. To use the plugins, first import `functional.py` and then use the corresponding Python methods to build the model.
 
 For an example of using the Fused Attention plugin in a model, please refer to [build_engine.py](./build_engine.py) for building the TensorRT engine and [run_engine.py](./run_engine.py) for running the engine in the runtime.
 

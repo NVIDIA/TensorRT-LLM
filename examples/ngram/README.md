@@ -1,6 +1,6 @@
 # NGram Speculative Decoding
 
-This document shows how to build and run a model using NGram speculative decoding (supported as `ASSISTED_GENERATION` in transformers and vLLM, source: [GitHub](https://github.com/apoorvumang/prompt-lookup-decoding/tree/main)) in TensorRT-LLM on single GPU, or single node multiple GPU.
+This document shows how to build and run a model using NGram speculative decoding (supported as `ASSISTED_GENERATION` in transformers and vLLM, source: [GitHub](https://github.com/apoorvumang/prompt-lookup-decoding/tree/main)) in TensorRT LLM on single GPU, or single node multiple GPU.
 
 ## Overview
 

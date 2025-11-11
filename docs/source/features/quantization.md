@@ -2,7 +2,7 @@
 
 ## Quantization in TensorRT LLM
 
-Quantization is a technique used to reduces memory footprint and computational cost by converting the model's weights and/or activations from high-precision floating-point numbers (like BF16) to lower-precision data types, such as INT8, FP8, or FP4.
+Quantization is a technique used to reduce memory footprint and computational cost by converting the model's weights and/or activations from high-precision floating-point numbers (like BF16) to lower-precision data types, such as INT8, FP8, or FP4.
 
 TensorRT LLM offers a variety of quantization recipes to optimize LLM inference. These recipes can be broadly categorized as follows:
 

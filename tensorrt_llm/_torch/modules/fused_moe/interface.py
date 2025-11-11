@@ -1,6 +1,6 @@
 import weakref
 from abc import abstractmethod
-from enum import Enum
+from enum import Enum, IntEnum
 from typing import Dict, List, Optional, Union, final
 
 import torch
@@ -20,6 +20,18 @@ class MoEWeightLoadingMode(Enum):
     FUSED_GATE_UP_PROJ = 1
     # Custom W4A8 weights from examples/quantization/quantize_mixed_precision_moe.py
     W4A8_CUSTOM = 2
+
+
+# The type of alltoall method
+class AlltoallMethodType(IntEnum):
+    # Not available
+    NotEnabled = 0
+    # MNNVL
+    MNNVL = 1
+    # DeepEP intranode or internode: CUDA Graphs are supported, IBGDA is required by internode
+    DeepEP = 2
+    # DeepEP low latency: CUDA Graphs are supported, IBGDA is required
+    DeepEPLowLatency = 3
 
 
 def extract_extra_attrs(layer_idx: str):
@@ -195,6 +207,9 @@ class MoE(nn.Module):
     def load_weights(self, weights: List[Dict]):
         raise NotImplementedError
 
+    def post_load_weights(self):
+        pass
+
     @abstractmethod
     def forward_impl(
         self,
@@ -224,7 +239,7 @@ class MoE(nn.Module):
         assert do_finalize, "Default forward_fake does not support do_finalize=False"
         data_type = output_dtype if is_nvfp4_input else x.dtype
         num_tokens = all_rank_num_tokens[
-            self.tp_rank] if all_rank_num_tokens else x.shape[0]
+            self.mapping.tp_rank] if all_rank_num_tokens else x.shape[0]
         hidden_size = x.shape[1] * (2 if is_nvfp4_input else 1)
         return x.new_empty((num_tokens, hidden_size), dtype=data_type)
 
@@ -239,6 +254,7 @@ class MoE(nn.Module):
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
+        **kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
         if self.register_to_config and is_torch_compiling():
             hidden_states = x.fp4_tensor if isinstance(
@@ -271,6 +287,7 @@ class MoE(nn.Module):
                 output_dtype=output_dtype,
                 all_rank_num_tokens=all_rank_num_tokens,
                 use_dp_padding=use_dp_padding,
+                **kwargs,
             )
 
     @property
@@ -296,6 +313,12 @@ class MoE(nn.Module):
     def has_nvfp4(self):
         assert self._weights_created
         return self.quant_config is not None and self.quant_config.layer_quant_mode.has_nvfp4(
+        )
+
+    @property
+    def has_w4a8_nvfp4_fp8(self):
+        assert self._weights_created
+        return self.quant_config is not None and self.quant_config.layer_quant_mode.has_w4a8_nvfp4_fp8(
         )
 
     @property
