@@ -932,9 +932,9 @@ class AutoTuner:
         dynamic_dims = []
 
         for spec in tuning_config.dynamic_tensor_specs:
-            assert inspect.isfunction(spec.gen_tuning_buckets) or isinstance(spec.gen_tuning_buckets, (list, tuple)), \
+            assert callable(spec.gen_tuning_buckets) or isinstance(spec.gen_tuning_buckets, (list, tuple)), \
                 "The given dynamic dimension must provide a opt value generation function or a list of opt values"
-            if inspect.isfunction(spec.gen_tuning_buckets):
+            if callable(spec.gen_tuning_buckets):
                 if tuning_config.tune_max_num_tokens is None:
                     # Use the current input size as the opt value
                     opt_shapes = spec.gen_tuning_buckets(
@@ -1067,7 +1067,11 @@ class AutoTuner:
         # One solution is to manituplate the tensor content to make it more like the real data
         # during the tuning process. This can by controlled in the preparation phase by the runner.
         # It must not use all zero tensors. Otherwise the timing results become unreliable.
-        return torch.randint(-5, 5, shapes, device=device).to(dtype)
+        if dtype == torch.float4_e2m1fn_x2:
+            return torch.randint(-5, 5, shapes,
+                                 device=device).to(torch.uint8).view(dtype)
+        else:
+            return torch.randint(-5, 5, shapes, device=device).to(dtype)
 
     def _prepare_input_tensors(
             self, profile: OptimizationProfile,

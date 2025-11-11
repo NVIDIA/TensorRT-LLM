@@ -1,22 +1,35 @@
 import pytest
 import torch
 
+from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import GroupedGemmInputsHelper
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import cute_dsl_nvfp4_grouped_gemm_ref
 from tensorrt_llm._torch.utils import unswizzle_sf
 from tensorrt_llm._utils import get_sm_version
 
 
-def get_max_num_tiles(num_tokens: int, top_k: int, tile_size: int, num_local_experts: int) -> int:
-    num_expanded_tokens = num_tokens * top_k
-    if num_expanded_tokens <= num_local_experts:
-        return num_expanded_tokens
-    return (num_expanded_tokens + (tile_size - 1) * num_local_experts) // tile_size
+@pytest.mark.parametrize("tile_size", [128, 256])
+@pytest.mark.parametrize("ep_size", [1, 8, 32])
+@pytest.mark.parametrize("top_k", [1, 2, 6, 8])
+def test_grouped_gemm_inputs_helper(top_k: int, ep_size: int, tile_size: int):
+    num_experts = 256
+    num_local_experts = num_experts // ep_size
 
+    helper = GroupedGemmInputsHelper(num_experts, top_k, num_local_experts, 0, tile_size)
+    max_num_tokens = 8192
+    num_tokens_list = list(range(1, max_num_tokens + 1))
+    max_num_permuted_tokens_list = [helper.get_max_num_permuted_tokens(x) for x in num_tokens_list]
+    num_inferred_tokens_list = [helper.infer_num_tokens(x) for x in max_num_permuted_tokens_list]
 
-def get_max_num_permuted_tokens(
-    num_tokens: int, top_k: int, tile_size: int, num_local_experts: int
-) -> int:
-    return get_max_num_tiles(num_tokens, top_k, tile_size, num_local_experts) * tile_size
+    for i in range(max_num_tokens):
+        assert num_inferred_tokens_list[i] >= num_tokens_list[i]
+        assert num_inferred_tokens_list[i] < num_tokens_list[i] + tile_size
+        if i > 0:
+            assert num_inferred_tokens_list[i] >= num_inferred_tokens_list[i - 1]
+
+    buckets = helper.gen_tuning_buckets(max_num_permuted_tokens_list[-1])
+    assert set([helper.map_to_tuning_buckets(x) for x in max_num_permuted_tokens_list]) == set(
+        buckets
+    )
 
 
 @pytest.mark.parametrize("tile_size", [128, 256])
@@ -55,10 +68,9 @@ def test_moe_sort(num_tokens: int, top_k: int, ep_size: int, tile_size: int):
     num_tokens_per_expert = num_tokens_per_expert.cpu()
     num_tiles_per_expert = num_tiles_per_expert.cpu()
 
-    max_num_tiles = get_max_num_tiles(num_tokens, top_k, tile_size, num_local_experts)
-    max_num_permuted_tokens = get_max_num_permuted_tokens(
-        num_tokens, top_k, tile_size, num_local_experts
-    )
+    helper = GroupedGemmInputsHelper(num_experts, top_k, num_local_experts, 0, tile_size)
+    max_num_tiles = helper.get_max_num_tiles(num_tokens)
+    max_num_permuted_tokens = helper.get_max_num_permuted_tokens(num_tokens)
     num_valid_tiles = num_tiles_per_expert.sum().item()
     num_valid_permuted_tokens = num_valid_tiles * tile_size
     assert 0 <= num_valid_tiles <= max_num_tiles
@@ -123,7 +135,8 @@ def test_moe_sort(num_tokens: int, top_k: int, ep_size: int, tile_size: int):
 def test_moe_permute(dtype: str, num_tokens: int, top_k: int, tile_size: int):
     sf_vec_size = 16
     hidden_size = 4096
-    num_local_experts = 256 // 32
+    num_experts = 256
+    num_local_experts = num_experts // 32
     x = torch.randint(-100, 100, (num_tokens, hidden_size), dtype=torch.int32, device="cuda")
     x_sf = None
     if dtype == "float4":
@@ -137,10 +150,9 @@ def test_moe_permute(dtype: str, num_tokens: int, top_k: int, tile_size: int):
     else:
         x = x.to(getattr(torch, dtype))
 
-    max_num_tiles = get_max_num_tiles(num_tokens, top_k, tile_size, num_local_experts)
-    max_num_permuted_tokens = get_max_num_permuted_tokens(
-        num_tokens, top_k, tile_size, num_local_experts
-    )
+    helper = GroupedGemmInputsHelper(num_experts, top_k, num_local_experts, 0, tile_size)
+    max_num_tiles = helper.get_max_num_tiles(num_tokens)
+    max_num_permuted_tokens = helper.get_max_num_permuted_tokens(num_tokens)
     tile_idx_to_mn_limit = (
         torch.arange(1, max_num_tiles + 1, dtype=torch.int32, device="cuda") * tile_size
     )
@@ -189,10 +201,10 @@ def test_moe_permute(dtype: str, num_tokens: int, top_k: int, tile_size: int):
 def test_moe_unpermute(dtype: str, num_tokens: int, top_k: int, tile_size: int):
     dtype = getattr(torch, dtype)
     hidden_size = 4096
-    num_local_experts = 256 // 32
-    num_permuted_tokens = get_max_num_permuted_tokens(
-        num_tokens, top_k, tile_size, num_local_experts
-    )
+    num_experts = 256
+    num_local_experts = num_experts // 32
+    helper = GroupedGemmInputsHelper(num_experts, top_k, num_local_experts, 0, tile_size)
+    num_permuted_tokens = helper.get_max_num_permuted_tokens(num_tokens)
     permuted_x = torch.randint(
         -100, 100, (num_permuted_tokens, hidden_size), dtype=torch.int32, device="cuda"
     ).to(dtype)
@@ -223,10 +235,9 @@ def test_nvfp4_grouped_gemm_blackwell(num_tokens: int, top_k: int, ep_size: int,
     num_experts = 256
     num_local_experts = num_experts // ep_size
 
-    max_num_tiles = get_max_num_tiles(num_tokens, top_k, tile_size, num_local_experts)
-    max_num_permuted_tokens = get_max_num_permuted_tokens(
-        num_tokens, top_k, tile_size, num_local_experts
-    )
+    helper = GroupedGemmInputsHelper(num_experts, top_k, num_local_experts, 0, tile_size)
+    max_num_tiles = helper.get_max_num_tiles(num_tokens)
+    max_num_permuted_tokens = helper.get_max_num_permuted_tokens(num_tokens)
     routing_logits = torch.randn(num_tokens, num_experts, device="cuda")
     _, token_selected_experts = routing_logits.topk(top_k, dim=-1)
     token_selected_experts = token_selected_experts.to(torch.int32)
@@ -287,9 +298,13 @@ def test_nvfp4_grouped_gemm_blackwell(num_tokens: int, top_k: int, ep_size: int,
         alpha,
         tile_idx_to_group_idx,
         num_non_exiting_tiles,
-        torch.bfloat16,
-        tile_size,
-        sf_vec_size,
+        num_experts=num_experts,
+        top_k=top_k,
+        num_local_experts=num_local_experts,
+        local_expert_offset=0,
+        tile_size=tile_size,
+        output_dtype=torch.bfloat16,
+        scaling_vector_size=sf_vec_size,
     )
     c_ref = cute_dsl_nvfp4_grouped_gemm_ref(
         a,
@@ -299,9 +314,9 @@ def test_nvfp4_grouped_gemm_blackwell(num_tokens: int, top_k: int, ep_size: int,
         alpha,
         tile_idx_to_group_idx,
         num_non_exiting_tiles,
-        torch.bfloat16,
-        tile_size,
-        sf_vec_size,
+        tile_size=tile_size,
+        output_dtype=torch.bfloat16,
+        scaling_vector_size=sf_vec_size,
     )
     torch.testing.assert_close(
         c[: num_valid_tiles * tile_size], c_ref[: num_valid_tiles * tile_size]
