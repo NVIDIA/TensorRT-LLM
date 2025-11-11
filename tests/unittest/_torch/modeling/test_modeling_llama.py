@@ -585,6 +585,10 @@ class TestLlama(unittest.TestCase):
         attn_metadata_gen_phase_0.seq_lens = torch.tensor(
             [gen_input_ids_1.size(-1)], dtype=torch.int)
         attn_metadata_gen_phase_0.kv_cache_params.num_cached_tokens_per_seq = num_cached_tokens_per_seq_1
+
+        attn_metadata_gen_phase_0.spec_decoding_position_offsets = None
+        attn_metadata_gen_phase_0.spec_decoding_packed_mask = None
+        attn_metadata_gen_phase_0.spec_decoding_generation_lengths = None
         attn_metadata_gen_phase_0.update_spec_dec_param(
             batch_size=batch_size,
             is_spec_decoding_enabled=is_spec_decoding_enabled,
@@ -632,6 +636,9 @@ class TestLlama(unittest.TestCase):
             use_spec_decoding=use_spec_decoding,
             is_spec_dec_tree=is_spec_dec_tree,
             is_spec_dec_dynamic_tree=False)
+        attn_metadata_ref.spec_decoding_position_offsets = None
+        attn_metadata_ref.spec_decoding_packed_mask = None
+        attn_metadata_ref.spec_decoding_generation_lengths = None
         attn_metadata_ref.update_spec_dec_param(
             batch_size=batch_size,
             is_spec_decoding_enabled=is_spec_decoding_enabled,
