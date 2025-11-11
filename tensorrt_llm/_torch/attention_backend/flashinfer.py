@@ -58,7 +58,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
     # cache concat/split kernels when using PD disaggregation
     # expects KV cache in [max_num_pages, 2, num_kv_heads, page_size, head_dim] layout,
-    # so set kv_layout as "NHD" here
+    # so set kv_layout as "HND" here
     kv_layout: Literal["NHD", "HND"] = "HND"
 
     paged_kv_indptr_decode: torch.Tensor = field(init=False)
