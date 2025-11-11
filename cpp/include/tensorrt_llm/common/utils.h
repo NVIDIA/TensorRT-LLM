@@ -17,10 +17,8 @@
 #pragma once
 
 #include <algorithm>
-#include <csignal>
 #include <initializer_list>
 #include <string>
-#include <unistd.h>
 
 #ifndef _WIN32
 #include <pthread.h>

@@ -153,49 +153,69 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
         if (!acceptIf(options.mDtypeA == mOptions.dtypeA,
                 fmtstr("dtypeA mismatch (kernel: %s, expected: %s)", tg::dtypeToString(options.mDtypeA).c_str(),
                     tg::dtypeToString(mOptions.dtypeA).c_str())))
+        {
             continue;
+        }
 
         if (!acceptIf(options.mDtypeB == mOptions.dtypeB,
                 fmtstr("dtypeB mismatch (kernel: %s, expected: %s)", tg::dtypeToString(options.mDtypeB).c_str(),
                     tg::dtypeToString(mOptions.dtypeB).c_str())))
+        {
             continue;
+        }
 
         if (!acceptIf(options.mDtypeC == mOptions.dtypeC,
                 fmtstr("dtypeC mismatch (kernel: %s, expected: %s)", tg::dtypeToString(options.mDtypeC).c_str(),
                     tg::dtypeToString(mOptions.dtypeC).c_str())))
+        {
             continue;
+        }
 
         if (!acceptIf(options.mUseDeepSeekFp8 == mOptions.deepSeekFp8,
                 fmtstr(
                     "deepSeekFp8 mismatch (kernel: %d, expected: %d)", options.mUseDeepSeekFp8, mOptions.deepSeekFp8)))
+        {
             continue;
+        }
 
         if (!acceptIf(options.mTransposeMmaOutput == mOptions.transposeMmaOutput,
                 fmtstr("transposeMmaOutput mismatch (kernel: %d, expected: %d)", options.mTransposeMmaOutput,
                     mOptions.transposeMmaOutput)))
+        {
             continue;
+        }
 
         if (!acceptIf((!doesRouteImplUseNoRoute(options.mRouteImpl)) == mOptions.routeAct,
                 fmtstr("routeAct mismatch (kernel: %d, expected: %d)", !doesRouteImplUseNoRoute(options.mRouteImpl),
                     mOptions.routeAct)))
+        {
             continue;
+        }
 
         if (!acceptIf(options.mFusedAct == mOptions.fusedAct,
                 fmtstr("fusedAct mismatch (kernel: %d, expected: %d)", options.mFusedAct, mOptions.fusedAct)))
+        {
             continue;
+        }
 
         if (!acceptIf(options.mIsStaticBatch == mOptions.staticBatch,
                 fmtstr(
                     "staticBatch mismatch (kernel: %d, expected: %d)", options.mIsStaticBatch, mOptions.staticBatch)))
+        {
             continue;
+        }
 
         if (!acceptIf(tileSize == mOptions.tileSize,
                 fmtstr("tileSize mismatch (kernel: %d, expected: %d)", tileSize, mOptions.tileSize)))
+        {
             continue;
+        }
 
         if (!acceptIf(isSMCompatible(gpuSM, configs[i].mSm),
                 fmtstr("SM not compatible (gpuSM: %d, kernelSM: %d)", gpuSM, static_cast<int>(configs[i].mSm))))
+        {
             continue;
+        }
 
         auto sm = configs[i].mSm;
         if (sm != SmVersion::Sm100f)
@@ -205,20 +225,26 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
             {
                 if (!acceptIf(sm == SmVersion::Sm100a,
                         fmtstr("SM version 100 requires Sm100a (kernel has: %d)", static_cast<int>(sm))))
+                {
                     continue;
+                }
             }
             else if (smVersion == 103)
             {
                 if (!acceptIf(sm == SmVersion::Sm103a,
                         fmtstr("SM version 103 requires Sm103a (kernel has: %d)", static_cast<int>(sm))))
+                {
                     continue;
+                }
             }
         }
 
         if (options.mUseDeepSeekFp8)
         {
             if (!acceptIf(options.mUseShuffledMatrixA == false, "useShuffledMatrixA should be false for DeepSeek Fp8"))
+            {
                 continue;
+            }
         }
 
         if (options.mFusedAct)
@@ -226,7 +252,9 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
             if (!acceptIf(options.mActType == static_cast<batchedGemm::gemmGatedAct::ActType>(mOptions.actType),
                     fmtstr("actType mismatch (kernel: %d, expected: %d)", static_cast<int>(options.mActType),
                         static_cast<int>(mOptions.actType))))
+            {
                 continue;
+            }
         }
 
         // FIXME: Disables a few static scheduler kernels (schedS) that appears to have issues;
@@ -236,14 +264,18 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
         if (!acceptIf(!(options.mTileScheduler == TileScheduler::Static && options.mUseTmaOobOpt == true
                           && options.mTileN == 64),
                 "Static scheduler with TmaOobOpt and TileN=64 (known issue)"))
+        {
             continue;
+        }
 
         if (mOptions.transposeMmaOutput)
         {
             if (!acceptIf(options.mEpilogueTileM == mOptions.epilogueTileM,
                     fmtstr("epilogueTileM mismatch (kernel: %d, expected: %d)", options.mEpilogueTileM,
                         mOptions.epilogueTileM)))
+            {
                 continue;
+            }
         }
 
         // Kernel passed all filters

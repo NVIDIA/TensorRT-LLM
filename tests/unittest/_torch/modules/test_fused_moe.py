@@ -55,14 +55,20 @@ MPI.pickle.__init__(
 
 @contextmanager
 def moe_trtllm_debug_msg(enable=False):
+    TLLM_BATCHED_GEMM_PRINT_NAME = os.environ.get(
+        "TLLM_BATCHED_GEMM_PRINT_NAME", "0")
+    TLLM_BATCHED_GEMM_PRINT_CONFIGS = os.environ.get(
+        "TLLM_BATCHED_GEMM_PRINT_CONFIGS", "0")
     if enable:
         os.environ["TLLM_BATCHED_GEMM_PRINT_NAME"] = "1"
         os.environ["TLLM_BATCHED_GEMM_PRINT_CONFIGS"] = "1"
     try:
         yield
     finally:
-        os.environ["TLLM_BATCHED_GEMM_PRINT_NAME"] = "0"
-        os.environ["TLLM_BATCHED_GEMM_PRINT_CONFIGS"] = "0"
+        os.environ[
+            "TLLM_BATCHED_GEMM_PRINT_NAME"] = TLLM_BATCHED_GEMM_PRINT_NAME
+        os.environ[
+            "TLLM_BATCHED_GEMM_PRINT_CONFIGS"] = TLLM_BATCHED_GEMM_PRINT_CONFIGS
 
 
 def round_up(x, alignment):
