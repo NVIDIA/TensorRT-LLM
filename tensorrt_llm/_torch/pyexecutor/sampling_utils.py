@@ -43,23 +43,9 @@ BeamSearchForPrefill: TypeAlias = tuple[Literal["beam_search_for_prefill"], int,
 BeamSearch: TypeAlias = tuple[Literal["beam_search"], int, float]
 GREEDY: Greedy = ("greedy", None)
 
-Strategy: TypeAlias = TopK | TopP | Greedy | TopKTopP | TemperatureOnly | BeamSearchForPrefill | BeamSearch
-
-
-@dataclass(kw_only=True)
-class StrategyMetadata:
-    pass
-
-
-@dataclass(kw_only=True)
-class BeamSearchMetadata(StrategyMetadata):
-    cache_indirection: torch.Tensor
-    cache_indirection_buffer: torch.Tensor
-    cum_log_probs: torch.Tensor
-    seq_slots: torch.Tensor
-    seq_lens: torch.Tensor
-    finished_beams: torch.Tensor
-    end_ids: torch.Tensor
+Strategy: TypeAlias = (
+    TopK | TopP | Greedy | TopKTopP | TemperatureOnly | BeamSearchForPrefill | BeamSearch
+)
 
 
 @dataclass(kw_only=True)
