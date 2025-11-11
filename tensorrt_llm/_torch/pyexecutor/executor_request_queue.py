@@ -66,6 +66,7 @@ class ExecutorRequestQueue:
         self.start_times = {}
         self.active = True
         self.batch_wait_timeout_ms = batch_wait_timeout_ms
+        self.send_requests_handler = None
 
         # State tracking
         self.num_fetch_requests = 0
@@ -609,15 +610,11 @@ class ExecutorRequestQueue:
 
         if not self.dist.is_last_pp_rank:
             with nvtx_range("send_requests_to_next_pp"):
-                if self._disable_mpi:
-                    isend_payload = self.dist.isend_object(
-                        payloads,
-                        self.dist.next_pp_rank,
-                        tag,
-                    )
-                    isend_payload.wait()
-                else:
-                    self.dist.send_object(payloads, self.dist.next_pp_rank, tag)
+                if self.send_requests_handler is not None:
+                    with nvtx_range("wait_prev_send_requests_handler"):
+                        self.send_requests_handler.wait()
+                self.send_requests_handler = self.dist.isend_object(
+                    payloads, self.dist.next_pp_rank, tag)
 
         return payloads
 
