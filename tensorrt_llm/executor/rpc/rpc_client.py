@@ -407,20 +407,13 @@ class RPCClient:
         if self._loop is None or not self._loop.is_running():
             self._loop = asyncio.new_event_loop()
 
-            # TODO: WAR. Need to fix Ray+RPC shutdown.
+            # TODO: WAR. Remove after RPC shutdown is fixed.
             def custom_exception_handler(loop, context):
                 exception = context.get('exception')
                 message = context.get('message', '')
 
-                if isinstance(exception, asyncio.CancelledError):
-                    if '_chain' in message or 'zmq' in message.lower(
-                    ) or '_AsyncSocket' in message:
-                        print(
-                            f"Suppressed zmq error during shutdown: {message}")
-                        return
-
-                if 'pending' in message:
-                    print(f"Suppressed error during shutdown: {message}")
+                if isinstance(exception, asyncio.CancelledError) or "pending" in message:
+                    logger.debug(f"Suppressed error during shutdown: {message}")
                     return
 
                 loop.default_exception_handler(context)

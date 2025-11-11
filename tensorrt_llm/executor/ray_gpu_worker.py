@@ -1,6 +1,7 @@
 import importlib
 import os
 from pathlib import Path
+from queue import Queue
 from typing import Any, List, Optional, Type, Union
 
 import ray
@@ -11,6 +12,7 @@ from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm._torch.virtual_memory import (materialize_with_tag,
                                                 release_with_tag,
                                                 verify_sleep_wakeup_tags)
+from tensorrt_llm._utils import ray_use_rpc
 
 from ..bindings import executor as tllm
 from ..builder import Engine
@@ -74,6 +76,11 @@ class RayWorkerWrapper:
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
         return self.worker.submit(request)
+
+    def enqueue_request(self,
+                        request: GenerationRequest,
+                        result_wait_queue: Queue | None = None) -> int:
+        return self.worker.enqueue_request(request, result_wait_queue)
 
     def abort_request(self, request_id: int) -> None:
         self.worker.abort_request(request_id)
@@ -182,8 +189,14 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
         if self.global_rank > 1:
             logger.set_rank(self.global_rank)
 
-        self.init_rpc_worker(self.global_rank, rpc_addr)
-        self.start_rpc_server()
+        if ray_use_rpc():
+            if rpc_addr is None:
+                raise RuntimeError(
+                    "RPC mode enabled but no rpc_addr provided to RayGPUWorker")
+            self.init_rpc_worker(self.global_rank, rpc_addr)
+            self.start_rpc_server()
+        else:
+            self.setup_engine()
 
     def setup_engine(self):
         if torch.distributed.is_initialized(
@@ -191,55 +204,10 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
             torch.distributed.barrier()
         super().setup_engine()
 
-    def _get_comm_ranks_device_id(self):
-        # Make sure C++ executor would use same devices/ranks as py_executor
-        global_rank = torch.distributed.get_rank()
-        world_size = torch.distributed.get_world_size()
-        comm_ranks = [None] * world_size
-        device_ids = [None] * world_size
-
-        torch.distributed.all_gather_object(comm_ranks, global_rank)
-        torch.distributed.all_gather_object(device_ids, self.device_id)
-
-        self._configure_affinity(self.device_id)
-
-        return comm_ranks, device_ids
-
-    def start(self):
-        pass
-
-    def shutdown(self):
-
-        if self.doing_shutdown:
-            return
-        else:
-            self.doing_shutdown = True
-
-        logger.debug(f'Worker {self.rank} shutting down...')
-
-        if hasattr(self, 'shutdown_event'):
-            self.shutdown_event.set()
-
-        if hasattr(self, 'rpc_server') and self.rpc_server is not None:
-            logger.info(f"[Rank {self.global_rank}] Shutting down RPC server")
-            self.rpc_server.shutdown()
-            self.rpc_server = None
-
-        if self.engine is not None:
-            self.engine.shutdown()
-            self.engine = None
-
-            assert self._executor_config is None, "An empty executor_config is expected in shutdown when LLM arguments are defined."
-            if (self.llm_args.backend == "pytorch"
-                    and hasattr(self, "checkpoint_loader")
-                    and self.checkpoint_loader is not None):
-                self.checkpoint_loader.cleanup()
-                self.checkpoint_loader = None
-
-        # Check if there are any errors from the threads before shutdown.
-        self._handle_background_error()
-
-        logger.debug(f"Worker {self.rank} shutdown done.")
+    def enqueue_request(self,
+                        request: GenerationRequest,
+                        result_wait_queue: Queue | None = None) -> int:
+        return self._enqueue_request(request, result_wait_queue)
 
     @control_action_decorator
     def sleep(self, sleep_tags: List[str]):
@@ -272,6 +240,63 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
         except Exception as e:
             logger.error(f"Encountered an error in wakeup")
             raise e
+
+    def start(self):
+        pass
+
+    def shutdown(self):
+
+        if self.doing_shutdown:
+            return
+        else:
+            self.doing_shutdown = True
+
+        logger.debug(f'Worker {self.rank} shutting down...')
+
+        if hasattr(self, 'shutdown_event'):
+            self.shutdown_event.set()
+
+        if hasattr(self, 'rpc_server') and self.rpc_server is not None:
+            logger.info(f"[Rank {self.global_rank}] Shutting down RPC server")
+            try:
+                self.rpc_server.shutdown()
+            except Exception as e:
+                # Suppress errors during RPC server shutdown
+                # These can occur if the server is already closed or during cleanup
+                logger.debug(
+                    f"[Rank {self.global_rank}] Suppressed error during RPC server shutdown: {e}"
+                )
+            self.rpc_server = None
+
+        if self.engine is not None:
+            self.engine.shutdown()
+            self.engine = None
+
+            assert self._executor_config is None, "An empty executor_config is expected in shutdown when LLM arguments are defined."
+            if (self.llm_args.backend == "pytorch"
+                    and hasattr(self, "checkpoint_loader")
+                    and self.checkpoint_loader is not None):
+                self.checkpoint_loader.cleanup()
+                self.checkpoint_loader = None
+
+        # Check if there are any errors from the threads before shutdown.
+        self._handle_background_error()
+
+        logger.debug(f"Worker {self.rank} shutdown done.")
+
+    def _get_comm_ranks_device_id(self):
+        # Make sure C++ executor would use same devices/ranks as py_executor
+        global_rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        comm_ranks = [None] * world_size
+        device_ids = [None] * world_size
+
+        torch.distributed.all_gather_object(comm_ranks, global_rank)
+        torch.distributed.all_gather_object(device_ids, self.device_id)
+
+        self._configure_affinity(self.device_id)
+
+        return comm_ranks, device_ids
 
     def __enter__(self):
         return self
