@@ -19,60 +19,8 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
-# StarCoder2-3B config (reduced for testing)
-STARCODER2_3B_CONFIG = {
-    "architectures": ["Starcoder2ForCausalLM"],
-    "attention_dropout": 0.0,
-    "bos_token_id": 50256,
-    "eos_token_id": 50256,
-    "hidden_act": "gelu",
-    "hidden_size": 2048,
-    "initializer_range": 0.02,
-    "intermediate_size": 8192,
-    "max_position_embeddings": 16384,
-    "model_type": "starcoder2",
-    "num_attention_heads": 16,
-    "num_hidden_layers": 6,  # Reduced from original for testing
-    "num_key_value_heads": 2,
-    "rope_theta": 10000.0,
-    "sliding_window": 4096,
-    "torch_dtype": "bfloat16",
-    "transformers_version": "4.50.0.dev0",
-    "use_bias": True,
-    "use_cache": True,
-    "vocab_size": 49152,
-    "norm_epsilon": 1e-5,
-    "mlp_type": "default",
-}
-
-# StarCoder2-7B config (reduced for testing)
-STARCODER2_7B_CONFIG = {
-    "architectures": ["Starcoder2ForCausalLM"],
-    "attention_dropout": 0.0,
-    "bos_token_id": 50256,
-    "eos_token_id": 50256,
-    "hidden_act": "gelu",
-    "hidden_size": 3072,
-    "initializer_range": 0.02,
-    "intermediate_size": 12288,
-    "max_position_embeddings": 16384,
-    "model_type": "starcoder2",
-    "num_attention_heads": 24,
-    "num_hidden_layers": 6,  # Reduced from original for testing
-    "num_key_value_heads": 2,
-    "rope_theta": 10000.0,
-    "sliding_window": 4096,
-    "torch_dtype": "bfloat16",
-    "transformers_version": "4.50.0.dev0",
-    "use_bias": True,
-    "use_cache": True,
-    "vocab_size": 49152,
-    "norm_epsilon": 1e-5,
-    "mlp_type": "default",
-}
-
-# StarCoder2-15B config (reduced for testing)
-STARCODER2_15B_CONFIG = {
+# Base config for all StarCoder2 models (based on HuggingFace configs)
+_STARCODER2_BASE_CONFIG = {
     "architectures": ["Starcoder2ForCausalLM"],
     "attention_dropout": 0.1,
     "residual_dropout": 0.1,
@@ -80,23 +28,50 @@ STARCODER2_15B_CONFIG = {
     "bos_token_id": 0,
     "eos_token_id": 0,
     "hidden_act": "gelu_pytorch_tanh",
-    "hidden_size": 6144,
-    "initializer_range": 0.01275,
-    "intermediate_size": 24576,
     "max_position_embeddings": 16384,
+    "mlp_type": "default",
     "model_type": "starcoder2",
-    "num_attention_heads": 48,
-    "num_hidden_layers": 6,  # Reduced from 40 for testing
-    "num_key_value_heads": 4,
-    "rope_theta": 100000,
+    "norm_epsilon": 1e-5,
+    "num_hidden_layers": 6,  # Reduced from 30/32/40 for testing
     "sliding_window": 4096,
-    "torch_dtype": "bfloat16",
-    "transformers_version": "4.50.0.dev0",
+    "transformers_version": "4.37.0.dev0",
     "use_bias": True,
     "use_cache": True,
     "vocab_size": 49152,
-    "norm_epsilon": 1e-5,
-    "mlp_type": "default",
+    "torch_dtype": "bfloat16",
+}
+
+# StarCoder2-3B config (reduced for testing)
+STARCODER2_3B_CONFIG = {
+    **_STARCODER2_BASE_CONFIG,
+    "hidden_size": 3072,
+    "initializer_range": 0.018042,
+    "intermediate_size": 12288,
+    "num_attention_heads": 24,
+    "num_key_value_heads": 2,
+    "rope_theta": 999999.4420358813,
+}
+
+# StarCoder2-7B config (reduced for testing)
+STARCODER2_7B_CONFIG = {
+    **_STARCODER2_BASE_CONFIG,
+    "hidden_size": 4608,
+    "initializer_range": 0.018042,
+    "intermediate_size": 18432,
+    "num_attention_heads": 36,
+    "num_key_value_heads": 4,
+    "rope_theta": 1000000,
+}
+
+# StarCoder2-15B config (reduced for testing)
+STARCODER2_15B_CONFIG = {
+    **_STARCODER2_BASE_CONFIG,
+    "hidden_size": 6144,
+    "initializer_range": 0.01275,
+    "intermediate_size": 24576,
+    "num_attention_heads": 48,
+    "num_key_value_heads": 4,
+    "rope_theta": 100000,
 }
 
 
@@ -124,7 +99,6 @@ def reduce_starcoder2_config(
 
 
 class TestStarcoder2(unittest.TestCase):
-
     def get_kv_cache_manager(
         self,
         dtype: torch.dtype,
@@ -149,7 +123,7 @@ class TestStarcoder2(unittest.TestCase):
             copy_on_partial_reuse=False,
             max_tokens=num_blocks * tokens_per_block,
         )
-        
+
         head_dim = config.hidden_size // config.num_attention_heads
         kv_cache_manager = KVCacheManager(
             kv_cache_config,
@@ -171,10 +145,10 @@ class TestStarcoder2(unittest.TestCase):
         # 3B * sizeof(float16) plus some extra for activations
         mem_for_full_model = int((2 + 1) * 3 * 2 ** (30))
         reduce_starcoder2_config(mem_for_full_model, config_dict)
-        
+
         if config_dict["num_hidden_layers"] <= 0:
             self.skipTest("Insufficient memory for a single StarCoder2 layer")
-            
+
         starcoder2_config = Starcoder2Config.from_dict(config_dict)
 
         dtype = starcoder2_config.torch_dtype
@@ -194,16 +168,14 @@ class TestStarcoder2(unittest.TestCase):
         sequence_lengths = context_sequence_lengths + [1, 1]
         past_seen_tokens = [0, 0, 0, 62, 75]
         request_ids = list(range(len(sequence_lengths)))
-        token_nums = (
-            torch.tensor(past_seen_tokens) + torch.tensor(sequence_lengths)
-        ).tolist()
+        token_nums = (torch.tensor(past_seen_tokens) + torch.tensor(sequence_lengths)).tolist()
         prompt_lens = token_nums[:3] + past_seen_tokens[3:]
 
         num_blocks = 100
         tokens_per_block = 128
         max_seq_len = num_blocks * tokens_per_block
         batch_size = len(context_sequence_lengths) + 2
-        
+
         kv_cache_manager = self.get_kv_cache_manager(
             dtype=dtype,
             config=starcoder2_config,
@@ -231,14 +203,8 @@ class TestStarcoder2(unittest.TestCase):
 
         position_ids = []
         for i, tokens in enumerate(past_seen_tokens):
-            seq_len = (
-                context_sequence_lengths[i]
-                if i < len(context_sequence_lengths)
-                else 1
-            )
-            position_id = torch.arange(
-                tokens, tokens + seq_len, device=input_ids.device
-            )
+            seq_len = context_sequence_lengths[i] if i < len(context_sequence_lengths) else 1
+            position_id = torch.arange(tokens, tokens + seq_len, device=input_ids.device)
             position_ids.append(position_id)
 
         position_ids = torch.cat(position_ids).unsqueeze(0)
@@ -267,26 +233,28 @@ class TestStarcoder2(unittest.TestCase):
 
     @parameterized.expand(
         [
-            # 3B model tests
-            Scenario(backend="TRTLLM", config_name="3B"),
-            # 7B model tests
-            Scenario(backend="TRTLLM", config_name="7B"),
-            # 15B model tests
-            Scenario(backend="TRTLLM", config_name="15B"),
+            # Test without CUDA graphs
+            Scenario(backend="TRTLLM", config_name="3B", use_cuda_graph=False),
+            Scenario(backend="TRTLLM", config_name="7B", use_cuda_graph=False),
+            Scenario(backend="TRTLLM", config_name="15B", use_cuda_graph=False),
+            # Test with CUDA graphs
+            Scenario(backend="TRTLLM", config_name="3B", use_cuda_graph=True),
+            Scenario(backend="TRTLLM", config_name="7B", use_cuda_graph=True),
+            Scenario(backend="TRTLLM", config_name="15B", use_cuda_graph=True),
         ],
         lambda testcase_func, param_num, param: f"{testcase_func.__name__}[{param.args[0]}]",
     )
     @torch.no_grad()
     def test_starcoder2_allclose_to_hf(self, scenario: Scenario) -> None:
         """
-        Compare TensorRT-LLM StarCoder2 logits to HuggingFace.
-        
-        This test compares raw logit outputs (numerical correctness) using full 
-        pretrained models from HuggingFace. It tests single forward passes for 
-        context and generation phases.
+        Compare TensorRT-LLM StarCoder2 output to HuggingFace.
+
+        Tests both context and generation phases using full pretrained models.
+        Optionally tests with CUDA graphs for generation phase optimization.
         """
         backend = scenario.backend
         config_name = scenario.config_name
+        use_cuda_graph = scenario.use_cuda_graph
         metadata_cls = get_attention_backend(backend).Metadata
 
         torch.random.manual_seed(0)
@@ -294,31 +262,26 @@ class TestStarcoder2(unittest.TestCase):
         # Skip if insufficient memory for full pretrained model
         _, total_mem = torch.cuda.mem_get_info()
         min_mem_required = {
-            "3B": 10 * (2**30),   # 10 GB
-            "7B": 20 * (2**30),   # 20 GB  
+            "3B": 10 * (2**30),  # 10 GB
+            "7B": 20 * (2**30),  # 20 GB
             "15B": 40 * (2**30),  # 40 GB
         }
-        
+
         if total_mem < min_mem_required[config_name]:
             self.skipTest(f"Insufficient memory for StarCoder2-{config_name}")
 
         # Load full pretrained model from HuggingFace
         model_name = f"bigcode/starcoder2-{config_name.lower()}"
         hf_starcoder2 = HFStarcoder2ForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch.bfloat16,
-            device_map="auto"
+            model_name, torch_dtype=torch.bfloat16, device_map="auto"
         )
-        
+
         dtype = torch.bfloat16
         device = torch.device("cuda")
 
         # Build TRT-LLM model from the same pretrained config
         with torch.device(device), default_dtype(dtype):
-            model_config = ModelConfig(
-                pretrained_config=hf_starcoder2.config, 
-                attn_backend=backend
-            )
+            model_config = ModelConfig(pretrained_config=hf_starcoder2.config, attn_backend=backend)
             starcoder2 = Starcoder2ForCausalLM(model_config).to(dtype).to(device)
             starcoder2.load_weights(hf_starcoder2.state_dict())
 
@@ -336,7 +299,7 @@ class TestStarcoder2(unittest.TestCase):
             num_blocks=num_blocks,
         )
 
-        # Context phase.
+        # Context phase (no CUDA graphs for prefill)
         input_ids = torch.tensor(
             [100, 200, 300, 400, 500, 600, 700, 800],
             dtype=torch.int32,
@@ -361,7 +324,7 @@ class TestStarcoder2(unittest.TestCase):
             request_ids=request_ids,
             prompt_lens=prompt_lens,
         )
-        
+
         position_ids = [torch.arange(0, input_ids.size(-1), dtype=torch.int32)]
         position_ids = torch.cat(position_ids).unsqueeze(0).cuda()
 
@@ -377,13 +340,12 @@ class TestStarcoder2(unittest.TestCase):
                 position_ids=position_ids,
                 use_cache=True,
             )
-            torch.testing.assert_close(
-                logits, ref.logits[:, -1].float(), atol=0.4, rtol=0.4
-            )
+            torch.testing.assert_close(logits, ref.logits[:, -1].float(), atol=0.4, rtol=0.4)
 
-        # Generation phase.
-        gen_input_ids = torch.tensor([900], dtype=torch.int, device=device)
+        # Generation phase (optionally with CUDA graphs)
+        gen_input_ids = torch.tensor([900], dtype=torch.int32, device=device)
         num_cached_tokens_per_seq = [input_ids.size(-1)]
+
         attn_metadata = metadata_cls(
             seq_lens=torch.tensor([gen_input_ids.size(-1)], dtype=torch.int),
             num_contexts=0,
@@ -400,220 +362,58 @@ class TestStarcoder2(unittest.TestCase):
 
         gen_position_ids = [
             torch.arange(
-                input_ids.size(-1), input_ids.size(-1) + gen_input_ids.size(-1)
-            )
-        ]
-        gen_position_ids = torch.cat(gen_position_ids).unsqueeze(0).cuda()
-        
-        with torch.inference_mode():
-            attn_metadata.prepare()
-            logits = starcoder2.forward(
-                input_ids=gen_input_ids,
-                position_ids=gen_position_ids,
-                attn_metadata=attn_metadata,
-            )
-            ref = hf_starcoder2.forward(
-                input_ids=gen_input_ids.unsqueeze(0),
-                position_ids=gen_position_ids,
-                past_key_values=ref.past_key_values,
-                use_cache=True,
-            )
-            torch.testing.assert_close(
-                logits, ref.logits[:, -1].float(), atol=0.4, rtol=0.4
-            )
-
-        kv_cache_manager.shutdown()
-
-    @parameterized.expand(
-        [
-            # 3B CUDA graph tests
-            Scenario(backend="TRTLLM", config_name="3B", use_cuda_graph=True),
-            # 7B CUDA graph tests
-            Scenario(backend="TRTLLM", config_name="7B", use_cuda_graph=True),
-            # 15B CUDA graph tests
-            Scenario(backend="TRTLLM", config_name="15B", use_cuda_graph=True),
-        ],
-        lambda testcase_func, param_num, param: f"{testcase_func.__name__}[{param.args[0]}]",
-    )
-    @torch.no_grad()
-    def test_starcoder2_with_cuda_graph(self, scenario: Scenario) -> None:
-        """Test StarCoder2 with CUDA graphs for generation."""
-        backend = scenario.backend
-        use_cuda_graph = scenario.use_cuda_graph
-        config_name = scenario.config_name
-        metadata_cls = get_attention_backend(backend).Metadata
-
-        torch.random.manual_seed(0)
-
-        if config_name == "3B":
-            config_dict = deepcopy(STARCODER2_3B_CONFIG)
-            mem_for_full_model = int((2 + 1) * 3 * 2 ** (30) * 2)
-        elif config_name == "15B":
-            config_dict = deepcopy(STARCODER2_15B_CONFIG)
-            mem_for_full_model = int((2 + 1) * 15 * 2 ** (30) * 2)
-        else:
-            raise ValueError(f"Unknown config_name: {config_name}")
-
-        reduce_starcoder2_config(mem_for_full_model, config_dict)
-        
-        if config_dict["num_hidden_layers"] <= 0:
-            self.skipTest(f"Insufficient memory for StarCoder2 {config_name} layer")
-            
-        starcoder2_config = Starcoder2Config.from_dict(config_dict)
-
-        dtype = starcoder2_config.torch_dtype
-        device = torch.device("cuda")
-
-        with torch.device(device), default_dtype(dtype):
-            hf_starcoder2 = HFStarcoder2ForCausalLM(starcoder2_config).eval()
-
-            model_config = ModelConfig(
-                pretrained_config=starcoder2_config, 
-                attn_backend=backend
-            )
-            starcoder2 = Starcoder2ForCausalLM(model_config).to(dtype).to(device)
-            starcoder2.load_weights(hf_starcoder2.state_dict())
-
-        num_blocks = 1
-        tokens_per_block = 128
-        max_seq_len = num_blocks * tokens_per_block
-        batch_size = 1
-
-        kv_cache_manager = self.get_kv_cache_manager(
-            dtype=dtype,
-            config=starcoder2_config,
-            tokens_per_block=tokens_per_block,
-            max_seq_len=max_seq_len,
-            batch_size=batch_size,
-            num_blocks=num_blocks,
-        )
-
-        # Context phase.
-        input_ids = torch.tensor(
-            [100, 200, 300, 400, 500, 600, 700, 800],
-            dtype=torch.int,
-            device=device,
-        )
-        num_cached_tokens_per_seq = [0]
-        request_ids = [1]
-        token_nums = [input_ids.size(-1)]
-        prompt_lens = [input_ids.size(-1)]
-        kv_cache_manager.add_dummy_requests(request_ids, token_nums)
-
-        attn_metadata = metadata_cls(
-            seq_lens=torch.tensor([input_ids.size(-1)], dtype=torch.int),
-            num_contexts=1,
-            kv_cache_params=KVCacheParams(
-                use_cache=True,
-                num_cached_tokens_per_seq=num_cached_tokens_per_seq,
-            ),
-            max_num_requests=1,
-            max_num_tokens=8192,
-            kv_cache_manager=kv_cache_manager,
-            request_ids=request_ids,
-            prompt_lens=prompt_lens,
-        )
-
-        position_ids = [torch.arange(0, input_ids.size(-1))]
-        position_ids = torch.cat(position_ids).unsqueeze(0).cuda()
-        
-        # Note: no CUDA graphs for prefill
-        with torch.inference_mode():
-            attn_metadata.prepare()
-            logits = starcoder2.forward(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                attn_metadata=attn_metadata,
-            )
-            ref = hf_starcoder2.forward(
-                input_ids=input_ids.unsqueeze(0),
-                position_ids=position_ids,
-                use_cache=True,
-            )
-
-        torch.testing.assert_close(
-            logits, ref.logits[:, -1].float(), atol=0.4, rtol=0.4
-        )
-
-        # Generation phase with optional CUDA graph
-        gen_input_ids = torch.tensor([900], dtype=torch.int, device=device)
-        num_cached_tokens_per_seq = [input_ids.size(-1)]
-
-        attn_metadata = metadata_cls(
-            seq_lens=torch.tensor([gen_input_ids.size(-1)], dtype=torch.int),
-            num_contexts=0,
-            kv_cache_params=KVCacheParams(
-                use_cache=True,
-                num_cached_tokens_per_seq=num_cached_tokens_per_seq,
-            ),
-            max_num_requests=1,
-            max_num_tokens=8192,
-            kv_cache_manager=kv_cache_manager,
-            request_ids=request_ids,
-            prompt_lens=prompt_lens,
-        )
-
-        gen_position_ids = [
-            torch.arange(
-                input_ids.size(-1), input_ids.size(-1) + gen_input_ids.size(-1)
+                input_ids.size(-1), input_ids.size(-1) + gen_input_ids.size(-1), dtype=torch.int32
             )
         ]
         gen_position_ids = torch.cat(gen_position_ids).unsqueeze(0).cuda()
 
+        # Setup CUDA graph runner if requested
         graph_runner = None
         if use_cuda_graph:
             from _torch.helpers import create_mock_engine
+
             mock_engine = create_mock_engine(1)
             graph_runner = CUDAGraphRunner(mock_engine)
+            attn_metadata = attn_metadata.create_cuda_graph_metadata(1)
 
-        def run_forward(input_ids, position_ids, attn_metadata):
-            attn_metadata.prepare()
+        # Run generation phase
+        with torch.inference_mode():
             if not use_cuda_graph:
-                return starcoder2.forward(
-                    input_ids=input_ids,
-                    position_ids=position_ids,
+                attn_metadata.prepare()
+                logits = starcoder2.forward(
+                    input_ids=gen_input_ids,
+                    position_ids=gen_position_ids,
                     attn_metadata=attn_metadata,
                 )
             else:
+                # CUDA graph path
                 inputs = {
-                    "input_ids": input_ids,
-                    "position_ids": position_ids,
+                    "input_ids": gen_input_ids,
+                    "position_ids": gen_position_ids,
                     "attn_metadata": attn_metadata,
                 }
                 key = (1, 0, False)
-                graph_runner.capture(
-                    key, lambda inputs: starcoder2.forward(**inputs), inputs
-                )
 
+                attn_metadata.prepare()
+                graph_runner.capture(key, lambda inputs: starcoder2.forward(**inputs), inputs)
+
+                # Run twice to catch buffer reallocation issues
                 for _ in range(2):
-                    # Run it twice to catch buffer reallocation issues
                     attn_metadata.prepare()
                     logits = graph_runner.replay(key, inputs)
-                return logits
 
-        if use_cuda_graph:
-            attn_metadata = attn_metadata.create_cuda_graph_metadata(1)
-
-        with torch.inference_mode():
-            logits = run_forward(
-                input_ids=gen_input_ids,
-                position_ids=gen_position_ids,
-                attn_metadata=attn_metadata,
-            )
+            # Compare with HuggingFace
             ref = hf_starcoder2.forward(
                 input_ids=gen_input_ids.unsqueeze(0),
                 position_ids=gen_position_ids,
                 past_key_values=ref.past_key_values,
                 use_cache=True,
             )
+            torch.testing.assert_close(logits, ref.logits[:, -1].float(), atol=0.4, rtol=0.4)
 
-        torch.testing.assert_close(
-            logits, ref.logits[:, -1].float(), atol=0.4, rtol=0.4
-        )
-        
+        # Cleanup
         if graph_runner is not None:
             graph_runner.clear()
-
         kv_cache_manager.shutdown()
 
     @parameterized.expand(
@@ -629,62 +429,57 @@ class TestStarcoder2(unittest.TestCase):
     def test_starcoder2_generated_tokens_match_hf(self, scenario: Scenario) -> None:
         """
         Compare generated tokens from TRT-LLM PyTorch backend to HuggingFace.
-        
-        This is the PyTorch backend equivalent of test_engine_allclose_to_hf in 
-        test_starcoder2_engine.py. Both tests use the same full pretrained models 
+
+        This is the PyTorch backend equivalent of test_engine_allclose_to_hf in
+        test_starcoder2_engine.py. Both tests use the same full pretrained models
         from HuggingFace and compare token-level generation output.
-        
+
         The difference is:
         - This test uses the PyTorch execution backend (TRTLLM attention)
         - The engine test uses the compiled TensorRT engine
         """
         backend = scenario.backend
         config_name = scenario.config_name
-        
+
         torch.random.manual_seed(0)
 
         # Skip if insufficient memory for full pretrained model
         _, total_mem = torch.cuda.mem_get_info()
         min_mem_required = {
-            "3B": 10 * (2**30),   # 10 GB
-            "7B": 20 * (2**30),   # 20 GB  
+            "3B": 10 * (2**30),  # 10 GB
+            "7B": 20 * (2**30),  # 20 GB
             "15B": 40 * (2**30),  # 40 GB
         }
-        
+
         if total_mem < min_mem_required[config_name]:
             self.skipTest(f"Insufficient memory for StarCoder2-{config_name}")
 
         # Load full pretrained model from HuggingFace (same as engine test)
         model_name = f"bigcode/starcoder2-{config_name.lower()}"
         hf_starcoder2 = HFStarcoder2ForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch.bfloat16,
-            device_map="auto"
+            model_name, torch_dtype=torch.bfloat16, device_map="auto"
         )
-        
+
         dtype = torch.bfloat16
         device = torch.device("cuda")
 
         # Build TRT-LLM model from the same pretrained config
         with torch.device(device), default_dtype(dtype):
-            model_config = ModelConfig(
-                pretrained_config=hf_starcoder2.config, 
-                attn_backend=backend
-            )
+            model_config = ModelConfig(pretrained_config=hf_starcoder2.config, attn_backend=backend)
             starcoder2 = Starcoder2ForCausalLM(model_config).to(dtype).to(device)
             starcoder2.load_weights(hf_starcoder2.state_dict())
 
         # Test prompt - same as engine test
         test_prompt = "def fibonacci(n):"
         tokenizer = AutoTokenizer.from_pretrained(model_name)
-        
+
         # Encode test prompt
         input_ids = torch.tensor(
             tokenizer.encode(test_prompt),
             dtype=torch.int32,
             device=device,
         )
-        
+
         # Setup KV cache for TRT-LLM generation
         num_blocks = 2
         tokens_per_block = 128
@@ -711,7 +506,7 @@ class TestStarcoder2(unittest.TestCase):
         # Context phase - process initial prompt
         token_nums = [input_ids.size(-1)]
         kv_cache_manager.add_dummy_requests(request_ids, token_nums)
-        
+
         attn_metadata = metadata_cls(
             seq_lens=torch.tensor([input_ids.size(-1)], dtype=torch.int),
             num_contexts=1,
@@ -726,7 +521,9 @@ class TestStarcoder2(unittest.TestCase):
             max_num_tokens=8192,
         )
 
-        position_ids = torch.arange(0, input_ids.size(-1), dtype=torch.int32, device=device).unsqueeze(0)
+        position_ids = torch.arange(
+            0, input_ids.size(-1), dtype=torch.int32, device=device
+        ).unsqueeze(0)
 
         with torch.inference_mode():
             attn_metadata.prepare()
@@ -744,7 +541,7 @@ class TestStarcoder2(unittest.TestCase):
         # Generation phase - generate remaining tokens
         for step in range(1, max_new_tokens):
             gen_input_ids = torch.tensor([next_token_id], dtype=torch.int32, device=device)
-            
+
             attn_metadata = metadata_cls(
                 seq_lens=torch.tensor([1], dtype=torch.int),
                 num_contexts=0,
@@ -760,9 +557,7 @@ class TestStarcoder2(unittest.TestCase):
             )
 
             gen_position_ids = torch.arange(
-                num_cached_tokens, num_cached_tokens + 1,
-                dtype=torch.int32,
-                device=device
+                num_cached_tokens, num_cached_tokens + 1, dtype=torch.int32, device=device
             ).unsqueeze(0)
 
             with torch.inference_mode():
@@ -787,35 +582,32 @@ class TestStarcoder2(unittest.TestCase):
                 pad_token_id=tokenizer.eos_token_id,
                 use_cache=True,
             )
-        
-        hf_output_ids = hf_output[0, len(input_ids):].cpu().tolist()
-        
+
+        hf_output_ids = hf_output[0, len(input_ids) :].cpu().tolist()
+
         # Decode for debugging
         trt_text = tokenizer.decode(trt_output_ids)
         hf_text = tokenizer.decode(hf_output_ids)
-        
+
         # Compare outputs - allow some tolerance for minor differences
         min_len = min(len(trt_output_ids), len(hf_output_ids))
-        matches = sum(
-            1 for i in range(min_len)
-            if trt_output_ids[i] == hf_output_ids[i]
-        )
+        matches = sum(1 for i in range(min_len) if trt_output_ids[i] == hf_output_ids[i])
         match_ratio = matches / min_len if min_len > 0 else 0.0
-        
+
         # Print for debugging
         print(f"\n{config_name}/{backend} TRT output: {trt_text}")
         print(f"{config_name}/{backend} HF output:  {hf_text}")
         print(f"Match ratio: {match_ratio:.2%} ({matches}/{min_len} tokens)")
-        
+
         # Should match at least 80% of tokens
         self.assertGreater(
-            match_ratio, 0.8,
-            f"TRT-LLM and HF token outputs differ significantly: {match_ratio:.2%} match"
+            match_ratio,
+            0.8,
+            f"TRT-LLM and HF token outputs differ significantly: {match_ratio:.2%} match",
         )
-        
+
         kv_cache_manager.shutdown()
 
 
 if __name__ == "__main__":
     unittest.main()
-
