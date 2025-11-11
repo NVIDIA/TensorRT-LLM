@@ -19,98 +19,103 @@ from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
 from ..modules.qk_norm_attention import QKNormRoPEAttention
 
-# TODO refine codes
-# class QwenAttention(Attention):
+OLD_QWEN_ATTENTION = False
 
-#     def __init__(
-#         self,
-#         model_config: ModelConfig[Qwen2Config],
-#         layer_idx: Optional[int] = None,
-#     ):
-#         config = model_config.pretrained_config
-#         if getattr(config, "rope_scaling", None) is not None:
-#             pos_embd_params = PositionalEmbeddingParams(
-#                 type=PositionEmbeddingType.from_string(
-#                     config.rope_scaling["type"]),
-#                 rope=RopeParams.from_config(config),
-#                 mrope_section=config.rope_scaling.get('mrope_section', None))
-#             # if "type" in config.rope_scaling:
-#             #     pos_type = config.rope_scaling["type"]
-#             # elif "rope_type" in config.rope_scaling:
-#             #     pos_type = config.rope_scaling["rope_type"]
-#             # else:
-#             #     raise ValueError(
-#             #         "rope_scaling must have type or rope_type field")
-#             # pos_embd_params = PositionalEmbeddingParams(
-#             #     type=PositionEmbeddingType.from_string(pos_type),
-#             #     rope=RopeParams.from_config(config),
-#             #     mrope_section=config.rope_scaling.get('mrope_section', None))
-#             print(f"pos_embd_params: {pos_embd_params}")
-#         else:
-#             pos_embd_params = PositionalEmbeddingParams(
-#                 type=PositionEmbeddingType.rope_gpt_neox,
-#                 rope=RopeParams.from_config(config),
-#             )
-#         super().__init__(
-#             hidden_size=config.hidden_size,
-#             num_attention_heads=config.num_attention_heads,
-#             num_key_value_heads=config.num_key_value_heads,
-#             max_position_embeddings=config.max_position_embeddings,
-#             bias=True,
-#             pos_embd_params=pos_embd_params,
-#             layer_idx=layer_idx,
-#             rope_fusion=not getattr(config, 'disable_fuse_rope', False),
-#             dtype=config.torch_dtype,
-#             dense_bias=False,
-#             config=model_config,
-#         )
+if OLD_QWEN_ATTENTION:
+    # TODO refine codes
+    # Has bug when we enable yarn now
+    class QwenAttention(Attention):
 
-class QwenAttention(QKNormRoPEAttention):
-
-    def __init__(
-        self,
-        model_config: ModelConfig[Qwen2Config],
-        layer_idx: Optional[int] = None,
-        fuse_qk_norm_rope: bool = True,
-    ):
-        config = model_config.pretrained_config
-
-        if getattr(config, "rope_scaling", None) is not None:
-            if "type" in config.rope_scaling:
-                pos_type = config.rope_scaling["type"]
-            elif "rope_type" in config.rope_scaling:
-                pos_type = config.rope_scaling["rope_type"]
+        def __init__(
+            self,
+            model_config: ModelConfig[Qwen2Config],
+            layer_idx: Optional[int] = None,
+        ):
+            config = model_config.pretrained_config
+            if getattr(config, "rope_scaling", None) is not None:
+                pos_embd_params = PositionalEmbeddingParams(
+                    type=PositionEmbeddingType.from_string(
+                        config.rope_scaling["type"]),
+                    rope=RopeParams.from_config(config),
+                    mrope_section=config.rope_scaling.get('mrope_section', None))
+                # if "type" in config.rope_scaling:
+                #     pos_type = config.rope_scaling["type"]
+                # elif "rope_type" in config.rope_scaling:
+                #     pos_type = config.rope_scaling["rope_type"]
+                # else:
+                #     raise ValueError(
+                #         "rope_scaling must have type or rope_type field")
+                # pos_embd_params = PositionalEmbeddingParams(
+                #     type=PositionEmbeddingType.from_string(pos_type),
+                #     rope=RopeParams.from_config(config),
+                #     mrope_section=config.rope_scaling.get('mrope_section', None))
+                print(f"pos_embd_params: {pos_embd_params}")
             else:
-                raise ValueError(
-                    "rope_scaling must have type or rope_type field")
-            pos_embd_params = PositionalEmbeddingParams(
-                type=PositionEmbeddingType.from_string(pos_type),
-                rope=RopeParams.from_config(config),
-            )
-        else:
-            pos_embd_params = PositionalEmbeddingParams(
-                type=PositionEmbeddingType.rope_gpt_neox,
-                rope=RopeParams.from_config(config),
+                pos_embd_params = PositionalEmbeddingParams(
+                    type=PositionEmbeddingType.rope_gpt_neox,
+                    rope=RopeParams.from_config(config),
+                )
+            super().__init__(
+                hidden_size=config.hidden_size,
+                num_attention_heads=config.num_attention_heads,
+                num_key_value_heads=config.num_key_value_heads,
+                max_position_embeddings=config.max_position_embeddings,
+                bias=True,
+                pos_embd_params=pos_embd_params,
+                layer_idx=layer_idx,
+                rope_fusion=not getattr(config, 'disable_fuse_rope', False),
+                dtype=config.torch_dtype,
+                dense_bias=False,
+                config=model_config,
             )
 
-        # Qwen3 has accuracy issues with deep_gemm (see: https://nvbugspro.nvidia.com/bug/5461712
-        # and https://nvbugspro.nvidia.com/bug/5505402)
-        disable_deep_gemm = True
-        super().__init__(
-            hidden_size=config.hidden_size,
-            num_attention_heads=config.num_attention_heads,
-            num_key_value_heads=config.num_key_value_heads,
-            max_position_embeddings=config.max_position_embeddings,
-            bias=True,
-            pos_embd_params=pos_embd_params,
-            fuse_qk_norm_rope=fuse_qk_norm_rope,
-            layer_idx=layer_idx,
-            dtype=config.torch_dtype,
-            dense_bias=False,
-            config=model_config,
-            disable_deep_gemm=disable_deep_gemm,
-            is_qk_norm=False,
-        )
+else:
+    class QwenAttention(QKNormRoPEAttention):
+
+        def __init__(
+            self,
+            model_config: ModelConfig[Qwen2Config],
+            layer_idx: Optional[int] = None,
+            fuse_qk_norm_rope: bool = True,
+        ):
+            config = model_config.pretrained_config
+
+            if getattr(config, "rope_scaling", None) is not None:
+                if "type" in config.rope_scaling:
+                    pos_type = config.rope_scaling["type"]
+                elif "rope_type" in config.rope_scaling:
+                    pos_type = config.rope_scaling["rope_type"]
+                else:
+                    raise ValueError(
+                        "rope_scaling must have type or rope_type field")
+                pos_embd_params = PositionalEmbeddingParams(
+                    type=PositionEmbeddingType.from_string(pos_type),
+                    rope=RopeParams.from_config(config),
+                )
+            else:
+                pos_embd_params = PositionalEmbeddingParams(
+                    type=PositionEmbeddingType.rope_gpt_neox,
+                    rope=RopeParams.from_config(config),
+                )
+
+            # Qwen3 has accuracy issues with deep_gemm (see: https://nvbugspro.nvidia.com/bug/5461712
+            # and https://nvbugspro.nvidia.com/bug/5505402)
+            disable_deep_gemm = True
+            super().__init__(
+                hidden_size=config.hidden_size,
+                num_attention_heads=config.num_attention_heads,
+                num_key_value_heads=config.num_key_value_heads,
+                max_position_embeddings=config.max_position_embeddings,
+                bias=True,
+                pos_embd_params=pos_embd_params,
+                fuse_qk_norm_rope=fuse_qk_norm_rope,
+                layer_idx=layer_idx,
+                dtype=config.torch_dtype,
+                dense_bias=False,
+                config=model_config,
+                disable_deep_gemm=disable_deep_gemm,
+                is_qk_norm=False,
+            )
 
 
 class QwenDecoderLayer(DecoderLayer):
