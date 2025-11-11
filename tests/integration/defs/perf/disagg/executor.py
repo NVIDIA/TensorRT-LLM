@@ -75,6 +75,7 @@ class SlurmRunCommandBuilder:
         output_path = EnvManager.get_output_path()
         install_mode = EnvManager.get_install_mode()
         repo_dir = EnvManager.get_repo_dir()
+        trtllm_wheel_path = EnvManager.get_trtllm_wheel_path()
 
         if cmd_type == SESSION_COLLECT_CMD_TYPE:
             if install_mode == "none":
@@ -83,6 +84,19 @@ class SlurmRunCommandBuilder:
                     "-c",
                     f"cd {work_dir} && python3 {work_dir}/simple_collect.py {output_path}",
                 ]
+            elif install_mode == "wheel":
+                # Install TensorRT-LLM wheel first, then run simple_collect.py
+                install_cmd = f"""
+                    cd {repo_dir}    
+                    echo '📦 Step 1: Installing TensorRT-LLM wheel...'
+                    pip3 install {trtllm_wheel_path} || echo '⚠️  Wheel install failed, continuing...'
+                    echo '✅ Wheel installation completed'
+                    
+                    echo '🚀 Step 2: Running simple_collect.py...'
+                    cd {work_dir}
+                    python3 {work_dir}/simple_collect.py {output_path}
+                """
+                return ["bash", "-c", install_cmd]
             elif install_mode == "source":
                 install_cmd = f"""
                 cd {repo_dir}
@@ -255,7 +269,7 @@ class JobManager:
             print(f"   ⚠️  Warning: Result directory does not exist yet: {result_dir}")
 
         # Call the internal implementation method
-        return JobManager._check_job_result(
+        check_result = JobManager._check_job_result(
             job_id=job_id,
             benchmark_type=test_config.benchmark_type,
             config=config_data,
@@ -265,6 +279,11 @@ class JobManager:
             timestamps=timestamps,
             test_name=test_name,
         )
+        
+        if os.path.exists(result_dir):
+            shutil.rmtree(result_dir)
+            print(f"   ✅ Result directory removed: {result_dir}")
+        return check_result
 
     @staticmethod
     def check_job_status(job_id: str) -> str:
