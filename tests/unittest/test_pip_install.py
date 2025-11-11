@@ -5,6 +5,7 @@ import sys
 import sysconfig
 
 import requests
+from utils.llm_data import llm_models_root
 
 
 def get_expected_license_files():
@@ -148,24 +149,6 @@ def install_tensorrt_llm():
     # Execute the final installation command
     print(f"Executing command: {install_command}")
     subprocess.check_call(install_command, shell=True)
-
-
-# NOTE: This routine is copied from from tests/unittests/utils/llm_data.py
-def llm_models_root(check=False) -> Optional[Path]:
-    root = Path("/home/scratch.trt_llm_data/llm-models/")
-
-    if "LLM_MODELS_ROOT" in os.environ:
-        root = Path(os.environ.get("LLM_MODELS_ROOT"))
-
-    if not root.exists():
-        root = Path("/scratch.trt_llm_data/llm-models/")
-
-    if check:
-        assert root.exists(), (
-            "You shall set LLM_MODELS_ROOT env or be able to access /home/scratch.trt_llm_data to run this test"
-        )
-
-    return root if root.exists() else None
 
 
 def create_link_for_models():
