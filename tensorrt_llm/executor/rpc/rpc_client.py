@@ -412,7 +412,8 @@ class RPCClient:
                 exception = context.get('exception')
                 message = context.get('message', '')
 
-                if isinstance(exception, asyncio.CancelledError) or "pending" in message:
+                if isinstance(exception,
+                              asyncio.CancelledError) or "pending" in message:
                     logger.debug(f"Suppressed error during shutdown: {message}")
                     return
 
