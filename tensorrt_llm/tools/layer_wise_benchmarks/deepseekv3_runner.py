@@ -62,8 +62,8 @@ class RoutingMethod(DeepseekV3Gate):
             raise NotImplementedError(f"Not support balance_method {self.balance_method}")
         return token_selected_experts, token_final_scales
 
-    @functools.cache
     @staticmethod
+    @functools.cache
     def get_balanced_selection(num_tokens, top_k, num_experts, dtype, world_size, rank):
         a = torch.arange(num_tokens * world_size * top_k, dtype=dtype, device="cuda").view(
             num_tokens, world_size, top_k
@@ -90,8 +90,8 @@ class RoutingMethod(DeepseekV3Gate):
         mixed_experts[num_balanced_tokens:] = imbalanced_experts[num_balanced_tokens:]
         return mixed_experts
 
-    @functools.cache
     @staticmethod
+    @functools.cache
     def get_all_to_one_selection(
         num_tokens, top_k, num_experts, balance_ratio, dtype, world_size, rank
     ):
@@ -103,8 +103,8 @@ class RoutingMethod(DeepseekV3Gate):
             imbalanced_experts, num_experts, balance_ratio, world_size, rank
         )
 
-    @functools.cache
     @staticmethod
+    @functools.cache
     def get_balanced_rank_imbalanced_expert_selection(
         num_tokens, top_k, num_experts, balance_ratio, dtype, world_size, rank
     ):
