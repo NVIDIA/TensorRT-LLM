@@ -242,7 +242,7 @@ public:
 
     void syncTransferManagerWithBufferManager() override
     {
-        NB_OVERRIDE_PURE(syncTransferManagerWithBufferManager);
+        PYBIND11_OVERLOAD_PURE(syncTransferManagerWithBufferManager);
     }
 
     void refreshBlocks() override
