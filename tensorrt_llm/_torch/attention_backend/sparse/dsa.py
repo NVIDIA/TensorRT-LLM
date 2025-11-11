@@ -432,7 +432,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
-        # TODO: remove these expanded buffers when fp8_paged_mqa_logits supports MTP > 1.
+        self.create_expanded_buffers(capture_graph=capture_graph)
+
+    # TODO: remove these expanded buffers when fp8_paged_mqa_logits supports MTP > 1.
+    def create_expanded_buffers(self, capture_graph=False):
         self.kv_lens_expanded_cuda = self.get_empty(
             self.cuda_graph_buffers,
             (self.max_num_sequences * (1 + self.max_draft_tokens), ),
@@ -467,6 +470,25 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
+
+    # This function is only used to create the expanded buffers when the max_draft_tokens is changed.
+    # TODO: remove this function when fp8_paged_mqa_logits can support MTP > 1.
+    def update_spec_dec_param(
+        self,
+        is_spec_decoding_enabled,
+        is_spec_dec_tree,
+        is_spec_dec_dynamic_tree,
+        max_draft_tokens,
+        spec_decoding_tensor: Optional['SpecDecodingTensor'] = None,
+    ):
+        super().update_spec_dec_param(is_spec_decoding_enabled,
+                                      is_spec_dec_tree,
+                                      is_spec_dec_dynamic_tree,
+                                      max_draft_tokens, spec_decoding_tensor)
+        init_shape = self.kv_lens_expanded_host.shape[0]
+        if self.max_num_sequences * (1 + self.max_draft_tokens) != init_shape:
+            capture_graph = torch.cuda.is_current_stream_capturing()
+            self.create_expanded_buffers(capture_graph=capture_graph)
 
     def prepare(self):
         super().prepare()
