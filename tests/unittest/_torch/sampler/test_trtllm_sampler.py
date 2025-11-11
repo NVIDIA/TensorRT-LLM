@@ -14,7 +14,7 @@ def model_path():
 
 def _create_llm_base(model_dir, enable_trtllm_sampler):
     """Base LLM creation with configurable sampler."""
-    pytorch_config = dict(enable_trtllm_sampler=enable_trtllm_sampler)
+    sampler_type = "TRTLLMSampler" if enable_trtllm_sampler else "TorchSampler"
 
     trt_kv_cache_config = TRT_KvCacheConfig(enable_block_reuse=False)
 
@@ -24,7 +24,7 @@ def _create_llm_base(model_dir, enable_trtllm_sampler):
         trust_remote_code=True,
         enable_chunked_prefill=True,
         cuda_graph_config=CudaGraphConfig(),
-        **pytorch_config,
+        sampler_type=sampler_type,
         kv_cache_config=trt_kv_cache_config,
         max_num_tokens=128
     )  # Only one request longer than max_num_tokens is required to test chunked prefill
