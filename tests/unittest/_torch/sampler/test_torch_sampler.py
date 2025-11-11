@@ -704,7 +704,11 @@ def test_are_stop_words_isnt_called_when_no_stop_words():
 
 
 class TestBatchedSampling:
-    """Validate batched/mixed sampling."""
+    """Validate batched/mixed sampling.
+
+    This test class focuses on the functionality implemented in `_sample_batched_by_strategy`
+    and `_unbatch_sampling_results`, as invoked from `sample_async` (via `_process_requests`).
+    """
 
     VOCAB_SIZE = 123
 
@@ -717,7 +721,11 @@ class TestBatchedSampling:
         include_uniform: bool = False,  # include_all takes precedence
         include_mixed: bool = False,  # include_all takes precedence
     ) -> list[tuple[list[SamplingParams], str]]:
-        """Return sampling params and a human-readable name."""
+        """Return test cases for testing batched sampling.
+
+        Each test case consists of a list of sampling parameters and a human-readable
+        test case name.
+        """
 
         BASE_CASES = {  # one entry per sampling strategy
             Greedy: SamplingParams(),
@@ -736,7 +744,7 @@ class TestBatchedSampling:
             return strategy_type.__args__[0].__args__[0]  # type: ignore
 
         if include_all or include_uniform:
-            # base cases
+            # Base cases (single-request batches)
             for strategy_type, params in BASE_CASES.items():
                 if strategy_type == Greedy and not allow_greedy:
                     continue
@@ -751,7 +759,7 @@ class TestBatchedSampling:
         rng = np.random.default_rng(seed=42)
 
         if include_all or include_uniform:
-            # homogeneous batches
+            # Homogeneous batches (all requests use the same sampling params)
             max_batch_size: Final = 24
             for strategy_type, params in BASE_CASES.items():
                 batch_size = rng.integers(low=1, high=max_batch_size)
@@ -776,7 +784,7 @@ class TestBatchedSampling:
             class VaryParams:
                 pass
 
-            # mixed contiguous batches
+            # Batches containing requests with different sampling params
             max_sub_batch_size: Final = 6
             type_to_constrain = TopK
             mixed_params_list = None
@@ -855,6 +863,11 @@ class TestBatchedSampling:
         sampling_params_list: list[SamplingParams],
         allow_zero_draft_len: bool,
     ) -> list[int]:
+        """Generate per-request draft lengths.
+
+        Currently drawn at random, every draft length is between 0
+        (1) and max_draft_len if allow_zero_draft_len is True (False).
+        """
         draft_len = list(
             np.random.default_rng(seed=42).integers(
                 1 if (max_draft_len > 0 and not allow_zero_draft_len) else 0,
@@ -909,6 +922,7 @@ class TestBatchedSampling:
         seq_slot_assignment: tuple[list[int], int],
         draft_lens: list[int],
     ) -> ScheduledRequests:
+        """Build a batch of test requests consumable by sample_async."""
         seq_slots, num_seq_slots = seq_slot_assignment
 
         class ScheduledRequestsMock:
@@ -992,6 +1006,10 @@ class TestBatchedSampling:
         mock_requests: ScheduledRequests,
         vocab_size: int,
     ) -> Generator[dict[str, torch.Tensor], None, None]:
+        """Provide a batch of random logits for use as input to sample_async.
+
+        This fixture also validates that the logits are not altered by the UUT.
+        """
         total_steps = sum(get_draft_token_length(req) + 1 for req in mock_requests.all_requests())
         logits = torch.testing.make_tensor(
             (total_steps, vocab_size),
@@ -1048,6 +1066,10 @@ class TestBatchedSampling:
         *,
         num_repeats: Optional[int] = None,
     ) -> torch.Tensor:
+        """Call sample_async.
+
+        Optionally, run sampling repeatedly, e.g., to gather statistics.
+        """
         assert not scheduled_requests.context_requests
         # FIXME: Currently, sample_async is not fully async (TRTLLM-9175)
         #   with assert_no_cuda_sync(sync_timeout_s=(0.01 * (num_repeats or 1) + 0.25)):
@@ -1138,6 +1160,14 @@ class TestBatchedSampling:
         params_label: str,
         allow_zero_draft_len: bool,  # used by fixtures
     ):
+        """Validate probabilities returned by sample_async.
+
+        For suitable inputs, sample_async populates the py_target_probs attribute, storing
+        the distribution from which the sampler has drawn the new tokens (typically these
+        are the probabilities computed after applying temperature, top-p/k masking, etc.).
+        This test checks that the presence of py_target_probs behaves as expected and
+        validates the values of this attribute (when present).
+        """
         with torch.cuda.Stream():
             torch.manual_seed(42)  # torch.testing.make_tensor does not accept Generator
 
@@ -1353,6 +1383,18 @@ class TestBatchedSampling:
         bypass_sampling: bool,
         monkeypatch: pytest.MonkeyPatch,
     ):
+        """Validate tokens sampled by the sampler.
+
+        This test validates the token generation by running many sampling iterations and comparing
+        the frequencies of the sampled tokens against the distributions (PMFs) computed separately
+        using the mechanism validated by `test_probs`.
+
+        To save time, for test cases (cf. sampling_params_list) which mainly mix requests with
+        sampling strategies validated by repeated sampling, repeated sampling is omitted. Instead,
+        the sampling routines of the sampling backend are patched to capture their input
+        logits / probs and return a pseudo-token identifying the capture result. Thus, the corresponding
+        observed PMFs can be directly compared with the expected ones.
+        """
         with torch.cuda.Stream():
             torch.manual_seed(42)  # torch.testing.make_tensor does not accept Generator
 
@@ -1825,6 +1867,11 @@ class TestBatchedSampling:
 
     @staticmethod
     def _build_seq_slot_assignments() -> list[tuple[list[int], int, str]]:
+        """Build seq_slot assignments.
+
+        This constructs various seq_slot assignments (see seq_slot_assignment method
+        for details), which are useful for validating the unbatching of sampling results.
+        """
         rng = np.random.default_rng(seed=42)
 
         max_seq_slots: Final = 2048
@@ -1907,6 +1954,13 @@ class TestBatchedSampling:
         allow_zero_draft_len: bool,  # used by fixtures
         ordered: bool,
     ):
+        """Validate _unbatch_sampling_results.
+
+        Considers variable numbers of generated tokens per request and varying seq_slot
+        assignments. By using unique integers as fictitious "token" values, the test
+        validates that the sampling results are copied into the correct locations in
+        the output buffers.
+        """
         with torch.cuda.Stream():
             seq_slots, total_seq_slots = seq_slot_assignment
             seq_slots_tensor = torch.tensor(seq_slots, dtype=torch.int32)
