@@ -673,7 +673,9 @@ class TorchSampler(Sampler):
         assert self._generator.device == device
         return self._generator
 
-    def get_spec_tree_manager(self, resource_manager: ResourceManager) -> Optional[SpecTreeManager]:
+    def get_spec_tree_manager(
+        self, resource_manager: Optional[ResourceManager]
+    ) -> Optional[SpecTreeManager]:
         if resource_manager is None:
             return None
         spec_resource_manager = resource_manager.get_resource_manager(
@@ -681,7 +683,7 @@ class TorchSampler(Sampler):
         )
         if spec_resource_manager is None or not hasattr(spec_resource_manager, "spec_tree_manager"):
             return None
-        return spec_resource_manager.spec_tree_manager
+        return spec_resource_manager.spec_tree_manager  # type: ignore
 
     @staticmethod
     def _meet_max_token_stop_criteria(request: LlmRequest, max_seq_len: int):

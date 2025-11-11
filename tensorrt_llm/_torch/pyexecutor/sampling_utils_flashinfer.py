@@ -91,17 +91,14 @@ class _StrategyImpls:
         def _prepare_logits_with_temperature(
             logits: torch.Tensor,
             group_logit_indices: Optional[torch.Tensor],
-            temperature: Optional[torch.Tensor],
+            temperature: torch.Tensor,
         ) -> torch.Tensor:
-            if temperature is not None:
-                temperature = temperature.unsqueeze(-1)
-                if group_logit_indices is not None:
-                    logits = torch.index_select(logits, 0, group_logit_indices)  # ensures copy
-                    logits /= temperature
-                else:
-                    logits = logits / temperature  # not inplace
-            elif group_logit_indices is not None:
-                logits = logits[group_logit_indices]
+            temperature = temperature.unsqueeze(-1)
+            if group_logit_indices is not None:
+                logits = torch.index_select(logits, 0, group_logit_indices)  # ensures copy
+                logits /= temperature
+            else:
+                logits = logits / temperature  # not inplace
             return logits
 
         @staticmethod
@@ -112,12 +109,12 @@ class _StrategyImpls:
         ) -> torch.Tensor:
             if group_logit_indices is not None:
                 logits = logits[group_logit_indices]
-            logits = flashinfer.sampling.softmax(
+            probs = flashinfer.sampling.softmax(
                 logits,
                 temperature,
                 enable_pdl=ENABLE_PDL,
             )
-            return logits
+            return probs
 
         @classmethod
         def _sample_from_probs(
@@ -151,7 +148,7 @@ class _StrategyImpls:
             group_logit_indices: Optional[torch.Tensor],
             top_k: Optional[torch.Tensor],
             top_p: Optional[torch.Tensor],
-            temperature: Optional[torch.Tensor],
+            temperature: torch.Tensor,
             generator: Optional[torch.Generator],
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             if top_k is not None:
