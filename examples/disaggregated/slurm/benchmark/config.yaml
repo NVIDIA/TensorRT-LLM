@@ -34,12 +34,25 @@ environment:
   model_path: "<model_path>"
   trtllm_repo: "<trtllm_repo>"
   build_wheel: false  # Don't build the wheel when launching multiple jobs
+  trtllm_wheel_path: ""  # Path to pre-built TensorRT-LLM wheel. If provided, install from this wheel instead
   dataset_file: "<dataset_file>"
   work_dir: "<full_path_to_work_dir>"
 
 # Profiling Configuration
 profiling:
   nsys_on: false  # Set to true to enable profiling
+
+# Accuracy Configuration
+accuracy:
+  enable_accuracy_test: false  # Set to true to enable accuracy evaluation
+  model: "local-completions"  # Model type for lm_eval
+  tasks: "gsm8k"  # Evaluation tasks (comma-separated)
+  num_concurrent: 512  # Number of concurrent requests
+  max_retries: 3  # Maximum number of retries
+  tokenized_requests: false  # Whether to use tokenized requests
+  timeout: 1200  # Request timeout in seconds
+  max_gen_toks: 256  # Maximum generation tokens
+  max_length: 4096  # Maximum sequence length
 
 worker_config:
   gen:

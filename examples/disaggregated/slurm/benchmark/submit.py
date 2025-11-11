@@ -3,6 +3,7 @@
 import argparse
 import glob
 import os
+import shutil
 import subprocess
 import sys
 
@@ -94,7 +95,10 @@ def submit_job(config):
 
     # Create full log directory path
     log_dir = os.path.join(log_base, dir_suffix)
-    os.makedirs(log_dir, exist_ok=True)
+    # Remove existing directory if it exists
+    if os.path.exists(log_dir):
+        shutil.rmtree(log_dir)
+    os.makedirs(log_dir)
 
     # Setup config file paths and save worker configs
     ctx_config_path = os.path.join(log_dir, 'ctx_config.yaml')
@@ -114,6 +118,7 @@ def submit_job(config):
         f'--ntasks={total_tasks}',
         f'--ntasks-per-node={hw_config["gpus_per_node"]}',
         f'--segment={total_nodes}',
+        f'--reservation=oos_fix_gdrdrv_dkms',
         slurm_config['script_file'],
         # Hardware configuration
         str(hw_config['gpus_per_node']),
@@ -150,9 +155,21 @@ def submit_job(config):
         env_config['container_mount'],
         env_config['container_image'],
         str(env_config['build_wheel']).lower(),
+        env_config.get('trtllm_wheel_path', ''),
 
         # Profiling
-        str(config['profiling']['nsys_on']).lower()
+        str(config['profiling']['nsys_on']).lower(),
+
+        # Accuracy evaluation
+        str(config['accuracy']['enable_accuracy_test']).lower(),
+        config['accuracy']['model'],
+        config['accuracy']['tasks'],
+        str(config['accuracy']['num_concurrent']),
+        str(config['accuracy']['max_retries']),
+        str(config['accuracy']['tokenized_requests']).lower(),
+        str(config['accuracy']['timeout']),
+        str(config['accuracy']['max_gen_toks']),
+        str(config['accuracy']['max_length'])
     ]
 
     # Submit the job
