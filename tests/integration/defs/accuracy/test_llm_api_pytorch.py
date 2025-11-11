@@ -19,9 +19,9 @@ import torch
 from defs.conftest import get_sm_version, is_sm_100f
 
 from tensorrt_llm import LLM
+from tensorrt_llm._torch.model_config import MoeLoadBalancerConfig
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import \
     IS_TRITON_KERNELS_AVAILABLE
-from tensorrt_llm._torch.pyexecutor.config import MoeLoadBalancerConfig
 from tensorrt_llm.llmapi import (AutoDecodingConfig, CudaGraphConfig,
                                  EagleDecodingConfig, KvCacheConfig, MoeConfig,
                                  MTPDecodingConfig, NGramDecodingConfig,
@@ -2373,14 +2373,16 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_mpi_world_size(8)
     @skip_pre_hopper
+    @pytest.mark.skip_less_device_memory(140000)
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
         [
             (8, 1, 8, 0, False, True, True, True, 24, "_DEFAULT"),
             (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT"),
             (8, 1, 8, 0, True, True, True, True, 24, "_DEFAULT"),
+            (8, 1, 8, 1, False, False, True, True, 1, "TRTLLM"),
         ],
-        ids=["baseline", "baseline_mtp1", "baseline_fp8kv"])
+        ids=["baseline", "baseline_mtp1", "baseline_fp8kv", "latency"])
     def test_fp8_blockscale(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                             attention_dp, cuda_graph, overlap_scheduler,
                             max_batch_size, moe_backend):
@@ -2407,6 +2409,10 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
         )
 
         if fp8kv:
+            if get_sm_version() < 100:
+                pytest.skip(
+                    "FP8 KV cache is not supported on pre-Blackwell architectures"
+                )
             kv_cache_config.dtype = "fp8"
 
         mtp_config = None
@@ -2439,11 +2445,12 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
         [
-            (8, 1, 8, 0, False, True, True, True, 24, "TRTLLM"),
-            (8, 1, 8, 1, False, True, True, True, 24, "TRTLLM"),
-            (8, 1, 8, 0, True, True, True, True, 24, "TRTLLM"),
+            (8, 1, 8, 0, False, True, True, True, 24, "CUTLASS"),
+            (8, 1, 8, 1, False, True, True, True, 24, "CUTLASS"),
+            (8, 1, 8, 0, True, True, True, True, 24, "CUTLASS"),
+            (8, 1, 8, 1, False, False, True, True, 1, "TRTLLM"),
         ],
-        ids=["baseline", "baseline_mtp1", "baseline_fp8kv"])
+        ids=["baseline", "baseline_mtp1", "baseline_fp8kv", "latency"])
     def test_nvfp4_multi_gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                               attention_dp, cuda_graph, overlap_scheduler,
                               max_batch_size, moe_backend):

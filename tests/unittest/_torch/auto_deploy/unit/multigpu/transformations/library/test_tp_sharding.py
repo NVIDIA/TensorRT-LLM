@@ -15,7 +15,7 @@ import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
     SplitDimension,
-    TPShardingInfo,
+    WeightShardingInfo,
 )
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op
@@ -272,7 +272,7 @@ def _run_pattern_detection_job(
                         dim = SplitDimension.COLUMN
                         dist_op = None
                     expected_transformations.append(
-                        TPShardingInfo(
+                        WeightShardingInfo(
                             target_node=node.name,
                             split_dim=dim,
                             rank=rank,
@@ -293,7 +293,7 @@ def _run_pattern_detection_job(
                         dim = SplitDimension.ROW
                         dist_op = "all_reduce"
                     expected_transformations.append(
-                        TPShardingInfo(
+                        WeightShardingInfo(
                             target_node=node.name,
                             split_dim=dim,
                             rank=rank,
@@ -307,7 +307,7 @@ def _run_pattern_detection_job(
             for node in gm.graph.nodes:
                 if is_linear_op(node):
                     expected_transformations.append(
-                        TPShardingInfo(
+                        WeightShardingInfo(
                             target_node=node.name,
                             split_dim=SplitDimension.COLUMN,  # Simple shard uses dim=0
                             rank=rank,
@@ -351,7 +351,7 @@ def _run_pattern_detection_job(
     optimizer.shared_config.local_rank = rank
     optimizer.shared_config.world_size = world_size
     _ = optimizer(None, gm)
-    detected_transformations = optimizer.shared_config.sharding_config.tp_transforms
+    detected_transformations = optimizer.shared_config.sharding_config.weight_sharding_transforms
 
     print(f"detected_transformations: {detected_transformations}")
     print(f"expected_transformations: {expected_transformations}")

@@ -629,6 +629,7 @@ class Indexer(nn.Module):
         self.scale_fmt = "ue8m0"
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+        self.weight_scale_factor = self.softmax_scale * self.n_heads**-0.5
 
     @staticmethod
     def prepare_one_prefill_chunk(
@@ -871,24 +872,12 @@ class Indexer(nn.Module):
         k_scale_bytes = k_scale_flat.view(torch.uint8).view(
             num_tokens, scale_size)
 
-        # Scatter FP8 data
+        # Use CUDA kernel to scatter FP8 and scale bytes into cache
         flat_indices_fp8 = metadata.slot_mapping_fp8[:num_tokens]
-        byte_offsets = torch.arange(head_dim, device=k_cache.device).unsqueeze(
-            0)  # [1, head_dim]
-        scatter_indices_fp8 = flat_indices_fp8.unsqueeze(
-            1) + byte_offsets  # [num_tokens, head_dim]
-        scatter_indices_fp8 = _unravel_indices(scatter_indices_fp8,
-                                               k_cache.shape)
-        k_cache[scatter_indices_fp8] = k_fp8_bytes
-
         flat_indices_scale = metadata.slot_mapping_scale[:num_tokens]
-        byte_offsets = torch.arange(
-            scale_size, device=k_cache.device).unsqueeze(0)  # [1, scale_size]
-        scatter_indices_scale = flat_indices_scale.unsqueeze(
-            1) + byte_offsets  # [num_tokens, scale_size]
-        scatter_indices_scale = _unravel_indices(scatter_indices_scale,
-                                                 k_cache.shape)
-        k_cache[scatter_indices_scale] = k_scale_bytes
+        torch.ops.trtllm.indexer_k_cache_scatter_op(k_fp8_bytes, k_scale_bytes,
+                                                    k_cache, flat_indices_fp8,
+                                                    flat_indices_scale)
 
     def _gather_k_cache_for_chunk(
         self,
@@ -956,8 +945,9 @@ class Indexer(nn.Module):
         k_fp8: torch.Tensor,
         k_scale: torch.Tensor,
         weights: torch.Tensor,
+        use_custom_topk: bool = True,
     ) -> torch.Tensor:
-
+        use_custom_topk = use_custom_topk and self.index_topk == 2048  #@TODO: Do we need to add a warning?
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
         num_ctx_tokens = metadata.num_ctx_tokens
@@ -971,7 +961,8 @@ class Indexer(nn.Module):
             (hidden_states.shape[0], self.index_topk),
             dtype=torch.int32,
             device=hidden_states.device)
-        topk_indices_buffer[:hidden_states.shape[0]] = -1
+        if not use_custom_topk:
+            topk_indices_buffer[:hidden_states.shape[0]] = -1
 
         # Store k_fp8 and k_scale into indexer k cache
         self._update_k_cache(k_fp8, k_scale, metadata)
@@ -990,22 +981,29 @@ class Indexer(nn.Module):
                         chunk.cu_seqlen_ks,
                         chunk.cu_seqlen_ke,
                     )
-                    topk_indices = logits.topk(min(self.index_topk,
-                                                   logits.shape[-1]),
-                                               dim=-1)[1]
-                    topk_indices -= chunk.cu_seqlen_ks[:, None]
+                    if use_custom_topk:
+                        torch.ops.trtllm.indexer_topk_prefill_op(
+                            logits, chunk.cu_seqlen_ks, chunk.cu_seqlen_ke,
+                            topk_indices_buffer[
+                                chunk.token_start:chunk.token_end, :])
+                    else:
+                        topk_indices = logits.topk(min(self.index_topk,
+                                                       logits.shape[-1]),
+                                                   dim=-1)[1]
+                        topk_indices -= chunk.cu_seqlen_ks[:, None]
 
-                    mask_lo = topk_indices >= 0
-                    mask_hi = topk_indices - (chunk.cu_seqlen_ke -
-                                              chunk.cu_seqlen_ks)[:, None] < 0
-                    mask = mask_lo & mask_hi
+                        mask_lo = topk_indices >= 0
+                        mask_hi = topk_indices - (chunk.cu_seqlen_ke -
+                                                  chunk.cu_seqlen_ks)[:,
+                                                                      None] < 0
+                        mask = mask_lo & mask_hi
 
-                    # local indices per sequence
-                    topk_indices = topk_indices.masked_fill(~mask, -1)
+                        # local indices per sequence
+                        topk_indices = topk_indices.masked_fill(~mask, -1)
 
-                    topk_indices_buffer[
-                        chunk.token_start:chunk.token_end, :topk_indices.
-                        shape[-1]] = topk_indices.to(dtype=torch.int32)
+                        topk_indices_buffer[
+                            chunk.token_start:chunk.token_end, :topk_indices.
+                            shape[-1]] = topk_indices.to(dtype=torch.int32)
             else:
                 # Fallback: single-pass indexer prefill (TODO: remove this once chunked prefill is fully tested)
                 cu_seqlen_ks = metadata.cu_seqlen_ks[:num_ctx_tokens]
@@ -1019,20 +1017,25 @@ class Indexer(nn.Module):
                     cu_seqlen_ks,
                     cu_seqlen_ke,
                 )
-                topk_indices = logits.topk(min(self.index_topk,
-                                               logits.shape[-1]),
-                                           dim=-1)[1]
-                topk_indices -= cu_seqlen_ks[:, None]
-                mask_lo = topk_indices >= 0
-                mask_hi = topk_indices - (cu_seqlen_ke - cu_seqlen_ks)[:,
-                                                                       None] < 0
-                mask = mask_lo & mask_hi
+                if use_custom_topk:
+                    torch.ops.trtllm.indexer_topk_prefill_op(
+                        logits, cu_seqlen_ks, cu_seqlen_ke,
+                        topk_indices_buffer[:num_ctx_tokens, :])
+                else:
+                    topk_indices = logits.topk(min(self.index_topk,
+                                                   logits.shape[-1]),
+                                               dim=-1)[1]
+                    topk_indices -= cu_seqlen_ks[:, None]
+                    mask_lo = topk_indices >= 0
+                    mask_hi = topk_indices - (cu_seqlen_ke -
+                                              cu_seqlen_ks)[:, None] < 0
+                    mask = mask_lo & mask_hi
 
-                # local indices per sequence
-                topk_indices = topk_indices.masked_fill(~mask, -1)
-                topk_indices_buffer[:num_ctx_tokens, :topk_indices.
-                                    shape[-1]] = topk_indices.to(
-                                        dtype=torch.int32)
+                    # local indices per sequence
+                    topk_indices = topk_indices.masked_fill(~mask, -1)
+                    topk_indices_buffer[:num_ctx_tokens, :topk_indices.
+                                        shape[-1]] = topk_indices.to(
+                                            dtype=torch.int32)
 
         if has_decode:
             max_seq_len = metadata.kv_cache_manager.max_seq_len
@@ -1069,101 +1072,130 @@ class Indexer(nn.Module):
                     num_generations],  # Only pass generation request block tables
                 metadata.scheduler_metadata_buffer,
                 max_seq_len)
-            # padded
-            positions = torch.arange(
-                max_seq_len,
-                device=q_decode.device).unsqueeze(0).expand(num_gen_tokens, -1)
-            row_indices = torch.arange(num_gen_tokens,
-                                       device=q_decode.device) // next_n
-            next_n_offset = torch.arange(num_gen_tokens,
-                                         device=q_decode.device) % next_n
-            index_end_pos = (
-                metadata.kv_lens_cuda_runtime[num_contexts + row_indices] -
-                next_n + next_n_offset).unsqueeze(1)
 
-            # index_end_pos: [B * N, 1]
-            mask = positions <= index_end_pos
-            # mask: [B * N, L]
-            logits_decode = logits_decode.masked_fill(~mask, float('-inf'))
-            topk_indices_decode = logits_decode.topk(
-                min(self.index_topk, logits_decode.shape[-1]),
-                dim=-1)[1].to(torch.int32)  # [B * N, K]
-            # ensure we don't set indices for the top k
-            # that is out of range(masked already)
-            # this will happen if context length is shorter than K
-            mask_decode = topk_indices_decode <= index_end_pos
+            if use_custom_topk:
+                # Kernel expects kv_lens (total cache length), not seq_lens (new tokens)
+                # This is because rowEnd = seq_len - next_n + offset + 1
+                gen_kv_lens_cuda = metadata.kv_lens_cuda_runtime[
+                    num_contexts:num_contexts + num_generations]
+                torch.ops.trtllm.indexer_topk_decode_op(
+                    logits_decode, gen_kv_lens_cuda,
+                    topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
+                                        num_gen_tokens, :], next_n)
+            else:
+                # padded
+                positions = torch.arange(
+                    max_seq_len, device=q_decode.device).unsqueeze(0).expand(
+                        num_gen_tokens, -1)
+                row_indices = torch.arange(num_gen_tokens,
+                                           device=q_decode.device) // next_n
+                next_n_offset = torch.arange(num_gen_tokens,
+                                             device=q_decode.device) % next_n
+                index_end_pos = (
+                    metadata.kv_lens_cuda_runtime[num_contexts + row_indices] -
+                    next_n + next_n_offset).unsqueeze(1)
+                # index_end_pos: [B * N, 1]
+                mask = positions <= index_end_pos
+                # mask: [B * N, L]
+                logits_decode = logits_decode.masked_fill(~mask, float('-inf'))
+                topk_indices_decode = logits_decode.topk(
+                    min(self.index_topk, logits_decode.shape[-1]),
+                    dim=-1)[1].to(torch.int32)  # [B * N, K]
+                # ensure we don't set indices for the top k
+                # that is out of range(masked already)
+                # this will happen if context length is shorter than K
+                mask_decode = topk_indices_decode <= index_end_pos
 
-            # local indices per sequence
-            topk_indices_decode = topk_indices_decode.masked_fill(
-                ~mask_decode, -1)
-
-            # Store in buffer
-            topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
-                                num_gen_tokens, :topk_indices_decode.
-                                shape[-1]] = topk_indices_decode.to(
-                                    dtype=torch.int32)
-
+                # local indices per sequence
+                topk_indices_decode = topk_indices_decode.masked_fill(
+                    ~mask_decode, -1)
+                # Store in buffer
+                topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
+                                    num_gen_tokens, :topk_indices_decode.
+                                    shape[-1]] = topk_indices_decode.to(
+                                        dtype=torch.int32)
         return topk_indices_buffer
+
+    def weight_scale(self, hidden_states: torch.Tensor,
+                     indexer_weights: Optional[torch.Tensor],
+                     q_scale: torch.Tensor) -> torch.Tensor:
+        weights = indexer_weights if indexer_weights is not None else self.weights_proj(
+            hidden_states)
+        weights = weights.unsqueeze(-1) * q_scale * self.weight_scale_factor
+        # output weights is guaranteed to be float32 due to type promotion from q_scale (float32)
+        weights = weights.squeeze(-1)
+        return weights
 
     @torch.inference_mode()
     def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
                 metadata: DSAtrtllmAttentionMetadata,
-                position_ids: torch.Tensor):
+                position_ids: torch.Tensor, indexer_k: Optional[torch.Tensor],
+                indexer_weights: Optional[torch.Tensor]):
         quant_block_size = metadata.kv_cache_manager.quant_block_size
         assert quant_block_size == 128, "Only support quant_block_size = 128 for now"
 
-        q, k = maybe_execute_in_parallel(
-            lambda: self.wq_b(qr),
-            lambda: self.wk(hidden_states),
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
+        if indexer_k is not None:
+            q, k = maybe_execute_in_parallel(
+                lambda: self.wq_b(
+                    qr),  # TODO: fuse wq_b and move this outside of the indexer
+                lambda: self.k_norm(indexer_k),
+                self.ln_events[0],
+                self.ln_events[1],
+                self.aux_stream,
+            )
+        else:
+            q, k = maybe_execute_in_parallel(
+                lambda: self.wq_b(qr),
+                lambda: self.k_norm(self.wk(hidden_states)),
+                self.ln_events[0],
+                self.ln_events[1],
+                self.aux_stream,
+            )
+
+        # q/k rope + possible fast_hadamard_transform
         q = q.view(-1, self.n_heads, self.head_dim)
-        q_pe, q_nope = torch.split(
-            q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
-        k = self.k_norm(k)
-        k_pe, k_nope = torch.split(
-            k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
 
-        # k_pe needs unsqueeze to match n_heads
+        q, k = maybe_execute_in_parallel(
+            lambda: torch.split(
+                q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1),
+            lambda: torch.split(
+                k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1),
+            self.ln_events[0],
+            self.ln_events[1],
+            self.aux_stream,
+        )
+
+        q_pe, q_nope = q
+        k_pe, k_nope = k
         q_pe, k_pe = self.rotary_emb(position_ids, [q_pe, k_pe.unsqueeze(1)])
-        q = torch.cat([q_pe, q_nope], dim=-1)
-        # Remove head dimension (size 1) for MQA k
-        k = torch.cat([k_pe[:, 0, :], k_nope], dim=-1)
+
+        k_pe = k_pe[:, 0, :]
+
+        def _prep_q_or_k(qk_pe, qk_nope):
+            q_or_k = torch.cat([qk_pe, qk_nope], dim=-1)
+            q_or_k = rotate_activation(q_or_k)
+            q_or_k = q_or_k.view(-1, self.head_dim)
+            q_or_k = fp8_utils.fp8_quantize_1x128_sf_transpose(
+                q_or_k, use_ue8m0=self.scale_fmt == "ue8m0")
+            return q_or_k
 
         q, k = maybe_execute_in_parallel(
-            lambda: rotate_activation(q),
-            lambda: rotate_activation(k),
+            lambda: _prep_q_or_k(q_pe, q_nope),
+            lambda: _prep_q_or_k(k_pe, k_nope),
             self.ln_events[0],
             self.ln_events[1],
             self.aux_stream,
         )
-        # we only quant q here since k quant is fused with cache insertion
-        q = q.view(-1, self.head_dim)
 
-        q, k = maybe_execute_in_parallel(
-            lambda: fp8_utils.fp8_quantize_1x128_sf_transpose(
-                q, use_ue8m0=self.scale_fmt == "ue8m0"),
-            lambda: fp8_utils.fp8_quantize_1x128_sf_transpose(
-                k, use_ue8m0=self.scale_fmt == "ue8m0"),
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
         q_fp8, q_scale = q
         k_fp8, k_scale = k
         q_fp8 = q_fp8.view(-1, self.n_heads, self.head_dim)
         q_scale = q_scale.view(-1, self.n_heads, 1)
 
-        weights = self.weights_proj(hidden_states)
-        weights = weights.unsqueeze(
-            -1) * q_scale * self.softmax_scale * self.n_heads**-0.5
-        weights = weights.squeeze(-1)
-
+        weights = self.weight_scale(hidden_states, indexer_weights, q_scale)
         # Return topk indices buffer for sparse attention [num_tokens, index_topk]
         return self.sparse_attn_indexer(metadata, hidden_states, q_fp8, k_fp8,
-                                        k_scale, weights.to(torch.float32))
+                                        k_scale, weights)
 
 
 class DSATrtllmAttention(TrtllmAttention):

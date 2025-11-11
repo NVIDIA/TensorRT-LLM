@@ -124,6 +124,14 @@ bool DecoderXQAImplJIT::shouldUse(XQAParams const& umbrellaXQAParams, bool forCo
         bool hasPerfGain = mayHavePerfGain(xqaParams);
         if (!hasPerfGain)
         {
+            if (!xqaParams.is_fp8_output && xqaParams.kv_cache_data_type == DATA_TYPE_E4M3
+                && (xqaParams.data_type == DATA_TYPE_BF16 || xqaParams.data_type == DATA_TYPE_FP16))
+            {
+                TLLM_LOG_DEBUG(
+                    "JIT XQA is selected in the generation phase for fp16/bf16 input and e4m3 kv cache because MMHA "
+                    "does not support this combination.");
+                return true;
+            }
             TLLM_LOG_DEBUG("JIT XQA is not used: maybe no performance gain");
             return false;
         }
@@ -367,7 +375,7 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
             .mask = reinterpret_cast<SpecDecParams::MaskType const*>(xqaParams.spec_decoding_packed_mask)};
     };
 
-    constexpr uint32_t kMAX_NB_KERNEL_PARAMS = 15;
+    constexpr uint32_t kMAX_NB_KERNEL_PARAMS = 16;
     uint32_t idxNextParam = 0;
     void* kernelParams[kMAX_NB_KERNEL_PARAMS];
     auto appendParam = [&](auto* p) mutable

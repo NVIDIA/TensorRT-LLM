@@ -29,7 +29,7 @@ from ..._utils import is_sm_100f
 from ...models.modeling_utils import QuantConfig
 from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-from ..utils import Fp4QuantizedTensor
+from ..utils import Fp4QuantizedTensor, unswizzle_sf
 
 
 class WeightMode(str, enum.Enum):
@@ -824,6 +824,9 @@ class NVFP4LinearMethod(LinearMethodBase):
                                                      act_sf,
                                                      module.weight_scale,
                                                      module.alpha, module.dtype)
+        # Take the dim of out_features if padded.
+        if output.shape[-1] > module.out_features:
+            output = output[..., :module.out_features]
 
         if bias is not None:
             output = output + bias
@@ -956,6 +959,48 @@ class NVFP4LinearMethod(LinearMethodBase):
         copy_weight(module.weight_scale, weight_scale)
         copy_weight(module.alpha, alpha)
         module.scalar_alpha = alpha.item()
+
+    def post_load_weights(self, module: Linear):
+        super().post_load_weights(module)
+        """
+        Pad weight and weight_scale tensors to meet torch trtllm NVFP4 GEMM alignment requirements.
+
+        Args:
+            row_alignment: Required row alignment (default: 32)
+            col_alignment: Required column alignment (default: 16)
+        """
+        row_alignment, col_alignment = 32, 16
+        row_pad_size = (row_alignment - module.weight.size(0)) % row_alignment
+        col_pad_size = (col_alignment - module.weight.size(1)) % col_alignment
+        if row_pad_size != 0 or col_pad_size != 0:
+            # Pad weight to meet NVFP4 GEMM kernel alignment requirements
+            module.weight = Parameter(F.pad(module.weight,
+                                            (0, col_pad_size, 0, row_pad_size),
+                                            mode='constant',
+                                            value=0),
+                                      requires_grad=False)
+            weight_col_size = module.weight.size(1)
+            assert (
+                weight_col_size * 2
+            ) % module.scaling_vector_size == 0, f"weight column size after padding {weight_col_size} must be divisible by scaling_vector_size {module.scaling_vector_size}"
+            # Pad weight_scale to match padded weight dimensions
+            # Padding should be performed on unswizzled weight_scale tensor
+            scale_rows = fp4_utils.pad_up(module.out_features, 128)
+            scale_cols = fp4_utils.pad_up(
+                module.in_features // module.scaling_vector_size, 4)
+            weight_scale_unswizzle = unswizzle_sf(module.weight_scale.data,
+                                                  scale_rows, scale_cols,
+                                                  module.scaling_vector_size)
+            weight_scale_unswizzle_pad = F.pad(
+                weight_scale_unswizzle,
+                (0, (col_pad_size * 2) // module.scaling_vector_size, 0,
+                 row_pad_size),
+                mode='constant',
+                value=0)
+            module.weight_scale = Parameter(
+                torch.ops.trtllm.block_scale_interleave(
+                    weight_scale_unswizzle_pad),
+                requires_grad=False)
 
 
 class W4A8NVFP4FP8LinearMethod(LinearMethodBase):

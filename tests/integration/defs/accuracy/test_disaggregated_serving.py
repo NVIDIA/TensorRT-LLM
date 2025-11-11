@@ -921,7 +921,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         with launch_disaggregated_llm(disaggregated_server_config,
                                       ctx_server_config, gen_server_config,
                                       self.MODEL_PATH) as llm:
-            model_name = "GPT-OSS/MXFP4"
+            model_name = "GPT-OSS/120B-MXFP4"
             task = GSM8K(model_name)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
