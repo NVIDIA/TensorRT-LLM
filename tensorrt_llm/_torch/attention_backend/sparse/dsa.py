@@ -432,6 +432,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
+        # TODO: remove these expanded buffers when fp8_paged_mqa_logits supports MTP > 1.
         self.kv_lens_expanded_cuda = self.get_empty(
             self.cuda_graph_buffers,
             (self.max_num_sequences * (1 + self.max_draft_tokens), ),
