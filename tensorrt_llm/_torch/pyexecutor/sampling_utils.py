@@ -72,9 +72,11 @@ class BeamSearchMetadata(StrategyMetadata):
     cache_indirection: torch.Tensor
     cache_indirection_buffer: torch.Tensor
     cum_log_probs: torch.Tensor
+    new_log_probs: torch.Tensor
     seq_slots: torch.Tensor
     seq_lens: torch.Tensor
     finished_beams: torch.Tensor
+    predecessor_beams: torch.Tensor
     end_ids: torch.Tensor
 
 
@@ -340,9 +342,8 @@ def beam_search_sampling_batch(
         # we can now use torch.where to fill the logprobs of the finished beams with -inf asynchronously
         logprobs = torch.where(finished_beams_mask_expanded, float("-inf"), logprobs)
 
-        # set the logprobs of the end tokens to 0
-        finished_beams_mask_host = finished_beams_mask.to("cpu", non_blocking=True)
         # get the offsets of the end tokens in the logprobs tensor
+
         end_ids_offset = torch.tensor(
             [
                 beam_search_args.end_ids[batch_idx]
@@ -350,12 +351,12 @@ def beam_search_sampling_batch(
                 + vocab_size * beam_width * batch_idx
                 for batch_idx in range(batch_size)
                 for beam_idx in range(beam_width)
-                if finished_beams_mask_host[batch_idx, beam_idx]
+                if finished_beams_mask[batch_idx, beam_idx]  # NB: This syncs
             ],
-            dtype=torch.int32,
+            dtype=torch.int64,
         ).to(logprobs.device, non_blocking=True)
         # fill
-        logprobs.view(-1)[end_ids_offset].fill_(0)
+        logprobs.view(-1).index_fill_(0, end_ids_offset, 0)
 
         # Add the current cum_log_probs to the logprobs of each beam
         logprobs += beam_search_args.cum_log_probs.unsqueeze(-1)[beam_search_args.seq_slots]
@@ -369,6 +370,7 @@ def beam_search_sampling_batch(
         # Rework the past cache indirection
         # get the beam idx from which the tokens were sampled (optimal predecessor)
         predecessor_beam = next_tokens // vocab_size
+        beam_search_args.predecessor_beams[beam_search_args.seq_slots] = predecessor_beam
 
         # update finished states of each beam
         finished_beams = beam_search_args.finished_beams[beam_search_args.seq_slots].view(-1)
@@ -424,6 +426,12 @@ def beam_search_sampling_batch(
         # project the next_tokens values to the vocab_size
         next_tokens = next_tokens % vocab_size
 
+        # update the logprobs of the newly generated tokens
+        # NB this is not needed if logprobs are not returned
+        old_cum_log_probs = beam_search_args.cum_log_probs[beam_search_args.seq_slots].view(-1)
+        beam_search_args.new_log_probs[beam_search_args.seq_slots] = (
+            sorted_logprobs[:, :beam_width] - old_cum_log_probs[offset_predecessor_beam]
+        )
         # update the beam scores
         beam_search_args.cum_log_probs[beam_search_args.seq_slots] = sorted_logprobs[:, :beam_width]
     return next_tokens, softmax
