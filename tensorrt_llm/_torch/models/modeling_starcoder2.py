@@ -5,17 +5,17 @@ from torch import nn
 from transformers import Starcoder2Config
 
 from tensorrt_llm._torch.attention_backend import AttentionMetadata
-from tensorrt_llm._torch.attention_backend.interface import (
-    PositionalEmbeddingParams, RopeParams)
+from tensorrt_llm._torch.attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_utils import (DecoderModel,
-                                                       DecoderModelForCausalLM,
-                                                       register_auto_model)
+from tensorrt_llm._torch.models.modeling_utils import (
+    DecoderModel,
+    DecoderModelForCausalLM,
+    register_auto_model,
+)
 from tensorrt_llm._torch.modules.attention import Attention
 from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
 from tensorrt_llm._torch.modules.embedding import Embedding
-from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
-from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
+from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm.functional import PositionEmbeddingType
@@ -24,15 +24,15 @@ from tensorrt_llm.functional import PositionEmbeddingType
 class Starcoder2LayerNorm(nn.LayerNorm):
     """
     Custom LayerNorm that skips weight initialization to support meta tensor initialization.
-    
+
     StarCoder2ForCausalLM inherits from DecoderModelForCausalLM which uses the PostInitCaller
     metaclass to enable meta tensor initialization (memory optimization). During model construction
     with meta tensors, PyTorch's nn.LayerNorm.reset_parameters() tries to initialize weights with
     ones_() which fails on meta tensors. This class skips that initialization step.
-    
+
     The weights will be properly initialized later when loaded from the HuggingFace checkpoint.
     """
-    
+
     def reset_parameters(self) -> None:
         # Skip initialization operations that conflict with meta tensor initialization
         pass
@@ -63,10 +63,10 @@ class Starcoder2Attention(Attention):
             dtype=config.torch_dtype,
             config=model_config,
         )
-        
+
         # Configure sliding window attention (4096 tokens)
-        self.attention_window_size = getattr(config, 'sliding_window', 4096)
-    
+        self.attention_window_size = getattr(config, "sliding_window", 4096)
+
     def forward(
         self,
         position_ids: torch.IntTensor,
@@ -89,7 +89,7 @@ class Starcoder2Attention(Attention):
 class Starcoder2DecoderLayer(DecoderLayer):
     """
     StarCoder2 Decoder Layer.
-    
+
     Architecture:
         - Layer normalization before attention (with bias)
         - Self-attention with GQA and sliding window
@@ -123,7 +123,7 @@ class Starcoder2DecoderLayer(DecoderLayer):
         else:
             raise ValueError(f"Unsupported mlp_type: {config.mlp_type}")
 
-        norm_eps = getattr(config, 'norm_epsilon', 1e-5)
+        norm_eps = getattr(config, "norm_epsilon", 1e-5)
         self.input_layernorm = Starcoder2LayerNorm(
             config.hidden_size,
             eps=norm_eps,
@@ -149,8 +149,10 @@ class Starcoder2DecoderLayer(DecoderLayer):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(
-                hidden_states + residual), hidden_states + residual
+            hidden_states, residual = (
+                self.input_layernorm(hidden_states + residual),
+                hidden_states + residual,
+            )
 
         # Self Attention
         hidden_states = self.self_attn(
@@ -165,11 +167,10 @@ class Starcoder2DecoderLayer(DecoderLayer):
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        
+
         if spec_metadata is not None:
-            spec_metadata.maybe_capture_hidden_states(self.layer_idx,
-                                                     hidden_states, residual)
-        
+            spec_metadata.maybe_capture_hidden_states(self.layer_idx, hidden_states, residual)
+
         return hidden_states, residual
 
 
@@ -190,16 +191,19 @@ class Starcoder2Model(DecoderModel):
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             gather_output=True,
         )
-        
-        self.layers = nn.ModuleList([
-            Starcoder2DecoderLayer(
-                model_config,
-                layer_idx,
-            ) for layer_idx in range(config.num_hidden_layers)
-        ])
-        
+
+        self.layers = nn.ModuleList(
+            [
+                Starcoder2DecoderLayer(
+                    model_config,
+                    layer_idx,
+                )
+                for layer_idx in range(config.num_hidden_layers)
+            ]
+        )
+
         # Use norm_epsilon (Starcoder2Config attribute name)
-        norm_eps = getattr(config, 'norm_epsilon', 1e-5)
+        norm_eps = getattr(config, "norm_epsilon", 1e-5)
         self.norm = Starcoder2LayerNorm(
             config.hidden_size,
             eps=norm_eps,
@@ -243,16 +247,16 @@ class Starcoder2Model(DecoderModel):
 
 @register_auto_model("Starcoder2ForCausalLM")
 class Starcoder2ForCausalLM(DecoderModelForCausalLM[Starcoder2Model, Starcoder2Config]):
-    
     def __init__(
         self,
         model_config: ModelConfig[Starcoder2Config],
     ):
-        # Ensure torch_dtype is set on pretrained_config (StarCoder2 uses bfloat16). 
+        # Ensure torch_dtype is set on pretrained_config (StarCoder2 uses bfloat16).
         # For the 15B FP32 checkpoint, we cast it to bfloat16 for consistency.
-        if model_config.pretrained_config.torch_dtype is None or model_config.pretrained_config.torch_dtype == torch.float32:
+        torch_dtype_to_check = model_config.pretrained_config.torch_dtype
+        if torch_dtype_to_check is None or torch_dtype_to_check == torch.float32:
             model_config.pretrained_config.torch_dtype = torch.bfloat16
-        
+
         super().__init__(
             Starcoder2Model(model_config),
             config=model_config,
@@ -263,27 +267,38 @@ class Starcoder2ForCausalLM(DecoderModelForCausalLM[Starcoder2Model, Starcoder2C
     def load_weights(self, weights, weight_mapper=None, skip_modules=[]):
         """
         Load weights with custom mapping for StarCoder2.
-        
+
         StarCoder2 uses GPT-2 style MLP naming (c_fc, c_proj)
         while our MLP module expects (up_proj, down_proj).
         """
         # Map HuggingFace StarCoder2 weight names to TensorRT-LLM names
         params_map = {
-            r'(.*?)\.mlp\.c_fc\.(.*)': r'\1.mlp.up_proj.\2',
-            r'(.*?)\.mlp\.c_proj\.(.*)': r'\1.mlp.down_proj.\2',
+            r"(.*?)\.mlp\.c_fc\.(.*)": r"\1.mlp.up_proj.\2",
+            r"(.*?)\.mlp\.c_proj\.(.*)": r"\1.mlp.down_proj.\2",
         }
-        
+
         if weight_mapper is None:
             # Use _load_weights_impl for non-weight-mapper path
             from tensorrt_llm._torch.models.modeling_utils import _load_weights_impl
+
             preload_weight_modules = getattr(self, "preload_weight_modules", None)
-            _load_weights_impl(self, weights, skip_modules, 
-                             params_map=params_map,
-                             preload_weight_modules=preload_weight_modules)
+            _load_weights_impl(
+                self,
+                weights,
+                skip_modules,
+                params_map=params_map,
+                preload_weight_modules=preload_weight_modules,
+            )
         else:
-            # Use _load_weights_impl_v2 for weight-mapper path  
+            # Use _load_weights_impl_v2 for weight-mapper path
             from tensorrt_llm._torch.models.modeling_utils import _load_weights_impl_v2
+
             preload_weight_modules = getattr(self, "preload_weight_modules", None)
-            _load_weights_impl_v2(self, weights, weight_mapper, skip_modules,
-                                params_map=params_map,
-                                preload_weight_modules=preload_weight_modules)
+            _load_weights_impl_v2(
+                self,
+                weights,
+                weight_mapper,
+                skip_modules,
+                params_map=params_map,
+                preload_weight_modules=preload_weight_modules,
+            )
