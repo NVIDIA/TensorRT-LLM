@@ -47,10 +47,14 @@ public:
         std::string const& directory = "");
 
     //! \brief Synchronize internal streams with bufferManager stream.
-    //! \details The buffer manager uses the same stream as the prefill and decode kernels. This method ensures that the internal kernels used for offloading and onboarding will wait for prefill and decode kernels before performing any block copies. This method must be called before the first call to KVCacheManager::addSequence in every step.
+    //! \details The buffer manager uses the same stream as the prefill and decode kernels. This method ensures that the
+    //! internal kernels used for offloading and onboarding will wait for prefill and decode kernels before performing
+    //! any block copies. This method must be called before the first call to KVCacheManager::addSequence in every step.
     void syncWithBufferManager();
 
-    //! \brief Synchronize bufferManager stream with internal streams. This method ensures that prefill and decode kernels for next step will wait for offloading and onboarding work that has already been scheduled. This method must be called after last call to KVCacheManager::addSequence in every step.
+    //! \brief Synchronize bufferManager stream with internal streams. This method ensures that prefill and decode
+    //! kernels for next step will wait for offloading and onboarding work that has already been scheduled. This method
+    //! must be called after last call to KVCacheManager::addSequence in every step.
     void syncTransfers();
 
 private:

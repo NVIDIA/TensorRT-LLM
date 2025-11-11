@@ -1339,7 +1339,7 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
 
     return numMatchedTokens;
 }
-    
+
 void BlockManager::syncTransferManagerWithBufferManager()
 {
     for (auto& [_, manager] : mWindowBlockManagers)
