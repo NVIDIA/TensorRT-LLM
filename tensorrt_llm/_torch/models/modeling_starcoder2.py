@@ -63,6 +63,27 @@ class Starcoder2Attention(Attention):
             dtype=config.torch_dtype,
             config=model_config,
         )
+        
+        # Configure sliding window attention (4096 tokens)
+        self.attention_window_size = getattr(config, 'sliding_window', 4096)
+    
+    def forward(
+        self,
+        position_ids: torch.IntTensor,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        **kwargs,
+    ) -> torch.Tensor:
+        """
+        Overrides parent to pass attention_window_size parameter.
+        """
+        return super().forward(
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            attn_metadata=attn_metadata,
+            attention_window_size=self.attention_window_size,
+            **kwargs,
+        )
 
 
 class Starcoder2DecoderLayer(DecoderLayer):
@@ -227,8 +248,9 @@ class Starcoder2ForCausalLM(DecoderModelForCausalLM[Starcoder2Model, Starcoder2C
         self,
         model_config: ModelConfig[Starcoder2Config],
     ):
-        # Ensure torch_dtype is set on pretrained_config (StarCoder2 uses bfloat16)
-        if model_config.pretrained_config.torch_dtype is None:
+        # Ensure torch_dtype is set on pretrained_config (StarCoder2 uses bfloat16). 
+        # For the 15B FP32 checkpoint, we cast it to bfloat16 for consistency.
+        if model_config.pretrained_config.torch_dtype is None or model_config.pretrained_config.torch_dtype == torch.float32:
             model_config.pretrained_config.torch_dtype = torch.bfloat16
         
         super().__init__(
@@ -265,4 +287,3 @@ class Starcoder2ForCausalLM(DecoderModelForCausalLM[Starcoder2Model, Starcoder2C
             _load_weights_impl_v2(self, weights, weight_mapper, skip_modules,
                                 params_map=params_map,
                                 preload_weight_modules=preload_weight_modules)
-
