@@ -206,7 +206,7 @@ public:
                 continue;
             }
             // Prepare custom mask for spec-decoding generation kernels.
-            if (params.layer_idx == 0 && params.is_spec_dec_tree)
+            if (params.mLayerIdx == 0 && params.mIsSpecDecTree)
             {
                 runPrepareCustomMask(kernelMeta, params, params.stream);
             }
@@ -524,11 +524,22 @@ private:
         }
         else if (isGenerationKernel(params.mKernelType))
         {
-            if (params.is_spec_dec_tree)
+            if (params.mIsSpecDecTree)
             {
-                kernelType = (params.mNumHeadsQPerKv <= 16 && (params.mHeadDimQk == 64 || params.mHeadDimQk == 128))
-                    ? FmhaKernelType::KeepsMmaAbForGeneration
-                    : FmhaKernelType::SwapsMmaAbForGeneration;
+
+                bool isSupported
+                    = params.mNumHeadsQPerKv <= 16 && (params.mHeadDimQk == 64 || params.mHeadDimQk == 128);
+                if (isSupported)
+                {
+                    kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
+                }
+                else
+                {
+                    TLLM_LOG_ERROR(
+                        "Tree-based speculative decoding is not supported with numHeadsQPerKv = %d and headDimQk = %d "
+                        "by TRTLLM-GEN",
+                        params.mNumHeadsQPerKv, params.mHeadDimQk);
+                }
             }
             else
             {
@@ -553,7 +564,7 @@ private:
         {
             // Use the maxNumHeadsQPerKvInCta (tileSizeQ) = 64 for MLA high-throughput generation kernels.
             maxNumHeadsQPerKvInCta = isMlaGenKernel(params) ? 64 : 32;
-            if (params.is_spec_dec_tree)
+            if (params.mIsSpecDecTree)
             {
                 maxNumHeadsQPerKvInCta = 128;
             }

@@ -1121,8 +1121,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         tile_size_kv = 128
         tile_size_q = 128
         # num_instances_q * num_instances_kv <= 2
-        num_instances_q = 2
-        num_instances_kv = 1
+        num_instances_q = 1
+        num_instances_kv = 2
         tile_size_kv_per_cta = tile_size_kv * num_instances_kv
         tile_size_q_per_cta = tile_size_q * num_instances_q
         max_num_custom_mask_tiles_kv = self.compute_max_num_custom_mask_tiles_kv_upper_bound(

@@ -242,8 +242,8 @@ struct TllmGenFmhaRunnerParams
     void* oPtr;
     // The output scaling factor buffer.
     void* oSfPtr;
-    // The spec-decoding generation lengths.
-    int const* spec_decoding_generation_lengths;
+    // The sequence lengths for Q.
+    int const* seqlensQPtr;
 
     // Head dimension for Q and K.
     int mHeadDimQk;
@@ -289,9 +289,9 @@ struct TllmGenFmhaRunnerParams
     // The cuda stream.
     cudaStream_t stream;
     // The layer index.
-    int32_t layer_idx = 0;
+    int32_t mLayerIdx = 0;
     // Whether the spec-dec tree is used.
-    bool is_spec_dec_tree = false;
+    bool mIsSpecDecTree = false;
 
     // set the attention mask type
     TllmGenFmhaRunnerParams& setAttentionMaskType(std::int8_t maskType)

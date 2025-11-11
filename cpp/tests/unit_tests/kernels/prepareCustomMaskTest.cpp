@@ -317,7 +317,7 @@ protected:
         runnerParams.mMaxSeqLenKv = *std::max_element(seqLensKv.begin(), seqLensKv.end());
         runnerParams.seqLensKvPtr = bufferCast<int32_t>(*seqLensKvDevice);
         runnerParams.cumSeqLensQPtr = bufferCast<int32_t>(*cumSeqLensQDevice);
-        runnerParams.spec_decoding_generation_lengths = bufferCast<int32_t>(*specDecodingGenerationLengthsDevice);
+        runnerParams.seqlensQPtr = bufferCast<int32_t>(*specDecodingGenerationLengthsDevice);
         runnerParams.firstSparseMaskOffsetsKvPtr = bufferCast<int32_t>(*firstSparseMaskOffsetsKvDevice);
         runnerParams.generalPackedCustoMaskPtr = bufferCast<int32_t>(*inputPackedMaskDevice);
         runnerParams.customMaskOffsetsPtr = bufferCast<int64_t>(*customMaskOffsetsDevice);
