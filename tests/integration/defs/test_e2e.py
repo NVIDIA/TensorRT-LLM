@@ -2466,6 +2466,7 @@ def test_ptp_quickstart_advanced_2gpus_sm120(llm_root, llm_venv, model_name,
         f"{llm_models_root()}/{model_path}",
         "--tp_size=2",
         "--max_num_tokens=256",
+        f"--kv_cache_fraction={_MEM_FRACTION_50}",
     ])
 
 
