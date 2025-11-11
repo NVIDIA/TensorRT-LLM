@@ -76,6 +76,10 @@ class EnvManager:
         return os.getenv("REPO_DIR", "")
 
     @staticmethod
+    def get_trtllm_wheel_path() -> str:
+        return os.getenv("TRTLLM_WHEEL_PATH", "")
+
+    @staticmethod
     def get_model_dir() -> str:
         return os.getenv("MODEL_DIR", "/lustre/fsw/portfolios/coreai/users/xqiao")
 
