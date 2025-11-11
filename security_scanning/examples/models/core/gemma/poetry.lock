@@ -873,13 +873,13 @@ zstd = ["zstandard (>=0.18.0)"]
 
 [[package]]
 name = "huggingface-hub"
-version = "1.1.1"
+version = "1.1.2"
 description = "Client library to download and publish models, datasets and other repos on the huggingface.co hub"
 optional = false
 python-versions = ">=3.9.0"
 files = [
-    {file = "huggingface_hub-1.1.1-py3-none-any.whl", hash = "sha256:85421e7e68bdf016b4dd199288beb7464fde84e5e7aed598a541ec8e3de7090b"},
-    {file = "huggingface_hub-1.1.1.tar.gz", hash = "sha256:7224cb359baac8390bd8a5dc5e228ea5073caf0f0b7d467bfa0d943d47d6d396"},
+    {file = "huggingface_hub-1.1.2-py3-none-any.whl", hash = "sha256:dfcfa84a043466fac60573c3e4af475490a7b0d7375b22e3817706d6659f61f7"},
+    {file = "huggingface_hub-1.1.2.tar.gz", hash = "sha256:7bdafc432dc12fa1f15211bdfa689a02531d2a47a3cc0d74935f5726cdbcab8e"},
 ]
 
 [package.dependencies]
@@ -1521,13 +1521,13 @@ test = ["flax (>=0.5.3)", "scikit-learn", "scipy (>=1.7.1)"]
 
 [[package]]
 name = "orbax-checkpoint"
-version = "0.11.27"
+version = "0.11.28"
 description = "Orbax Checkpoint"
 optional = false
 python-versions = ">=3.10"
 files = [
-    {file = "orbax_checkpoint-0.11.27-py3-none-any.whl", hash = "sha256:71896f3f881eabf5bf8bcc4d20e4f2c0898e1d8083de161a734f6732691e44bb"},
-    {file = "orbax_checkpoint-0.11.27.tar.gz", hash = "sha256:c02106928aa8133902f0cc391ad742014115fb2557d72a657034251680c0e9ad"},
+    {file = "orbax_checkpoint-0.11.28-py3-none-any.whl", hash = "sha256:094273495fca331da88ec845053a96a7f0152b0223c6b51b82a6c1b32f373c3b"},
+    {file = "orbax_checkpoint-0.11.28.tar.gz", hash = "sha256:a72075411c8aa4b48ddd9f2b247348bdfcf7b72f633b4d9c99541648089e90e9"},
 ]
 
 [package.dependencies]
