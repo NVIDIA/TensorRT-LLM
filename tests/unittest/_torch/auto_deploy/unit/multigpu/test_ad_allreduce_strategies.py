@@ -107,12 +107,36 @@ def _prepare_dataset(root_dir: str, temp_dir: str, model_path_or_name: str, num_
 def test_allreduce_strategies(llm_root, shared_dataset, allreduce_strategy):  # noqa: F811
     """Test different allreduce strategies with multi-GPU configuration.
 
-    This test validates that all allreduce strategies work correctly with TP=2.
-    Note: TWOSHOT strategy will automatically fall back to ONESHOT when sequence
-    length is smaller than TP size during initialization.
+    This test validates that allreduce strategies are correctly passed through the
+    transform pipeline to the custom op execution. The strategy is configured in the
+    detect_sharding transform and passed as an explicit function argument to the
+    torch_dist_all_reduce custom op.
 
-    Test has a 300 second timeout to prevent indefinite hangs.
-    Test will be skipped if fewer than 2 GPUs are available.
+    Implementation flow:
+        transforms.detect_sharding.allreduce_strategy (YAML config)
+            ↓ (transform creation)
+        ShardingTransformConfig.allreduce_strategy
+            ↓ (transform application)
+        WeightShardingInfo.allreduce_strategy
+            ↓ (graph node insertion)
+        torch_dist_all_reduce(tensor, strategy)
+            ↓ (custom op execution)
+        trtllm_allreduce(tensor, op, strategy=strategy)
+            ↓ (TRT-LLM AllReduce with specified strategy)
+
+    Configuration:
+        The allreduce_strategy is set in the transforms config:
+        ```yaml
+        transforms:
+          detect_sharding:
+            allreduce_strategy: "ONESHOT"  # or AUTO, NCCL, TWOSHOT, etc.
+        ```
+
+    Test configuration:
+        - Model: Llama-3.1-8B with TP=2
+        - Dataset: 10 synthetic requests (128 input, 128 output tokens)
+        - Timeout: 300 seconds to catch hangs
+        - Skipped if fewer than 2 GPUs available
 
     Args:
         llm_root: Root directory fixture
@@ -136,22 +160,25 @@ def test_allreduce_strategies(llm_root, shared_dataset, allreduce_strategy):  # 
         with open(dataset_path, "w") as f:
             f.write(shared_dataset)
 
-        # Create configuration with specified allreduce strategy
+        # Create configuration with specified allreduce strategy in transforms
         extra_llm_api_options_path = f"{temp_dir}/extra_llm_api_options.yaml"
         with open(extra_llm_api_options_path, "w") as f:
             yaml.dump(
                 {
                     "model": model_name,
-                    "allreduce_strategy": allreduce_strategy,
                     "max_batch_size": max_batch_size,
                     "max_num_tokens": max_num_tokens,
                     "max_seq_len": 256,
                     "transforms": {
+                        "detect_sharding": {
+                            "stage": "sharding",
+                            "allreduce_strategy": allreduce_strategy,
+                        },
                         "compile_model": {
                             "stage": "compile",
                             "backend": "torch-cudagraph",
                             "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128, 256],
-                        }
+                        },
                     },
                 },
                 f,

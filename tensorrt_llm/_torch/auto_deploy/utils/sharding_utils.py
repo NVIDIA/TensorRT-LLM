@@ -10,9 +10,10 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from torch.fx import GraphModule, Node
 
+from ....functional import AllReduceStrategy
 from ..models.factory import ShardingConfigSource
 from ..utils.logger import ad_logger
 from .node_utils import (
@@ -27,6 +28,36 @@ from .quantization_utils import (
     cutlass_fp4_scale_to_modelopt_fp4_scale,
     modelopt_fp4_scale_to_cutlass_fp4_scale,
 )
+
+
+def validate_allreduce_strategy(v):
+    """Convert string names like 'AUTO' to AllReduceStrategy enum.
+
+    This is a shared validator for allreduce_strategy fields across all config classes.
+
+    Args:
+        v: Value to validate - can be AllReduceStrategy enum, string name, or integer value
+
+    Returns:
+        AllReduceStrategy enum value
+
+    Raises:
+        ValueError: If the input is an invalid strategy string
+    """
+    if isinstance(v, AllReduceStrategy):
+        return v
+    if isinstance(v, str):
+        # Try to get enum by name
+        try:
+            return AllReduceStrategy[v]
+        except KeyError:
+            raise ValueError(
+                f"Invalid allreduce strategy: {v}. "
+                f"Valid options: {', '.join(s.name for s in AllReduceStrategy)}"
+            )
+    if isinstance(v, int):
+        return AllReduceStrategy(v)
+    return v  # Let Pydantic handle other types
 
 
 def _load_hook(
@@ -238,6 +269,7 @@ def _insert_sharded_mamba(
     quantization_cb: Optional[
         Callable[[GraphModule, nn.Module, Node, str, torch.Size, int, int, int], None]
     ] = None,
+    allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
 ) -> bool:
     """
     To shard Mamba layer, first column-shard the first linear layer: entry_node,
@@ -342,6 +374,7 @@ def _insert_sharded_mamba(
         min_local_shape=min_local_shape,
         fused_weight_dims=entry_fused_dims,
         quantization_cb=quantization_cb,
+        allreduce_strategy=allreduce_strategy,
     )
 
     # Get all weight nodes in the subgraph except for out_proj
@@ -407,6 +440,7 @@ def _shard_parameter_node(
     quantization_cb: Optional[
         Callable[[GraphModule, nn.Module, Node, str, torch.Size, int, int, int], None]
     ] = None,
+    allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
 ) -> None:
     """Replace the node with parametrized weight tensor with a new node that accepts sharded weights.
 
@@ -486,15 +520,18 @@ def _shard_parameter_node(
         return
 
     # figure out the right dist op
-    dist_lookup = {
-        0: (torch.ops.auto_deploy.torch_dist_all_gather.default, -1),
-        1: (torch.ops.auto_deploy.torch_dist_all_reduce.default,),
-    }
-    fn_dist, *dist_args = dist_lookup[dim]
+    if dim == 0:
+        # Column split -> all_gather
+        fn_dist = torch.ops.auto_deploy.torch_dist_all_gather.default
+        dist_args = (node, -1)
+    else:
+        # Row split -> all_reduce with strategy
+        fn_dist = torch.ops.auto_deploy.torch_dist_all_reduce.default
+        dist_args = (node, allreduce_strategy.name)
 
     # add reduction node
     with gm.graph.inserting_after(node):
-        dist_node = gm.graph.call_function(fn_dist, args=(node, *dist_args))
+        dist_node = gm.graph.call_function(fn_dist, args=dist_args)
         node.replace_all_uses_with(dist_node)
         dist_node.replace_input_with(dist_node, node)
 
@@ -529,6 +566,13 @@ class ShardingTransformInfo(BaseModel, ABC):
     target_node: str
     rank: int
     world_size: int
+    allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO
+
+    @field_validator("allreduce_strategy", mode="before")
+    @classmethod
+    def _validate_allreduce_strategy(cls, v):
+        """Convert string names like 'AUTO' to AllReduceStrategy enum."""
+        return validate_allreduce_strategy(v)
 
     def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
         """
@@ -628,6 +672,7 @@ class WeightShardingInfo(ShardingTransformInfo):
                 if isinstance(self.fused_weight_dims, dict)
                 else None,
                 quantization_cb=self.quantization_cb,
+                allreduce_strategy=self.allreduce_strategy,
             )
         else:
             _shard_parameter_node(
@@ -640,6 +685,7 @@ class WeightShardingInfo(ShardingTransformInfo):
                 min_local_shape=self.min_local_shape,
                 fused_weight_dims=self.fused_weight_dims,
                 quantization_cb=self.quantization_cb,
+                allreduce_strategy=self.allreduce_strategy,
             )
 
 
@@ -939,6 +985,7 @@ def _insert_sharded_moe(
     rank: int,
     world_size: int,
     scale_names: Sequence[str] = (),
+    allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
 ):
     """Update the torch_moe node with sharded weight lists,
     sharded `selected_experts` and `final_scales(router_logics)`.
@@ -1014,7 +1061,8 @@ def _insert_sharded_moe(
     # -- add an all_reduce node --
     with gm.graph.inserting_after(node):
         dist_node = gm.graph.call_function(
-            torch.ops.auto_deploy.torch_dist_all_reduce.default, args=(node,)
+            torch.ops.auto_deploy.torch_dist_all_reduce.default,
+            args=(node, allreduce_strategy.name),
         )
         node.replace_all_uses_with(dist_node)
         dist_node.replace_input_with(dist_node, node)
@@ -1043,6 +1091,7 @@ def _insert_sharded_mxfp4_mlp_ep(
     node: Node,
     rank: int,
     world_size: int,
+    allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
 ):
     """
     Transform a call to auto_deploy::triton_mxfp4_moe into:
@@ -1085,7 +1134,9 @@ def _insert_sharded_mxfp4_mlp_ep(
 
     # Add a dist all-reduce after the op (sum partial results across EP ranks)
     with gm.graph.inserting_after(node):
-        red = gm.graph.call_function(torch.ops.auto_deploy.torch_dist_all_reduce, args=(node,))
+        red = gm.graph.call_function(
+            torch.ops.auto_deploy.torch_dist_all_reduce, args=(node, allreduce_strategy.name)
+        )
         node.replace_all_uses_with(red)
         # keep dataflow: red(input=node)
         red.replace_input_with(red, node)
@@ -1114,7 +1165,7 @@ class EPShardingInfo(ShardingTransformInfo):
 
     def apply(self, gm: GraphModule, node: Node) -> None:
         """Apply EP sharding transformation to the graph module."""
-        _insert_sharded_moe(gm, node, self.rank, self.world_size, [])
+        _insert_sharded_moe(gm, node, self.rank, self.world_size, [], self.allreduce_strategy)
 
 
 class MXFP4EPShardingInfo(EPShardingInfo):
@@ -1128,7 +1179,7 @@ class MXFP4EPShardingInfo(EPShardingInfo):
         return True
 
     def apply(self, gm: GraphModule, node: Node) -> None:
-        _insert_sharded_mxfp4_mlp_ep(gm, node, self.rank, self.world_size)
+        _insert_sharded_mxfp4_mlp_ep(gm, node, self.rank, self.world_size, self.allreduce_strategy)
 
 
 class FP8EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
@@ -1144,7 +1195,9 @@ class FP8EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
         return ["input_scale", "weight_scale"]
 
     def apply(self, gm: GraphModule, node: Node) -> None:
-        _insert_sharded_moe(gm, node, self.rank, self.world_size, self.scale_names())
+        _insert_sharded_moe(
+            gm, node, self.rank, self.world_size, self.scale_names(), self.allreduce_strategy
+        )
 
 
 class NVFP4EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
@@ -1160,7 +1213,9 @@ class NVFP4EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
         return ["input_scale", "weight_scale", "alpha"]
 
     def apply(self, gm: GraphModule, node: Node) -> None:
-        _insert_sharded_moe(gm, node, self.rank, self.world_size, self.scale_names())
+        _insert_sharded_moe(
+            gm, node, self.rank, self.world_size, self.scale_names(), self.allreduce_strategy
+        )
 
 
 EP_SHARDING_RULES = [
@@ -1213,10 +1268,20 @@ class ShardingConfig(BaseModel):
     sharding_dims: List[ShardingDim] = Field(
         default_factory=lambda: [ShardingDim.SSM, ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
     )
+    allreduce_strategy: AllReduceStrategy = Field(
+        default=AllReduceStrategy.AUTO,
+        description="AllReduce strategy for distributed operations (AUTO, NCCL, ONESHOT, TWOSHOT, etc.)",
+    )
     weight_sharding_transforms: List[WeightShardingInfo] = Field(default_factory=list)
     parameter_update_transforms: List[ParameterUpdateInfo] = Field(default_factory=list)
     bmm_transforms: List[BMMShardingInfo] = Field(default_factory=list)
     ep_transforms: List[EPShardingInfo] = Field(default_factory=list)
+
+    @field_validator("allreduce_strategy", mode="before")
+    @classmethod
+    def _validate_allreduce_strategy(cls, v):
+        """Convert string names like 'AUTO' to AllReduceStrategy enum."""
+        return validate_allreduce_strategy(v)
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)

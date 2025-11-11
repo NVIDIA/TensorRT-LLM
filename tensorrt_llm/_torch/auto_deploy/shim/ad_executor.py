@@ -325,16 +325,11 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     port = mpi_dist.broadcast(dist.get_free_port())  # use MPI broadcast to pick a free port
     dist.initialize_or_skip(rank, world_size, port)
 
-    # Configure allreduce strategy if specified
-    if hasattr(ad_config, "allreduce_strategy") and ad_config.allreduce_strategy != "AUTO":
-        from tensorrt_llm.functional import AllReduceStrategy
-
-        from ..distributed.trtllm import TRTLLM_OP_AVAILABLE, set_allreduce_strategy
-
-        if TRTLLM_OP_AVAILABLE:
-            strategy = getattr(AllReduceStrategy, ad_config.allreduce_strategy)
-            set_allreduce_strategy(strategy)
-            ad_logger.info(f"Using allreduce strategy: {ad_config.allreduce_strategy}")
+    # Log allreduce strategy if configured in transforms
+    if "detect_sharding" in ad_config.transforms:
+        strategy = ad_config.transforms["detect_sharding"].get("allreduce_strategy", "AUTO")
+        if strategy != "AUTO":
+            ad_logger.info(f"Using allreduce strategy from transforms config: {strategy}")
 
     # some config
     assert ad_config.max_beam_width <= 1, "_autodeploy + beam_search is not supported"

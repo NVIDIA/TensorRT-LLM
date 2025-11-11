@@ -22,9 +22,10 @@ from collections import defaultdict
 from typing import DefaultDict, Dict, List, Set, Tuple, Type
 
 import torch
-from pydantic import Field
+from pydantic import Field, field_validator
 from torch.fx import GraphModule, Node
 
+from .....functional import AllReduceStrategy
 from ...models.factory import ModelFactory, ShardingConfigSource
 from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
@@ -49,6 +50,7 @@ from ...utils.sharding_utils import (
     SplitDimension,
     WeightShardingInfo,
     get_all_weights_in_subgraph,
+    validate_allreduce_strategy,
 )
 from ..interface import (
     BaseTransform,
@@ -149,6 +151,18 @@ class ShardingTransformConfig(TransformConfig):
     sharding_dims: List[ShardingDim] = Field(
         default_factory=lambda: [ShardingDim.SSM, ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
     )
+    allreduce_strategy: AllReduceStrategy = Field(
+        default=AllReduceStrategy.AUTO,
+        description="AllReduce strategy for distributed operations. "
+        "Options: AUTO (automatic selection), NCCL, ONESHOT, TWOSHOT, MIN_LATENCY, "
+        "LOWPRECISION, UB, MNNVL, NCCL_SYMMETRIC",
+    )
+
+    @field_validator("allreduce_strategy", mode="before")
+    @classmethod
+    def _validate_allreduce_strategy(cls, v):
+        """Convert string names like 'AUTO' to AllReduceStrategy enum."""
+        return validate_allreduce_strategy(v)
 
 
 @TransformRegistry.register("detect_sharding")
@@ -196,6 +210,7 @@ class Sharding(BaseTransform):
         sharding_config = shared_config.sharding_config
         sharding_config.rank = local_rank
         sharding_config.world_size = world_size
+        sharding_config.allreduce_strategy = self.config.allreduce_strategy
         sharding_config.predefined_config = factory.get_sharding_config() if factory else {}
         sharding_config.factory_source = (
             sharding_config.predefined_config.get("source", ShardingConfigSource.UNKNOWN)

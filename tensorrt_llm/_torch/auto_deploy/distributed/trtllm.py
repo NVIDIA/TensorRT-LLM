@@ -13,37 +13,31 @@ try:
     # warmup causes hangs due to workspace allocation with CPU synchronization
     _allreduce_cache = {}
 
-    # Global allreduce strategy configuration
-    # Can be set via set_allreduce_strategy() to override the default AUTO strategy
-    _global_allreduce_strategy = AllReduceStrategy.AUTO
-
-    def set_allreduce_strategy(strategy: AllReduceStrategy):
-        """Set the global allreduce strategy for distributed operations.
-
-        Args:
-            strategy: AllReduceStrategy enum value (AUTO, NCCL, ONESHOT, TWOSHOT, etc.)
-        """
-        global _global_allreduce_strategy
-        _global_allreduce_strategy = strategy
-        # Clear cache when strategy changes to force recreation with new strategy
-        _allreduce_cache.clear()
-
     def trtllm_allgather(tensor, dim, sizes=None):
         rank, world_size = get_rank_world_size()
         p_config = Mapping(world_size=world_size, tp_size=world_size, rank=rank)
         return allgather(tensor, p_config, dim=dim, sizes=sizes)
 
-    def trtllm_allreduce(tensor, op, all_reduce_params=None):
+    def trtllm_allreduce(tensor, op, all_reduce_params=None, strategy: str = "AUTO"):
         rank, world_size = get_rank_world_size()
         assert op == ReduceOp.SUM, "TRT-LLM all reduce only supports SUM op."
 
+        # Convert string strategy to enum
+        try:
+            strategy_enum = getattr(AllReduceStrategy, strategy)
+        except AttributeError:
+            raise ValueError(
+                f"Invalid allreduce strategy: {strategy}. "
+                f"Valid options: AUTO, NCCL, ONESHOT, TWOSHOT, MIN_LATENCY, "
+                f"LOWPRECISION, UB, MNNVL, NCCL_SYMMETRIC"
+            )
+
         # Cache key includes rank, world_size, dtype, and strategy to handle different configurations
-        cache_key = (rank, world_size, tensor.dtype, _global_allreduce_strategy)
+        cache_key = (rank, world_size, tensor.dtype, strategy_enum)
         if cache_key not in _allreduce_cache:
             p_config = Mapping(world_size=world_size, tp_size=world_size, rank=rank)
-            # Use the configured global strategy
             _allreduce_cache[cache_key] = AllReduce(
-                mapping=p_config, strategy=_global_allreduce_strategy, dtype=tensor.dtype
+                mapping=p_config, strategy=strategy_enum, dtype=tensor.dtype
             )
 
         torch_op = _allreduce_cache[cache_key]
@@ -74,13 +68,10 @@ try:
     TRTLLM_OP_AVAILABLE = True
 except ImportError:
 
-    def set_allreduce_strategy(strategy):
-        raise ImportError("TRT-LLM is not available.")
-
     def trtllm_allgather(tensor, dim, sizes=None):
         raise ImportError("TRT-LLM is not available.")
 
-    def trtllm_allreduce(tensor, op):
+    def trtllm_allreduce(tensor, op, all_reduce_params=None, strategy: str = "AUTO"):
         raise ImportError("TRT-LLM is not available.")
 
     TRTLLM_OP_AVAILABLE = False
