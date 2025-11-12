@@ -36,10 +36,17 @@ class RpcWorker(BaseWorker):
         - `shutdown`: Shutdown the worker.
     """
 
-    # Number of RPC server workers
+    # Default number of RPC server workers
     # Increased to handle concurrent requests and prevent thread pool exhaustion
     # Need enough workers for: submit requests + fetch_responses + other operations
-    NUM_WORKERS = 32
+    # Can be overridden via constructor parameter
+    DEFAULT_NUM_WORKERS = 32
+
+    # Default timeout for fetch_responses in seconds
+    # This is a short timeout to prevent blocking the event loop while still allowing
+    # responses to be fetched efficiently. The value is tuned to balance responsiveness
+    # and CPU usage. Can be overridden via constructor parameter.
+    DEFAULT_FETCH_TIMEOUT = 0.1
 
     def __init__(
         self,
@@ -51,6 +58,8 @@ class RpcWorker(BaseWorker):
         hf_model_dir: Optional[Path] = None,
         tokenizer: Optional[TokenizerBase] = None,
         llm_args: Optional[BaseLlmArgs] = None,
+        num_workers: Optional[int] = None,
+        fetch_timeout: Optional[float] = None,
     ) -> None:
         super().__init__(
             engine=engine,
@@ -62,6 +71,12 @@ class RpcWorker(BaseWorker):
             tokenizer=tokenizer,
             llm_args=llm_args,
         )
+
+        # Configure number of RPC workers
+        self.num_workers = num_workers if num_workers is not None else self.DEFAULT_NUM_WORKERS
+
+        # Configure fetch timeout
+        self._fetch_timeout = fetch_timeout if fetch_timeout is not None else self.DEFAULT_FETCH_TIMEOUT
 
         # Extract garbage_collection_gen0_threshold from llm_args if available
         self.garbage_collection_gen0_threshold = (
@@ -95,7 +110,9 @@ class RpcWorker(BaseWorker):
                               color="orange",
                               category="Worker"):
             # NOTE: This is a blocking call, it will wait for the responses to be available.
-            responses = super().await_responses(timeout=0.1)
+            # Use the configured fetch timeout if no timeout is provided
+            actual_timeout = timeout if timeout is not None else self._fetch_timeout
+            responses = super().await_responses(timeout=actual_timeout)
             self._await_response_helper.responses_handler(responses)
             logger_debug(f"[worker] Fetched {len(responses)} responses",
                          color="green")
@@ -248,11 +265,11 @@ class RpcWorker(BaseWorker):
 
         else:
             logger_debug(
-                f"[worker] Worker {mpi_rank()} is creating the RPC service",
+                f"[worker] Worker {mpi_rank()} is creating the RPC service with {worker.num_workers} workers",
                 color="yellow")
             # Step 2: Create the RPC service, it will expose all the APIs of the worker as remote call to the client
             # Set num_workers to larger than 1 since there are some streaming tasks runs infinitely, such as await_responses_async.
-            rpc_server = RPCServer(worker, num_workers=RpcWorker.NUM_WORKERS)
+            rpc_server = RPCServer(worker, num_workers=worker.num_workers)
             rpc_server.bind(rpc_addr)
             rpc_server.start()
             logger_debug(f"[worker] RPC server {mpi_rank()} is started",
