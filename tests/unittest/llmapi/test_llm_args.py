@@ -778,3 +778,172 @@ class TestStrictBaseModelArbitraryArgs:
                 pydantic_core._pydantic_core.ValidationError) as exc_info:
             TestConfig(field1="test", field2=100, extra_field="should_fail")
         assert "extra_field" in str(exc_info.value)
+
+
+class TestApplyEnvOverrides:
+    """Test suite for apply_env_overrides function."""
+
+    def test_apply_env_overrides_basic(self):
+        """Test basic env_overrides application."""
+        import os
+
+        from tensorrt_llm.llmapi.llm_args import apply_env_overrides
+
+        # Setup
+        test_var = "TEST_ENV_VAR_BASIC"
+        if test_var in os.environ:
+            del os.environ[test_var]
+
+        config_dict = {
+            "max_batch_size": 256,
+            "env_overrides": {
+                test_var: "test_value"
+            }
+        }
+
+        # Apply env overrides
+        apply_env_overrides(config_dict)
+
+        # Verify env var was set
+        assert test_var in os.environ
+        assert os.environ[test_var] == "test_value"
+
+        # Verify env_overrides was removed from config_dict
+        assert "env_overrides" not in config_dict
+
+        # Cleanup
+        del os.environ[test_var]
+
+    def test_apply_env_overrides_shell_precedence(self):
+        """Test that shell environment takes precedence over config."""
+        import os
+
+        from tensorrt_llm.llmapi.llm_args import apply_env_overrides
+
+        # Setup
+        test_var = "TEST_ENV_VAR_PRECEDENCE"
+        os.environ[test_var] = "shell_value"
+
+        config_dict = {"env_overrides": {test_var: "config_value"}}
+
+        # Apply env overrides
+        apply_env_overrides(config_dict)
+
+        # Verify shell value was preserved
+        assert os.environ[test_var] == "shell_value"
+
+        # Cleanup
+        del os.environ[test_var]
+
+    def test_apply_env_overrides_multiple_vars(self):
+        """Test applying multiple environment variables."""
+        import os
+
+        from tensorrt_llm.llmapi.llm_args import apply_env_overrides
+
+        # Setup
+        test_vars = ["TEST_VAR_1", "TEST_VAR_2", "TEST_VAR_3"]
+        for var in test_vars:
+            if var in os.environ:
+                del os.environ[var]
+
+        config_dict = {
+            "env_overrides": {
+                "TEST_VAR_1": "value1",
+                "TEST_VAR_2": "value2",
+                "TEST_VAR_3": "value3"
+            }
+        }
+
+        # Apply env overrides
+        apply_env_overrides(config_dict)
+
+        # Verify all vars were set
+        assert os.environ["TEST_VAR_1"] == "value1"
+        assert os.environ["TEST_VAR_2"] == "value2"
+        assert os.environ["TEST_VAR_3"] == "value3"
+
+        # Cleanup
+        for var in test_vars:
+            del os.environ[var]
+
+    def test_apply_env_overrides_type_conversion(self):
+        """Test that different value types are converted to strings."""
+        import os
+
+        from tensorrt_llm.llmapi.llm_args import apply_env_overrides
+
+        # Setup
+        test_vars = ["TEST_INT", "TEST_BOOL", "TEST_STR"]
+        for var in test_vars:
+            if var in os.environ:
+                del os.environ[var]
+
+        config_dict = {
+            "env_overrides": {
+                "TEST_INT": 123,
+                "TEST_BOOL": True,
+                "TEST_STR": "string_value"
+            }
+        }
+
+        # Apply env overrides
+        apply_env_overrides(config_dict)
+
+        # Verify all values were converted to strings
+        assert os.environ["TEST_INT"] == "123"
+        assert os.environ["TEST_BOOL"] == "True"
+        assert os.environ["TEST_STR"] == "string_value"
+
+        # Cleanup
+        for var in test_vars:
+            del os.environ[var]
+
+    def test_apply_env_overrides_no_env_section(self):
+        """Test that function handles missing env_overrides section."""
+        from tensorrt_llm.llmapi.llm_args import apply_env_overrides
+
+        config_dict = {"max_batch_size": 256}
+
+        # Should not raise any errors
+        apply_env_overrides(config_dict)
+
+        # Config should remain unchanged
+        assert config_dict == {"max_batch_size": 256}
+
+    def test_apply_env_overrides_with_config_path(self):
+        """Test that config_path is used in logging."""
+        import os
+
+        from tensorrt_llm.llmapi.llm_args import apply_env_overrides
+
+        # Setup
+        test_var = "TEST_ENV_VAR_PATH"
+        if test_var in os.environ:
+            del os.environ[test_var]
+
+        config_dict = {"env_overrides": {test_var: "test_value"}}
+
+        # Apply with config path (should work without errors)
+        apply_env_overrides(config_dict, "/path/to/config.yaml")
+
+        # Verify env var was set
+        assert test_var in os.environ
+        assert os.environ[test_var] == "test_value"
+
+        # Cleanup
+        del os.environ[test_var]
+
+    def test_apply_env_overrides_invalid_type(self):
+        """Test that invalid env_overrides type is handled gracefully."""
+        from tensorrt_llm.llmapi.llm_args import apply_env_overrides
+
+        config_dict = {
+            "env_overrides": "not_a_dict"  # Invalid type
+        }
+
+        # Should not raise, but should log warning
+        apply_env_overrides(config_dict)
+
+        # env_overrides should still be removed
+        assert "env_overrides" not in config_dict

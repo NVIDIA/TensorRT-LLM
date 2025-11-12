@@ -2949,6 +2949,42 @@ class TorchLlmArgs(BaseLlmArgs):
         return executor_config
 
 
+def apply_env_overrides(config_dict: Dict,
+                        config_path: Optional[str] = None) -> None:
+    """Apply environment variable overrides from config file.
+
+    Extracts and applies environment variables from the 'env_overrides' section
+    of the config dictionary. Shell environment variables take precedence over
+    config file values.
+
+    Args:
+        config_dict: Configuration dictionary potentially containing 'env_overrides'
+        config_path: Optional path to config file for logging context
+    """
+    if 'env_overrides' not in config_dict:
+        return
+
+    env_overrides = config_dict.pop('env_overrides')
+    if not isinstance(env_overrides, dict):
+        logger.warning(
+            f"env_overrides must be a dictionary, got {type(env_overrides).__name__}"
+        )
+        return
+
+    config_context = f" from {config_path}" if config_path else ""
+    logger.info(f"Processing environment variable overrides{config_context}")
+
+    for key, value in env_overrides.items():
+        str_value = str(value)
+        if key in os.environ:
+            logger.debug(
+                f"Skipping {key}={str_value} (already set to {os.environ[key]})"
+            )
+        else:
+            os.environ[key] = str_value
+            logger.info(f"Setting {key}={str_value}")
+
+
 def update_llm_args_with_extra_dict(
         llm_args: Dict,
         llm_args_dict: Dict,

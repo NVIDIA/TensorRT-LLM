@@ -20,6 +20,8 @@ from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
 from tensorrt_llm.bench.benchmark.utils.general import (
     get_settings_from_engine, get_settings, ALL_SUPPORTED_BACKENDS)
 # isort: on
+import yaml
+
 from tensorrt_llm.bench.benchmark.utils.general import (
     generate_warmup_dataset, update_sampler_args_with_extra_options)
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
@@ -29,6 +31,7 @@ from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer,
                                            update_metadata_for_multimodal)
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy
+from tensorrt_llm.llmapi.llm_utils import apply_env_overrides
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -59,6 +62,13 @@ from tensorrt_llm.sampling_params import SamplingParams
     default=None,
     multiple=True,
     help="Paths to custom module directories to import.",
+)
+@optgroup.option(
+    "--config",
+    type=str,
+    default=None,
+    help=
+    "Path to a YAML file that overwrites the parameters specified by trtllm-bench."
 )
 @optgroup.option(
     "--extra_llm_api_options",
@@ -293,6 +303,25 @@ def throughput_command(
 ) -> None:
     """Run a throughput test on a TRT-LLM engine."""
     logger.info("Preparing to run throughput benchmark...")
+
+    # Validate that both --config and --extra_llm_api_options are not specified
+    config = params.get("config")
+    extra_llm_api_options = params.get("extra_llm_api_options")
+    if config is not None and extra_llm_api_options is not None:
+        raise click.UsageError(
+            "Cannot specify both --config and --extra_llm_api_options. "
+            "Please use only one of these flags.")
+
+    # Merge config flags and apply env_overrides early
+    config_file = config or extra_llm_api_options
+    if config_file is not None:
+        with open(config_file, 'r') as f:
+            config_dict = yaml.safe_load(f)
+        # Apply environment variable overrides early
+        apply_env_overrides(config_dict, config_file)
+        # Store the config file path for later use
+        params["extra_llm_api_options"] = config_file
+
     # Parameters from CLI
     image_data_format: str = params.get("image_data_format", "pt")
     data_device: str = params.get("data_device", "cpu")

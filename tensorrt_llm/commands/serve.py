@@ -28,7 +28,8 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               extract_disagg_cluster_config,
                                               parse_disagg_config_file,
                                               parse_metadata_server_config_file)
-from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
+from tensorrt_llm.llmapi.llm_utils import (apply_env_overrides,
+                                           update_llm_args_with_extra_dict)
 from tensorrt_llm.llmapi.mpi_session import find_free_port
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.logger import logger, severity_map
@@ -302,6 +303,13 @@ class ChoiceWithAlias(click.Choice):
               default=False,
               help="Flag for HF transformers.")
 @click.option(
+    "--config",
+    type=str,
+    default=None,
+    help=
+    "Path to a YAML file that overwrites the parameters specified by trtllm-serve."
+)
+@click.option(
     "--extra_llm_api_options",
     type=str,
     default=None,
@@ -360,9 +368,9 @@ def serve(
         ep_size: Optional[int], cluster_size: Optional[int],
         gpus_per_node: Optional[int], kv_cache_free_gpu_memory_fraction: float,
         num_postprocess_workers: int, trust_remote_code: bool,
-        extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
-        tool_parser: Optional[str], metadata_server_config_file: Optional[str],
-        server_role: Optional[str],
+        config: Optional[str], extra_llm_api_options: Optional[str],
+        reasoning_parser: Optional[str], tool_parser: Optional[str],
+        metadata_server_config_file: Optional[str], server_role: Optional[str],
         fail_fast_on_attention_window_too_large: bool,
         otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
         disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str]):
@@ -371,6 +379,15 @@ def serve(
     MODEL: model name | HF checkpoint path | TensorRT engine path
     """
     logger.set_level(log_level)
+
+    # Validate that both --config and --extra_llm_api_options are not specified
+    if config is not None and extra_llm_api_options is not None:
+        raise click.UsageError(
+            "Cannot specify both --config and --extra_llm_api_options. "
+            "Please use only one of these flags.")
+
+    # Merge config flags (prefer --config over --extra_llm_api_options)
+    config_file = config or extra_llm_api_options
 
     llm_args, _ = get_llm_args(
         model=model,
@@ -395,9 +412,11 @@ def serve(
         enable_chunked_prefill=enable_chunked_prefill)
 
     llm_args_extra_dict = {}
-    if extra_llm_api_options is not None:
-        with open(extra_llm_api_options, 'r') as f:
+    if config_file is not None:
+        with open(config_file, 'r') as f:
             llm_args_extra_dict = yaml.safe_load(f)
+        # Apply environment variable overrides before LLM initialization
+        apply_env_overrides(llm_args_extra_dict, config_file)
     llm_args = update_llm_args_with_extra_dict(llm_args, llm_args_extra_dict)
 
     metadata_server_cfg = parse_metadata_server_config_file(
