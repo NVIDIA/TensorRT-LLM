@@ -181,12 +181,10 @@ def trtllm_quant_fp8_moe_fused(
     activation_type = ActivationType.Swiglu
     if mlp_style == "gated_mlp":
         # Gated MLP uses Silu: silu(x @ w1.T) * (x @ w3.T)
-        # For gated MLP, concatenate w1 and w3
-        # TensorRT-LLM expects [w3, w1] concatenated
+        # For gated MLP, concatenate w1 and w3 as [w3, w1]
         w3_w1_stacked = torch.cat([w3_weight, w1_weight], dim=1).contiguous()  # [E, 2*I, H]
         fc1_expert_weights = w3_w1_stacked
         if act_fn == "silu":
-            # activation_type = ActivationType.Silu
             activation_type = ActivationType.Swiglu  # need to fix this in trtllm
         else:
             raise ValueError(f"Unsupported activation '{act_fn}' for gated_mlp. Use 'silu'.")
