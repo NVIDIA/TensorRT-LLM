@@ -2,7 +2,6 @@ import itertools
 from typing import List, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 
 from ..._utils import get_sm_version
 from ...math_utils import pad_up
@@ -29,11 +28,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
     from ..cute_dsl_kernels.blackwell.grouped_blockscaled_gemm_persistent import \
         Sm100BlockScaledPersistentGroupedGemmKernel
     from ..cute_dsl_kernels.blackwell.utils import make_ptr
-
-    @torch.compile(options={"max-autotune": True})
-    def swiglu_fused_moe(x):
-        x, gate = x.chunk(2, dim=-1)
-        return F.silu(gate) * x
 
     class CuteDSLNVFP4BlackwellLinear(TunableRunner):
         kernel_dict = dict()
@@ -808,10 +802,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 tile_size=tile_size,
                 output_dtype=self.output_dtype,
             )
-            x = swiglu_fused_moe(x)
-            x, x_sf = torch.ops.trtllm.fp4_quantize(x, gemm2_input_global_scale,
-                                                    self.scaling_vector_size,
-                                                    False, True)
+            x, x_sf = torch.ops.trtllm.moe_swiglu_nvfp4_quantize(
+                input=x,
+                global_sf=gemm2_input_global_scale,
+                tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                num_non_exiting_tiles=num_non_exiting_tiles,
+                tile_tokens_dim=tile_size,
+            )
             x = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_blackwell(
                 input=x.view(torch.float4_e2m1fn_x2),
                 weight=gemm2_weight.view(torch.float4_e2m1fn_x2),

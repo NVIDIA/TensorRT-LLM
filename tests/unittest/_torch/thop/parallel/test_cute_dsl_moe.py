@@ -159,7 +159,7 @@ def test_moe_permute(dtype: str, num_tokens: int, top_k: int, tile_size: int):
     permuted_idx_to_expanded_idx = torch.randint(
         0, num_tokens * top_k, (max_num_permuted_tokens,), dtype=torch.int32, device="cuda"
     )
-    num_non_exiting_tiles_val = (num_tokens * top_k) // tile_size
+    num_non_exiting_tiles_val = (num_tokens * top_k + tile_size - 1) // tile_size
     num_non_exiting_tiles = torch.tensor(
         [num_non_exiting_tiles_val], dtype=torch.int32, device="cuda"
     )
@@ -204,13 +204,13 @@ def test_moe_unpermute(dtype: str, num_tokens: int, top_k: int, tile_size: int):
     num_experts = 256
     num_local_experts = num_experts // 32
     helper = GroupedGemmInputsHelper(num_experts, top_k, num_local_experts, 0, tile_size)
-    num_permuted_tokens = helper.get_max_num_permuted_tokens(num_tokens)
+    max_num_permuted_tokens = helper.get_max_num_permuted_tokens(num_tokens)
     permuted_x = torch.randint(
-        -100, 100, (num_permuted_tokens, hidden_size), dtype=torch.int32, device="cuda"
+        -100, 100, (max_num_permuted_tokens, hidden_size), dtype=torch.int32, device="cuda"
     ).to(dtype)
 
     expanded_idx_to_permuted_idx = torch.randint(
-        0, num_permuted_tokens, (num_tokens, top_k), dtype=torch.int32, device="cuda"
+        0, max_num_permuted_tokens, (num_tokens, top_k), dtype=torch.int32, device="cuda"
     )
     topk_scales = torch.randn(num_tokens, top_k, dtype=torch.float32, device="cuda").softmax(dim=-1)
     x = torch.ops.trtllm.moe_unpermute(permuted_x, expanded_idx_to_permuted_idx, topk_scales)
@@ -227,29 +227,46 @@ def test_moe_unpermute(dtype: str, num_tokens: int, top_k: int, tile_size: int):
 @pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
 def test_moe_swiglu(dtype: str, num_tokens: int, top_k: int, tile_size: int):
     dtype = getattr(torch, dtype)
+    sf_vec_size = 16
     interm_size = 4096
     num_experts = 256
     num_local_experts = num_experts // 32
     helper = GroupedGemmInputsHelper(num_experts, top_k, num_local_experts, 0, tile_size)
     max_num_tiles = helper.get_max_num_tiles(num_tokens)
-    num_permuted_tokens = helper.get_max_num_permuted_tokens(num_tokens)
+    max_num_permuted_tokens = helper.get_max_num_permuted_tokens(num_tokens)
 
     x = torch.randint(
-        -100, 100, (num_permuted_tokens, interm_size * 2), dtype=torch.int32, device="cuda"
+        -100, 100, (max_num_permuted_tokens, interm_size * 2), dtype=torch.int32, device="cuda"
     ).to(dtype)
     tile_idx_to_mn_limit = (
         torch.arange(1, max_num_tiles + 1, dtype=torch.int32, device="cuda") * tile_size
     )
-    num_non_exiting_tiles_val = (num_tokens * top_k) // tile_size
+    num_non_exiting_tiles_val = (num_tokens * top_k + tile_size - 1) // tile_size
     num_non_exiting_tiles = torch.tensor(
         [num_non_exiting_tiles_val], dtype=torch.int32, device="cuda"
     )
     y = torch.ops.trtllm.moe_swiglu(x, tile_idx_to_mn_limit, num_non_exiting_tiles, tile_size)
     _x, _gate = x.chunk(2, dim=-1)
     y_ref = torch.nn.functional.silu(_gate) * _x
-    torch.testing.assert_close(
-        y[: num_non_exiting_tiles_val * tile_size], y_ref[: num_non_exiting_tiles_val * tile_size]
+    num_permuted_tokens = num_non_exiting_tiles_val * tile_size
+    torch.testing.assert_close(y[:num_permuted_tokens], y_ref[:num_permuted_tokens])
+
+    global_sf = y[:num_permuted_tokens].abs().max().float() / (448 * 6)
+    global_sf = 1 / global_sf
+    y, y_sf = torch.ops.trtllm.moe_swiglu_nvfp4_quantize(
+        x, global_sf, tile_idx_to_mn_limit, num_non_exiting_tiles, tile_size
     )
+    y_ref, y_sf_ref = torch.ops.trtllm.fp4_quantize(y_ref, global_sf, 16, False)
+    match_ratio = (
+        y[:num_permuted_tokens].view(torch.uint8) == y_ref[:num_permuted_tokens]
+    ).sum().item() / y[:num_permuted_tokens].numel()
+    assert match_ratio > 0.999
+
+    num_sf_elements = num_permuted_tokens * interm_size // sf_vec_size
+    match_ratio = (
+        y_sf[:num_sf_elements] == y_sf_ref[:num_sf_elements]
+    ).sum().item() / num_sf_elements
+    assert match_ratio > 0.999
 
 
 @pytest.mark.skipif(

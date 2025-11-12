@@ -33,7 +33,7 @@ void moeUnpermute(InputType const* permuted_input, InputType* output, int32_t co
     cudaStream_t stream);
 
 template <typename InputType, typename OutputType, typename SFType>
-void moeActivation(InputType const* input, OutputType* output, SFType const* output_sf,
+void moeActivation(InputType const* input, OutputType* output, float const* global_sf, SFType* output_sf,
     int32_t const* tile_idx_to_mn_limit, int32_t const* num_non_exiting_tiles,
     cutlass_kernels::ActivationParams activation_params, int32_t const interm_size, int32_t const tile_size,
     cudaStream_t stream);
