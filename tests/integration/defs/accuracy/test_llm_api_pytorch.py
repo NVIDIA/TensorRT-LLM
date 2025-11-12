@@ -2380,7 +2380,7 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
             (8, 1, 8, 0, False, True, True, True, 24, "_DEFAULT"),
             (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT"),
             (8, 1, 8, 0, True, True, True, True, 24, "_DEFAULT"),
-            (8, 1, 8, 1, False, False, True, True, 1, "TRTLLM"),
+            (8, 1, 8, 3, False, False, True, True, 1, "TRTLLM"),
         ],
         ids=["baseline", "baseline_mtp1", "baseline_fp8kv", "latency"])
     def test_fp8_blockscale(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
@@ -2448,7 +2448,7 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
             (8, 1, 8, 0, False, True, True, True, 24, "CUTLASS"),
             (8, 1, 8, 1, False, True, True, True, 24, "CUTLASS"),
             (8, 1, 8, 0, True, True, True, True, 24, "CUTLASS"),
-            (8, 1, 8, 1, False, False, True, True, 1, "TRTLLM"),
+            (8, 1, 8, 3, False, False, True, True, 1, "TRTLLM"),
         ],
         ids=["baseline", "baseline_mtp1", "baseline_fp8kv", "latency"])
     def test_nvfp4_multi_gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
