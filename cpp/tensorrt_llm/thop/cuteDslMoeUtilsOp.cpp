@@ -139,18 +139,17 @@ std::tuple<torch::Tensor, torch::optional<torch::Tensor>> moe_permute(torch::Ten
     TORCH_CHECK(tile_idx_to_mn_limit.scalar_type() == torch::kInt32, "tile_idx_to_mn_limit must be int32.");
     int64_t const num_tiles = tile_idx_to_mn_limit.size(0);
     TORCH_CHECK(permuted_idx_to_expanded_idx.dim() == 1, "permuted_idx_to_expanded_idx must be 1D.");
-    int64_t const num_permuted_tokens = permuted_idx_to_expanded_idx.size(0);
-    TORCH_CHECK(num_permuted_tokens == tile_tokens_dim * num_tiles,
-        "num_permuted_tokens must be equal to tile_tokens_dim * num_tiles.");
-    TORCH_CHECK(num_permuted_tokens >= num_tokens * top_k,
-        "num_permuted_tokens must be greater than or equal to num_tokens * top_k.");
+    int64_t const max_num_permuted_tokens = permuted_idx_to_expanded_idx.size(0);
+    TORCH_CHECK(max_num_permuted_tokens == tile_tokens_dim * num_tiles,
+        "max_num_permuted_tokens must be equal to tile_tokens_dim * num_tiles.");
+    TORCH_CHECK(max_num_permuted_tokens >= num_tokens * top_k,
+        "max_num_permuted_tokens must be greater than or equal to num_tokens * top_k.");
 
-    TORCH_CHECK(num_non_exiting_tiles.dim() == 1, "num_non_exiting_tiles must be 1D.");
-    TORCH_CHECK(num_non_exiting_tiles.size(0) == 1, "num_non_exiting_tiles must have 1 element.");
+    TORCH_CHECK(num_non_exiting_tiles.numel() == 1, "num_non_exiting_tiles must have 1 element.");
     TORCH_CHECK(num_non_exiting_tiles.scalar_type() == torch::kInt32, "num_non_exiting_tiles must be int32.");
 
-    auto permuted_output
-        = torch::empty({num_permuted_tokens, input.size(1)}, torch::dtype(input.scalar_type()).device(torch::kCUDA));
+    auto permuted_output = torch::empty(
+        {max_num_permuted_tokens, input.size(1)}, torch::dtype(input.scalar_type()).device(torch::kCUDA));
 
     void* input_sf_ptr = nullptr;
     void* permuted_sf_ptr = nullptr;
@@ -160,7 +159,7 @@ std::tuple<torch::Tensor, torch::optional<torch::Tensor>> moe_permute(torch::Ten
         TORCH_CHECK(input_sf.has_value(), "input_sf is required for NVFP4.");
         input_sf_ptr = input_sf->data_ptr();
         int64_t constexpr kSFVecSize = 16;
-        permuted_sf = torch::empty({num_permuted_tokens * hidden_size / kSFVecSize},
+        permuted_sf = torch::empty({max_num_permuted_tokens * hidden_size / kSFVecSize},
             torch::dtype(input_sf->scalar_type()).device(torch::kCUDA));
         permuted_sf_ptr = permuted_sf->data_ptr();
     }
@@ -171,8 +170,8 @@ std::tuple<torch::Tensor, torch::optional<torch::Tensor>> moe_permute(torch::Ten
     tensorrt_llm::kernels::cute_dsl::moePermute<InputType, SFType>(static_cast<InputType*>(input.data_ptr()),          \
         static_cast<InputType*>(permuted_output.data_ptr()), static_cast<SFType*>(input_sf_ptr),                       \
         static_cast<SFType*>(permuted_sf_ptr), tile_idx_to_mn_limit.data_ptr<int32_t>(),                               \
-        permuted_idx_to_expanded_idx.data_ptr<int32_t>(), num_non_exiting_tiles.data_ptr<int32_t>(), hidden_size,      \
-        top_k, tile_tokens_dim, stream)
+        permuted_idx_to_expanded_idx.data_ptr<int32_t>(), num_non_exiting_tiles.data_ptr<int32_t>(),                   \
+        max_num_permuted_tokens, hidden_size, top_k, tile_tokens_dim, stream)
 
     if (input.scalar_type() == torch::kHalf)
     {
@@ -206,7 +205,7 @@ torch::Tensor moe_unpermute(torch::Tensor const& permuted_input, torch::Tensor c
     torch::Tensor const& topk_scales)
 {
     TORCH_CHECK(permuted_input.dim() == 2, "permuted_input must be 2D.");
-    int64_t const num_permuted_tokens = permuted_input.size(0);
+    int64_t const max_num_permuted_tokens = permuted_input.size(0);
     int64_t const hidden_size = permuted_input.size(1);
     TORCH_CHECK(expanded_idx_to_permuted_idx.dim() == 2, "expanded_idx_to_permuted_idx must be 2D.");
     int64_t const num_tokens = expanded_idx_to_permuted_idx.size(0);
@@ -215,8 +214,8 @@ torch::Tensor moe_unpermute(torch::Tensor const& permuted_input, torch::Tensor c
     TORCH_CHECK(topk_scales.size(0) == num_tokens, "topk_scales.size(0) must be num_tokens.");
     TORCH_CHECK(topk_scales.size(1) == top_k, "topk_scales.size(1) must be top_k.");
 
-    TORCH_CHECK(num_permuted_tokens >= num_tokens * top_k,
-        "num_permuted_tokens must be greater than or equal to num_tokens * top_k.");
+    TORCH_CHECK(max_num_permuted_tokens >= num_tokens * top_k,
+        "max_num_permuted_tokens must be greater than or equal to num_tokens * top_k.");
 
     auto output
         = torch::empty({num_tokens, hidden_size}, torch::dtype(permuted_input.scalar_type()).device(torch::kCUDA));
@@ -260,21 +259,20 @@ torch::Tensor moe_swiglu(torch::Tensor const& input, torch::Tensor const& tile_i
 {
     TORCH_CHECK(input.dim() == 2, "input must be 2D.");
     TORCH_CHECK(input.size(1) % 2 == 0, "input.size(1) must be even.");
-    int64_t const num_permuted_tokens = input.size(0);
+    int64_t const max_num_permuted_tokens = input.size(0);
     int64_t const interm_size = input.size(1) / 2;
 
     TORCH_CHECK(tile_idx_to_mn_limit.dim() == 1, "tile_idx_to_mn_limit must be 1D.");
     TORCH_CHECK(tile_idx_to_mn_limit.scalar_type() == torch::kInt32, "tile_idx_to_mn_limit must be int32.");
     int64_t const num_tiles = tile_idx_to_mn_limit.size(0);
-    TORCH_CHECK(num_permuted_tokens == tile_tokens_dim * num_tiles,
-        "num_permuted_tokens must be equal to tile_tokens_dim * num_tiles.");
+    TORCH_CHECK(max_num_permuted_tokens == tile_tokens_dim * num_tiles,
+        "max_num_permuted_tokens must be equal to tile_tokens_dim * num_tiles.");
 
-    TORCH_CHECK(num_non_exiting_tiles.dim() == 1, "num_non_exiting_tiles must be 1D.");
-    TORCH_CHECK(num_non_exiting_tiles.size(0) == 1, "num_non_exiting_tiles must have 1 element.");
+    TORCH_CHECK(num_non_exiting_tiles.numel() == 1, "num_non_exiting_tiles must have 1 element.");
     TORCH_CHECK(num_non_exiting_tiles.scalar_type() == torch::kInt32, "num_non_exiting_tiles must be int32.");
 
     auto output
-        = torch::empty({num_permuted_tokens, interm_size}, torch::dtype(input.scalar_type()).device(torch::kCUDA));
+        = torch::empty({max_num_permuted_tokens, interm_size}, torch::dtype(input.scalar_type()).device(torch::kCUDA));
     tensorrt_llm::kernels::cutlass_kernels::ActivationParams activation_params{
         tensorrt_llm::kernels::cutlass_kernels::ActivationType::Swiglu};
 
@@ -284,7 +282,7 @@ torch::Tensor moe_swiglu(torch::Tensor const& input, torch::Tensor const& tile_i
     tensorrt_llm::kernels::cute_dsl::moeActivation<InputType, OutputType, SFType>(                                     \
         static_cast<InputType*>(input.data_ptr()), static_cast<OutputType*>(output.data_ptr()), nullptr, nullptr,      \
         tile_idx_to_mn_limit.data_ptr<int32_t>(), num_non_exiting_tiles.data_ptr<int32_t>(), activation_params,        \
-        interm_size, tile_tokens_dim, stream)
+        max_num_permuted_tokens, interm_size, tile_tokens_dim, stream)
 
     if (input.scalar_type() == torch::kHalf)
     {
@@ -310,24 +308,25 @@ std::tuple<torch::Tensor, torch::Tensor> moe_swiglu_nvfp4_quantize(torch::Tensor
 {
     TORCH_CHECK(input.dim() == 2, "input must be 2D.");
     TORCH_CHECK(input.size(1) % 2 == 0, "input.size(1) must be even.");
-    int64_t const num_permuted_tokens = input.size(0);
+    int64_t const max_num_permuted_tokens = input.size(0);
     int64_t const interm_size = input.size(1) / 2;
 
     TORCH_CHECK(tile_idx_to_mn_limit.dim() == 1, "tile_idx_to_mn_limit must be 1D.");
     TORCH_CHECK(tile_idx_to_mn_limit.scalar_type() == torch::kInt32, "tile_idx_to_mn_limit must be int32.");
     int64_t const num_tiles = tile_idx_to_mn_limit.size(0);
-    TORCH_CHECK(num_permuted_tokens == tile_tokens_dim * num_tiles,
-        "num_permuted_tokens must be equal to tile_tokens_dim * num_tiles.");
+    TORCH_CHECK(max_num_permuted_tokens == tile_tokens_dim * num_tiles,
+        "max_num_permuted_tokens must be equal to tile_tokens_dim * num_tiles.");
 
-    TORCH_CHECK(num_non_exiting_tiles.dim() == 1, "num_non_exiting_tiles must be 1D.");
-    TORCH_CHECK(num_non_exiting_tiles.size(0) == 1, "num_non_exiting_tiles must have 1 element.");
+    TORCH_CHECK(global_sf.numel() == 1, "global_sf must have 1 element.");
+    TORCH_CHECK(global_sf.scalar_type() == torch::kFloat32, "global_sf must be float32.");
+    TORCH_CHECK(num_non_exiting_tiles.numel() == 1, "num_non_exiting_tiles must have 1 element.");
     TORCH_CHECK(num_non_exiting_tiles.scalar_type() == torch::kInt32, "num_non_exiting_tiles must be int32.");
 
     auto output = torch::empty(
-        {num_permuted_tokens, interm_size / 2}, torch::dtype(torch::kFloat4_e2m1fn_x2).device(torch::kCUDA));
+        {max_num_permuted_tokens, interm_size / 2}, torch::dtype(torch::kFloat4_e2m1fn_x2).device(torch::kCUDA));
     int64_t constexpr kSFVecSize = 16;
     auto output_sf = torch::empty(
-        {num_permuted_tokens * interm_size / kSFVecSize}, torch::dtype(torch::kUInt8).device(torch::kCUDA));
+        {max_num_permuted_tokens * interm_size / kSFVecSize}, torch::dtype(torch::kUInt8).device(torch::kCUDA));
 
     tensorrt_llm::kernels::cutlass_kernels::ActivationParams activation_params{
         tensorrt_llm::kernels::cutlass_kernels::ActivationType::Swiglu};
@@ -339,7 +338,7 @@ std::tuple<torch::Tensor, torch::Tensor> moe_swiglu_nvfp4_quantize(torch::Tensor
         static_cast<InputType*>(input.data_ptr()), static_cast<OutputType*>(output.data_ptr()),                        \
         global_sf.data_ptr<float>(), static_cast<SFType*>(output_sf.data_ptr()),                                       \
         tile_idx_to_mn_limit.data_ptr<int32_t>(), num_non_exiting_tiles.data_ptr<int32_t>(), activation_params,        \
-        interm_size, tile_tokens_dim, stream)
+        max_num_permuted_tokens, interm_size, tile_tokens_dim, stream)
 
     if (input.scalar_type() == torch::kHalf)
     {

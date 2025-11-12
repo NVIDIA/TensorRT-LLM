@@ -115,8 +115,8 @@ __global__ void moePermuteKernel(InputType const* input, InputType* permuted_out
 template <typename InputType, typename SFType>
 void moePermute(InputType const* input, InputType* permuted_output, SFType const* input_sf, SFType* permuted_sf,
     int32_t const* tile_idx_to_mn_limit, int32_t const* permuted_idx_to_expanded_idx,
-    int32_t const* num_non_exiting_tiles, int32_t const hidden_size, int32_t const top_k, int32_t const tile_size,
-    cudaStream_t stream)
+    int32_t const* num_non_exiting_tiles, int32_t const max_num_permuted_tokens, int32_t const hidden_size,
+    int32_t const top_k, int32_t const tile_size, cudaStream_t stream)
 {
     int32_t constexpr kThreadsPerBlock = 256;
     int32_t constexpr kSFVecSize = 16;
@@ -126,16 +126,21 @@ void moePermute(InputType const* input, InputType* permuted_output, SFType const
 #ifdef ENABLE_FP4
     if constexpr (std::is_same_v<InputType, __nv_fp4_e2m1>)
     {
+        int32_t constexpr kSFMAlignment = 128;
+        int32_t constexpr kSFKAlignment = 4;
         int32_t constexpr kSFElemPerCopy = sfElemPerCopy<SFType>();
-        TLLM_CHECK_WITH_INFO(hidden_size % (kSFVecSize * kSFElemPerCopy) == 0, "hidden_size must be divisible by %d.",
-            kSFVecSize * kSFElemPerCopy);
+        static_assert(kSFElemPerCopy == kSFKAlignment);
+        TLLM_CHECK_WITH_INFO(max_num_permuted_tokens % kSFMAlignment == 0,
+            "max_num_permuted_tokens must be divisible by %d.", kSFMAlignment);
+        TLLM_CHECK_WITH_INFO(hidden_size % (kSFVecSize * kSFKAlignment) == 0, "hidden_size must be divisible by %d.",
+            kSFVecSize * kSFKAlignment);
         TLLM_CHECK_WITH_INFO(input_sf != nullptr, "input_sf is required for NVFP4.");
         TLLM_CHECK_WITH_INFO(permuted_sf != nullptr, "permuted_sf is required for NVFP4.");
     }
 #endif
 
-    static int64_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
-    int32_t const blocks = smCount;
+    static int32_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
+    int32_t const blocks = std::min(smCount, max_num_permuted_tokens);
     int32_t const threads = kThreadsPerBlock;
 
     auto kernel = &moePermuteKernel<InputType, SFType, kSFVecSize, kThreadsPerBlock>;
@@ -157,8 +162,9 @@ void moePermute(InputType const* input, InputType* permuted_output, SFType const
 #define INSTANTIATE_MOE_PERMUTE(InputType, SFType)                                                                     \
     template void moePermute<InputType, SFType>(InputType const* input, InputType* permuted_output,                    \
         SFType const* input_sf, SFType* permuted_sf, int32_t const* tile_idx_to_mn_limit,                              \
-        int32_t const* permuted_idx_to_expanded_idx, int32_t const* num_non_exiting_tiles, int32_t const hidden_size,  \
-        int32_t const top_k, int32_t const tile_size, cudaStream_t stream)
+        int32_t const* permuted_idx_to_expanded_idx, int32_t const* num_non_exiting_tiles,                             \
+        int32_t const max_num_permuted_tokens, int32_t const hidden_size, int32_t const top_k,                         \
+        int32_t const tile_size, cudaStream_t stream)
 
 INSTANTIATE_MOE_PERMUTE(half, uint8_t);
 #ifdef ENABLE_BF16
@@ -276,7 +282,11 @@ __global__ void moeActivationKernel(InputType const* input, OutputType* output, 
     int32_t const interm_size, int32_t const tile_size)
 {
     using ComputeType = float;
+#ifdef ENABLE_FP4
     using ElemOutputCopyType = std::conditional_t<std::is_same_v<OutputType, __nv_fp4_e2m1>, uint32_t, ElemCopyType>;
+#else
+    using ElemOutputCopyType = ElemCopyType;
+#endif
     int32_t constexpr kElemPerCopy = elemPerCopy<InputType>();
     // Need int64_t to prevent overflow when computing pointer offsets.
     int64_t const kCopyPerToken = interm_size / kElemPerCopy;
@@ -323,6 +333,7 @@ __global__ void moeActivationKernel(InputType const* input, OutputType* output, 
                 }
             }
 
+#ifdef ENABLE_FP4
             if constexpr (std::is_same_v<OutputType, __nv_fp4_e2m1>)
             {
                 auto* sf_dst_ptr = cvt_quant_get_sf_out_offset<SFType, kSFVecSize / kElemPerCopy>(
@@ -332,6 +343,7 @@ __global__ void moeActivationKernel(InputType const* input, OutputType* output, 
                     *reinterpret_cast<PackedVec<InputType>*>(rmem), global_sf_val, sf_dst_ptr);
             }
             else
+#endif
             {
                 dst_ptr[i] = *reinterpret_cast<ElemCopyType*>(rmem);
             }
@@ -346,16 +358,30 @@ __global__ void moeActivationKernel(InputType const* input, OutputType* output, 
 template <typename InputType, typename OutputType, typename SFType>
 void moeActivation(InputType const* input, OutputType* output, float const* global_sf, SFType* output_sf,
     int32_t const* tile_idx_to_mn_limit, int32_t const* num_non_exiting_tiles,
-    cutlass_kernels::ActivationParams activation_params, int32_t const interm_size, int32_t const tile_size,
-    cudaStream_t stream)
+    cutlass_kernels::ActivationParams activation_params, int32_t const max_num_permuted_tokens,
+    int32_t const interm_size, int32_t const tile_size, cudaStream_t stream)
 {
     int32_t constexpr kThreadsPerBlock = 256;
     int32_t constexpr kSFVecSize = 16;
     int32_t constexpr kElemPerCopy = elemPerCopy<InputType>();
     TLLM_CHECK_WITH_INFO(interm_size % kElemPerCopy == 0, "interm_size must be divisible by %d.", kElemPerCopy);
 
-    static int64_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
-    int32_t const blocks = smCount;
+#ifdef ENABLE_FP4
+    if constexpr (std::is_same_v<InputType, __nv_fp4_e2m1>)
+    {
+        int32_t constexpr kSFMAlignment = 128;
+        int32_t constexpr kSFKAlignment = 4;
+        TLLM_CHECK_WITH_INFO(max_num_permuted_tokens % kSFMAlignment == 0,
+            "max_num_permuted_tokens must be divisible by %d.", kSFMAlignment);
+        TLLM_CHECK_WITH_INFO(interm_size % (kSFVecSize * kSFKAlignment) == 0, "interm_size must be divisible by %d.",
+            kSFVecSize * kSFKAlignment);
+        TLLM_CHECK_WITH_INFO(global_sf != nullptr, "global_sf is required for NVFP4.");
+        TLLM_CHECK_WITH_INFO(output_sf != nullptr, "output_sf is required for NVFP4.");
+    }
+#endif
+
+    static int32_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
+    int32_t const blocks = std::min(smCount, max_num_permuted_tokens);
     int32_t const threads = kThreadsPerBlock;
 
     auto kernel_array
@@ -394,12 +420,15 @@ void moeActivation(InputType const* input, OutputType* output, float const* glob
     template void moeActivation<InputType, OutputType, SFType>(InputType const* input, OutputType* output,             \
         float const* global_sf, SFType* output_sf, int32_t const* tile_idx_to_mn_limit,                                \
         int32_t const* num_non_exiting_tiles, cutlass_kernels::ActivationParams activation_params,                     \
-        int32_t const interm_size, int32_t const tile_size, cudaStream_t stream)
+        int32_t const max_num_permuted_tokens, int32_t const interm_size, int32_t const tile_size,                     \
+        cudaStream_t stream)
 
 INSTANTIATE_MOE_ACTIVATION(half, half, uint8_t);
-INSTANTIATE_MOE_ACTIVATION(half, __nv_fp4_e2m1, uint8_t);
 #ifdef ENABLE_BF16
 INSTANTIATE_MOE_ACTIVATION(__nv_bfloat16, __nv_bfloat16, uint8_t);
+#endif
+#ifdef ENABLE_FP4
+INSTANTIATE_MOE_ACTIVATION(half, __nv_fp4_e2m1, uint8_t);
 INSTANTIATE_MOE_ACTIVATION(__nv_bfloat16, __nv_fp4_e2m1, uint8_t);
 #endif
 #undef INSTANTIATE_MOE_ACTIVATION
