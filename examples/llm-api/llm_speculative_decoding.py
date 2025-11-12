@@ -26,7 +26,6 @@ def run_MTP(model: Optional[str] = None):
         model=model or "nvidia/DeepSeek-R1-FP4",
         speculative_config=spec_config,
     )
-
     for prompt in prompts:
         response = llm.generate(prompt, SamplingParams(max_tokens=10))
         print(response.outputs[0].text)
