@@ -342,31 +342,12 @@ class ExecutorRequestQueue:
             self, activate_requests: List[LlmRequest],
             num_active_requests_on_engine: int) -> List[LlmRequest]:
 
-        if self.is_sm_disagg:
-            return self._fetch_new_requests_sm_disagg(
-                len(activate_requests), num_active_requests_on_engine)
-        elif self.enable_attention_dp:
+        if self.enable_attention_dp:
             return self._fetch_new_requests_attention_dp(activate_requests)
         else:
-            return self._fetch_new_requests_attention_tp(len(activate_requests))
-
-    def _fetch_new_requests_sm_disagg(
-            self, num_active_requests: int,
-            num_active_requests_on_engine: int) -> List[LlmRequest]:
-        """Handle SM-level disaggregation request fetching."""
-        total_max_num_active_requests = (self.max_num_active_requests +
-                                         num_active_requests -
-                                         num_active_requests_on_engine)
-
-        # fetch and process requests into waiting queue
-        new_requests = self._fetch_and_process_requests(
-            num_active_requests_on_engine,
-            total_max_num_active_requests,
-            enable_attention_dp=False)
-
-        # Merge requests and add to active list
-        merged_requests = self._merge_requests(new_requests)
-        return merged_requests
+            num_active_requests = num_active_requests_on_engine if self.is_sm_disagg else len(
+                activate_requests)
+            return self._fetch_new_requests_attention_tp(num_active_requests)
 
     def _fetch_new_requests_attention_tp(
             self, num_active_requests: int) -> List[LlmRequest]:

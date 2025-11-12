@@ -29,7 +29,7 @@ from .config_utils import is_mla, is_nemotron_hybrid, is_qwen3_next
 from .guided_decoder import GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
-from .llm_request import ExecutorResponse
+from .llm_request import ExecutorResponse, LlmRequestState
 from .mamba_cache_manager import MambaHybridCacheManager
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
@@ -38,7 +38,7 @@ from .resource_manager import (KVCacheManager, PeftCacheManager,
 from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
                       TRTLLMSampler)
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
-                        SimpleScheduler, SmDisaggCtxScheduler)
+                        SimpleScheduler)
 from .seq_slot_manager import SeqSlotManager
 
 GB = 1 << 30
@@ -801,8 +801,10 @@ def create_py_executor_instance(
             two_step_lookahead=mapping.has_pp())
         mb_scheduler = BindMicroBatchScheduler(
             sm_disagg_config.context_max_batch_size,
-            sm_disagg_config.context_max_num_tokens, ctx_chunk_config)
-        ctx_scheduler = SmDisaggCtxScheduler(capacity_scheduler, mb_scheduler)
+            sm_disagg_config.context_max_num_tokens,
+            ctx_chunk_config,
+            no_schedule_after_state=LlmRequestState.GENERATION_IN_PROGRESS)
+        ctx_scheduler = SimpleScheduler(capacity_scheduler, mb_scheduler)
     else:
         ctx_scheduler = None
 

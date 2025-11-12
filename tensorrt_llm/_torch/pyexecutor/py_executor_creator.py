@@ -374,6 +374,7 @@ def create_py_executor(
                 attn_runtime_features=attn_runtime_features,
                 dist=dist,
                 spec_config=spec_config,
+                is_sm_disagg_ctx_phase=True,
                 weight_sharing_model=model_engine.model,
             )
     else:

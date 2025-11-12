@@ -7,7 +7,7 @@ from strenum import StrEnum
 from tensorrt_llm.bindings import internal as tb_internal
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 
-from .llm_request import LlmRequest, LlmRequestState, get_context_requests
+from .llm_request import LlmRequest, LlmRequestState
 
 RequestList = list[LlmRequest]
 
@@ -79,6 +79,9 @@ class BindCapacityScheduler(CapacityScheduler):
         scheduler_policy: CapacitySchedulerPolicy = CapacitySchedulerPolicy.
         GUARANTEED_NO_EVICT,
         two_step_lookahead: bool = False,
+        no_schedule_until_state: LlmRequestState = LlmRequestState.CONTEXT_INIT,
+        no_schedule_after_state: LlmRequestState = LlmRequestState.
+        GENERATION_COMPLETE,
     ):
         super(BindCapacityScheduler, self).__init__()
         self.kv_cache_manager = kv_cache_manager
@@ -89,8 +92,8 @@ class BindCapacityScheduler(CapacityScheduler):
             capacity_scheduler_policy=scheduler_policy._to_pybind(),
             has_kv_cache_manager=kv_cache_manager is not None,
             two_step_lookahead=two_step_lookahead,
-            no_schedule_until_state=LlmRequestState.CONTEXT_INIT,
-            no_schedule_after_state=LlmRequestState.GENERATION_COMPLETE)
+            no_schedule_until_state=no_schedule_until_state,
+            no_schedule_after_state=no_schedule_after_state)
 
     def schedule_request(
         self, active_requests: RequestList
@@ -175,6 +178,9 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
         max_batch_size: int,
         max_num_tokens: int = None,
         ctx_chunk_config: Optional[Tuple[StrEnum, int]] = None,
+        no_schedule_until_state: LlmRequestState = LlmRequestState.CONTEXT_INIT,
+        no_schedule_after_state: LlmRequestState = LlmRequestState.
+        GENERATION_COMPLETE,
     ) -> None:
         super(BindMicroBatchScheduler, self).__init__()
         self.max_batch_size = max_batch_size
@@ -186,7 +192,8 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
                 ctx_chunk_config[0]._to_pybind(), ctx_chunk_config[1])
 
         self.impl = tb_internal.algorithms.MicroBatchScheduler(
-            ctx_chunk_config_cpp, max_num_tokens)
+            ctx_chunk_config_cpp, max_num_tokens, no_schedule_until_state,
+            no_schedule_after_state)
 
     def schedule(
         self, active_requests: RequestList, inflight_request_ids: set[int]
@@ -207,31 +214,6 @@ class SimpleScheduler(RequestScheduler):
                          inflight_request_ids: set[int]) -> SchedulerOutput:
         fitting_requests, fitting_disagg_gen_init_requests, paused_requests = self.capacity_scheduler.schedule_request(
             active_requests)
-
-        context_requests, generation_requests = self.micro_batch_scheduler.schedule(
-            fitting_requests, inflight_request_ids)
-        # Convert from binding type RequestVector to list[LlmRequest],
-        # so Python fields on LlmRequest won't be stripped away
-        return SchedulerOutput(list(context_requests),
-                               list(generation_requests), list(paused_requests),
-                               list(fitting_disagg_gen_init_requests),
-                               len(fitting_requests))
-
-
-class SmDisaggCtxScheduler(RequestScheduler):
-
-    def __init__(self, capacity_scheduler: CapacityScheduler,
-                 micro_batch_scheduler: MicroBatchScheduler):
-        super(SmDisaggCtxScheduler, self).__init__()
-        self.capacity_scheduler = capacity_scheduler
-        self.micro_batch_scheduler = micro_batch_scheduler
-
-    def schedule_request(self, active_requests: RequestList,
-                         inflight_request_ids: set[int]) -> SchedulerOutput:
-        fitting_requests, fitting_disagg_gen_init_requests, paused_requests = self.capacity_scheduler.schedule_request(
-            active_requests)
-
-        fitting_requests = get_context_requests(fitting_requests)
 
         context_requests, generation_requests = self.micro_batch_scheduler.schedule(
             fitting_requests, inflight_request_ids)

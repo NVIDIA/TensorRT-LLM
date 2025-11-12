@@ -42,6 +42,7 @@ from ..speculative.drafter import Drafter
 from ..speculative.mtp import SampleStateTensorsMTP
 from ..speculative.speculation_gate import SpeculationGate
 from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
+from .green_ctx import green_ctx_split_percent
 from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
@@ -215,9 +216,10 @@ class PyExecutor:
         self.responses = {}
         self.result_wait_queues = {}
 
-        self.sm_disagg_lock = threading.Lock()
-        self.ctx_request_cv = threading.Condition(self.sm_disagg_lock)
-        self.gen_request_cv = threading.Condition(self.sm_disagg_lock)
+        if self.ctx_model_engine is not None:
+            self.sm_disagg_lock = threading.Lock()
+            self.ctx_request_cv = threading.Condition(self.sm_disagg_lock)
+            self.gen_request_cv = threading.Condition(self.sm_disagg_lock)
 
         # kv cache events
         self.kv_cache_manager = self.resource_manager.resource_managers.get(
@@ -229,6 +231,9 @@ class PyExecutor:
         self.max_input_len = max_input_len
         # _executor_loop private data
         self.max_num_active_requests = model_engine.get_max_num_sequences()
+        if self.ctx_model_engine is not None:
+            self.max_num_active_requests += ctx_model_engine.get_max_num_sequences(
+            )
         self.active_requests: List[LlmRequest] = []
         self.expected_num_active_requests = 0
         self.ctx_in_transmission_requests = dict()
@@ -1694,7 +1699,11 @@ class PyExecutor:
                         iter_stats=iter_stats)
 
     def _executor_loop_sm_disagg(self):
-        stream_ctx, stream_gen = self.split_device_green_ctx()
+        (stream_ctx, stream_gen), (res_ctx, res_gen) = green_ctx_split_percent(
+            self.sm_disagg_ctx_sm_percent, self.device_id)
+        logger.info(
+            f"Green contexts allocated {res_ctx.sm.smCount} SMs for context phase and {res_gen.sm.smCount} SMs for generation phase."
+        )
 
         thread_ctx = threading.Thread(target=self._executor_loop_sm_disagg_ctx,
                                       args=(stream_ctx, ),
@@ -1704,42 +1713,6 @@ class PyExecutor:
         self._executor_loop_sm_disagg_gen_overlap(stream_gen)
 
         thread_ctx.join()
-
-    def split_device_green_ctx(self):
-        device = torch.device("cuda", self.device_id)
-        device_properties = torch.cuda.get_device_properties(device)
-        sm_count = device_properties.multi_processor_count
-        if device_properties.major >= 9:
-            sm_min = 8
-            sm_align = 8
-        else:
-            sm_min = 4 if device_properties.major == 8 else 2
-            sm_align = 2
-
-        from flashinfer import green_ctx
-
-        def split_device_green_ctx_aligned(sm_s1):
-            sm_s1 = round(sm_s1 / sm_align) * sm_align
-            sm_s1 = min(max(sm_s1, sm_min), sm_count - sm_min)
-            return green_ctx.split_device_green_ctx_by_sm_count(device, [sm_s1])
-
-        sm_ctx = round(sm_count * self.sm_disagg_ctx_sm_percent)
-        sm_gen = sm_count - sm_ctx
-        # Choose the split closer to user-specified percentage when sm_count is not divisible by sm_align
-        sm_ctx_dist = min(sm_ctx % sm_align, sm_align - (sm_ctx % sm_align))
-        sm_gen_dist = min(sm_gen % sm_align, sm_align - (sm_gen % sm_align))
-        if sm_gen_dist < sm_ctx_dist:
-            (stream_gen,
-             stream_ctx), (res_gen,
-                           res_ctx) = split_device_green_ctx_aligned(sm_gen)
-        else:
-            (stream_ctx,
-             stream_gen), (res_ctx,
-                           res_gen) = split_device_green_ctx_aligned(sm_ctx)
-        logger.info(
-            f"Green contexts allocated {res_ctx.sm.smCount} SMs for context phase and {res_gen.sm.smCount} SMs for generation phase."
-        )
-        return stream_ctx, stream_gen
 
     def _accept_draft_tokens(
         self, scheduled_batch: ScheduledRequests,
