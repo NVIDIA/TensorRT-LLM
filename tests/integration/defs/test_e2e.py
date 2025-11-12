@@ -1675,7 +1675,7 @@ def test_openai_lora(llm_root, llm_venv):
 
 
 def test_openai_chat_multimodal_example(llm_root, llm_venv):
-    time.sleep(310)
+    time.sleep(610)
     pytest.fail("Emma test")
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd(
