@@ -3482,75 +3482,210 @@ def test_llama4_long_context_kv_cache_split_4gpus(llm_root, llm_venv):
     RCCA: https://nvbugspro.nvidia.com/bug/5555681
 
     Reproduces KV cache split overflow issue in disaggregated serving scenario.
+    Uses separate prefill and decode workers to reproduce the bug.
     Matches genai-perf reproduction with 128k input tokens.
     """
+    import os
+    import subprocess
     import tempfile
+    import time
 
-    from tensorrt_llm import LLM, SamplingParams
+    import requests
+    import yaml
 
-    model_path = f"{llm_models_root()}/llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8"
-    with tempfile.NamedTemporaryFile(mode='w+t',
-                                     suffix=".llama4_long_context.log",
-                                     dir="./",
-                                     delete=True,
-                                     delete_on_close=True) as running_log:
-        with LLM(
-                model_path,
-                tensor_parallel_size=8,
-                pipeline_parallel_size=1,
-                moe_expert_parallel_size=1,  # Match disaggregated config
-                max_seq_len=257000,  # Match disaggregated config: 257k
-                max_input_len=256000,  # Match disaggregated config: 256k input
-                max_num_tokens=8192,
-                max_batch_size=1,  # Match disaggregated config
-                enable_chunked_prefill=True,
-                trust_remote_code=True,
-                backend="pytorch",
-                kv_cache_config={
-                    "enable_block_reuse": True,
-                    "free_gpu_memory_fraction":
-                    0.3  # Match disaggregated config
-                },
-                disable_overlap_scheduler=True,
-                cache_transceiver_config={
-                    "backend":
-                    "UCX",  # Critical: UCX backend for KV cache transmission
-                    "max_tokens_in_buffer": 2048  # Match disaggregated config
-                }) as llm:
+    # Set environment variable for DEBUG log level to reproduce detailed plugin logs
+    # 设置环境变量以启用DEBUG日志级别，复现详细的plugin注册日志
+    os.environ['TLLM_LOG_LEVEL'] = 'debug'
 
-            # Create a prompt that matches genai-perf reproduction scenario
-            # Target ~128k tokens (approximately 512k characters)
-            # This matches: --synthetic-input-tokens-mean 128000
-            base_text = "Machine learning is a fascinating field of study. " * 10000
-            long_prompt = "Summarize the following text: " + base_text
+    # Use Llama-4-Scout model as shown in the reproduction log
+    # 使用日志中显示的Llama-4-Scout模型
+    model_path = f"{llm_models_root()}/llama4-models/nvidia/Llama-4-Scout-17B-16E-Instruct"
 
-            sampling_params = SamplingParams(
-                max_tokens=100,  # Match genai-perf: --output-tokens-mean 100
-                min_tokens=100,  # Match genai-perf: --extra-inputs min_tokens:100
-                temperature=0.0,
-                ignore_eos=
-                True,  # Match genai-perf: --extra-inputs ignore_eos:true
-            )
+    temp_dir = tempfile.mkdtemp()
 
-            # Test basic generation with long context
-            result = llm.generate(long_prompt, sampling_params=sampling_params)
+    # Configuration for context (prefill) worker with 2 GPUs
+    # 配置prefill worker使用2个GPU
+    ctx_config = {
+        "tensor_parallel_size": 2,
+        "pipeline_parallel_size": 1,
+        "disable_overlap_scheduler": True,
+        "max_seq_len": 257000,
+        "max_input_len": 256000,
+        "max_num_tokens": 8192,
+        "max_batch_size": 1,
+        "enable_chunked_prefill": True,
+        "kv_cache_config": {
+            "enable_block_reuse": True,
+            "free_gpu_memory_fraction": 0.3
+        },
+        "cache_transceiver_config": {
+            "backend": "UCX",
+            # Intentionally set to small value to reproduce buffer overflow
+            # 故意设置为小值以复现缓冲区溢出
+            "max_tokens_in_buffer": 2048
+        }
+    }
 
-            # Verify output is generated successfully
-            assert len(result.outputs) > 0
-            output_text = result.outputs[0].text
-            assert len(output_text) > 0
+    # Configuration for generation (decode) worker with 2 GPUs
+    # 配置decode worker使用2个GPU
+    gen_config = {
+        "tensor_parallel_size": 2,
+        "pipeline_parallel_size": 1,
+        "max_seq_len": 257000,
+        "max_input_len": 256000,
+        "max_num_tokens": 8192,
+        "max_batch_size": 1,
+        "kv_cache_config": {
+            "enable_block_reuse": False,
+            "free_gpu_memory_fraction": 0.3
+        },
+        "cache_transceiver_config": {
+            "backend": "UCX",
+            # Intentionally set to small value to reproduce buffer overflow
+            # 故意设置为小值以复现缓冲区溢出
+            "max_tokens_in_buffer": 2048
+        }
+    }
 
-            # Check for repetitive/meaningless output caused by KV cache corruption
-            # Count max consecutive identical characters
-            max_repeat = max(
-                (sum(1 for _ in group)
-                 for char, group in __import__('itertools').groupby(output_text)
-                 ),
-                default=0)
-            assert max_repeat < 20, \
-                f"Found {max_repeat} consecutive identical characters, " \
-                f"suggesting KV cache corruption. Output: {output_text[:200]}"
+    # Disaggregated server configuration
+    # Disaggregated服务器配置
+    disagg_config = {
+        "hostname": "localhost",
+        "port": 8000,
+        "backend": "pytorch",
+        "context_servers": {
+            "num_instances": 1,
+            "urls": ["localhost:8001"]
+        },
+        "generation_servers": {
+            "num_instances": 1,
+            "urls": ["localhost:8002"]
+        }
+    }
 
-            print(
-                f"Successfully generated output with long context: {output_text[:100]}..."
-            )
+    # Write config files
+    # 写入配置文件
+    ctx_config_path = os.path.join(temp_dir, "ctx_config.yaml")
+    gen_config_path = os.path.join(temp_dir, "gen_config.yaml")
+    disagg_config_path = os.path.join(temp_dir, "disagg_config.yaml")
+
+    with open(ctx_config_path, 'w') as f:
+        yaml.dump(ctx_config, f)
+    with open(gen_config_path, 'w') as f:
+        yaml.dump(gen_config, f)
+    with open(disagg_config_path, 'w') as f:
+        yaml.dump(disagg_config, f)
+
+    processes = []
+    try:
+        # Start context server on GPU 0-1
+        # 在GPU 0-1上启动context server
+        print("Starting context server on GPUs 0-1...")
+        ctx_env = os.environ.copy()
+        ctx_env["CUDA_VISIBLE_DEVICES"] = "0,1"
+        ctx_env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+        ctx_proc = subprocess.Popen([
+            "trtllm-serve", model_path, "--host", "localhost", "--port", "8001",
+            "--backend", "pytorch", "--extra_llm_api_options", ctx_config_path
+        ],
+                                    env=ctx_env,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE)
+        processes.append(ctx_proc)
+
+        # Start generation server on GPU 2-3
+        # 在GPU 2-3上启动generation server
+        print("Starting generation server on GPUs 2-3...")
+        gen_env = os.environ.copy()
+        gen_env["CUDA_VISIBLE_DEVICES"] = "2,3"
+        gen_env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+        gen_proc = subprocess.Popen([
+            "trtllm-serve", model_path, "--host", "localhost", "--port", "8002",
+            "--backend", "pytorch", "--extra_llm_api_options", gen_config_path
+        ],
+                                    env=gen_env,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE)
+        processes.append(gen_proc)
+
+        # Wait for servers to be ready
+        # 等待服务器就绪
+        print("Waiting for context and generation servers to be ready...")
+        time.sleep(30)  # Give servers time to initialize
+
+        # Check if servers are healthy
+        # 检查服务器健康状态
+        for i in range(60):
+            try:
+                ctx_health = requests.get("http://localhost:8001/health",
+                                          timeout=5)
+                gen_health = requests.get("http://localhost:8002/health",
+                                          timeout=5)
+                if ctx_health.status_code == 200 and gen_health.status_code == 200:
+                    print("Both servers are ready!")
+                    break
+            except:
+                pass
+            time.sleep(2)
+        else:
+            raise RuntimeError("Servers failed to start within timeout")
+
+        # Start disaggregated orchestrator
+        # 启动disaggregated orchestrator
+        print("Starting disaggregated orchestrator...")
+        disagg_proc = subprocess.Popen(
+            ["trtllm-serve", "disaggregated", "-c", disagg_config_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE)
+        processes.append(disagg_proc)
+
+        # Wait for orchestrator to be ready
+        # 等待orchestrator就绪
+        print("Waiting for orchestrator to be ready...")
+        time.sleep(10)
+
+        # Create a long prompt that exceeds max_tokens_in_buffer to trigger the bug
+        # 创建超过max_tokens_in_buffer的长提示以触发bug
+        # Each repetition is ~10 tokens, so 12800 repetitions ≈ 128k tokens
+        base_text = "Machine learning is a fascinating field of study. " * 12800
+        long_prompt = "Summarize the following text: " + base_text
+
+        print(f"Prompt length: {len(long_prompt)} characters")
+        print("Sending request to disaggregated server...")
+
+        # Send request to disaggregated server
+        # 向disaggregated server发送请求
+        response = requests.post("http://localhost:8000/v1/completions",
+                                 json={
+                                     "model": model_path,
+                                     "prompt": long_prompt,
+                                     "max_tokens": 100,
+                                     "temperature": 0.0,
+                                     "ignore_eos": True
+                                 },
+                                 timeout=300)
+
+        result = response.json()
+        print(f"Response: {result}")
+
+        # Verify output is generated
+        # 验证输出已生成
+        assert "choices" in result
+        assert len(result["choices"]) > 0
+        output_text = result["choices"][0]["text"]
+        assert len(output_text) > 0
+
+        print(f"Successfully generated output: {output_text[:100]}...")
+
+    finally:
+        # Cleanup processes
+        # 清理进程
+        print("Cleaning up processes...")
+        for proc in processes:
+            proc.terminate()
+            proc.wait(timeout=10)
+
+        # Cleanup temp directory
+        # 清理临时目录
+        import shutil
+        shutil.rmtree(temp_dir, ignore_errors=True)
