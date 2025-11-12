@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/cuteDslKernels/moeUtils.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
+#include "tensorrt_llm/kernels/quantization.h"
 
 #include <cuda_fp4.h>
 #include <cute/numeric/numeric_types.hpp>
@@ -270,11 +271,12 @@ INSTANTIATE_MOE_UNPERMUTE(__nv_bfloat16, __nv_bfloat16);
 
 template <typename InputType, typename OutputType, typename SFType, int32_t kSFVecSize, typename ActFn,
     int32_t kThreadsPerBlock>
-__global__ void moeActivationKernel(InputType const* input, OutputType* output, SFType const* output_sf,
-    int32_t const* tile_idx_to_mn_limit, int32_t const* num_non_exiting_tiles, int32_t const interm_size,
-    int32_t const tile_size)
+__global__ void moeActivationKernel(InputType const* input, OutputType* output, float const* global_sf,
+    SFType* output_sf, int32_t const* tile_idx_to_mn_limit, int32_t const* num_non_exiting_tiles,
+    int32_t const interm_size, int32_t const tile_size)
 {
     using ComputeType = float;
+    using ElemOutputCopyType = std::conditional_t<std::is_same_v<OutputType, __nv_fp4_e2m1>, uint32_t, ElemCopyType>;
     int32_t constexpr kElemPerCopy = elemPerCopy<InputType>();
     // Need int64_t to prevent overflow when computing pointer offsets.
     int64_t const kCopyPerToken = interm_size / kElemPerCopy;
@@ -286,6 +288,8 @@ __global__ void moeActivationKernel(InputType const* input, OutputType* output, 
     asm volatile("griddepcontrol.wait;");
 #endif
 
+    float global_sf_val = global_sf == nullptr ? 1.0f : global_sf[0];
+
     int32_t const num_tokens = num_non_exiting_tiles[0] * tile_size;
     for (int32_t permuted_idx = blockIdx.x; permuted_idx < num_tokens; permuted_idx += gridDim.x)
     {
@@ -296,7 +300,7 @@ __global__ void moeActivationKernel(InputType const* input, OutputType* output, 
         }
         auto const* src_ptr
             = reinterpret_cast<ElemCopyType const*>(input) + permuted_idx * kCopyPerToken * (ActFn::IS_GLU ? 2 : 1);
-        auto* dst_ptr = reinterpret_cast<ElemCopyType*>(output) + permuted_idx * kCopyPerToken;
+        auto* dst_ptr = reinterpret_cast<ElemOutputCopyType*>(output) + permuted_idx * kCopyPerToken;
         for (int32_t i = threadIdx.x; i < kCopyPerToken; i += kThreadsPerBlock)
         {
             *reinterpret_cast<ElemCopyType*>(rmem) = src_ptr[i];
@@ -318,7 +322,19 @@ __global__ void moeActivationKernel(InputType const* input, OutputType* output, 
                     rmem[j] = static_cast<InputType>(act(static_cast<ComputeType>(rmem[j])));
                 }
             }
-            dst_ptr[i] = *reinterpret_cast<ElemCopyType*>(rmem);
+
+            if constexpr (std::is_same_v<OutputType, __nv_fp4_e2m1>)
+            {
+                auto* sf_dst_ptr = cvt_quant_get_sf_out_offset<SFType, kSFVecSize / kElemPerCopy>(
+                    /* batchIdx= */ std::nullopt, permuted_idx, i, /*numRows=*/std::nullopt, interm_size / kSFVecSize,
+                    output_sf, QuantizationSFLayout::SWIZZLED);
+                dst_ptr[i] = cvt_warp_fp16_to_fp4<InputType, kSFVecSize, false>(
+                    *reinterpret_cast<PackedVec<InputType>*>(rmem), global_sf_val, sf_dst_ptr);
+            }
+            else
+            {
+                dst_ptr[i] = *reinterpret_cast<ElemCopyType*>(rmem);
+            }
         }
     }
 
@@ -328,7 +344,7 @@ __global__ void moeActivationKernel(InputType const* input, OutputType* output, 
 }
 
 template <typename InputType, typename OutputType, typename SFType>
-void moeActivation(InputType const* input, OutputType* output, SFType const* output_sf,
+void moeActivation(InputType const* input, OutputType* output, float const* global_sf, SFType* output_sf,
     int32_t const* tile_idx_to_mn_limit, int32_t const* num_non_exiting_tiles,
     cutlass_kernels::ActivationParams activation_params, int32_t const interm_size, int32_t const tile_size,
     cudaStream_t stream)
@@ -370,19 +386,21 @@ void moeActivation(InputType const* input, OutputType* output, SFType const* out
     attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
     config.numAttrs = 1;
     config.attrs = attrs;
-    cudaLaunchKernelEx(
-        &config, kernel, input, output, output_sf, tile_idx_to_mn_limit, num_non_exiting_tiles, interm_size, tile_size);
+    cudaLaunchKernelEx(&config, kernel, input, output, global_sf, output_sf, tile_idx_to_mn_limit,
+        num_non_exiting_tiles, interm_size, tile_size);
 }
 
 #define INSTANTIATE_MOE_ACTIVATION(InputType, OutputType, SFType)                                                      \
     template void moeActivation<InputType, OutputType, SFType>(InputType const* input, OutputType* output,             \
-        SFType const* output_sf, int32_t const* tile_idx_to_mn_limit, int32_t const* num_non_exiting_tiles,            \
-        cutlass_kernels::ActivationParams activation_params, int32_t const interm_size, int32_t const tile_size,       \
-        cudaStream_t stream)
+        float const* global_sf, SFType* output_sf, int32_t const* tile_idx_to_mn_limit,                                \
+        int32_t const* num_non_exiting_tiles, cutlass_kernels::ActivationParams activation_params,                     \
+        int32_t const interm_size, int32_t const tile_size, cudaStream_t stream)
 
 INSTANTIATE_MOE_ACTIVATION(half, half, uint8_t);
+INSTANTIATE_MOE_ACTIVATION(half, __nv_fp4_e2m1, uint8_t);
 #ifdef ENABLE_BF16
 INSTANTIATE_MOE_ACTIVATION(__nv_bfloat16, __nv_bfloat16, uint8_t);
+INSTANTIATE_MOE_ACTIVATION(__nv_bfloat16, __nv_fp4_e2m1, uint8_t);
 #endif
 #undef INSTANTIATE_MOE_ACTIVATION
 

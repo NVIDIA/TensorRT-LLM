@@ -404,10 +404,13 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             tile_size=tile_size,
             output_dtype=output_dtype,
         )
-        x = swiglu_fused_moe(x)
-        x, x_sf = torch.ops.trtllm.fp4_quantize(x, self.fc2_input_scale,
-                                                self.scaling_vector_size, False,
-                                                True)
+        x, x_sf = torch.ops.trtllm.moe_swiglu_nvfp4_quantize(
+            input=x,
+            global_sf=self.fc2_input_scale,
+            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+            num_non_exiting_tiles=num_non_exiting_tiles,
+            tile_tokens_dim=tile_size,
+        )
         x = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_blackwell(
             input=x.view(torch.float4_e2m1fn_x2),
             weight=self.w2_weight.view(torch.float4_e2m1fn_x2),

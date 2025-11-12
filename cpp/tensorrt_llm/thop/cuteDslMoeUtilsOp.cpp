@@ -282,7 +282,7 @@ torch::Tensor moe_swiglu(torch::Tensor const& input, torch::Tensor const& tile_i
 
 #define DISPATCH_MOE_ACTIVATION(InputType, OutputType, SFType)                                                         \
     tensorrt_llm::kernels::cute_dsl::moeActivation<InputType, OutputType, SFType>(                                     \
-        static_cast<InputType*>(input.data_ptr()), static_cast<OutputType*>(output.data_ptr()), nullptr,               \
+        static_cast<InputType*>(input.data_ptr()), static_cast<OutputType*>(output.data_ptr()), nullptr, nullptr,      \
         tile_idx_to_mn_limit.data_ptr<int32_t>(), num_non_exiting_tiles.data_ptr<int32_t>(), activation_params,        \
         interm_size, tile_tokens_dim, stream)
 
@@ -304,6 +304,61 @@ torch::Tensor moe_swiglu(torch::Tensor const& input, torch::Tensor const& tile_i
     return output;
 }
 
+std::tuple<torch::Tensor, torch::Tensor> moe_swiglu_nvfp4_quantize(torch::Tensor const& input,
+    torch::Tensor const& global_sf, torch::Tensor const& tile_idx_to_mn_limit,
+    torch::Tensor const& num_non_exiting_tiles, int64_t const tile_tokens_dim)
+{
+    TORCH_CHECK(input.dim() == 2, "input must be 2D.");
+    TORCH_CHECK(input.size(1) % 2 == 0, "input.size(1) must be even.");
+    int64_t const num_permuted_tokens = input.size(0);
+    int64_t const interm_size = input.size(1) / 2;
+
+    TORCH_CHECK(tile_idx_to_mn_limit.dim() == 1, "tile_idx_to_mn_limit must be 1D.");
+    TORCH_CHECK(tile_idx_to_mn_limit.scalar_type() == torch::kInt32, "tile_idx_to_mn_limit must be int32.");
+    int64_t const num_tiles = tile_idx_to_mn_limit.size(0);
+    TORCH_CHECK(num_permuted_tokens == tile_tokens_dim * num_tiles,
+        "num_permuted_tokens must be equal to tile_tokens_dim * num_tiles.");
+
+    TORCH_CHECK(num_non_exiting_tiles.dim() == 1, "num_non_exiting_tiles must be 1D.");
+    TORCH_CHECK(num_non_exiting_tiles.size(0) == 1, "num_non_exiting_tiles must have 1 element.");
+    TORCH_CHECK(num_non_exiting_tiles.scalar_type() == torch::kInt32, "num_non_exiting_tiles must be int32.");
+
+    auto output = torch::empty(
+        {num_permuted_tokens, interm_size / 2}, torch::dtype(torch::kFloat4_e2m1fn_x2).device(torch::kCUDA));
+    int64_t constexpr kSFVecSize = 16;
+    auto output_sf = torch::empty(
+        {num_permuted_tokens * interm_size / kSFVecSize}, torch::dtype(torch::kUInt8).device(torch::kCUDA));
+
+    tensorrt_llm::kernels::cutlass_kernels::ActivationParams activation_params{
+        tensorrt_llm::kernels::cutlass_kernels::ActivationType::Swiglu};
+
+    auto const& stream = at::cuda::getCurrentCUDAStream(input.get_device());
+
+#define DISPATCH_MOE_ACTIVATION(InputType, OutputType, SFType)                                                         \
+    tensorrt_llm::kernels::cute_dsl::moeActivation<InputType, OutputType, SFType>(                                     \
+        static_cast<InputType*>(input.data_ptr()), static_cast<OutputType*>(output.data_ptr()),                        \
+        global_sf.data_ptr<float>(), static_cast<SFType*>(output_sf.data_ptr()),                                       \
+        tile_idx_to_mn_limit.data_ptr<int32_t>(), num_non_exiting_tiles.data_ptr<int32_t>(), activation_params,        \
+        interm_size, tile_tokens_dim, stream)
+
+    if (input.scalar_type() == torch::kHalf)
+    {
+        DISPATCH_MOE_ACTIVATION(half, __nv_fp4_e2m1, uint8_t);
+    }
+    else if (input.scalar_type() == torch::kBFloat16)
+    {
+        DISPATCH_MOE_ACTIVATION(__nv_bfloat16, __nv_fp4_e2m1, uint8_t);
+    }
+    else
+    {
+        TORCH_CHECK(false, "Unsupported input dtype: ", input.scalar_type());
+    }
+
+#undef DISPATCH_MOE_ACTIVATION
+
+    return {output, output_sf};
+}
+
 } // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -322,6 +377,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "moe_swiglu(Tensor input, Tensor tile_idx_to_mn_limit, Tensor num_non_exiting_tiles, "
         "int tile_tokens_dim) -> Tensor");
+    m.def(
+        "moe_swiglu_nvfp4_quantize(Tensor input, Tensor global_sf, Tensor tile_idx_to_mn_limit, Tensor "
+        "num_non_exiting_tiles, int tile_tokens_dim) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
@@ -331,4 +389,5 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
     m.impl("moe_permute", &torch_ext::moe_permute);
     m.impl("moe_unpermute", &torch_ext::moe_unpermute);
     m.impl("moe_swiglu", &torch_ext::moe_swiglu);
+    m.impl("moe_swiglu_nvfp4_quantize", &torch_ext::moe_swiglu_nvfp4_quantize);
 }
