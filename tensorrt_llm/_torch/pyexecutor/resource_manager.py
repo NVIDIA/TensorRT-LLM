@@ -718,7 +718,7 @@ class KVCacheManager(BaseResourceManager):
             if kv_cache_config.free_gpu_memory_fraction is not None:
                 max_tokens = min(kv_cache_config.max_tokens, max_tokens)
                 logger.warning(
-                    f'Both free_gpu_memory_fraction and max_tokens are set (to {free_mem_fraction} and {max_tokens} with free memory {free_mem / (1 << 32)} of total memory {total_mem / (1<<32)}, respectively). The smaller value will be used.'
+                    f'Both free_gpu_memory_fraction and max_tokens are set (to {free_mem_fraction} and {max_tokens} with free memory {free_mem / (1 << 30)}GiB of total memory {total_mem / (1<<30)}GiB, respectively). The smaller value will be used.'
                 )
             else:
                 max_tokens = kv_cache_config.max_tokens
@@ -1317,18 +1317,20 @@ class BlockManager:
 
 class ResourceManager:
 
-    def __init__(self, resource_managers: dict[str, BaseResourceManager]):
+    def __init__(self, resource_managers: dict[ResourceManagerType,
+                                               BaseResourceManager]):
         self.resource_managers = OrderedDict(resource_managers)
 
-    def __call__(self, name: str):
-        return self.resource_managers[name]
+    def __call__(self, type: ResourceManagerType):
+        return self.resource_managers[type]
 
-    def register_resource_manager(self, name: str,
+    def register_resource_manager(self, type: ResourceManagerType,
                                   resource_manager: BaseResourceManager):
-        self.resource_managers[name] = resource_manager
+        self.resource_managers[type] = resource_manager
 
-    def get_resource_manager(self, name: str) -> BaseResourceManager:
-        return self.resource_managers.get(name)
+    def get_resource_manager(
+            self, type: ResourceManagerType) -> Optional[BaseResourceManager]:
+        return self.resource_managers.get(type)
 
     @nvtx_range("prepare_resources")
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
@@ -1339,8 +1341,8 @@ class ResourceManager:
     @nvtx_range("update_resources")
     def update_resources(self,
                          scheduled_batch: ScheduledRequests,
-                         attn_metadata: "AttentionMetadata" = None,
-                         kv_cache_dtype_byte_size: float = None):
+                         attn_metadata: Optional["AttentionMetadata"] = None,
+                         kv_cache_dtype_byte_size: Optional[float] = None):
         for _, resource_manager in self.resource_managers.items():
             if hasattr(resource_manager, "update_resources"):
                 if isinstance(resource_manager, KVCacheManager):
@@ -1355,7 +1357,8 @@ class ResourceManager:
             if hasattr(resource_manager, "free_resources"):
                 resource_manager.free_resources(request)
 
-    def reorder_pipeline(self, resource_manager_list: list[str]):
+    def reorder_pipeline(self,
+                         resource_manager_list: list[ResourceManagerType]):
         assert set(resource_manager_list) == set(self.resource_managers.keys())
         for resource_manager in resource_manager_list:
             self.resource_managers.move_to_end(resource_manager)

@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.utils._pytree as pytree
 from torch import fx
+from torch._dispatch.python import enable_python_dispatcher
 from torch._export.utils import _detect_fake_mode_from_gm
 from torch._prims_common import DeviceLikeType
 from torch._subclasses import FakeTensor, FakeTensorMode
@@ -210,7 +211,8 @@ def _run_shape_prop_single_gm(
 
     # run shape propagation if we have all the fake tensors
     if all(inp is not _NO_VAL for inp in inps):
-        FakeTensorProp(gm, fake_mode).propagate(*inps)
+        with enable_python_dispatcher():
+            FakeTensorProp(gm, fake_mode).propagate(*inps)
     else:
         ad_logger.warning("No fake tensors and no args available for shape propagation")
 

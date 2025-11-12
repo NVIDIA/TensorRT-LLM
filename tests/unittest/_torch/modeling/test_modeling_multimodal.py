@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Type
 
 import torch
-from _torch.helpers import create_mock_engine
+from _torch.helpers import create_mock_cuda_graph_runner
 from transformers import AutoProcessor, AutoTokenizer, PretrainedConfig, PreTrainedModel
 from utils.llm_data import llm_models_root
 
@@ -17,7 +17,6 @@ from tensorrt_llm._torch.attention_backend.interface import AttentionRuntimeFeat
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -425,8 +424,7 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
             trtllm_inputs["attn_metadata"].prepare()
             return self.trtllm_model.forward(**trtllm_inputs)
         else:
-            mock_engine = create_mock_engine(1)
-            graph_runner = CUDAGraphRunner(mock_engine)
+            graph_runner = create_mock_cuda_graph_runner(1)
             trtllm_inputs["attn_metadata"] = trtllm_inputs[
                 "attn_metadata"
             ].create_cuda_graph_metadata(1)
