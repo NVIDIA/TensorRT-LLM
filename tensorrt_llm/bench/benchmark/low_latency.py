@@ -15,7 +15,6 @@ from tensorrt_llm.bench.benchmark import (generate_json_report,
                                           get_general_cli_options, get_llm)
 from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
 from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
-from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy
@@ -221,7 +220,7 @@ def latency_command(
         logger.info(metadata.get_summary_for_print())
 
     # Engine configuration parsing for PyTorch backend
-    kwargs = {}
+    llm_args_max_sql = None
     if options.backend and options.backend.lower(
     ) in ALL_SUPPORTED_BACKENDS and options.backend.lower() != "tensorrt":
         if bench_env.checkpoint_path is None:
@@ -229,9 +228,9 @@ def latency_command(
 
         exec_settings = get_settings(params, metadata, bench_env.model,
                                      bench_env.checkpoint_path)
-        kwargs_max_sql = options.max_seq_len or metadata.max_sequence_length
-        logger.info(f"Setting PyTorch max sequence length to {kwargs_max_sql}")
-        kwargs["max_seq_len"] = kwargs_max_sql
+        llm_args_max_sql = options.max_seq_len or metadata.max_sequence_length
+        logger.info(
+            f"Setting PyTorch max sequence length to {llm_args_max_sql}")
     elif options.backend.lower() == "tensorrt":
         assert options.max_seq_len is None, (
             "max_seq_len is not a runtime parameter for C++ backend")
@@ -249,18 +248,16 @@ def latency_command(
             f"{options.backend} is not a known backend, check help for available options.",
             param_hint="backend")
 
-    exec_settings["model"] = options.model
+    exec_settings.model = options.model
     engine_tokens = exec_settings["settings_config"]["max_num_tokens"]
 
     # Update configuration with runtime options
-    exec_settings["settings_config"][
-        "kv_cache_percent"] = options.kv_cache_percent
-    exec_settings["settings_config"]["max_batch_size"] = 1
-    exec_settings["settings_config"]["max_num_tokens"] = engine_tokens
-    exec_settings["settings_config"]["beam_width"] = options.beam_width
-    exec_settings["settings_config"]["chunking"] = False
-    exec_settings["settings_config"][
-        "scheduler_policy"] = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
+    exec_settings.settings_config.kv_cache_percent = options.kv_cache_percent
+    exec_settings.settings_config.max_batch_size = 1
+    exec_settings.settings_config.max_num_tokens = engine_tokens
+    exec_settings.settings_config.beam_width = options.beam_width
+    exec_settings.settings_config.chunking = False
+    exec_settings.settings_config.scheduler_policy = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
 
     # Set environment variables for setting runtime options.
     # TODO: Once passing of variables is fixed, these should work
@@ -271,31 +268,27 @@ def latency_command(
     os.environ["TRTLLM_ENABLE_PDL"] = "1"
 
     # Performance options
-    exec_settings["performance_options"]["cuda_graphs"] = True
-    exec_settings["performance_options"]["multi_block_mode"] = True
+    exec_settings.performance_options.cuda_graphs = True
+    exec_settings.performance_options.multi_block_mode = True
 
-    exec_settings["extra_llm_api_options"] = params.get("extra_llm_api_options")
+    exec_settings.extra_llm_api_options = params.get("extra_llm_api_options")
 
     # Decoding Options
     if medusa_choices is not None:
         with open(medusa_choices, "r") as medusa_yml:
-            exec_settings["decoding_config"]["medusa_choices"] = \
+            exec_settings.decoding_config.medusa_choices = \
                 yaml.load(medusa_yml, Loader=yaml.SafeLoader)
 
-    # Construct the runtime configuration dataclass.
-    runtime_config = RuntimeConfig(**exec_settings)
-
     llm = None
-    # TODO this might need changes after updating get_llm_args below
-    kwargs = kwargs | runtime_config.get_llm_args()
-    kwargs['backend'] = options.backend
+    llm_args = exec_settings.get_llm_args()
+    llm_args.max_seq_len = llm_args_max_sql
 
     try:
         logger.info("Setting up latency benchmark.")
 
-        llm = get_llm(runtime_config, kwargs)
+        llm = get_llm(exec_settings, kwargs)
 
-        ignore_eos = True if runtime_config.decoding_config.decoding_mode == SpeculativeDecodingMode.NONE else False
+        ignore_eos = True if exec_settings.decoding_config.decoding_mode == SpeculativeDecodingMode.NONE else False
         eos_id = tokenizer.eos_token_id if not ignore_eos else -1
         pad_id = tokenizer.pad_token_id if not ignore_eos else -1
 

@@ -13,8 +13,11 @@ from tensorrt_llm._torch.pyexecutor.model_loader import \
 from tensorrt_llm.bench.build.build import (get_benchmark_engine_settings,
                                             get_model_config)
 from tensorrt_llm.bench.build.dataclasses import NemotronHybridConfig
+from tensorrt_llm.bench.dataclasses.configuration import (
+    ExecutorSettingsConfig, PerformanceOptions, RuntimeConfig)
 from tensorrt_llm.bench.dataclasses.general import (DatasetMetadata,
                                                     InferenceRequest)
+from tensorrt_llm.llmapi.llm_args import CudaGraphConfig, KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -23,7 +26,6 @@ _KV_CACHE_MAP = {
     QuantAlgo.NVFP4.value: "fp8",
 }
 
-# TODO
 ALL_SUPPORTED_BACKENDS = ["pytorch", "_autodeploy", "tensorrt"]
 
 
@@ -68,7 +70,7 @@ def get_settings_from_engine(
 
 
 def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
-                 model_path: Union[Path, None]) -> Dict[str, Union[str, int]]:
+                 model_path: Union[Path, None]) -> RuntimeConfig:
     """Retrieve basic runtime config for pytorch backend path
 
     Args:
@@ -76,14 +78,14 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
         model (str): Model name.
         model_path (Union[Path, None]): Path to the model.
     Returns:
-        Dict[str, Union[str, int]]: Properties for runtime config.
+        RuntimeConfig: Properties for runtime config.
     """
     extra_llm_api_options = params.get("extra_llm_api_options")
     enable_chunked_prefill = params.get("enable_chunked_prefill", False)
 
     kv_cache_dtype = "auto"
     mamba_ssm_cache_dtype = params.get("mamba_ssm_cache_dtype", "auto")
-    kv_cache_config = {}
+    # TODO: use common method to read YAML
     if extra_llm_api_options:
         with open(extra_llm_api_options, 'r') as f:
             llm_args_dict = yaml.safe_load(f)
@@ -156,13 +158,16 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
             # Expecting this to be the max of chunk block and max_num_tokens.
             pass
 
-    cuda_graph_config = {
-        "enable_padding": True,
-        "max_batch_size": max_batch_size
-    }
+    # this is used downstream by get_pytorch_perf_config. seems like they should reorganized
+    cuda_graph_config = CudaGraphConfig(
+        enable_padding=True,
+        max_batch_size=max_batch_size,
+    )
 
-    kv_cache_config["dtype"] = kv_cache_dtype
-    kv_cache_config["mamba_ssm_cache_dtype"] = mamba_ssm_cache_dtype
+    kv_cache_config = KvCacheConfig(
+        dtype=kv_cache_dtype,
+        mamba_ssm_cache_dtype=mamba_ssm_cache_dtype,
+    )
 
     pyt_options = {
         "cuda_graph_config": cuda_graph_config,
@@ -170,22 +175,21 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
     }
 
     backend = params.get("backend", "pytorch")
-    return {
-        "sw_version": version("tensorrt_llm"),
-        "model_path": model_path,
-        "settings_config": {
-            "max_batch_size": int(max_batch_size),
-            "max_num_tokens": int(max_num_tokens),
-            "chunking": enable_chunked_prefill,
-        },
-        "mapping": mapping,
-        "backend": backend,
-        "decoding_config": {},
-        "performance_options": {
-            "cuda_graphs": True,
-            "pytorch_config": pyt_options,
-        }
-    }
+    return RuntimeConfig(
+        sw_version=version("tensorrt_llm"),
+        model_path=model_path,
+        settings_config=ExecutorSettingsConfig(
+            max_batch_size=int(max_batch_size),
+            max_num_tokens=int(max_num_tokens),
+            chunking=enable_chunked_prefill,
+        ),
+        mapping=mapping,
+        backend=backend,
+        performance_options=PerformanceOptions(
+            cuda_graphs=True,
+            pytorch_config=pyt_options,
+        ),
+    )
 
 
 def generate_warmup_dataset(requests, steps) -> List[InferenceRequest]:

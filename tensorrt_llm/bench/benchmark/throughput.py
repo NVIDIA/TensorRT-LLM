@@ -22,7 +22,6 @@ from tensorrt_llm.bench.benchmark.utils.general import (
 # isort: on
 from tensorrt_llm.bench.benchmark.utils.general import (
     generate_warmup_dataset, update_sampler_args_with_extra_options)
-from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
@@ -317,9 +316,6 @@ def throughput_command(
                 f"Failed to import custom module from {custom_module_dir}: {e}")
             raise e
 
-    # Runtime kwargs and option tracking.
-    kwargs = {}
-
     # Dataset Loading and Preparation
     with open(options.dataset_path, "r") as dataset:
         metadata, requests = create_dataset_from_stream(
@@ -354,9 +350,9 @@ def throughput_command(
 
         exec_settings = get_settings(params, metadata, bench_env.model,
                                      bench_env.checkpoint_path)
-        kwargs_max_sql = options.max_seq_len or metadata.max_sequence_length
-        logger.info(f"Setting PyTorch max sequence length to {kwargs_max_sql}")
-        kwargs["max_seq_len"] = kwargs_max_sql
+        llm_args_max_sql = options.max_seq_len or metadata.max_sequence_length
+        logger.info(
+            f"Setting PyTorch max sequence length to {llm_args_max_sql}")
     elif options.backend.lower() == "tensorrt":
         assert options.max_seq_len is None, (
             "max_seq_len is not a runtime parameter for C++ backend")
@@ -375,43 +371,35 @@ def throughput_command(
             f"{options.backend} is not a known backend, check help for available options.",
             param_hint="backend")
 
-    exec_settings["model"] = options.model
-    engine_bs = exec_settings["settings_config"]["max_batch_size"]
-    engine_tokens = exec_settings["settings_config"]["max_num_tokens"]
+    exec_settings.model = options.model
+    engine_bs = exec_settings.settings_config.max_batch_size
+    engine_tokens = exec_settings.settings_config.max_num_tokens
 
     # Runtime Options
     runtime_max_bs = max_batch_size or engine_bs
     runtime_max_tokens = max_num_tokens or engine_tokens
 
     # Update configuration with runtime options
-    exec_settings["settings_config"][
-        "kv_cache_percent"] = options.kv_cache_percent
-    exec_settings["settings_config"]["max_batch_size"] = runtime_max_bs
-    exec_settings["settings_config"]["max_num_tokens"] = runtime_max_tokens
-    exec_settings["settings_config"]["beam_width"] = options.beam_width
-    exec_settings["settings_config"][
-        "scheduler_policy"] = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT if scheduler_policy == "guaranteed_no_evict" else CapacitySchedulerPolicy.MAX_UTILIZATION
-    exec_settings["settings_config"]["chunking"] = enable_chunked_context
+    exec_settings.settings_config.kv_cache_percent = options.kv_cache_percent
+    exec_settings.settings_config.max_batch_size = runtime_max_bs
+    exec_settings.settings_config.max_num_tokens = runtime_max_tokens
+    exec_settings.settings_config.beam_width = options.beam_width
+    exec_settings.settings_config.scheduler_policy = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT if scheduler_policy == "guaranteed_no_evict" else CapacitySchedulerPolicy.MAX_UTILIZATION
+    exec_settings.settings_config.chunking = enable_chunked_context
 
     # Dynamic runtime features.
-    exec_settings["settings_config"]["dynamic_max_batch_size"] = True
+    exec_settings.settings_config.dynamic_max_batch_size = True
 
     # LlmArgs
-    exec_settings["extra_llm_api_options"] = params.pop("extra_llm_api_options")
-    exec_settings["iteration_log"] = options.iteration_log
+    exec_settings.extra_llm_api_options = params.pop("extra_llm_api_options")
+    exec_settings.iteration_log = options.iteration_log
 
-    # Construct the runtime configuration dataclass.
-    runtime_config = RuntimeConfig(**exec_settings)
     llm = None
-
     try:
         logger.info("Setting up throughput benchmark.")
-        # TODO this might need changes after updating get_llm_args below
-        kwargs = kwargs | runtime_config.get_llm_args()
-        kwargs['skip_tokenizer_init'] = not no_skip_tokenizer_init
-        kwargs['backend'] = options.backend
-
-        llm = get_llm(runtime_config, kwargs)
+        llm_args = exec_settings.get_llm_args()
+        llm_args.skip_tokenizer_init = not no_skip_tokenizer_init
+        llm = get_llm(exec_settings, llm_args)
 
         sampler_args = {
             "end_id": options.eos_id,

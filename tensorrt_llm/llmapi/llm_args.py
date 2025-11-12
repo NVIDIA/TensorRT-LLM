@@ -16,10 +16,12 @@ import torch
 import yaml
 from pydantic import BaseModel, ConfigDict
 from pydantic import Field as PydanticField
-from pydantic import PositiveInt, PrivateAttr, field_validator, model_validator
+from pydantic import (PositiveInt, PrivateAttr, TypeAdapter, field_validator,
+                      model_validator)
 from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
 
+from tensorrt_llm._torch.auto_deploy import LlmArgs as AutoDeployLlmArgs
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
 
@@ -2736,8 +2738,12 @@ def get_model_format(model_dir: str,
         return model_format
 
 
-# TODO?
 LlmArgs = TorchLlmArgs
+LlmArgsAdapter = TypeAdapter(Annotated[Union[TorchLlmArgs, TrtLlmArgs,
+                                             AutoDeployLlmArgs],
+                                       Field(discriminator="backend")])
+# the potential problem with this is that we want a YAML file with no backend specified to still be parsed
+# as TorchLlmArgs
 
 TRT_LLMARGS_EXPLICIT_DOCSTRING = generate_api_docs_as_docstring(TrtLlmArgs,
                                                                 indent=' ' * 4)
