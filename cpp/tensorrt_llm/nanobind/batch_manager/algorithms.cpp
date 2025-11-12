@@ -17,7 +17,6 @@
 
 #include "algorithms.h"
 #include "tensorrt_llm/batch_manager/agentTree.h"
-#include "tensorrt_llm/batch_manager/allocateKvCache.h"
 #include "tensorrt_llm/batch_manager/assignReqSeqSlots.h"
 #include "tensorrt_llm/batch_manager/capacityScheduler.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
@@ -118,11 +117,4 @@ void tensorrt_llm::nanobind::batch_manager::algorithms::initBindings(nb::module_
         .def("__call__", &AssignReqSeqSlots::operator(), nb::arg("seq_slot_manager"), nb::arg("context_requests"),
             nb::arg("generation_requests"))
         .def("name", [](AssignReqSeqSlots const&) { return AssignReqSeqSlots::name; });
-
-    nb::class_<AllocateKvCache>(m, AllocateKvCache::name)
-        .def(nb::init<>(), nb::call_guard<nb::gil_scoped_release>())
-        .def("__call__", &AllocateKvCache::operator(), nb::arg("kv_cache_manager"), nb::arg("context_requests"),
-            nb::arg("generation_requests"), nb::arg("model_config"), nb::arg("cross_kv_cache_manager") = std::nullopt,
-            nb::call_guard<nb::gil_scoped_release>())
-        .def("name", [](AllocateKvCache const&) { return AllocateKvCache::name; });
 }
