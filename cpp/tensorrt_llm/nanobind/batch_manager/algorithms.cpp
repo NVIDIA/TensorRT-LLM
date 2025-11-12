@@ -17,7 +17,6 @@
 
 #include "algorithms.h"
 #include "tensorrt_llm/batch_manager/agentTree.h"
-#include "tensorrt_llm/batch_manager/assignReqSeqSlots.h"
 #include "tensorrt_llm/batch_manager/capacityScheduler.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
@@ -111,10 +110,4 @@ void tensorrt_llm::nanobind::batch_manager::algorithms::initBindings(nb::module_
             nb::arg("kv_cache_manager") = std::nullopt, nb::arg("cross_kv_cache_manager") = std::nullopt,
             nb::arg("peft_cache_manager") = std::nullopt)
         .def("name", [](PauseRequests const&) { return PauseRequests::name; });
-
-    nb::class_<AssignReqSeqSlots>(m, AssignReqSeqSlots::name)
-        .def(nb::init<>())
-        .def("__call__", &AssignReqSeqSlots::operator(), nb::arg("seq_slot_manager"), nb::arg("context_requests"),
-            nb::arg("generation_requests"))
-        .def("name", [](AssignReqSeqSlots const&) { return AssignReqSeqSlots::name; });
 }
