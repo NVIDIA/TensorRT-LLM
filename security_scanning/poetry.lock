@@ -447,13 +447,13 @@ virtualenv = ["virtualenv (>=20.11)", "virtualenv (>=20.17)", "virtualenv (>=20.
 
 [[package]]
 name = "certifi"
-version = "2025.10.5"
+version = "2025.11.12"
 description = "Python package for providing Mozilla's CA Bundle."
 optional = false
 python-versions = ">=3.7"
 files = [
-    {file = "certifi-2025.10.5-py3-none-any.whl", hash = "sha256:0f212c2744a9bb6de0c56639a6f68afe01ecd92d91f14ae897c4fe7bbeeef0de"},
-    {file = "certifi-2025.10.5.tar.gz", hash = "sha256:47c09d31ccf2acf0be3f701ea53595ee7e0b8fa08801c6624be771df09ae7b43"},
+    {file = "certifi-2025.11.12-py3-none-any.whl", hash = "sha256:97de8790030bbd5c2d96b7ec782fc2f7820ef8dba6db909ccf95449f2d062d4b"},
+    {file = "certifi-2025.11.12.tar.gz", hash = "sha256:d8ab5478f2ecd78af242878415affce761ca6bc54a22a27e026d7c25357c3316"},
 ]
 
 [[package]]
@@ -2092,39 +2092,33 @@ dev = ["absl-py", "pyink", "pylint (>=2.6.0)", "pytest", "pytest-xdist"]
 
 [[package]]
 name = "mlx"
-version = "0.29.3"
+version = "0.29.4"
 description = "A framework for machine learning on Apple silicon."
 optional = false
-python-versions = ">=3.9"
+python-versions = ">=3.10"
 files = [
-    {file = "mlx-0.29.3-cp310-cp310-macosx_13_0_arm64.whl", hash = "sha256:340d46443fe0b1e5d84c1e36aa633310de70365ce79aefcaa6f618e62bd4b045"},
-    {file = "mlx-0.29.3-cp310-cp310-macosx_14_0_arm64.whl", hash = "sha256:8449c0e7c221e38368a734a471e0c4b1a7fea072947c75e893a1ee214f208d34"},
-    {file = "mlx-0.29.3-cp310-cp310-macosx_15_0_arm64.whl", hash = "sha256:1bba5203ed3f785167f5b8891c2e91ede23401586b0a723bfaf815a3ed450e3d"},
-    {file = "mlx-0.29.3-cp310-cp310-manylinux_2_35_x86_64.whl", hash = "sha256:ffb3a167da52baeb05756895298a2d582b5e9b9b9364b4a454b78b824a9fa482"},
-    {file = "mlx-0.29.3-cp311-cp311-macosx_13_0_arm64.whl", hash = "sha256:0ffdf1f171c903adeaa688210ba39063059b102f3dcc52a64c2200d95d237f15"},
-    {file = "mlx-0.29.3-cp311-cp311-macosx_14_0_arm64.whl", hash = "sha256:e7d1d815be0d4a41e598bdb2992822dafd9ab0d59d4b88af760ee0b6584506b7"},
-    {file = "mlx-0.29.3-cp311-cp311-macosx_15_0_arm64.whl", hash = "sha256:d33bff69887fadfd85ce67b8e11318c2319984f3ad4157f871aa9d3beb9de972"},
-    {file = "mlx-0.29.3-cp311-cp311-manylinux_2_35_x86_64.whl", hash = "sha256:8ead74126ffcc1ae49f3b1e0e988620ffbb059c38184f4e9390e294808e2c614"},
-    {file = "mlx-0.29.3-cp312-cp312-macosx_13_0_arm64.whl", hash = "sha256:86c62791ce930028d75c41b88b4e3ceb58f5f2e263ff9bfacda998b0c03d9544"},
-    {file = "mlx-0.29.3-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:cddf6bcdc561094af6b3f0706f8768ecc5216a97eb6973e838c3ac2e2fca2cc8"},
-    {file = "mlx-0.29.3-cp312-cp312-macosx_15_0_arm64.whl", hash = "sha256:b2e1a249437d017a7425358420d28e641b7bc9c2650f3e013c1b1f4f239d8533"},
-    {file = "mlx-0.29.3-cp312-cp312-manylinux_2_35_x86_64.whl", hash = "sha256:f09f71ee958f04824b7c7b275a1c1deb052740f5e69eccbff6672e43d9d7f890"},
-    {file = "mlx-0.29.3-cp313-cp313-macosx_13_0_arm64.whl", hash = "sha256:d59eccf6a1e1e131becc5a3910504507862da3a4e9b7bd9e73a625515d767844"},
-    {file = "mlx-0.29.3-cp313-cp313-macosx_14_0_arm64.whl", hash = "sha256:6642aa0a6dc2242c024fb8274d00631a7e7ffbdcef26148afd299b877c1e6a4a"},
-    {file = "mlx-0.29.3-cp313-cp313-macosx_15_0_arm64.whl", hash = "sha256:ec0aef311fab10cb5f2c274afa6edf6c482636096a5f7886aba43676454aa462"},
-    {file = "mlx-0.29.3-cp313-cp313-manylinux_2_35_x86_64.whl", hash = "sha256:e217a99ece66832a2e631131df32e9feb047276b68ac59ca0ad63735842f6dd0"},
-    {file = "mlx-0.29.3-cp39-cp39-macosx_13_0_arm64.whl", hash = "sha256:c6778d023cc540a83a08caa750c9752523c24ddebd4201b2f34c9e0a2e109394"},
-    {file = "mlx-0.29.3-cp39-cp39-macosx_14_0_arm64.whl", hash = "sha256:30a1da8b2aeb4f4b405759b108abbbe3b4f8c5924ac3d550006509bc7bcbfc49"},
-    {file = "mlx-0.29.3-cp39-cp39-macosx_15_0_arm64.whl", hash = "sha256:ac2409a1ba79149143232a02ae5b1a201864413979a76d8f9d63107022e0dce5"},
-    {file = "mlx-0.29.3-cp39-cp39-manylinux_2_35_x86_64.whl", hash = "sha256:efefa29663387f9340602d4b5906881398eda12f48882a60994fd2b379848d96"},
+    {file = "mlx-0.29.4-cp310-cp310-macosx_14_0_arm64.whl", hash = "sha256:b1f030cb5c15efb86605aca1537a751599a2040791e2dd25e10d7fdf35dce98a"},
+    {file = "mlx-0.29.4-cp310-cp310-macosx_15_0_arm64.whl", hash = "sha256:b26e3a9053693930c87690396614212a7436972bcfca66235b6056dcf9c4c600"},
+    {file = "mlx-0.29.4-cp310-cp310-manylinux_2_35_x86_64.whl", hash = "sha256:75d95ba021480143e844df2483dd6365a1437f9139f2544da2377001ad3d254e"},
+    {file = "mlx-0.29.4-cp311-cp311-macosx_14_0_arm64.whl", hash = "sha256:c75df43f3083774ba1242b7e2659ab24640aa25cc8f17f3e1df28b1576a98bcf"},
+    {file = "mlx-0.29.4-cp311-cp311-macosx_15_0_arm64.whl", hash = "sha256:5d22dca9e301a8b2a7034e97ce426393d7a9de7684338a190bf931f81d8fa537"},
+    {file = "mlx-0.29.4-cp311-cp311-manylinux_2_35_x86_64.whl", hash = "sha256:5e62e84716245ed6d04a5eafdc4dce88439fe56cd50f70af485f4d6be5540ce2"},
+    {file = "mlx-0.29.4-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:5d9abfd01c6a4046018d07f5987921a08d29ef95b5522ed77ab79d6a093c8746"},
+    {file = "mlx-0.29.4-cp312-cp312-macosx_15_0_arm64.whl", hash = "sha256:4fef4fe5c879824253d21d65d25a88b25d8b9379e76eb98434d70d90ff1203e2"},
+    {file = "mlx-0.29.4-cp312-cp312-manylinux_2_35_x86_64.whl", hash = "sha256:0edbc7eae0fd2e2361cbfad785cec92930ed0dafb44c2fc1442bc45f36fd4a26"},
+    {file = "mlx-0.29.4-cp313-cp313-macosx_15_0_arm64.whl", hash = "sha256:12f9fd8e2a4c9fae68677ceca10962a5e89cf4a3d938a2ed0767c44bcf19abec"},
+    {file = "mlx-0.29.4-cp313-cp313-manylinux_2_35_x86_64.whl", hash = "sha256:cc4639d49c9b25f6abbdd630ddc2e03f87845da45c35c93e9452cb9925f1a79a"},
+    {file = "mlx-0.29.4-cp314-cp314-macosx_14_0_arm64.whl", hash = "sha256:ca0d45e76d105b7f033dfd783ea255dec8134da88c5844c77cbebe8b1e7e950d"},
+    {file = "mlx-0.29.4-cp314-cp314-macosx_15_0_arm64.whl", hash = "sha256:cb2b5c9595c7f500151d6683ee5c6495a7ad662a51f6d4bc4af368f001d276fd"},
+    {file = "mlx-0.29.4-cp314-cp314-manylinux_2_35_x86_64.whl", hash = "sha256:f1a34409324fe985c6e1a6cd7904530cb84061d9b742911f051b5a91b766f717"},
 ]
 
 [package.dependencies]
-mlx-metal = {version = "0.29.3", markers = "platform_system == \"Darwin\""}
+mlx-metal = {version = "0.29.4", markers = "platform_system == \"Darwin\""}
 
 [package.extras]
-cpu = ["mlx-cpu (==0.29.3)"]
-cuda = ["mlx-cuda (==0.29.3)"]
+cpu = ["mlx-cpu (==0.29.4)"]
+cuda = ["mlx-cuda (==0.29.4)"]
 dev = ["nanobind (==2.4.0)", "numpy", "pre-commit", "setuptools (>=80)", "torch", "typing_extensions"]
 
 [[package]]
@@ -2155,14 +2149,13 @@ train = ["datasets", "tqdm"]
 
 [[package]]
 name = "mlx-metal"
-version = "0.29.3"
+version = "0.29.4"
 description = "A framework for machine learning on Apple silicon."
 optional = false
-python-versions = ">=3.9"
+python-versions = ">=3.10"
 files = [
-    {file = "mlx_metal-0.29.3-py3-none-macosx_13_0_arm64.whl", hash = "sha256:27b5a4d905202a71e84d9fd559ea0236813f6f960ef494e5cafe9c45df4c9d7c"},
-    {file = "mlx_metal-0.29.3-py3-none-macosx_14_0_arm64.whl", hash = "sha256:f426d4b67f96b4d6f0ed50d5992933595aadb370dc3e9ed2410bafbc16229882"},
-    {file = "mlx_metal-0.29.3-py3-none-macosx_15_0_arm64.whl", hash = "sha256:106616f7f825851043c53d3dc186965c003985da9cbb6e5c034f35108fc1fc27"},
+    {file = "mlx_metal-0.29.4-py3-none-macosx_14_0_arm64.whl", hash = "sha256:6068e4149cafaa18b782949f6dcd734351bc61d5a3fd2d5f71b2a63c73772dfe"},
+    {file = "mlx_metal-0.29.4-py3-none-macosx_15_0_arm64.whl", hash = "sha256:1ea68296d151d35ecdd76c3bf244affe12172b9f646dd54174e4e833f4972c52"},
 ]
 
 [[package]]
