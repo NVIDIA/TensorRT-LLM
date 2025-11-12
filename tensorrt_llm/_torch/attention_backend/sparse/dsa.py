@@ -290,6 +290,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     indexer_max_chunk_size: int
     # Topk for sparse MLA
     sparse_mla_topk: int
+    # max number of draft tokens
+    max_draft_tokens: int = 0
 
     def __init__(self, *args, **kwargs):
         self.num_sms = tensorrt_llm.deep_gemm.get_num_sms()
@@ -485,6 +487,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                                       is_spec_dec_tree,
                                       is_spec_dec_dynamic_tree,
                                       max_draft_tokens, spec_decoding_tensor)
+        self.max_draft_tokens = max_draft_tokens
         init_shape = self.kv_lens_expanded_host.shape[0]
         if self.max_num_sequences * (1 + self.max_draft_tokens) != init_shape:
             capture_graph = torch.cuda.is_current_stream_capturing()
