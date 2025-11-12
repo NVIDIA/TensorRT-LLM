@@ -1113,37 +1113,6 @@ class GlobalState {
     static def uploadResultStageNames = []
 }
 
-String getShortenedJobName(String path)
-{
-    static final nameMapping = [
-        "L0_MergeRequest": "l0-mr",
-        "L0_Custom": "l0-cus",
-        "L0_PostMerge": "l0-pm",
-        "L0_PostMergeDocker": "l0-pmd",
-        "L1_Custom": "l1-cus",
-        "L1_Nightly": "l1-nt",
-        "L1_Stable": "l1-stb",
-        "BuildDockerImageSanityTest": "img-check",
-    ]
-    def parts = path.split('/')
-    // Apply nameMapping to the last part (jobName)
-    def jobName = parts[-1]
-    boolean replaced = false
-    nameMapping.each { key, value ->
-        if (jobName.contains(key)) {
-            jobName = jobName.replace(key, value)
-            replaced = true
-        }
-    }
-    if (!replaced) {
-        jobName = jobName.length() > 7 ? jobName.substring(0, 7) : jobName
-    }
-    // Replace the last part with the transformed jobName
-    parts[-1] = jobName
-    // Rejoin the parts with '-', convert to lowercase
-    return parts.join('-').toLowerCase()
-}
-
 def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSuccess=false, postTag="")
 {
     checkStageName([stageName])
@@ -1212,8 +1181,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                   kubernetes.io/os: linux"""
     def containerConfig = ""
     def nodeLabelPrefix = ""
-    def jobName = getShortenedJobName(env.JOB_NAME)
-    def buildID = env.BUILD_ID
 
     def archSuffix = arch == "arm64" ? "arm" : "amd"
     def jnlpImage = "urm.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
@@ -1355,7 +1322,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                         - SYS_ADMIN"""
         break
     }
-    def nodeLabel = trtllm_utils.appendRandomPostfix("${nodeLabelPrefix}---tensorrt-${jobName}-${buildID}")
+    def nodeLabel = trtllm_utils.getNodeLabel(nodeLabelPrefix)
     def pvcVolume = """
                 - name: sw-tensorrt-pvc
                   persistentVolumeClaim:
