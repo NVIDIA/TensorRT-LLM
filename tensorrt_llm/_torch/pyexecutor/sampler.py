@@ -1890,6 +1890,8 @@ class TorchSampler(Sampler):
                 logprobs_cuda = logits_cuda[logprobs_logit_indices_cuda].to(
                     dtype=torch.float32, non_blocking=True
                 )
+                print(f"DEBUG: this is should be raw logits: {logprobs_cuda}")
+                print(f"DEBUG: logprobs_cuda.shape: {logprobs_cuda.shape}")
 
             topk_vals_cuda, topk_indices_cuda = torch.topk(
                 logprobs_cuda, k=max(req.py_num_logprobs for req in requests), dim=-1
