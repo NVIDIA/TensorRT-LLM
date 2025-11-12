@@ -269,7 +269,8 @@ private:
     std::unique_ptr<executor::kv_cache::CacheState> mCacheState;
     std::unique_ptr<executor::kv_cache::ConnectionManager> mManager;
     std::optional<executor::CacheTransceiverConfig> mCacheTransceiverConfig;
-    std::unique_ptr<kv_cache_manager::CacheTransBufferManager> mCacheTransBufferManager;
+    std::vector<std::unique_ptr<kv_cache_manager::CacheTransBufferManager>> mCacheTransBufferManagers;
+    std::vector<kv_cache_manager::CacheTransBufferManager*> mCacheTransBufferManagerPtrs;
     // library handle to the communicator related features,
     // this is used to defer dependency resolution until needed.
     static std::mutex mDllMutex;

@@ -145,27 +145,26 @@ def _triton_cached_ssm(
 
         dt_hp = dt_decode[:, :, None].expand(-1, num_heads, head_dim)
         dt_bias_hp = dt_bias[..., None].expand(num_heads, head_dim)
-        dt_pre = torch.nn.functional.softplus(dt_hp + dt_bias_hp.to(dtype=dt_hp.dtype))
-        dt_pre = torch.clamp(dt_pre, time_step_limit[0], time_step_limit[1])
         A_full = A[..., None, None].expand(num_heads, head_dim, ssm_state_size)
         D_full = D[..., None].expand(num_heads, head_dim)
 
-        dt_bias_zero = torch.zeros_like(dt_bias_hp)
         y_dec = selective_state_update(
             ssm_state_cache,
             x_decode,
-            dt_pre,
+            dt_hp,
             A_full,
             B_decode,
             C_decode,
             D=D_full,
             z=None,
-            dt_bias=dt_bias_zero,
-            dt_softplus=False,
+            dt_bias=dt_bias_hp,
+            dt_softplus=True,
             state_batch_indices=slot_idx_decode,
         )  # [nd, H, D]
 
-        y_flat[total_prefill_tokens : total_prefill_tokens + num_decode] = y_dec.to(y_flat.dtype)
+        y_flat[total_prefill_tokens : total_prefill_tokens + num_decode].copy_(
+            y_dec.to(y_flat.dtype)
+        )
 
     return y
 
