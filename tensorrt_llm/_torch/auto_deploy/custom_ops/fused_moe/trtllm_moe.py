@@ -28,8 +28,7 @@ def trtllm_moe_fused(
     if mlp_style == "gated_mlp":
         # Gated MLP uses Silu: silu(x @ w1.T) * (x @ w3.T)
         if act_fn == "silu":
-            # activation_type = ActivationType.Silu
-            activation_type = ActivationType.Swiglu  # need to fix this in trtllm
+            activation_type = ActivationType.Swiglu
         else:
             raise ValueError(f"Unsupported activation '{act_fn}' for gated_mlp. Use 'silu'.")
     elif mlp_style == "mlp":
@@ -185,7 +184,7 @@ def trtllm_quant_fp8_moe_fused(
         w3_w1_stacked = torch.cat([w3_weight, w1_weight], dim=1).contiguous()  # [E, 2*I, H]
         fc1_expert_weights = w3_w1_stacked
         if act_fn == "silu":
-            activation_type = ActivationType.Swiglu  # need to fix this in trtllm
+            activation_type = ActivationType.Swiglu
         else:
             raise ValueError(f"Unsupported activation '{act_fn}' for gated_mlp. Use 'silu'.")
     elif mlp_style == "mlp":
