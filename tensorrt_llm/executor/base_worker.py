@@ -569,6 +569,11 @@ class BaseWorker(GenerationExecutor):
             if self._is_pytorch_backend and request.scheduling_params is not None:
                 executor_request.py_scheduling_params = request.scheduling_params
 
+            if self._is_pytorch_backend:
+                logprob_params = self._get_logprob_params(request)
+                if logprob_params is not None:
+                    executor_request._logprob_params = logprob_params
+
             if request.arrival_time is not None:
                 executor_request.py_arrival_time = request.arrival_time
 

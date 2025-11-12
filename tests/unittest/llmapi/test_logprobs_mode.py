@@ -1,9 +1,13 @@
 import pytest
 from utils.llm_data import llm_models_root
 
+import tensorrt_llm
 from tensorrt_llm import LLM
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.sampling_params import SamplingParams
+
+print(f"tensorrt_llm.__file__: {tensorrt_llm.__file__}")
+# /home/dominicw/.local/lib/python3.12/site-packages/tensorrt_llm
 
 MODEL_PATH = llm_models_root() / "DeepSeek-V3-Lite/bf16"
 
@@ -22,11 +26,11 @@ MODEL_PATH = llm_models_root() / "DeepSeek-V3-Lite/bf16"
 def test_logprobs_mode_basic(logprobs_mode, temperature, top_k):
     llm = LLM(
         MODEL_PATH,
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.7),
     )
 
     sampling_params = SamplingParams(
-        max_tokens=5,
+        max_tokens=10,
         logprobs=3,
         temperature=temperature,
         top_k=top_k,
@@ -35,6 +39,7 @@ def test_logprobs_mode_basic(logprobs_mode, temperature, top_k):
 
     prompts = ["The future of AI is"]
     outputs = llm.generate(prompts, sampling_params=sampling_params)
+    print(f"outputs: {outputs}")
 
     assert len(outputs) == 1
     output = outputs[0]
@@ -51,6 +56,7 @@ def test_logprobs_mode_basic(logprobs_mode, temperature, top_k):
         for token_id, logprob_obj in token_logprobs.items():
             all_logprob_values.append(logprob_obj.logprob)
 
+    print(f"all_logprob_values: {all_logprob_values}")
     # Validate based on mode
     if "logprobs" in logprobs_mode:
         for val in all_logprob_values:
