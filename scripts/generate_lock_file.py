@@ -33,7 +33,7 @@ import re
 import shutil
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, os.getcwd())
@@ -77,13 +77,20 @@ def get_project_info(path: str):
 
 
 def generate_metadata_json():
-    commit_hash = subprocess.check_output(["git", "rev-parse", "HEAD"],
-                                          text=True).strip()
+    try:
+        commit_hash = subprocess.check_output(["git", "rev-parse", "HEAD"],
+                                              text=True).strip()
+    except subprocess.CalledProcessError as e:
+        print(f"Error retrieving git commit hash: {e}")
+        raise
+
     data = {
         "commit_hash": commit_hash,
-        "timestamp": datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     }
-    with open(f"{FOLDER_SECURITY_SCANNING}/metadata.json", "w") as f:
+    with open(f"{FOLDER_SECURITY_SCANNING}/metadata.json",
+              "w",
+              encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
 
