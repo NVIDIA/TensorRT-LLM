@@ -33,11 +33,7 @@ def enforce_single_worker():
     ],
 )
 @pytest.mark.high_cuda_memory
-@pytest.mark.no_xdist
 def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
-    """
-    Test output correctness with various schedules and batch sizes.
-    """
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     memory_required = 30 if drafter_type == "model_drafter" else 20
     if total_mem_gb < memory_required:
@@ -150,7 +146,6 @@ def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
     ],
 )
 @pytest.mark.high_cuda_memory
-@pytest.mark.no_xdist
 def test_draft_len_schedule_functionality(drafter_type: str, draft_schedule: dict):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
@@ -247,11 +242,6 @@ def test_draft_len_schedule_functionality(drafter_type: str, draft_schedule: dic
                 actual_draft_lens.append(draft_len)
 
             iteration_data[-1]["actual_draft_lens"] = actual_draft_lens
-
-            # Filter out context-phase iterations (no generation requests = no draft tokens)
-            # This happens when all requests are still in prefill/context phase
-            if len(scheduled_batch.generation_requests) == 0:
-                iteration_data.pop()
 
         return result
 
