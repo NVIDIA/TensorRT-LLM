@@ -129,3 +129,13 @@ if [ $opencv -eq 1 ]; then
     rm -rf /usr/local/lib/python3*/dist-packages/cv2/
     pip3 install opencv-python-headless --force-reinstall --no-deps --no-cache-dir
 fi
+
+if [ $ucx -eq 1 ]; then
+    echo "Installing UCX..."
+    GITHUB_MIRROR=$GITHUB_MIRROR bash $SCRIPT_DIR/install_ucx.sh
+fi
+
+if [ $nixl -eq 1 ]; then
+    echo "Installing NIXL..."
+    GITHUB_MIRROR=$GITHUB_MIRROR bash $SCRIPT_DIR/install_nixl.sh
+fi
