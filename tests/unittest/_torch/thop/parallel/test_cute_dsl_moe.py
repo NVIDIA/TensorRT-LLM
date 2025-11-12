@@ -221,6 +221,37 @@ def test_moe_unpermute(dtype: str, num_tokens: int, top_k: int, tile_size: int):
     torch.testing.assert_close(x, x_ref)
 
 
+@pytest.mark.parametrize("tile_size", [128, 256])
+@pytest.mark.parametrize("top_k", [1, 2, 8])
+@pytest.mark.parametrize("num_tokens", [128, 515, 1024])
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_moe_swiglu(dtype: str, num_tokens: int, top_k: int, tile_size: int):
+    dtype = getattr(torch, dtype)
+    interm_size = 4096
+    num_experts = 256
+    num_local_experts = num_experts // 32
+    helper = GroupedGemmInputsHelper(num_experts, top_k, num_local_experts, 0, tile_size)
+    max_num_tiles = helper.get_max_num_tiles(num_tokens)
+    num_permuted_tokens = helper.get_max_num_permuted_tokens(num_tokens)
+
+    x = torch.randint(
+        -100, 100, (num_permuted_tokens, interm_size * 2), dtype=torch.int32, device="cuda"
+    ).to(dtype)
+    tile_idx_to_mn_limit = (
+        torch.arange(1, max_num_tiles + 1, dtype=torch.int32, device="cuda") * tile_size
+    )
+    num_non_exiting_tiles_val = (num_tokens * top_k) // tile_size
+    num_non_exiting_tiles = torch.tensor(
+        [num_non_exiting_tiles_val], dtype=torch.int32, device="cuda"
+    )
+    y = torch.ops.trtllm.moe_swiglu(x, tile_idx_to_mn_limit, num_non_exiting_tiles, tile_size)
+    _x, _gate = x.chunk(2, dim=-1)
+    y_ref = torch.nn.functional.silu(_gate) * _x
+    torch.testing.assert_close(
+        y[: num_non_exiting_tiles_val * tile_size], y_ref[: num_non_exiting_tiles_val * tile_size]
+    )
+
+
 @pytest.mark.skipif(
     get_sm_version() != 100, reason="This test is only supported in Blackwell architecture"
 )

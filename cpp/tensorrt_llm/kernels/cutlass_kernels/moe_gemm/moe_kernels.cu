@@ -37,7 +37,6 @@
 #include "cutlass/util/packed_stride.hpp"
 
 #include "cutlass/array.h"
-#include "cutlass/epilogue/thread/activation.h"
 #include "cutlass/numeric_conversion.h"
 #include "cutlass/numeric_types.h"
 
@@ -1936,56 +1935,6 @@ INSTANTIATE_FINALIZE_MOE_ROUTING(float, float, float);
 #ifdef ENABLE_BF16
 INSTANTIATE_FINALIZE_MOE_ROUTING(__nv_bfloat16, __nv_bfloat16, __nv_bfloat16);
 #endif
-
-// ============================== Activation Adaptors =================================
-template <template <class> class ActFn>
-struct IdentityAdaptor
-{
-    constexpr static bool IS_GLU = false;
-    float alpha = 1.0f;
-    float beta = 0.0f;
-    float limit = std::numeric_limits<float>::infinity();
-
-    template <class T>
-    __device__ T operator()(T const& x) const
-    {
-        ActFn<T> fn{};
-        return fn(x);
-    }
-};
-
-template <template <class> class ActFn>
-struct GLUAdaptor
-{
-    constexpr static bool IS_GLU = true;
-    float alpha = 1.0f;
-    float beta = 0.0f;
-    float limit = std::numeric_limits<float>::infinity();
-
-    template <class T>
-    __device__ T operator()(T const& gate, T const& linear) const
-    {
-        ActFn<T> fn{};
-        return fn(gate) * linear;
-    }
-};
-
-struct SwigluBiasAdaptor
-{
-    constexpr static bool IS_GLU = true;
-    float alpha = 1.0f;
-    float beta = 0.0f;
-    float limit = std::numeric_limits<float>::infinity();
-
-    template <class T>
-    __device__ T operator()(T const& gate, T const& linear) const
-    {
-        cutlass::epilogue::thread::Sigmoid<T> fn{};
-        T linear_clamped = cutlass::maximum<T>{}(cutlass::minimum<T>{}(linear, limit), -limit);
-        T gate_clamped = cutlass::minimum<T>{}(gate, limit);
-        return gate_clamped * fn(gate_clamped * alpha) * (linear_clamped + beta);
-    }
-};
 
 // ============================== Gated Activation =================================
 constexpr static int ACTIVATION_THREADS_PER_BLOCK = 256;

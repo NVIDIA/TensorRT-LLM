@@ -15,6 +15,7 @@
  */
 
 #pragma once
+#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h"
 #include <cstdint>
 #include <cuda_runtime.h>
 
@@ -30,4 +31,11 @@ template <typename InputType, typename TopKScaleType>
 void moeUnpermute(InputType const* permuted_input, InputType* output, int32_t const* expanded_idx_to_permuted_idx,
     TopKScaleType const* topk_scales, int32_t const num_tokens, int32_t const hidden_size, int32_t const top_k,
     cudaStream_t stream);
+
+template <typename InputType, typename OutputType, typename SFType>
+void moeActivation(InputType const* input, OutputType* output, SFType const* output_sf,
+    int32_t const* tile_idx_to_mn_limit, int32_t const* num_non_exiting_tiles,
+    cutlass_kernels::ActivationParams activation_params, int32_t const interm_size, int32_t const tile_size,
+    cudaStream_t stream);
+
 } // namespace tensorrt_llm::kernels::cute_dsl
