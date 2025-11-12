@@ -1067,6 +1067,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         max_draft_tokens,
         spec_decoding_tensor: Optional['SpecDecodingTensor'] = None,
     ):
+
         if spec_decoding_tensor is not None:
             spec_decoding_position_offsets = spec_decoding_tensor.position_offsets
             spec_decoding_packed_mask = spec_decoding_tensor.packed_mask
