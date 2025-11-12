@@ -129,6 +129,9 @@ ARG BUILD_WHEEL_ARGS="--clean --benchmarks"
 ARG BUILD_WHEEL_SCRIPT="scripts/build_wheel.py"
 RUN --mount=type=cache,target=/root/.cache/pip --mount=type=cache,target=${CCACHE_DIR} \
     GITHUB_MIRROR=$GITHUB_MIRROR python3 ${BUILD_WHEEL_SCRIPT} ${BUILD_WHEEL_ARGS}
+RUN python3 scripts/copy_third_party_sources.py \
+      --deps-dir cpp/build/_deps \
+      --output-dir /third-party-sources
 
 FROM ${DEVEL_IMAGE} AS release
 
@@ -168,6 +171,8 @@ RUN chmod -R a+w examples && \
       benchmarks/cpp/disaggServerBenchmark.cpp \
       benchmarks/cpp/CMakeLists.txt && \
     rm -rf /root/.cache/pip
+
+COPY --from=wheel /third-party-sources /third-party-sources
 
 ARG GIT_COMMIT
 ARG TRT_LLM_VER
