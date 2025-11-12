@@ -85,7 +85,7 @@ worker_config:
       dtype: fp8
     moe_config:
       backend: WIDEEP
-      use_low_precision_moe_combine: true
+      # use_low_precision_moe_combine: true
       load_balancer:
         num_slots: 288
         layer_updates_per_iter: 1
