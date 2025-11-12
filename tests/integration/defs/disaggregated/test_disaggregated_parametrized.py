@@ -560,6 +560,7 @@ _ds_v3_lite_tp1_cfg = DisaggregatedTestConfig(
     global_config={
         "backend": "pytorch",
         "free_gpu_memory_fraction": 0.1,
+        "moe_config": {"backend": "TRTLLM"},
     },
     ctx_config={
         "disable_overlap_scheduler": True,
@@ -576,6 +577,7 @@ _ds_v3_lite_4_gpus_cfg = DisaggregatedTestConfig(
     global_config={
         "backend": "pytorch",
         "free_gpu_memory_fraction": 0.7,
+        "moe_config": {"backend": "TRTLLM"},
     },
     ctx_config={
         "tensor_parallel_size": 2,
