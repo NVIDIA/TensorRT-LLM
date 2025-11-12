@@ -3,6 +3,7 @@ from dataclasses import replace
 from typing import Dict, List, Optional
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from tensorrt_llm.mapping import Mapping
@@ -11,8 +12,15 @@ from tensorrt_llm.quantization.utils import fp4_utils
 from ...distributed import allgather, reducescatter
 from ...model_config import ModelConfig
 from ..gated_mlp import GatedMLP
+from ..mlp import MLP
 from .interface import MoEWeightLoadingMode
 from .routing import BaseMoeRoutingMethod
+
+SHOW_LAYER_IDX = 1
+
+
+def relu2(x: torch.Tensor) -> torch.Tensor:
+    return torch.square(F.relu(x))
 
 
 class VanillaMoE(nn.ModuleList):
@@ -31,6 +39,7 @@ class VanillaMoE(nn.ModuleList):
         VANILLA,
         apply_router_weight_on_input: bool = False,
         pack_weights: bool = False,
+        layer_idx: Optional[int] = None,
     ):
         from ...distributed import AllReduce
 
@@ -41,6 +50,12 @@ class VanillaMoE(nn.ModuleList):
         self.intermediate_size = intermediate_size
         self.weight_loading_mode = weight_loading_mode
         self.pack_weights = pack_weights
+
+        assert not pack_weights, "pack_weights must be False for VanillaMoE"
+
+        self.layer_idx = layer_idx
+
+        self.model_type = "nemotron_h"
 
         self.dtype = dtype
         self.reduce_results = reduce_results
@@ -107,7 +122,18 @@ class VanillaMoE(nn.ModuleList):
         )
         for expert_idx in range(self.num_experts):
             if self.expert_start <= expert_idx < self.expert_end:
-                module_list[expert_idx] = GatedMLP(
+                if self.model_type == "nemotron_h":
+                    module_list[expert_idx] = MLP(
+                        hidden_size=self.hidden_size,
+                        intermediate_size=self.intermediate_size,
+                        bias=False,
+                        activation=relu2,
+                        dtype=self.dtype,
+                        config=model_config,
+                        layer_idx=None,
+                    )
+                else:
+                    module_list[expert_idx] = GatedMLP(
                     hidden_size=self.hidden_size,
                     intermediate_size=self.intermediate_size,
                     bias=False,
@@ -470,12 +496,15 @@ class VanillaMoE(nn.ModuleList):
         expanded_scales: torch.Tensor,
         sorted_experts: torch.Tensor,
         batch_indices: torch.Tensor,
+        show: bool = False,
     ) -> torch.Tensor:
         final_hidden_states = torch.zeros(
             input.shape,
             dtype=input.dtype,
             device=input.device,
         )
+        if show and self.ep_rank == 0:
+            print("="*100)
         for expert_idx in range(self.expert_start, self.expert_end):
             expert_mask = sorted_experts == expert_idx
             if not torch.any(expert_mask):
@@ -485,7 +514,22 @@ class VanillaMoE(nn.ModuleList):
             expanded_scale = expanded_scales[expert_mask]
 
             output = self[expert_idx](expanded_input)
-            final_hidden_states[batch_idx] += output * expanded_scale
+            scaled_output = output * expanded_scale
+            final_hidden_states[batch_idx] += scaled_output
+
+            # if show and expert_idx == 7 and self.ep_rank == 0:
+            #     print("="*100)
+            #     # print(f"VanillaMoE expert_idx: {expert_idx}")
+            #     # print(f"VanillaMoE expanded_input: {expanded_input.shape=} \n{expanded_input.dtype=} \n{expanded_input.device=} \n{expanded_input=!r}")
+            #     # print(f"VanillaMoE batch_idx: {batch_idx.shape=} \n{batch_idx.dtype=} \n{batch_idx.device=} \n{batch_idx=!r}")
+            #     # print(f"VanillaMoE expanded_scale: {expanded_scale.shape=} \n{expanded_scale.dtype=} \n{expanded_scale.device=} \n{expanded_scale=!r}")
+            #     # print(f"VanillaMoE output: {output.shape=} \n{output.dtype=} \n{output.device=} \n{output=!r}")
+            #     print(f"VanillaMoE scaled_output: {scaled_output.shape=} \n{scaled_output.dtype=} \n{scaled_output.device=} \n{scaled_output=!r}")
+            #     print("="*100)
+        if show:
+            print("="*100)
+            print(f"111 VanillaMoE {self.ep_rank=} run_experts: {final_hidden_states.shape=} \n{final_hidden_states.dtype=} \n{final_hidden_states.device=} \n{final_hidden_states=!r}")
+            print("="*100)
         return final_hidden_states
 
     def forward(
@@ -496,11 +540,25 @@ class VanillaMoE(nn.ModuleList):
         use_dp_padding: Optional[bool] = None,
         **kwargs,
     ) -> torch.Tensor:
+        show = x.shape[0] == 6 and self.layer_idx == SHOW_LAYER_IDX
+        show = False
         assert x.shape[-1] == self.hidden_size
         x = x.view(-1, self.hidden_size)
 
         token_selected_experts, token_final_scales = self.routing_method.apply(
-            router_logits)
+            router_logits, show)
+
+        # if show:
+        #     print("="*100)
+        #     print(f"VanillaMoE token_selected_experts: {token_selected_experts.shape=} \n{token_selected_experts.dtype=} \n{token_selected_experts.device=} \n{token_selected_experts=!r}")
+        #     print(f"VanillaMoE token_final_scales: {token_final_scales.shape=} \n{token_final_scales.dtype=} \n{token_final_scales.device=} \n{token_final_scales=!r}")
+        #     print("="*100)
+
+        # if show:
+        #     print("="*100)
+        #     print(f"self.use_dp: {self.use_dp}")
+        #     print(f"self.parallel_size: {self.parallel_size}")
+        #     print("="*100)
 
         if self.use_dp and self.parallel_size > 1:
             x, token_selected_experts, token_final_scales = allgather(
@@ -521,17 +579,38 @@ class VanillaMoE(nn.ModuleList):
         expanded_inputs = x[batch_indices]
         expanded_scales = token_final_scales[batch_indices, nth_experts, None]
 
+        # if show and self.ep_rank == 0:
+        #     print("="*100)
+        #     print(f"VanillaMoE x: {x.shape=} \n{x.dtype=} \n{x.device=} \n{x=!r}")
+        #     print(f"VanillaMoE expanded_inputs: {expanded_inputs.shape=} \n{expanded_inputs.dtype=} \n{expanded_inputs.device=} \n{expanded_inputs=!r}")
+        #     print(f"VanillaMoE expanded_scales: {expanded_scales.shape=} \n{expanded_scales.dtype=} \n{expanded_scales.device=} \n{expanded_scales=!r}")
+        #     print(f"VanillaMoE sorted_experts: {sorted_experts.shape=} \n{sorted_experts.dtype=} \n{sorted_experts.device=} \n{sorted_experts=!r}")
+        #     print(f"VanillaMoE batch_indices: {batch_indices.shape=} \n{batch_indices.dtype=} \n{batch_indices.device=} \n{batch_indices=!r}")
+        #     print("="*100)
         final_hidden_states = self.run_experts(
             x,
             expanded_inputs,
             expanded_scales,
             sorted_experts,
             batch_indices,
+            show,
         )
+
+        if show:
+            print("="*100)
+            # print(f"VanillaMoE after run_experts tp_rank: {self.tp_rank=} {self.tp_size=} {self.ep_rank=} {self.ep_size=} {self.cluster_rank=} {self.cluster_size=} {self.use_dp=} {self.parallel_size=} {self.reduce_results=}")
+            print(f"222 VanillaMoE {self.ep_rank=} after run_experts: {final_hidden_states.shape=} \n{final_hidden_states.dtype=} \n{final_hidden_states.device=} \n{final_hidden_states=!r}")
+            print("="*100)
 
         final_hidden_states = self.reducescatter_or_allreduce(
             final_hidden_states,
             all_rank_num_tokens=all_rank_num_tokens,
             use_dp_padding=use_dp_padding,
         )
+
+        if show:
+            print("="*100)
+            print(f"333 VanillaMoE {self.ep_rank=} final final allreduce final_hidden_states: {final_hidden_states.shape=} \n{final_hidden_states.dtype=} \n{final_hidden_states.device=} \n{final_hidden_states=!r}")
+            print("="*100)
+
         return final_hidden_states

@@ -158,6 +158,7 @@ def create_moe(
             model_config=model_config,
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
+            layer_idx=layer_idx,
         )
     elif moe_cls == CuteDslFusedMoE:
         return moe_cls(

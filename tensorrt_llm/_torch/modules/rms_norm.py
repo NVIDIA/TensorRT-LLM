@@ -65,13 +65,19 @@ class RMSNorm(nn.Module):
         residual: Union[
             Optional[torch.Tensor],
             _ArgumentNotSpecifiedSentinelType] = _ARGUMENT_NOT_SPECIFIED_SENTINEL,
+        show: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
         return_residual = True
         if residual is self._ARGUMENT_NOT_SPECIFIED_SENTINEL:
             return_residual = False
             residual = None
 
-        if IS_FLASHINFER_AVAILABLE:
+        if show:
+            print("="*100)
+            print(f"{IS_FLASHINFER_AVAILABLE=}")
+            print("="*100)
+
+        if False and IS_FLASHINFER_AVAILABLE:
             from ..custom_ops import (flashinfer_fused_add_rmsnorm,
                                       flashinfer_gemma_fused_add_rmsnorm,
                                       flashinfer_gemma_rmsnorm,
@@ -96,6 +102,13 @@ class RMSNorm(nn.Module):
         else:
             input_dtype = hidden_states.dtype
             hidden_states = hidden_states.to(torch.float32)
+
+            if show:
+                print("="*100)
+                print(f"RMSNorm 1 forward: {hidden_states.shape=} \n{hidden_states.dtype=} \n{hidden_states.device=} \n{hidden_states=!r}")
+                print(f"RMSNorm 2 forward: {residual=!r}")
+                print("="*100)
+
             if residual is not None:
                 hidden_states = hidden_states + residual.to(torch.float32)
                 residual = hidden_states.to(input_dtype)
@@ -103,11 +116,23 @@ class RMSNorm(nn.Module):
             variance = hidden_states.pow(2).mean(-1, keepdim=True)
             hidden_states = hidden_states * torch.rsqrt(variance +
                                                         self.variance_epsilon)
+            if show:
+                print("="*100)
+                print(f"RMSNorm 3 forward: {hidden_states.shape=} \n{hidden_states.dtype=} \n{hidden_states.device=} \n{hidden_states=!r}")
+                print(f"RMSNorm 4 forward: {variance.shape=} \n{variance.dtype=} \n{variance.device=} \n{variance=!r}")
+                print(f"RMSNorm 5 forward: {self.variance_epsilon=!r}")
+                print(f"RMSNorm 5 forward: {self.weight=!r}")
+                print("="*100)
             if not self.use_gemma:
                 hidden_states = self.weight * hidden_states.to(input_dtype)
             else:
                 hidden_states = (self.weight +
                                  1) * hidden_states.to(input_dtype)
+            if show:
+                print("="*100)
+                print(f"RMSNorm 6 forward: {hidden_states.shape=} \n{hidden_states.dtype=} \n{hidden_states.device=} \n{hidden_states=!r}")
+                print(f"RMSNorm 7 forward: {self.use_gemma=!r}")
+                print("="*100)
 
         if return_residual:
             return hidden_states, cast(Optional[torch.Tensor], residual)
