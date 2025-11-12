@@ -167,7 +167,6 @@ class ADEngine(ModelEngine):
 
         # build model
         self.model = get_inference_model(self.cache_seq_interface)
-        print(self.llm_args)
         # start fresh with fixed seed
         torch.manual_seed(42)
 
