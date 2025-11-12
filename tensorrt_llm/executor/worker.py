@@ -21,7 +21,7 @@ from ..llmapi.tracer import VizTracer, set_global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue, logger_debug,
                             print_traceback_on_error)
 from ..sampling_params import BatchedLogitsProcessor
-from .base_worker import BaseWorker
+from .base_worker import BaseWorker, _init_hf_modules
 from .executor import IterationResultQueue
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import (PostprocWorker, PostprocWorkerConfig,
@@ -242,6 +242,10 @@ def worker_main(
     llm_args: Optional[BaseLlmArgs] = None,
 ) -> None:
     mpi_comm().barrier()
+
+    if llm_args is not None and llm_args.trust_remote_code:
+        _init_hf_modules()
+
     logger_debug(f"Worker {mpi_rank()} entering worker_main...\n", "green")
 
     result_queue: Optional[IpcQueue] = None

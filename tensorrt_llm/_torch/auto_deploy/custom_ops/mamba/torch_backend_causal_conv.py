@@ -355,4 +355,5 @@ class TorchBackendCausalConv(AttentionDescriptor):
         stride, padding, dilation, groups, padding_mode = extract_op_args(
             source_attn_node, "stride", "padding", "dilation", "groups", "padding_mode"
         )
-        return [stride, padding, dilation, groups, padding_mode]
+        # None is for activation parameter, which may not exist in the source node (added by fusion later)
+        return [stride, padding, dilation, groups, padding_mode, None]
