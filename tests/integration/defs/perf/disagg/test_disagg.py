@@ -77,14 +77,20 @@ class TestDisaggBenchmark:
             assert success, f"Job submission failed: {test_config.test_id}"
             assert job_id, "Unable to get job ID"
 
-            # Wait for completion
-            completed = JobManager.wait_for_completion(job_id, 7200)
+            # Wait for completion (with early failure detection)
+            completed, error_msg = JobManager.wait_for_completion(
+                job_id, 7200, test_config, check_early_failure=True
+            )
             if not completed:
                 JobManager.cancel_job(job_id)
                 result_dir = JobManager.get_result_dir(test_config)
                 JobManager.backup_logs(job_id, test_config, result_dir)
                 JobManager.cleanup_result_dir(result_dir)
-                assert False, f"Job execution timeout: {job_id}"
+                # Provide detailed error message
+                if error_msg == "timeout":
+                    assert False, f"Job execution timeout after 7200s: {job_id}"
+                else:
+                    assert False, f"Job failed early: {error_msg} (job_id: {job_id})"
 
             # End tracking test case
             test_tracker.end_test_case()

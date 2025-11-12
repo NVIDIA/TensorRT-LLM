@@ -4,6 +4,7 @@ Simplified version.
 """
 
 import os
+import re
 import shutil
 import time
 from pathlib import Path
@@ -366,6 +367,54 @@ class JobManager:
         return check_result
 
     @staticmethod
+    def check_for_early_failure(job_id: str, test_config) -> tuple[bool, Optional[str]]:
+        """Check logs for early failure indicators.
+        
+        Args:
+            job_id: SLURM job ID
+            test_config: TestConfig object
+            
+        Returns:
+            tuple: (has_error, error_message)
+        """
+        # Key error patterns
+        error_patterns = [
+            (r"\[E\]\s+Traceback", "TRT-LLM error traceback detected"),
+            (r"srun: error:", "SLURM error detected"),
+        ]
+        
+        try:
+            # Check gen and ctx server logs if result_dir exists
+            try:
+                result_dir = JobManager.get_result_dir(test_config)
+                if os.path.exists(result_dir):
+                    # Find all output_gen_*.log and output_ctx_*.log files
+                    for filename in os.listdir(result_dir):
+                        if (filename.startswith("output_gen_") or filename.startswith("output_ctx_")) and filename.endswith(".log"):
+                            log_path = os.path.join(result_dir, filename)
+                            try:
+                                with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
+                                    # Read last 100KB
+                                    f.seek(0, 2)
+                                    file_size = f.tell()
+                                    f.seek(max(0, file_size - 102400), 0)
+                                    recent_content = f.read()
+                                    
+                                    for pattern, error_msg in error_patterns:
+                                        if re.search(pattern, recent_content, re.MULTILINE):
+                                            return True, f"{error_msg} in {filename}"
+                            except Exception as e:
+                                print(f"   ⚠️  Warning: Failed to check {filename}: {e}")
+            except Exception as e:
+                # result_dir might not exist yet, that's OK
+                pass
+                
+        except Exception as e:
+            print(f"   ⚠️  Warning: Error during early failure check: {e}")
+        
+        return False, None
+
+    @staticmethod
     def check_job_status(job_id: str) -> str:
         """Check job status using sacct (works for all job states)."""
         try:
@@ -387,9 +436,26 @@ class JobManager:
             return "ERROR"
 
     @staticmethod
-    def wait_for_completion(job_id: str, timeout: int = 3600) -> bool:
-        """Wait for job completion."""
+    def wait_for_completion(job_id: str, timeout: int = 3600, test_config=None, 
+                           check_early_failure: bool = True) -> tuple[bool, Optional[str]]:
+        """Wait for job completion with optional early failure detection.
+        
+        Args:
+            job_id: SLURM job ID
+            timeout: Maximum wait time in seconds
+            test_config: TestConfig object (required for early failure detection)
+            check_early_failure: Whether to check logs for early failures
+            
+        Returns:
+            tuple: (completed_successfully, error_message)
+                - (True, None): Job completed normally
+                - (False, "timeout"): Job timed out
+                - (False, error_msg): Job failed early with specific error
+        """
         start_time = time.time()
+        check_interval = 30  # Check every 30 seconds
+        failure_check_interval = 60  # Check for failures every 60 seconds
+        last_failure_check = start_time
 
         # Wait for job to appear in system (initial delay)
         print(f"   ⏳ Waiting for job {job_id} to appear in system...")
@@ -417,19 +483,31 @@ class JobManager:
             ] or ("error" in status.lower() and status != "ERROR"):
                 if status == "COMPLETED":
                     print(f"   ✅ Job {job_id} completed successfully")
+                    return True, None
                 else:
                     print(f"   ❌ Job {job_id} finished with status: {status}")
-                return True  # Job finished (successfully or with failure)
+                    return True, None  # Job finished (let check_result determine success)
 
             # For running states, don't print repeatedly - status change already printed above
             # Only log unexpected/unknown statuses
             if status not in ["RUNNING", "PENDING", "CONFIGURING", "COMPLETING", "UNKNOWN"]:
                 print(f"   🔍 Job {job_id} has unexpected status: {status}")
 
-            time.sleep(30)  # check every 30 seconds
+            # Check for early failures (only when job is running and test_config is provided)
+            current_time = time.time()
+            if (check_early_failure and test_config and status == "RUNNING" and 
+                current_time - last_failure_check >= failure_check_interval):
+                has_error, error_msg = JobManager.check_for_early_failure(job_id, test_config)
+                if has_error:
+                    print(f"   🚨 Early failure detected: {error_msg}")
+                    print(f"   🛑 Stopping wait for job {job_id}")
+                    return False, error_msg
+                last_failure_check = current_time
+
+            time.sleep(check_interval)
 
         print(f"   ⏰ Job {job_id} timeout after {timeout} seconds")
-        return False  # timeout
+        return False, "timeout"
 
     @staticmethod
     def cancel_job(job_id: str) -> bool:
