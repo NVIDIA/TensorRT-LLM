@@ -3536,16 +3536,14 @@ def test_eagle3_output_consistency_4gpus(model_dir: str, draft_model_dir: str):
         speculative_model_dir=eagle_model_dir,
         eagle3_one_model=True,
     )
-    llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
-    results_spec = llm_spec.generate([prompt], sampling_params)
-    output_spec = results_spec[0].outputs[0].text
-    llm_spec.shutdown()
+    with LLM(**llm_common_config, speculative_config=spec_config) as llm_spec:
+        results_spec = llm_spec.generate([prompt], sampling_params)
+        output_spec = results_spec[0].outputs[0].text
 
     # Run without Eagle3 (baseline)
-    llm_ref = LLM(**llm_common_config)
-    results_ref = llm_ref.generate([prompt], sampling_params)
-    output_ref = results_ref[0].outputs[0].text
-    llm_ref.shutdown()
+    with LLM(**llm_common_config) as llm_ref:
+        results_ref = llm_ref.generate([prompt], sampling_params)
+        output_ref = results_ref[0].outputs[0].text
 
     length_ratio = min(len(output_spec), len(output_ref)) / max(
         len(output_spec), len(output_ref))
@@ -3553,7 +3551,6 @@ def test_eagle3_output_consistency_4gpus(model_dir: str, draft_model_dir: str):
         f"Output lengths differ too much! "
         f"Eagle3: {len(output_spec)} chars, Baseline: {len(output_ref)} chars")
 
-    import re
     repetitive_pattern = re.compile(
         r'(.)\1{10,}')  # Check for 10+ repeated chars
     assert not repetitive_pattern.search(output_spec), (
