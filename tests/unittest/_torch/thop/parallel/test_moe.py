@@ -1806,10 +1806,10 @@ def test_moe_fp8_per_tensor_scale(num_tokens, hidden_size, intermediate_size,
                                                         tile_tokens_dim)
     elif routing_method_type == RoutingMethodType.Renormalize:
         permute_info, scores = routing_reference_renormalize(
-            expert_logits, top_k, num_experts, tile_tokens_dim)
+            expert_logits, top_k, tile_tokens_dim)
     elif routing_method_type == RoutingMethodType.RenormalizeNaive:
         permute_info, scores = routing_reference_renormalize_naive(
-            expert_logits, top_k, num_experts, tile_tokens_dim)
+            expert_logits, top_k, tile_tokens_dim)
     elif routing_method_type == RoutingMethodType.Llama4:
         permute_info, scores = routing_reference_no_aux(
             expert_logits, routing_bias, top_k, n_groups, top_k_groups,

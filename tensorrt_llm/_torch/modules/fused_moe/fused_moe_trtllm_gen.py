@@ -285,7 +285,7 @@ class TRTLLMGenFusedMoE(MoE):
                     False)
         elif self.has_w4a8_mxfp4_mxfp8:
             x, x_sf = torch.ops.trtllm.mxfp8_quantize(
-                x, False, alignment=self.quant_method.weight_alignment)
+                x, False, alignment=self.quant_method.input_hidden_alignment)
             x_row, x_col = x.shape[0], x.shape[1]
         elif self.has_deepseek_fp8_block_scales:
             # No change required before communication
