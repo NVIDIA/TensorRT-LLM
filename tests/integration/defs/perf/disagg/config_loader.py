@@ -402,7 +402,7 @@ class ConfigLoader:
 
         # Apply overrides based on field paths
         for (section, key), value_getter in field_mapping.items():
-            if section in config and key in config[section]:
+            if section in config:
                 config[section][key] = value_getter()
         return config
 
