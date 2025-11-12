@@ -36,6 +36,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 0, 0, get_last_power_of_2_num_tokens_buckets,
                 last_positive_power_of_2), ),
             constraint_specs=(ConstraintSpec(2, 0, fp4_scale_infer_shape), ),
+            use_cuda_graph=True,
         )
 
         def __init__(self, alpha: float, output_dtype: torch.dtype):
