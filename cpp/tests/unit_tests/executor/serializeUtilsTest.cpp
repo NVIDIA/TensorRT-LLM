@@ -1087,7 +1087,8 @@ TEST(SerializeUtilsTest, RequestAndBufferInfo)
     // Test with all fields populated
     {
         kv_cache::RequestAndBufferInfo original{"testAgent", "127.0.0.1:8080",
-            tensorrt_llm::batch_manager::RequestInfo{}, kv_cache::MemoryDesc{nullptr, 1024, 0},
+            tensorrt_llm::batch_manager::RequestInfo{},
+            std::vector<kv_cache::MemoryDesc>{kv_cache::MemoryDesc{nullptr, 1024, 0}},
             std::make_optional<std::string>("metadata"), 1};
 
         auto deserialized = serializeDeserializeNotification(original);
@@ -1095,9 +1096,10 @@ TEST(SerializeUtilsTest, RequestAndBufferInfo)
         EXPECT_EQ(original.mAgentName, deserialized.mAgentName);
         EXPECT_EQ(original.mAddress, deserialized.mAddress);
         EXPECT_EQ(original.mRequestInfo.getRequestId(), deserialized.mRequestInfo.getRequestId());
-        EXPECT_EQ(original.mBufferDesc.getAddr(), deserialized.mBufferDesc.getAddr());
-        EXPECT_EQ(original.mBufferDesc.getLen(), deserialized.mBufferDesc.getLen());
-        EXPECT_EQ(original.mBufferDesc.getDeviceId(), deserialized.mBufferDesc.getDeviceId());
+        ASSERT_EQ(original.mBufferDescs.size(), deserialized.mBufferDescs.size());
+        EXPECT_EQ(original.mBufferDescs[0].getAddr(), deserialized.mBufferDescs[0].getAddr());
+        EXPECT_EQ(original.mBufferDescs[0].getLen(), deserialized.mBufferDescs[0].getLen());
+        EXPECT_EQ(original.mBufferDescs[0].getDeviceId(), deserialized.mBufferDescs[0].getDeviceId());
         EXPECT_EQ(original.mMetadata, deserialized.mMetadata);
         EXPECT_EQ(original.mValidConnectionIdx, deserialized.mValidConnectionIdx);
     }
@@ -1105,16 +1107,18 @@ TEST(SerializeUtilsTest, RequestAndBufferInfo)
     // Test with nullopt metadata
     {
         kv_cache::RequestAndBufferInfo original{"testAgent2", "192.168.1.1:9090",
-            tensorrt_llm::batch_manager::RequestInfo{}, kv_cache::MemoryDesc{nullptr, 512, 0}, std::nullopt, 2};
+            tensorrt_llm::batch_manager::RequestInfo{},
+            std::vector<kv_cache::MemoryDesc>{kv_cache::MemoryDesc{nullptr, 512, 0}}, std::nullopt, 2};
 
         auto deserialized = serializeDeserializeNotification(original);
 
         EXPECT_EQ(original.mAgentName, deserialized.mAgentName);
         EXPECT_EQ(original.mAddress, deserialized.mAddress);
         EXPECT_EQ(original.mRequestInfo.getRequestId(), deserialized.mRequestInfo.getRequestId());
-        EXPECT_EQ(original.mBufferDesc.getAddr(), deserialized.mBufferDesc.getAddr());
-        EXPECT_EQ(original.mBufferDesc.getLen(), deserialized.mBufferDesc.getLen());
-        EXPECT_EQ(original.mBufferDesc.getDeviceId(), deserialized.mBufferDesc.getDeviceId());
+        ASSERT_EQ(original.mBufferDescs.size(), deserialized.mBufferDescs.size());
+        EXPECT_EQ(original.mBufferDescs[0].getAddr(), deserialized.mBufferDescs[0].getAddr());
+        EXPECT_EQ(original.mBufferDescs[0].getLen(), deserialized.mBufferDescs[0].getLen());
+        EXPECT_EQ(original.mBufferDescs[0].getDeviceId(), deserialized.mBufferDescs[0].getDeviceId());
         EXPECT_EQ(original.mMetadata, deserialized.mMetadata);
         EXPECT_EQ(original.mValidConnectionIdx, deserialized.mValidConnectionIdx);
     }
@@ -1194,7 +1198,8 @@ TEST(SerializeUtilsTest, NotificationInfo)
     // Test with RequestAndBufferInfo variant
     {
         kv_cache::RequestAndBufferInfo requestInfo{"testAgent", "127.0.0.1:8080",
-            tensorrt_llm::batch_manager::RequestInfo{}, kv_cache::MemoryDesc{nullptr, 1024, 0},
+            tensorrt_llm::batch_manager::RequestInfo{},
+            std::vector<kv_cache::MemoryDesc>{kv_cache::MemoryDesc{nullptr, 1024, 0}},
             std::make_optional<std::string>("test_metadata"), 1};
 
         kv_cache::NotificationInfo original{requestInfo};
