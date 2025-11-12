@@ -118,7 +118,7 @@ def submit_job(config):
         f'--ntasks={total_tasks}',
         f'--ntasks-per-node={hw_config["gpus_per_node"]}',
         f'--segment={total_nodes}',
-        f'--reservation=oos_fix_gdrdrv_dkms',
+        # f'--reservation=oos_fix_gdrdrv_dkms',
         slurm_config['script_file'],
         # Hardware configuration
         str(hw_config['gpus_per_node']),
