@@ -18,6 +18,7 @@ pytorch=0
 opencv=0
 ucx=0
 nixl=0
+etcd=0
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -65,6 +66,10 @@ while [[ $# -gt 0 ]]; do
             nixl=1
             shift 1
             ;;
+        --etcd)
+            etcd=1
+            shift 1
+            ;;
         --all)
             base=1
             cmake=1
@@ -77,6 +82,7 @@ while [[ $# -gt 0 ]]; do
             opencv=1
             ucx=1
             nixl=1
+            etcd=1
             shift 1
             ;;
         *)
@@ -150,4 +156,9 @@ fi
 if [ $nixl -eq 1 ]; then
     echo "Installing NIXL..."
     GITHUB_MIRROR=$GITHUB_MIRROR bash $SCRIPT_DIR/install_nixl.sh
+fi
+
+if [ $etcd -eq 1 ]; then
+    echo "Installing etcd..."
+    bash $SCRIPT_DIR/install_etcd.sh
 fi
