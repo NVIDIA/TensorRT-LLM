@@ -972,19 +972,14 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
 }
 
 std::unique_ptr<BaseCacheFormatter> createCacheFormatter(
-    BaseKVCacheManager* cacheManager, CacheTransBufferManager* cacheTransBufferManager, bool isMLA)
+    BaseKVCacheManager* cacheManager, std::vector<CacheTransBufferManager*> const& cacheTransBufferManagers, bool isMLA)
 {
+    TLLM_CHECK(!cacheTransBufferManagers.empty());
     if (isMLA)
     {
-        std::vector<CacheTransBufferManager*> cacheTransBufferManagers = {cacheTransBufferManager};
-        auto maxNumTokens = cacheTransBufferManager->getMaxNumTokens();
-        if (cacheManager->isEnableIndexerKCache())
-        {
-            cacheTransBufferManagers.push_back(new CacheTransBufferManager(cacheManager, maxNumTokens, true));
-        }
         return std::make_unique<MLACacheFormatter>(cacheManager, cacheTransBufferManagers);
     }
-    return std::make_unique<CacheFormatter>(cacheManager, cacheTransBufferManager);
+    return std::make_unique<CacheFormatter>(cacheManager, cacheTransBufferManagers[0]);
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

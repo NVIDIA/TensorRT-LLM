@@ -294,15 +294,17 @@ protected:
     {
         int maxNumTokens = 1024;
         mCacheTransBufferManager = std::make_unique<CacheTransBufferManager>(mManager.get(), maxNumTokens);
+        std::vector<CacheTransBufferManager*> bufferManagers;
+        bufferManagers.push_back(mCacheTransBufferManager.get());
         if (isSender)
         {
             mSender = std::make_unique<CacheSender>(mConnectionManager.get(), *mCacheState, mlocalRank,
-                std::make_unique<CacheFormatter>(mManager.get(), mCacheTransBufferManager.get()));
+                createCacheFormatter(mManager.get(), bufferManagers, /*isMLA=*/false));
         }
         else
         {
             mRequester = std::make_unique<CacheReceiver>(mConnectionManager.get(), *mCacheState, mlocalRank,
-                std::make_unique<CacheFormatter>(mManager.get(), mCacheTransBufferManager.get()));
+                createCacheFormatter(mManager.get(), bufferManagers, /*isMLA=*/false));
         }
     }
 
@@ -709,7 +711,17 @@ protected:
             || tensorrt_llm::common::getEnvUseNixlKvCache())
         {
             int maxNumTokens = 2048;
-            mCacheTransBufferManager = std::make_unique<CacheTransBufferManager>(mManager.get(), maxNumTokens);
+            mCacheTransBufferManagers.clear();
+            mCacheTransBufferManagers.emplace_back(
+                std::make_unique<CacheTransBufferManager>(mManager.get(), maxNumTokens));
+            std::vector<CacheTransBufferManager*> bufferManagers;
+            bufferManagers.push_back(mCacheTransBufferManagers.back().get());
+            if (mManager->isEnableIndexerKCache() && mIsMLA)
+            {
+                mCacheTransBufferManagers.emplace_back(
+                    std::make_unique<CacheTransBufferManager>(mManager.get(), maxNumTokens, true));
+                bufferManagers.push_back(mCacheTransBufferManagers.back().get());
+            }
             bool isUcx = tensorrt_llm::common::getEnvUseUCXKvCache();
             bool isNixl = tensorrt_llm::common::getEnvUseNixlKvCache();
             TLLM_LOG_INFO("Enable %s KV cache transport.", isUcx ? "UCX" : isNixl ? "NIXL" : "MPI");
@@ -738,8 +750,8 @@ protected:
 
                 setenv("TRTLLM_NIXL_PORT", std::to_string(port).c_str(), 1);
 
-                mConnectionManager = std::make_unique<texec::kv_cache::AgentConnectionManager>(
-                    mCacheTransBufferManager.get(), *mCacheState);
+                mConnectionManager
+                    = std::make_unique<texec::kv_cache::AgentConnectionManager>(bufferManagers, *mCacheState);
             }
             else
             {
@@ -748,7 +760,7 @@ protected:
 
             TLLM_LOG_DEBUG("setUpCacheTransceiver mIsMLA: %d", mIsMLA);
             auto makeFormatter
-                = [this]() { return createCacheFormatter(mManager.get(), mCacheTransBufferManager.get(), mIsMLA); };
+                = [this, bufferManagers]() { return createCacheFormatter(mManager.get(), bufferManagers, mIsMLA); };
             TLLM_LOG_DEBUG("setUpCacheTransceiver makeFormatter");
 
             if (mIsContext)
@@ -1225,7 +1237,7 @@ protected:
 
     SizeType32 mMaxNumSequences{};
     std::unique_ptr<KVCacheManager> mManager;
-    std::unique_ptr<CacheTransBufferManager> mCacheTransBufferManager;
+    std::vector<std::unique_ptr<CacheTransBufferManager>> mCacheTransBufferManagers;
     std::unique_ptr<CacheSender> mSender;
     std::unique_ptr<CacheReceiver> mRequester;
     std::unique_ptr<texec::kv_cache::CacheState> mCacheState;

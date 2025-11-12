@@ -131,6 +131,16 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
 
     for (auto transferIndexerKCache : transferringIndexerKCache)
     {
+        auto activeBufferIdx = transferIndexerKCache ? 1UL : 0UL;
+        for (auto const* connection : connections)
+        {
+            if (auto const* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connection))
+            {
+                TLLM_CHECK(agentConnection->getSenderBufferCount() > activeBufferIdx);
+                const_cast<executor::kv_cache::AgentConnection*>(agentConnection)
+                    ->setActiveSenderBufferIdx(activeBufferIdx);
+            }
+        }
         int blockNum = 0;
         std::vector<runtime::ITensor::SharedPtr> inputKvCacheBlocks;
         if (!transferIndexerKCache)
@@ -417,9 +427,10 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
         else
         {
             auto* agentConnnecion = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[0]);
+            size_t activeBufferIdx = transferIndexerKCache ? 1 : 0;
             if (agentConnnecion != nullptr)
             {
-                cacheBufferId = agentConnnecion->getCacheBufferId();
+                cacheBufferId = agentConnnecion->getCacheBufferId(activeBufferIdx);
                 TLLM_CHECK(cacheBufferId.has_value());
             }
             else
