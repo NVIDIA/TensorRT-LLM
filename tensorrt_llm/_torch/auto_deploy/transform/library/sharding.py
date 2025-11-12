@@ -22,9 +22,10 @@ from collections import defaultdict
 from typing import DefaultDict, Dict, List, Set, Tuple, Type
 
 import torch
-from pydantic import Field
+from pydantic import Field, field_validator
 from torch.fx import GraphModule, Node
 
+from .....functional import AllReduceStrategy
 from ...models.factory import ModelFactory, ShardingConfigSource
 from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
@@ -149,6 +150,32 @@ class ShardingTransformConfig(TransformConfig):
     sharding_dims: List[ShardingDim] = Field(
         default_factory=lambda: [ShardingDim.SSM, ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
     )
+    allreduce_strategy: AllReduceStrategy = Field(
+        default=AllReduceStrategy.AUTO,
+        description="AllReduce strategy for distributed operations. Options: AUTO (automatic selection), "
+        "NCCL (NCCL-based), ONESHOT (single-phase fusion kernel), TWOSHOT (two-phase fusion kernel), "
+        "MIN_LATENCY (minimum latency heuristic), LOWPRECISION (low precision allreduce), "
+        "UB (unified buffer), MNNVL (multi-node NVLINK), NCCL_SYMMETRIC (NCCL symmetric). "
+        "This is set as a global variable during transform application.",
+    )
+
+    @field_validator("allreduce_strategy", mode="before")
+    @classmethod
+    def _validate_allreduce_strategy(cls, v):
+        """Convert string names like 'AUTO' or 'ONESHOT' to AllReduceStrategy enum."""
+        if isinstance(v, AllReduceStrategy):
+            return v
+        if isinstance(v, str):
+            try:
+                return AllReduceStrategy[v]
+            except KeyError:
+                raise ValueError(
+                    f"Invalid allreduce strategy: {v}. "
+                    f"Valid options: {', '.join(s.name for s in AllReduceStrategy)}"
+                )
+        if isinstance(v, int):
+            return AllReduceStrategy(v)
+        return v
 
 
 @TransformRegistry.register("detect_sharding")
@@ -185,6 +212,23 @@ class Sharding(BaseTransform):
     ) -> Tuple[GraphModule, TransformInfo]:
         local_rank, world_size = shared_config.local_rank, shared_config.world_size
         # world_size = 2
+
+        # Configure global allreduce strategy from transform config
+        # This is set once during sharding transform and used by all distributed operations
+        if hasattr(self.config, "allreduce_strategy"):
+            try:
+                from ...distributed.trtllm import TRTLLM_OP_AVAILABLE, set_allreduce_strategy
+
+                if TRTLLM_OP_AVAILABLE:
+                    # config.allreduce_strategy is already an AllReduceStrategy enum
+                    set_allreduce_strategy(self.config.allreduce_strategy)
+                    if self.config.allreduce_strategy != AllReduceStrategy.AUTO:
+                        ad_logger.info(
+                            f"Global allreduce strategy configured from transform: "
+                            f"{self.config.allreduce_strategy.name}"
+                        )
+            except (ImportError, AttributeError) as e:
+                ad_logger.warning(f"Failed to set allreduce strategy: {e}")
 
         if world_size < 2:
             ad_logger.info("Skipping sharding for single device")

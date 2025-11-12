@@ -80,6 +80,7 @@ transforms:
     sharding_source: ['heuristic']
     support_partial_config: true
     sharding_dims: ['tp', 'ep', 'bmm']
+    allreduce_strategy: 'AUTO'
     requires_shape_prop: true
   # TODO: (hg) need to ensure run_shape_prop after sharding.
   sharding_transform_executor:

@@ -13,20 +13,35 @@ try:
     # warmup causes hangs due to workspace allocation with CPU synchronization
     _allreduce_cache = {}
 
-    # Global allreduce strategy configuration
-    # Can be set via set_allreduce_strategy() to override the default AUTO strategy
+    # Global AllReduce Strategy Configuration
+    # =========================================
+    # This global variable controls which allreduce implementation is used across
+    # all distributed operations in AutoDeploy. It's set once at initialization
+    # time via set_allreduce_strategy() and remains constant during execution.
     _global_allreduce_strategy = AllReduceStrategy.AUTO
 
     def set_allreduce_strategy(strategy: AllReduceStrategy):
-        """Set the global allreduce strategy for distributed operations.
+        """Set the global allreduce strategy for all distributed operations.
 
-        Args:
-            strategy: AllReduceStrategy enum value (AUTO, NCCL, ONESHOT, TWOSHOT, etc.)
+        This should be called once during initialization, before any distributed
+        operations are executed. All subsequent allreduce calls will use this strategy.
+
+        Note:
+            This clears the allreduce cache to ensure new operations use the updated strategy.
+            Call this before any model compilation or CUDA graph capture.
         """
         global _global_allreduce_strategy
         _global_allreduce_strategy = strategy
         # Clear cache when strategy changes to force recreation with new strategy
         _allreduce_cache.clear()
+
+    def get_allreduce_strategy() -> AllReduceStrategy:
+        """Get the current global allreduce strategy.
+
+        Returns:
+            The currently configured AllReduceStrategy enum value.
+        """
+        return _global_allreduce_strategy
 
     def trtllm_allgather(tensor, dim, sizes=None):
         rank, world_size = get_rank_world_size()
@@ -75,6 +90,9 @@ try:
 except ImportError:
 
     def set_allreduce_strategy(strategy):
+        raise ImportError("TRT-LLM is not available.")
+
+    def get_allreduce_strategy():
         raise ImportError("TRT-LLM is not available.")
 
     def trtllm_allgather(tensor, dim, sizes=None):
