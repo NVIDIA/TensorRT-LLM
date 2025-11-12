@@ -230,40 +230,17 @@ class JobManager:
             return False, error_msg
 
     @staticmethod
-    def check_result(
-        job_id: str,
-        test_config,
-        timestamps: Optional[Dict[str, str]] = None,
-        test_name: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Check job execution result and generate report.
-
-        High-level method that automatically extracts parameters from TestConfig,
-        parses logs, generates performance reports, and saves results to CSV.
-
+    def backup_logs(job_id: str, test_config, result_dir: str) -> Optional[str]:
+        """Backup logs and config files to test_id directory.
+        
         Args:
             job_id: SLURM job ID
-            test_config: TestConfig object containing configuration
-            timestamps: Optional timestamps dict for the test case
-            test_name: Optional test name for reporting
-
+            test_config: TestConfig object
+            result_dir: Result directory path
+            
         Returns:
-            Dict with 'success' status and other result information
+            backup_dir path if successful, None otherwise
         """
-        # Extract parameters from YAML config using common utility
-        config_data = test_config.config_data
-        fields = extract_config_fields(config_data)
-
-        # Extract fields for logging and result directory
-        log_base = fields["log_base"]
-        context_dir = fields["context_dir"]
-        log_dir_name = log_base
-
-        print(f"   📁 Log directory: {log_dir_name}")
-        print(f"   📁 Context directory: {context_dir}")
-
-        result_dir = os.path.join(EnvManager.get_script_dir(), log_dir_name, context_dir)
-
         # Copy result_dir to a timestamped backup directory
         if os.path.exists(result_dir):
             # Replace colons with underscores for safe directory naming
@@ -292,10 +269,84 @@ class JobManager:
                 else:
                     print(f"   ⚠️  Warning: Case config not found: {case_config_path}")
 
+                return backup_dir
             except Exception as e:
                 print(f"   ⚠️  Warning: Failed to create backup copy: {e}")
+                return None
         else:
             print(f"   ⚠️  Warning: Result directory does not exist yet: {result_dir}")
+            return None
+
+    @staticmethod
+    def cleanup_result_dir(result_dir: str) -> bool:
+        """Clean up result directory.
+        
+        Args:
+            result_dir: Result directory path
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        if os.path.exists(result_dir):
+            try:
+                shutil.rmtree(result_dir)
+                print(f"   ✅ Result directory removed: {result_dir}")
+                return True
+            except Exception as e:
+                print(f"   ⚠️  Warning: Failed to remove result directory: {e}")
+                return False
+        return True
+
+    @staticmethod
+    def get_result_dir(test_config) -> str:
+        """Get result directory.
+        
+        Args:
+            test_config: TestConfig object
+            
+        Returns:
+            Result directory path
+        """
+        config_data = test_config.config_data
+        fields = extract_config_fields(config_data)
+
+        # Extract fields for logging and result directory
+        log_base = fields["log_base"]
+        context_dir = fields["context_dir"]
+        log_dir_name = log_base
+
+        print(f"   📁 Log directory: {log_dir_name}")
+        print(f"   📁 Context directory: {context_dir}")
+
+        result_dir = os.path.join(EnvManager.get_script_dir(), log_dir_name, context_dir)
+        return result_dir
+
+    @staticmethod
+    def check_result(
+        job_id: str,
+        test_config,
+        timestamps: Optional[Dict[str, str]] = None,
+        test_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Check job execution result and generate report.
+
+        High-level method that automatically extracts parameters from TestConfig,
+        parses logs, generates performance reports, and saves results to CSV.
+
+        Args:
+            job_id: SLURM job ID
+            test_config: TestConfig object containing configuration
+            timestamps: Optional timestamps dict for the test case
+            test_name: Optional test name for reporting
+
+        Returns:
+            Dict with 'success' status and other result information
+        """
+        config_data = test_config.config_data
+        # Get result directory
+        result_dir = JobManager.get_result_dir(test_config)
+        # Backup logs and config files
+        JobManager.backup_logs(job_id, test_config, result_dir)
 
         # Call the internal implementation method
         check_result = JobManager._check_job_result(
@@ -309,9 +360,9 @@ class JobManager:
             test_name=test_name,
         )
         
-        if os.path.exists(result_dir):
-            shutil.rmtree(result_dir)
-            print(f"   ✅ Result directory removed: {result_dir}")
+        # Clean up result directory
+        JobManager.cleanup_result_dir(result_dir)
+        
         return check_result
 
     @staticmethod
@@ -494,12 +545,17 @@ class JobManager:
         if not parse_result["status"]:
             return result
 
+        # Check if df is None
+        result_df = parse_result.get("df")
+        if result_df is None:
+            print("   ❌ Parse result contains None DataFrame")
+            return result
+
         output_path = EnvManager.get_output_path()
         os.makedirs(output_path, exist_ok=True)
 
         output_csv = os.path.join(output_path, "perf_script_test_results.csv")
         result_saver = ResultSaver(output_csv)
-        result_df = parse_result["df"]
         result_saver.append_a_df(result_df)
         result["success"] = True
         result["status"] = "SUCCESS"

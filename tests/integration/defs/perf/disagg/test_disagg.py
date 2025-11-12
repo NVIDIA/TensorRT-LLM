@@ -81,6 +81,9 @@ class TestDisaggBenchmark:
             completed = JobManager.wait_for_completion(job_id, 7200)
             if not completed:
                 JobManager.cancel_job(job_id)
+                result_dir = JobManager.get_result_dir(test_config)
+                JobManager.backup_logs(job_id, test_config, result_dir)
+                JobManager.cleanup_result_dir(result_dir)
                 assert False, f"Job execution timeout: {job_id}"
 
             # End tracking test case
