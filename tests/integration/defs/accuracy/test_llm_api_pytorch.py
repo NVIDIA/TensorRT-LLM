@@ -19,9 +19,9 @@ import torch
 from defs.conftest import get_sm_version, is_sm_100f
 
 from tensorrt_llm import LLM
+from tensorrt_llm._torch.model_config import MoeLoadBalancerConfig
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import \
     IS_TRITON_KERNELS_AVAILABLE
-from tensorrt_llm._torch.pyexecutor.config import MoeLoadBalancerConfig
 from tensorrt_llm.llmapi import (AutoDecodingConfig, CudaGraphConfig,
                                  EagleDecodingConfig, KvCacheConfig, MoeConfig,
                                  MTPDecodingConfig, NGramDecodingConfig,
@@ -1617,14 +1617,15 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_device_not_contain(["GB200"])
+    @parametrize_with_ids("moe_backend", ["WIDEEP", "CUTLASS", "TRTLLM"])
     @parametrize_with_ids("mtp_nextn", [0, 2])
-    def test_bfloat16_4gpus_online_eplb(self, mtp_nextn):
+    def test_bfloat16_4gpus_online_eplb(self, moe_backend, mtp_nextn):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
         num_slots = 80
         eplb_config = MoeLoadBalancerConfig(num_slots=num_slots,
                                             layer_updates_per_iter=2)
         pytorch_config = dict(cuda_graph_config=CudaGraphConfig(),
-                              moe_config=MoeConfig(backend="WIDEEP",
+                              moe_config=MoeConfig(backend=moe_backend,
                                                    load_balancer=eplb_config))
         mtp_config = None
         if mtp_nextn > 0:
@@ -1641,14 +1642,15 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_device_not_contain(["GB200"])
+    @parametrize_with_ids("moe_backend", ["WIDEEP", "TRTLLM"])
     @parametrize_with_ids("fp8kv", [True, False])
-    def test_nvfp4_4gpus_online_eplb(self, fp8kv):
+    def test_nvfp4_4gpus_online_eplb(self, moe_backend, fp8kv):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
         num_slots = 80
         eplb_config = MoeLoadBalancerConfig(num_slots=num_slots,
                                             layer_updates_per_iter=2)
         pytorch_config = dict(cuda_graph_config=CudaGraphConfig(),
-                              moe_config=MoeConfig(backend="WIDEEP",
+                              moe_config=MoeConfig(backend=moe_backend,
                                                    load_balancer=eplb_config))
         if fp8kv:
             kv_cache_config.dtype = "fp8"
@@ -2380,8 +2382,9 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
             (8, 1, 8, 0, False, True, True, True, 24, "_DEFAULT"),
             (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT"),
             (8, 1, 8, 0, True, True, True, True, 24, "_DEFAULT"),
+            (8, 1, 8, 3, False, False, True, True, 1, "TRTLLM"),
         ],
-        ids=["baseline", "baseline_mtp1", "baseline_fp8kv"])
+        ids=["baseline", "baseline_mtp1", "baseline_fp8kv", "latency"])
     def test_fp8_blockscale(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                             attention_dp, cuda_graph, overlap_scheduler,
                             max_batch_size, moe_backend):
@@ -2408,6 +2411,10 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
         )
 
         if fp8kv:
+            if get_sm_version() < 100:
+                pytest.skip(
+                    "FP8 KV cache is not supported on pre-Blackwell architectures"
+                )
             kv_cache_config.dtype = "fp8"
 
         mtp_config = None
@@ -2443,8 +2450,9 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
             (8, 1, 8, 0, False, True, True, True, 24, "CUTLASS"),
             (8, 1, 8, 1, False, True, True, True, 24, "CUTLASS"),
             (8, 1, 8, 0, True, True, True, True, 24, "CUTLASS"),
+            (8, 1, 8, 3, False, False, True, True, 1, "TRTLLM"),
         ],
-        ids=["baseline", "baseline_mtp1", "baseline_fp8kv"])
+        ids=["baseline", "baseline_mtp1", "baseline_fp8kv", "latency"])
     def test_nvfp4_multi_gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                               attention_dp, cuda_graph, overlap_scheduler,
                               max_batch_size, moe_backend):
@@ -3921,6 +3929,42 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           sampling_params=sampling_params,
                           extra_evaluator_kwargs=extra_evaluator_kwargs)
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_device_not_contain(["GB200"])
+    @pytest.mark.parametrize(
+        "kv_cache_dtype",
+        ["auto", pytest.param("fp8", marks=skip_pre_blackwell)])
+    def test_w4_4gpus_online_eplb(self, kv_cache_dtype, mocker):
+        """Test GPTOSS with online expert parallel load balancer using TRTLLM backend and attention DP."""
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
+                          {"scores_filter": "exact_match,flexible-extract"})
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
+                                        dtype=kv_cache_dtype)
+
+        # Configure online expert parallel load balancer
+        num_slots = 144
+        eplb_config = MoeLoadBalancerConfig(num_slots=num_slots,
+                                            layer_updates_per_iter=2)
+
+        pytorch_config = dict(disable_overlap_scheduler=False,
+                              cuda_graph_config=CudaGraphConfig(),
+                              moe_config=MoeConfig(backend="TRTLLM",
+                                                   load_balancer=eplb_config))
+
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=4,
+                 pipeline_parallel_size=1,
+                 moe_expert_parallel_size=4,
+                 kv_cache_config=kv_cache_config,
+                 enable_attention_dp=True,
+                 **pytorch_config) as llm:
+            model_name = "GPT-OSS/120B-MXFP4"
+            task = GSM8K(model_name)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
 
 @skip_pre_hopper

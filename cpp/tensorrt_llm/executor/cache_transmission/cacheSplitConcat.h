@@ -97,11 +97,12 @@ nvinfer1::Dims makeShapeFromCacheState(kv_cache::CacheState const& cacheState);
 
 void splitKVCacheDispatch(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>> const& kVCacheBlocksPerWindow,
     std::vector<runtime::ITensor::SharedPtr>& ouputSplitBlocks, kv_cache::CacheState const& peerCacheState,
-    kv_cache::CacheState const& selfCacheState, int selfIdx, runtime::BufferManager const& bufferManager);
+    kv_cache::CacheState const& selfCacheState, int selfIdx, runtime::BufferManager const& bufferManager,
+    bool isIndexerKCache = false);
 
 void concatKvCacheV2Dispatch(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlocksPerWindow,
     std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>& outputKvCacheBlocksPerWindow,
     kv_cache::CacheState const& peerCacheState, kv_cache::CacheState const& selfCacheState, int selfIdx,
-    runtime::BufferManager const& bufferManager);
+    runtime::BufferManager const& bufferManager, bool isIndexerKCache = false);
 
 } // namespace tensorrt_llm::executor::kv_cache

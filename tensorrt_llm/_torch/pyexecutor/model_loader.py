@@ -6,6 +6,8 @@ from typing import Callable, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
+    BaseCheckpointLoader
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.logger import logger
@@ -14,13 +16,13 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 
+from ...llmapi.llm_args import LoadFormat
 from ..model_config import ModelConfig
 from ..models import AutoModelForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_utils import MetaInitMode, timing
 from ..modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, maybe_create_moe_load_balancer)
-from .config import LoadFormat
 
 _KV_CACHE_MAP = {
     "fp8": QuantAlgo.FP8.value,
@@ -63,7 +65,7 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
     if not valid_pyt_quant:
         raise ValueError(
             "Overriding KV cache quantization with an invalid type "
-            f'"PyTorchConfig.kv_cache_dtype="{pyt_kv_cache_dtype}" '
+            f'"llm_args.KvCacheConfig.dtype="{pyt_kv_cache_dtype}" '
             f'Accepted types are "{_VALID_KV_CACHE_DTYPES}".')
 
     # If we get to this point we have a valid quantization setting, but if
@@ -71,7 +73,7 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
     if kv_cache_quant is not None and mapped_pyt_quant != kv_cache_quant:
         raise RuntimeError(
             "Attempting to override KV cache quantization "
-            f'"{kv_cache_quant}" with PyTorchConfig.kv_cache_dtype='
+            f'"{kv_cache_quant}" with llm_args.KvCacheConfig.dtype='
             f'"{pyt_kv_cache_dtype}". You cannot override a checkpoint with a '
             "pre-quantized KV cache that doesn't match.")
 
@@ -149,6 +151,31 @@ def get_rank_model_storage(model):
         ):
             total_bytes += buf.element_size() * buf.nelement()
     return total_bytes
+
+
+def _construct_checkpoint_loader(
+        backend: str, checkpoint_loader: Optional[BaseCheckpointLoader],
+        checkpoint_format: Optional[str]) -> Optional[BaseCheckpointLoader]:
+    if backend == "_autodeploy":
+        return None
+
+    from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
+        BaseCheckpointLoader
+    from tensorrt_llm._torch.models.modeling_utils import (
+        get_checkpoint_weight_loader, get_config_loader)
+
+    if checkpoint_loader is None:
+        checkpoint_weight_loader = get_checkpoint_weight_loader(
+            checkpoint_format)()
+        config_loader = get_config_loader(checkpoint_format)()
+
+        checkpoint_loader = BaseCheckpointLoader.get(
+            checkpoint_format=checkpoint_format,
+            weight_loader=checkpoint_weight_loader,
+            weight_mapper=None,
+            config_loader=config_loader)
+
+    return checkpoint_loader
 
 
 class ModelLoader:
