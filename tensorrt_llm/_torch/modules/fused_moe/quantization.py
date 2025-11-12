@@ -208,12 +208,18 @@ class FusedMoEMethodBase(ABC):
             module.w2_bias = None
 
     def load_expert_weights_to_dst(
-            self, module: torch.nn.Module, weights: List[Dict],
-            weight_loading_mode: MoEWeightLoadingMode,
-            load_expert_ids: List[int], dst_w3_w1_weights_tensor: torch.Tensor,
-            dst_w2_weights_tensor: torch.Tensor,
-            dst_w3_w1_bias_tensor: Optional[torch.Tensor],
-            dst_w2_bias_tensor: Optional[torch.Tensor]):
+        self,
+        *,
+        module: torch.nn.Module,
+        weights: List[Dict],
+        weight_loading_mode: MoEWeightLoadingMode,
+        load_expert_ids: List[int],
+        dst_w3_w1_weights_tensor: torch.Tensor,
+        dst_w2_weights_tensor: torch.Tensor,
+        dst_w3_w1_bias_tensor: Optional[torch.Tensor],
+        dst_w2_bias_tensor: Optional[torch.Tensor],
+        already_sharded: bool,
+    ):
         # Multithread weight load is superseded by prefetch_files() in model_engine.py
         # Also, threading adds overhead in order to protect shuffle index cache with critical section.
         for local_slot_id, expert_id in enumerate(load_expert_ids):
@@ -246,31 +252,53 @@ class FusedMoEMethodBase(ABC):
                     f"Unknown weight loading mode in MoE: {weight_loading_mode}"
                 )
 
-            self.load_expert_w3_w1_weight(module, w1_weight, w3_weight,
-                                          dst_w3_w1_weights_tensor[expert_idx])
+            self.load_expert_w3_w1_weight(
+                module=module,
+                w1_weight=w1_weight,
+                w3_weight=w3_weight,
+                dst_w3_w1_weight=dst_w3_w1_weights_tensor[expert_idx],
+                already_sharded=already_sharded)
 
-            self.load_expert_w2_weight(module, w2_weight,
-                                       dst_w2_weights_tensor[expert_idx])
+            self.load_expert_w2_weight(
+                module=module,
+                w2_weight=w2_weight,
+                dst_w2_weight=dst_w2_weights_tensor[expert_idx],
+                already_sharded=already_sharded)
 
             if module.bias:
                 self.load_expert_w3_w1_weight(
-                    module, w1_bias, w3_bias,
-                    dst_w3_w1_bias_tensor.data[expert_idx])
+                    module=module,
+                    w1_weight=w1_bias,
+                    w3_weight=w3_bias,
+                    dst_w3_w1_weight=dst_w3_w1_bias_tensor.data[expert_idx],
+                    already_sharded=already_sharded)
 
-                self.load_expert_w2_weight(module, w2_bias,
-                                           dst_w2_bias_tensor.data[expert_idx])
+                self.load_expert_w2_weight(
+                    module=module,
+                    w2_weight=w2_bias,
+                    dst_w2_weight=dst_w2_bias_tensor.data[expert_idx],
+                    already_sharded=already_sharded)
 
     def load_weights(self, module: torch.nn.Module, weights: List[Dict],
-                     weight_loading_mode: MoEWeightLoadingMode):
+                     weight_loading_mode: MoEWeightLoadingMode,
+                     already_sharded: bool):
+        logger.info(
+            f"Loading weights for {module.__class__.__name__} with weight mode: {weight_loading_mode} and already sharded: {already_sharded}"
+        )
 
         self.load_expert_weights_to_dst(
-            module, weights, weight_loading_mode,
-            module.initial_local_expert_ids, module.w3_w1_weight.data,
-            module.w2_weight.data,
-            module.w3_w1_bias.data if module.bias else None,
-            module.w2_bias.data if module.bias else None)
+            module=module,
+            weights=weights,
+            weight_loading_mode=weight_loading_mode,
+            load_expert_ids=module.initial_local_expert_ids,
+            dst_w3_w1_weights_tensor=module.w3_w1_weight.data,
+            dst_w2_weights_tensor=module.w2_weight.data,
+            dst_w3_w1_bias_tensor=module.w3_w1_bias.data
+            if module.bias else None,
+            dst_w2_bias_tensor=module.w2_bias.data if module.bias else None,
+            already_sharded=already_sharded)
 
-        self.load_quant_scales(module, weights)
+        self.load_quant_scales(module, weights, already_sharded)
 
         if self.need_load_shared_weights(module):
             local_shared_load_expert_ids = module.layer_load_balancer.get_load_expert_ids(
@@ -297,11 +325,17 @@ class FusedMoEMethodBase(ABC):
                     dtype=module.w2_bias.data.dtype,
                     device='cpu')
             self.load_expert_weights_to_dst(
-                module, weights, weight_loading_mode,
-                local_shared_load_expert_ids, local_shared_w3_w1_tensors,
-                local_shared_w2_tensors,
-                local_shared_w3_w1_bias_tensors if module.bias else None,
-                local_shared_w2_bias_tensors if module.bias else None)
+                module=module,
+                weights=weights,
+                weight_loading_mode=weight_loading_mode,
+                load_expert_ids=local_shared_load_expert_ids,
+                dst_w3_w1_weights_tensor=local_shared_w3_w1_tensors,
+                dst_w2_weights_tensor=local_shared_w2_tensors,
+                dst_w3_w1_bias_tensor=local_shared_w3_w1_bias_tensors
+                if module.bias else None,
+                dst_w2_bias_tensor=local_shared_w2_bias_tensors
+                if module.bias else None,
+                already_sharded=already_sharded)
             weight_fns = {
                 'w3_w1_weight': local_shared_w3_w1_tensors,
                 'w2_weight': local_shared_w2_tensors
@@ -324,7 +358,8 @@ class FusedMoEMethodBase(ABC):
         # Re-setup quant scales after loading weights as the tensors may have been modified.
         self.setup_quant_scales(module)
 
-    def load_quant_scales(self, module: torch.nn.Module, weights: List[Dict]):
+    def load_quant_scales(self, module: torch.nn.Module, weights: List[Dict],
+                          already_sharded: bool):
         pass
 
     @abstractmethod
@@ -341,25 +376,40 @@ class FusedMoEMethodBase(ABC):
         raise NotImplementedError
 
     # Helper function
-    def load_expert_w3_w1_weight(self, module: torch.nn.Module,
-                                 w1_weight: torch.Tensor,
-                                 w3_weight: torch.Tensor,
-                                 dst_w3_w1_weight: torch.Tensor):
+    def load_expert_w3_w1_weight(
+        self,
+        *,
+        module: torch.nn.Module,
+        w1_weight: torch.Tensor,
+        w3_weight: torch.Tensor,
+        dst_w3_w1_weight: torch.Tensor,
+        already_sharded: bool,
+    ):
         """
         Load w1 and w3 weights for each expert.
         Override this method if you need to preprocess the weights differently.
         """
+
+        if not already_sharded:
+            tp_size = module.tp_size
+            tp_rank = module.tp_rank
+            tp_mode_column = TensorParallelMode.COLUMN
+        else:
+            tp_size = 1
+            tp_rank = 0
+            tp_mode_column = None
+
         # device don't have to be 'cuda', e.g. 'cpu' for online EPLB
         device = dst_w3_w1_weight.device
         w1_weight_shard = load_weight_shard(w1_weight,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN,
+                                            tp_size,
+                                            tp_rank,
+                                            tp_mode_column,
                                             device=device)
         w3_weight_shard = load_weight_shard(w3_weight,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN,
+                                            tp_size,
+                                            tp_rank,
+                                            tp_mode_column,
                                             device=device)
 
         w31_weight_shard = torch.cat([w3_weight_shard, w1_weight_shard], dim=0)
@@ -367,19 +417,34 @@ class FusedMoEMethodBase(ABC):
                                non_blocking=True)
 
     # Helper function
-    def load_expert_w2_weight(self, module: torch.nn.Module,
-                              w2_weight: torch.Tensor,
-                              dst_w2_weight: torch.Tensor):
+    def load_expert_w2_weight(
+        self,
+        *,
+        module: torch.nn.Module,
+        w2_weight: torch.Tensor,
+        dst_w2_weight: torch.Tensor,
+        already_sharded: bool,
+    ):
         """
         Load w2 weight for each expert.
         Override this method if you need to preprocess the weights differently.
         """
+
+        if not already_sharded:
+            tp_size = module.tp_size
+            tp_rank = module.tp_rank
+            tp_mode_row = TensorParallelMode.ROW
+        else:
+            tp_size = 1
+            tp_rank = 0
+            tp_mode_row = None
+
         # device don't have to be 'cuda', e.g. 'cpu' for online EPLB
         device = dst_w2_weight.device
         w2_weight_shard = load_weight_shard(w2_weight,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.ROW,
+                                            tp_size,
+                                            tp_rank,
+                                            tp_mode_row,
                                             device=device)
         dst_w2_weight.copy_(w2_weight_shard.view(dst_w2_weight.dtype),
                             non_blocking=True)
@@ -617,8 +682,10 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
         self.setup_quant_scales(module)
 
     def load_weights(self, module: torch.nn.Module, weights: List[Dict],
-                     weight_loading_mode: MoEWeightLoadingMode):
-        super().load_weights(module, weights, weight_loading_mode)
+                     weight_loading_mode: MoEWeightLoadingMode,
+                     already_sharded: bool):
+        super().load_weights(module, weights, weight_loading_mode,
+                             already_sharded)
 
     def setup_quant_scales(self, module: torch.nn.Module):
         module.quant_scales = FusedMoEQuantScalesDeepSeekFP8BlockScales(
@@ -627,9 +694,27 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
         )
 
     def load_expert_all_weight_scale_fp8_block_scale(
-            self, module: torch.nn.Module, weights: Dict,
-            load_expert_ids: List[int], dst_w3_w1_weight_scale: torch.Tensor,
-            dst_w2_weight_scale: torch.Tensor, device):
+        self,
+        *,
+        module: torch.nn.Module,
+        weights: Dict,
+        load_expert_ids: List[int],
+        dst_w3_w1_weight_scale: torch.Tensor,
+        dst_w2_weight_scale: torch.Tensor,
+        device,
+        already_sharded: bool,
+    ):
+        if not already_sharded:
+            tp_size = module.tp_size
+            tp_rank = module.tp_rank
+            tp_mode_column = TensorParallelMode.COLUMN
+            tp_mode_row = TensorParallelMode.ROW
+        else:
+            tp_size = 1
+            tp_rank = 0
+            tp_mode_column = None
+            tp_mode_row = None
+
         for local_slot_id, expert_id in enumerate(load_expert_ids):
             if module.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
                 w3_scale = weights['gate_up_proj_weight_scale'][
@@ -647,16 +732,16 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
                 )
 
             w3_w1_scale_shard = load_weight_shard(w3_scale,
-                                                  module.tp_size,
-                                                  module.tp_rank,
-                                                  TensorParallelMode.COLUMN,
+                                                  tp_size,
+                                                  tp_rank,
+                                                  tp_mode_column,
                                                   device=device)
 
             if w1_scale is not None:
                 w1_scale_shard = load_weight_shard(w1_scale,
-                                                   module.tp_size,
-                                                   module.tp_rank,
-                                                   TensorParallelMode.COLUMN,
+                                                   tp_size,
+                                                   tp_rank,
+                                                   tp_mode_column,
                                                    device=device)
                 w3_w1_scale_shard = torch.cat(
                     [w3_w1_scale_shard, w1_scale_shard], dim=-2)
@@ -664,20 +749,22 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
             dst_w3_w1_weight_scale[local_slot_id].copy_(w3_w1_scale_shard)
 
             w2_scale_shard = load_weight_shard(w2_scale,
-                                               module.tp_size,
-                                               module.tp_rank,
-                                               TensorParallelMode.ROW,
+                                               tp_size,
+                                               tp_rank,
+                                               tp_mode_row,
                                                device=device)
             dst_w2_weight_scale[local_slot_id].copy_(w2_scale_shard)
 
-    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+    def load_quant_scales(self, module: torch.nn.Module, weights: Dict,
+                          already_sharded: bool):
         self.load_expert_all_weight_scale_fp8_block_scale(
             module,
             weights,
             module.initial_local_expert_ids,
             module.w3_w1_weight_scaling_factor.data,
             module.w2_weight_scaling_factor.data,
-            device=torch.device("cuda"))
+            device=torch.device("cuda"),
+            already_sharded=already_sharded)
         if self.need_load_shared_weights(module):
             local_shared_load_expert_ids = module.layer_load_balancer.get_load_expert_ids(
             )
@@ -697,7 +784,8 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
                 local_shared_load_expert_ids,
                 local_shared_w3_w1_scale_tensors,
                 local_shared_w2_scale_tensors,
-                device=torch.device("cpu"))
+                device=torch.device("cpu"),
+                already_sharded=already_sharded)
             module.register_all_parameter_slot_and_to_fix_weight_fns({
                 'w3_w1_weight_scaling_factor':
                 local_shared_w3_w1_scale_tensors,
@@ -710,7 +798,8 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
         DeepSeekFP8BlockScalesFusedMoEMethod):
 
     def load_weights(self, module: torch.nn.Module, weights: List[Dict],
-                     weight_loading_mode: MoEWeightLoadingMode):
+                     weight_loading_mode: MoEWeightLoadingMode,
+                     already_sharded: bool):
         if is_sm_100f():
             expert_ids = set(module.initial_local_expert_ids)
             if self.need_load_shared_weights(module):
@@ -726,7 +815,8 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
                     scale = weights[name][:]
                     weights[weight_name], weights[name] = resmooth_to_fp8_e8m0(
                         weight, scale)
-        super().load_weights(module, weights, weight_loading_mode)
+        super().load_weights(module, weights, weight_loading_mode,
+                             already_sharded)
 
     def post_load_weights(self, module: torch.nn.Module):
         super().post_load_weights(module)
@@ -798,19 +888,32 @@ class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
             fc2_weight_scale=module.fc2_weight_scale,
         )
 
-    def load_expert_w3_w1_weight(self, module: torch.nn.Module,
-                                 w1_weight: torch.Tensor,
-                                 w3_weight: torch.Tensor,
-                                 dst_w3_w1_weight: torch.Tensor):
+    def load_expert_w3_w1_weight(
+        self,
+        *,
+        module: torch.nn.Module,
+        w1_weight: torch.Tensor,
+        w3_weight: torch.Tensor,
+        dst_w3_w1_weight: torch.Tensor,
+        already_sharded: bool,
+    ):
         """
         Load w1 and w3 weights for each expert.
         """
-        w1_weight_shard = load_weight_shard(w1_weight, module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN)
-        w3_weight_shard = load_weight_shard(w3_weight, module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN)
+
+        if not already_sharded:
+            tp_size = module.tp_size
+            tp_rank = module.tp_rank
+            tp_mode_column = TensorParallelMode.COLUMN
+        else:
+            tp_size = 1
+            tp_rank = 0
+            tp_mode_column = None
+
+        w1_weight_shard = load_weight_shard(w1_weight, tp_size, tp_rank,
+                                            tp_mode_column)
+        w3_weight_shard = load_weight_shard(w3_weight, tp_size, tp_rank,
+                                            tp_mode_column)
         w31_weight_shard = torch.cat([w3_weight_shard, w1_weight_shard], dim=0)
 
         weight_dtype = torch.int8
@@ -828,15 +931,29 @@ class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
         dst_w3_w1_weight.copy_(w31_weight_shard.view(dst_w3_w1_weight.dtype),
                                non_blocking=True)
 
-    def load_expert_w2_weight(self, module: torch.nn.Module,
-                              w2_weight: torch.Tensor,
-                              dst_w2_weight: torch.Tensor):
+    def load_expert_w2_weight(
+        self,
+        *,
+        module: torch.nn.Module,
+        w2_weight: torch.Tensor,
+        dst_w2_weight: torch.Tensor,
+        already_sharded: bool,
+    ):
         """
         Load w2 weight for each expert.
         """
-        w2_weight_shard = load_weight_shard(w2_weight, module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.ROW)
+
+        if not already_sharded:
+            tp_size = module.tp_size
+            tp_rank = module.tp_rank
+            tp_mode_row = TensorParallelMode.ROW
+        else:
+            tp_size = 1
+            tp_rank = 0
+            tp_mode_row = None
+
+        w2_weight_shard = load_weight_shard(w2_weight, tp_size, tp_rank,
+                                            tp_mode_row)
 
         weight_dtype = torch.int8
         if not module.quant_config.layer_quant_mode.is_int8_weight_only():
@@ -851,18 +968,32 @@ class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
         dst_w2_weight.copy_(w2_weight_shard.view(dst_w2_weight.dtype),
                             non_blocking=True)
 
-    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+    def load_quant_scales(
+        self,
+        module: torch.nn.Module,
+        weights: Dict,
+        already_sharded: bool,
+    ):
+        if not already_sharded:
+            tp_size = module.tp_size
+            tp_rank = module.tp_rank
+            tp_mode_column = TensorParallelMode.COLUMN
+            tp_mode_row = TensorParallelMode.ROW
+        else:
+            tp_size = 1
+            tp_rank = 0
+            tp_mode_column = None
+            tp_mode_row = None
+
         # fc31 scales
         all_w3_scales = [
-            load_weight_shard(weights[f"{expert_id}.w3.weight_scale"],
-                              module.tp_size, module.tp_rank,
-                              TensorParallelMode.COLUMN)
+            load_weight_shard(weights[f"{expert_id}.w3.weight_scale"], tp_size,
+                              tp_rank, tp_mode_column)
             for expert_id in module.initial_local_expert_ids
         ]
         all_w1_scales = [
-            load_weight_shard(weights[f"{expert_id}.w1.weight_scale"],
-                              module.tp_size, module.tp_rank,
-                              TensorParallelMode.COLUMN)
+            load_weight_shard(weights[f"{expert_id}.w1.weight_scale"], tp_size,
+                              tp_rank, tp_mode_column)
             for expert_id in module.initial_local_expert_ids
         ]
         w3_w1_scales = torch.cat(
@@ -873,9 +1004,8 @@ class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
 
         # fc2 scales
         all_w2_scales = [
-            load_weight_shard(weights[f"{expert_id}.w2.weight_scale"],
-                              module.tp_size, module.tp_rank,
-                              TensorParallelMode.ROW)
+            load_weight_shard(weights[f"{expert_id}.w2.weight_scale"], tp_size,
+                              tp_rank, tp_mode_row)
             for expert_id in module.initial_local_expert_ids
         ]
         w2_scales = torch.stack(all_w2_scales).to(module.dtype)
@@ -977,10 +1107,15 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
             alpha_2=module.fc2_alpha,
         )
 
-    def load_expert_w3_w1_weight(self, module: torch.nn.Module,
-                                 w1_weight: torch.Tensor,
-                                 w3_weight: torch.Tensor,
-                                 dst_w3_w1_weight: torch.Tensor):
+    def load_expert_w3_w1_weight(
+        self,
+        *,
+        module: torch.nn.Module,
+        w1_weight: torch.Tensor,
+        w3_weight: torch.Tensor,
+        dst_w3_w1_weight: torch.Tensor,
+        already_sharded: bool,
+    ):
         """
         Load w1 and w3 weights for each expert.
         Override this method if you need to preprocess the weights differently.
@@ -988,15 +1123,25 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
         device = dst_w3_w1_weight.device
         self.device = device
 
+        if not already_sharded:
+            tp_size = module.tp_size
+            tp_rank = module.tp_rank
+            tp_mode_column = TensorParallelMode.COLUMN
+            TensorParallelMode.ROW
+        else:
+            tp_size = 1
+            tp_rank = 0
+            tp_mode_column = None
+
         w1_weight_shard = load_weight_shard(w1_weight,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN,
+                                            tp_size,
+                                            tp_rank,
+                                            tp_mode_column,
                                             device=device)
         w3_weight_shard = load_weight_shard(w3_weight,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN,
+                                            tp_size,
+                                            tp_rank,
+                                            tp_mode_column,
                                             device=device)
         w31_weight_shard = torch.cat([w3_weight_shard, w1_weight_shard], dim=0)
 
@@ -1033,18 +1178,33 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
         dst_w3_w1_weight.copy_(w31_weight_shard.view(dst_w3_w1_weight.dtype),
                                non_blocking=True)
 
-    def load_expert_w2_weight(self, module: torch.nn.Module,
-                              w2_weight: torch.Tensor,
-                              dst_w2_weight: torch.Tensor):
+    def load_expert_w2_weight(
+        self,
+        *,
+        module: torch.nn.Module,
+        w2_weight: torch.Tensor,
+        dst_w2_weight: torch.Tensor,
+        already_sharded: bool,
+    ):
         """
         Load w2 weight for each expert.
         Override this method if you need to preprocess the weights differently.
         """
         device = dst_w2_weight.device
+
+        if not already_sharded:
+            tp_size = module.tp_size
+            tp_rank = module.tp_rank
+            tp_mode_row = TensorParallelMode.ROW
+        else:
+            tp_size = 1
+            tp_rank = 0
+            tp_mode_row = None
+
         w2_weight_shard = load_weight_shard(w2_weight,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.ROW,
+                                            tp_size,
+                                            tp_rank,
+                                            tp_mode_row,
                                             device=device)
 
         packer = torch.ops.trtllm.pack_int8_tensor_to_packed_int4
@@ -1078,8 +1238,24 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
         dst_w2_weight.copy_(w2_weight_shard.view(dst_w2_weight.dtype),
                             non_blocking=True)
 
-    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+    def load_quant_scales(
+        self,
+        module: torch.nn.Module,
+        weights: Dict,
+        already_sharded: bool,
+    ):
         assert self.device.type == "cuda"
+
+        if not already_sharded:
+            tp_size = module.tp_size
+            tp_rank = module.tp_rank
+            tp_mode_column = TensorParallelMode.COLUMN
+            tp_mode_row = TensorParallelMode.ROW
+        else:
+            tp_size = 1
+            tp_rank = 0
+            tp_mode_column = None
+            tp_mode_row = None
 
         # fc31 scales
         w4a8_custom = module.weight_loading_mode == MoEWeightLoadingMode.W4A8_CUSTOM
@@ -1119,17 +1295,17 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
             # In vanilla ckpt (at least from ModelOpt), per-tensor input_scale and per-channel pre_quant_scale are separately stored
             all_w3_pre_quant_scales = [
                 load_weight_shard(weights[f"{expert_id}.w3.pre_quant_scale"],
-                                  module.tp_size,
-                                  module.tp_rank,
-                                  TensorParallelMode.ROW,
+                                  tp_size,
+                                  tp_rank,
+                                  tp_mode_row,
                                   device=self.device)
                 for expert_id in module.initial_local_expert_ids
             ]
             all_w1_pre_quant_scales = [
                 load_weight_shard(weights[f"{expert_id}.w1.pre_quant_scale"],
-                                  module.tp_size,
-                                  module.tp_rank,
-                                  TensorParallelMode.ROW,
+                                  tp_size,
+                                  tp_rank,
+                                  tp_mode_row,
                                   device=self.device)
                 for expert_id in module.initial_local_expert_ids
             ]
@@ -1186,17 +1362,17 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
         # Per-group weight_scale
         all_w3_scales = [
             load_weight_shard(weights[f"{expert_id}.w3.{weight_scale_name}"],
-                              module.tp_size,
-                              module.tp_rank,
-                              TensorParallelMode.COLUMN,
+                              tp_size,
+                              tp_rank,
+                              tp_mode_column,
                               device=self.device)
             for expert_id in module.initial_local_expert_ids
         ]
         all_w1_scales = [
             load_weight_shard(weights[f"{expert_id}.w1.{weight_scale_name}"],
-                              module.tp_size,
-                              module.tp_rank,
-                              TensorParallelMode.COLUMN,
+                              tp_size,
+                              tp_rank,
+                              tp_mode_column,
                               device=self.device)
             for expert_id in module.initial_local_expert_ids
         ]
@@ -1247,9 +1423,9 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
             # In vanilla ckpt (at least from ModelOpt), per-tensor input_scale and per-channel pre_quant_scale are separately stored
             all_w2_pre_quant_scales = [
                 load_weight_shard(weights[f"{expert_id}.w2.pre_quant_scale"],
-                                  module.tp_size,
-                                  module.tp_rank,
-                                  TensorParallelMode.COLUMN,
+                                  tp_size,
+                                  tp_rank,
+                                  tp_mode_column,
                                   device=self.device)
                 for expert_id in module.initial_local_expert_ids
             ]
@@ -1282,9 +1458,9 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
         # Per-group weight_scale
         all_w2_scales = [
             load_weight_shard(weights[f"{expert_id}.w2.{weight_scale_name}"],
-                              module.tp_size,
-                              module.tp_rank,
-                              TensorParallelMode.ROW,
+                              tp_size,
+                              tp_rank,
+                              tp_mode_row,
                               device=self.device)
             for expert_id in module.initial_local_expert_ids
         ]
@@ -1367,24 +1543,39 @@ class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
             scale_1_interleaved=module.fc31_weight_scale,
             scale_2_interleaved=module.fc2_weight_scale)
 
-    def load_expert_w3_w1_weight(self, module: torch.nn.Module,
-                                 w1_weight: torch.Tensor,
-                                 w3_weight: torch.Tensor,
-                                 dst_w3_w1_weight: torch.Tensor):
+    def load_expert_w3_w1_weight(
+        self,
+        *,
+        module: torch.nn.Module,
+        w1_weight: torch.Tensor,
+        w3_weight: torch.Tensor,
+        dst_w3_w1_weight: torch.Tensor,
+        already_sharded: bool,
+    ):
         """
         Load w1 and w3 weights for each expert.
         Override this method if you need to preprocess the weights differently.
         """
         device = dst_w3_w1_weight.device
+
+        if not already_sharded:
+            tp_size = module.tp_size
+            tp_rank = module.tp_rank
+            tp_mode_column = TensorParallelMode.COLUMN
+        else:
+            tp_size = 1
+            tp_rank = 0
+            tp_mode_column = None
+
         w1_weight_shard = load_weight_shard(w1_weight,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN,
+                                            tp_size,
+                                            tp_rank,
+                                            tp_mode_column,
                                             device=device)
         w3_weight_shard = load_weight_shard(w3_weight,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN,
+                                            tp_size,
+                                            tp_rank,
+                                            tp_mode_column,
                                             device=device)
 
         pad_size_inter = module.intermediate_size_per_partition - w3_weight_shard.shape[
@@ -1407,18 +1598,33 @@ class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
         dst_w3_w1_weight.copy_(w31_weight_shard.view(dst_w3_w1_weight.dtype),
                                non_blocking=True)
 
-    def load_expert_w2_weight(self, module: torch.nn.Module,
-                              w2_weight: torch.Tensor,
-                              dst_w2_weight: torch.Tensor):
+    def load_expert_w2_weight(
+        self,
+        *,
+        module: torch.nn.Module,
+        w2_weight: torch.Tensor,
+        dst_w2_weight: torch.Tensor,
+        already_sharded: bool,
+    ):
         """
         Load w2 weight for each expert.
         Override this method if you need to preprocess the weights differently.
         """
         device = dst_w2_weight.device
+
+        if not already_sharded:
+            tp_size = module.tp_size
+            tp_rank = module.tp_rank
+            tp_mode_row = TensorParallelMode.ROW
+        else:
+            tp_size = 1
+            tp_rank = 0
+            tp_mode_row = None
+
         w2_weight_shard = load_weight_shard(w2_weight,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.ROW,
+                                            tp_size,
+                                            tp_rank,
+                                            tp_mode_row,
                                             device=device)
 
         pad_size_hidden = module.hidden_size - w2_weight_shard.shape[0]
@@ -1436,8 +1642,24 @@ class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
         dst_w2_weight.copy_(w2_weight_shard.view(dst_w2_weight.dtype),
                             non_blocking=True)
 
-    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+    def load_quant_scales(
+        self,
+        module: torch.nn.Module,
+        weights: Dict,
+        already_sharded: bool,
+    ):
         device = module.fc31_weight_scale.data.device
+
+        if not already_sharded:
+            tp_size = module.tp_size
+            tp_rank = module.tp_rank
+            tp_mode_column = TensorParallelMode.COLUMN
+            tp_mode_row = TensorParallelMode.ROW
+        else:
+            tp_size = 1
+            tp_rank = 0
+            tp_mode_column = None
+            tp_mode_row = None
 
         # fc31 scales
         assert (len(module.interleave) == 2)
@@ -1447,15 +1669,15 @@ class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
         for expert_id in module.initial_local_expert_ids:
             w3_scale_shard = load_weight_shard(
                 weights[f"{expert_id}.w3.weight_scale_inv"],
-                module.tp_size,
-                module.tp_rank,
-                TensorParallelMode.COLUMN,
+                tp_size,
+                tp_rank,
+                tp_mode_column,
                 device=device)
             w1_scale_shard = load_weight_shard(
                 weights[f"{expert_id}.w1.weight_scale_inv"],
-                module.tp_size,
-                module.tp_rank,
-                TensorParallelMode.COLUMN,
+                tp_size,
+                tp_rank,
+                tp_mode_column,
                 device=device)
 
             pad_size_hidden = module.hidden_size // self.group_size - w3_scale_shard.shape[
@@ -1491,9 +1713,9 @@ class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
         for expert_id in module.initial_local_expert_ids:
             w2_scales_shard = load_weight_shard(
                 weights[f"{expert_id}.w2.weight_scale_inv"],
-                module.tp_size,
-                module.tp_rank,
-                TensorParallelMode.ROW,
+                tp_size,
+                tp_rank,
+                tp_mode_row,
                 device=device)
             pad_size_hidden = module.hidden_size - w2_scales_shard.shape[0]
             pad_size_inter = module.intermediate_size_per_partition // self.group_size - w2_scales_shard.shape[
@@ -1583,32 +1805,59 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
 
     @abstractmethod
     def load_expert_w3_w1_weight_scale_nvfp4(
-            self, module: torch.nn.Module, w1_weight_scale: torch.Tensor,
-            w3_weight_scale: torch.Tensor,
-            dst_w3_w1_weight_scale: torch.Tensor):
+        self,
+        *,
+        module: torch.nn.Module,
+        w1_weight_scale: torch.Tensor,
+        w3_weight_scale: torch.Tensor,
+        dst_w3_w1_weight_scale: torch.Tensor,
+        already_sharded: bool,
+    ):
         pass
 
     @abstractmethod
-    def load_expert_w2_weight_scale_nvfp4(self, module: torch.nn.Module,
-                                          w2_weight_scale: torch.Tensor,
-                                          dst_w2_weight_scale: torch.Tensor):
+    def load_expert_w2_weight_scale_nvfp4(
+        self,
+        *,
+        module: torch.nn.Module,
+        w2_weight_scale: torch.Tensor,
+        dst_w2_weight_scale: torch.Tensor,
+        already_sharded: bool,
+    ):
         pass
 
-    def load_expert_fc31_input_scale_nvfp4(self, w1_input_scale, w3_input_scale,
-                                           dst_fc31_input_scale: torch.Tensor):
+    def load_expert_fc31_input_scale_nvfp4(
+        self,
+        *,
+        w1_input_scale,
+        w3_input_scale,
+        dst_fc31_input_scale: torch.Tensor,
+        already_sharded: bool,
+    ):
         w1_input_scale = w1_input_scale[...].reshape([])
         w3_input_scale = w3_input_scale[...].reshape([])
         assert torch.allclose(
             w1_input_scale, w3_input_scale), "w1_input_scale != w3_input_scale"
         dst_fc31_input_scale.copy_(w1_input_scale)
 
-    def load_expert_fc2_input_scale_nvfp4(self, w2_input_scale,
-                                          dst_fc2_input_scale: torch.Tensor):
+    def load_expert_fc2_input_scale_nvfp4(
+        self,
+        *,
+        w2_input_scale,
+        dst_fc2_input_scale: torch.Tensor,
+        already_sharded: bool,
+    ):
         dst_fc2_input_scale.copy_(w2_input_scale[...].reshape([]))
 
-    def load_expert_fc31_alpha_nvfp4(self, w1_weight_scale_2, w3_weight_scale_2,
-                                     final_fc31_input_scale: torch.Tensor,
-                                     dst_fc31_alpha: torch.Tensor):
+    def load_expert_fc31_alpha_nvfp4(
+        self,
+        *,
+        w1_weight_scale_2,
+        w3_weight_scale_2,
+        final_fc31_input_scale: torch.Tensor,
+        dst_fc31_alpha: torch.Tensor,
+        already_sharded: bool,
+    ):
         w1_weight_scale_2 = w1_weight_scale_2[...].reshape([])
         w3_weight_scale_2 = w3_weight_scale_2[...].reshape([])
         assert torch.allclose(
@@ -1619,17 +1868,29 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         dst_fc31_alpha.copy_(1.0 /
                              (final_fc31_input_scale * w3_w1_weight_scale_2))
 
-    def load_expert_fc2_alpha_nvfp4(self, w2_weight_scale_2,
-                                    final_fc2_input_scale: torch.Tensor,
-                                    dst_w2_alpha: torch.Tensor):
+    def load_expert_fc2_alpha_nvfp4(
+        self,
+        *,
+        w2_weight_scale_2,
+        final_fc2_input_scale: torch.Tensor,
+        dst_fc2_alpha: torch.Tensor,
+        already_sharded: bool,
+    ):
         w2_weight_scale_2 = 1.0 / w2_weight_scale_2[...].reshape([])
-        dst_w2_alpha.copy_(1.0 / (final_fc2_input_scale * w2_weight_scale_2))
+        dst_fc2_alpha.copy_(1.0 / (final_fc2_input_scale * w2_weight_scale_2))
 
     def load_all_fp4_weight_scales_and_alphas(
-            self, module: torch.nn.Module, weights: Dict,
-            load_expert_ids: List[int], dst_w3_w1_weight_scale: torch.Tensor,
-            dst_w2_weight_scale: torch.Tensor, dst_fc31_alpha: torch.Tensor,
-            dst_fc2_alpha: torch.Tensor):
+        self,
+        *,
+        module: torch.nn.Module,
+        weights: Dict,
+        load_expert_ids: List[int],
+        dst_w3_w1_weight_scale: torch.Tensor,
+        dst_w2_weight_scale: torch.Tensor,
+        dst_fc31_alpha: torch.Tensor,
+        dst_fc2_alpha: torch.Tensor,
+        already_sharded: bool,
+    ):
         for local_slot_id, expert_id in enumerate(load_expert_ids):
             if module.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
                 w1_weight_scale = weights[f"{expert_id}.w1.weight_scale"]
@@ -1664,20 +1925,31 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                 w3_weight_scale_2 = w1_weight_scale_2
 
             self.load_expert_w3_w1_weight_scale_nvfp4(
-                module, w1_weight_scale, w3_weight_scale,
-                dst_w3_w1_weight_scale[expert_idx])
+                module=module,
+                w1_weight_scale=w1_weight_scale,
+                w3_weight_scale=w3_weight_scale,
+                dst_w3_w1_weight_scale=dst_w3_w1_weight_scale[expert_idx],
+                already_sharded=already_sharded)
             self.load_expert_w2_weight_scale_nvfp4(
-                module, w2_weight_scale, dst_w2_weight_scale[expert_idx])
+                module=module,
+                w2_weight_scale=w2_weight_scale,
+                dst_w2_weight_scale=dst_w2_weight_scale[expert_idx],
+                already_sharded=already_sharded)
 
-            self.load_expert_fc31_alpha_nvfp4(w1_weight_scale_2,
-                                              w3_weight_scale_2,
-                                              module.fc31_input_scale.data,
-                                              dst_fc31_alpha[expert_idx])
-            self.load_expert_fc2_alpha_nvfp4(w2_weight_scale_2,
-                                             module.fc2_input_scale.data,
-                                             dst_fc2_alpha[expert_idx])
+            self.load_expert_fc31_alpha_nvfp4(
+                w1_weight_scale_2=w1_weight_scale_2,
+                w3_weight_scale_2=w3_weight_scale_2,
+                final_fc31_input_scale=module.fc31_input_scale.data,
+                dst_fc31_alpha=dst_fc31_alpha[expert_idx],
+                already_sharded=already_sharded)
+            self.load_expert_fc2_alpha_nvfp4(
+                w2_weight_scale_2=w2_weight_scale_2,
+                final_fc2_input_scale=module.fc2_input_scale.data,
+                dst_fc2_alpha=dst_fc2_alpha[expert_idx],
+                already_sharded=already_sharded)
 
-    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+    def load_quant_scales(self, module: torch.nn.Module, weights: Dict,
+                          already_sharded: bool):
         # Step1: Load input scales.
         tmp_fc31_input_scale = torch.empty(module.num_experts,
                                            dtype=torch.float32)
@@ -1699,9 +1971,14 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                 )
 
             self.load_expert_fc31_input_scale_nvfp4(
-                w1_input_scale, w3_input_scale, tmp_fc31_input_scale[expert_id])
+                w1_input_scale=w1_input_scale,
+                w3_input_scale=w3_input_scale,
+                dst_fc31_input_scale=tmp_fc31_input_scale[expert_id],
+                already_sharded=already_sharded)
             self.load_expert_fc2_input_scale_nvfp4(
-                w2_input_scale, tmp_fc2_input_scale[expert_id])
+                w2_input_scale=w2_input_scale,
+                dst_fc2_input_scale=tmp_fc2_input_scale[expert_id],
+                already_sharded=already_sharded)
 
         # fc31_input_scale is the reciprocal of the maximum of all w1 input scales and w3 input scales.
         module.fc31_input_scale.data.copy_(
@@ -1712,9 +1989,14 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
 
         # Step2: Load weight block scales and alphas.
         self.load_all_fp4_weight_scales_and_alphas(
-            module, weights, module.initial_local_expert_ids,
-            module.w3_w1_weight_scale.data, module.w2_weight_scale.data,
-            module.fc31_alpha.data, module.fc2_alpha.data)
+            module=module,
+            weights=weights,
+            load_expert_ids=module.initial_local_expert_ids,
+            dst_w3_w1_weight_scale=module.w3_w1_weight_scale.data,
+            dst_w2_weight_scale=module.w2_weight_scale.data,
+            dst_fc31_alpha=module.fc31_alpha.data,
+            dst_fc2_alpha=module.fc2_alpha.data,
+            already_sharded=already_sharded)
 
         # Step 3: if needed, load into shared
         if self.need_load_shared_weights(module):
@@ -1741,9 +2023,14 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                 dtype=module.fc2_alpha.data.dtype,
                 device='cpu')
             self.load_all_fp4_weight_scales_and_alphas(
-                module, weights, local_shared_load_expert_ids,
-                local_shared_w3_w1_scale_tensors, local_shared_w2_scale_tensors,
-                local_shared_fc31_alpha_tensors, local_shared_fc2_alpha_tensors)
+                module=module,
+                weights=weights,
+                load_expert_ids=local_shared_load_expert_ids,
+                dst_w3_w1_weight_scale=local_shared_w3_w1_scale_tensors,
+                dst_w2_weight_scale=local_shared_w2_scale_tensors,
+                dst_fc31_alpha=local_shared_fc31_alpha_tensors,
+                dst_fc2_alpha=local_shared_fc2_alpha_tensors,
+                already_sharded=already_sharded)
 
             module.register_all_parameter_slot_and_to_fix_weight_fns({
                 'w3_w1_weight_scale':
@@ -1779,20 +2066,35 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
                                self.block_scales_dtype, block_scales_vec_size)
 
     def load_expert_w3_w1_weight_scale_nvfp4(
-            self, module: torch.nn.Module, w1_weight_scale: torch.Tensor,
-            w3_weight_scale: torch.Tensor,
-            dst_w3_w1_weight_scale: torch.Tensor):
+        self,
+        *,
+        module: torch.nn.Module,
+        w1_weight_scale: torch.Tensor,
+        w3_weight_scale: torch.Tensor,
+        dst_w3_w1_weight_scale: torch.Tensor,
+        already_sharded: bool,
+    ):
         # device don't have to be 'cuda', e.g. 'cpu' for online EPLB
         device = dst_w3_w1_weight_scale.device
+
+        if not already_sharded:
+            tp_size = module.tp_size
+            tp_rank = module.tp_rank
+            tp_mode_column = TensorParallelMode.COLUMN
+        else:
+            tp_size = 1
+            tp_rank = 0
+            tp_mode_column = None
+
         w1_weight_scale = load_weight_shard(w1_weight_scale,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN,
+                                            tp_size,
+                                            tp_rank,
+                                            tp_mode_column,
                                             device=device)
         w3_weight_scale = load_weight_shard(w3_weight_scale,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN,
+                                            tp_size,
+                                            tp_rank,
+                                            tp_mode_column,
                                             device=device)
         # Keep weights in device buffer
         # w3
@@ -1819,15 +2121,30 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
 
         dst_w3_w1_weight_scale.copy_(dst_w3_w1_weight_scale_interleaved)
 
-    def load_expert_w2_weight_scale_nvfp4(self, module: torch.nn.Module,
-                                          w2_weight_scale: torch.Tensor,
-                                          dst_w2_weight_scale: torch.Tensor):
+    def load_expert_w2_weight_scale_nvfp4(
+        self,
+        *,
+        module: torch.nn.Module,
+        w2_weight_scale: torch.Tensor,
+        dst_w2_weight_scale: torch.Tensor,
+        already_sharded: bool,
+    ):
         # device don't have to be 'cuda', e.g. 'cpu' for online EPLB
         device = dst_w2_weight_scale.device
+
+        if not already_sharded:
+            tp_size = module.tp_size
+            tp_rank = module.tp_rank
+            tp_mode_row = TensorParallelMode.ROW
+        else:
+            tp_size = 1
+            tp_rank = 0
+            tp_mode_row = None
+
         w2_weight_scale = load_weight_shard(w2_weight_scale,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.ROW,
+                                            tp_size,
+                                            tp_rank,
+                                            tp_mode_row,
                                             device=device)
         # Keep weights in device buffer
         dst_w2_weight_scale.copy_(
@@ -1869,21 +2186,36 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
     def setup_quant_scales(self, module: torch.nn.Module):
         module.quant_scales = tuple()
 
-    def load_expert_w3_w1_weight(self, module: torch.nn.Module,
-                                 w1_weight: torch.Tensor,
-                                 w3_weight: torch.Tensor,
-                                 dst_w3_w1_weight: torch.Tensor):
+    def load_expert_w3_w1_weight(
+        self,
+        *,
+        module: torch.nn.Module,
+        w1_weight: torch.Tensor,
+        w3_weight: torch.Tensor,
+        dst_w3_w1_weight: torch.Tensor,
+        already_sharded: bool,
+    ):
         device = dst_w3_w1_weight.device
         assert device.type == "cuda"
+
+        if not already_sharded:
+            tp_size = module.tp_size
+            tp_rank = module.tp_rank
+            tp_mode_column = TensorParallelMode.COLUMN
+        else:
+            tp_size = 1
+            tp_rank = 0
+            tp_mode_column = None
+
         w1_weight_shard = load_weight_shard(w1_weight,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN,
+                                            tp_size,
+                                            tp_rank,
+                                            tp_mode_column,
                                             device=device)
         w3_weight_shard = load_weight_shard(w3_weight,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN,
+                                            tp_size,
+                                            tp_rank,
+                                            tp_mode_column,
                                             device=device)
 
         # FIXME: this depends on the kernel internals
@@ -1909,15 +2241,30 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
             dst_w3_w1_weight.dtype),
                                non_blocking=True)
 
-    def load_expert_w2_weight(self, module: torch.nn.Module,
-                              w2_weight: torch.Tensor,
-                              dst_w2_weight: torch.Tensor):
+    def load_expert_w2_weight(
+        self,
+        *,
+        module: torch.nn.Module,
+        w2_weight: torch.Tensor,
+        dst_w2_weight: torch.Tensor,
+        already_sharded: bool,
+    ):
         device = dst_w2_weight.device
         assert device.type == "cuda"
+
+        if not already_sharded:
+            tp_size = module.tp_size
+            tp_rank = module.tp_rank
+            tp_mode_row = TensorParallelMode.ROW
+        else:
+            tp_size = 1
+            tp_rank = 0
+            tp_mode_row = None
+
         w2_weight_shard = load_weight_shard(w2_weight,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.ROW,
+                                            tp_size,
+                                            tp_rank,
+                                            tp_mode_row,
                                             device=device)
 
         # FIXME: this depends on the kernel internals
@@ -1939,23 +2286,36 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
                             non_blocking=True)
 
     def load_expert_w3_w1_weight_scale_nvfp4(
-            self,
-            module: torch.nn.Module,
-            w1_weight_scale: torch.Tensor,
-            w3_weight_scale: torch.Tensor,
-            dst_w3_w1_weight_scale: torch.Tensor,
-            num_elts_per_sf: int = 16):
+        self,
+        *,
+        module: torch.nn.Module,
+        w1_weight_scale: torch.Tensor,
+        w3_weight_scale: torch.Tensor,
+        dst_w3_w1_weight_scale: torch.Tensor,
+        already_sharded: bool,
+        num_elts_per_sf: int = 16,
+    ):
         device = dst_w3_w1_weight_scale.device
         assert device.type == "cuda"
+
+        if not already_sharded:
+            tp_size = module.tp_size
+            tp_rank = module.tp_rank
+            tp_mode_column = TensorParallelMode.COLUMN
+        else:
+            tp_size = 1
+            tp_rank = 0
+            tp_mode_column = None
+
         w1_weight_scale = load_weight_shard(w1_weight_scale,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN,
+                                            tp_size,
+                                            tp_rank,
+                                            tp_mode_column,
                                             device=device)
         w3_weight_scale = load_weight_shard(w3_weight_scale,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN,
+                                            tp_size,
+                                            tp_rank,
+                                            tp_mode_column,
                                             device=device)
         # Keep weights in device buffer
         # w3
@@ -1998,17 +2358,31 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
             processed_w3_w1_weight_scale.view(
                 self.block_scales_dtype).reshape(orig_shape))
 
-    def load_expert_w2_weight_scale_nvfp4(self,
-                                          module: torch.nn.Module,
-                                          w2_weight_scale: torch.Tensor,
-                                          dst_w2_weight_scale: torch.Tensor,
-                                          num_elts_per_sf: int = 16):
+    def load_expert_w2_weight_scale_nvfp4(
+        self,
+        *,
+        module: torch.nn.Module,
+        w2_weight_scale: torch.Tensor,
+        dst_w2_weight_scale: torch.Tensor,
+        already_sharded: bool,
+        num_elts_per_sf: int = 16,
+    ):
         device = dst_w2_weight_scale.device
         assert device.type == "cuda"
+
+        if not already_sharded:
+            tp_size = module.tp_size
+            tp_rank = module.tp_rank
+            tp_mode_row = TensorParallelMode.ROW
+        else:
+            tp_size = 1
+            tp_rank = 0
+            tp_mode_row = None
+
         w2_weight_scale = load_weight_shard(w2_weight_scale,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.ROW,
+                                            tp_size,
+                                            tp_rank,
+                                            tp_mode_row,
                                             device=device)
         # Keep weights in device buffer
         dst_w2_weight_scale.copy_(
@@ -2040,8 +2414,13 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
             processed_w2_weight_scale.view(
                 self.block_scales_dtype).reshape(orig_shape))
 
-    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
-        super().load_quant_scales(module, weights)
+    def load_quant_scales(
+        self,
+        module: torch.nn.Module,
+        weights: Dict,
+        already_sharded: bool,
+    ):
+        super().load_quant_scales(module, weights, already_sharded)
 
         # last step: load fc31_scale_c
         module.fc31_scale_c.data.copy_(module.fc2_input_scale.data *
@@ -2068,18 +2447,36 @@ class W4A8NVFP4FP8TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEMethod):
         self.setup_quant_scales(module)
 
     def load_expert_w3_w1_weight_scale_nvfp4(
-            self, module: torch.nn.Module, w1_weight_scale: torch.Tensor,
-            w3_weight_scale: torch.Tensor,
-            dst_w3_w1_weight_scale: torch.Tensor):
-        return super().load_expert_w3_w1_weight_scale_nvfp4(
-            module, w1_weight_scale, w3_weight_scale, dst_w3_w1_weight_scale,
-            32)
+        self,
+        *,
+        module: torch.nn.Module,
+        w1_weight_scale: torch.Tensor,
+        w3_weight_scale: torch.Tensor,
+        dst_w3_w1_weight_scale: torch.Tensor,
+        already_sharded: bool,
+    ):
+        super().load_expert_w3_w1_weight_scale_nvfp4(
+            module=module,
+            w1_weight_scale=w1_weight_scale,
+            w3_weight_scale=w3_weight_scale,
+            dst_w3_w1_weight_scale=dst_w3_w1_weight_scale,
+            already_sharded=already_sharded,
+            num_elts_per_sf=32)
 
-    def load_expert_w2_weight_scale_nvfp4(self, module: torch.nn.Module,
-                                          w2_weight_scale: torch.Tensor,
-                                          dst_w2_weight_scale: torch.Tensor):
-        return super().load_expert_w2_weight_scale_nvfp4(
-            module, w2_weight_scale, dst_w2_weight_scale, 32)
+    def load_expert_w2_weight_scale_nvfp4(
+        self,
+        *,
+        module: torch.nn.Module,
+        w2_weight_scale: torch.Tensor,
+        dst_w2_weight_scale: torch.Tensor,
+        already_sharded: bool,
+    ):
+        super().load_expert_w2_weight_scale_nvfp4(
+            module=module,
+            w2_weight_scale=w2_weight_scale,
+            dst_w2_weight_scale=dst_w2_weight_scale,
+            already_sharded=already_sharded,
+            num_elts_per_sf=32)
 
 
 def _get_weight_alignment(weight_alignment, scaling_vector_size, tp_size,
@@ -2207,12 +2604,14 @@ class MXFP4WeightFusedMoEMethod(FusedMoEMethodBase):
             self.load_expert_w2_weight_scale_mxfp4(
                 module, w2_weight_scale, dst_w2_weight_scale[expert_idx])
 
-    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+    def load_quant_scales(self, module: torch.nn.Module, weights: Dict,
+                          already_sharded: bool):
         # Step1: Load weight block scales.
         self.load_all_mxfp4_weight_scales(module, weights,
                                           module.initial_local_expert_ids,
                                           module.w3_w1_weight_scale.data,
-                                          module.w2_weight_scale.data)
+                                          module.w2_weight_scale.data,
+                                          already_sharded)
 
         # Step 2: if needed, load into shared
         if self.need_load_shared_weights(module):
@@ -2260,10 +2659,24 @@ class MXFP4WeightCutlassFusedMoEMethod(MXFP4WeightFusedMoEMethod):
                                self.block_scales_dtype, block_scales_vec_size,
                                self.weight_alignment)
 
-    def load_expert_w3_w1_weight(self, module: torch.nn.Module,
-                                 w1_weight: torch.Tensor,
-                                 w3_weight: torch.Tensor,
-                                 dst_w3_w1_weight: torch.Tensor):
+    def load_expert_w3_w1_weight(
+        self,
+        *,
+        module: torch.nn.Module,
+        w1_weight: torch.Tensor,
+        w3_weight: torch.Tensor,
+        dst_w3_w1_weight: torch.Tensor,
+        already_sharded: bool,
+    ):
+        if not already_sharded:
+            tp_size = module.tp_size
+            tp_rank = module.tp_rank
+            tp_mode_column = TensorParallelMode.COLUMN
+        else:
+            tp_size = 1
+            tp_rank = 0
+            tp_mode_column = None
+
         # We pad before the sharding. This is done to avoid fractional scaling factors
         # per shard.
         #
@@ -2275,8 +2688,8 @@ class MXFP4WeightCutlassFusedMoEMethod(MXFP4WeightFusedMoEMethod):
         # while it should've loaded 22nd for the first 16 elements only.
         # We pad the weights before the sharding to avoid this issue.
         alignment = _get_weight_alignment(self.weight_alignment,
-                                          module.scaling_vector_size,
-                                          module.tp_size, w1_weight.shape[0])
+                                          module.scaling_vector_size, tp_size,
+                                          w1_weight.shape[0])
         if len(w1_weight.shape) == 2:
             # Pad weights
             # We already satisfy alignment factor of 2 for we pack two MXFP4 into Uint8.
@@ -2295,30 +2708,42 @@ class MXFP4WeightCutlassFusedMoEMethod(MXFP4WeightFusedMoEMethod):
             w1_weight = maybe_pad_for_mxfp4(w1_weight, alignment)
             w3_weight = maybe_pad_for_mxfp4(w3_weight, alignment)
 
-        w1_weight_shard = load_weight_shard(w1_weight, module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN)
-        w3_weight_shard = load_weight_shard(w3_weight, module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN)
+        w1_weight_shard = load_weight_shard(w1_weight, tp_size, tp_rank,
+                                            tp_mode_column)
+        w3_weight_shard = load_weight_shard(w3_weight, tp_size, tp_rank,
+                                            tp_mode_column)
 
         w31_weight_shard = torch.cat([w3_weight_shard, w1_weight_shard], dim=0)
         dst_w3_w1_weight.copy_(w31_weight_shard.view(dst_w3_w1_weight.dtype),
                                non_blocking=True)
 
     # Helper function
-    def load_expert_w2_weight(self, module: torch.nn.Module,
-                              w2_weight: torch.Tensor,
-                              dst_w2_weight: torch.Tensor):
+    def load_expert_w2_weight(
+        self,
+        *,
+        module: torch.nn.Module,
+        w2_weight: torch.Tensor,
+        dst_w2_weight: torch.Tensor,
+        already_sharded: bool,
+    ):
         """
         Load w2 weight for each expert.
         Override this method if you need to preprocess the weights differently.
         """
+        if not already_sharded:
+            tp_size = module.tp_size
+            tp_rank = module.tp_rank
+            tp_mode_row = TensorParallelMode.ROW
+        else:
+            tp_size = 1
+            tp_rank = 0
+            tp_mode_row = None
+
         shard_w2_weight_dim = 2 * w2_weight.shape[1] if len(
             w2_weight.shape) == 2 else w2_weight.shape[0]
         alignment = _get_weight_alignment(self.weight_alignment,
-                                          module.scaling_vector_size,
-                                          module.tp_size, shard_w2_weight_dim)
+                                          module.scaling_vector_size, tp_size,
+                                          shard_w2_weight_dim)
 
         if len(w2_weight.shape) == 2:
             assert w2_weight.dtype == torch.uint8
@@ -2329,22 +2754,34 @@ class MXFP4WeightCutlassFusedMoEMethod(MXFP4WeightFusedMoEMethod):
             assert len(w2_weight.shape) == 1
             w2_weight = maybe_pad_for_mxfp4(w2_weight, self.weight_alignment)
 
-        w2_weight_shard = load_weight_shard(w2_weight, module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.ROW)
+        w2_weight_shard = load_weight_shard(w2_weight, tp_size, tp_rank,
+                                            tp_mode_row)
 
         dst_w2_weight.copy_(w2_weight_shard.view(dst_w2_weight.dtype),
                             non_blocking=True)
 
     def load_expert_w3_w1_weight_scale_mxfp4(
-            self, module: torch.nn.Module, w1_weight_scale: torch.Tensor,
-            w3_weight_scale: torch.Tensor,
-            dst_w3_w1_weight_scale: torch.Tensor):
+        self,
+        *,
+        module: torch.nn.Module,
+        w1_weight_scale: torch.Tensor,
+        w3_weight_scale: torch.Tensor,
+        dst_w3_w1_weight_scale: torch.Tensor,
+        already_sharded: bool,
+    ):
         device = dst_w3_w1_weight_scale.device
 
+        if not already_sharded:
+            tp_size = module.tp_size
+            tp_rank = module.tp_rank
+            tp_mode_column = TensorParallelMode.COLUMN
+        else:
+            tp_size = 1
+            tp_rank = 0
+            tp_mode_column = None
+
         alignment = _get_weight_alignment(self.weight_alignment,
-                                          module.scaling_vector_size,
-                                          module.tp_size,
+                                          module.scaling_vector_size, tp_size,
                                           w3_weight_scale.shape[0])
 
         w1_weight_scale = maybe_pad_for_mxfp4(
@@ -2355,14 +2792,14 @@ class MXFP4WeightCutlassFusedMoEMethod(MXFP4WeightFusedMoEMethod):
             self.weight_alignment // module.scaling_vector_size, alignment)
 
         w1_weight_scale = load_weight_shard(w1_weight_scale,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN,
+                                            tp_size,
+                                            tp_rank,
+                                            tp_mode_column,
                                             device=device)
         w3_weight_scale = load_weight_shard(w3_weight_scale,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN,
+                                            tp_size,
+                                            tp_rank,
+                                            tp_mode_column,
                                             device=device)
 
         # Keep weights in device buffer
@@ -2380,14 +2817,27 @@ class MXFP4WeightCutlassFusedMoEMethod(MXFP4WeightFusedMoEMethod):
                 dst_w3_w1_weight_scale.view(float4_sf_dtype)).view(
                     self.block_scales_dtype).reshape(orig_shape))
 
-    def load_expert_w2_weight_scale_mxfp4(self, module: torch.nn.Module,
-                                          w2_weight_scale: torch.Tensor,
-                                          dst_w2_weight_scale: torch.Tensor):
+    def load_expert_w2_weight_scale_mxfp4(
+        self,
+        *,
+        module: torch.nn.Module,
+        w2_weight_scale: torch.Tensor,
+        dst_w2_weight_scale: torch.Tensor,
+        already_sharded: bool,
+    ):
         device = dst_w2_weight_scale.device
 
+        if not already_sharded:
+            tp_size = module.tp_size
+            tp_rank = module.tp_rank
+            tp_mode_row = TensorParallelMode.ROW
+        else:
+            tp_size = 1
+            tp_rank = 0
+            tp_mode_row = None
+
         alignment = _get_weight_alignment(self.weight_alignment,
-                                          module.scaling_vector_size,
-                                          module.tp_size,
+                                          module.scaling_vector_size, tp_size,
                                           w2_weight_scale.shape[-1])
 
         w2_weight_scale = maybe_pad_for_mxfp4(
@@ -2395,9 +2845,9 @@ class MXFP4WeightCutlassFusedMoEMethod(MXFP4WeightFusedMoEMethod):
             self.weight_alignment)
 
         w2_weight_scale = load_weight_shard(w2_weight_scale,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.ROW,
+                                            tp_size,
+                                            tp_rank,
+                                            tp_mode_row,
                                             device=device)
 
         # Keep weights in device buffer
@@ -2428,12 +2878,13 @@ class W4A8MXFP4MXFP8CutlassFusedMoEMethod(MXFP4WeightCutlassFusedMoEMethod):
 
         self.setup_quant_scales(module)
 
-    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+    def load_quant_scales(self, module: torch.nn.Module, weights: Dict,
+                          already_sharded: bool):
         # Step1: Load input scales.
         module.fake_input_scale.fill_(1.)
 
         # Step2: Load weight block scales.
-        super().load_quant_scales(module, weights)
+        super().load_quant_scales(module, weights, already_sharded)
 
     def setup_quant_scales(self, module: torch.nn.Module):
         module.quant_scales = FusedMoEQuantScalesW4A8MXFP4MXFP8(
@@ -2481,7 +2932,8 @@ class W4A8MXFP4FP8CutlassFusedMoEMethod(MXFP4WeightCutlassFusedMoEMethod):
             self, w2_input_scale, dst_fc2_input_scale: torch.Tensor):
         dst_fc2_input_scale.copy_(w2_input_scale[...].reshape([]))
 
-    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+    def load_quant_scales(self, module: torch.nn.Module, weights: Dict,
+                          already_sharded: bool):
         # Step1: Load input scales.
         tmp_fc31_input_scale = torch.empty(module.num_experts,
                                            dtype=torch.float32)
@@ -2517,7 +2969,7 @@ class W4A8MXFP4FP8CutlassFusedMoEMethod(MXFP4WeightCutlassFusedMoEMethod):
         module.fc2_input_dequant.data.copy_(tmp_fc2_input_scale.max())
 
         # Step2: Load weight block scales.
-        super().load_quant_scales(module, weights)
+        super().load_quant_scales(module, weights, already_sharded)
 
     def setup_quant_scales(self, module: torch.nn.Module):
         module.quant_scales = FusedMoEQuantScalesW4A8MXFP4FP8(
@@ -2554,12 +3006,26 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
     def setup_quant_scales(self, module: torch.nn.Module):
         module.quant_scales = tuple()
 
-    def load_expert_w3_w1_weight(self, module: torch.nn.Module,
-                                 w1_weight: torch.Tensor,
-                                 w3_weight: torch.Tensor,
-                                 dst_w3_w1_weight: torch.Tensor):
+    def load_expert_w3_w1_weight(
+        self,
+        *,
+        module: torch.nn.Module,
+        w1_weight: torch.Tensor,
+        w3_weight: torch.Tensor,
+        dst_w3_w1_weight: torch.Tensor,
+        already_sharded: bool,
+    ):
         device = dst_w3_w1_weight.device
         assert device.type == "cuda"
+
+        if not already_sharded:
+            tp_size = module.tp_size
+            tp_rank = module.tp_rank
+            tp_mode_column = TensorParallelMode.COLUMN
+        else:
+            tp_size = 1
+            tp_rank = 0
+            tp_mode_column = None
 
         # We pad before the sharding. This is done to avoid fractional scaling factors
         # per shard.
@@ -2572,8 +3038,8 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
         # while it should've loaded 22nd for the first 16 elements only.
         # We pad the weights before the sharding to avoid this issue.
         alignment = _get_weight_alignment(self.weight_alignment,
-                                          module.scaling_vector_size,
-                                          module.tp_size, w1_weight.shape[0])
+                                          module.scaling_vector_size, tp_size,
+                                          w1_weight.shape[0])
         if len(w1_weight.shape) == 2:
             # Pad weights
             # We already satisfy alignment factor of 2 for we pack two MXFP4 into Uint8.
@@ -2593,14 +3059,14 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
             w3_weight = maybe_pad_for_mxfp4(w3_weight, alignment).float()
 
         w1_weight_shard = load_weight_shard(w1_weight,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN,
+                                            tp_size,
+                                            tp_rank,
+                                            tp_mode_column,
                                             device=device)
         w3_weight_shard = load_weight_shard(w3_weight,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN,
+                                            tp_size,
+                                            tp_rank,
+                                            tp_mode_column,
                                             device=device)
         # FIXME: this depends on the kernel internals
         epilogue_tile_m = 128
@@ -2623,17 +3089,31 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
             dst_w3_w1_weight.dtype),
                                non_blocking=True)
 
-    def load_expert_w2_weight(self, module: torch.nn.Module,
-                              w2_weight: torch.Tensor,
-                              dst_w2_weight: torch.Tensor):
+    def load_expert_w2_weight(
+        self,
+        *,
+        module: torch.nn.Module,
+        w2_weight: torch.Tensor,
+        dst_w2_weight: torch.Tensor,
+        already_sharded: bool,
+    ):
         device = dst_w2_weight.device
         assert device.type == "cuda"
+
+        if not already_sharded:
+            tp_size = module.tp_size
+            tp_rank = module.tp_rank
+            tp_mode_row = TensorParallelMode.ROW
+        else:
+            tp_size = 1
+            tp_rank = 0
+            tp_mode_row = None
 
         shard_w2_weight_dim = 2 * w2_weight.shape[1] if len(
             w2_weight.shape) == 2 else w2_weight.shape[0]
         alignment = _get_weight_alignment(self.weight_alignment,
-                                          module.scaling_vector_size,
-                                          module.tp_size, shard_w2_weight_dim)
+                                          module.scaling_vector_size, tp_size,
+                                          shard_w2_weight_dim)
 
         if len(w2_weight.shape) == 2:
             assert w2_weight.dtype == torch.uint8
@@ -2645,12 +3125,12 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
             # The bias is applied at each TP rank before the final accumulation.
             assert len(w2_weight.shape) == 1
             w2_weight = maybe_pad_for_mxfp4(
-                w2_weight, self.weight_alignment).float() / module.tp_size
+                w2_weight, self.weight_alignment).float() / tp_size
 
         w2_weight_shard = load_weight_shard(w2_weight,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.ROW,
+                                            tp_size,
+                                            tp_rank,
+                                            tp_mode_row,
                                             device=device)
 
         # FIXME: this depends on the kernel internals
@@ -2672,15 +3152,28 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
                             non_blocking=True)
 
     def load_expert_w3_w1_weight_scale_mxfp4(
-            self, module: torch.nn.Module, w1_weight_scale: torch.Tensor,
-            w3_weight_scale: torch.Tensor,
-            dst_w3_w1_weight_scale: torch.Tensor):
+        self,
+        *,
+        module: torch.nn.Module,
+        w1_weight_scale: torch.Tensor,
+        w3_weight_scale: torch.Tensor,
+        dst_w3_w1_weight_scale: torch.Tensor,
+        already_sharded: bool,
+    ):
         device = dst_w3_w1_weight_scale.device
         assert device.type == "cuda"
 
+        if not already_sharded:
+            tp_size = module.tp_size
+            tp_rank = module.tp_rank
+            tp_mode_column = TensorParallelMode.COLUMN
+        else:
+            tp_size = 1
+            tp_rank = 0
+            tp_mode_column = None
+
         alignment = _get_weight_alignment(self.weight_alignment,
-                                          module.scaling_vector_size,
-                                          module.tp_size,
+                                          module.scaling_vector_size, tp_size,
                                           w3_weight_scale.shape[0])
 
         w1_weight_scale = maybe_pad_for_mxfp4(
@@ -2691,14 +3184,14 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
             self.weight_alignment // module.scaling_vector_size, alignment)
 
         w1_weight_scale = load_weight_shard(w1_weight_scale,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN,
+                                            tp_size,
+                                            tp_rank,
+                                            tp_mode_column,
                                             device=device)
         w3_weight_scale = load_weight_shard(w3_weight_scale,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN,
+                                            tp_size,
+                                            tp_rank,
+                                            tp_mode_column,
                                             device=device)
 
         # Keep weights in device buffer
@@ -2735,15 +3228,28 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
             processed_w3_w1_weight_scale.view(
                 self.block_scales_dtype).reshape(orig_shape))
 
-    def load_expert_w2_weight_scale_mxfp4(self, module: torch.nn.Module,
-                                          w2_weight_scale: torch.Tensor,
-                                          dst_w2_weight_scale: torch.Tensor):
+    def load_expert_w2_weight_scale_mxfp4(
+        self,
+        *,
+        module: torch.nn.Module,
+        w2_weight_scale: torch.Tensor,
+        dst_w2_weight_scale: torch.Tensor,
+        already_sharded: bool,
+    ):
         device = dst_w2_weight_scale.device
         assert device.type == "cuda"
 
+        if not already_sharded:
+            tp_size = module.tp_size
+            tp_rank = module.tp_rank
+            tp_mode_row = TensorParallelMode.ROW
+        else:
+            tp_size = 1
+            tp_rank = 0
+            tp_mode_row = None
+
         alignment = _get_weight_alignment(self.weight_alignment,
-                                          module.scaling_vector_size,
-                                          module.tp_size,
+                                          module.scaling_vector_size, tp_size,
                                           w2_weight_scale.shape[-1])
 
         w2_weight_scale = maybe_pad_for_mxfp4(
@@ -2751,9 +3257,9 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
             self.weight_alignment)
 
         w2_weight_scale = load_weight_shard(w2_weight_scale,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.ROW,
+                                            tp_size,
+                                            tp_rank,
+                                            tp_mode_row,
                                             device=device)
 
         # Keep weights in device buffer
@@ -2822,7 +3328,8 @@ class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
         dst_fc31_input_scale.copy_(w1_input_scale)
         dst_fc2_input_scale.copy_(w2_input_scale)
 
-    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+    def load_quant_scales(self, module: torch.nn.Module, weights: Dict,
+                          already_sharded: bool):
         # Step1: Load input scales.
         tmp_fc31_input_scale = torch.empty(module.num_experts,
                                            dtype=torch.float32)
@@ -2854,7 +3361,7 @@ class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
         module.fc2_input_dequant.data.copy_(tmp_fc2_input_scale.max())
 
         # Step2: Load weight block scales.
-        super().load_quant_scales(module, weights)
+        super().load_quant_scales(module, weights, already_sharded)
 
 
 class W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
@@ -2862,6 +3369,7 @@ class W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
     def create_weights(self, module: torch.nn.Module):
         super().create_weights(module)
 
-    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+    def load_quant_scales(self, module: torch.nn.Module, weights: Dict,
+                          already_sharded: bool):
         # Load weight block scales.
-        super().load_quant_scales(module, weights)
+        super().load_quant_scales(module, weights, already_sharded)

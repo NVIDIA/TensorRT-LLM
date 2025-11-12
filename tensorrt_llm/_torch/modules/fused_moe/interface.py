@@ -204,7 +204,7 @@ class MoE(nn.Module):
         raise NotImplementedError
 
     @abstractmethod
-    def load_weights(self, weights: List[Dict]):
+    def load_weights(self, weights: List[Dict], already_sharded: bool = False):
         raise NotImplementedError
 
     def post_load_weights(self):

@@ -8,6 +8,7 @@ from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 
 
 class BaseWeightMapper(ABC):
+    already_sharded: bool = False
 
     def __init__(self):
         self._callbacks: list[Callable] = []

@@ -1060,12 +1060,13 @@ class WideEPMoE(MoE):
                         expert_id, weight_name, weight_tensor.dtype,
                         weight_tensor[0].shape)
 
-    def load_weights(self, weights: List[Dict]):
+    def load_weights(self, weights: List[Dict], already_sharded: bool = False):
         assert self._weights_created
         assert len(weights) == 1
         weights = weights[0]
 
-        self.quant_method.load_weights(self, weights, self.weight_loading_mode)
+        self.quant_method.load_weights(self, weights, self.weight_loading_mode,
+                                       already_sharded)
 
     def post_load_weights(self):
         self.quant_method.post_load_weights(self)
