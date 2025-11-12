@@ -829,9 +829,7 @@ class TorchSampler(Sampler):
 
             # Fast path: all stop words are single tokens
             if max_stop_word_length == 1:
-                if new_token in stop_words_list:
-                    return True
-                return False
+                return new_token in stop_words_list
 
             # Slow path: at least one multi-token stop word exists
             tokens = request.get_tokens(0)
