@@ -101,6 +101,11 @@ class SamplerEvent:
     cuda_event: torch.cuda.Event
     worker_futures: Optional[list[futures.Future[Any]]] = None
 
+    def synchronize(self):
+        if self.worker_futures:
+            futures.wait(self.worker_futures)
+        self.cuda_event.synchronize()
+
 
 @dataclass(kw_only=True)
 class SampleState:
@@ -773,13 +778,6 @@ class AsyncWorkerMixin:
         self._async_worker_futures = []
 
         return SamplerEvent(cuda_event=cuda_event, worker_futures=worker_futures)
-
-    @staticmethod
-    def _sampler_event_synchronize(sampler_event: SamplerEvent):
-        if sampler_event:
-            if sampler_event.worker_futures:
-                futures.wait(sampler_event.worker_futures)
-            sampler_event.cuda_event.synchronize()
 
 
 class TorchSampler(Sampler, AsyncWorkerMixin):
@@ -1721,7 +1719,8 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         resource_manager: Optional[ResourceManager] = None,
     ) -> None:
         assert isinstance(state, SampleStateTorch)
-        self._sampler_event_synchronize(state.sampler_event)
+        if state.sampler_event:
+            state.sampler_event.synchronize()
 
         assert state.host is not None
         new_tokens = state.host.new_tokens
@@ -2990,7 +2989,8 @@ class TRTLLMSampler(Sampler, AsyncWorkerMixin):
         if state.scheduled_requests.batch_size == 0:
             return
 
-        self._sampler_event_synchronize(state.sampler_event)
+        if state.sampler_event:
+            state.sampler_event.synchronize()
 
         beam_width = self.beam_width(state.scheduled_requests.all_requests())
 
