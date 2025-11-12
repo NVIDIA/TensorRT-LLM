@@ -118,13 +118,8 @@ class Drafter(ABC):
         Args:
             new_max_total_draft_tokens: The new max total draft tokens
         """
-        logger.info(
-            f"[DRAFTER_DEBUG] update_max_total_draft_tokens: "
-            f"old={self.max_total_draft_tokens}, new={new_max_total_draft_tokens}"
-        )
         self.max_total_draft_tokens = new_max_total_draft_tokens
         self.max_draft_len = new_max_total_draft_tokens
-        logger.info(f"[DRAFTER_DEBUG] update_max_total_draft_tokens completed")
 
     def run_drafter_post(
         self,

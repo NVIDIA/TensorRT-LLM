@@ -1044,26 +1044,13 @@ class PyExecutor:
                 self.max_total_draft_tokens = self.drafter.get_draft_len_for_batch_size(
                     batch_size_input)
 
-                # DEBUG: Log when draft_len changes
-                logger.info(
-                    f"[DRAFT_SCHEDULE_DEBUG] batch_size={batch_size_input}, "
-                    f"draft_len={self.max_total_draft_tokens}, "
-                    f"calling update_max_total_draft_tokens")
-
                 self.drafter.update_max_total_draft_tokens(
                     self.max_total_draft_tokens)
-
-                logger.info(
-                    f"[DRAFT_SCHEDULE_DEBUG] update_max_total_draft_tokens returned successfully"
-                )
 
             # Check if draft_len=0 → immediately disable
             # self.max_total_draft_tokens==0 is only possible when draft_len_schedule is provided
             # for example, draft_len_schedule = {1:4, 4:2, 8:0}, batch_size >= 8 will set self.max_draft_len = 0
             if self.drafter.draft_len_schedule is not None and self.max_total_draft_tokens == 0:
-                logger.info(
-                    f"[DRAFT_SCHEDULE_DEBUG] draft_len=0, disabling spec_decode"
-                )
                 self.use_spec_decode = False
             elif getattr(self, 'speculation_permanently_disabled', False):
                 self.use_spec_decode = False
@@ -1192,15 +1179,7 @@ class PyExecutor:
                         if self.kv_cache_transceiver:
                             self.guided_decoder.init_disagg_gen_requests()
 
-                    if self.drafter is not None:
-                        logger.info(
-                            f"[EXECUTOR_DEBUG] use_spec_decode={self.use_spec_decode}, "
-                            f"max_total_draft_tokens={self.max_total_draft_tokens}"
-                        )
-
                     if self.drafter is not None and self.use_spec_decode:
-                        logger.info(
-                            f"[EXECUTOR_DEBUG] Calling prepare_draft_tokens...")
                         if self.guided_decoder is not None:
                             self.guided_decoder.rollback_rejected_tokens()
                         with request_context(
@@ -1211,8 +1190,6 @@ class PyExecutor:
                             # Pad draft tokens to the max draft length. This is for CUDA graph compatibility.
                             self.drafter.pad_draft_tokens_for_cuda_graph(
                                 scheduled_batch)
-                        logger.info(
-                            f"[EXECUTOR_DEBUG] prepare_draft_tokens completed")
                         # add_batch must be called again to restore to target requests with updated draft tokens.
                         if self.guided_decoder is not None:
                             self.guided_decoder.add_batch(scheduled_batch)

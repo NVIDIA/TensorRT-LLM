@@ -18,15 +18,8 @@ from utils.util import similar
 @pytest.fixture(scope="module", autouse=True)
 def enforce_single_worker():
     """Force single-worker mode for all tests in this module."""
-    print("\n=== MODULE FIXTURE: enforce_single_worker STARTING ===", flush=True)
-    import os
-
     os.environ["TLLM_WORKER_USE_SINGLE_PROCESS"] = "1"
-    print("=== MODULE FIXTURE: enforce_single_worker DONE (about to yield) ===", flush=True)
     yield
-    print("=== MODULE FIXTURE: enforce_single_worker TEARDOWN ===", flush=True)
-    if "TLLM_WORKER_USE_SINGLE_PROCESS" in os.environ:
-        del os.environ["TLLM_WORKER_USE_SINGLE_PROCESS"]
 
 
 # # ============================================================================
@@ -44,11 +37,6 @@ def enforce_single_worker():
 def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
     """
     Test output correctness with various schedules and batch sizes.
-    This is the primary correctness test that validates:
-    - Multiple different schedules work correctly
-    - Output with draft_len_schedule matches output with fixed draft_len
-    - Works across different batch size transitions
-    - Both NGram and ModelDrafter function correctly
     """
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     memory_required = 30 if drafter_type == "model_drafter" else 20
@@ -59,7 +47,7 @@ def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
     target_model = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
     draft_model = f"{models_path}/llama-3.2-models/Llama-3.2-3B-Instruct"
 
-    max_batch_size = 4
+    max_batch_size = 8
     max_draft_len = max(schedule.values())  # Use max from schedule
 
     kv_cache_config = KvCacheConfig(
@@ -105,7 +93,6 @@ def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
 
     # Give each request different max_tokens so they finish at different times
     # This creates batch size transitions to test draft_len_schedule
-    # Use deterministic sampling settings to maximize similarity with non-spec baseline
     sampling_params_list = [
         SamplingParams(
             max_tokens=i + 3,
@@ -117,13 +104,11 @@ def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
         )
         for i in range(len(prompts))
     ]
-    print("2\n")
     # With dynamic draft_len_schedule
     llm_with_schedule = LLM(**llm_common_config, speculative_config=spec_config)
     results_with_schedule = llm_with_schedule.generate(prompts, sampling_params_list)
     generated_text_with_schedule = [result.outputs[0].text for result in results_with_schedule]
     llm_with_schedule.shutdown()
-    print("3\n")
     # Reference: spec decode with fixed max_draft_len (no schedule)
     if drafter_type == "ngram":
         spec_config_fixed = NGramDecodingConfig(
@@ -140,7 +125,6 @@ def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
             speculative_model_dir=str(draft_model),
             draft_len_schedule=None,  # No schedule - fixed draft length
         )
-    print("4\n")
     llm_fixed = LLM(**llm_common_config, speculative_config=spec_config_fixed)
     results_fixed = llm_fixed.generate(prompts, sampling_params_list)
     generated_text_fixed = [result.outputs[0].text for result in results_fixed]
@@ -167,35 +151,17 @@ def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
 )
 @pytest.mark.high_cuda_memory
 @pytest.mark.no_xdist
-# @pytest.mark.capture_disabled  # Workaround for pytest capture system hang
 def test_draft_len_schedule_functionality(drafter_type: str, draft_schedule: dict):
-    """
-    Test that draft_len=0 in schedule properly disables speculation.
-    Verifies:
-    - When schedule maps to draft_len=0, speculation is disabled
-    - System falls back to normal generation
-    - Output is still correct
-    - max_draft_tokens is set to 0 when batch_size triggers draft_len=0
-    - Works for both NGram and ModelDrafter
-    """
-    print("\n=== TEST: test_draft_len_schedule_functionality STARTED ===", flush=True)
-    print(f"=== TEST: drafter_type={drafter_type} ===", flush=True)
-    print("5 - About to check CUDA", flush=True)
-
-    # Force CUDA initialization first
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
-    print("6 - CUDA is available, getting device properties", flush=True)
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-    print(f"7 - Got memory: {total_mem_gb}GB", flush=True)
     if drafter_type == "model_drafter" and total_mem_gb < 30:
         pytest.skip("Not enough memory for 2-model setup")
     elif total_mem_gb < 20:
         pytest.skip("Not enough memory")
     max_batch_size = 7
 
-    print("8 - Creating LLM config", flush=True)
     llm_common_config = dict(
         model=llm_models_root() / "llama-3.1-model" / "Meta-Llama-3.1-8B",
         backend="pytorch",
@@ -204,16 +170,14 @@ def test_draft_len_schedule_functionality(drafter_type: str, draft_schedule: dic
         max_batch_size=max_batch_size,
         max_num_tokens=2048,
     )
-    print("9 - Config created", flush=True)
 
-    # Create spec_config based on drafter_type using the draft_schedule parameter
     if drafter_type == "ngram":
         spec_config = NGramDecodingConfig(
             max_draft_len=5,
             max_matching_ngram_size=2,
             draft_len_schedule=draft_schedule,
         )
-    else:  # model_drafter
+    else:
         spec_config = DraftTargetDecodingConfig(
             max_draft_len=5,
             speculative_model_dir=str(
@@ -236,21 +200,16 @@ def test_draft_len_schedule_functionality(drafter_type: str, draft_schedule: dic
         for i in range(8)
     ]
 
-    print("10 - About to create LLM (this might hang if GPU memory issues)", flush=True)
     llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
-    print("11 - LLM created successfully", flush=True)
 
     drafter = llm_spec._executor.engine.drafter
     executor = llm_spec._executor.engine
-    print("12 - Got drafter and executor references", flush=True)
 
     iteration_data = []
     # Store original methods
     original_update_max_total_draft_tokens = drafter.update_max_total_draft_tokens
     original_prepare_draft = drafter.prepare_draft_tokens
     original_should_use_spec_decode = drafter.should_use_spec_decode
-
-    print("13 - Setting up mocks and instrumentation", flush=True)
 
     # 1. Mock should_use_spec_decode to always return True
     # This isolates draft_len_schedule testing from max_concurrency logic
@@ -259,18 +218,8 @@ def test_draft_len_schedule_functionality(drafter_type: str, draft_schedule: dic
 
     drafter.should_use_spec_decode = mock_should_use_spec_decode
 
-    # good up to here
-
     # 2. Instrument update_max_total_draft_tokens to capture when draft_len changes
     def instrumented_update_max_total_draft_tokens(new_max_total_draft_tokens: int):
-        # SEGFAULT FIX: Don't access executor state when draft_len=0
-        # When drafting is disabled, accessing executor.active_requests causes C++ state corruption
-        if new_max_total_draft_tokens == 0:
-            # Just call original and skip instrumentation
-            original_update_max_total_draft_tokens(new_max_total_draft_tokens)
-            return
-
-        # Only instrument when drafting is actually happening
         batch_size_active = len(executor.active_requests)
         original_update_max_total_draft_tokens(new_max_total_draft_tokens)
 
@@ -307,22 +256,17 @@ def test_draft_len_schedule_functionality(drafter_type: str, draft_schedule: dic
         return result
 
     drafter.prepare_draft_tokens = instrumented_prepare_draft
-    print("14 - Instrumentation complete, starting generation", flush=True)
-    # good up to here
     try:
         llm_spec.generate(prompts, sampling_params_list)
-        print("15 - Generation completed successfully", flush=True)
     finally:
-        # Restore methods in finally block to ensure cleanup even if generate() fails
         drafter.update_max_total_draft_tokens = original_update_max_total_draft_tokens
         drafter.prepare_draft_tokens = original_prepare_draft
         drafter.should_use_spec_decode = original_should_use_spec_decode
         llm_spec.shutdown()
-        print("16 - Cleanup done", flush=True)
     # ========================================================================
     # Verification Rule 1: batch_size_active → drafter_max_draft_tokens mapping
     # ========================================================================
-    # Hardcoded expected mapping (floor lookup):
+    # Hardcoded expected mapping:
     # This matches what the authentic code does: len(executor.active_requests)
     expected_mapping = {
         1: 5,
@@ -363,12 +307,12 @@ def test_draft_len_schedule_functionality(drafter_type: str, draft_schedule: dic
                 )
 
     elif drafter_type == "model_drafter":
-        # ModelDrafter: the drafter should produce full draft_len all the time
+        # ModelDrafter: all actual_draft_lens == drafter_max_draft_tokens
         for idx, it in enumerate(iteration_data):
             drafter_tokens = it["drafter_max_draft_tokens"]
             actual_lens = it["actual_draft_lens"]
 
-            if drafter_tokens > 0:  # Only count when speculation is active (draft_len > 0)
+            if drafter_tokens > 0:
                 for req_idx, actual_len in enumerate(actual_lens):
                     assert actual_len == drafter_tokens, (
                         f"Iter {idx}, req {req_idx}: ModelDrafter produced {actual_len} "
