@@ -147,6 +147,7 @@ def torch_causal_conv_prepare_metadata(
     pages_per_seq: torch.Tensor,
     slot_idx: torch.Tensor,
     page_size: int,
+    chunk_size: int,
 ) -> List[torch.Tensor]:
     """Prepare metadata for cached causal conv.
 
@@ -197,7 +198,6 @@ def _torch_cached_causal_conv1d(
     dilation: int,
     groups: int,
     padding_mode: str,
-    activation: Optional[str],
 ) -> torch.Tensor:
     """Flattened cached causal conv that respects slot-indexed state caches.
 
@@ -224,7 +224,6 @@ def _torch_cached_causal_conv1d(
             groups,
             padding_mode,
             cache_batch,
-            activation,
         )
 
         conv_state_cache.index_copy_(0, slot_idx_long, updated_state.to(conv_state_cache.dtype))
@@ -259,7 +258,6 @@ def _torch_cached_causal_conv1d(
             dilation,
             groups,
             padding_mode,
-            activation,
         )
 
         y_flat.index_copy_(0, idx_i, y_seq[0].to(y_flat.dtype))
@@ -289,7 +287,6 @@ def _torch_cached_causal_conv1d_fake(
     dilation: int,
     groups: int,
     padding_mode: str,
-    activation: Optional[str],
 ):
     return torch.empty(
         input.shape[0], input.shape[1], weight.shape[0], device=input.device, dtype=input.dtype

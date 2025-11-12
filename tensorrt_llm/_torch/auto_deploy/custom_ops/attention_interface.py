@@ -204,6 +204,8 @@ class SequenceInfo:
         # NOTE: order of keys is relevant here!
         self._uncached_arg_names = ("input_ids", "position_ids")
         self._cached_arg_names = ("seq_len", "input_pos", "cache_loc", "pages_per_seq", "slot_idx")
+        # page_size is the size of attentionkv-cache pages.
+        # chunk_size is used in mamba prefill kernels to split the context into chunks.
         self._cached_constants = ("page_size", "chunk_size")
         ############################################################################################
 
