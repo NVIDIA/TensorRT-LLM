@@ -123,25 +123,6 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
 
     device: str = Field(default="cuda", description="The device to use for the model.", frozen=True)
 
-    allreduce_strategy: Literal[
-        "AUTO",
-        "NCCL",
-        "ONESHOT",
-        "TWOSHOT",
-        "MIN_LATENCY",
-        "LOWPRECISION",
-        "UB",
-        "MNNVL",
-        "NCCL_SYMMETRIC",
-    ] = Field(
-        default="AUTO",
-        description="AllReduce strategy for distributed inference. Options: AUTO (automatic selection), "
-        "NCCL (NCCL-based), ONESHOT (single-phase fusion kernel), TWOSHOT (two-phase fusion kernel), "
-        "MIN_LATENCY (minimum latency heuristic), LOWPRECISION (low precision allreduce), "
-        "UB (unified buffer), MNNVL (multi-node NVLINK), NCCL_SYMMETRIC (NCCL symmetric). "
-        "AUTO is recommended for most use cases.",
-    )
-
     # TODO: see if we can just remove this field and use kv_cache_config.dtype instead?
     kv_cache_dtype: str = Field(
         default="auto",
