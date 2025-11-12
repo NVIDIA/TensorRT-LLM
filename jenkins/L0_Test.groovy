@@ -756,6 +756,7 @@ def getPytestBaseCommandLine(
         "LLM_BACKEND_ROOT=${llmSrc}/triton_backend",
         "LLM_MODELS_ROOT=${MODEL_CACHE_DIR}",
         "MODEL_CACHE_DIR=${MODEL_CACHE_DIR}",
+        "COLUMNS=200",
         extraInternalEnv,
         pytestUtil,
         "pytest",
@@ -849,6 +850,12 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 // Download and Unzip Tar File
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv ${llmTarfile}")
                 sh "cd ${llmPath} && tar -zxf ${BUILD_CONFIGS[config][TARNAME]}"
+
+                // Download and Merge waives.txt
+                mergeWaivesTxt(pipeline, llmSrcLocal, stageName)
+
+                // Add passed test list from previous pipeline run to the waives.txt
+                reusePassedTestResults(llmSrcLocal, stageName, testListPathNode, waivesListPathNode)
 
                 Utils.exec(pipeline, script: "echo \"Script to trigger Slurm srun job: \" && cat ${scriptRunLocalPath}")
                 Utils.copyFileToRemoteHost(
@@ -2081,6 +2088,70 @@ def generateRerunReport(stageName, llmSrc) {
     echo "Rerun report generation completed for stage: ${stageName}"
 }
 
+def mergeWaivesTxt(pipeline, llmSrc, stageName) {
+    def waivesTxt = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/waive_list/waives.txt"
+    try {
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${waivesTxt}")
+        if (!fileExists("waives.txt")) {
+            error "There is no merged waives.txt file, use the default waives.txt."
+        }
+        sh "rm ${llmSrc}/tests/integration/test_lists/waives.txt"
+        sh "mv waives.txt ${llmSrc}/tests/integration/test_lists/waives.txt"
+        echo "Download merged waives.txt successfully"
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        echo "Failed to download merged waives.txt, use the default waives.txt. Error: ${e.message}"
+    }
+}
+
+def reusePassedTestResults(llmSrc, stageName, testDBList, waivesTxt) {
+    // Get passed test list from open search
+    def passedTestListFile = "${WORKSPACE}/${stageName}/passed_test_list.txt"
+    sh """
+        python3 ${llmSrc}/jenkins/scripts/open_search_query.py \
+        --commit-id ${env.gitlabCommit} \
+        --stage-name ${stageName} \
+        --output-file ${passedTestListFile}
+    """
+
+    def passedTestList = readFile(file: passedTestListFile).readLines()
+    // Read the original test list
+    def originalTestLines = readFile(file: testDBList).readLines()
+
+    def reusedTests = []
+    for (originalLine in originalTestLines) {
+        def testLine = originalLine.trim()
+        if (testLine) {
+            for (passedTest in passedTestList) {
+                passedTest = passedTest.trim()
+                if (testLine.contains(passedTest)) {
+                    reusedTests.add(passedTest)
+                    break
+                }
+            }
+        }
+    }
+
+    // Append reused tests to waives.txt
+    if (reusedTests.size() > 0) {
+        sh(label: "Reused Tests", script: "echo \"Reused tests:\n${reusedTests.join('\n')}\"")
+
+        // Build the content to append
+        def reusedTestsContent = reusedTests.collect { test ->
+            "${test} SKIP (Reused from previous pipeline)"
+        }.join('\n')
+
+        // Use heredoc to append content directly without intermediate files
+        sh """
+            cat >> ${waivesTxt} << 'REUSED_TESTS_EOF'
+${reusedTestsContent}
+REUSED_TESTS_EOF
+        """
+        sh(label: "Updated Waives File", script: "echo \"Appended ${reusedTests.size()} reused tests to ${waivesTxt}\"")
+    }
+}
+
 def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312")
 {
     // Step 1: create LLM_ROOT dir and clean up the workspace
@@ -2134,22 +2205,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv ${llmTarfile}")
         sh "cd ${llmPath} && tar -zxf ${tarName}"
-
-        // Download the new merged waives.txt
-        def waivesTxt = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/waive_list/waives.txt"
-        try {
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${waivesTxt}")
-            if (!fileExists("waives.txt")) {
-                error "There is no merged waives.txt file, use the default waives.txt."
-            }
-            sh "rm ${llmSrc}/tests/integration/test_lists/waives.txt"
-            sh "mv waives.txt ${llmSrc}/tests/integration/test_lists/waives.txt"
-            echo "Download merged waives.txt successfully"
-        } catch (InterruptedException e) {
-            throw e
-        } catch (Exception e) {
-            echo "Failed to download merged waives.txt, use the default waives.txt. Error: ${e.message}"
-        }
 
         // install python package
         if (env.alternativeTRT) {
@@ -2266,6 +2321,12 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
         // Process shard test list and create separate files for regular and isolate tests
         def preprocessedLists = processShardTestList(llmSrc, testDBList, splitId, splits, perfMode)
+
+        // Download and Merge waives.txt
+        mergeWaivesTxt(pipeline, llmSrc, stageName)
+
+        // Add passed test list from previous pipeline run to the waives.txt
+        reusePassedTestResults(llmSrc, stageName, testDBList, "${llmSrc}/tests/integration/test_lists/waives.txt")
 
         // Test Coverage
         def TRTLLM_WHL_PATH = sh(returnStdout: true, script: "pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2").replaceAll("\\s","")
