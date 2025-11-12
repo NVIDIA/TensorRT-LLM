@@ -519,6 +519,77 @@ class CublasLtFP4GemmRunner(TunableRunner):
         return result
 
 
+class CudaCoreNVFP4Runner(TunableRunner):
+    """
+    CUDA Core-based NVFP4 GEMM runner on modern architectures.
+
+    This runner is available on:
+    - SM >= 100 (Blackwell and newer architectures)
+    - M <= 8 (small batch size limitation from kernel template)
+    """
+
+    # Shared tuning config (no tactics needed, single implementation)
+    tuning_config = TuningConfig()
+
+    # Minimum supported architecture: SM100 (Blackwell)
+    MIN_SM_VERSION = 100
+    # Maximum M dimension (from cudaCoreGemmTemplateMaxM in C++ kernel)
+    MAX_M_DIMENSION = 8
+
+    def __init__(self, to_userbuffers: bool, output_dtype: torch.dtype):
+        super().__init__()
+        self.to_userbuffers = to_userbuffers
+        self.output_dtype = output_dtype
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
+        """Return [0] if architecture and shape requirements are met, otherwise []."""
+        # Check architecture support at runtime
+        if torch.cuda.is_available():
+            capability = torch.cuda.get_device_capability(
+                torch.device('cuda:0'))
+            sm_version = capability[0] * 10 + capability[1]
+            if sm_version < self.MIN_SM_VERSION:
+                return []
+        else:
+            return []
+
+        # Check M dimension limitation (kernel template constraint)
+        act_fp4, weight, act_sf, weight_scale, alpha = inputs
+        m = act_fp4.shape[0]
+        if m > self.MAX_M_DIMENSION:
+            return []
+
+        # Single tactic (no config variations)
+        return [0]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: int = -1,
+    ) -> torch.Tensor:
+        act_fp4, weight, act_sf, weight_scale, alpha = inputs
+
+        # Unswizzle the activation scale factors
+        # act_sf is swizzled, need to reverse it for cuda_core_nvfp4_gemm
+        m = act_fp4.shape[0]
+        act_sf_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
+            act_sf.view((m + 128 - 1) // 128 * 128, -1))
+
+        # Call CUDA Core NVFP4 GEMM
+        result = torch.ops.trtllm.cuda_core_nvfp4_gemm(
+            act_fp4,
+            weight,
+            scale_a=act_sf_unswizzled,
+            scale_b=weight_scale,
+            alpha=alpha,
+            bias=None,
+            out_dtype=self.output_dtype,
+            to_userbuffers=self.to_userbuffers,
+        )
+        return result
+
+
 @torch.library.custom_op("trtllm::nvfp4_gemm_cublaslt", mutates_args=())
 def nvfp4_gemm_cublaslt(
     act_fp4: torch.Tensor,
@@ -805,12 +876,13 @@ def nvfp4_gemm_unified(
     to_userbuffers: bool = False,
     backend: str = "auto",
 ) -> torch.Tensor:
-    """Unified NVFP4 GEMM for Blackwell (SM 100) with automatic or manual backend selection.
+    """Unified NVFP4 GEMM with automatic or manual backend selection.
 
     This function can automatically choose the best backend or force a specific backend:
     - CUTLASS: Predefined CUTLASS configurations with auto-tuning
     - cuBLASLt: Heuristic-based algorithms from cuBLASLt library
     - CuteDSL: Blackwell-optimized persistent kernels (when available and inputs are valid)
+    - CUDA Core: CUDA Core implementation on SM >= 89 (Ada+), M <= 16 (explicit selection only)
 
     The AutoTuner profiles all available backends during the first run and caches
     the best choice for each input shape. Subsequent calls use the cached selection
@@ -829,49 +901,86 @@ def nvfp4_gemm_unified(
             - 'cutlass': Force use CUTLASS (FP4GemmRunner)
             - 'cublaslt': Force use cuBLASLt (CublasLtFP4GemmRunner)
             - 'cutedsl': Force use CuteDSL (CuteDSLNVFP4Wrapper)
+            - 'cuda_core': Force use CUDA Core (CudaCoreNVFP4Runner, requires SM >= 89, M <= 16)
 
     Returns:
         Output tensor [m, n] with dtype=output_dtype
 
     Raises:
-        ValueError: If SM version is not 100 (Blackwell), or if backend is invalid/unavailable
+        ValueError: If backend is invalid/unavailable
     """
 
-    # Validate Blackwell architecture
-    #if get_sm_version() != 100:
-    #    raise ValueError(
-    #        f"nvfp4_gemm requires SM 100 (Blackwell architecture), got SM {get_sm_version()}. "
-    #        f"NVFP4 operations are only supported on Blackwell GPUs."
-    #    )
-
     # Validate backend parameter
-    valid_backends = ['auto', 'cutlass', 'cublaslt', 'cutedsl']
+    valid_backends = ['auto', 'cutlass', 'cublaslt', 'cutedsl', 'cuda_core']
     if backend not in valid_backends:
         raise ValueError(
             f"Invalid backend '{backend}'. Must be one of {valid_backends}")
 
-    # Case 1: Auto selection (default behavior)
-    if backend == "auto":
-        tuner = AutoTuner.get()
-        runners = []
+    # Build list of runners based on backend parameter
+    runners = []
 
-        # 1. Always add CUTLASS runner (most compatible)
+    # CUDA Core runner can be enabled via backend='cuda_core' (not in auto mode by default)
+    # This avoids AutoTuner cache incompatibility issues
+    if backend == "cuda_core":
+        # Check if architecture is supported (SM >= 89)
+        is_cuda_core_supported = False
+        if torch.cuda.is_available():
+            capability = torch.cuda.get_device_capability(
+                torch.device('cuda:0'))
+            sm_version = capability[0] * 10 + capability[1]
+            is_cuda_core_supported = sm_version >= CudaCoreNVFP4Runner.MIN_SM_VERSION
+
+        if is_cuda_core_supported:
+            runners.append(CudaCoreNVFP4Runner(to_userbuffers, output_dtype))
+            logger.debug("CUDA Core runner added to nvfp4_gemm_unified")
+        else:
+            raise ValueError(
+                f"CUDA Core backend requires SM >= {CudaCoreNVFP4Runner.MIN_SM_VERSION} (Ada or newer). "
+                f"Current SM version: {sm_version if torch.cuda.is_available() else 'N/A'}. "
+                f"Please use backend='auto' or another backend.")
+
+    # Add CUTLASS runner (always available)
+    if backend in ["auto", "cutlass"]:
         runners.append(
             FP4GemmRunner(fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4,
                           to_userbuffers, output_dtype))
+        logger.debug("CUTLASS runner added to nvfp4_gemm_unified")
 
-        # 2. Add cuBLASLt runner if available
+    # Add cuBLASLt runner if available
+    if backend in ["auto", "cublaslt"]:
         if IS_CUBLASLT_AVAILABLE:
             runners.append(CublasLtFP4GemmRunner(to_userbuffers, output_dtype))
             logger.debug("cuBLASLt runner added to nvfp4_gemm_unified")
+        elif backend == "cublaslt":
+            raise ValueError(
+                "cuBLASLt backend is not available. "
+                "Please check cuBLASLt installation or use backend='auto'.")
 
-        # 3. Add CuteDSL runner if available
-        #    The wrapper will handle validation and graceful degradation
+    # Add CuteDSL runner if available
+    if backend in ["auto", "cutedsl"]:
         if IS_CUTLASS_DSL_AVAILABLE:
             runners.append(CuteDSLNVFP4Wrapper(to_userbuffers, output_dtype))
             logger.debug("CuteDSL runner added to nvfp4_gemm_unified")
+        elif backend == "cutedsl":
+            raise ValueError(
+                "CuteDSL backend is not available. "
+                "Please check CuteDSL installation or use backend='auto'.")
 
-        # AutoTuner automatically profiles all runners and selects the best
+    # Validate that we have at least one runner
+    if not runners:
+        raise ValueError(f"No valid runners available for backend '{backend}'. "
+                         "This should not happen - please report this bug.")
+
+    logger.debug(
+        f"nvfp4_gemm_unified: {len(runners)} runners available for backend '{backend}': "
+        f"{[type(r).__name__ for r in runners]}")
+
+    # Use AutoTuner to select best runner and tactic
+    # - For 'auto' mode: compare across all backends, find global optimum
+    # - For forced backend: only one backend in list, but still find its best tactic
+    tuner = AutoTuner.get()
+
+    try:
         best_runner, best_tactic = tuner.choose_one(
             "trtllm::nvfp4_gemm_unified::gemm",
             runners,
@@ -879,70 +988,27 @@ def nvfp4_gemm_unified(
             tuning_config,  # All runners use the same tuning_config
             [act_fp4, weight, act_sf, weight_scale, alpha],
         )
-
-        logger.debug(
-            f"nvfp4_gemm_unified selected backend: {type(best_runner).__name__}, tactic: {best_tactic}"
+    except IndexError as e:
+        # Provide more helpful error message
+        logger.error(
+            f"AutoTuner failed to select a runner. Available runners: "
+            f"{[type(r).__name__ for r in runners]}, "
+            f"shapes: M={act_fp4.shape[0]}, K={act_fp4.shape[1]*2}, N={weight.shape[0]}"
         )
+        raise RuntimeError(
+            f"AutoTuner failed to find a valid (runner, tactic) pair. "
+            f"This may indicate that all runners returned empty tactics for the given input shape. "
+            f"Available runners: {[type(r).__name__ for r in runners]}, "
+            f"Input shape: M={act_fp4.shape[0]}, K={act_fp4.shape[1]*2}, N={weight.shape[0]}"
+        ) from e
 
-        # Execute with the best runner
-        return best_runner(
-            inputs=[act_fp4, weight, act_sf, weight_scale, alpha],
-            tactic=best_tactic)
+    logger.debug(
+        f"nvfp4_gemm_unified selected backend: {type(best_runner).__name__}, "
+        f"tactic: {best_tactic} (mode: {backend})")
 
-    # Case 2: Force CUTLASS
-    elif backend == "cutlass":
-        logger.debug("nvfp4_gemm_unified: Forcing CUTLASS backend")
-        runner = FP4GemmRunner(fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4,
-                               to_userbuffers, output_dtype)
-        return runner(
-            inputs=[act_fp4, weight, act_sf, weight_scale, alpha],
-            tactic=-1  # Use default tactic
-        )
-
-    # Case 3: Force cuBLASLt
-    elif backend == "cublaslt":
-        if not IS_CUBLASLT_AVAILABLE:
-            raise ValueError(
-                "cuBLASLt backend is not available. "
-                "Please check cuBLASLt installation or use backend='auto'.")
-        logger.debug("nvfp4_gemm_unified: Forcing cuBLASLt backend")
-        runner = CublasLtFP4GemmRunner(to_userbuffers, output_dtype)
-        return runner(
-            inputs=[act_fp4, weight, act_sf, weight_scale, alpha],
-            tactic=-1  # Use default tactic
-        )
-
-    # Case 4: Force CuteDSL
-    elif backend == "cutedsl":
-        if not IS_CUTLASS_DSL_AVAILABLE:
-            raise ValueError(
-                "CuteDSL backend is not available. "
-                "Please check CuteDSL installation or use backend='auto'.")
-
-        logger.debug("nvfp4_gemm_unified: Forcing CuteDSL backend")
-        wrapper = CuteDSLNVFP4Wrapper(to_userbuffers, output_dtype)
-
-        # Validate inputs and get available tactics
-        try:
-            tactics = wrapper.get_valid_tactics(
-                [act_fp4, weight, act_sf, weight_scale, alpha], None)
-        except Exception as e:
-            raise ValueError(
-                f"CuteDSL backend failed input validation: {e}\n"
-                "Consider using backend='auto' to fall back to other backends.")
-
-        if not tactics:
-            raise ValueError(
-                "CuteDSL backend has no valid tactics for this input shape. "
-                "This may be due to:\n"
-                "  - Unsupported matrix dimensions\n"
-                "  - Invalid scale tensor shapes\n"
-                "  - SM version mismatch\n"
-                "Consider using backend='auto' to fall back to other backends.")
-
-        # Use first available tactic
-        return wrapper(inputs=[act_fp4, weight, act_sf, weight_scale, alpha],
-                       tactic=tactics[0])
+    # Execute with the best runner and tactic
+    return best_runner(inputs=[act_fp4, weight, act_sf, weight_scale, alpha],
+                       tactic=best_tactic)
 
 
 @nvfp4_gemm_unified.register_fake
