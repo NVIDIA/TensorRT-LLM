@@ -1,3 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
 """The model factory interface used by auto-deploy to build custom models."""
 
 import copy
@@ -12,6 +28,7 @@ from torch.export import Dim
 from torch.fx import GraphModule
 
 from ..custom_ops.attention_interface import CacheConfig
+from ..utils.cuda_mem_tracker import get_mem_info_in_mb
 from ..utils.logger import ad_logger
 
 DynamicShape = Dict[int, Dim]  # indicating the dynamic shape in tensor dimension
@@ -285,11 +302,20 @@ class ModelFactory(ABC):
 
         """
         ad_logger.info("Loading and initializing weights.")
+        free_mem_pre, _ = get_mem_info_in_mb()
+        ad_logger.info(f"Free memory before loading weights (MB): {free_mem_pre}")
         self._to_maybe_random(model, device)
+        params_size = sum(p.numel() * p.element_size() for p in model.parameters())
+        total_size_GB = params_size / (1024**3)
+        ad_logger.info(f"Estimated parameters memory: {total_size_GB:.2f} GB")
+
         if not self.skip_loading_weights:
             self.prefetch_checkpoint(force=True)
             self._load_checkpoint(model, device)
+
         ad_logger.info("Loading and initializing weights. Done.")
+        free_mem_post, _ = get_mem_info_in_mb()
+        ad_logger.info(f"Free memory after loading weights (MB): {free_mem_post}")
 
     @staticmethod
     def _to_maybe_random(model: nn.Module, device: DeviceLikeType):
