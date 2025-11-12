@@ -144,6 +144,9 @@ class SequenceInfo:
         self.page_size = page_size if page_size > 0 else max_seq_len
         self.vocab_size_padded = vocab_size_padded
         self.chunk_size = chunk_size
+        # chunk_size is an input to a custom op, so it can not be none. We set it to a default value of 128.
+        if chunk_size is None:
+            self.chunk_size = 128
         # NOTE (lucaslie): WAR to address issue when using flashinfer attention with
         # (max_batch_size, max_seq_len) input in trtllm runtime.
         # see https://github.com/NVIDIA/TensorRT-LLM/issues/4504
