@@ -9,16 +9,13 @@ import pytest
 import torch
 from _torch_test_utils import fp8_compatible, trtllm_ops_available  # noqa: F401
 from torch.nn import functional as F
+from utils.util import skip_pre_hopper
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import ActivationType
 
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 FP8_DTYPE = torch.float8_e4m3fn
-
-
-def _is_hopper_or_later():
-    return torch.cuda.get_device_capability(0) >= (8, 9)
 
 
 def dynamic_per_tensor_fp8_quant(x: torch.tensor) -> tuple[torch.tensor, torch.tensor]:
@@ -185,10 +182,7 @@ F16_TEST_DTYPES = [
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
 @pytest.mark.parametrize("itype, otype, wtype", F16_TEST_DTYPES)
 @pytest.mark.parametrize("activation_func", ["silu", "relu2"])
-@pytest.mark.skipif(
-    not _is_hopper_or_later() or not trtllm_ops_available(),
-    reason="Requires Hopper or later and trtllm support",
-)
+@skip_pre_hopper
 def test_trtllm_fused_moe(
     batch_size,
     hidden_size,
@@ -250,6 +244,7 @@ def test_trtllm_fused_moe(
 
     # (num_experts, 2 * intermediate_size, hidden_size) => (num_experts, intermediate_size, hidden_size)
     _, w1_weight = torch.chunk(w31_weight, 2, dim=1)
+    mlp_style = "mlp" if activation_func == "relu2" else "gated_mlp"
 
     ad_test_output = torch.ops.auto_deploy.trtllm_moe_fused(
         x,
@@ -257,14 +252,14 @@ def test_trtllm_fused_moe(
         routing_weights,
         w3_w1_stacked_weight=get_fc1_expert_weights(activation_func, w31_weight, w1_weight),
         w2_stacked_weight=w2_weight,
-        mlp_style="mlp" if activation_func == "relu2" else "gated_mlp",
+        mlp_style=mlp_style,
         act_fn=activation_func,
     )
     trtllm_test_output = torch.ops.trtllm.fused_moe(
         x,
         selected_experts.to(torch.int),
         routing_weights,
-        fc1_expert_weights=w1_weight.contiguous() if activation_func == "relu2" else w31_weight,
+        fc1_expert_weights=get_fc1_expert_weights(activation_func, w31_weight, w1_weight),
         fc1_expert_biases=None,
         fc2_expert_weights=w2_weight,
         fc2_expert_biases=None,
@@ -274,6 +269,16 @@ def test_trtllm_fused_moe(
     )[0].view(x.shape)
 
     torch.cuda.synchronize()
+    if mlp_style == "mlp":
+        with torch.inference_mode():
+            output_triton_moe = torch.ops.auto_deploy.triton_moe_fused(
+                x,
+                selected_experts,
+                routing_weights,
+                w1_weight.contiguous(),
+                w2_weight.contiguous(),
+            )[0].view(x.shape)
+            torch.testing.assert_close(output_triton_moe, ad_test_output, rtol=1e-1, atol=1e-1)
 
     diff = (ref_output - ad_test_output).abs()
     print(f"max diff: {diff.max()}")
@@ -370,25 +375,17 @@ def test_trtllm_fused_fp8moe(
     # For fp8, the hidden_state expects quantized.
     w3_scales, w1_scales = torch.chunk(w31_scales, 2, dim=-1)
 
-    x_quant, hidden_states_scale = dynamic_per_tensor_fp8_quant(x)
+    _, hidden_states_scale = dynamic_per_tensor_fp8_quant(x)
     hidden_states_scale = hidden_states_scale[0].detach().clone().cuda()
 
     w3_input_scale = torch.tensor([1.0]).cuda()
     w2_input_scale = torch.tensor([1.0]).cuda()
-    quant_scales = [
-        torch.squeeze(w1_scales * hidden_states_scale).float(),  # gemm1 dequant scale
-        w3_input_scale[0],  # gemm2 activation quant scale
-        torch.squeeze(w2_scales * w2_input_scale[0]).float(),  # gemm2 dequant scale
-        hidden_states_scale,  # gemm1 input dequant scale
-    ]
-
     torch.cuda.synchronize()
     print("before fused_moe.cutlass_fused_moe")
 
     # (num_experts, 2 * intermediate_size, hidden_size) => (num_experts, intermediate_size, hidden_size)
     w3_weight, w1_weight = torch.chunk(w31_weight, 2, dim=1)
-
-    activation_type = _activation_type_from_str(activation_func)
+    mlp_style = "mlp" if activation_func == "relu2" else "gated_mlp"
 
     ad_test_output = torch.ops.auto_deploy.trtllm_quant_fp8_moe_fused(
         x,  # Note! unquantized input is expected
@@ -403,28 +400,34 @@ def test_trtllm_fused_fp8moe(
         w1_weight_scale=w1_scales,
         w2_weight_scale=w2_scales,
         w3_weight_scale=w3_scales,
-        mlp_style="mlp" if activation_func == "relu2" else "gated_mlp",
+        mlp_style=mlp_style,
         act_fn=activation_func,
     )
 
-    _ = torch.ops.trtllm.fused_moe(
-        x_quant,  # Note! quantized input is expected
-        selected_experts.to(torch.int),
-        routing_weights,
-        fc1_expert_weights=w1_weight.contiguous() if activation_func == "relu2" else w31_weight,
-        fc1_expert_biases=None,
-        fc2_expert_weights=w2_weight,
-        fc2_expert_biases=None,
-        output_dtype=otype,
-        quant_scales=quant_scales,
-        activation_type=activation_type,
-    )[0].view(x_quant.shape)
     torch.cuda.synchronize()
+
+    if mlp_style == "mlp":
+        with torch.inference_mode():
+            output_triton_fp8_moe = torch.ops.auto_deploy.triton_quant_fp8_moe(
+                x,
+                selected_experts,
+                routing_weights,
+                w1_weight,
+                w2_weight,
+                w3_weight,
+                hidden_states_scale.unsqueeze(0),
+                w2_input_scale,
+                w3_input_scale,
+                w1_scales,
+                w2_scales,
+                w3_scales,
+                mlp_style=mlp_style,
+                act_fn=activation_func,
+            )
+            torch.testing.assert_close(output_triton_fp8_moe, ref_output, rtol=1e-1, atol=1e-1)
 
     diff = (ref_output - ad_test_output).abs()
     print(f"max diff: {diff.max()}")
-    # assert trtllm_test_output is not None
-    # torch.testing.assert_close(ad_test_output, trtllm_test_output, rtol=1e-6, atol=1e-6)
 
     _print_diff_if(lambda diff: diff.max() > 1e-1, diff, ad_test_output, ref_output)
     torch.testing.assert_close(ref_output, ad_test_output, rtol=1e-1, atol=1e-1)
