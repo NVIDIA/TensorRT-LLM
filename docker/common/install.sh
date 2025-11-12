@@ -16,6 +16,8 @@ polygraphy=0
 mpi4py=0
 pytorch=0
 opencv=0
+ucx=0
+nixl=0
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -55,6 +57,14 @@ while [[ $# -gt 0 ]]; do
             opencv=1
             shift 1
             ;;
+        --ucx)
+            ucx=1
+            shift 1
+            ;;
+        --nixl)
+            nixl=1
+            shift 1
+            ;;
         --all)
             base=1
             cmake=1
@@ -65,6 +75,8 @@ while [[ $# -gt 0 ]]; do
             mpi4py=1
             pytorch=1
             opencv=1
+            ucx=1
+            nixl=1
             shift 1
             ;;
         *)
