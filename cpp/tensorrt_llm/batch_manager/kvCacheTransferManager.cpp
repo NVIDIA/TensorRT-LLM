@@ -211,8 +211,8 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
 // Note about recording events to wait for cudaMempyAsync calls between blocks:
 // The memory copy involves raw memory blocks, which are pointed to by the
 // memory pool block index. When recording events, you must use getMemoryPoolBlockIndex()
-// as the raw memory block identifier. Using getBlockId() when recording events is wrong. 
-// getBlockId() returns the logical block id, which has nothing to do with the raw memory 
+// as the raw memory block identifier. Using getBlockId() when recording events is wrong.
+// getBlockId() returns the logical block id, which has nothing to do with the raw memory
 // block pointers involved in a cudaMemcpy.
 //
 
@@ -223,7 +223,7 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
 // for offload/onboard/partial copy is dangerous. We have an asynchronous decoder
 // that may not synchronize or synchronize at a later point in the execution stream.
 // To avoid synchronization issues caused by changes to decoder design we introduce
-// a new method SyncWithBufferManager() that ensures that internal copy streams 
+// a new method SyncWithBufferManager() that ensures that internal copy streams
 // will wait for prefill and decode kernels that have already been scheduled.
 //
 // Earlier versions of this code did not account for all possible cases where a new block copy
