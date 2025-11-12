@@ -130,6 +130,11 @@ def test_triton_context_flattened_and_state_writeback(mamba_env):
         ],
         dim=0,
     )
+    seq_idx_prefill = torch.repeat_interleave(
+        torch.arange(len(lens), device=device, dtype=torch.int32),
+        seq_len,
+    ).view(1, -1)
+    batch_info_tensor = torch.tensor([len(lens), sum(lens), 0], dtype=torch.int32)
     # Torch reference
     y_torch = torch.ops.auto_deploy.torch_cached_ssm(
         hidden_states,
@@ -164,7 +169,8 @@ def test_triton_context_flattened_and_state_writeback(mamba_env):
         cu_seqlens,
         None,  # chunk indices
         None,  # chunk offsets
-        torch.tensor([len(lens), sum(lens), 0], dtype=torch.int32),  # batch info tensor
+        seq_idx_prefill,
+        batch_info_tensor,
         ssm_state_cache_triton,
         time_step_limit,
         chunk_size,
