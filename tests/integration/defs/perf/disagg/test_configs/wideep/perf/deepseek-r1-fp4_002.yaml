@@ -60,7 +60,7 @@ worker_config:
     enable_lm_head_tp_in_adp: true
     pipeline_parallel_size: 1
     max_batch_size: 128
-    max_num_tokens: 256
+    max_num_tokens: 512
     max_seq_len: 2251
     cuda_graph_config:
       enable_padding: true
