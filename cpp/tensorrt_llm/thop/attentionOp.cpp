@@ -821,16 +821,6 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
         = runner->getWorkspaceSize(*op, num_tokens, max_attention_window_size, num_gen_tokens, max_blocks_per_sequence);
     TLLM_LOG_TRACE("Expected workspace size is %ld bytes", workspace_size);
 
-    if (workspace_size >= (16l << 30))
-    {
-        auto const [free_mem, total_mem] = tensorrt_llm::common::getDeviceMemoryInfo(false);
-        if (workspace_size >= static_cast<int64_t const>(free_mem))
-        {
-            throw std::runtime_error("attention workspace size " + std::to_string(workspace_size)
-                + " bytes, exceeds available CUDA memory " + std::to_string(free_mem) + " bytes");
-        }
-    }
-
     torch::Tensor workspace;
     if (workspace_.has_value())
     {
@@ -844,6 +834,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     }
     else
     {
+        TLLM_LOG_TRACE("Allocate new attention workspace with size %ld bytes", workspace_size);
         workspace = torch::empty({workspace_size}, torch::dtype(torch::kByte).device(qkv_or_q.device()));
     }
 

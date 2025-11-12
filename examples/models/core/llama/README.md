@@ -1540,14 +1540,15 @@ bash -c 'python ./examples/mmlu.py --test_trt_llm \
 ## Run LLaMa-3.3 70B Model on PyTorch Backend
 This section provides the steps to run LLaMa-3.3 70B model FP8 precision on PyTorch backend by launching TensorRT LLM server and run performance benchmarks.
 
-
 ### Prepare TensorRT LLM extra configs
 ```bash
 cat >./extra-llm-api-config.yml <<EOF
-stream_interval: 2
+stream_interval: 10
 cuda_graph_config:
   max_batch_size: 1024
   enable_padding: true
+kv_cache_config:
+  dtype: fp8
 EOF
 ```
 Explanation:
@@ -1581,5 +1582,5 @@ python -m tensorrt_llm.serve.scripts.benchmark_serving \
         --random-input-len 1024 \
         --random-output-len 2048 \
         --random-ids \
-        --max-concurrency 1024 \
+        --max-concurrency 1024
 ```

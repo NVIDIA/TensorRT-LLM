@@ -5,6 +5,7 @@ import sys
 import sysconfig
 
 import requests
+from utils.llm_data import llm_models_root
 
 
 def get_expected_license_files():
@@ -150,6 +151,23 @@ def install_tensorrt_llm():
     subprocess.check_call(install_command, shell=True)
 
 
+def create_link_for_models():
+    models_root = llm_models_root()
+    if not models_root.exists():
+        print(f"ERROR: Models root {models_root} does not exist")
+        exit(1)
+    src_dst_dict = {
+        # TinyLlama-1.1B-Chat-v1.0
+        f"{models_root}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0":
+        f"{os.getcwd()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+
 def test_pip_install():
     parser = argparse.ArgumentParser(description="Check Pip Install")
     parser.add_argument("--wheel_path",
@@ -178,6 +196,10 @@ def test_pip_install():
         shell=True)
     print("##########  Verify license files  ##########")
     verify_license_files()
+
+    print("##########  Create link for models  ##########")
+    create_link_for_models()
+
     print("##########  Test quickstart example  ##########")
     subprocess.check_call(
         "python3 ../../examples/llm-api/quickstart_example.py", shell=True)
