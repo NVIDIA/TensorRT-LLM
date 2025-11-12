@@ -242,7 +242,7 @@ public:
 
     void syncTransferManagerWithBufferManager() override
     {
-        PYBIND11_OVERLOAD_PURE(syncTransferManagerWithBufferManager);
+        PYBIND11_OVERLOAD_PURE(void, tbk::BaseKVCacheManager, syncTransferManagerWithBufferManager);
     }
 
     void refreshBlocks() override
