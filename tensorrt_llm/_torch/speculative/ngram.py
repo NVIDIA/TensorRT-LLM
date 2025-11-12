@@ -181,6 +181,11 @@ class NGramDrafter(Drafter):
         scheduled_requests: ScheduledRequests,
         resource_manager: Optional[ResourceManager] = None,
     ) -> None:
+        logger.info(
+            f"[NGRAM_DEBUG] prepare_draft_tokens called: "
+            f"num_gen_requests={len(scheduled_requests.generation_requests)}, "
+            f"max_total_draft_tokens={self.max_total_draft_tokens}")
+
         # Sort by request_id when py_batch_idx is None as a fallback.
         # This happens in the disagg case: for a set of new requests, we draft
         # before forward_step, so py_batch_idx is not assigned.
@@ -201,9 +206,19 @@ class NGramDrafter(Drafter):
             )
             request.py_draft_tokens = draft_tokens
 
+        logger.info(f"[NGRAM_DEBUG] prepare_draft_tokens completed")
+
     def update_max_total_draft_tokens(self,
                                       new_max_total_draft_tokens: int) -> None:
         """Override to propagate to NGramPoolManager."""
+        logger.info(
+            f"[NGRAM_DEBUG] NGramDrafter.update_max_total_draft_tokens: new={new_max_total_draft_tokens}"
+        )
         super().update_max_total_draft_tokens(new_max_total_draft_tokens)
-        self.spec_resource_manager.max_total_draft_tokens(
-            new_max_total_draft_tokens)
+        logger.info(
+            f"[NGRAM_DEBUG] Updating NGramPoolManager.max_total_draft_tokens to {new_max_total_draft_tokens}"
+        )
+        self.spec_resource_manager.max_total_draft_tokens = new_max_total_draft_tokens
+        logger.info(
+            f"[NGRAM_DEBUG] NGramDrafter.update_max_total_draft_tokens completed"
+        )
