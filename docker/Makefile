@@ -56,6 +56,10 @@ NGC_STAGING_REPO   ?= nvcr.io/nvstaging/tensorrt-llm
 NGC_REPO           ?= nvcr.io/nvidia/tensorrt-llm
 NGC_USE_STAGING    ?= 0
 NGC_AUTO_REPO      ?= $(if $(filter 1,$(NGC_USE_STAGING)),$(NGC_STAGING_REPO),$(NGC_REPO))
+SH_ENV             ?= $(shell docker inspect --format='{{range .Config.Env}}{{println .}}{{end}}' $(BASE_IMAGE):$(BASE_TAG) \
+    				  | grep '^ENV=' | sed 's/^[^=]*=//' 2>/dev/null)
+BASH_ENV           ?= $(shell docker inspect --format='{{range .Config.Env}}{{println .}}{{end}}' $(BASE_IMAGE):$(BASE_TAG) \
+    				  | grep '^BASH_ENV=' | sed 's/^[^=]*=//' 2>/dev/null)
 
 define add_local_user
 	docker build \
@@ -97,6 +101,8 @@ endef
 		$(if $(GIT_COMMIT), --build-arg GIT_COMMIT="$(GIT_COMMIT)") \
 		$(if $(GITHUB_MIRROR), --build-arg GITHUB_MIRROR="$(GITHUB_MIRROR)") \
 		$(if $(PYTHON_VERSION), --build-arg PYTHON_VERSION="$(PYTHON_VERSION)") \
+		$(if $(SH_ENV), --build-arg SH_ENV="$(SH_ENV)") \
+		$(if $(BASH_ENV), --build-arg BASH_ENV="$(BASH_ENV)") \
 		$(if $(STAGE), --target $(STAGE)) \
 		--file Dockerfile.multi \
 		--tag $(IMAGE_WITH_TAG) \
