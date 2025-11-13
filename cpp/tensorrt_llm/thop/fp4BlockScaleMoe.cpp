@@ -436,66 +436,6 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     workspace.bmm1_workspace = workspace_fc1.data_ptr();
     workspace.bmm2_workspace = workspace_fc2.data_ptr();
     auto const& moe_stream = at::cuda::getCurrentCUDAStream(hidden_states.get_device());
-
-    // check alpha and beta print
-    std::vector<float> alpha_vals, beta_vals;
-    if (gemm1_alpha.has_value())
-    {
-        auto alpha_cpu = gemm1_alpha.value().cpu().contiguous();
-        float* alpha_ptr = alpha_cpu.data_ptr<float>();
-        std::cout << "[FP4BlockScaleMoe] gemm1 alpha: ";
-        for (int i = 0; i < local_num_experts; ++i)
-        {
-            std::cout << alpha_ptr[i] << " ";
-        }
-        std::cout << std::endl;
-    }
-    if (gemm1_beta.has_value())
-    {
-        auto beta_cpu = gemm1_beta.value().cpu().contiguous();
-        float* beta_ptr = beta_cpu.data_ptr<float>();
-        std::cout << "[FP4BlockScaleMoe] gemm1 beta: ";
-        for (int i = 0; i < local_num_experts; ++i)
-        {
-            std::cout << beta_ptr[i] << " ";
-        }
-        std::cout << std::endl;
-    }
-    if (gemm1_clamp_limit.has_value())
-    {
-        auto clamp_cpu = gemm1_clamp_limit.value().cpu().contiguous();
-        float* clamp_ptr = clamp_cpu.data_ptr<float>();
-        std::cout << "[FP4BlockScaleMoe] gemm1 clamp limit: ";
-        for (int i = 0; i < local_num_experts; ++i)
-        {
-            std::cout << clamp_ptr[i] << " ";
-        }
-        std::cout << std::endl;
-    }
-    std::vector<float> gemm1_bias_vals;
-    if (gemm1_bias.has_value())
-    {
-        auto bias_cpu = gemm1_bias.value().cpu().contiguous();
-        float* bias_ptr = bias_cpu.data_ptr<float>();
-        std::cout << "[FP4BlockScaleMoe] gemm1 bias: ";
-        for (int i = 0; i < std::min(local_num_experts * intermediate_size * 2, int64_t(30)); ++i)
-        {
-            std::cout << bias_ptr[i] << " ";
-        }
-        std::cout << std::endl;
-    }
-    if (gemm2_bias.has_value())
-    {
-        auto bias_cpu = gemm2_bias.value().cpu().contiguous();
-        float* bias_ptr = bias_cpu.data_ptr<float>();
-        std::cout << "[FP4BlockScaleMoe] gemm2 bias: ";
-        for (int i = 0; i < std::min(local_num_experts * args.hidden_size, int64_t(30)); ++i)
-        {
-            std::cout << bias_ptr[i] << " ";
-        }
-        std::cout << std::endl;
-    }
-
     moe_runner.run(args, workspace, hidden_states.get_device(), moe_stream, moeConfigIndex);
 
     if (!do_finalize)
