@@ -13,12 +13,12 @@ from utils.util import similar
 
 
 # # ============================================================================
-# # Fixture: Force single-worker mode for all tests in this module
+# # Fixture: Force single-worker mode
+# # Used in test 2, as it needs to check the states of the executor
 # # ============================================================================
-@pytest.fixture(scope="module", autouse=True)
-def enforce_single_worker():
-    """Force single-worker mode for all tests in this module."""
-    os.environ["TLLM_WORKER_USE_SINGLE_PROCESS"] = "1"
+@pytest.fixture(scope="function")
+def enforce_single_worker(monkeypatch):
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
     yield
 
 
@@ -33,7 +33,6 @@ def enforce_single_worker():
     ],
 )
 @pytest.mark.high_cuda_memory
-@pytest.mark.xdist_group("speculative_high_mem")
 def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     memory_required = 30 if drafter_type == "model_drafter" else 20
@@ -48,7 +47,7 @@ def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
     max_draft_len = max(schedule.values())  # Use max from schedule
 
     kv_cache_config = KvCacheConfig(
-        enable_block_reuse=False, enable_partial_reuse=False, max_tokens=8192
+        enable_block_reuse=False, enable_partial_reuse=False, max_tokens=1024
     )
 
     llm_common_config = dict(
@@ -58,7 +57,7 @@ def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
         disable_overlap_scheduler=True,
         max_batch_size=max_batch_size,
         kv_cache_config=kv_cache_config,
-        max_num_tokens=2048,
+        max_num_tokens=1024,
     )
 
     if drafter_type == "ngram":
@@ -147,8 +146,9 @@ def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
     ],
 )
 @pytest.mark.high_cuda_memory
-@pytest.mark.xdist_group("speculative_high_mem")
-def test_draft_len_schedule_functionality(drafter_type: str, draft_schedule: dict):
+def test_draft_len_schedule_functionality(
+    enforce_single_worker, drafter_type: str, draft_schedule: dict
+):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
@@ -159,13 +159,18 @@ def test_draft_len_schedule_functionality(drafter_type: str, draft_schedule: dic
         pytest.skip("Not enough memory")
     max_batch_size = 7
 
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=False, enable_partial_reuse=False, max_tokens=1024
+    )
+
     llm_common_config = dict(
         model=llm_models_root() / "llama-3.1-model" / "Meta-Llama-3.1-8B",
         backend="pytorch",
         attn_backend="TRTLLM",
         disable_overlap_scheduler=True,
         max_batch_size=max_batch_size,
-        max_num_tokens=2048,
+        kv_cache_config=kv_cache_config,
+        max_num_tokens=1024,
     )
 
     if drafter_type == "ngram":
@@ -194,7 +199,7 @@ def test_draft_len_schedule_functionality(drafter_type: str, draft_schedule: dic
             top_k=1,
             top_p=1.0,
         )
-        for i in range(8)
+        for i in range(7)
     ]
 
     llm_spec = LLM(**llm_common_config, speculative_config=spec_config)

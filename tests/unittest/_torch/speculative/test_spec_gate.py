@@ -21,7 +21,6 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 # This test set the max_concurrency to a large value to prevent spec decode turned off due to number of effective requests > max_concurrency,
 # So that we can only focus on the turning off effect from the SpeculationGate.
 @pytest.mark.high_cuda_memory
-@pytest.mark.xdist_group("speculative_high_mem")
 def test_spec_gate_e2e():
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 35:
