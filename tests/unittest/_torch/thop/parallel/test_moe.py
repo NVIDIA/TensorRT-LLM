@@ -1483,8 +1483,13 @@ class TestMoeFp4:
                 hidden_states_scale_linear_fp4,
                 gemm1_weights_fp4_shuffled,
                 gemm1_scales_fp4_shuffled,
+                None,  # Bias
+                None,  # Alpha
+                None,  # Beta
+                None,  # Limit
                 gemm2_weights_fp4_shuffled,
                 gemm2_scales_fp4_shuffled,
+                None,  # Bias
                 scale_c_fc1,
                 scale_gate_fc1,
                 scale_c_fc2,
