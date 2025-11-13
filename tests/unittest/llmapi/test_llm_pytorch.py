@@ -930,6 +930,7 @@ class TestLlmError:
 
 
 @skip_ray
+@pytest.mark.skip(reason="https://nvbugs/5594753")
 def test_llm_rpc():
     # TODO: remove the with-statement when shutdown hang issue is fixed
     with LLM(model=llama_model_path,
