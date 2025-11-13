@@ -529,8 +529,10 @@ class RPCServer:
                 async def stream_with_timeout():
                     nonlocal chunk_index
                     async for result in func(*req.args, **req.kwargs):
-                        if not result:
-                            continue  # WAR
+                        if result is None or result == []:
+                            # Skip None values or empty list to save bandwidth
+                            # TODO[Superjomn]: add a flag to control this behavior
+                            continue
                         # Check if shutdown was triggered
                         if self._shutdown_event.is_set():
                             raise RPCCancelled(
@@ -559,8 +561,8 @@ class RPCServer:
             else:
                 # No timeout specified, stream normally
                 async for result in func(*req.args, **req.kwargs):
-                    if not result:
-                        continue  # WAR
+                    if result is None or result == []:
+                        continue  # Skip None values or empty list
                     # Check if shutdown was triggered
                     if self._shutdown_event.is_set():
                         raise RPCCancelled(

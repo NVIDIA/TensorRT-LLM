@@ -1,5 +1,4 @@
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from queue import Queue
 from threading import Event
@@ -88,9 +87,9 @@ class RpcWorker(BaseWorker):
         self._response_queue = Queue()
         self.set_result_queue(self._response_queue)
 
-        # Create a thread pool for the fetch_responses_loop_async task to avoid
-        # being interfered by other tasks such as submit().
-        self._fetch_responses_loop_executor = ThreadPoolExecutor(max_workers=1)
+        # Note: We don't create a persistent ThreadPoolExecutor anymore
+        # to avoid thread leaks. Instead, we use asyncio.to_thread() which
+        # manages threads internally.
 
     def submit(self, request: GenerationRequest):
         """ Submits a request to the worker. """
@@ -128,11 +127,10 @@ class RpcWorker(BaseWorker):
 
     async def fetch_responses_async(self,
                                     timeout: Optional[float] = None) -> list:
-        # First, await any pending responses without blocking the event loop
-        loop = asyncio.get_event_loop()
-        responses = await loop.run_in_executor(
-            self._fetch_responses_loop_executor,
-            lambda: self.fetch_responses(timeout=timeout))
+        # Use asyncio.to_thread to avoid blocking the event loop
+        # This is similar to fetch_stats_async and fetch_kv_cache_events_async
+        responses = await asyncio.to_thread(self.fetch_responses,
+                                            timeout=timeout)
         return responses
 
     async def fetch_stats_async(self, timeout: Optional[float] = None) -> list:
