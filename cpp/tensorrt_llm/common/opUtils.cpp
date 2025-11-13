@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/common/opUtils.h"
+#include "tensorrt_llm/common/ncclUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiTags.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
@@ -112,8 +113,21 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
     std::shared_ptr<ncclComm_t> ncclComm(new ncclComm_t,
         [](ncclComm_t* comm)
         {
-            ncclCommDestroy(*comm);
-            delete comm;
+            if (comm && *comm)
+            {
+                // STEP 1: Clean up all registered resources FIRST
+                tensorrt_llm::common::nccl_util::NcclCommResourceManager::getInstance().cleanupResources(*comm);
+
+                // STEP 2: Now destroy the NCCL communicator
+                ncclResult_t result = ncclCommDestroy(*comm);
+                if (result != ncclSuccess)
+                {
+                    TLLM_LOG_WARNING("ncclCommDestroy failed with error: %d", result);
+                }
+
+                // STEP 3: Free the memory
+                delete comm;
+            }
         });
 #if defined(_WIN32)
     // Need static connection initialization for accurate KV cache size estimation
