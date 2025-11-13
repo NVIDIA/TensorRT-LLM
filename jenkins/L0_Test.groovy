@@ -846,7 +846,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 sh "cd ${llmPath} && tar -zxf ${BUILD_CONFIGS[config][TARNAME]}"
 
                 // Upload slurm_run_sh to Frontend node
-                def scriptRunLocalPath = "${llmSrcLocal}/jenkins/scripts/slurm_run.sh"
+                def scriptRunLocalPath = "${llmSrcLocal}/jenkins/scripts/slurm_run_test.sh"
 
                 Utils.exec(pipeline, script: "echo \"Script to trigger slurm job: \" && cat ${scriptRunLocalPath}")
                 Utils.copyFileToRemoteHost(
@@ -997,7 +997,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             stage("[${stageName}] Run Pytest") {
                 Utils.exec(
                     pipeline,
-                    timeout: false,
+                    timeout: 200,
                     script: Utils.sshUserCmd(
                         remote,
                         scriptExecPathNode,
