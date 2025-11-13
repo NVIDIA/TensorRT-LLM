@@ -921,9 +921,50 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 taskArgs = [
                     *taskArgs,
                 ]
+
+                def containerImageArg = container
+                def srunPrologue = ""
+                if (cluster.containerRuntime == ContainerRuntime.ENROOT) {
+                    mounts = [
+                        "/lustre/fs1/portfolios/coreai/projects/coreai_tensorrt_ci:/scratch.trt_llm_data:ro",
+                        "/home/svc_tensorrt:/home/svc_tensorrt",
+                        "/home/svc_tensorrt/.cache:/root/.cache",
+                        // workspace needs to be explicitly mounted if container runtime is enroot to avoid chroot error
+                        "${jobWorkspace}",
+                    ].join(",")
+
+                    def enrootImagePath = "/lustre/fs1/portfolios/coreai/projects/coreai_tensorrt_ci/users/svc_tensorrt/containers/container-\${SLURM_JOB_ID}.sqsh"
+                    containerImageArg = enrootImagePath
+
+                    srunPrologue = """
+                    export ENROOT_CACHE_PATH='/home/svc_tensorrt/.cache/enroot'
+
+                    retry_command() {
+                        local cmd=\$1
+                        local max_attempts=\${2:-3}
+                        local delay=\${3:-60}
+                        local attempt=1
+
+                        until \$cmd
+                        do
+                            if ((attempt >= max_attempts))
+                            then
+                                echo "Command '\$cmd' failed after \$max_attempts attempts"
+                                return 1
+                            fi
+
+                            echo "Command '\$cmd' failed (attempt \$attempt of \$max_attempts). Retrying in \${delay}s..."
+                            sleep \$delay
+                            ((attempt++))
+                        done
+                    }
+
+                    retry_command "enroot import -o $enrootImagePath -- docker://$container"
+                    """.replaceAll("(?m)^\\s*", "")
+                }
+
                 srunArgs = [
-                    "--container-image=$container",
-                    "--container-workdir=/home/svc_tensorrt/bloom/scripts",
+                    "--container-image=$containerImageArg",
                     "--container-mounts=$mounts",
                     "--container-env=NVIDIA_IMEX_CHANNELS"
                 ]
@@ -951,6 +992,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export NVIDIA_IMEX_CHANNELS=0
                     export NVIDIA_IMEX_CHANNELS=0
                     export NVIDIA_VISIBLE_DEVICES=\$(seq -s, 0 \$((\$(nvidia-smi --query-gpu=count -i 0 --format=noheader)-1)))
+
+                    ${srunPrologue}
+
                     chmod +x $scriptRunNode
                     srun --kill-on-bad-exit=1 ${srunArgs.join(" ")} ${scriptRunNode}
                 """.replaceAll("(?m)^\\s*", "")
