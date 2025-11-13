@@ -6,12 +6,12 @@ if [ -n "${GITHUB_MIRROR}" ]; then
     GITHUB_URL=${GITHUB_MIRROR}
 fi
 
-UCX_VERSION="v1.19.x"
+UCX_VERSION="1.19.x"
 UCX_INSTALL_PATH="/usr/local/ucx/"
 CUDA_PATH="/usr/local/cuda"
 
 rm -rf ${UCX_INSTALL_PATH}
-curl -L ${GITHUB_URL}/openucx/ucx/archive/refs/heads/${UCX_VERSION}.tar.gz -o ucx-${UCX_VERSION}.tar.gz
+curl -L ${GITHUB_URL}/openucx/ucx/archive/refs/heads/v${UCX_VERSION}.tar.gz -o ucx-${UCX_VERSION}.tar.gz
 tar -xzf ucx-${UCX_VERSION}.tar.gz
 mv ucx-${UCX_VERSION} ucx
 cd ucx
