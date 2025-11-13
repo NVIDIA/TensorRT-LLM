@@ -18,8 +18,8 @@ TensorRT LLM perf tests
 import os
 import re
 import shutil
-import sys
 import socket
+import sys
 from typing import Dict, List, NamedTuple
 
 import pytest
@@ -35,9 +35,10 @@ from .open_search_db_utils import (add_id, get_history_data, get_job_info,
                                    print_regressive_test_cases)
 from .pytorch_model_config import get_model_yaml_config
 from .sampler_options_config import get_sampler_options_config
-from .utils import (AbstractPerfScriptTestClass, PerfBenchScriptTestCmds,
-                    PerfDisaggScriptTestCmds, PerfMultiNodeDisaggScriptTestCmds,
-                    PerfMetricType, PerfAggrScriptTestCmds, generate_test_nodes)
+from .utils import (AbstractPerfScriptTestClass, PerfAggrScriptTestCmds,
+                    PerfBenchScriptTestCmds, PerfDisaggScriptTestCmds,
+                    PerfMetricType, PerfMultiNodeDisaggScriptTestCmds,
+                    generate_test_nodes)
 
 if not hasattr(re, "Pattern"):
     re.Pattern = type(re.compile(""))
@@ -584,7 +585,10 @@ class ServerConfig:
             if k not in ['name', 'model_name', 'gpus', 'client_configs']
         }
 
-    def to_cmd(self, working_dir: str, hostname: str = "localhost", port: int = 8000) -> List[str]:
+    def to_cmd(self,
+               working_dir: str,
+               hostname: str = "localhost",
+               port: int = 8000) -> List[str]:
         model_dir = get_model_dir(self.model_name)
         self.model_path = model_dir if os.path.exists(
             model_dir) else self.model_name
@@ -714,7 +718,10 @@ class ClientConfig:
         self.streaming = client_config_data.get('streaming', True)
         self.model_path = ""
 
-    def to_cmd(self, working_dir: str, hostname: str = "localhost", port: int = 8000) -> List[str]:
+    def to_cmd(self,
+               working_dir: str,
+               hostname: str = "localhost",
+               port: int = 8000) -> List[str]:
         model_dir = get_model_dir(self.model_name)
         self.model_path = model_dir if os.path.exists(
             model_dir) else self.model_name
@@ -727,7 +734,8 @@ class ClientConfig:
             str(self.osl), "--random-range-ratio",
             str(self.random_range_ratio), "--ignore-eos",
             "--percentile-metrics", "ttft,tpot,itl,e2el", "--max-concurrency",
-            str(self.concurrency), "--host", hostname, "--port", str(port)
+            str(self.concurrency), "--host", hostname, "--port",
+            str(port)
         ]
         if self.backend:
             benchmark_cmd.append("--backend")
@@ -857,28 +865,29 @@ def parse_aggr_config_file(config_file_path: str, select_pattern: str = None):
     return execution_plan, server_configs, server_client_configs
 
 
-def parse_multi_node_disagg_config_file(config_file_path: str, select_pattern: str = None):
+def parse_multi_node_disagg_config_file(config_file_path: str,
+                                        select_pattern: str = None):
     # Get disagg_server_idx from environment variable
     disagg_server_idx = os.environ.get("DISAGG_SERVER_IDX", "DISAGG")
-    
+
     # Get hostname
     hostname = socket.gethostname()
-    
+
     # Determine port based on disagg_server_idx
     port = 8333
     if "CTX" in disagg_server_idx and "GEN" in disagg_server_idx:
         port = 8336
-    
+
     # Parse selection pattern
     if select_pattern:
         execution_plan = parse_select_pattern(select_pattern)
     else:
         execution_plan = None
-    
+
     # Read YAML config file
     with open(config_file_path, 'r') as f:
         config = yaml.safe_load(f)
-    
+
     disagg_configs = []
     hardware = config.get('hardware', {})
     # Parse disaggregated configurations
@@ -891,9 +900,12 @@ def parse_multi_node_disagg_config_file(config_file_path: str, select_pattern: s
         # Assert model_name, benchmark, gen, ctx are not None
         model_name = disagg_config_data.get('model_name', None)
         assert model_name is not None, "model_name is required"
-        assert disagg_config_data.get('benchmark', None) is not None, "benchmark is required"
-        assert disagg_config_data.get('gen', None) is not None, "gen is required"
-        assert disagg_config_data.get('ctx', None) is not None, "ctx is required"
+        assert disagg_config_data.get('benchmark',
+                                      None) is not None, "benchmark is required"
+        assert disagg_config_data.get('gen',
+                                      None) is not None, "gen is required"
+        assert disagg_config_data.get('ctx',
+                                      None) is not None, "ctx is required"
 
         # Create disagg_config dict
         disagg_config = {
@@ -909,7 +921,7 @@ def parse_multi_node_disagg_config_file(config_file_path: str, select_pattern: s
             'client': ClientConfig(disagg_config_data['benchmark'], model_name),
         }
         disagg_configs.append(disagg_config)
-    
+
     return disagg_configs
 
 
@@ -1251,7 +1263,8 @@ class PerfTestConfig:
             self.config_file = labels[1]
             if "disagg" in labels[1]:
                 self.runtime = "multi_node_disagg_server"
-                self.gpu_type = labels[1].replace("l0_", "").replace("_multi_nodes_disagg", "").lower()
+                self.gpu_type = labels[1].replace("l0_", "").replace(
+                    "_multi_nodes_disagg", "").lower()
             else:
                 self.runtime = "aggr_server"
                 self.gpu_type = labels[1].replace("l0_", "").lower()
@@ -1651,12 +1664,12 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         gen_server_cmds = []
         disagg_server_cmds = []
         benchmark_cmds = []
-        
+
         # Create hostnames directory
         hostnames_dir = os.path.join(self._working_dir, "hostnames")
         if not os.path.exists(hostnames_dir):
             os.makedirs(hostnames_dir, exist_ok=True)
-        
+
         for disagg_config in self._config.disagg_configs:
             disagg_server_idx = disagg_config['disagg_server_idx']
             hostname = disagg_config['hostname']
@@ -1667,36 +1680,41 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             benchmark_cmd = None
             if "CTX" in disagg_server_idx or "GEN" in disagg_server_idx:
                 # Write hostname to hostnames folder
-                hostname_file = os.path.join(hostnames_dir, f"{disagg_server_idx}.txt")
+                hostname_file = os.path.join(hostnames_dir,
+                                             f"{disagg_server_idx}.txt")
                 with open(hostname_file, 'w') as f:
                     f.write(hostname)
-                
+
                 # Generate CTX or GEN server commands if this is a CTX or GEN node
                 is_ctx = "CTX" in disagg_server_idx
-                server_config = disagg_config['ctx_server'] if is_ctx else disagg_config['gen_server']
-                server_cmd = server_config.to_cmd(self._working_dir, hostname, port)
+                server_config = disagg_config[
+                    'ctx_server'] if is_ctx else disagg_config['gen_server']
+                server_cmd = server_config.to_cmd(self._working_dir, hostname,
+                                                  port)
                 server_cmd = " ".join(server_cmd)
                 if is_ctx:
                     ctx_server_cmd = server_cmd
                 else:
-                    gen_server_cmd = server_cmd    
+                    gen_server_cmd = server_cmd
                 # Generate extra-llm-api-config.yml
                 config_content = server_config.generate_extra_llm_api_config()
                 config_filename = f"extra-llm-api-config.{disagg_config['name']}.{'ctx' if is_ctx else 'gen'}.yml"
                 config_path = os.path.join(self._working_dir, config_filename)
                 with open(config_path, 'w') as f:
-                    f.write(config_content)    
+                    f.write(config_content)
             else:
                 # Generate DISAGG server and benchmark commands if this is the DISAGG node
                 timeout = disagg_config['timeout']
                 disagg_cmd = [
                     "trtllm-serve", "disaggregated", "-c",
-                    f"{self._working_dir}/server_config.yaml",
-                    "-t", str(timeout), "-r", str(timeout)
+                    f"{self._working_dir}/server_config.yaml", "-t",
+                    str(timeout), "-r",
+                    str(timeout)
                 ]
                 disagg_server_cmd = " ".join(disagg_cmd)
                 # Generate benchmark command
-                benchmark_cmd = disagg_config['client'].to_cmd(self._working_dir, hostname, port)
+                benchmark_cmd = disagg_config['client'].to_cmd(
+                    self._working_dir, hostname, port)
                 benchmark_cmd = " ".join(benchmark_cmd)
             ctx_server_cmds.append(ctx_server_cmd)
             gen_server_cmds.append(gen_server_cmd)
@@ -1979,13 +1997,11 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                                                    "perf-sanity")
             if not os.path.exists(perf_sanity_working_dir):
                 os.makedirs(perf_sanity_working_dir, exist_ok=True)
-            server_cmds, client_cmds, names = self.get_trtllm_aggr_commands(
-            )
-            return PerfAggrScriptTestCmds(
-                server_cmds=server_cmds,
-                client_cmds=client_cmds,
-                names=names,
-                working_dir=perf_sanity_working_dir)
+            server_cmds, client_cmds, names = self.get_trtllm_aggr_commands()
+            return PerfAggrScriptTestCmds(server_cmds=server_cmds,
+                                          client_cmds=client_cmds,
+                                          names=names,
+                                          working_dir=perf_sanity_working_dir)
 
         if is_disagg:
             ctx_cmd, gen_cmd = self._get_disagg_worker_deploy_command()
@@ -1996,19 +2012,23 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                                             client_cmd, benchmark_cmd)
 
         if is_multi_node_disagg:
-            perf_sanity_working_dir = os.path.join(self._working_dir, "perf-sanity")
+            perf_sanity_working_dir = os.path.join(self._working_dir,
+                                                   "perf-sanity")
             if not os.path.exists(perf_sanity_working_dir):
                 os.makedirs(perf_sanity_working_dir, exist_ok=True)
-            ctx_server_cmds, gen_server_cmds, disagg_server_cmds, benchmark_cmds = self.get_trtllm_multi_node_disagg_commands()
+            ctx_server_cmds, gen_server_cmds, disagg_server_cmds, benchmark_cmds = self.get_trtllm_multi_node_disagg_commands(
+            )
             return PerfMultiNodeDisaggScriptTestCmds(
                 ctx_server_cmds=ctx_server_cmds,
                 gen_server_cmds=gen_server_cmds,
                 disagg_server_cmds=disagg_server_cmds,
                 benchmark_cmds=benchmark_cmds,
                 working_dir=perf_sanity_working_dir,
-                num_ctx_servers=self._config.disagg_configs[0]['hardware']['num_ctx_servers'],
-                num_gen_servers=self._config.disagg_configs[0]['hardware']['num_gen_servers'])
-        
+                num_ctx_servers=self._config.disagg_configs[0]['hardware']
+                ['num_ctx_servers'],
+                num_gen_servers=self._config.disagg_configs[0]['hardware']
+                ['num_gen_servers'])
+
         if is_python and num_gpus > 1:
             # TODO: Fix https://nvbugs/4449875
             pytest.skip(
@@ -2240,9 +2260,10 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                     if self._current_cmd_idx in self._test_results:
                         del self._test_results[self._current_cmd_idx]
 
-        # Only upload for multi_node_disagg_server when disagg_server_idx == "DISAGG"
-        if self._config.runtime != "multi_node_disagg_server" or self._config.disagg_configs[0]['disagg_server_idx'] == "DISAGG":
-            self.upload_test_results_to_database()
+            # Only upload for multi_node_disagg_server when disagg_server_idx == "DISAGG"
+            if self._config.runtime != "multi_node_disagg_server" or self._config.disagg_configs[
+                    0]['disagg_server_idx'] == "DISAGG":
+                self.upload_test_results_to_database()
 
         finally:
             # Clean up engine dir after use.
@@ -2497,8 +2518,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             )
         elif self._config.runtime == "multi_node_disagg_server":
             metric_label = self._config.to_string(
-                custom_server_name=disagg_config_name,
-            )
+                custom_server_name=disagg_config_name, )
         else:
             # Otherwise, generate per-bs and per-seqlen label.
             metric_label = self._config.to_string(

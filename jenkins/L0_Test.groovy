@@ -1175,17 +1175,17 @@ def runLLMMultiNodeDisaggTestlistWithSbatch(pipeline, platform, testList, config
                 ).join(" ")
 
             }
-            
+
             stage("[${stageName}] Run Pytest") {
                 // Define container and mounts for slurm_exec.py
                 def container = LLM_DOCKER_IMAGE.replace("urm.nvidia.com/", "urm.nvidia.com#")
                 def mounts = "/home/scratch.trt_llm_data:/scratch.trt_llm_data:ro,/home/svc_tensorrt/bloom/scripts:/home/svc_tensorrt/bloom/scripts"
-                
+
                 // Generate sbatch parameter string (without --nodes, --ntasks, etc. which will come from config yaml)
                 def sbatchParams = """--output=${outputPath}
 ${partition.additionalArgs}
 ${(partition?.name && partition.name != "unspecified") ? "--partition=${partition.name}" : ""}"""
-                
+
                 def slurm_exec_cmd = """python3 ${scriptExecPathNode} \\
 --sbatch-params '${sbatchParams.replaceAll("'", "'\\\\''")}' \\
 --config-yaml '${configYamlFile}' \\
@@ -1205,7 +1205,7 @@ ${(partition?.name && partition.name != "unspecified") ? "--partition=${partitio
 --script-install-node '${scriptInstallPathNode}' \\
 --test-list-path-node '${testListPathNode}' \\
 --output-path '${outputPath}'"""
-                
+
                 Utils.exec(
                     pipeline,
                     timeout: false,
