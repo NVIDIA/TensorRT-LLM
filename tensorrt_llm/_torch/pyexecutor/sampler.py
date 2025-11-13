@@ -280,7 +280,9 @@ def _group_requests_by_strategy_key(
     )
     for req_index, req in enumerate(requests):
         strategy = _request_strategy(req, vocab_size=vocab_size)
-        speculation_needs_probs = req.py_draft_logits is not None and strategy is not GREEDY
+        # In the overlap path, py_draft_logits is not updated yet,
+        # so we use get_draft_token_length() for the checking.
+        speculation_needs_probs = get_draft_token_length(req) > 0 and strategy is not GREEDY
         strategy_key = strategy_to_key(strategy, speculation_needs_probs)
         group_dict_entry = group_dict[(strategy_key, speculation_needs_probs)]
         group_dict_entry[0].append(req_index)
