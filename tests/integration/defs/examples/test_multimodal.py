@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import os
-import uuid
 
 import pytest
 import torch
@@ -413,7 +412,7 @@ def _test_llm_multimodal_general(llm_venv,
     elif vision_model_type == 'llava_onevision':
         vit_batch_size = vit_batch_size * 32
 
-    llm_engine_subdir = uuid.uuid4().hex[:8]
+    llm_engine_subdir = f"{data_type}" if enc_dec_model else ""
     # Phi4MM has both vision and audio. Engine build dumps to vision and audio dirs automatically by builder.
     component_dir = "vision" if vision_model_type != "phi-4-multimodal" else ""
     build_cmd = [
