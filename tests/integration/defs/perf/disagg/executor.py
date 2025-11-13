@@ -453,13 +453,13 @@ class JobManager:
                 - (False, error_msg): Job failed early with specific error
         """
         start_time = time.time()
-        check_interval = 30  # Check every 30 seconds
+        check_interval = 600  # Check every 10 minutes
         failure_check_interval = 60  # Check for failures every 60 seconds
         last_failure_check = start_time
 
         # Wait for job to appear in system (initial delay)
         print(f"   ⏳ Waiting for job {job_id} to appear in system...")
-        time.sleep(10)  # Initial wait for job to be scheduled
+        time.sleep(60)  # Initial wait for job to be scheduled
 
         last_status = None  # Track status changes
         while time.time() - start_time < timeout:
