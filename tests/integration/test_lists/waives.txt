@@ -407,4 +407,4 @@ examples/test_multimodal.py::test_llm_multimodal_general[llava-1.5-7b-hf-pp:1-tp
 examples/test_multimodal.py::test_llm_multimodal_general[llava-onevision-qwen2-7b-ov-hf-video-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1] SKIP (https://nvbugs/5655832)
 examples/test_multimodal.py::test_llm_multimodal_general[llava-onevision-qwen2-7b-ov-hf-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1] SKIP (https://nvbugs/5655832)
 examples/test_multimodal.py::test_llm_multimodal_general[Qwen2-VL-7B-Instruct-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:4] SKIP (https://nvbugs/5655832)
-disaggregated/test_.py::test_disagg_server_restart[etcd-round_robin] SKIP (https://nvbugs/5633340)
+disaggregated/test_auto_scaling.py::test_disagg_server_restart[etcd-round_robin] SKIP (https://nvbugs/5633340)
