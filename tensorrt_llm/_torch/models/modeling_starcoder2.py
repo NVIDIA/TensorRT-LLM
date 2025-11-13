@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from typing import Optional
 
 import torch
@@ -264,13 +279,16 @@ class Starcoder2ForCausalLM(DecoderModelForCausalLM[Starcoder2Model, Starcoder2C
             vocab_size=model_config.pretrained_config.vocab_size,
         )
 
-    def load_weights(self, weights, weight_mapper=None, skip_modules=[]):
+    def load_weights(self, weights, weight_mapper=None, skip_modules=None):
         """
         Load weights with custom mapping for StarCoder2.
 
         StarCoder2 uses GPT-2 style MLP naming (c_fc, c_proj)
         while our MLP module expects (up_proj, down_proj).
         """
+        if skip_modules is None:
+            skip_modules = []
+
         # Map HuggingFace StarCoder2 weight names to TensorRT-LLM names
         params_map = {
             r"(.*?)\.mlp\.c_fc\.(.*)": r"\1.mlp.up_proj.\2",

@@ -4054,3 +4054,49 @@ class TestSeedOss_36B(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=dict(
                               apply_chat_template=True,
                               chat_template_kwargs=chat_template_kwargs))
+
+
+class TestStarcoder2_3B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "bigcode/starcoder2-3b"
+    MODEL_PATH = f"{llm_models_root()}/starcoder2-3b/"
+
+    @skip_pre_hopper
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH,
+                 attn_backend="TRTLLM",
+                 cuda_graph_config=None,
+                 max_batch_size=128,
+                 max_seq_len=4096) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestStarcoder2_7B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "bigcode/starcoder2-7b"
+    MODEL_PATH = f"{llm_models_root()}/starcoder2-7b/"
+
+    @skip_pre_hopper
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH,
+                 attn_backend="TRTLLM",
+                 cuda_graph_config=None,
+                 max_batch_size=128,
+                 max_seq_len=4096) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestStarcoder2_15B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "bigcode/starcoder2-15b"
+    MODEL_PATH = f"{llm_models_root()}/starcoder2-15b/"
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH,
+                 attn_backend="TRTLLM",
+                 cuda_graph_config=None,
+                 max_batch_size=128,
+                 max_seq_len=4096) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
