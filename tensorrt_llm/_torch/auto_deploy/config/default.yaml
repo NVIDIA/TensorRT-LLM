@@ -124,7 +124,7 @@ transforms:
   # TODO (lucaslie): add backend selection as part of configurable inference optimizers
   fuse_rmsnorm:
     stage: post_load_fusion
-    rmsnorm_backend: flashinfer
+    rmsnorm_backend: triton
     gated_rmsnorm_backend: triton
     requires_shape_prop: true
 
