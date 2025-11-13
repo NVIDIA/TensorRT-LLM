@@ -139,6 +139,7 @@ def extract_weight_node(node: Node) -> int:
             n for n in node.args if isinstance(n, Node) and find_get_attr_node(n) is not None
         ]
         # can be two weights (if bias weight is present)
+        weight_node = None
         if weight_nodes:
             weight_node = weight_nodes[0]
         # for modelopt quantized graph, there will be a quantize_op
