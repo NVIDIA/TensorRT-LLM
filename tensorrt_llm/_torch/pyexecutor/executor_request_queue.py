@@ -50,7 +50,7 @@ class ExecutorRequestQueue:
     def __init__(self, dist: Distributed, enable_attention_dp: bool,
                  max_batch_size: int, max_beam_width: int,
                  max_num_active_requests: int, enable_iter_perf_stats: bool,
-                 batch_wait_timeout_ms: float):
+                 batch_wait_timeout_ms: float, using_kv_connector: bool):
         self.dist = dist
         self.request_queue: queue.Queue[RequestQueueItem] = queue.Queue()
         self.waiting_queue: deque[RequestQueueItem] = deque()
@@ -66,7 +66,7 @@ class ExecutorRequestQueue:
         self.active = True
         self.batch_wait_timeout_ms = batch_wait_timeout_ms
         self.send_requests_handler = None
-
+        self.using_kv_connector = using_kv_connector
         # State tracking
         self.num_fetch_requests = 0
         self.num_fetch_requests_cur_rank = 0
@@ -700,6 +700,7 @@ class ExecutorRequestQueue:
                 _should_exclude_last_generation_logits(),
                 input_token_ids=input_ids_this_rank,
                 position_ids=position_ids_this_rank,
+                using_kv_connector=self.using_kv_connector
             )
             req_with_children.append(req)
             if req.child_requests:
@@ -727,7 +728,8 @@ class ExecutorRequestQueue:
         for req_item in new_requests:
             req = executor_request_to_llm_request(
                 req_item.id, req_item.request, req_item.child_req_ids,
-                self._should_exclude_last_generation_logits())
+                self._should_exclude_last_generation_logits(),
+                using_kv_connector=self.using_kv_connector)
             req_with_children.append(req)
             if req.child_requests:
                 req_with_children.extend(req.child_requests)
@@ -779,7 +781,7 @@ class ExecutorRequestQueue:
 
             req = executor_request_to_llm_request(
                 req_id, exe_req, self._should_exclude_last_generation_logits(),
-                ctx_blocks_list)
+                ctx_blocks_list, using_kv_connector=self.using_kv_connector)
             req.gen_iters = 0
             req.ctx_iters = 0
             req.ctx_blocks = ctx_blocks

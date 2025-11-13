@@ -423,10 +423,6 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             raise RuntimeError(
                 "load_kv_async must be False when num_tokens is 0!")
 
-        # TODO(jthomson04): This part is a bit ugly.
-        # When the connector indicates that a request will be loaded asynchronously, we need to suspend it's execution.
-        # This is problematic, since at the point when this function is called, the request has already been scheduled!
-        # Because of this, we need to remove it from our list of scheduled requests (see `take_scheduled_requests_pending_load`).
         if load_kv_async:
             self.new_async_requests.loading[request.request_id] = request
 
@@ -444,33 +440,20 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self._scheduler_output = self.scheduler_output_manager.build_scheduler_output(
             scheduled_batch, self.new_async_requests, kv_cache_manager)
 
-    def take_scheduled_requests_pending_load(
-            self, scheduled_requests: ScheduledRequests):
-        """
-        Remove context requests from our list of scheduled requests that are being loaded asynchronously.
-        This is done to prevent the runtime from attempting to load the KV cache for these requests.
-
-        Args:
-            scheduled_requests: The scheduled requests.
-
-        Returns:
-            The scheduled requests with the context requests that are being loaded asynchronously removed.
-        """
-        allowed_context_requests = []
-
-        for req in scheduled_requests.context_requests:
-            # If this request is being loaded asynchronously, in addition to removing it from the list of scheduled requests,
-            # we also need to update it's state.
-            if req.request_id in self.new_async_requests.loading.keys():
-                req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
-
-                # Replace the request with the canonical request.
-                self.new_async_requests.loading[req.request_id] = req
+    def mark_ready_requests(
+            self, fitting_disagg_gen_init_requests: List[LlmRequest]
+    ) -> List[LlmRequest]:
+        ready_requests = []
+        for req in fitting_disagg_gen_init_requests:
+            # If we're not loading this request asynchronously, mark it as ready for the upcoming forward pass.
+            if req.py_request_id not in self.new_async_requests.loading_ids:
+                ready_requests.append(req)
+                req.state = LlmRequestState.CONTEXT_INIT
             else:
-                allowed_context_requests.append(req)
-
-        # Update the list of scheduled requests.
-        scheduled_requests.context_requests = allowed_context_requests
+                # The req we get from the C++ call is different than the one in python.
+                # Replace it with the canonical request.
+                self.new_async_requests.loading[req.py_request_id] = req
+        return ready_requests
 
     def handle_metadata(self) -> object:
         metadata = self._run_on_leader(
@@ -498,8 +481,6 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         saving_async = self._run_on_leader(
             lambda: self.scheduler.request_finished(req, cache_block_ids))
 
-        # This is similar to take_scheduled_requests_pending_load.
-        # We need to update the request's state to indicate that it's still being used, but isn't schedulable.
         if saving_async:
             self.new_async_requests.saving[req.request_id] = req
             req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS

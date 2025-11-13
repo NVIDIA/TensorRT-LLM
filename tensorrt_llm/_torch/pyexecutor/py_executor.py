@@ -255,7 +255,7 @@ class PyExecutor:
             max_num_active_requests=self.max_num_active_requests,
             enable_iter_perf_stats=self.enable_iter_perf_stats,
             batch_wait_timeout_ms=self.batch_wait_timeout_ms,
-        )
+            using_kv_connector=kv_connector_manager is not None)
         self.executor_request_queue.set_exclude_last_generation_logits(
             self.disable_overlap_scheduler, self.dist.pp_size)
         self.control_request_barrier = threading.Event()
@@ -1073,7 +1073,7 @@ class PyExecutor:
             for request in scheduled_batch.all_requests():
                 request.py_disable_speculative_decoding = True
 
-        if self.kv_cache_transceiver:
+        if self.kv_cache_transceiver or self.kv_connector_manager:
             # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
             self._prepare_disagg_gen_init(fitting_disagg_gen_init_requests)
 
@@ -1081,7 +1081,23 @@ class PyExecutor:
                 logger.warning(
                     "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
                 )
-                self._check_disagg_ctx_cache_transfer_status(1)
+
+                if self.kv_cache_transceiver:
+                    self._check_disagg_ctx_cache_transfer_status(1)
+
+        if self.kv_connector_manager:
+            # Some of our connector requests may not be doing an async load.
+            # In this case, we mark them as ready by moving them back to the context init state.
+            self.kv_connector_manager.mark_ready_requests(
+                fitting_disagg_gen_init_requests)
+
+            # Now that we've marked some more requests as ready, we need to re-schedule the batch.
+            # The first time we call schedule, we pick which requests we should allocate kv cache for and pass along to the connector.
+            # The second time is once we know which requests are being loaded synchronously/asynchronously.
+            scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
+            )
+
+            assert len(fitting_disagg_gen_init_requests) == 0, "Fitting disaggregated generation init requests should be empty"
 
         self.num_scheduled_requests = scheduled_batch.batch_size
         logger.debug(
@@ -1092,8 +1108,8 @@ class PyExecutor:
 
     def _kv_connector_start_batch(self, scheduled_batch):
         if self.kv_connector_manager:
-            self.kv_connector_manager.take_scheduled_requests_pending_load(
-                scheduled_batch)
+            self.kv_connector_manager.build_scheduler_output(
+                scheduled_batch, self.kv_cache_manager)
             self.kv_connector_manager.handle_metadata()
             self.kv_connector_manager.worker.start_load_kv(
                 torch.cuda.current_stream())
@@ -1152,11 +1168,6 @@ class PyExecutor:
 
                     self._kv_connector_start_batch(scheduled_batch)
 
-                # if using a kv connector, we need to call can_queue again since scheduled_batch might have changed
-                if self.kv_connector_manager:
-                    can_queue = self._can_queue(scheduled_batch)
-
-                if can_queue:
                     # init_disagg_gen_requests must be before drafter loop, otherwise draft requests do not have initialized matchers.
                     # init_disagg_gen_requests must be before engine forward, where the prev_seq_slot is updated.
                     if self.guided_decoder is not None:
@@ -1368,12 +1379,6 @@ class PyExecutor:
                     self.resource_manager.prepare_resources(scheduled_batch)
 
                     self._kv_connector_start_batch(scheduled_batch)
-
-                # if using a kv connector, we need to call can_queue again since scheduled_batch might have changed
-                if self.kv_connector_manager:
-                    can_queue = self._can_queue(scheduled_batch)
-
-                if can_queue:
 
                     # The generation requests that are do not have batch_idx,
                     # needs to be in front of the batch due to the assumptions
@@ -1843,9 +1848,12 @@ class PyExecutor:
                     self.resource_manager.resource_managers[
                         resource_mgr_type].prepare_resources(
                             disagg_gen_init_to_prepare)
-
-            # Trigger KV cache exchange for new disagg_gen_init_requests
-            self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
+            if self.kv_cache_transceiver and not self.kv_connector_manager:
+                # Trigger KV cache exchange for new disagg_gen_init_requests
+                self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
+            elif self.kv_connector_manager:
+                for req in fitting_disagg_gen_init_requests:
+                    req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
 
     @nvtx_range("_prepare_disagg_gen_transmission_complete")
     def _prepare_disagg_gen_transmission_complete(self, scheduled_batch):
