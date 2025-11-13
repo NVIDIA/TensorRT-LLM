@@ -61,6 +61,7 @@ class TestDisaggBenchmark:
         try:
             print(f"\n{'=' * 60}")
             print(f"Test: {test_config.display_name}")
+            print(f"Test ID: {test_config.test_id}")
             print(f"Config file: {test_config.config_path}")
             print(f"Test type: {test_config.test_type}")
             print(f"Category: {test_config.test_category}")
