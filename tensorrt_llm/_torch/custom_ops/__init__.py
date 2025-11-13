@@ -1,3 +1,4 @@
+from ..cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..modules.attention import attn_custom_op_inplace, mla_custom_op_inplace
@@ -37,4 +38,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
     from .cute_dsl_custom_ops import cute_dsl_nvfp4_gemm_blackwell
     __all__ += [
         'cute_dsl_nvfp4_gemm_blackwell',
+    ]
+
+if IS_CUDA_TILE_AVAILABLE:
+    from .cuda_tile_custom_ops import (cuda_tile_rms_norm,
+                                       cuda_tile_rms_norm_fuse_residual_)
+    __all__ += [
+        'cuda_tile_rms_norm',
+        'cuda_tile_rms_norm_fuse_residual_',
     ]
