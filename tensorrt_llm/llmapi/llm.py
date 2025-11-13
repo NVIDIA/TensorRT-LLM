@@ -1008,8 +1008,6 @@ class _TorchLLM(BaseLLM):
         # TODO: revisit gather_context_logits
         return_logits = self.args.gather_generation_logits
 
-        logger.info(f"{self.args}")
-
         self._executor = self._executor_cls.create(
             self._engine_dir,
             executor_config=None,
