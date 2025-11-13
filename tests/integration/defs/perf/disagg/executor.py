@@ -401,7 +401,9 @@ class JobManager:
                 if os.path.exists(result_dir):
                     # Find all output_gen_*.log and output_ctx_*.log files
                     for filename in os.listdir(result_dir):
-                        if (filename.startswith("output_gen_") or filename.startswith("output_ctx_")) and filename.endswith(".log"):
+                        is_gen_log = filename.startswith("output_gen_")
+                        is_ctx_log = filename.startswith("output_ctx_")
+                        if (is_gen_log or is_ctx_log) and filename.endswith(".log"):
                             log_path = os.path.join(result_dir, filename)
                             try:
                                 with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
