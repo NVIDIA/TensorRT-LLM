@@ -839,8 +839,6 @@ def check_accuracy(a, b, atol, rtol, percent):
         raise Exception("NaN in a")
     if torch.any(torch.isnan(b)):
         raise Exception("NaN in b")
-    print("check_accuracy a:", a)
-    print("check_accuracy b:", b)
     assert a.shape == b.shape
     left = torch.abs(a - b)
     right = atol + rtol * torch.abs(b)
@@ -1633,10 +1631,10 @@ class TestMoeFp4:
                 routed_scaling, padding)
         elif routing_method_type == RoutingMethodType.Renormalize:
             permute_info, scores = routing_reference_renormalize(
-                expert_logits, top_k, num_experts, padding)
+                expert_logits, top_k, padding)
         elif routing_method_type == RoutingMethodType.RenormalizeNaive:
             permute_info, scores = routing_reference_renormalize_naive(
-                expert_logits, top_k, num_experts, padding)
+                expert_logits, top_k, padding)
 
         swiglu_alpha_tensor = torch.full((num_experts, ),
                                          swiglu_alpha,
