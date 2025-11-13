@@ -1834,7 +1834,11 @@ class ShardingTransformContainer(BaseModel):
         return True
 
     def get_factory_config(self) -> Dict[str, Any]:
+<<<<<<< HEAD
         return self.factory_config
 
     def get_manual_config(self) -> Dict[str, Any]:
-        return self.manual_config
+=======
+        if self.factory_config is not None:
+            return self.factory_config
+        return {}
