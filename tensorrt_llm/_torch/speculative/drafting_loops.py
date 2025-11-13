@@ -10,6 +10,7 @@ for speculation can be launched as a single CUDA graph.
 
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
+from typing import Optional, final
 
 import torch
 
@@ -22,20 +23,33 @@ from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
 class BaseDraftingLoopWrapper(ABC, torch.nn.Module):
 
     @abstractmethod
-    def forward(self, *args, **kwargs) -> dict[str, torch.Tensor]:
+    def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor,
+                attn_metadata: AttentionMetadata, spec_metadata: SpecMetadata,
+                **kwargs) -> dict[str, torch.Tensor]:
         raise NotImplementedError
 
     @abstractmethod
-    def sample(self, *args, **kwargs) -> torch.Tensor:
+    def sample(self,
+               logits: torch.Tensor,
+               max_top_k: Optional[int] = None) -> torch.Tensor:
         raise NotImplementedError
 
     @abstractmethod
-    def prepare_for_generation(self, *args, **kwargs) -> torch.Tensor:
+    def prepare_for_generation(
+        self,
+        attn_metadata: AttentionMetadata,
+        spec_metadata: SpecMetadata,
+        position_ids: torch.Tensor,
+        spec_tree_manager: Optional[SpecTreeManager] = None
+    ) -> torch.Tensor | None:
         raise NotImplementedError
 
-    @abstractmethod
+    @final
     def load_weights_from_target_model(self, target_model) -> None:
-        raise NotImplementedError
+        loader = getattr(self.draft_model, "load_weights_from_target_model",
+                         None)
+        if callable(loader):
+            self.draft_model.load_weights_from_target_model(target_model)
 
 
 @contextmanager
@@ -180,13 +194,6 @@ class LinearDraftingLoopWrapper(BaseDraftingLoopWrapper):
                     device=spec_metadata.hidden_states_write_indices.device))
 
         return new_position_ids
-
-    def load_weights_from_target_model(self,
-                                       target_model: torch.nn.Module) -> None:
-        loader = getattr(self.draft_model, "load_weights_from_target_model",
-                         None)
-        if callable(loader):
-            self.draft_model.load_weights_from_target_model(target_model)
 
 
 class TreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
@@ -501,10 +508,3 @@ class TreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
         spec_metadata.is_first_draft = False
 
         return
-
-    def load_weights_from_target_model(self,
-                                       target_model: torch.nn.Module) -> None:
-        loader = getattr(self.draft_model, "load_weights_from_target_model",
-                         None)
-        if callable(loader):
-            self.draft_model.load_weights_from_target_model(target_model)

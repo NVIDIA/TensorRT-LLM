@@ -363,10 +363,9 @@ def create_py_executor(
                         LinearDraftingLoopWrapper, TreeDraftingLoopWrapper)
                     from tensorrt_llm.llmapi import EagleDecodingConfig
 
-                    use_tree_drafter = False
-                    if isinstance(draft_spec_config, EagleDecodingConfig
-                                  ) and not draft_spec_config.is_linear_tree:
-                        use_tree_drafter = True
+                    use_tree_drafter = isinstance(
+                        draft_spec_config, EagleDecodingConfig
+                    ) and not draft_spec_config.is_linear_tree
 
                     if use_tree_drafter:
                         return TreeDraftingLoopWrapper(
