@@ -20,8 +20,6 @@ from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
 from tensorrt_llm.bench.benchmark.utils.general import (
     get_settings_from_engine, get_settings, ALL_SUPPORTED_BACKENDS)
 # isort: on
-import yaml
-
 from tensorrt_llm.bench.benchmark.utils.general import (
     generate_warmup_dataset, update_sampler_args_with_extra_options)
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
@@ -31,7 +29,6 @@ from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer,
                                            update_metadata_for_multimodal)
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy
-from tensorrt_llm.llmapi.llm_utils import apply_env_overrides
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -312,14 +309,9 @@ def throughput_command(
             "Cannot specify both --config and --extra_llm_api_options. "
             "Please use only one of these flags.")
 
-    # Merge config flags and apply env_overrides early
+    # Merge config flags (env_overrides handled by centralized loader)
     config_file = config or extra_llm_api_options
     if config_file is not None:
-        with open(config_file, 'r') as f:
-            config_dict = yaml.safe_load(f)
-        # Apply environment variable overrides early
-        apply_env_overrides(config_dict, config_file)
-        # Store the config file path for later use
         params["extra_llm_api_options"] = config_file
 
     # Parameters from CLI

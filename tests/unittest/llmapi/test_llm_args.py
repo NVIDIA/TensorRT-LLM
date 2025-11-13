@@ -947,3 +947,64 @@ class TestApplyEnvOverrides:
 
         # env_overrides should still be removed
         assert "env_overrides" not in config_dict
+
+    def test_update_llm_args_with_extra_options_applies_env_overrides(self):
+        """Test that update_llm_args_with_extra_options calls apply_env_overrides."""
+        import os
+
+        from tensorrt_llm.llmapi.llm_args import \
+            update_llm_args_with_extra_options
+
+        # Setup - clean test env vars
+        test_vars = [
+            "TEST_CENTRALIZED_VAR1", "TEST_CENTRALIZED_VAR2",
+            "TEST_CENTRALIZED_VAR3"
+        ]
+        for var in test_vars:
+            if var in os.environ:
+                del os.environ[var]
+
+        # Create temporary YAML file with env_overrides
+        yaml_content = {
+            "max_batch_size": 512,
+            "max_num_tokens": 8192,
+            "env_overrides": {
+                "TEST_CENTRALIZED_VAR1": "value1",
+                "TEST_CENTRALIZED_VAR2": 42,
+                "TEST_CENTRALIZED_VAR3": True
+            }
+        }
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml',
+                                         delete=False) as f:
+            yaml.dump(yaml_content, f)
+            config_file = f.name
+
+        try:
+            # Call the centralized function
+            base_llm_args = {"tensor_parallel_size": 2}
+            result_llm_args = update_llm_args_with_extra_options(
+                base_llm_args, config_file)
+
+            # Verify environment variables were set
+            assert "TEST_CENTRALIZED_VAR1" in os.environ
+            assert os.environ["TEST_CENTRALIZED_VAR1"] == "value1"
+            assert "TEST_CENTRALIZED_VAR2" in os.environ
+            assert os.environ["TEST_CENTRALIZED_VAR2"] == "42"
+            assert "TEST_CENTRALIZED_VAR3" in os.environ
+            assert os.environ["TEST_CENTRALIZED_VAR3"] == "True"
+
+            # Verify env_overrides was NOT passed through to llm_args
+            assert "env_overrides" not in result_llm_args
+
+            # Verify other config values were merged
+            assert result_llm_args["max_batch_size"] == 512
+            assert result_llm_args["max_num_tokens"] == 8192
+            assert result_llm_args["tensor_parallel_size"] == 2
+
+        finally:
+            # Cleanup
+            os.unlink(config_file)
+            for var in test_vars:
+                if var in os.environ:
+                    del os.environ[var]

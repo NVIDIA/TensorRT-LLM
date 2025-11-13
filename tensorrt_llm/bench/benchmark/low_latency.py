@@ -19,7 +19,6 @@ from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy
-from tensorrt_llm.llmapi.llm_utils import apply_env_overrides
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 
 # isort: off
@@ -209,14 +208,9 @@ def latency_command(
             "Cannot specify both --config and --extra_llm_api_options. "
             "Please use only one of these flags.")
 
-    # Merge config flags and apply env_overrides early
+    # Merge config flags (env_overrides handled by centralized loader)
     config_file = config or extra_llm_api_options
     if config_file is not None:
-        with open(config_file, 'r') as f:
-            config_dict = yaml.safe_load(f)
-        # Apply environment variable overrides early
-        apply_env_overrides(config_dict, config_file)
-        # Store the config file path for later use
         params["extra_llm_api_options"] = config_file
 
     # Parameters from CLI

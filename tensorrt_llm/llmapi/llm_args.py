@@ -3043,6 +3043,8 @@ def update_llm_args_with_extra_options(llm_args: Dict,
     if extra_llm_api_options is not None:
         with open(extra_llm_api_options, 'r') as f:
             llm_args_dict = yaml.safe_load(f)
+            # Apply environment variable overrides from config file
+            apply_env_overrides(llm_args_dict, extra_llm_api_options)
             llm_args = update_llm_args_with_extra_dict(llm_args, llm_args_dict,
                                                        extra_llm_api_options)
     return llm_args

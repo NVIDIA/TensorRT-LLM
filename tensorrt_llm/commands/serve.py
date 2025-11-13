@@ -28,8 +28,7 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               extract_disagg_cluster_config,
                                               parse_disagg_config_file,
                                               parse_metadata_server_config_file)
-from tensorrt_llm.llmapi.llm_utils import (apply_env_overrides,
-                                           update_llm_args_with_extra_dict)
+from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_options
 from tensorrt_llm.llmapi.mpi_session import find_free_port
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.logger import logger, severity_map
@@ -411,13 +410,8 @@ def serve(
         otlp_traces_endpoint=otlp_traces_endpoint,
         enable_chunked_prefill=enable_chunked_prefill)
 
-    llm_args_extra_dict = {}
-    if config_file is not None:
-        with open(config_file, 'r') as f:
-            llm_args_extra_dict = yaml.safe_load(f)
-        # Apply environment variable overrides before LLM initialization
-        apply_env_overrides(llm_args_extra_dict, config_file)
-    llm_args = update_llm_args_with_extra_dict(llm_args, llm_args_extra_dict)
+    # Load config file if provided (handles env_overrides internally)
+    llm_args = update_llm_args_with_extra_options(llm_args, config_file)
 
     metadata_server_cfg = parse_metadata_server_config_file(
         metadata_server_config_file)
