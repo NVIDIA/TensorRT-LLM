@@ -51,6 +51,24 @@ def submit_job(config):
     hw_config = config['hardware']
     env_config = config['environment']
 
+    # Set default accuracy configuration for backward compatibility
+    if 'accuracy' not in config:
+        config['accuracy'] = {
+            'enable_accuracy_test':
+            False,
+            'model':
+            'local-completions',
+            'tasks':
+            'gsm8k',
+            'model_args_extra':
+            'num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=1200,max_gen_toks=256,max_length=4096'
+        }
+
+    # Set default environment configuration for backward compatibility
+    env_config.setdefault('trtllm_repo', '')
+    env_config.setdefault('build_wheel', False)
+    env_config.setdefault('trtllm_wheel_path', '')
+
     # Get number of servers from config
     ctx_num = hw_config['num_ctx_servers']
     gen_num = hw_config['num_gen_servers']
@@ -155,7 +173,7 @@ def submit_job(config):
         env_config['container_mount'],
         env_config['container_image'],
         str(env_config['build_wheel']).lower(),
-        env_config.get('trtllm_wheel_path', ''),
+        env_config['trtllm_wheel_path'],
 
         # Profiling
         str(config['profiling']['nsys_on']).lower(),
@@ -164,12 +182,7 @@ def submit_job(config):
         str(config['accuracy']['enable_accuracy_test']).lower(),
         config['accuracy']['model'],
         config['accuracy']['tasks'],
-        str(config['accuracy']['num_concurrent']),
-        str(config['accuracy']['max_retries']),
-        str(config['accuracy']['tokenized_requests']).lower(),
-        str(config['accuracy']['timeout']),
-        str(config['accuracy']['max_gen_toks']),
-        str(config['accuracy']['max_length'])
+        config['accuracy']['model_args_extra']
     ]
 
     # Submit the job

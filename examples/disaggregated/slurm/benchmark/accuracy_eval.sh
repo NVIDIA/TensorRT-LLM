@@ -6,12 +6,7 @@ full_logdir=${1}
 accuracy_model=${2}
 accuracy_tasks=${3}
 model_path=${4}
-accuracy_num_concurrent=${5}
-accuracy_max_retries=${6}
-accuracy_tokenized_requests=${7}
-accuracy_timeout=${8}
-accuracy_max_gen_toks=${9}
-accuracy_max_length=${10}
+model_args_extra=${5}
 
 echo "Starting accuracy evaluation..."
 echo "Log directory: ${full_logdir}"
@@ -20,7 +15,7 @@ echo "Log directory: ${full_logdir}"
 config_file="${full_logdir}/server_config.yaml"
 
 # Wait for server_config.yaml to be created
-max_wait=60
+max_wait=1800
 wait_count=0
 while [ ! -f "${config_file}" ] && [ ${wait_count} -lt ${max_wait} ]; do
     echo "Waiting for server_config.yaml to be created..."
@@ -63,13 +58,13 @@ while ! curl -s -o /dev/null -w "%{http_code}" http://${hostname}:${port}/health
 done
 
 # Install lm_eval and run evaluation
-echo "Installing lm_eval[api]==0.4.8 and running evaluation..."
+echo "Installing lm_eval[api] and running evaluation..."
 pip install lm_eval[api]==0.4.8
 
 echo "Running lm_eval with tasks: ${accuracy_tasks}..."
 lm_eval --model ${accuracy_model} \
     --tasks ${accuracy_tasks} \
-    --model_args model=${model_path},base_url=${base_url},num_concurrent=${accuracy_num_concurrent},max_retries=${accuracy_max_retries},tokenized_requests=${accuracy_tokenized_requests},timeout=${accuracy_timeout},max_gen_toks=${accuracy_max_gen_toks},max_length=${accuracy_max_length} \
+    --model_args model=${model_path},base_url=${base_url},${model_args_extra} \
     --trust_remote_code
 
 echo "Accuracy evaluation completed successfully"

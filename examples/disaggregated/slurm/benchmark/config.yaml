@@ -47,12 +47,7 @@ accuracy:
   enable_accuracy_test: false  # Set to true to enable accuracy evaluation
   model: "local-completions"  # Model type for lm_eval
   tasks: "gsm8k"  # Evaluation tasks (comma-separated)
-  num_concurrent: 512  # Number of concurrent requests
-  max_retries: 3  # Maximum number of retries
-  tokenized_requests: false  # Whether to use tokenized requests
-  timeout: 1200  # Request timeout in seconds
-  max_gen_toks: 256  # Maximum generation tokens
-  max_length: 4096  # Maximum sequence length
+  model_args_extra: "num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=1200,max_gen_toks=256,max_length=4096"  # Extra model arguments for lm_eval
 
 worker_config:
   gen:

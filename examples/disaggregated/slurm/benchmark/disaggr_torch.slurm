@@ -45,12 +45,7 @@ nsys_on=${29}
 enable_accuracy_test=${30}
 accuracy_model=${31}
 accuracy_tasks=${32}
-accuracy_num_concurrent=${33}
-accuracy_max_retries=${34}
-accuracy_tokenized_requests=${35}
-accuracy_timeout=${36}
-accuracy_max_gen_toks=${37}
-accuracy_max_length=${38}
+model_args_extra=${33}
 
 # Print all parsed arguments
 echo "Parsed arguments:"
@@ -94,12 +89,7 @@ echo "Accuracy Configuration:"
 echo "  enable_accuracy_test: ${enable_accuracy_test}"
 echo "  accuracy_model: ${accuracy_model}"
 echo "  accuracy_tasks: ${accuracy_tasks}"
-echo "  accuracy_num_concurrent: ${accuracy_num_concurrent}"
-echo "  accuracy_max_retries: ${accuracy_max_retries}"
-echo "  accuracy_tokenized_requests: ${accuracy_tokenized_requests}"
-echo "  accuracy_timeout: ${accuracy_timeout}"
-echo "  accuracy_max_gen_toks: ${accuracy_max_gen_toks}"
-echo "  accuracy_max_length: ${accuracy_max_length}"
+echo "  model_args_extra: ${model_args_extra}"
 
 container_name="disaggr-test"
 
@@ -245,8 +235,7 @@ if [ "${enable_accuracy_test}" = "true" ]; then
         --mpi=pmix --overlap -N 1 -n 1 \
         bash ${work_dir}/accuracy_eval.sh \
         "${full_logdir}" "${accuracy_model}" "${accuracy_tasks}" "${model_path}" \
-        "${accuracy_num_concurrent}" "${accuracy_max_retries}" "${accuracy_tokenized_requests}" \
-        "${accuracy_timeout}" "${accuracy_max_gen_toks}" "${accuracy_max_length}" \
+        "${model_args_extra}" \
         &> ${full_logdir}/accuracy_eval.log; then
         cleanup_on_failure "Accuracy evaluation failed. Check ${full_logdir}/accuracy_eval.log for details"
     fi
