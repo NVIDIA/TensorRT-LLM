@@ -736,6 +736,7 @@ def getNodeArgs(int nodeCount, int gpuCount) {
 def getPytestBaseCommandLine(
     String llmSrc,
     String stageName,
+    String waivesFilePath,
     Boolean perfMode,
     String outputPath,
     String trtllmWheelPath,
@@ -767,7 +768,7 @@ def getPytestBaseCommandLine(
         "--timeout=${pytestTestTimeout}",
         "--rootdir ${llmSrc}/tests/integration/defs",
         "--test-prefix=${stageName}",
-        "--waives-file=${llmSrc}/tests/integration/test_lists/waives.txt",
+        "--waives-file=${waivesFilePath}",
         "--output-dir=${outputPath}/",
         "--csv=${outputPath}/report.csv",
         "--junit-xml ${outputPath}/results.xml",
@@ -851,12 +852,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv ${llmTarfile}")
                 sh "cd ${llmPath} && tar -zxf ${BUILD_CONFIGS[config][TARNAME]}"
 
-                // Download and Merge waives.txt
-                mergeWaivesTxt(pipeline, llmSrcLocal, stageName)
-
-                // Add passed test list from previous pipeline run to the waives.txt
-                reusePassedTestResults(llmSrcLocal, stageName, testListPathNode, waivesListPathNode)
-
                 Utils.exec(pipeline, script: "echo \"Script to trigger Slurm srun job: \" && cat ${scriptRunLocalPath}")
                 Utils.copyFileToRemoteHost(
                     pipeline,
@@ -878,6 +873,24 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     remote,
                     testListPathLocal,
                     testListPathNode
+                )
+
+                // Download and Merge waives.txt
+                mergeWaivesTxt(pipeline, llmSrcLocal, stageName)
+
+                // Add passed test list from previous pipeline run to the waives.txt
+                reusePassedTestResults(llmSrcLocal, stageName, testListPathNode, waivesListPathNode)
+
+                // Add passed test list from previous pipeline run to the waives.txt
+                if (testFilter[(REUSE_TEST)] != false) {
+                    reusePassedTestResults(llmSrcLocal, stageName, testListPathLocal, "${llmSrcLocal}/tests/integration/test_lists/waives.txt")
+                }
+
+                Utils.copyFileToRemoteHost(
+                    pipeline,
+                    remote,
+                    "${llmSrcLocal}/tests/integration/test_lists/waives.txt",
+                    waivesListPathNode
                 )
 
                 // generate .coveragerc in workspace and add file path to pytest command
@@ -907,6 +920,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 def pytestCommand = getPytestBaseCommandLine(
                     llmSrcNode,
                     stageName,
+                    waivesListPathNode,
                     perfMode,
                     jobWorkspace,
                     "__PLACEHOLDER_TRTLLM_WHL_PATH__",
@@ -1108,6 +1122,8 @@ def trimForStageList(stageNameList)
 
 // Test filter flags
 @Field
+def REUSE_TEST = "reuse_test"
+@Field
 def REUSE_STAGE_LIST = "reuse_stage_list"
 @Field
 def ENABLE_SKIP_TEST = "skip_test"
@@ -1139,6 +1155,7 @@ def DEBUG_MODE = "debug"
 def DETAILED_LOG = "detailed_log"
 @Field
 def testFilter = [
+    (REUSE_TEST): null,
     (REUSE_STAGE_LIST): null,
     (ENABLE_SKIP_TEST): false,
     (TEST_STAGE_LIST): null,
@@ -2106,49 +2123,55 @@ def mergeWaivesTxt(pipeline, llmSrc, stageName) {
 }
 
 def reusePassedTestResults(llmSrc, stageName, testDBList, waivesTxt) {
-    // Get passed test list from open search
-    def passedTestListFile = "${WORKSPACE}/${stageName}/passed_test_list.txt"
-    sh """
-        python3 ${llmSrc}/jenkins/scripts/open_search_query.py \
-        --commit-id ${env.gitlabCommit} \
-        --stage-name ${stageName} \
-        --output-file ${passedTestListFile}
-    """
+    try {
+        // Get passed test list from open search
+        def passedTestListFile = "${WORKSPACE}/${stageName}/passed_test_list.txt"
+        sh """
+            python3 ${llmSrc}/jenkins/scripts/open_search_query.py \
+            --commit-id ${env.gitlabCommit} \
+            --stage-name ${stageName} \
+            --output-file ${passedTestListFile}
+        """
 
-    def passedTestList = readFile(file: passedTestListFile).readLines()
-    // Read the original test list
-    def originalTestLines = readFile(file: testDBList).readLines()
+        def passedTestList = readFile(file: passedTestListFile).readLines()
+        // Read the original test list
+        def originalTestLines = readFile(file: testDBList).readLines()
 
-    def reusedTests = []
-    for (originalLine in originalTestLines) {
-        def testLine = originalLine.trim()
-        if (testLine) {
-            for (passedTest in passedTestList) {
-                passedTest = passedTest.trim()
-                if (testLine.contains(passedTest)) {
-                    reusedTests.add(passedTest)
-                    break
+        def reusedTests = []
+        for (originalLine in originalTestLines) {
+            def testLine = originalLine.trim()
+            if (testLine) {
+                for (passedTest in passedTestList) {
+                    passedTest = passedTest.trim()
+                    if (testLine.contains(passedTest)) {
+                        reusedTests.add(passedTest)
+                        break
+                    }
                 }
             }
         }
-    }
 
-    // Append reused tests to waives.txt
-    if (reusedTests.size() > 0) {
-        sh(label: "Reused Tests", script: "echo \"Reused tests:\n${reusedTests.join('\n')}\"")
+        // Append reused tests to waives.txt
+        if (reusedTests.size() > 0) {
+            sh(label: "Reused Tests", script: "echo \"Reused tests:\n${reusedTests.join('\n')}\"")
 
-        // Build the content to append
-        def reusedTestsContent = reusedTests.collect { test ->
-            "${test} SKIP (Reused from previous pipeline)"
-        }.join('\n')
+            // Build the content to append
+            def reusedTestsContent = reusedTests.collect { test ->
+                "${test} SKIP (Reused from previous pipeline)"
+            }.join('\n')
 
-        // Use heredoc to append content directly without intermediate files
-        sh """
-            cat >> ${waivesTxt} << 'REUSED_TESTS_EOF'
-${reusedTestsContent}
-REUSED_TESTS_EOF
-        """
-        sh(label: "Updated Waives File", script: "echo \"Appended ${reusedTests.size()} reused tests to ${waivesTxt}\"")
+            // Use heredoc to append content directly without intermediate files
+            sh """
+                cat >> ${waivesTxt} << 'REUSED_TESTS_EOF'
+    ${reusedTestsContent}
+    REUSED_TESTS_EOF
+            """
+            sh(label: "Updated Waives File", script: "echo \"Appended ${reusedTests.size()} reused tests to ${waivesTxt}\"")
+        }
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        echo "Failed to add passed test list from previous pipeline run to the waives.txt. Error: ${e.message}"
     }
 }
 
@@ -2319,14 +2342,16 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
         def testDBList = renderTestDB(testList, llmSrc, stageName)
 
-        // Process shard test list and create separate files for regular and isolate tests
-        def preprocessedLists = processShardTestList(llmSrc, testDBList, splitId, splits, perfMode)
-
         // Download and Merge waives.txt
         mergeWaivesTxt(pipeline, llmSrc, stageName)
 
         // Add passed test list from previous pipeline run to the waives.txt
-        reusePassedTestResults(llmSrc, stageName, testDBList, "${llmSrc}/tests/integration/test_lists/waives.txt")
+        if (testFilter[(REUSE_TEST)] != false) {
+            reusePassedTestResults(llmSrc, stageName, testDBList, "${llmSrc}/tests/integration/test_lists/waives.txt")
+        }
+
+        // Process shard test list and create separate files for regular and isolate tests
+        def preprocessedLists = processShardTestList(llmSrc, testDBList, splitId, splits, perfMode)
 
         // Test Coverage
         def TRTLLM_WHL_PATH = sh(returnStdout: true, script: "pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2").replaceAll("\\s","")
@@ -2347,6 +2372,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def pytestCommand = getPytestBaseCommandLine(
             llmSrc,
             stageName,
+            "${llmSrc}/tests/integration/test_lists/waives.txt",
             perfMode,
             "${WORKSPACE}/${stageName}",
             TRTLLM_WHL_PATH,

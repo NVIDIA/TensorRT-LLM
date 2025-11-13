@@ -81,6 +81,8 @@ def trimForStageList(stageNameList)
 }
 
 @Field
+def REUSE_TEST = "reuse_test"
+@Field
 def REUSE_STAGE_LIST = "reuse_stage_list"
 @Field
 def ENABLE_SKIP_TEST = "skip_test"
@@ -114,6 +116,7 @@ def DEBUG_MODE = "debug"
 def DETAILED_LOG = "detailed_log"
 
 def testFilter = [
+    (REUSE_TEST): gitlabParamsFromBot.get(REUSE_TEST, null),
     (REUSE_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get(REUSE_STAGE_LIST, null)?.tokenize(',')),
     (ENABLE_SKIP_TEST): gitlabParamsFromBot.get((ENABLE_SKIP_TEST), false),
     (TEST_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get((TEST_STAGE_LIST), null)?.tokenize(',')),
