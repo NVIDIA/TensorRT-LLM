@@ -2,10 +2,12 @@
 set -ex
 
 GITHUB_URL="https://github.com"
+if [ -n "${GITHUB_MIRROR}" ]; then
+    GITHUB_URL=${GITHUB_MIRROR}
+fi
 UCX_INSTALL_PATH="/usr/local/ucx/"
 CUDA_PATH="/usr/local/cuda"
 NIXL_VERSION="0.5.0"
-NIXL_REPO="https://github.com/ai-dynamo/nixl.git"
 OLD_LD_LIBRARY_PATH=$LD_LIBRARY_PATH
 
 ARCH_NAME="x86_64-linux-gnu"
@@ -20,7 +22,9 @@ if [ -n "${GITHUB_MIRROR}" ]; then
 fi
 pip3 install --no-cache-dir meson ninja pybind11
 
-git clone --depth 1 -b ${NIXL_VERSION} ${NIXL_REPO}
+curl -L ${GITHUB_URL}/ai-dynamo/nixl/archive/refs/tags/${NIXL_VERSION}.tar.gz -o nixl-${NIXL_VERSION}.tar.gz
+tar -xzf nixl-${NIXL_VERSION}.tar.gz
+mv nixl-${NIXL_VERSION} nixl
 cd nixl
 
 CUDA_SO_PATH=$(find "/usr/local" -name "libcuda.so.1" 2>/dev/null | head -n1)
