@@ -869,8 +869,7 @@ def instantiate_sampler(
         max_batch_size=max_batch_size,
         speculative_config=speculative_config,
         max_beam_width=max_beam_width,
-        disable_overlap_scheduler=pytorch_backend_config.
-        disable_overlap_scheduler,
+        disable_overlap_scheduler=llm_args.disable_overlap_scheduler,
         disable_flashinfer_sampling=disable_flashinfer_sampling,
     )
     decoding_mode = get_decoding_mode(decoding_config=decoding_config,

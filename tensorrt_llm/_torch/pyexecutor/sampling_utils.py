@@ -74,7 +74,7 @@ class UtilsSamplingParams:
     top_p: Optional[float]
     top_k: Optional[int]
     beam_width: Optional[int]
-    is_context_init_state: bool
+    is_context_init_state: Optional[bool] = None
 
 
 def resolve_sampling_strategy(params: UtilsSamplingParams, *, vocab_size: int) -> Strategy:
@@ -101,6 +101,9 @@ def resolve_sampling_strategy(params: UtilsSamplingParams, *, vocab_size: int) -
 
     # Beam search does not rely on top_p or top_k, so we can return the strategy here
     if beam_width > 1:
+        assert params.is_context_init_state is not None, (
+            "is_context_init_state must be specified for beam search"
+        )
         if params.is_context_init_state:
             return ("beam_search_for_prefill", beam_width, temperature)
         else:
@@ -271,7 +274,7 @@ def update_cache_indirection_buffer(
     assert cache_indirection_input.device == cache_indirection_output.device, (
         "cache_indirection_input and cache_indirection_output must be on the same device"
     )
-    cache_indirection_input[seq_slots] = cache_indirection_output[seq_slots]
+    cache_indirection_input.index_copy_(0, seq_slots, cache_indirection_output[seq_slots])
 
 
 def beam_search_sampling_batch(
@@ -329,20 +332,13 @@ def beam_search_sampling_batch(
         logprobs = torch.where(finished_beams_mask_expanded, float("-inf"), logprobs)
 
         # get the offsets of the end tokens in the logprobs tensor
-
-        end_ids_offset = torch.tensor(
-            [
-                beam_search_args.end_ids[batch_idx]
-                + vocab_size * beam_idx
-                + vocab_size * beam_width * batch_idx
-                for batch_idx in range(batch_size)
-                for beam_idx in range(beam_width)
-                if finished_beams_mask[batch_idx, beam_idx]  # NB: This syncs
-            ],
-            dtype=torch.int64,
-        ).to(logprobs.device, non_blocking=True)
-        # fill
-        logprobs.view(-1).index_fill_(0, end_ids_offset, 0)
+        # NB: Modulo vocab size is necessary to prevent end_ids from being out of bounds (e.g. -1)
+        index = beam_search_args.end_ids.view(-1, 1, 1).expand(-1, beam_width, 1) % vocab_size
+        # Turn the mask into a tensor of 0s and 1s for multiplication
+        # NB: we use int32 because float(-inf) * 0 returns nan instead of 0 in the scatter_reduce_
+        src = (~finished_beams_mask).to(torch.int32).unsqueeze(-1)
+        # multiply the end_id logprob of finished beams with 0, other beams multiply with 1
+        logprobs.view(torch.int32).scatter_reduce_(2, index, src, "prod")
 
         # Add the current cum_log_probs to the logprobs of each beam
         logprobs += beam_search_args.cum_log_probs.unsqueeze(-1)[beam_search_args.seq_slots]
@@ -367,6 +363,9 @@ def beam_search_sampling_batch(
             * beam_width
         )
         finished_beams = finished_beams[offset_predecessor_beam]
+        beam_search_args.finished_beams[beam_search_args.seq_slots] = finished_beams.view(
+            batch_size, beam_width
+        )
 
         # Update the cache indirection
         cache_indirection = beam_search_args.cache_indirection[beam_search_args.seq_slots]
@@ -380,34 +379,26 @@ def beam_search_sampling_batch(
             index=predecessor_beam.unsqueeze(2).expand(-1, -1, cache_indirection.size(2)),
             out=cache_indirection,
         )
-        # We need to set the cache indirection for the newly generated tokens
-        _, cache_indirection_max_beam_width, cache_indirection_max_seq_len = (
-            beam_search_args.cache_indirection.shape
-        )
-        # Get the positions of the seq_lens for a flattened cache indirection
-        seq_len_offs = torch.tensor(
-            [
-                beam_search_args.seq_lens[batch_idx]
-                + cache_indirection_max_seq_len * beam_idx
-                + cache_indirection_max_seq_len * cache_indirection_max_beam_width * batch_idx
-                for batch_idx in range(batch_size)
-                for beam_idx in range(beam_width)
-            ],
-            dtype=torch.int32,
-            device="cpu",
-        ).to(cache_indirection.device, non_blocking=True)
-        # Prepare target values (torch.arange(beam_width) )
+
+        # Prepare target values
         target_values = (
             torch.arange(
                 beam_width * batch_size, device=cache_indirection.device, dtype=torch.int32
             )
             % beam_width
         )
-        cache_indirection.view(-1)[seq_len_offs] = target_values
+
+        # seq lens is of shape (batch_size), we assume all beams have the same seq len
+        # therefore we can use expand
+        index = beam_search_args.seq_lens.view(-1, 1, 1).expand(-1, beam_width, 1)
+        # index is of shape (batch_size, beam_width, 1)
+        src = target_values.view(batch_size, beam_width, 1)
+        # src is of shape (batch_size, beam_width, 1)
+        # cache_indirection is of shape (batch_size, beam_width, max_seq_len)
+        cache_indirection.scatter_(2, index, src)
+
+        # copy the batched buffer back to the original buffer
         beam_search_args.cache_indirection[beam_search_args.seq_slots] = cache_indirection
-        beam_search_args.finished_beams[beam_search_args.seq_slots] = finished_beams.view(
-            batch_size, beam_width
-        )
 
         # project the next_tokens values to the vocab_size
         next_tokens = next_tokens % vocab_size

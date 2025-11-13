@@ -42,6 +42,7 @@ from tensorrt_llm._torch.pyexecutor.sampler import (
     LlmRequest,
     ScheduledRequests,
     SimpleGroupedStrategySampler,
+    StrategyMetadata,
     TorchSampler,
     _BatchedSamplingResult,
     _request_get_sampling_params,
@@ -49,6 +50,8 @@ from tensorrt_llm._torch.pyexecutor.sampler import (
     get_draft_token_length,
 )
 from tensorrt_llm._torch.pyexecutor.sampling_utils import (
+    BeamSearch,
+    BeamSearchForPrefill,
     Greedy,
     Strategy,
     TemperatureOnly,
@@ -81,6 +84,7 @@ class TestStrategySelection:
 
     class MockLlmRequest:
         sampling_config: SamplingConfig
+        is_context_init_state: bool  # Not used in this test
 
     def _check_params(self, params: SamplingParams):
         # cf. description of 'top_p' in doc-string of SamplingParams and
@@ -97,6 +101,7 @@ class TestStrategySelection:
     def _build_mock_llm_request(self, params: SamplingParams) -> LlmRequest:
         request = self.MockLlmRequest()
         request.sampling_config = SamplingConfig(params._get_sampling_config())
+        request.is_context_init_state = False  # Not used in this test
         return cast(LlmRequest, request)
 
     def test_defaults(self):
@@ -327,6 +332,7 @@ class TestStrategySelection:
                 max_num_sequences=12,
                 max_beam_width=1,
                 max_total_draft_tokens=3,
+                disable_overlap_scheduler=False,
             )
         )
 
@@ -616,6 +622,7 @@ class RequestCase:
             # so we can test that write_finish_reasons uses seq_slots correctly
             max_num_sequences=MAX_NUM_SEQUENCES,
             max_beam_width=1,
+            disable_overlap_scheduler=False,
         )
         sampler = TorchSampler(args=sampler_args)
 
@@ -781,7 +788,9 @@ class TestBatchedSampling:
         }
 
         # Check that all relevant strategies are covered
-        assert Union[*BASE_CASES.keys()] == Strategy
+        # Beam search is tested in test_beam_search.py instead of here.
+        # It's added here to pass the assert statement, without testing it.
+        assert Union[*BASE_CASES.keys(), BeamSearch, BeamSearchForPrefill] == Strategy
 
         test_cases = []
 
@@ -1078,6 +1087,7 @@ class TestBatchedSampling:
                 max_num_sequences=num_seq_slots,
                 max_total_draft_tokens=max_draft_len,
                 disable_flashinfer_sampling=(not use_flashinfer),
+                disable_overlap_scheduler=False,
             )
         )
 
@@ -1458,6 +1468,7 @@ class TestBatchedSampling:
                 group_logit_indices: Optional[torch.Tensor] = None,
                 generator: Optional[torch.Generator] = None,
                 return_probs: bool,
+                        group_metadata: StrategyMetadata | None = None,
             ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
                 assert issubclass(group_key, sampling_utils_flashinfer._StrategyImpls.StrategyImpl)
                 assert generator is sampler.get_generator(logits.device)
@@ -2205,7 +2216,7 @@ class TestBatchedSampling:
             first_token = rng.integers(123456)
             batch_next_tokens_cuda_int = torch.arange(
                 first_token, first_token + total_steps, dtype=torch.int32, device="cuda"
-            )
+            ).unsqueeze(1)  # Add a dimension for beam width
 
             batched_sampling_result = _BatchedSamplingResult(
                 batch_req_indices=batch_req_indices.clone(),
@@ -2227,7 +2238,7 @@ class TestBatchedSampling:
                 new_tokens_host = sampler._unbatch_sampling_results(
                     batched_sampling_result=batched_sampling_result,
                     new_tokens_cuda=new_tokens_cuda,
-                    req_num_steps=req_num_steps,
+                    req_num_generated_tokens=req_num_steps,
                     seq_slots=seq_slots_tensor,
                 )
                 res.result = UutResult(new_tokens_host=new_tokens_host)
@@ -2258,8 +2269,8 @@ class TestBatchedSampling:
                 steps = draft_lens[req_idx] + 1
                 seq_slot = seq_slots[req_idx]
                 req_tokens = batch_next_tokens_cuda_int[input_offset : (input_offset + steps)]
-                torch.testing.assert_close(new_tokens_cuda[:steps, seq_slot, 0], req_tokens)
-                torch.testing.assert_close(new_tokens_host[:steps, seq_slot, 0], req_tokens.cpu())
+                torch.testing.assert_close(new_tokens_cuda[:steps, seq_slot], req_tokens)
+                torch.testing.assert_close(new_tokens_host[:steps, seq_slot], req_tokens.cpu())
                 input_offset += steps
 
         _run_test_with_warmup(_uut_provider, max_sync_s=0.2)
