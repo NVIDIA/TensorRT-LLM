@@ -231,14 +231,14 @@ class JobManager:
             return False, error_msg
 
     @staticmethod
-    def backup_logs(job_id: str, test_config, result_dir: str) -> Optional[str]:
+    def backup_logs(job_id: str, test_config, result_dir: str, is_passed: bool) -> Optional[str]:
         """Backup logs and config files to test_id directory.
         
         Args:
             job_id: SLURM job ID
             test_config: TestConfig object
             result_dir: Result directory path
-            
+            is_passed: Whether the job passed
         Returns:
             backup_dir path if successful, None otherwise
         """
@@ -246,12 +246,21 @@ class JobManager:
         if os.path.exists(result_dir):
             # Replace colons with underscores for safe directory naming
             dst_dir_name = test_config.test_id.replace(":", "-")
+            # Add ERROR suffix if the job failed
+            if not is_passed:
+                dst_dir_name = f"{dst_dir_name}_ERROR"
             backup_dir = os.path.join(os.path.dirname(result_dir), dst_dir_name)
 
             try:
                 print("   📦 Copying result directory to backup...")
                 print(f"   📁 Source: {result_dir}")
                 print(f"   📁 Destination: {backup_dir}")
+                
+                # Remove old backup if it exists
+                if os.path.exists(backup_dir):
+                    print(f"   ⚠️  Warning: Backup directory already exists, removing old backup")
+                    shutil.rmtree(backup_dir)
+                
                 shutil.copytree(result_dir, backup_dir)
                 print(f"   ✅ Backup created successfully: {backup_dir}")
 
@@ -346,8 +355,7 @@ class JobManager:
         config_data = test_config.config_data
         # Get result directory
         result_dir = JobManager.get_result_dir(test_config)
-        # Backup logs and config files
-        JobManager.backup_logs(job_id, test_config, result_dir)
+       
 
         # Call the internal implementation method
         check_result = JobManager._check_job_result(
@@ -361,6 +369,9 @@ class JobManager:
             test_name=test_name,
         )
         
+        is_passed = check_result["success"]
+        # Backup logs and config files
+        JobManager.backup_logs(job_id, test_config, result_dir, is_passed)
         # Clean up result directory
         JobManager.cleanup_result_dir(result_dir)
         

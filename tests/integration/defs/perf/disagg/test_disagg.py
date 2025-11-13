@@ -84,7 +84,7 @@ class TestDisaggBenchmark:
             if not completed:
                 JobManager.cancel_job(job_id)
                 result_dir = JobManager.get_result_dir(test_config)
-                JobManager.backup_logs(job_id, test_config, result_dir)
+                JobManager.backup_logs(job_id, test_config, result_dir, False)
                 JobManager.cleanup_result_dir(result_dir)
                 # Provide detailed error message
                 if error_msg == "timeout":
