@@ -304,8 +304,8 @@ class MatchRepeatKV(BaseTransform):
         info = TransformInfo(
             skipped=False,
             num_matches=num_kv_patterns,
-            is_clean=False,
-            has_valid_shapes=False,
+            is_clean=num_kv_patterns == 0,
+            has_valid_shapes=num_kv_patterns == 0,
         )
 
         return gm, info
@@ -333,8 +333,8 @@ class MatchEagerAttention(BaseTransform):
         info = TransformInfo(
             skipped=False,
             num_matches=num_eager_patterns,
-            is_clean=False,
-            has_valid_shapes=False,
+            is_clean=num_eager_patterns == 0,
+            has_valid_shapes=num_eager_patterns == 0,
         )
 
         return gm, info
@@ -647,8 +647,8 @@ class MatchSDPAToTorchAttention(BaseTransform):
         info = TransformInfo(
             skipped=False,
             num_matches=num_patterns,
-            is_clean=False,
-            has_valid_shapes=False,
+            is_clean=num_patterns == 0,
+            has_valid_shapes=num_patterns == 0,
         )
         return gm, info
 
@@ -685,8 +685,8 @@ class MatchRepeatKVWithTorchAttention(BaseTransform):
         info = TransformInfo(
             skipped=False,
             num_matches=num_patterns,
-            is_clean=False,
-            has_valid_shapes=False,
+            is_clean=num_patterns == 0,
+            has_valid_shapes=num_patterns == 0,
         )
         return gm, info
 
@@ -870,7 +870,7 @@ class MatchAttentionLayout(BaseTransform):
         info = TransformInfo(
             skipped=False,
             num_matches=num_matches,
-            is_clean=False,
-            has_valid_shapes=False,
+            is_clean=num_matches == 0,
+            has_valid_shapes=num_matches == 0,
         )
         return gm, info

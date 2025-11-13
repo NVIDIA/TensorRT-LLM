@@ -105,7 +105,10 @@ class ShardingTransformExecutor(BaseTransform):
                 ad_logger.warning(f"Invalid parameter update transformation {update_transform}.")
 
         info = TransformInfo(
-            skipped=False, num_matches=num_matches, is_clean=False, has_valid_shapes=False
+            skipped=False,
+            num_matches=num_matches,
+            is_clean=num_matches == 0,
+            has_valid_shapes=num_matches == 0,
         )
         # exit()
         return gm, info

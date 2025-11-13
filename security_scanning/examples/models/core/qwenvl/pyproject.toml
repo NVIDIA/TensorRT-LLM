@@ -15,7 +15,7 @@ sentencepiece = ">=0.1.99"
 tiktoken = "^0.12.0"
 einops = "^0.8.1"
 matplotlib = "^3.10.7"
-torchvision = "^0.24.0"
+torchvision = "^0.24.1"
 
 
 [build-system]
