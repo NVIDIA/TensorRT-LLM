@@ -1187,6 +1187,7 @@ class ShardingSource(Enum):
 
     HEURISTIC = "heuristic"
     FACTORY = "factory"
+    MANUAL = "manual"
 
 
 class ShardingDim(Enum):
