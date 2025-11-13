@@ -33,6 +33,7 @@ def enforce_single_worker():
     ],
 )
 @pytest.mark.high_cuda_memory
+@pytest.mark.xdist_group("speculative_high_mem")
 def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     memory_required = 30 if drafter_type == "model_drafter" else 20
@@ -146,6 +147,7 @@ def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
     ],
 )
 @pytest.mark.high_cuda_memory
+@pytest.mark.xdist_group("speculative_high_mem")
 def test_draft_len_schedule_functionality(drafter_type: str, draft_schedule: dict):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")

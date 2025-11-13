@@ -24,6 +24,7 @@ def enforce_single_worker(monkeypatch):
 
 @pytest.mark.parametrize("disable_overlap_scheduler", [True, False])
 @pytest.mark.high_cuda_memory
+@pytest.mark.xdist_group("speculative_high_mem")
 def test_dynamic_spec_decode(enforce_single_worker,
                              disable_overlap_scheduler: bool):
     # mock_should_use_spec_decode doesn't work with multiple processes,
@@ -124,6 +125,7 @@ def test_dynamic_spec_decode(enforce_single_worker,
 # Later: len(requests): 1, max_batch_size: 3, token_cap: 1638 -> num_effective_requests: 1, self.max_concurrency: 2 -> spec decode ON
 @pytest.mark.parametrize("disable_overlap_scheduler", [True, False])
 @pytest.mark.high_cuda_memory
+@pytest.mark.xdist_group("speculative_high_mem")
 def test_dynamic_spec_decode_without_force_single_process(
         disable_overlap_scheduler: bool):
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
