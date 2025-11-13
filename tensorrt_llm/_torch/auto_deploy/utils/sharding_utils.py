@@ -261,6 +261,7 @@ def _insert_sharded_mamba(
     dim: int,
     rank: int,
     world_size: int,
+    allreduce_strategy: AllReduceStrategy,
     add_dist: bool = False,
     min_local_shape: int = 1,
     weights_to_shard: Optional[list[str]] = None,
@@ -269,10 +270,11 @@ def _insert_sharded_mamba(
     quantization_cb: Optional[
         Callable[[GraphModule, nn.Module, Node, str, torch.Size, int, int, int], None]
     ] = None,
-    allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
 ) -> bool:
     """
     To shard Mamba layer, first column-shard the first linear layer: entry_node,
+
+    NOTE: allreduce_strategy is MANDATORY and must be explicitly provided.
     then shard all remaining weight tensors found in the subgraph defined between
     entry_node and the next successor linear node.
     First, validate if this is indeed a mamba module: within the subgraph,
@@ -291,6 +293,10 @@ def _insert_sharded_mamba(
         fused_weight_dims: Optional dict mapping weight keys to their fused dimension lists
         quantization_cb: Optional quantization callback
     """
+    if allreduce_strategy is None:
+        raise ValueError(
+            f"allreduce_strategy must be set for Mamba sharding on node {entry_node.name}"
+        )
     # Find next linear node to define subgraph boundary
     try:
         next_lin_node, depth = bfs(entry_node, is_any_lin_op, include_root=False)
@@ -434,18 +440,24 @@ def _shard_parameter_node(
     dim: int,
     rank: int,
     world_size: int,
+    allreduce_strategy: AllReduceStrategy,
     add_dist: bool = False,
     min_local_shape: int = 1,
     fused_weight_dims: Optional[list] = None,
     quantization_cb: Optional[
         Callable[[GraphModule, nn.Module, Node, str, torch.Size, int, int, int], None]
     ] = None,
-    allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
 ) -> None:
     """Replace the node with parametrized weight tensor with a new node that accepts sharded weights.
 
+    NOTE: allreduce_strategy is MANDATORY and must be explicitly provided.
+
     The state_dict is also updated to contain the sharded weights.
     """
+    if allreduce_strategy is None:
+        raise ValueError(
+            f"allreduce_strategy must be set for parameter sharding on node {node.name}"
+        )
     assert dim in [0, 1], "Only dim 0 and 1 are supported for sharding"
     assert add_dist or dim == 0, "For dim=1 sharding, dist_op is required."
 
@@ -559,19 +571,25 @@ class SplitDimension(IntEnum):
 
 
 class ShardingTransformInfo(BaseModel, ABC):
-    """Abstract base class for transformation configurations."""
+    """Abstract base class for transformation configurations.
+
+    NOTE: allreduce_strategy will be automatically injected by ShardingConfig.add()
+    if not provided at creation time. The strategy comes from the parent ShardingConfig.
+    """
 
     model_config = ConfigDict(frozen=True)  # Makes the model immutable and hashable
 
     target_node: str
     rank: int
     world_size: int
-    allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO
+    allreduce_strategy: Optional[AllReduceStrategy] = None  # Set by ShardingConfig.add() if None
 
     @field_validator("allreduce_strategy", mode="before")
     @classmethod
     def _validate_allreduce_strategy(cls, v):
         """Convert string names like 'AUTO' to AllReduceStrategy enum."""
+        if v is None:
+            return None
         return validate_allreduce_strategy(v)
 
     def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
@@ -690,12 +708,18 @@ class WeightShardingInfo(ShardingTransformInfo):
 
 
 class ParameterUpdateInfo(ShardingTransformInfo):
-    """Configuration for node args sharding transformations."""
+    """Configuration for node args sharding transformations.
+
+    NOTE: This transformation doesn't insert distributed operations, so
+    allreduce_strategy has a default value (unlike other transformations).
+    """
 
     target_node: str
     rank: int
     world_size: int
     args: tuple
+    # ParameterUpdateInfo doesn't insert distributed ops, so strategy doesn't matter
+    allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO
 
     def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
         """Validate the transformation configuration."""
@@ -984,13 +1008,17 @@ def _insert_sharded_moe(
     node: Node,
     rank: int,
     world_size: int,
+    allreduce_strategy: AllReduceStrategy,
     scale_names: Sequence[str] = (),
-    allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
 ):
     """Update the torch_moe node with sharded weight lists,
     sharded `selected_experts` and `final_scales(router_logics)`.
     Add an all_reduce node after the moe node.
+
+    NOTE: allreduce_strategy is MANDATORY.
     """
+    if allreduce_strategy is None:
+        raise ValueError(f"allreduce_strategy must be set for MoE sharding on node {node.name}")
     scale_names = list(scale_names)
 
     num_experts = len(node.args[3])
@@ -1091,13 +1119,14 @@ def _insert_sharded_mxfp4_mlp_ep(
     node: Node,
     rank: int,
     world_size: int,
-    allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
+    allreduce_strategy: AllReduceStrategy,
 ):
-    """
-    Transform a call to auto_deploy::triton_mxfp4_moe into:
-      - sharded expert parameters along dim 0 (this rank's slice),
+    """Transform a call to auto_deploy::triton_mxfp4_moe into:
+      - sharded expert parameters along dim 0 (this rank slice),
       - call to auto_deploy::triton_mxfp4_moe_ep(..., local_lo, local_hi),
       - followed by torch_dist_all_reduce.
+
+    NOTE: allreduce_strategy is MANDATORY and must be explicitly provided.
 
     Expects the original op signature:
       (hidden_states,
@@ -1106,6 +1135,10 @@ def _insert_sharded_mxfp4_mlp_ep(
        alpha, limit,
        down_blocks, down_bias, down_scales)
     """
+    if allreduce_strategy is None:
+        raise ValueError(
+            f"allreduce_strategy must be set for MXFP4 MLP EP sharding on node {node.name}"
+        )
 
     IDX_GATE_UP_BLOCKS = 4
     IDX_GATE_UP_BIAS = 5
@@ -1165,7 +1198,7 @@ class EPShardingInfo(ShardingTransformInfo):
 
     def apply(self, gm: GraphModule, node: Node) -> None:
         """Apply EP sharding transformation to the graph module."""
-        _insert_sharded_moe(gm, node, self.rank, self.world_size, [], self.allreduce_strategy)
+        _insert_sharded_moe(gm, node, self.rank, self.world_size, self.allreduce_strategy, [])
 
 
 class MXFP4EPShardingInfo(EPShardingInfo):
@@ -1196,7 +1229,7 @@ class FP8EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
 
     def apply(self, gm: GraphModule, node: Node) -> None:
         _insert_sharded_moe(
-            gm, node, self.rank, self.world_size, self.scale_names(), self.allreduce_strategy
+            gm, node, self.rank, self.world_size, self.allreduce_strategy, self.scale_names()
         )
 
 
@@ -1214,7 +1247,7 @@ class NVFP4EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
 
     def apply(self, gm: GraphModule, node: Node) -> None:
         _insert_sharded_moe(
-            gm, node, self.rank, self.world_size, self.scale_names(), self.allreduce_strategy
+            gm, node, self.rank, self.world_size, self.allreduce_strategy, self.scale_names()
         )
 
 
@@ -1270,7 +1303,8 @@ class ShardingConfig(BaseModel):
     )
     allreduce_strategy: AllReduceStrategy = Field(
         default=AllReduceStrategy.AUTO,
-        description="AllReduce strategy for distributed operations (AUTO, NCCL, ONESHOT, TWOSHOT, etc.)",
+        description="AllReduce strategy for distributed operations. "
+        "Options: AUTO, NCCL, ONESHOT, TWOSHOT, MIN_LATENCY, LOWPRECISION, UB, MNNVL, NCCL_SYMMETRIC, SYMM_MEM",
     )
     weight_sharding_transforms: List[WeightShardingInfo] = Field(default_factory=list)
     parameter_update_transforms: List[ParameterUpdateInfo] = Field(default_factory=list)
@@ -1305,7 +1339,18 @@ class ShardingConfig(BaseModel):
     def add(self, transform: ShardingTransformInfo) -> bool:
         """Append a transform only if that node was
         not sharded before. Do not overwrite existing transforms.
+
+        Automatically propagates allreduce_strategy from this config to the transform
+        if the transform doesn't already have one set.
         """
+        # Inject allreduce_strategy from config into transform if it's None
+        # This creates a new transform instance with the strategy set
+        if transform.allreduce_strategy is None:
+            # Create a new transform with the strategy injected
+            transform_dict = transform.model_dump()
+            transform_dict["allreduce_strategy"] = self.allreduce_strategy
+            transform = type(transform)(**transform_dict)
+
         # Find the appropriate list by checking inheritance
         transform_list = None
         for base_class, transform_list_candidate in self._transform_list_dict.items():

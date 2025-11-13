@@ -26,8 +26,8 @@ def all_gather_fake(tensor, dim=0):
 
 
 @torch.library.custom_op("auto_deploy::torch_dist_all_reduce", mutates_args=(), device_types="cuda")
-def all_reduce(t: torch.Tensor, strategy: str = "AUTO") -> torch.Tensor:
-    """All_reduce across the ranks. Reduction op is SUM.
+def all_reduce(t: torch.Tensor, strategy: str) -> torch.Tensor:
+    """All_reduce across the ranks. Reduction op is SUM. Strategy is MANDATORY.
 
     Args:
         t: Tensor to reduce across ranks
@@ -44,5 +44,5 @@ def all_reduce(t: torch.Tensor, strategy: str = "AUTO") -> torch.Tensor:
 
 
 @all_reduce.register_fake
-def all_reduce_fake(tensor, strategy="AUTO"):
+def all_reduce_fake(tensor, strategy):
     return torch.empty_like(tensor)

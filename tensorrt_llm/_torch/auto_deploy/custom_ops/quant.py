@@ -239,10 +239,10 @@ def fp8_linear_fake(
 def fused_fp8_linear_all_reduce(
     input: torch.Tensor,
     weight_fp8: torch.Tensor,
+    strategy: str,
     bias: Optional[torch.Tensor] = None,
     input_scale: Optional[torch.Tensor] = None,
     weight_scale: Optional[torch.Tensor] = None,
-    strategy: str = "AUTO",
 ) -> torch.Tensor:
     out = torch.ops.auto_deploy.torch_quant_fp8_linear(
         input, weight_fp8, bias, input_scale, weight_scale
@@ -257,10 +257,10 @@ def fused_fp8_linear_all_reduce(
 def fused_fp8_linear_all_reduce_fake(
     input: torch.Tensor,
     weight_fp8: torch.Tensor,
+    strategy: str,
     bias: Optional[torch.Tensor] = None,
     input_scale: Optional[torch.Tensor] = None,
     weight_scale: Optional[torch.Tensor] = None,
-    strategy: str = "AUTO",
 ) -> torch.Tensor:
     return torch.ops.auto_deploy.torch_quant_fp8_linear(
         input, weight_fp8, bias, input_scale, weight_scale
