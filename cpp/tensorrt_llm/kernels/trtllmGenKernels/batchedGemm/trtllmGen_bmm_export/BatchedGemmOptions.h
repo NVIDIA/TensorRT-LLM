@@ -209,11 +209,13 @@ inline bool checkAndUpdateBatchedGemmOptions(
     }
     if (options.mFusedAct)
     {
+        std::cout << "checking fused act options" << std::endl;
         // ensure that we check the fused options as well
         isValid = gemmGatedAct::checkAndUpdateGemmGatedActOptions(options, cudaArch, updateOptions);
     }
     else
     {
+        std::cout << "checking gemm options" << std::endl;
         isValid = gemm::checkAndUpdateGemmOptions(options, cudaArch, 1 /* tpGrpSize */, updateOptions);
     }
 
