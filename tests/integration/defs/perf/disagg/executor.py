@@ -464,7 +464,7 @@ class JobManager:
                 - (False, error_msg): Job failed early with specific error
         """
         start_time = time.time()
-        check_interval = 600  # Check every 10 minutes
+        check_interval = 180  # Check every 3 minutes
         failure_check_interval = 60  # Check for failures every 60 seconds
         last_failure_check = start_time
 
