@@ -1405,6 +1405,11 @@ class DSACacheManager(KVCacheManager):
         return self.indexer_k_cache_pool_per_layer[layer_offset].view(
             self.num_blocks, block_size, 1, per_token_size)
 
+    def shutdown(self):
+        # Clear Python references BEFORE C++ frees the underlying CUDA buffers
+        self.indexer_k_cache_pool_per_layer = []
+        super().shutdown()
+
     @staticmethod
     def get_cache_size_per_token(model_config: ModelConfig, mapping: Mapping,
                                  **kwargs):
