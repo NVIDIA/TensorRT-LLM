@@ -654,6 +654,15 @@ def _register_fake():
             device=input.device)
         return output, output_sf
 
+    @torch.library.register_fake("trtllm::moe_gelu")
+    def _(
+        input: torch.Tensor,
+        tile_idx_to_mn_limit: torch.Tensor,
+        num_non_exiting_tiles: torch.Tensor,
+        tile_tokens_dim: int,
+    ) -> torch.Tensor:
+        return torch.empty_like(input)
+
     @torch.library.register_fake("trtllm::allgather_list")
     def allgather_list(input_list, sizes, group):
         assert len(input_list) > 0
