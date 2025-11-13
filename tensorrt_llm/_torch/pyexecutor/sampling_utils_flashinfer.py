@@ -35,6 +35,7 @@ from .sampling_utils import (
     GREEDY,
     GroupedStrategySampler,
     Strategy,
+    StrategyMetadata,
     TemperatureOnly,
     TopK,
     TopKTopP,
@@ -598,6 +599,7 @@ class FlashInferGroupedStrategySampler(GroupedStrategySampler[Type[_StrategyImpl
         group_logit_indices: Optional[torch.Tensor] = None,
         generator: Optional[torch.Generator] = None,
         return_probs: bool,
+        group_metadata: StrategyMetadata | None = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         if group_logit_indices is None:
             assert logits.size(0) == len(strategies)
