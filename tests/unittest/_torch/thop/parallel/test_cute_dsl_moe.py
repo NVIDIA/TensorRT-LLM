@@ -7,6 +7,11 @@ from tensorrt_llm._torch.utils import unswizzle_sf
 from tensorrt_llm._utils import get_sm_version
 
 
+def swiglu_ref(x: torch.Tensor) -> torch.Tensor:
+    x, gate = x.chunk(2, dim=-1)
+    return x * torch.nn.functional.silu(gate)
+
+
 @pytest.mark.parametrize("tile_size", [128, 256])
 @pytest.mark.parametrize("ep_size", [1, 8, 32])
 @pytest.mark.parametrize("top_k", [1, 2, 6, 8])
@@ -227,6 +232,37 @@ def test_moe_unpermute(dtype: str, num_tokens: int, top_k: int, tile_size: int):
 @pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
 def test_moe_swiglu(dtype: str, num_tokens: int, top_k: int, tile_size: int):
     dtype = getattr(torch, dtype)
+    interm_size = 4096
+    num_experts = 256
+    num_local_experts = num_experts // 32
+    helper = GroupedGemmInputsHelper(num_experts, top_k, num_local_experts, 0, tile_size)
+    max_num_tiles = helper.get_max_num_tiles(num_tokens)
+    max_num_permuted_tokens = helper.get_max_num_permuted_tokens(num_tokens)
+
+    x = torch.randint(
+        -100, 100, (max_num_permuted_tokens, interm_size * 2), dtype=torch.int32, device="cuda"
+    ).to(dtype)
+    tile_idx_to_mn_limit = (
+        torch.arange(1, max_num_tiles + 1, dtype=torch.int32, device="cuda") * tile_size
+    )
+    num_non_exiting_tiles_val = (num_tokens * top_k + tile_size - 1) // tile_size
+    num_non_exiting_tiles = torch.tensor(
+        [num_non_exiting_tiles_val], dtype=torch.int32, device="cuda"
+    )
+    num_permuted_tokens = num_non_exiting_tiles_val * tile_size
+
+    y = torch.ops.trtllm.moe_swiglu(x, tile_idx_to_mn_limit, num_non_exiting_tiles, tile_size)
+    y_ref = swiglu_ref(x)
+    torch.testing.assert_close(y[:num_permuted_tokens], y_ref[:num_permuted_tokens])
+
+
+@pytest.mark.skipif(get_sm_version() != 100, reason="This test is only supported on SM 100 GPUs")
+@pytest.mark.parametrize("tile_size", [128, 256])
+@pytest.mark.parametrize("top_k", [1, 2, 8])
+@pytest.mark.parametrize("num_tokens", [128, 515, 1024])
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_moe_swiglu_nvfp4_quantize(dtype: str, num_tokens: int, top_k: int, tile_size: int):
+    dtype = getattr(torch, dtype)
     sf_vec_size = 16
     interm_size = 4096
     num_experts = 256
@@ -245,18 +281,14 @@ def test_moe_swiglu(dtype: str, num_tokens: int, top_k: int, tile_size: int):
     num_non_exiting_tiles = torch.tensor(
         [num_non_exiting_tiles_val], dtype=torch.int32, device="cuda"
     )
-    y = torch.ops.trtllm.moe_swiglu(x, tile_idx_to_mn_limit, num_non_exiting_tiles, tile_size)
-    _x, _gate = x.chunk(2, dim=-1)
-    y_ref = torch.nn.functional.silu(_gate) * _x
     num_permuted_tokens = num_non_exiting_tiles_val * tile_size
-    torch.testing.assert_close(y[:num_permuted_tokens], y_ref[:num_permuted_tokens])
 
-    global_sf = y[:num_permuted_tokens].abs().max().float() / (448 * 6)
+    global_sf = swiglu_ref(x).abs().max().float() / (448 * 6)
     global_sf = 1 / global_sf
     y, y_sf = torch.ops.trtllm.moe_swiglu_nvfp4_quantize(
         x, global_sf, tile_idx_to_mn_limit, num_non_exiting_tiles, tile_size
     )
-    y_ref, y_sf_ref = torch.ops.trtllm.fp4_quantize(y_ref, global_sf, 16, False)
+    y_ref, y_sf_ref = torch.ops.trtllm.fp4_quantize(swiglu_ref(x), global_sf, 16, False)
     match_ratio = (
         y[:num_permuted_tokens].view(torch.uint8) == y_ref[:num_permuted_tokens]
     ).sum().item() / y[:num_permuted_tokens].numel()
@@ -269,9 +301,7 @@ def test_moe_swiglu(dtype: str, num_tokens: int, top_k: int, tile_size: int):
     assert match_ratio > 0.999
 
 
-@pytest.mark.skipif(
-    get_sm_version() != 100, reason="This test is only supported in Blackwell architecture"
-)
+@pytest.mark.skipif(get_sm_version() != 100, reason="This test is only supported on SM 100 GPUs")
 @pytest.mark.parametrize("tile_size", [128])
 @pytest.mark.parametrize("ep_size", [1, 8, 32])
 @pytest.mark.parametrize("top_k", [1, 2, 8])
