@@ -83,7 +83,7 @@ transforms:
     manual_config:
         head_dim : 128
         tp_plan :
-        # mamba SSM layers
+          # mamba SSM layers
           in_proj: mamba
           out_proj: rowwise
           # attention layers
@@ -91,6 +91,9 @@ transforms:
           k_proj: colwise
           v_proj: colwise
           o_proj: rowwise
+          # NOTE: for performance reason, consider not sharding the following
+          # layers at all. Commenting out the following layers will replicate
+          # them across ranks.
           # MLP and shared experts in MoE layers
           gate_proj: colwise
           up_proj: colwise
