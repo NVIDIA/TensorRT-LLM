@@ -521,10 +521,10 @@ class CublasLtFP4GemmRunner(TunableRunner):
 
 class CudaCoreNVFP4Runner(TunableRunner):
     """
-    CUDA Core-based NVFP4 GEMM runner on modern architectures.
+    CUDA Core-based NVFP4 GEMM runner.
 
     This runner is available on:
-    - SM >= 100 (Blackwell and newer architectures)
+    - SM >= 100 (Blackwell)
     - M <= 8 (small batch size limitation from kernel template)
     """
 
@@ -882,11 +882,12 @@ def nvfp4_gemm_unified(
     - CUTLASS: Predefined CUTLASS configurations with auto-tuning
     - cuBLASLt: Heuristic-based algorithms from cuBLASLt library
     - CuteDSL: Blackwell-optimized persistent kernels (when available and inputs are valid)
-    - CUDA Core: CUDA Core implementation on SM >= 89 (Ada+), M <= 16 (explicit selection only)
+    - CUDA Core: CUDA Core implementation (requires SM >= 100 and M <= 8)
 
     The AutoTuner profiles all available backends during the first run and caches
     the best choice for each input shape. Subsequent calls use the cached selection
-    with zero overhead.
+    with zero overhead. In 'auto' mode, backends are only considered if their
+    requirements are met (e.g., CUDA Core only participates when SM >= 100 and M <= 8).
 
     Args:
         act_fp4: Activation tensor [m, k] in FP4 format (packed in uint8)
@@ -901,7 +902,7 @@ def nvfp4_gemm_unified(
             - 'cutlass': Force use CUTLASS (FP4GemmRunner)
             - 'cublaslt': Force use cuBLASLt (CublasLtFP4GemmRunner)
             - 'cutedsl': Force use CuteDSL (CuteDSLNVFP4Wrapper)
-            - 'cuda_core': Force use CUDA Core (CudaCoreNVFP4Runner, requires SM >= 89, M <= 16)
+            - 'cuda_core': Force use CUDA Core (CudaCoreNVFP4Runner, requires SM >= 100, M <= 8)
 
     Returns:
         Output tensor [m, n] with dtype=output_dtype
@@ -919,25 +920,34 @@ def nvfp4_gemm_unified(
     # Build list of runners based on backend parameter
     runners = []
 
-    # CUDA Core runner can be enabled via backend='cuda_core' (not in auto mode by default)
-    # This avoids AutoTuner cache incompatibility issues
-    if backend == "cuda_core":
-        # Check if architecture is supported (SM >= 89)
+    # Add CUDA Core runner if conditions are met
+    # Only instantiate when both SM version and M dimension requirements are satisfied
+    if backend in ["auto", "cuda_core"]:
         is_cuda_core_supported = False
+        m = act_fp4.shape[0]
+        sm_version = None
+
         if torch.cuda.is_available():
             capability = torch.cuda.get_device_capability(
                 torch.device('cuda:0'))
             sm_version = capability[0] * 10 + capability[1]
-            is_cuda_core_supported = sm_version >= CudaCoreNVFP4Runner.MIN_SM_VERSION
+            # Check both SM version and M dimension constraints
+            is_cuda_core_supported = (
+                sm_version >= CudaCoreNVFP4Runner.MIN_SM_VERSION
+                and m <= CudaCoreNVFP4Runner.MAX_M_DIMENSION)
 
         if is_cuda_core_supported:
             runners.append(CudaCoreNVFP4Runner(to_userbuffers, output_dtype))
-            logger.debug("CUDA Core runner added to nvfp4_gemm_unified")
-        else:
-            raise ValueError(
-                f"CUDA Core backend requires SM >= {CudaCoreNVFP4Runner.MIN_SM_VERSION} (Ada or newer). "
-                f"Current SM version: {sm_version if torch.cuda.is_available() else 'N/A'}. "
-                f"Please use backend='auto' or another backend.")
+            logger.debug(
+                f"CUDA Core runner added to nvfp4_gemm_unified (SM={sm_version}, M={m})"
+            )
+        elif backend == "cuda_core":
+            # Explicitly requested but conditions not met - raise error
+            error_msg = f"CUDA Core backend requires SM >= {CudaCoreNVFP4Runner.MIN_SM_VERSION} and M <= {CudaCoreNVFP4Runner.MAX_M_DIMENSION}. "
+            error_msg += f"Current: SM={sm_version if sm_version else 'N/A'}, M={m}. "
+            error_msg += "Please use backend='auto' or another backend."
+            raise ValueError(error_msg)
+        # For auto mode: silently skip if conditions not met
 
     # Add CUTLASS runner (always available)
     if backend in ["auto", "cutlass"]:
