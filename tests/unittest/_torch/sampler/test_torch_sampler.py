@@ -1468,7 +1468,7 @@ class TestBatchedSampling:
                 group_logit_indices: Optional[torch.Tensor] = None,
                 generator: Optional[torch.Generator] = None,
                 return_probs: bool,
-                        group_metadata: StrategyMetadata | None = None,
+                group_metadata: StrategyMetadata | None = None,
             ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
                 assert issubclass(group_key, sampling_utils_flashinfer._StrategyImpls.StrategyImpl)
                 assert generator is sampler.get_generator(logits.device)
