@@ -163,6 +163,7 @@ def triton_rocket_qk_split(
     input_lens_cumsum: torch.Tensor,
     valid_seq_indices: torch.Tensor,
     k_output_offsets: torch.Tensor,
+    total_rocket_k_ctx_tokens: int,
     num_heads: int,
     num_kv_heads: int,
     head_dim: int,
@@ -182,6 +183,7 @@ def triton_rocket_qk_split(
         input_lens_cumsum: Cumulative sum of context lengths [batch_size + 1]
         valid_seq_indices: Indices of valid sequences [valid_batch_size]
         k_output_offsets: Offset for each valid sequence [valid_batch_size]
+        total_rocket_k_ctx_tokens: Total number of RocketKV key context tokens
         num_heads: Number of query heads
         num_kv_heads: Number of key/value heads
         head_dim: Dimension of each head
@@ -194,7 +196,7 @@ def triton_rocket_qk_split(
     """
 
     q_total_output_tokens = window_size * valid_batch_size
-    k_total_output_tokens = k_output_offsets[valid_batch_size].item()
+    k_total_output_tokens = total_rocket_k_ctx_tokens
 
     q_window = torch.empty((num_heads, q_total_output_tokens, head_dim),
                            device=input_tensor.device,
@@ -503,14 +505,18 @@ def triton_softmax(
     Apply softmax to flattened input tensor.
 
     Args:
-        input_tensor: Input tensor [num_heads, q_len_per_seq, total_k_tokens]
+        input_tensor: Input tensor [num_heads, len_per_seq, total_k_tokens] or [num_heads, total_k_tokens]
         cum_lens: Cumulative lengths [batch_size + 1]
         batch_size: Number of batches
 
     Returns:
-        output: Softmax results [num_heads, q_len_per_seq, total_k_tokens]
+        output: Softmax results, shape is like input_tensor
     """
-    num_heads, q_len_per_seq, total_k_tokens = input_tensor.shape
+    if input_tensor.ndim == 2:
+        num_heads, total_k_tokens = input_tensor.shape
+        len_per_seq = 1
+    else:
+        num_heads, len_per_seq, total_k_tokens = input_tensor.shape
 
     output = torch.empty_like(input_tensor,
                               dtype=input_tensor.dtype,
@@ -518,7 +524,7 @@ def triton_softmax(
 
     BLOCK_SIZE = 512
 
-    grid = (num_heads, batch_size * q_len_per_seq)
+    grid = (num_heads, batch_size * len_per_seq)
 
     softmax_kernel[grid](
         input_tensor,
@@ -526,7 +532,7 @@ def triton_softmax(
         cum_lens,
         batch_size,
         num_heads,
-        q_len_per_seq,
+        len_per_seq,
         total_k_tokens,
         BLOCK_SIZE=BLOCK_SIZE,
     )
@@ -1074,54 +1080,49 @@ def rocket_paged_kt_cache_bmm_kernel(
     q_ptr,
     kt_cache_tensor_ptr,
     kt_cache_block_offsets_ptr,
-    dim_pos_ptr,
     kv_lens_ptr,
     output_ptr,
     output_offsets_ptr,
     num_gen_tokens,
     num_kv_heads,
-    num_heads_per_kv,
+    num_heads_per_kv: tl.constexpr,
     head_dim,
     kt_page_size,
     tokens_per_block,
     max_kt_blocks_per_seq,
     total_kt_tokens,
     sm_scale,
+    Q_BLOCK_SIZE: tl.constexpr,
     KT_BLOCK_SIZE: tl.constexpr,
     DIM_BLOCK_SIZE: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
-    global_head_idx = tl.program_id(1)
+    kv_head_idx = tl.program_id(1)
 
-    if batch_idx >= num_gen_tokens or global_head_idx >= num_kv_heads * num_heads_per_kv:
+    if batch_idx >= num_gen_tokens or kv_head_idx >= num_kv_heads:
         return
     kv_len = tl.load(kv_lens_ptr + batch_idx)
     num_kt_tokens = (kv_len + kt_page_size - 1) // kt_page_size
 
-    kv_head_idx = global_head_idx // num_heads_per_kv
-    q_head_idx = global_head_idx % num_heads_per_kv
-
     q_base = (batch_idx * num_kv_heads * num_heads_per_kv * head_dim +
-              kv_head_idx * num_heads_per_kv * head_dim + q_head_idx * head_dim)
-    dim_pos_base = (batch_idx * num_kv_heads * head_dim +
-                    kv_head_idx * head_dim)
+              kv_head_idx * num_heads_per_kv * head_dim)
+
+    q_head_offsets = tl.arange(0, Q_BLOCK_SIZE)
+    q_head_mask = q_head_offsets < num_heads_per_kv
 
     output_offset = tl.load(output_offsets_ptr + batch_idx)
 
     dim_indices = tl.arange(0, DIM_BLOCK_SIZE)
     dim_mask = dim_indices < head_dim
 
-    q_indices = q_base + dim_indices
-    q_values = tl.load(q_ptr + q_indices, mask=dim_mask, other=0.0)
-    q_values = tl.broadcast_to(q_values[None, :],
-                               (KT_BLOCK_SIZE, DIM_BLOCK_SIZE))
+    q_indices = q_base + q_head_offsets[:,
+                                        None] * head_dim + dim_indices[None, :]
+    q_values = tl.load(q_ptr + q_indices,
+                       mask=q_head_mask[:, None] & dim_mask[None, :])
 
-    dim_pos_indices = dim_pos_base + dim_indices
-    dim_pos_values = tl.load(dim_pos_ptr + dim_pos_indices,
-                             mask=dim_mask,
-                             other=0)
-    dim_pos_values = tl.broadcast_to(dim_pos_values[None, :],
-                                     (KT_BLOCK_SIZE, DIM_BLOCK_SIZE))
+    dim_pos_values = tl.sum(q_values, axis=0) > 0
+    dim_pos_values = tl.broadcast_to(dim_pos_values[:, None],
+                                     (DIM_BLOCK_SIZE, KT_BLOCK_SIZE))
 
     for kt_block_idx_start in tl.range(0, num_kt_tokens, KT_BLOCK_SIZE):
         kt_token_indices = kt_block_idx_start + tl.arange(0, KT_BLOCK_SIZE)
@@ -1138,11 +1139,10 @@ def rocket_paged_kt_cache_bmm_kernel(
             (block_indices * tokens_per_block + token_indices_in_block) *
             num_kv_heads * 2 * head_dim + kv_head_idx * 2 * head_dim)
 
-        combined_mask = dim_mask[
-            None, :] & kt_token_mask[:,
-                                     None]  # Shape: [KT_BLOCK_SIZE, DIM_BLOCK_SIZE]
+        combined_mask = dim_mask[:, None] & kt_token_mask[
+            None, :]  # Shape: [DIM_BLOCK_SIZE, KT_BLOCK_SIZE]
 
-        kt_cache_indices_min = cache_bases[:, None] + dim_indices[None, :]
+        kt_cache_indices_min = cache_bases[None, :] + dim_indices[:, None]
         kt_cache_indices_max = kt_cache_indices_min + head_dim
         kt_cache_values_min = tl.load(kt_cache_tensor_ptr +
                                       kt_cache_indices_min,
@@ -1156,19 +1156,23 @@ def rocket_paged_kt_cache_bmm_kernel(
         kt_cache_values = tl.where(dim_pos_values > 0, kt_cache_values_max,
                                    kt_cache_values_min)
 
-        results = tl.sum(q_values * kt_cache_values, axis=1)
+        results = tl.dot(q_values,
+                         kt_cache_values)  # [Q_BLOCK_SIZE, KT_BLOCK_SIZE]
 
-        output_indices = global_head_idx * total_kt_tokens + output_offset + kt_token_indices
+        output_mask = q_head_mask[:, None] & kt_token_mask[None, :]
+        output_indices = (kv_head_idx * num_heads_per_kv * total_kt_tokens +
+                          q_head_offsets[:, None] * total_kt_tokens +
+                          output_offset + kt_token_indices[None, :])
+
         tl.store(output_ptr + output_indices,
                  results * sm_scale,
-                 mask=kt_token_mask)
+                 mask=output_mask)
 
 
 def triton_rocket_paged_kt_cache_bmm(
     q: torch.Tensor,
     kt_cache_tensor: torch.Tensor,
     kt_cache_block_offsets: torch.Tensor,
-    dim_pos: torch.Tensor,
     kv_lens: torch.Tensor,
     output_offsets: torch.Tensor,
     kt_page_size: int,
@@ -1184,7 +1188,6 @@ def triton_rocket_paged_kt_cache_bmm(
         q: Query tensor [num_gen_tokens, num_kv_heads, num_heads_per_kv, head_dim]
         kt_cache_tensor: KT cache tensor
         kt_cache_block_offsets: Block offsets [num_gen_tokens, max_kt_blocks_per_seq]
-        dim_pos: Dimension offsets [num_gen_tokens, num_kv_heads, head_dim] (0 or head_dim for each dim)
         kv_lens: Sequence lengths [num_gen_tokens]
         output_offsets: Output offsets [num_gen_tokens + 1]
         kt_page_size: Page size for KT tokens
@@ -1193,22 +1196,23 @@ def triton_rocket_paged_kt_cache_bmm(
         total_kt_tokens: Total number of KT tokens (fixed size)
         sm_scale: Scale factor for softmax
     Returns:
-        output: BMM results [num_heads, 1, total_kt_tokens]
+        output: BMM results [num_kv_heads, num_heads_per_kv, total_kt_tokens]
     """
     num_gen_tokens, num_kv_heads, num_heads_per_kv, head_dim = q.shape
-    total_num_heads = num_kv_heads * num_heads_per_kv
+    num_kv_heads * num_heads_per_kv
 
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(head_dim)
 
-    # Create output tensor with shape [num_heads, 1, total_kt_tokens]
-    output = torch.empty((total_num_heads, 1, total_kt_tokens),
+    # Create output tensor with shape [num_kv_heads, num_heads_per_kv, total_kt_tokens]
+    output = torch.empty((num_kv_heads, num_heads_per_kv, total_kt_tokens),
                          dtype=torch.float32,
                          device=q.device)
 
-    grid = lambda meta: (num_gen_tokens, total_num_heads)
+    grid = lambda meta: (num_gen_tokens, num_kv_heads)
 
-    KT_BLOCK_SIZE = 128
+    Q_BLOCK_SIZE = num_heads_per_kv
+    KT_BLOCK_SIZE = 64
     if head_dim <= 128:
         DIM_BLOCK_SIZE = 128
     elif head_dim <= 256:
@@ -1220,7 +1224,6 @@ def triton_rocket_paged_kt_cache_bmm(
         q,
         kt_cache_tensor,
         kt_cache_block_offsets,
-        dim_pos,
         kv_lens,
         output,
         output_offsets,
@@ -1233,6 +1236,7 @@ def triton_rocket_paged_kt_cache_bmm(
         max_kt_blocks_per_seq,
         total_kt_tokens,
         sm_scale,
+        Q_BLOCK_SIZE=Q_BLOCK_SIZE,
         KT_BLOCK_SIZE=KT_BLOCK_SIZE,
         DIM_BLOCK_SIZE=DIM_BLOCK_SIZE,
     )
