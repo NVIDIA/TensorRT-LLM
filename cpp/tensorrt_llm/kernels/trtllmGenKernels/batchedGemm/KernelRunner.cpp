@@ -405,8 +405,8 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, int32_t va
     gemmData.mProblemDimensions.mValidK = validK;
     gemmData.mProblemDimensions.mRank = 0;
     gemmData.mProblemDimensions.mWorldSize = 1;
-    gemmData.mProblemDimensions.mValidM = m;
-    gemmData.mProblemDimensions.mValidN = n;
+    gemmData.mProblemDimensions.mValidM = n;
+    gemmData.mProblemDimensions.mValidN = m;
     gemmData.mProblemDimensions.mValidK = k;
 
     // Inputs
@@ -560,8 +560,8 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(int32_t m
     gemmData.mProblemDimensions.mRank = 0;
     gemmData.mProblemDimensions.mWorldSize = 1;
     gemmData.mProblemDimensions.mMaxNumCtasInTokenDim = maxNumCtasInBatchDim;
-    gemmData.mProblemDimensions.mValidM = m;
-    gemmData.mProblemDimensions.mValidN = n;
+    gemmData.mProblemDimensions.mValidM = n;
+    gemmData.mProblemDimensions.mValidN = m;
     gemmData.mProblemDimensions.mValidK = k;
     auto cmpFunc = [&configs, &gemmData, &bmm, &multiProcessorCount](int64_t idx0, int64_t idx1)
     {
@@ -633,6 +633,7 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(int32_t m
     std::vector<int64_t> validConfigIndices;
     for (auto const& configIndex : prioritizedIndices)
     {
+        std::cout << "checking config index " << configIndex << std::endl;
         auto const& config = configs[configIndex];
         auto isValidConfig = bmm.isValidConfig(config, gemmData);
         if (isValidConfig)
@@ -687,8 +688,8 @@ bool TrtllmGenBatchedGemmRunner::isValidConfigIndex(int32_t configIndex, int32_t
     gemmData.mProblemDimensions.mRank = 0;
     gemmData.mProblemDimensions.mWorldSize = 1;
     gemmData.mProblemDimensions.mMaxNumCtasInTokenDim = maxNumCtasInBatchDim;
-    gemmData.mProblemDimensions.mValidM = m;
-    gemmData.mProblemDimensions.mValidN = n;
+    gemmData.mProblemDimensions.mValidM = n;
+    gemmData.mProblemDimensions.mValidN = m;
     gemmData.mProblemDimensions.mValidK = k;
 
     auto const& config = configs[configIndex];

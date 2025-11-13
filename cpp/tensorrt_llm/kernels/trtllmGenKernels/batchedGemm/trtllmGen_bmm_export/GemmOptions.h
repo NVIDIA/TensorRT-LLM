@@ -629,6 +629,7 @@ inline int32_t getShuffleBlockSize(int epilogueTileM)
 inline bool checkAndUpdateGemmOptions(
     GemmOptions& options, tg::CudaArch cudaArch, int tpGrpSize, bool updateOptions = true)
 {
+    std::cout << "Checking GemmOptions..." << std::endl;
     options.mWorldSize = tpGrpSize;
 
     bool isBlackwell = tg::isArchBlackwell(cudaArch);
@@ -641,9 +642,11 @@ inline bool checkAndUpdateGemmOptions(
         }
         else
         {
+            std::cout << "failed at dtypeB" << std::endl;
             return false;
         }
     }
+    std::cout << "ckpt 0" << std::endl;
 
     // If not specified, used the input dtypes as MMA dtypes (no cast required).
     if (options.mDtypeMmaA == tg::Dtype::Void)
@@ -654,6 +657,7 @@ inline bool checkAndUpdateGemmOptions(
         }
         else
         {
+            std::cout << "failed at dtypeMmaA" << std::endl;
             return false;
         }
     }
@@ -665,6 +669,7 @@ inline bool checkAndUpdateGemmOptions(
         }
         else
         {
+            std::cout << "failed at dtypeMmaB" << std::endl;
             return false;
         }
     }
@@ -696,6 +701,7 @@ inline bool checkAndUpdateGemmOptions(
         }
         else
         {
+            std::cout << "failed at validM/N/K" << std::endl;
             return false;
         }
     }
@@ -706,10 +712,12 @@ inline bool checkAndUpdateGemmOptions(
         bool hasValidParams = (options.mValidM != -1 && options.mValidM != options.mM)
             || (options.mValidN != -1 && options.mValidN != options.mN)
             || (options.mValidK != -1 && options.mValidK != options.mK);
+        std::cout << "test BlockMajorK start" << std::endl;
         TLLM_CHECK_ERROR(!hasValidParams,
             "BlockMajorK layout does not support validM/validN/validK parameters due to swizzled layout. "
             "Found validM=",
             options.mValidM, " validN=", options.mValidN, " validK=", options.mValidK);
+        std::cout << "test BlockMajorK start2" << std::endl;
     }
 
 #ifdef TLLM_PUBLIC_RELEASE
@@ -718,7 +726,7 @@ inline bool checkAndUpdateGemmOptions(
         TLLM_CHECK_ERROR(false, "E2m1 x E4m3 is not supported for JIT compile. Use cubins instead.");
     }
 #endif // TLLM_PUBLIC_RELEASE
-
+    std::cout << "ckpt 1" << std::endl;
     // Check that the A cast is supported.
     // Currently, we only support {MxFp4, NvFp4} -> Bf16.
     TLLM_CHECK_ERROR((options.mDtypeA == options.mDtypeMmaA)
@@ -762,7 +770,7 @@ inline bool checkAndUpdateGemmOptions(
         TLLM_CHECK_ERROR(options.mDtypeMmaB == tg::Dtype::E4m3 || options.mDtypeMmaB == tg::Dtype::E2m1,
             "For dtypeMmaA = E4m3/E2m1 A, dtypeMmaB must also be E4m3/E2m1.");
     }
-
+    std::cout << "ckpt 2" << std::endl;
     // kind::mxf8f6f4
     if (options.mDtypeMmaA == tg::Dtype::MxE4m3 || options.mDtypeMmaA == tg::Dtype::MxE2m1)
     {
@@ -774,7 +782,7 @@ inline bool checkAndUpdateGemmOptions(
         TLLM_CHECK_ERROR(options.mDtypeMmaA == tg::Dtype::MxE4m3 || options.mDtypeMmaA == tg::Dtype::MxE2m1,
             "For dtypeMmaB = MxE4m3 or MxE2m1, dtypeMmaA must also be MxE4m3 or MxE2m1.");
     }
-
+    std::cout << "ckpt 3" << std::endl;
     // kind::f16
     if (options.mDtypeMmaA == tg::Dtype::Fp16 || options.mDtypeMmaA == tg::Dtype::Bfloat16)
     {
@@ -806,6 +814,7 @@ inline bool checkAndUpdateGemmOptions(
         }
         else
         {
+            std::cout << "failed at mmaKind" << std::endl;
             return false;
         }
     }
@@ -822,6 +831,7 @@ inline bool checkAndUpdateGemmOptions(
         }
         else
         {
+            std::cout << "failed at mmaK" << std::endl;
             return false;
         }
     }
@@ -852,7 +862,7 @@ inline bool checkAndUpdateGemmOptions(
             "Hopper does not use TMEM. The register layout corresponds to 16dp256bit. Got ", options.mEpilogueLdtmDps,
             "dp", options.mEpilogueLdtmBits, "bit.");
     }
-
+    std::cout << "ckpt 4" << std::endl;
     // Constraints for NvFp4 and MxFp8.
     if ((options.mMmaKind == tg::MmaKind::MxFp4NvFp4 || options.mMmaKind == tg::MmaKind::MxFp8Fp6Fp4
             || options.mDtypeC == tg::Dtype::MxE4m3)
@@ -872,6 +882,7 @@ inline bool checkAndUpdateGemmOptions(
             }
             else
             {
+                std::cout << "failed at mmaM" << std::endl;
                 return false;
             }
         }
@@ -916,6 +927,7 @@ inline bool checkAndUpdateGemmOptions(
             }
             else
             {
+                std::cout << "failed at mmaK" << std::endl;
                 return false;
             }
         }
@@ -1022,6 +1034,7 @@ inline bool checkAndUpdateGemmOptions(
         }
         else
         {
+            std::cout << "failed at dtypeC" << std::endl;
             return false;
         }
     }
@@ -1037,6 +1050,7 @@ inline bool checkAndUpdateGemmOptions(
         }
         else
         {
+            std::cout << "failed at epilogueTileM" << std::endl;
             return false;
         }
     }
@@ -1051,6 +1065,7 @@ inline bool checkAndUpdateGemmOptions(
         }
         else
         {
+            std::cout << "failed at epilogueTileN" << std::endl;
             return false;
         }
     }
@@ -1066,6 +1081,7 @@ inline bool checkAndUpdateGemmOptions(
         }
         else
         {
+            std::cout << "failed at epilogueTileM/N" << std::endl;
             return false;
         }
     }
@@ -1080,6 +1096,7 @@ inline bool checkAndUpdateGemmOptions(
         }
         else
         {
+            std::cout << "failed at epilogueTileM" << std::endl;
             return false;
         }
     }
@@ -1200,6 +1217,7 @@ inline bool checkAndUpdateGemmOptions(
             }
             else
             {
+                std::cout << "failed at epilogueTileM/N" << std::endl;
                 return false;
             }
         }
@@ -1223,6 +1241,7 @@ inline bool checkAndUpdateGemmOptions(
         }
         else
         {
+            std::cout << "failed at mmaStages" << std::endl;
             return false;
         }
     }
@@ -1234,6 +1253,7 @@ inline bool checkAndUpdateGemmOptions(
         }
         else
         {
+            std::cout << "failed at mmaStages" << std::endl;
             return false;
         }
     }
@@ -1245,6 +1265,7 @@ inline bool checkAndUpdateGemmOptions(
         }
         else
         {
+            std::cout << "failed at mmaStages" << std::endl;
             return false;
         }
     }
@@ -1341,6 +1362,7 @@ inline bool checkAndUpdateGemmOptions(
             }
             else
             {
+                std::cout << "failed at tileM" << std::endl;
                 return false;
             }
         }
@@ -1355,6 +1377,7 @@ inline bool checkAndUpdateGemmOptions(
             }
             else
             {
+                std::cout << "failed at numSlicesForSliceK" << std::endl;
                 return false;
             }
         }
@@ -1399,6 +1422,7 @@ inline bool checkAndUpdateGemmOptions(
             }
             else
             {
+                std::cout << "failed at unrollLoop2xForMma" << std::endl;
                 return false;
             }
         }
@@ -1419,6 +1443,7 @@ inline bool checkAndUpdateGemmOptions(
         }
         else
         {
+            std::cout << "failed at tileScheduler" << std::endl;
             return false;
         }
     }
@@ -1434,6 +1459,7 @@ inline bool checkAndUpdateGemmOptions(
         }
         else
         {
+            std::cout << "failed at earlyExit" << std::endl;
             return false;
         }
     }
@@ -1521,6 +1547,7 @@ inline bool checkAndUpdateGemmOptions(
             }
             else
             {
+                std::cout << "failed at blockK" << std::endl;
                 return false;
             }
         }
