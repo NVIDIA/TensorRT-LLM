@@ -172,15 +172,10 @@ def _triton_cached_ssm(
 
     # Prefill: concatenate tokens at the front and run combined scan
     if num_prefill > 0:
-        # seq_len_prefill = seq_len[:num_prefill]
-
         hs_prefill = hs_flat[:num_prefill_tokens].unsqueeze(0)  # [1, S_p, H, D]
         B_prefill = B_flat[:num_prefill_tokens].unsqueeze(0)  # [1, S_p, G, N]
         C_prefill = C_flat[:num_prefill_tokens].unsqueeze(0)  # [1, S_p, G, N]
         dt_prefill = dt_flat[:num_prefill_tokens].unsqueeze(0)  # [1, S_p, H]
-
-        # seq_ids = torch.arange(num_prefill, device=device, dtype=torch.int32)
-        # seq_idx_prefill = torch.repeat_interleave(seq_ids, seq_len_prefill).view(1, -1)
 
         initial_states = None
         if torch.any(use_initial_states[:num_prefill]):
