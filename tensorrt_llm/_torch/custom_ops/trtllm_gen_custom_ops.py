@@ -312,14 +312,23 @@ class FP4BlockScaleMoERunner(TunableRunner):
 
         ROUTER_LOGITS_IDX = 0
         CONSTRAINED_RL_DIM = 0
+        TOPK_WEIGHTS_IDX = 11
+        TOPK_IDS_IDX = 12
 
         constraint_routing_logits = ConstraintSpec(ROUTER_LOGITS_IDX,
                                                    CONSTRAINED_RL_DIM,
                                                    _constrain_to_num_tokens)
+        constraint_topk_weights = ConstraintSpec(TOPK_WEIGHTS_IDX,
+                                                 CONSTRAINED_RL_DIM,
+                                                 _constrain_to_num_tokens)
+        constraint_topk_ids = ConstraintSpec(TOPK_IDS_IDX, CONSTRAINED_RL_DIM,
+                                             _constrain_to_num_tokens)
 
         constraint_specs_tuple = (
             constraint_hidden_states_scale,
             constraint_routing_logits,
+            constraint_topk_weights,
+            constraint_topk_ids,
         )
 
         return constraint_specs_tuple
@@ -648,14 +657,23 @@ class FP8BlockScaleMoERunner(TunableRunner):
 
         ROUTER_LOGITS_IDX = 0
         CONSTRAINED_RL_DIM = 0
+        TOPK_WEIGHTS_IDX = 8
+        TOPK_IDS_IDX = 9
 
         constraint_routing_logits = ConstraintSpec(ROUTER_LOGITS_IDX,
                                                    CONSTRAINED_RL_DIM,
                                                    _constrain_to_num_tokens)
+        constraint_topk_weights = ConstraintSpec(TOPK_WEIGHTS_IDX,
+                                                 CONSTRAINED_RL_DIM,
+                                                 _constrain_to_num_tokens)
+        constraint_topk_ids = ConstraintSpec(TOPK_IDS_IDX, CONSTRAINED_RL_DIM,
+                                             _constrain_to_num_tokens)
 
         constraint_specs_tuple = (
             constraint_hidden_states_scale,
             constraint_routing_logits,
+            constraint_topk_weights,
+            constraint_topk_ids,
         )
 
         return constraint_specs_tuple
@@ -943,13 +961,21 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
 
         ROUTER_LOGITS_IDX = 0
         CONSTRAINED_RL_DIM = 0
+        TOPK_WEIGHTS_IDX = 13
+        TOPK_IDS_IDX = 14
 
         constraint_routing_logits = ConstraintSpec(ROUTER_LOGITS_IDX,
                                                    CONSTRAINED_RL_DIM,
                                                    _constrain_routing_logits)
+        constraint_topk_weights = ConstraintSpec(TOPK_WEIGHTS_IDX,
+                                                 CONSTRAINED_RL_DIM,
+                                                 _constrain_routing_logits)
+        constraint_topk_ids = ConstraintSpec(TOPK_IDS_IDX, CONSTRAINED_RL_DIM,
+                                             _constrain_routing_logits)
 
         constraint_specs_tuple = (constraint_hidden_states_scale,
-                                  constraint_routing_logits)
+                                  constraint_routing_logits,
+                                  constraint_topk_weights, constraint_topk_ids)
 
         return constraint_specs_tuple
 
@@ -1204,12 +1230,20 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
 
         ROUTER_LOGITS_IDX = 0
         CONSTRAINED_RL_DIM = 0
+        TOPK_WEIGHTS_IDX = 15
+        TOPK_IDS_IDX = 16
 
         constraint_routing_logits = ConstraintSpec(ROUTER_LOGITS_IDX,
                                                    CONSTRAINED_RL_DIM,
                                                    _constrain_routing_logits)
+        constraint_topk_weights = ConstraintSpec(TOPK_WEIGHTS_IDX,
+                                                 CONSTRAINED_RL_DIM,
+                                                 _constrain_routing_logits)
+        constraint_topk_ids = ConstraintSpec(TOPK_IDS_IDX, CONSTRAINED_RL_DIM,
+                                             _constrain_routing_logits)
 
-        constraint_specs_tuple = (constraint_routing_logits, )
+        constraint_specs_tuple = (constraint_routing_logits,
+                                  constraint_topk_weights, constraint_topk_ids)
 
         return constraint_specs_tuple
 
@@ -1460,12 +1494,20 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
 
         ROUTER_LOGITS_IDX = 0
         CONSTRAINED_DIM = 0
+        TOPK_WEIGHTS_IDX = 12
+        TOPK_IDS_IDX = 13
 
         constraint_routing_logits = ConstraintSpec(ROUTER_LOGITS_IDX,
                                                    CONSTRAINED_DIM,
                                                    _constrain_routing_logits)
+        constraint_topk_weights = ConstraintSpec(TOPK_WEIGHTS_IDX,
+                                                 CONSTRAINED_DIM,
+                                                 _constrain_routing_logits)
+        constraint_topk_ids = ConstraintSpec(TOPK_IDS_IDX, CONSTRAINED_DIM,
+                                             _constrain_routing_logits)
 
-        constraint_specs_tuple = (constraint_routing_logits, )
+        constraint_specs_tuple = (constraint_routing_logits,
+                                  constraint_topk_weights, constraint_topk_ids)
 
         return constraint_specs_tuple
 
@@ -1716,12 +1758,20 @@ class FP8FP4BlockScaleMoERunner(TunableRunner):
 
         ROUTER_LOGITS_IDX = 0
         CONSTRAINED_RL_DIM = 0
+        TOPK_WEIGHTS_IDX = 10
+        TOPK_IDS_IDX = 11
 
         constraint_routing_logits = ConstraintSpec(ROUTER_LOGITS_IDX,
                                                    CONSTRAINED_RL_DIM,
                                                    _constrain_to_num_tokens)
+        constraint_topk_weights = ConstraintSpec(TOPK_WEIGHTS_IDX,
+                                                 CONSTRAINED_RL_DIM,
+                                                 _constrain_to_num_tokens)
+        constraint_topk_ids = ConstraintSpec(TOPK_IDS_IDX, CONSTRAINED_RL_DIM,
+                                             _constrain_to_num_tokens)
 
-        constraint_specs_tuple = (constraint_routing_logits, )
+        constraint_specs_tuple = (constraint_routing_logits,
+                                  constraint_topk_weights, constraint_topk_ids)
 
         return constraint_specs_tuple
 
