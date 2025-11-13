@@ -301,6 +301,36 @@ def test_moe_swiglu_nvfp4_quantize(dtype: str, num_tokens: int, top_k: int, tile
     assert match_ratio > 0.999
 
 
+@pytest.mark.parametrize("tile_size", [128, 256])
+@pytest.mark.parametrize("top_k", [1, 2, 8])
+@pytest.mark.parametrize("num_tokens", [128, 515, 1024])
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_moe_gelu(dtype: str, num_tokens: int, top_k: int, tile_size: int):
+    dtype = getattr(torch, dtype)
+    interm_size = 4096
+    num_experts = 256
+    num_local_experts = num_experts // 32
+    helper = GroupedGemmInputsHelper(num_experts, top_k, num_local_experts, 0, tile_size)
+    max_num_tiles = helper.get_max_num_tiles(num_tokens)
+    max_num_permuted_tokens = helper.get_max_num_permuted_tokens(num_tokens)
+
+    x = torch.randint(
+        -100, 100, (max_num_permuted_tokens, interm_size), dtype=torch.int32, device="cuda"
+    ).to(dtype)
+    tile_idx_to_mn_limit = (
+        torch.arange(1, max_num_tiles + 1, dtype=torch.int32, device="cuda") * tile_size
+    )
+    num_non_exiting_tiles_val = (num_tokens * top_k + tile_size - 1) // tile_size
+    num_non_exiting_tiles = torch.tensor(
+        [num_non_exiting_tiles_val], dtype=torch.int32, device="cuda"
+    )
+    num_permuted_tokens = num_non_exiting_tiles_val * tile_size
+
+    y = torch.ops.trtllm.moe_gelu(x, tile_idx_to_mn_limit, num_non_exiting_tiles, tile_size)
+    y_ref = torch.nn.functional.gelu(x)
+    torch.testing.assert_close(y[:num_permuted_tokens], y_ref[:num_permuted_tokens])
+
+
 @pytest.mark.skipif(get_sm_version() != 100, reason="This test is only supported on SM 100 GPUs")
 @pytest.mark.parametrize("tile_size", [128])
 @pytest.mark.parametrize("ep_size", [1, 8, 32])
