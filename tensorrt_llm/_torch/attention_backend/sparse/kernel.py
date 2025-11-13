@@ -1121,10 +1121,18 @@ def rocket_paged_kt_cache_bmm_kernel(
                        mask=q_head_mask[:, None] & dim_mask[None, :])
 
     dim_pos_values = tl.sum(q_values, axis=0) > 0
-    dim_pos_values = tl.broadcast_to(dim_pos_values[:, None],
-                                     (DIM_BLOCK_SIZE, KT_BLOCK_SIZE))
+    dim_pos_values = tl.broadcast_to(dim_pos_values[None, :],
+                                     (KT_BLOCK_SIZE, DIM_BLOCK_SIZE))
 
-    for kt_block_idx_start in tl.range(0, num_kt_tokens, KT_BLOCK_SIZE):
+    q_values = q_values.to(kt_cache_tensor_ptr.dtype.element_ty)
+
+    for kt_block_idx_start in tl.range(0,
+                                       num_kt_tokens,
+                                       KT_BLOCK_SIZE,
+                                       flatten=True,
+                                       warp_specialize=True):
+        kt_block_idx_start = tl.multiple_of(kt_block_idx_start, KT_BLOCK_SIZE)
+
         kt_token_indices = kt_block_idx_start + tl.arange(0, KT_BLOCK_SIZE)
         kt_token_mask = kt_token_indices < num_kt_tokens
 
@@ -1139,10 +1147,11 @@ def rocket_paged_kt_cache_bmm_kernel(
             (block_indices * tokens_per_block + token_indices_in_block) *
             num_kv_heads * 2 * head_dim + kv_head_idx * 2 * head_dim)
 
-        combined_mask = dim_mask[:, None] & kt_token_mask[
-            None, :]  # Shape: [DIM_BLOCK_SIZE, KT_BLOCK_SIZE]
+        combined_mask = dim_mask[
+            None, :] & kt_token_mask[:,
+                                     None]  # Shape: [KT_BLOCK_SIZE, DIM_BLOCK_SIZE]
 
-        kt_cache_indices_min = cache_bases[None, :] + dim_indices[:, None]
+        kt_cache_indices_min = cache_bases[:, None] + dim_indices[None, :]
         kt_cache_indices_max = kt_cache_indices_min + head_dim
         kt_cache_values_min = tl.load(kt_cache_tensor_ptr +
                                       kt_cache_indices_min,
@@ -1157,7 +1166,7 @@ def rocket_paged_kt_cache_bmm_kernel(
                                    kt_cache_values_min)
 
         results = tl.dot(q_values,
-                         kt_cache_values)  # [Q_BLOCK_SIZE, KT_BLOCK_SIZE]
+                         kt_cache_values.T)  # [Q_BLOCK_SIZE, KT_BLOCK_SIZE]
 
         output_mask = q_head_mask[:, None] & kt_token_mask[None, :]
         output_indices = (kv_head_idx * num_heads_per_kv * total_kt_tokens +

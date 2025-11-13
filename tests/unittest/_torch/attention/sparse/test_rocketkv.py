@@ -27,10 +27,13 @@ def test_model(backend, model_name, attention_backend):
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                     enable_block_reuse=False)
 
+    dtype = torch.float8_e5m2 if attention_backend == "TRTLLM" else torch.bfloat16
+
     sparse_attention_config = RocketSparseAttentionConfig(
         window_size=32,
         kernel_size=63,
         prompt_budget=2048,
+        kt_cache_dtype=dtype,
     )
 
     cuda_graph_config = CudaGraphConfig(
@@ -378,6 +381,7 @@ def test_sparse_attn_predict(batch_size, num_contexts):
         page_size=3,
         topk=43,
         topr=96,
+        kt_cache_dtype=torch.float8_e5m2,
     )
 
     # Create sequence lengths
@@ -459,7 +463,12 @@ def test_sparse_attn_predict(batch_size, num_contexts):
         trtllm_kt_buf = trtllm_kv_cache_manager.get_kt_buffers(layer_idx)
         vanilla_kt_buf = vanilla_kv_cache_manager.get_kt_buffers(layer_idx)
 
-        torch.nn.init.normal_(trtllm_kt_buf)
+        if trtllm_kt_buf.dtype == torch.float8_e5m2:
+            temp_buf = torch.empty_like(trtllm_kt_buf, dtype=torch.float16)
+            torch.nn.init.normal_(temp_buf)
+            trtllm_kt_buf.copy_(temp_buf.to(trtllm_kt_buf.dtype))
+        else:
+            torch.nn.init.normal_(trtllm_kt_buf)
 
         # Map trtllm data to vanilla based on block offsets
         # TRTLLM: (num_blocks, kt_tokens_per_block, num_kv_heads, 2*head_dim)
@@ -501,9 +510,11 @@ def test_sparse_attn_predict(batch_size, num_contexts):
                 # Copy to vanilla buffer
                 vanilla_block = vanilla_blocks[vanilla_block_idx]
                 if vanilla_block >= 0:
-                    vanilla_kt_buf[vanilla_block, kt_token_idx:kt_token_idx +
-                                   kt_tokens_in_this_block].copy_(trtllm_kt_buf[
-                                       trtllm_block, :kt_tokens_in_this_block])
+                    vanilla_kt_buf[
+                        vanilla_block, kt_token_idx:kt_token_idx +
+                        kt_tokens_in_this_block].copy_(trtllm_kt_buf[
+                            trtllm_block, :kt_tokens_in_this_block].to(
+                                vanilla_kt_buf.dtype))
 
                 kt_token_idx += kt_tokens_in_this_block
 
