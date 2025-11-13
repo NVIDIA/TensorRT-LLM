@@ -198,9 +198,16 @@ class SampleStateWithMMResult:
     data: MultimodalResult
 
 
-class RequestGroupKey(Generic[GenericStrategyKeyType], NamedTuple):
+@dataclass(kw_only=True, frozen=True)
+class RequestGroupKey(Generic[GenericStrategyKeyType]):
     strategy: GenericStrategyKeyType
     speculation_needs_probs: bool
+
+    def __iter__(self):
+        return iter((self.strategy, self.speculation_needs_probs))
+
+    def __len__(self):
+        return 2
 
 
 class RequestGroupValue(NamedTuple):
