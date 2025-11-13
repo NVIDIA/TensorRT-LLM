@@ -18,7 +18,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/cuteDslKernels/moeUtils.h"
-#include "tensorrt_llm/kernels/moe_utils.cuh"
+#include "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_kernels.cuh"
 #include "tensorrt_llm/kernels/quantization.cuh"
 #include "tensorrt_llm/kernels/quantization.h"
 
