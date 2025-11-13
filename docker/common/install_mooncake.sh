@@ -31,7 +31,7 @@ apt-get install -y --no-install-recommends \
 
 mkdir -p /third-party-source
 
-YALANTINGLIBS_VERSION="v1.0.0"
+YALANTINGLIBS_VERSION="0.5.5"
 curl -L ${GITHUB_URL}/alibaba/yalantinglibs/archive/refs/tags/${YALANTINGLIBS_VERSION}.tar.gz -o yalantinglibs-${YALANTINGLIBS_VERSION}.tar.gz
 tar -xzf yalantinglibs-${YALANTINGLIBS_VERSION}.tar.gz
 mv yalantinglibs-${YALANTINGLIBS_VERSION} yalantinglibs
