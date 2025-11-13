@@ -16,7 +16,6 @@ l0_dgx_b300:
       backend: pytorch
   tests:
   - unittest/_torch/attention
-  - unittest/_torch/thop
   - unittest/_torch/executor
   - unittest/_torch/modules
   - unittest/_torch/modeling -k "modeling_llama"

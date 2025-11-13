@@ -175,7 +175,7 @@ class DemoLLM(LLM):
         self._executor = DemoGenerationExecutor(
             world_size=self.args.world_size,
             tokenizer=self.tokenizer,
-            ad_config=self.args.get_pytorch_backend_config(),
+            ad_config=self.args,
         )
 
     def __del__(self):

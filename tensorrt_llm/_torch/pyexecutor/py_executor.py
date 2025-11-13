@@ -254,7 +254,6 @@ class PyExecutor:
             max_num_active_requests=self.max_num_active_requests,
             enable_iter_perf_stats=self.enable_iter_perf_stats,
             batch_wait_timeout_ms=self.batch_wait_timeout_ms,
-            is_disaggregated=kv_cache_transceiver is not None,
         )
         self.executor_request_queue.set_exclude_last_generation_logits(
             self.disable_overlap_scheduler, self.dist.pp_size)
@@ -1113,7 +1112,6 @@ class PyExecutor:
                     else:
                         self.ctx_in_transmission_requests[req.py_request_id] = (
                             request, block_id, counter - 1)
-                    break
 
     def _kv_connector_wait_for_save(self):
         if self.kv_connector_manager is not None:
@@ -1696,7 +1694,7 @@ class PyExecutor:
                 )
                 req.py_kv_transfer_timed_out = True
 
-        for req, _ in self.ctx_in_transmission_requests:
+        for req, _, _ in self.ctx_in_transmission_requests.values():
             flag_if_kv_transfer_timed_out(req, "context")
 
         for req in self.active_requests:

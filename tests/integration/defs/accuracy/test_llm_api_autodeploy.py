@@ -173,6 +173,18 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
             "compile_backend": "torch-cudagraph",
             "free_mem_ratio": 0.7,
             "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
+            "transforms": {
+                "detect_sharding": {
+                    "sharding_source": ['factory', 'heuristic'],
+                    "sharding_dims": ['ep', 'bmm'],
+                },
+                # NOTE: some accuracy benchmarks may require fp32 precision for mamba cache
+                # "insert_cached_ssm_attention": {
+                #     "cache_config": {
+                #         "mamba_dtype": "float32",
+                #     },
+                # },
+            }
         }
 
     def get_default_sampling_params(self):

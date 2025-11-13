@@ -16,28 +16,39 @@ SCALING_VECTOR_SIZE = 16  # NVFP4 block size along K
 INT4_BLOCK_SIZE = 128
 
 
-@pytest.mark.parametrize("bias", [torch.rand(32).to("cuda") * 10, None])
+@pytest.mark.parametrize("M", [3, 12])  # NOTE: ensures both kernels are called
+@pytest.mark.parametrize("N", [18, 28, 30, 32])
+@pytest.mark.parametrize("K", [16, 32])
+@pytest.mark.parametrize("bias", [True, False])
 @pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
-def test_fp8_linear(bias):
-    input = torch.rand(3, 16).to("cuda")
-    weight = torch.rand(32, 16).to("cuda")
-    bias = torch.rand(32).to("cuda") * 10
+def test_fp8_linear(M, N, K, bias):
+    if N % 16 != 0 or K % 16 != 0:
+        pytest.skip("https://github.com/NVIDIA/TensorRT-LLM/issues/8811")
+
+    input = torch.rand(M, K, device="cuda")
+    weight = torch.rand(N, K, device="cuda")
+    bias = torch.rand(N).to("cuda") * 10 if bias else None
 
     weight_scale = (torch.max(torch.abs(weight)) / 448).to("cuda")
     weight_fp8 = (weight / weight_scale).to(torch.float8_e4m3fn)
 
-    output_fp8_gemm = torch.ops.auto_deploy.torch_quant_fp8_linear(
+    output_fp8_trtllm = torch.ops.auto_deploy.trtllm_quant_fp8_linear(
         input,
         weight_fp8,
         bias=bias,
         input_scale=torch.tensor(1.0).to("cuda"),
         weight_scale=weight_scale,
     )
-    output_fp32_gemm = torch.ops.aten.linear.default(input, weight, bias=bias)
+    output_fp8_torch = torch.ops.auto_deploy.torch_quant_fp8_linear(
+        input,
+        weight_fp8,
+        bias=bias,
+        input_scale=torch.tensor(1.0).to("cuda"),
+        weight_scale=weight_scale,
+    )
+    assert output_fp8_trtllm.shape == output_fp8_torch.shape
 
-    assert output_fp8_gemm.shape == output_fp32_gemm.shape
-
-    assert torch.allclose(output_fp8_gemm, output_fp32_gemm, rtol=0.01, atol=0.15)
+    torch.testing.assert_close(output_fp8_trtllm, output_fp8_torch, rtol=0.01, atol=0.05)
 
 
 @pytest.mark.skipif(
