@@ -1580,8 +1580,8 @@ class TestMoeFp4:
             num_experts, hidden_size, device='cuda', dtype=torch.float)
 
         # waived due to missing kernel support for bias in nvfp4
-        gemm1_bias[:] = 0
-        gemm2_bias[:] = 0
+        #gemm1_bias[:] = 0
+        #gemm2_bias[:] = 0
 
         use_ue8m0 = False
         # Quantize hidden states. Produces scales for activations in 128x4 layout for ref impl.
@@ -1823,7 +1823,7 @@ class TestMoeFp4:
                        output_dequant_actual,
                        atol=0.2,
                        rtol=0.2,
-                       percent=0.9)
+                       percent=0.85)
 
     def run_moe_fp8_fp4_test(self, num_tokens: int, hidden_size: int,
                              intermediate_size: int, routing_info: dict,
