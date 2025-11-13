@@ -112,6 +112,7 @@ def _cuda_cached_causal_conv1d(
     dilation: int,
     groups: int,
     padding_mode: str,
+    activation: Optional[str],
 ) -> torch.Tensor:
     """Flattened cached causal conv that respects slot-indexed state caches (CUDA backend).
 
@@ -175,7 +176,7 @@ def _cuda_cached_causal_conv1d(
             cache_indices=cache_indices,
             has_initial_state=has_initial_state,
             conv_states=conv_state_cache,
-            activation=None,
+            activation=activation,
             pad_slot_id=PAD_SLOT_ID,
         )  # (dim, total_prefill_tokens)
 
@@ -185,16 +186,16 @@ def _cuda_cached_causal_conv1d(
 
     # DECODE: batch update for single-token sequences
     if num_decode > 0:
-        # Use true start offsets for decode tokens (tail after prefills)
-        decode_idx = seq_start[num_prefill:].to(torch.long)
-        x_decode = inp_flat.index_select(0, decode_idx)  # [num_decode, C_in]
+        x_decode = inp_flat[
+            total_prefill_tokens : total_prefill_tokens + num_decode
+        ]  # [num_decode, C_in]
 
         y_dec = causal_conv1d_update(
             x_decode,  # [batch, dim]
             conv_state_cache,
             w2d,
             bias,
-            activation=None,
+            activation=activation,
             cache_seqlens=None,
             conv_state_indices=slot_idx[num_prefill:].to(torch.int32),
             pad_slot_id=PAD_SLOT_ID,
@@ -202,7 +203,9 @@ def _cuda_cached_causal_conv1d(
 
         if y_dec.dim() == 3:
             y_dec = y_dec.squeeze(-1)
-        y_flat.index_copy_(0, decode_idx, y_dec.to(y_flat.dtype))
+        y_flat[total_prefill_tokens : total_prefill_tokens + num_decode].copy_(
+            y_dec.to(y_flat.dtype)
+        )
 
     # Custom op must not return an alias of any input; return a fresh tensor
     return y.contiguous().clone()
@@ -227,6 +230,7 @@ def _cuda_cached_causal_conv1d_fake(
     dilation: int,
     groups: int,
     padding_mode: str,
+    activation: Optional[str],
 ):
     return torch.empty(
         input.shape[0], input.shape[1], weight.shape[0], device=input.device, dtype=input.dtype
@@ -293,4 +297,5 @@ class CudaBackendCausalConv(AttentionDescriptor):
         stride, padding, dilation, groups, padding_mode = extract_op_args(
             source_attn_node, "stride", "padding", "dilation", "groups", "padding_mode"
         )
-        return [stride, padding, dilation, groups, padding_mode]
+        # None is for activation parameter, which may not exist in the source node (added by fusion later)
+        return [stride, padding, dilation, groups, padding_mode, None]

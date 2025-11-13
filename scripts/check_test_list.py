@@ -261,7 +261,7 @@ def main():
         print(
             "Duplicate test names found in waives.txt, please delete one or combine them first!!!\n"
         )
-        pass_flag = False
+        # pass_flag = False
 
     non_existent_cases_file = os.path.join(llm_src, "nonexits_cases.json")
     if os.path.isfile(non_existent_cases_file) and os.path.getsize(

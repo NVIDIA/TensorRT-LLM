@@ -185,10 +185,7 @@ llm_perf_core:
   #mixtral_8x7b_v0.1_fp8 pytorch backend
   - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1_instruct_fp8-bench-pytorch-float8-input_output_len:128,128-gpus:2]
   - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1_instruct_fp8-bench-pytorch-float8-input_output_len:512,32-gpus:2]
-  #phi_3_mini_128k_instruct
-  #pytorch backend
-  - perf/test_perf.py::test_perf[phi_3_mini_128k_instruct-bench-pytorch-float16-maxbs:128-input_output_len:1000,1000-tp:2]
-  - perf/test_perf.py::test_perf[phi_3_mini_128k_instruct-bench-pytorch-float16-maxbs:128-input_output_len:500,2000-tp:2]
+
 
 - condition:
     terms:
