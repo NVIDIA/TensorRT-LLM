@@ -199,6 +199,9 @@ class RayGPUWorker(BaseWorker):
 
         torch.distributed.all_gather_object(comm_ranks, global_rank)
         torch.distributed.all_gather_object(device_ids, self.device_id)
+
+        self._configure_affinity(self.device_id)
+
         return comm_ranks, device_ids
 
     def enqueue_request(self,

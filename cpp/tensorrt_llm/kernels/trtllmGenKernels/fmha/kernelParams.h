@@ -107,6 +107,8 @@ struct KernelParams
     // The sequence lengths for K/V. Required by pagedKv kernels to avoid unnecessary computation
     // based on (ptrCumSeqLensKv[batchIdx + 1] - ptrCumSeqLensKv[batchIdx]).
     int32_t const* ptrSeqLensKv;
+    // Reserved buffer.
+    int32_t* ptrReservedBuffer;
     // The softmax stats buffer.
     float2* ptrSoftmaxStats;
 
@@ -152,6 +154,8 @@ struct KernelParams
     float mScaleSfKv;
     // The SF scale for O.
     float mScaleSfO;
+    // The reserved parameter.
+    float mReservedParam;
     // The start token index in SF tensor. Used for FP4 SF offset calculation in generation phase
     // kernel when inflight batching is enabled in TRT-LLM.
     int32_t mStartTokenIdx;

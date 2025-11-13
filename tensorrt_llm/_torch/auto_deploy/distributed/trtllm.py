@@ -28,7 +28,7 @@ try:
             p_config = Mapping(world_size=world_size, tp_size=world_size, rank=rank)
             # Use Strategy.AUTO for optimal performance
             _allreduce_cache[cache_key] = AllReduce(
-                mapping=p_config, strategy=AllReduceStrategy.AUTO, dtype=tensor.dtype
+                mapping=p_config, strategy=AllReduceStrategy.NCCL, dtype=tensor.dtype
             )
 
         torch_op = _allreduce_cache[cache_key]

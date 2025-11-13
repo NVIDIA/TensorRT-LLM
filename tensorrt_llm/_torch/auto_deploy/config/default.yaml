@@ -77,8 +77,8 @@ transforms:
   detect_sharding:
     stage: sharding
     simple_shard_only: false
-    use_sharding_from_factory: false
-    support_partial_config: false
+    sharding_source: ['heuristic']
+    support_partial_config: true
     sharding_dims: ['tp', 'ep', 'bmm']
     requires_shape_prop: true
   # TODO: (hg) need to ensure run_shape_prop after sharding.
@@ -109,7 +109,7 @@ transforms:
     enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
   fuse_fp8_linear:
     stage: post_load_fusion
-    backend: torch
+    backend: trtllm
   fuse_nvfp4_linear:
     stage: post_load_fusion
     backend: trtllm
@@ -165,6 +165,8 @@ transforms:
   ############################################################################################
   # COMPILE MODEL
   ############################################################################################
+  fuse_causal_conv_activation:
+    stage: compile
   compile_model:
     stage: compile
     run_per_gm: false

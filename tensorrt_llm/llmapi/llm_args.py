@@ -8,9 +8,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum, EnumMeta
 from pathlib import Path
-from typing import (TYPE_CHECKING, Any, ClassVar, Dict, List, Literal, Optional,
-                    Set, Tuple, Type, TypeAlias, TypeVar, Union, get_args,
-                    get_origin)
+from typing import (Any, ClassVar, Dict, List, Literal, Optional, Set, Tuple,
+                    Type, TypeAlias, TypeVar, Union, get_args, get_origin)
 
 import torch
 import yaml
@@ -24,9 +23,6 @@ from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
 
 from .._utils import mpi_rank
-
-if TYPE_CHECKING:
-    from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 
 # yapf: disable
 # isort: off
@@ -265,6 +261,109 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         return backend == "pytorch"
 
 
+class MoeLoadBalancerConfig(StrictBaseModel):
+    """
+    Pydantic configuration model for the Mixture of Experts (MoE) load balancer.
+
+    This model holds configuration data (`num_slots`, etc.) as well as
+    runtime state (`_ep_rank`, `_ep_size`) which must be set via the
+    `setup()` method before use.
+    """
+
+    num_slots: Optional[int] = None
+    initial_global_assignments: Optional[Dict[int, List[int]]] = Field(
+        default=None,
+        repr=False  # Exclude this large dict from model representation
+    )
+    layer_updates_per_iter: int = 0
+    _ep_rank: Optional[int] = PrivateAttr(default=None)
+    _ep_size: Optional[int] = PrivateAttr(default=None)
+
+    # --- Methods ---
+
+    def setup(self, ep_rank: int, ep_size: int) -> None:
+        """
+        Initializes the runtime state of the configuration.
+        This must be called before accessing properties like `num_local_slots`.
+        """
+        self._ep_rank = ep_rank
+        self._ep_size = ep_size
+
+        # This assertion was in the original and is critical.
+        if self.num_slots is None:
+            raise ValueError("`num_slots` cannot be None when calling setup().")
+
+        if self.num_slots % ep_size != 0:
+            raise ValueError(
+                f"`num_slots` ({self.num_slots}) must be divisible by `ep_size` ({ep_size})."
+            )
+
+    # --- Computed Properties ---
+    # These properties depend on the runtime state set by setup()
+
+    @property
+    def ep_rank(self) -> int:
+        """Public accessor for the private expert parallel rank."""
+        if self._ep_rank is None:
+            raise AttributeError("ep_rank is not set. Call setup() first.")
+        return self._ep_rank
+
+    @property
+    def ep_size(self) -> int:
+        """Public accessor for the private expert parallel size."""
+        if self._ep_size is None:
+            raise AttributeError("ep_size is not set. Call setup() first.")
+        return self._ep_size
+
+    @property
+    def num_local_slots(self) -> int:
+        """Calculates the number of slots local to this rank."""
+        if self.num_slots is None or self._ep_size is None:
+            raise ValueError(
+                "Cannot calculate `num_local_slots`. "
+                "`num_slots` must be set and setup() must be called.")
+        return self.num_slots // self._ep_size
+
+    @property
+    def slot_start(self) -> int:
+        """Calculates the starting global slot index for this rank."""
+        if self._ep_rank is None:
+            raise ValueError(
+                "Cannot calculate `slot_start`. Call setup() first.")
+        return self._ep_rank * self.num_local_slots
+
+    @property
+    def slot_end(self) -> int:
+        """Calculates the ending global slot index (exclusive) for this rank."""
+        return self.slot_start + self.num_local_slots
+
+    def get_layer_initial_global_assignments(
+            self, layer_idx: int) -> Optional[List[int]]:
+        """
+        Retrieves the initial global assignments for a specific layer.
+        """
+        if self.initial_global_assignments is None:
+            return None
+
+        if layer_idx not in self.initial_global_assignments:
+            raise KeyError(
+                f"layer_idx {layer_idx} not found in `initial_global_assignments`."
+            )
+
+        assignments = self.initial_global_assignments[layer_idx]
+
+        if self.num_slots is None:
+            raise ValueError(
+                "`num_slots` is not set, cannot verify assignment length.")
+
+        if len(assignments) != self.num_slots:
+            raise ValueError(
+                f"Assignment length ({len(assignments)}) for layer {layer_idx} "
+                f"does not match `num_slots` ({self.num_slots}).")
+
+        return assignments
+
+
 class MoeConfig(StrictBaseModel):
     """
     Configuration for MoE.
@@ -330,6 +429,7 @@ class _ParallelConfig(StrictBaseModel):
     moe_tp_size: int = -1
     moe_ep_size: int = -1
     cp_config: dict = Field(default_factory=dict)
+    pp_partition: Optional[List[int]] = Field(default=None)
     enable_attention_dp: bool = False
     enable_lm_head_tp_in_adp: bool = False
 
@@ -376,6 +476,7 @@ class _ParallelConfig(StrictBaseModel):
                        gpus_per_node=self.gpus_per_node,
                        tp_size=self.tp_size,
                        pp_size=self.pp_size,
+                       pp_partition=self.pp_partition,
                        cp_size=self.cp_size,
                        cp_config=self.cp_config,
                        enable_attention_dp=self.enable_attention_dp,
@@ -1591,6 +1692,12 @@ class BaseLlmArgs(StrictBaseModel):
         description="Enable LM head TP in attention dp.",
         status="prototype")
 
+    pp_partition: Optional[List[int]] = Field(
+        default=None,
+        description=
+        "Pipeline parallel partition, a list of each rank's layer number.",
+        status="prototype")
+
     cp_config: Optional[dict] = Field(default_factory=dict,
                                       description="Context parallel config.",
                                       status="prototype")
@@ -1847,6 +1954,7 @@ class BaseLlmArgs(StrictBaseModel):
             moe_ep_size=self.moe_expert_parallel_size,
             enable_attention_dp=self.enable_attention_dp,
             enable_lm_head_tp_in_adp=self.enable_lm_head_tp_in_adp,
+            pp_partition=self.pp_partition,
             cp_config=self.cp_config)
         return self
 
@@ -2597,6 +2705,9 @@ class TorchLlmArgs(BaseLlmArgs):
     # PrivateVars
     _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
 
+    _disable_flash_infer_sampling: bool = PrivateAttr(default=True)
+    """Unless this is set to False, FlashInfer.sampling is not used, even if available."""
+
     @property
     def quant_config(self) -> QuantConfig:
         if self._quant_config is None:
@@ -2665,7 +2776,6 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_load_balancer(self) -> 'TorchLlmArgs':
-        from .._torch import MoeLoadBalancerConfig
         if isinstance(self.moe_config.load_balancer, str):
             if not os.path.exists(self.moe_config.load_balancer):
                 raise FileNotFoundError(
@@ -2837,79 +2947,6 @@ class TorchLlmArgs(BaseLlmArgs):
         executor_config = super().get_executor_config(_hf_model_dir, tokenizer)
         executor_config.mm_encoder_only = self.mm_encoder_only
         return executor_config
-
-    # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
-    def get_pytorch_backend_config(self) -> "PyTorchConfig":
-        from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-
-        return PyTorchConfig(
-            extra_resource_managers=self.extra_resource_managers,
-            use_cuda_graph=bool(self.cuda_graph_config is not None),
-            cuda_graph_batch_sizes=self.cuda_graph_config.batch_sizes
-            if self.cuda_graph_config else
-            CudaGraphConfig.model_fields['batch_sizes'].default,
-            cuda_graph_max_batch_size=self.cuda_graph_config.max_batch_size
-            if self.cuda_graph_config else
-            CudaGraphConfig.model_fields['max_batch_size'].default,
-            cuda_graph_padding_enabled=self.cuda_graph_config.enable_padding
-            if self.cuda_graph_config else
-            CudaGraphConfig.model_fields['enable_padding'].default,
-            disable_overlap_scheduler=self.disable_overlap_scheduler,
-            moe_max_num_tokens=self.moe_config.max_num_tokens,
-            moe_load_balancer=self.moe_config.load_balancer,
-            attn_backend=self.attn_backend,
-            moe_backend=self.moe_config.backend,
-            use_low_precision_moe_combine=self.moe_config.
-            use_low_precision_moe_combine,
-            sampler_type=self.sampler_type,
-            kv_cache_dtype=self.kv_cache_config.dtype,
-            mamba_ssm_cache_dtype=self.kv_cache_config.mamba_ssm_cache_dtype,
-            enable_iter_perf_stats=self.enable_iter_perf_stats,
-            enable_iter_req_stats=self.enable_iter_req_stats,
-            print_iter_log=self.print_iter_log,
-            torch_compile_enabled=bool(self.torch_compile_config is not None),
-            torch_compile_fullgraph=self.torch_compile_config.enable_fullgraph
-            if self.torch_compile_config is not None else
-            TorchCompileConfig.model_fields['enable_fullgraph'].default,
-            torch_compile_inductor_enabled=self.torch_compile_config.
-            enable_inductor if self.torch_compile_config is not None else
-            TorchCompileConfig.model_fields['enable_inductor'].default,
-            torch_compile_piecewise_cuda_graph=self.torch_compile_config.
-            enable_piecewise_cuda_graph
-            if self.torch_compile_config is not None else TorchCompileConfig.
-            model_fields['enable_piecewise_cuda_graph'].default,
-            torch_compile_piecewise_cuda_graph_num_tokens=self.
-            torch_compile_config.capture_num_tokens
-            if self.torch_compile_config is not None else
-            TorchCompileConfig.model_fields['capture_num_tokens'].default,
-            torch_compile_enable_userbuffers=self.torch_compile_config.
-            enable_userbuffers if self.torch_compile_config is not None else
-            TorchCompileConfig.model_fields['enable_userbuffers'].default,
-            torch_compile_max_num_streams=self.torch_compile_config.
-            max_num_streams if self.torch_compile_config is not None else
-            TorchCompileConfig.model_fields['max_num_streams'].default,
-            enable_autotuner=self.enable_autotuner,
-            enable_layerwise_nvtx_marker=self.enable_layerwise_nvtx_marker,
-            load_format=self.load_format,
-            enable_min_latency=self.enable_min_latency,
-            moe_disable_finalize_fusion=self.moe_config.disable_finalize_fusion,
-            stream_interval=self.stream_interval,
-            force_dynamic_quantization=self.force_dynamic_quantization,
-            allreduce_strategy=self.allreduce_strategy,
-            attention_dp_enable_balance=bool(
-                self.attention_dp_config is not None
-                and self.attention_dp_config.enable_balance),
-            attention_dp_time_out_iters=self.attention_dp_config.timeout_iters
-            if self.attention_dp_config is not None else
-            AttentionDpConfig.model_fields['timeout_iters'].default,
-            attention_dp_batching_wait_iters=self.attention_dp_config.
-            batching_wait_iters if self.attention_dp_config is not None else
-            AttentionDpConfig.model_fields['batching_wait_iters'].default,
-            batch_wait_timeout_ms=self.batch_wait_timeout_ms,
-            batch_wait_timeout_iters=self.batch_wait_timeout_iters,
-            batch_wait_max_tokens_ratio=self.batch_wait_max_tokens_ratio,
-            enable_sleep=self.enable_sleep,
-        )
 
 
 def update_llm_args_with_extra_dict(
