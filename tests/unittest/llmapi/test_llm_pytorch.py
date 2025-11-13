@@ -948,7 +948,6 @@ def test_llm_rpc():
 
 @skip_ray
 @pytest.mark.asyncio
-@pytest.mark.skip(reason="https://nvbugs/5594753")
 async def test_llm_rpc_streaming():
     # TODO: remove the with-statement when shutdown hang issue is fixed
     with LLM(model=llama_model_path,
