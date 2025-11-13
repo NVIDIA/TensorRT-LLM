@@ -201,7 +201,6 @@ class Sharding(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         local_rank, world_size = shared_config.local_rank, shared_config.world_size
-        # world_size = 2
 
         if world_size < 2:
             ad_logger.info("Skipping sharding for single device")
@@ -215,9 +214,9 @@ class Sharding(BaseTransform):
         sharding_config.world_size = world_size
         sharding_config.allreduce_strategy = self.config.allreduce_strategy
         ad_logger.info(f"Using allreduce strategy: {sharding_config.allreduce_strategy.name}")
-        sharding_config.predefined_config = factory.get_sharding_config() if factory else {}
+        sharding_config.factory_config = factory.get_sharding_config() if factory else {}
         sharding_config.factory_source = (
-            sharding_config.predefined_config.get("source", ShardingConfigSource.UNKNOWN)
+            sharding_config.factory_config.get("source", ShardingConfigSource.UNKNOWN)
             if factory
             else ShardingConfigSource.UNKNOWN
         )
@@ -225,19 +224,28 @@ class Sharding(BaseTransform):
         sharding_config.support_partial_config = self.config.support_partial_config
         sharding_config.sharding_dims = self.config.sharding_dims
         sharding_config.sharding_source = self.config.sharding_source
-
-        sharding_config.validate_config()
+        sharding_config.manual_config = self.config.manual_config
+        sharding_config.validate_config(ShardingSource.MANUAL)
+        sharding_config.validate_config(ShardingSource.FACTORY)
 
         info = TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
         for source in sharding_config.sharding_source:
             if source == ShardingSource.FACTORY:
-                if len(sharding_config.get_predefined_config()) == 0:
+                if len(sharding_config.get_factory_config()) == 0:
                     ad_logger.warning(
                         "No factory config found. Skipping sharding from factory config"
                     )
                     continue
                 ad_logger.info("Applying sharding from factory config")
-                info += detect_sharding_from_factory_config(gm, sharding_config)
+                info += detect_sharding_from_config(gm, sharding_config, ShardingSource.FACTORY)
+            elif source == ShardingSource.MANUAL:
+                if len(sharding_config.get_manual_config()) == 0:
+                    ad_logger.warning(
+                        "No manual config found. Skipping sharding from manual config"
+                    )
+                    continue
+                ad_logger.info("Applying sharding from manual config")
+                info += detect_sharding_from_config(gm, sharding_config, ShardingSource.MANUAL)
 
             elif source == ShardingSource.HEURISTIC:
                 ad_logger.info(
@@ -516,9 +524,10 @@ def _process_column_sharding(
             )
 
 
-def detect_sharding_from_factory_config(
+def detect_sharding_from_config(
     gm: GraphModule,
     sharding_config: ShardingConfig,
+    source: ShardingSource,
 ) -> TransformInfo:
     """
     Create sharding transformations from the predefined config.
@@ -542,10 +551,15 @@ def detect_sharding_from_factory_config(
     #   - "gather"
     # The following constraints are based on
     # https://github.com/huggingface/transformers/blob/d8e05951b8efd4880acca9a3f291e8b65841a86d/src/transformers/models/llama4/configuration_llama4.py#L249
+    if source == ShardingSource.FACTORY:
+        config = sharding_config.get_factory_config()
+    elif source == ShardingSource.MANUAL:
+        config = sharding_config.get_manual_config()
+    else:
+        raise ValueError(f"Unsupported sharding source: {source}")
 
-    factory_config = sharding_config.get_predefined_config()
-    head_dim = factory_config["head_dim"]
-    tp_plan = factory_config["tp_plan"]
+    head_dim = config["head_dim"]
+    tp_plan = config["tp_plan"]
 
     rank, world_size = sharding_config.rank, sharding_config.world_size
 
@@ -635,8 +649,8 @@ def detect_sharding_from_factory_config(
                         col_row_action = config.replace("local_", "")
                         if col_row_action == "colwise":
                             sharding_config.add(
-                                WeightShardingInfo(
-                                    target_node=lin_node.name,
+                                WeightShardingInfo.from_node(
+                                    lin_node,
                                     split_dim=SplitDimension.COLUMN,
                                     rank=rank,
                                     world_size=world_size,
@@ -646,8 +660,8 @@ def detect_sharding_from_factory_config(
                             )
                         elif col_row_action == "rowwise":
                             if sharding_config.add(
-                                WeightShardingInfo(
-                                    target_node=lin_node.name,
+                                WeightShardingInfo.from_node(
+                                    lin_node,
                                     split_dim=SplitDimension.ROW,
                                     rank=rank,
                                     world_size=world_size,
@@ -698,29 +712,6 @@ def detect_sharding_from_factory_config(
     )
 
     num_matches = len(sharding_config.weight_sharding_transforms)
-
-    if sharding_config.support_partial_config:
-        ad_logger.info(
-            f"Partial factory config applied only for TP. "
-            f"Applying heuristics for {sharding_config.sharding_dims}."
-        )
-
-        # run EP sharding across ranks
-        if "ep" in sharding_config.sharding_dims:
-            ep_info = detect_ep_shard(gm, sharding_config)
-        else:
-            ep_info = TransformInfo(
-                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
-            )
-
-        # run BMM sharding across ranks
-        if "bmm" in sharding_config.sharding_dims:
-            dp_bmm_info = detect_dp_bmm_shard(gm, sharding_config)
-        else:
-            dp_bmm_info = TransformInfo(
-                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
-            )
-        num_matches += ep_info.num_matches + dp_bmm_info.num_matches
 
     return TransformInfo(
         skipped=False,
