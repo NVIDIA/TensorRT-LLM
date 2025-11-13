@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/common/attentionOp.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
@@ -813,6 +814,30 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
 
         auto seq_offset = num_contexts;
         auto token_offset = is_gen_only ? 0 : num_ctx_tokens;
+
+        TLLM_LOG_INFO("[ATTN DEBUG] Layer %ld, Generation phase: num_seqs=%d, num_tokens=%d", layer_idx,
+            num_generations, num_gen_tokens);
+
+        auto q_data_ptr = qkv_or_q.data_ptr();
+        int64_t q_size = qkv_or_q.numel();
+        int64_t q_dim = qkv_or_q.size(-1);
+        TLLM_LOG_INFO(
+            "[ATTN DEBUG] Before attention: Q shape [%ld, %ld], total_elements=%ld", num_gen_tokens, q_dim, q_size);
+
+        if (qkv_or_q.scalar_type() == torch::kBFloat16)
+        {
+            auto q_accessor = qkv_or_q.accessor<at::BFloat16, 2>();
+            tensorrt_llm::common::printArrayInfo(
+                reinterpret_cast<__nv_bfloat16 const*>(q_accessor[token_offset].data()),
+                std::min((int64_t) 1024, q_dim), "[ATTN DEBUG] Q input (first gen token)", true);
+        }
+        else if (qkv_or_q.scalar_type() == torch::kFloat16)
+        {
+            auto q_accessor = qkv_or_q.accessor<at::Half, 2>();
+            tensorrt_llm::common::printArrayInfo(reinterpret_cast<half const*>(q_accessor[token_offset].data()),
+                std::min((int64_t) 1024, q_dim), "[ATTN DEBUG] Q input (first gen token)", true);
+        }
+
         runner->run(*op,
             /*is_context=*/false, seq_offset,
             /*num_seqs=*/num_generations, token_offset,
@@ -823,6 +848,22 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe, block_ids_per_seq, mrope_rotary_cos_sin,
             mrope_position_deltas, mla_tensor_params, softmax_stats_tensor, spec_decoding_tensor_params,
             attention_sinks, sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets);
+
+        TLLM_LOG_INFO("[ATTN DEBUG] After attention: output shape [%ld, %ld]", output.size(0), output.size(-1));
+
+        if (output.scalar_type() == torch::kBFloat16)
+        {
+            auto out_accessor = output.accessor<at::BFloat16, 2>();
+            tensorrt_llm::common::printArrayInfo(
+                reinterpret_cast<__nv_bfloat16 const*>(out_accessor[token_offset].data()),
+                std::min((int64_t) 1024, output.size(-1)), "[ATTN DEBUG] Attention output (first gen token)", true);
+        }
+        else if (output.scalar_type() == torch::kFloat16)
+        {
+            auto out_accessor = output.accessor<at::Half, 2>();
+            tensorrt_llm::common::printArrayInfo(reinterpret_cast<half const*>(out_accessor[token_offset].data()),
+                std::min((int64_t) 1024, output.size(-1)), "[ATTN DEBUG] Attention output (first gen token)", true);
+        }
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", layer_idx);

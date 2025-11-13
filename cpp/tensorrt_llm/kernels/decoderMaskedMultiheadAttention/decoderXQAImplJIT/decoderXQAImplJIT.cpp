@@ -519,10 +519,16 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
                 multi_block = computeMultiBlockCount(xqaParams, xqaParams.batch_size, multiprocessor_count);
             }
         }
+        else
+        {
+            TLLM_LOG_INFO("[DecoderXQA-JIT] multi_block_mode=FALSE");
+        }
         uint32_t const nbKVHeads = xqaParams.num_kv_heads;
         auto const gridDim = (isGMMAKernel ? dim3{specDecBlocks, multi_block, nbKVHeads * xqaParams.batch_size}
                                            : dim3{multi_block, nbKVHeads, xqaParams.batch_size});
         dim3 const blockDim(128, 1, isGMMAKernel ? 3 : 2);
+        TLLM_LOG_INFO("[DecoderXQA-JIT] Launching kernel: gridDim=(%d, %d, %d), blockDim=(128, 1, %d)", gridDim.x,
+            gridDim.y, gridDim.z, blockDim.z);
         cubinObj->launch(gridDim, blockDim, stream, kernelParams);
     }
     sync_check_cuda_error(stream);

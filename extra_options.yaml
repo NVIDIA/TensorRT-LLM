@@ -1,0 +1,10 @@
+# cuda_graph_config:
+#   batch_sizes: [256]
+#   # max_batch_size: 256
+#   enable_padding: true
+cuda_graph_config: null
+scheduler_config:
+  capacity_scheduler_policy: STATIC_BATCH
+# moe_config:
+#   disable_finalize_fusion: true
+# max_batch_size: 1

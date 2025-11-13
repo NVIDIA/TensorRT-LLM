@@ -26,7 +26,13 @@ def get_moe_cls(
     quant_config = model_config.quant_config
     if override_quant_config is not None:
         quant_config = override_quant_config
+
+    logger.info(
+        f"[MoE Backend Selection] moe_backend={moe_backend.upper()}, quant_config={quant_config}"
+    )
+
     if moe_backend.upper() == "CUTLASS":
+        logger.info(f"[MoE Backend Selection] Returning CutlassFusedMoE")
         return CutlassFusedMoE
     elif moe_backend.upper() == "VANILLA":
         return VanillaMoE
@@ -42,16 +48,24 @@ def get_moe_cls(
                 or quant_config.quant_mode.has_w4a8_nvfp4_fp8()
                 or quant_config.quant_mode.has_w4a8_mxfp4_fp8()
                 or quant_config.quant_mode.has_w4a8_mxfp4_mxfp8()):
+            logger.info(
+                f"[MoE Backend Selection] Returning TRTLLMGenFusedMoE (quantized)"
+            )
             return TRTLLMGenFusedMoE
         else:
             logger.warning(
                 "TRTLLMGenFusedMoE only supports fp8_block_scales, nvfp4, w4a16_mxfp4, w4a8_mxfp4_fp8 and w4a8_mxfp4_mxfp8. "
                 f"Check out details in quant_config: {quant_config}"
                 "Using CutlassFusedMoE instead.")
+            logger.info(
+                f"[MoE Backend Selection] Returning CutlassFusedMoE (fallback from TRTLLM)"
+            )
             return CutlassFusedMoE
     elif moe_backend.upper() == "WIDEEP":
+        logger.info(f"[MoE Backend Selection] Returning WideEPMoE")
         return WideEPMoE
     elif moe_backend.upper() == "TRITON":
+        logger.info(f"[MoE Backend Selection] Returning TritonFusedMoE")
         return TritonFusedMoE
     else:
         raise ValueError(f"Unsupported moe backend: {moe_backend}")
@@ -76,6 +90,8 @@ def create_moe(
     swiglu_limit: Optional[torch.Tensor] = None,
 ) -> MoE:
     moe_cls = get_moe_cls(model_config, override_quant_config)
+
+    logger.info(f"[MoE Creation] Creating MoE with class: {moe_cls.__name__}")
 
     moe_load_balancer = get_moe_load_balancer()
     if moe_load_balancer is not None:

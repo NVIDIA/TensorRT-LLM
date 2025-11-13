@@ -16,6 +16,7 @@
  */
 #include "attentionOp.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
@@ -197,7 +198,12 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     xqaParams.qkv_bias_enabled = mQKVBiasEnabled;
     xqaParams.cross_attention = mCrossAttention;
     xqaParams.max_distance = mMaxDistance;
-    xqaParams.multi_block_mode = common::getEnvForceDeterministicAttention() ? false : mMultiBlockMode;
+    bool forceDeterministic = common::getEnvForceDeterministicAttention();
+    xqaParams.multi_block_mode = forceDeterministic ? false : mMultiBlockMode;
+    TLLM_LOG_INFO(
+        "[XQA PARAMS DEBUG] getEnvForceDeterministicAttention()=%d, mMultiBlockMode=%d, final "
+        "xqaParams.multi_block_mode=%d",
+        forceDeterministic, mMultiBlockMode, xqaParams.multi_block_mode);
     // Medusa mode will have multiple query tokens.
     xqaParams.multi_query_tokens = mIsSpecDecodingEnabled && mUseSpecDecoding;
     xqaParams.is_spec_dec_tree = mIsSpecDecTree;
@@ -2272,14 +2278,24 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
         this->template convertMMHAParamsToXQAParams<T, KVCacheBuffer>(xqaParams, params, /*forConfigurePlugin=*/false);
         if (mEnableXQA && mXqaDispatcher->shouldUse(xqaParams))
         {
-            TLLM_LOG_DEBUG("XQA kernels are selected in the generation phase.");
+            TLLM_LOG_INFO("[ATTN KERNEL DEBUG] XQA kernels selected for generation (batch_beam=%d)", batch_beam);
             xqaParams.stream = stream;
             if (mCpSize > 1)
             {
                 xqaParams.output = mhaOutput;
                 xqaParams.qkv = attention_input;
             }
+
+            sync_check_cuda_error(stream);
+            int64_t q_size = std::min((int64_t) 1024, (int64_t) (mNumHeads * mHeadSize));
+            tensorrt_llm::common::printArrayInfo(
+                attention_input, q_size, "[ATTN KERNEL DEBUG] Q before XQA (first token)", true);
+
             mXqaDispatcher->run(xqaParams, kv_cache_buffer, kv_scale_cache_buffer);
+
+            sync_check_cuda_error(stream);
+            tensorrt_llm::common::printArrayInfo(reinterpret_cast<T const*>(params.context_buf), q_size,
+                "[ATTN KERNEL DEBUG] Output after XQA (first token)", true);
             if (mCpSize > 1 && mAttnTpSize > 1 && mAttnCpSize == 1)
             {
                 this->template ulyssesGenerationPostprocess<T>(
@@ -2302,7 +2318,8 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
         }
         else
         {
-            TLLM_LOG_DEBUG("XQA kernels are not selected in the generation phase.");
+            TLLM_LOG_INFO(
+                "[ATTN KERNEL DEBUG] XQA kernels NOT selected, falling back to MMHA (batch_beam=%d)", batch_beam);
         }
     }
 
@@ -2433,6 +2450,14 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
     dispatch_params.mrope_position_deltas = params.mrope_position_deltas;
 
     using DataType = typename SATypeConverter<T>::Type;
+
+    sync_check_cuda_error(stream);
+    int64_t q_size = std::min((int64_t) 1024, (int64_t) (mNumHeads * mHeadSize));
+    TLLM_LOG_INFO("[ATTN KERNEL DEBUG] Before MMHA dispatch: batch_beam=%d, mNumHeads=%d, mHeadSize=%d", batch_beam,
+        mNumHeads, mHeadSize);
+    tensorrt_llm::common::printArrayInfo(
+        attention_input, q_size, "[ATTN KERNEL DEBUG] Q before MMHA (first token)", true);
+
     if (!isCrossAttention())
     {
         // self attn
@@ -2446,6 +2471,9 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
         fusedQKV_masked_attention_dispatch(mmhca_params, dispatch_params, stream);
     }
     sync_check_cuda_error(stream);
+
+    tensorrt_llm::common::printArrayInfo(reinterpret_cast<T const*>(params.context_buf), q_size,
+        "[ATTN KERNEL DEBUG] Output after MMHA (first token)", true);
 
     if (mCpSize > 1 && mAttnTpSize > 1 && mAttnCpSize == 1)
     {

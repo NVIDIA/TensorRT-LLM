@@ -589,6 +589,61 @@ class AutoTuner:
                     f"[AutoTunner] Using the fallback tactic, due to cache miss on input shapes={input_shapes}",
                     key=custom_op)
 
+            if os.getenv("FORCE_MOE_FIRST_TACTIC", "0") == "1":
+                num_tactics = "unknown"
+                first_valid_tactic = 0  # fallback
+                tactics_list = ""
+
+                try:
+                    dummy_profile = OptimizationProfile(
+                        [[StaticDim(dim) for dim in shape]
+                         for shape in input_shapes])
+
+                    valid_tactics = best_runner.get_valid_tactics(
+                        inputs, dummy_profile, **kwargs)
+                    num_tactics = len(valid_tactics)
+
+                    if len(valid_tactics) > 0:
+                        first_valid_tactic = valid_tactics[0]
+                        tactics_list = str(valid_tactics)
+                    else:
+                        tactics_list = "(empty valid tactics list)"
+
+                except Exception as e:
+                    error_msg = f"{type(e).__name__}: {str(e)[:100]}"
+                    try:
+                        related_entries = self.profiling_cache.get_specific_custom_op(
+                            custom_op)
+                        num_tactics = f"{len(related_entries)} cached entries"
+                        tactics_list = f"(get_valid_tactics failed: {error_msg})"
+                    except Exception as e2:
+                        tactics_list = f"(get_valid_tactics failed: {error_msg}; cache lookup failed: {type(e2).__name__})"
+
+                forced_runner = best_runner if best_runner_id == 0 else runners[
+                    0]
+                forced_runner_id = best_runner_id if best_runner_id == 0 else 0
+
+                logger.info(
+                    f"[AutoTuner] FORCE_MOE_FIRST_TACTIC enabled for custom_op='{custom_op}': "
+                    f"input_shapes={input_shapes}, "
+                    f"cached_runner={best_runner.__class__.__name__} (runner_id={best_runner_id}), "
+                    f"cached_tactic={best_tactic}, "
+                    f"valid_tactics (count={num_tactics}): {tactics_list}, "
+                    f"forcing_runner={forced_runner.__class__.__name__} (runner_id={forced_runner_id}), "
+                    f"forcing_tactic={first_valid_tactic}")
+                return (forced_runner, first_valid_tactic)
+            elif os.getenv("FORCE_FALLBACK_TACTIC", "0") == "1":
+                fallback_runner = runners[0]
+                fallback_tactic = -1
+                logger.info(
+                    f"[AutoTuner] FORCE_FALLBACK_TACTIC enabled for custom_op='{custom_op}': "
+                    f"input_shapes={input_shapes}, "
+                    f"cached_runner={best_runner.__class__.__name__} (runner_id={best_runner_id}), "
+                    f"cached_tactic={best_tactic}, "
+                    f"forcing_runner={fallback_runner.__class__.__name__} (runner_id=0), "
+                    f"forcing_tactic={fallback_tactic}")
+                return (fallback_runner, fallback_tactic)
+
             return (best_runner, best_tactic)
 
         assert len(runners) > 0, "At least one runner is required"

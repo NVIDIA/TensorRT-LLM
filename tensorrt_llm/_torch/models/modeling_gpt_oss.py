@@ -127,6 +127,7 @@ class AttentionBlock(Attention):
 
 
 class MLPBlock(torch.nn.Module):
+    _forward_pass_counter = 0
 
     def __init__(
         self,
@@ -136,6 +137,8 @@ class MLPBlock(torch.nn.Module):
         use_custom_cublas_mm: bool = False,
     ):
         super().__init__()
+
+        self.layer_idx = layer_idx
 
         self.config = config  # Store config as instance variable
         pretrained_config = config.pretrained_config
@@ -160,6 +163,12 @@ class MLPBlock(torch.nn.Module):
             top_k=pretrained_config.num_experts_per_tok,
             output_dtype=torch.bfloat16
             if config.moe_backend.upper() == "TRTLLM" else torch.float32)
+
+        print(f"[MoE CONFIG] Layer {layer_idx}: "
+              f"top_k={pretrained_config.num_experts_per_tok}, "
+              f"num_experts={pretrained_config.num_local_experts}, "
+              f"moe_backend={config.moe_backend.upper()}, "
+              f"routing_method={self.routing_method.__class__.__name__}")
 
         self.swiglu_alpha = torch.tensor(
             [1.702] * (self.num_experts // config.mapping.moe_ep_size),
@@ -234,6 +243,41 @@ class MLPBlock(torch.nn.Module):
             g = torch.ops.trtllm.tinygemm2(x, weight, bias)
         else:
             g = self.gate(x)
+
+        if os.environ.get(
+                'DEBUG_MOE_ROUTING',
+                '0') == '1' and not torch.cuda.is_current_stream_capturing():
+            if self.layer_idx == 0:
+                MLPBlock._forward_pass_counter += 1
+
+            batch_size = g.shape[0]
+            pass_num = MLPBlock._forward_pass_counter
+
+            if batch_size > 100:
+                phase = "CONTEXT"
+            elif batch_size > 1:
+                phase = f"DECODE-BATCH({batch_size})"
+            else:
+                phase = "DECODE-SINGLE"
+
+            print(
+                f"[PASS {pass_num:04d}] [LAYER {self.layer_idx}] [{phase}] Gate output shape: {g.shape}"
+            )
+            print(
+                f"[PASS {pass_num:04d}] [LAYER {self.layer_idx}] [{phase}] Gate output (first token, all experts): {g[0, :].cpu().float().numpy()}"
+            )
+
+            import torch.nn.functional as F
+            probs = F.softmax(g[0, :].float(), dim=0)
+            top_k_values, top_k_indices = torch.topk(probs,
+                                                     k=4)  # top_k=4 for GPT-OSS
+            print(
+                f"[PASS {pass_num:04d}] [LAYER {self.layer_idx}] [{phase}] Selected experts (first token): {top_k_indices.cpu().numpy()}"
+            )
+            print(
+                f"[PASS {pass_num:04d}] [LAYER {self.layer_idx}] [{phase}] Expert probabilities (first token): {top_k_values.cpu().numpy()}"
+            )
+
         return g
 
     def forward_normal(
@@ -249,6 +293,26 @@ class MLPBlock(torch.nn.Module):
         t = x
 
         g = self.compute_gate_output(t)
+
+        if os.environ.get(
+                'DEBUG_MOE_ROUTING',
+                '0') == '1' and not torch.cuda.is_current_stream_capturing():
+            batch_size = t.shape[0]
+            pass_num = MLPBlock._forward_pass_counter
+            phase = "CONTEXT" if batch_size > 100 else (
+                f"DECODE-BATCH({batch_size})"
+                if batch_size > 1 else "DECODE-SINGLE")
+            print(
+                f"[PASS {pass_num:04d}] [LAYER {self.layer_idx}] [{phase}] Hidden state (first token, first 32 dims): {t[0, :32].cpu().float().numpy()}"
+            )
+
+            t_cpu = t[0, :].cpu().float().numpy()
+            print(
+                f"[PASS {pass_num:04d}] [LAYER {self.layer_idx}] [{phase}] Hidden state (first token) FULL STATS: "
+                f"mean={t_cpu.mean():.6f}, std={t_cpu.std():.6f}, "
+                f"max={t_cpu.max():.6f}, min={t_cpu.min():.6f}, "
+                f"nZeros={(t_cpu == 0).sum()}")
+
         # Use ideal load balanced logits if enabled, otherwise use gate output
         if os.environ.get('ENABLE_PERFECT_ROUTER', '0') == '1':
             # WARNING: This discards the learned gate output and uses ideal logits for perfect load balancing
@@ -258,7 +322,35 @@ class MLPBlock(torch.nn.Module):
                 num_tokens=num_tokens, num_experts=num_experts, device=x.device)
 
         # When attention_dp is not enabled, don't pass those parameters
+        if os.environ.get(
+                'DEBUG_MOE_ROUTING',
+                '0') == '1' and not torch.cuda.is_current_stream_capturing():
+            print(
+                f"[LAYER {self.layer_idx}] BEFORE ROUTING - router_logits shape: {g.shape}"
+            )
+
         expert_output = self.experts(x=t, router_logits=g)
+
+        if os.environ.get(
+                'DEBUG_MOE_ROUTING',
+                '0') == '1' and not torch.cuda.is_current_stream_capturing():
+            batch_size = expert_output.shape[0]
+            pass_num = MLPBlock._forward_pass_counter
+            phase = "CONTEXT" if batch_size > 100 else (
+                f"DECODE-BATCH({batch_size})"
+                if batch_size > 1 else "DECODE-SINGLE")
+
+            print(
+                f"[PASS {pass_num:04d}] [LAYER {self.layer_idx}] [{phase}] AFTER ROUTING - expert_output shape: {expert_output.shape}"
+            )
+
+            output_cpu = expert_output[0, :].cpu().float().numpy()
+            output_norm = torch.norm(expert_output[0, :]).item()
+            print(
+                f"[PASS {pass_num:04d}] [LAYER {self.layer_idx}] [{phase}] Expert output FULL STATS (first token): "
+                f"norm={output_norm:.6f}, mean={output_cpu.mean():.6f}, std={output_cpu.std():.6f}, "
+                f"max={output_cpu.max():.6f}, min={output_cpu.min():.6f}, "
+                f"nZeros={(output_cpu == 0).sum()}")
 
         expert_output = expert_output.view(orig_shape)
         return expert_output, residual
@@ -295,10 +387,24 @@ class MLPBlock(torch.nn.Module):
 
         # Let CutlassFusedMoE and TRTLLMGenFusedMoE handle allgather internally
         # Pass the normalized tensor (t) as input to experts, not x
+        if os.environ.get(
+                'DEBUG_MOE_ROUTING',
+                '0') == '1' and not torch.cuda.is_current_stream_capturing():
+            print(
+                f"[LAYER {self.layer_idx}] BEFORE ROUTING (attn_dp) - router_logits shape: {g.shape}"
+            )
+
         expert_output = self.experts(x=t,
                                      router_logits=g,
                                      all_rank_num_tokens=all_rank_num_tokens,
                                      use_dp_padding=False)
+
+        if os.environ.get(
+                'DEBUG_MOE_ROUTING',
+                '0') == '1' and not torch.cuda.is_current_stream_capturing():
+            print(
+                f"[LAYER {self.layer_idx}] AFTER ROUTING (attn_dp) - expert_output shape: {expert_output.shape}"
+            )
 
         expert_output = expert_output.view(orig_shape)
         return expert_output, residual
@@ -373,20 +479,92 @@ class TransformerBlock(DecoderLayer):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
 
+        if os.environ.get(
+                'DEBUG_MOE_ROUTING',
+                '0') == '1' and not torch.cuda.is_current_stream_capturing():
+            batch_size = hidden_states.shape[0]
+            pass_num = MLPBlock._forward_pass_counter
+            phase = "CONTEXT" if batch_size > 100 else (
+                f"DECODE-BATCH({batch_size})"
+                if batch_size > 1 else "DECODE-SINGLE")
+            hs_cpu = hidden_states[0, :].cpu().float().numpy()
+            print(
+                f"[PASS {pass_num:04d}] [LAYER {self.layer_idx}] [{phase}] After input_layernorm FULL STATS: "
+                f"mean={hs_cpu.mean():.6f}, std={hs_cpu.std():.6f}, max={hs_cpu.max():.6f}, min={hs_cpu.min():.6f}"
+            )
+
         x, residual = self.attn(position_ids,
                                 hidden_states,
                                 attn_metadata,
                                 residual=residual,
                                 **kwargs)
+
+        if os.environ.get(
+                'DEBUG_MOE_ROUTING',
+                '0') == '1' and not torch.cuda.is_current_stream_capturing():
+            batch_size = x.shape[0]
+            pass_num = MLPBlock._forward_pass_counter
+            phase = "CONTEXT" if batch_size > 100 else (
+                f"DECODE-BATCH({batch_size})"
+                if batch_size > 1 else "DECODE-SINGLE")
+            x_cpu = x[0, :].cpu().float().numpy()
+            print(
+                f"[PASS {pass_num:04d}] [LAYER {self.layer_idx}] [{phase}] After attention FULL STATS: "
+                f"mean={x_cpu.mean():.6f}, std={x_cpu.std():.6f}, max={x_cpu.max():.6f}, min={x_cpu.min():.6f}"
+            )
+
         x, residual = self.post_attention_layernorm(x, residual)
 
+        if os.environ.get(
+                'DEBUG_MOE_ROUTING',
+                '0') == '1' and not torch.cuda.is_current_stream_capturing():
+            batch_size = x.shape[0]
+            pass_num = MLPBlock._forward_pass_counter
+            phase = "CONTEXT" if batch_size > 100 else (
+                f"DECODE-BATCH({batch_size})"
+                if batch_size > 1 else "DECODE-SINGLE")
+            x_cpu = x[0, :].cpu().float().numpy()
+            print(
+                f"[PASS {pass_num:04d}] [LAYER {self.layer_idx}] [{phase}] After post_attention_layernorm FULL STATS: "
+                f"mean={x_cpu.mean():.6f}, std={x_cpu.std():.6f}, max={x_cpu.max():.6f}, min={x_cpu.min():.6f}"
+            )
+
         x, residual = self.mlp(x, attn_metadata, residual)
+
+        if os.environ.get(
+                'DEBUG_MOE_ROUTING',
+                '0') == '1' and not torch.cuda.is_current_stream_capturing():
+            batch_size = x.shape[0]
+            pass_num = MLPBlock._forward_pass_counter
+            phase = "CONTEXT" if batch_size > 100 else (
+                f"DECODE-BATCH({batch_size})"
+                if batch_size > 1 else "DECODE-SINGLE")
+            x_cpu = x[0, :].cpu().float().numpy()
+            print(
+                f"[PASS {pass_num:04d}] [LAYER {self.layer_idx}] [{phase}] After MLP FULL STATS: "
+                f"mean={x_cpu.mean():.6f}, std={x_cpu.std():.6f}, max={x_cpu.max():.6f}, min={x_cpu.min():.6f}"
+            )
 
         if spec_metadata is not None:
             spec_metadata.maybe_capture_hidden_states(self.layer_idx, x,
                                                       residual)
 
         x, residual = self.next_layer_layernorm(x, residual)
+
+        if os.environ.get(
+                'DEBUG_MOE_ROUTING',
+                '0') == '1' and not torch.cuda.is_current_stream_capturing():
+            batch_size = x.shape[0]
+            pass_num = MLPBlock._forward_pass_counter
+            phase = "CONTEXT" if batch_size > 100 else (
+                f"DECODE-BATCH({batch_size})"
+                if batch_size > 1 else "DECODE-SINGLE")
+            x_cpu = x[0, :].cpu().float().numpy()
+            print(
+                f"[PASS {pass_num:04d}] [LAYER {self.layer_idx}] [{phase}] After next_layer_layernorm FULL STATS (->Layer {self.layer_idx+1}): "
+                f"mean={x_cpu.mean():.6f}, std={x_cpu.std():.6f}, max={x_cpu.max():.6f}, min={x_cpu.min():.6f}"
+            )
+
         return x, residual
 
     def forward_tp(

@@ -330,6 +330,12 @@ public:
             {
                 multi_block = computeMultiBlockCount(xqaParams, xqaParams.batch_size, multiprocessor_count);
             }
+            else
+            {
+                TLLM_LOG_INFO("[DecoderXQA-Precompiled] multi_block_mode=FALSE");
+            }
+            TLLM_LOG_INFO("[DecoderXQA-Precompiled] Launching kernel: gridDim=(%d, %d, %d), blockDim=(128, 1, %d)",
+                multi_block, xqaParams.num_kv_heads, xqaParams.batch_size, isGmmaKernel ? 3 : 2);
             TLLM_CU_CHECK(mDriver->cuLaunchKernel(func, multi_block, xqaParams.num_kv_heads, xqaParams.batch_size, 128,
                 1, isGmmaKernel ? 3 : 2, shared_mem_bytes, stream, kernelParams, nullptr));
         }

@@ -120,7 +120,14 @@ template <typename KVCacheBuffer>
 void DecoderXQARunner::run(
     XQAParams const& xqa_params, KVCacheBuffer const& kv_cache_buffer, cudaStream_t const& stream)
 {
-    return getImplFromXQAParams(xqa_params, false)->run(xqa_params, kv_cache_buffer, stream);
+    TLLM_LOG_INFO("[DecoderXQA DEBUG] ========== DecoderXQARunner::run START ==========");
+    TLLM_LOG_INFO("[DecoderXQA DEBUG] batch_size=%d, num_q_heads=%d, num_kv_heads=%d, head_size=%d",
+        xqa_params.batch_size, xqa_params.num_q_heads, xqa_params.num_kv_heads, xqa_params.head_size);
+
+    auto* impl = getImplFromXQAParams(xqa_params, false);
+    impl->run(xqa_params, kv_cache_buffer, stream);
+
+    TLLM_LOG_INFO("[DecoderXQA DEBUG] DecoderXQARunner::run COMPLETED");
 }
 
 std::shared_ptr<DecoderXQARunnerResource> DecoderXQARunner::getResourceGlobal()

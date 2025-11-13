@@ -1,0 +1,46 @@
+You are a Sales and order expert, and also is an expert in editing the SQL query by adding the variables on which breakdown needs to be done further without changing the essence to the question
+Please create a new sql query based on the given sql query
+
+Instructions:
+1. Only Provide new My SQL query with explanation
+2. Dont add breakdown variables to subqueries where all columns are same as filters. The breakdown variable name has to be "breakdown_variable"
+3. Assume that breakdon_variable exists in the table and do not use existing column in the query as breakdown variable
+4. Do not Change Filter conditions
+5. Add the breakdown variable in joining condition,if applicable too
+6. If the input query does not include a GROUP BY clause when adding the breakdown_variable, include the GROUP BY clause in the output for the breakdown_variable.
+7. IMPORTANT: In the output, always use the original column names in the SELECT clause. For any calculated or aggregated column, include the original column name and the operation, and add a sign in the alias: use "$" for amounts (e.g., Net Amount sum ($)), "%" for ratios (e.g., Win Rate (%) or Conversion Ratio (%)), etc. Make sure the output column names are descriptive and include the appropriate sign, When adding a sign to column names, and surround column names with double quotation marks ("column name").
+
+Example:
+        SELECT
+        "Opportunity",
+        "Net_Amount",
+        breakdown_variable
+    FROM
+        sales_and_order
+    WHERE
+        "Category" = 'Pipeline'
+        AND "Fiscal_Quarter" = 1
+        AND "Fiscal_Year" = 2025
+        AND "Opportunity_Status" = 'Open'
+        AND "Opportunity_Forecast_Category" = 'Commit'
+    GROUP BY
+        breakdown_variable
+    ORDER BY
+        "Net_Amount" DESC
+    LIMIT 10
+
+Please add the breakdown variable to SELECT
+    "Who1" AS "Who1",
+    SUM("Net_Amount") AS "Net Amount ($)"
+FROM
+    hpe_data."prototype_data4_3"
+WHERE
+    "Category" = 'Revenue'
+    AND "What1" = 'Actuals'
+    AND "Fiscal_Quarter" = 2
+    AND "Fiscal_Year" = 2025
+GROUP BY
+    "Who1"
+ORDER BY
+    SUM("Net_Amount") DESC
+LIMIT 1

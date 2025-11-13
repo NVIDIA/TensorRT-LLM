@@ -315,9 +315,17 @@ template <typename T, typename KVCacheBuffer>
 void XqaDispatcher::runImpl(
     XQAParams params, KVCacheBuffer const& kv_cache_buffer, KVCacheBuffer const& kv_cache_block_scales_buffer)
 {
+    TLLM_LOG_INFO("[XQA DEBUG] ========== XQA Kernel Invocation ==========");
+    TLLM_LOG_INFO("[XQA DEBUG] batch_size=%d, beam_width=%d, total_num_input_tokens=%d", params.batch_size,
+        params.beam_width, params.total_num_input_tokens);
+    if (!params.multi_block_mode)
+    {
+        TLLM_LOG_INFO("[XQA DEBUG] params.multi_block_mode = False");
+    }
+
     if (mUseTllmGen)
     {
-        TLLM_LOG_DEBUG("Running TRTLLM-GEN generation kernel.");
+        TLLM_LOG_INFO("[XQA DEBUG] mUseTllmGen path");
         TLLM_CHECK_WITH_INFO(mTllmGenFMHARunner.get(), "mTllmGenFMHARunner not initialized.");
 
         int num_q_heads = params.num_q_heads;
@@ -491,8 +499,14 @@ void XqaDispatcher::runImpl(
     }
     else
     {
+        TLLM_LOG_INFO("[XQA DEBUG] (non-TllmGen)");
+        TLLM_LOG_INFO(
+            "[XQA DEBUG] Passing params.multi_block_mode=%d to DecoderXQA dispatcher", params.multi_block_mode);
         mDecoderXqaRunner->template dispatch<KVCacheBuffer>(params, kv_cache_buffer, params.stream);
+        TLLM_LOG_INFO("[XQA DEBUG] DecoderXQA dispatch completed");
     }
+
+    TLLM_LOG_INFO("[XQA DEBUG] XQA runImpl completed");
 }
 
 void XqaDispatcher::run(
