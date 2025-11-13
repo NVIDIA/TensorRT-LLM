@@ -123,10 +123,7 @@ llm_perf_nim:
   #trt backend
   - perf/test_perf.py::test_perf[mistral_7b_v0.1-bench-float16-maxbs:256-input_output_len:1000,1000-quant:fp8]
   - perf/test_perf.py::test_perf[mistral_7b_v0.1-bench-float16-maxbs:256-input_output_len:500,2000-quant:fp8]
-  #phi_3_mini_4k_instruct
-  #trt backend
-  - perf/test_perf.py::test_perf[phi_3_mini_4k_instruct-bench-float16-maxbs:128-input_output_len:1000,1000-quant:fp8]
-  - perf/test_perf.py::test_perf[phi_3_mini_4k_instruct-bench-float16-maxbs:64-input_output_len:500,2000-quant:fp8]
+
 
 - condition:
     terms:
@@ -214,10 +211,7 @@ llm_perf_nim:
   # torch backend
   - perf/test_perf.py::test_perf[mistral_7b_v0.1-bench-pytorch-float16-input_output_len:128,128]
   - perf/test_perf.py::test_perf[llama_v3.2_1b-bench-pytorch-bfloat16-input_output_len:128,128-gpus:2]
-  #phi_3_mini_128k_instruct
-  #trt backend
-  - perf/test_perf.py::test_perf[phi_3_mini_128k_instruct-bench-float16-maxbs:128-input_output_len:1000,1000-quant:fp8-tp:2]
-  - perf/test_perf.py::test_perf[phi_3_mini_128k_instruct-bench-float16-maxbs:128-input_output_len:500,2000-quant:fp8-tp:2]
+
 
 - condition:
     terms:
