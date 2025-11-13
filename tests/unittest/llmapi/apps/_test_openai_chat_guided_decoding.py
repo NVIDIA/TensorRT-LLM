@@ -366,6 +366,7 @@ You are a helpful assistant."""
     )
 
     message = chat_completion.choices[0].message
+    print(f"Message: {message}")
     assert message.content is not None
     assert message.role == "assistant"
 
