@@ -112,7 +112,7 @@ class CudaGraphConfig(StrictBaseModel):
         default=0, description="Maximum batch size for CUDA graphs.")
 
     enable_padding: bool = Field(
-        default=False,
+        default=True,
         description=
         "If true, batches are rounded up to the nearest cuda_graph_batch_size. This is usually a net win for performance."
     )
