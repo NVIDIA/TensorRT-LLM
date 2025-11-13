@@ -14,7 +14,6 @@ from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_starcoder2 import Starcoder2ForCausalLM
-from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -114,7 +113,7 @@ class TestStarcoder2(unittest.TestCase):
         elif dtype == torch.bfloat16:
             kv_cache_dtype = tensorrt_llm.bindings.DataType.BF16
         else:
-            raise ValueError("Invalid dtype")
+            raise ValueError(f"Invalid dtype: {dtype}")
 
         mapping = Mapping(world_size=1, tp_size=1, rank=0)
         kv_cache_config = KvCacheConfig(
@@ -160,7 +159,7 @@ class TestStarcoder2(unittest.TestCase):
 
         input_ids = torch.tensor(
             [100, 200, 300, 400, 500, 600, 700, 800],
-            dtype=torch.int,
+            dtype=torch.long,
             device=device,
         )
 
@@ -188,7 +187,7 @@ class TestStarcoder2(unittest.TestCase):
 
         metadata_cls = get_attention_backend(model_config.attn_backend).Metadata
         attn_metadata = metadata_cls(
-            seq_lens=torch.tensor(sequence_lengths, dtype=torch.int),
+            seq_lens=torch.tensor(sequence_lengths, dtype=torch.long),
             num_contexts=len(context_sequence_lengths),
             kv_cache_params=KVCacheParams(
                 use_cache=True,
@@ -302,7 +301,7 @@ class TestStarcoder2(unittest.TestCase):
         # Context phase (no CUDA graphs for prefill)
         input_ids = torch.tensor(
             [100, 200, 300, 400, 500, 600, 700, 800],
-            dtype=torch.int32,
+            dtype=torch.long,
             device=device,
         )
         num_cached_tokens_per_seq = [0]
@@ -312,7 +311,7 @@ class TestStarcoder2(unittest.TestCase):
         kv_cache_manager.add_dummy_requests(request_ids, token_nums)
 
         attn_metadata = metadata_cls(
-            seq_lens=torch.tensor([input_ids.size(-1)], dtype=torch.int),
+            seq_lens=torch.tensor([input_ids.size(-1)], dtype=torch.long),
             num_contexts=1,
             kv_cache_params=KVCacheParams(
                 use_cache=True,
@@ -325,7 +324,7 @@ class TestStarcoder2(unittest.TestCase):
             prompt_lens=prompt_lens,
         )
 
-        position_ids = [torch.arange(0, input_ids.size(-1), dtype=torch.int32)]
+        position_ids = [torch.arange(0, input_ids.size(-1), dtype=torch.long)]
         position_ids = torch.cat(position_ids).unsqueeze(0).cuda()
 
         with torch.inference_mode():
@@ -343,11 +342,11 @@ class TestStarcoder2(unittest.TestCase):
             torch.testing.assert_close(logits, ref.logits[:, -1].float(), atol=0.4, rtol=0.4)
 
         # Generation phase (optionally with CUDA graphs)
-        gen_input_ids = torch.tensor([900], dtype=torch.int32, device=device)
+        gen_input_ids = torch.tensor([900], dtype=torch.long, device=device)
         num_cached_tokens_per_seq = [input_ids.size(-1)]
 
         attn_metadata = metadata_cls(
-            seq_lens=torch.tensor([gen_input_ids.size(-1)], dtype=torch.int),
+            seq_lens=torch.tensor([gen_input_ids.size(-1)], dtype=torch.long),
             num_contexts=0,
             kv_cache_params=KVCacheParams(
                 use_cache=True,
@@ -362,7 +361,7 @@ class TestStarcoder2(unittest.TestCase):
 
         gen_position_ids = [
             torch.arange(
-                input_ids.size(-1), input_ids.size(-1) + gen_input_ids.size(-1), dtype=torch.int32
+                input_ids.size(-1), input_ids.size(-1) + gen_input_ids.size(-1), dtype=torch.long
             )
         ]
         gen_position_ids = torch.cat(gen_position_ids).unsqueeze(0).cuda()
@@ -370,10 +369,9 @@ class TestStarcoder2(unittest.TestCase):
         # Setup CUDA graph runner if requested
         graph_runner = None
         if use_cuda_graph:
-            from _torch.helpers import create_mock_engine
+            from _torch.helpers import create_mock_cuda_graph_runner
 
-            mock_engine = create_mock_engine(1)
-            graph_runner = CUDAGraphRunner(mock_engine)
+            graph_runner = create_mock_cuda_graph_runner(1)
             attn_metadata = attn_metadata.create_cuda_graph_metadata(1)
 
         # Run generation phase
@@ -476,7 +474,7 @@ class TestStarcoder2(unittest.TestCase):
         # Encode test prompt
         input_ids = torch.tensor(
             tokenizer.encode(test_prompt),
-            dtype=torch.int32,
+            dtype=torch.long,
             device=device,
         )
 
@@ -508,7 +506,7 @@ class TestStarcoder2(unittest.TestCase):
         kv_cache_manager.add_dummy_requests(request_ids, token_nums)
 
         attn_metadata = metadata_cls(
-            seq_lens=torch.tensor([input_ids.size(-1)], dtype=torch.int),
+            seq_lens=torch.tensor([input_ids.size(-1)], dtype=torch.long),
             num_contexts=1,
             kv_cache_params=KVCacheParams(
                 use_cache=True,
@@ -522,7 +520,7 @@ class TestStarcoder2(unittest.TestCase):
         )
 
         position_ids = torch.arange(
-            0, input_ids.size(-1), dtype=torch.int32, device=device
+            0, input_ids.size(-1), dtype=torch.long, device=device
         ).unsqueeze(0)
 
         with torch.inference_mode():
@@ -540,10 +538,10 @@ class TestStarcoder2(unittest.TestCase):
 
         # Generation phase - generate remaining tokens
         for step in range(1, max_new_tokens):
-            gen_input_ids = torch.tensor([next_token_id], dtype=torch.int32, device=device)
+            gen_input_ids = torch.tensor([next_token_id], dtype=torch.long, device=device)
 
             attn_metadata = metadata_cls(
-                seq_lens=torch.tensor([1], dtype=torch.int),
+                seq_lens=torch.tensor([1], dtype=torch.long),
                 num_contexts=0,
                 kv_cache_params=KVCacheParams(
                     use_cache=True,
@@ -557,7 +555,7 @@ class TestStarcoder2(unittest.TestCase):
             )
 
             gen_position_ids = torch.arange(
-                num_cached_tokens, num_cached_tokens + 1, dtype=torch.int32, device=device
+                num_cached_tokens, num_cached_tokens + 1, dtype=torch.long, device=device
             ).unsqueeze(0)
 
             with torch.inference_mode():
