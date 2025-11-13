@@ -10,10 +10,10 @@ and operates on a purely functional paradigm that is compatible with the torch c
 """
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from typing import Dict, List, Literal, Optional, Protocol, Sequence, Set, Tuple, Type, Union
 
 import torch
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from torch._ops import OpOverloadPacket
 from torch.fx import Node
 from torch.types import Number
@@ -24,11 +24,39 @@ from ..utils.logger import ad_logger
 Constant = Union[int, float, str, None]
 
 
-@dataclass
-class CacheConfig:
-    """A dataclass to hold information how to configure the cache."""
+class CacheConfig(BaseModel):
+    """Cache configuration for attention-related dtypes."""
 
-    dtype: Optional[torch.dtype] = None
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True,
+        extra="forbid",
+    )
+
+    dtype: Optional[torch.dtype] = Field(default=None, description="KV cache dtype.")
+    mamba_dtype: Optional[torch.dtype] = Field(default=None, description="Mamba cache dtype.")
+
+    @field_validator("dtype", "mamba_dtype", mode="before")
+    @classmethod
+    def _coerce_dtype(cls, value):
+        if value is None or isinstance(value, torch.dtype):
+            return value
+        if isinstance(value, str):
+            dtype = getattr(torch, value, None)
+            assert isinstance(dtype, torch.dtype), f"Invalid {dtype=}"
+            return dtype
+        return value
+
+    def __or__(self, other: "CacheConfig") -> "CacheConfig":
+        """Combine two CacheConfig objects field-wise using Python's `or` semantics.
+
+        For each field, selects the first non-None value between `self` and `other`.
+        """
+        if not isinstance(other, CacheConfig):
+            raise NotImplementedError(f"Cannot combine CacheConfig with {type(other)}")
+        merged_kwargs = {}
+        for field_name in type(self).model_fields.keys():
+            merged_kwargs[field_name] = getattr(self, field_name) or getattr(other, field_name)
+        return CacheConfig(**merged_kwargs)
 
 
 class SequenceInfo:

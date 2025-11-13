@@ -169,7 +169,9 @@ class FuseRMSNorm(BaseTransform):
 
         cnt = patterns.apply(graph)
 
-        info = TransformInfo(skipped=False, num_matches=cnt, is_clean=False, has_valid_shapes=False)
+        info = TransformInfo(
+            skipped=False, num_matches=cnt, is_clean=cnt == 0, has_valid_shapes=cnt == 0
+        )
 
         return gm, info
 
@@ -256,7 +258,7 @@ class FuseGatedRMSNorm(BaseTransform):
         info = TransformInfo(
             skipped=False,
             num_matches=num,
-            is_clean=False,
-            has_valid_shapes=False,
+            is_clean=num == 0,
+            has_valid_shapes=num == 0,
         )
         return gm, info

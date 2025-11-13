@@ -80,8 +80,8 @@ class TestNano_V2_VLM(LlmapiAccuracyTestHarness):
 
 
 class TestLlava_V1_6_Mistral_7B(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "llava-hf/llava-v1.6-mistral-7b"
-    MODEL_PATH = f"{llm_models_root()}/llava-v1.6-mistral-7b"
+    MODEL_NAME = "llava-hf/llava-v1.6-mistral-7b-hf"
+    MODEL_PATH = f"{llm_models_root()}/llava-v1.6-mistral-7b-hf"
     MAX_NUM_TOKENS = 16384
 
     # NOTE: MMMU adds <|endoftext|> to the stop token.
@@ -157,3 +157,38 @@ class TestVILA1_5_3B(LlmapiAccuracyTestHarness):
         ) as llm:
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
+
+
+class TestNemotron_Nano_12B_V2_VL(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16"
+    MODEL_PATH = f"{llm_models_root()}/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16"
+    MAX_NUM_TOKENS = 25600
+    EXTRA_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        system_prompt="/no_think",
+    )
+
+    # NOTE: MMMU adds <|endoftext|> to the stop token.
+    sampling_params = SamplingParams(
+        max_tokens=MAX_NUM_TOKENS,
+        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+        temperature=0.0,
+        top_k=1,
+        stop="<|endoftext|>",
+    )
+
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8, enable_block_reuse=False)
+
+    def test_auto_dtype(self):
+        with LLM(
+            self.MODEL_PATH,
+            max_batch_size=128,
+            max_num_tokens=self.MAX_NUM_TOKENS,
+            kv_cache_config=self.kv_cache_config,
+        ) as llm:
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(
+                llm,
+                sampling_params=self.sampling_params,
+                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+            )

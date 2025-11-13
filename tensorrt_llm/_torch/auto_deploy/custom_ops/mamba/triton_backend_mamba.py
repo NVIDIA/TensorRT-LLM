@@ -125,6 +125,7 @@ def _triton_cached_ssm(
             dt_limit=(time_step_limit[0], time_step_limit[1]),
             return_final_states=False,
             return_varlen_states=True,
+            mamba_ssm_cache_dtype=ssm_state_cache.dtype,
         )
 
         y_flat[:total_prefill_tokens] = y_prefill[0].to(y_flat.dtype)
@@ -144,27 +145,26 @@ def _triton_cached_ssm(
 
         dt_hp = dt_decode[:, :, None].expand(-1, num_heads, head_dim)
         dt_bias_hp = dt_bias[..., None].expand(num_heads, head_dim)
-        dt_pre = torch.nn.functional.softplus(dt_hp + dt_bias_hp.to(dtype=dt_hp.dtype))
-        dt_pre = torch.clamp(dt_pre, time_step_limit[0], time_step_limit[1])
         A_full = A[..., None, None].expand(num_heads, head_dim, ssm_state_size)
         D_full = D[..., None].expand(num_heads, head_dim)
 
-        dt_bias_zero = torch.zeros_like(dt_bias_hp)
         y_dec = selective_state_update(
             ssm_state_cache,
             x_decode,
-            dt_pre,
+            dt_hp,
             A_full,
             B_decode,
             C_decode,
             D=D_full,
             z=None,
-            dt_bias=dt_bias_zero,
-            dt_softplus=False,
+            dt_bias=dt_bias_hp,
+            dt_softplus=True,
             state_batch_indices=slot_idx_decode,
         )  # [nd, H, D]
 
-        y_flat[total_prefill_tokens : total_prefill_tokens + num_decode] = y_dec.to(y_flat.dtype)
+        y_flat[total_prefill_tokens : total_prefill_tokens + num_decode].copy_(
+            y_dec.to(y_flat.dtype)
+        )
 
     return y
 
@@ -198,9 +198,7 @@ def _triton_cached_ssm_fake(
     )
 
 
-## Note: we reuse the existing metadata custom op and its registered fake from torch backend.
-
-
+# TODO: consider inheriting from TorchBackendSSM instead of redefining everything
 @AttentionRegistry.register("triton_ssm")
 class TritonBackendSSM(AttentionDescriptor):
     @classmethod
@@ -247,6 +245,9 @@ class TritonBackendSSM(AttentionDescriptor):
         else:
             ssm_state_size = max(1, B_fake.shape[-1])
 
+        # extract ssm_state_dtype from cache_config or hs_fake
+        ssm_state_dtype = cache_config.mamba_dtype or hs_fake.dtype
+
         def _get_ssm_cache(si: SequenceInfo):
             return torch.empty(
                 si.max_batch_size,
@@ -254,7 +255,7 @@ class TritonBackendSSM(AttentionDescriptor):
                 head_dim,
                 ssm_state_size,
                 device=si.device,
-                dtype=cache_config.dtype or hs_fake.dtype,
+                dtype=ssm_state_dtype,
             )
 
         return {"ssm_state_cache": _get_ssm_cache}

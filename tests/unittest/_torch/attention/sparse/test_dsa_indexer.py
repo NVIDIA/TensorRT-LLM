@@ -381,7 +381,8 @@ def _create_mock_metadata(request_ids,
                           cache_manager,
                           num_ctx_tokens,
                           num_tokens,
-                          indexer_max_chunk_size=8194):
+                          indexer_max_chunk_size=8194,
+                          max_draft_tokens=0):
     """Helper to create mock metadata for testing."""
 
     class MockKVCacheParams:
@@ -396,6 +397,7 @@ def _create_mock_metadata(request_ids,
             self.request_ids = request_ids
             self.num_contexts = num_contexts
             self.num_generations = num_generations
+            self.max_draft_tokens = max_draft_tokens
             # Keep seq_lens on CPU for split_prefill_chunks and other CPU operations
             # CUDA kernels will convert to CUDA as needed
             self.seq_lens = seq_lens.cpu() if seq_lens.is_cuda else seq_lens
@@ -826,6 +828,7 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
         cache_manager=cache_manager,
         num_ctx_tokens=total_context_tokens,
         num_tokens=total_context_tokens,
+        max_draft_tokens=next_n - 1,
     )
     Indexer.prepare(metadata_context)
 
@@ -851,6 +854,7 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
         cache_manager=cache_manager,
         num_ctx_tokens=0,
         num_tokens=batch_size * num_gen_tokens,
+        max_draft_tokens=next_n - 1,
     )
     Indexer.prepare(metadata_gen)
 
@@ -1175,6 +1179,7 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
             f"  Chunk {i}: Q[{chunk.token_start}:{chunk.token_end}] ({num_q} tokens), "
             f"K[{chunk.k_token_start}:{chunk.k_token_end}] ({num_k} tokens)")
 
+    indexer._update_k_cache(k_fp8, k_scale, metadata_chunked)
     topk_indices_chunked = indexer.sparse_attn_indexer(metadata_chunked,
                                                        hidden_states, q_fp8,
                                                        k_fp8, k_scale, weights)
@@ -1206,6 +1211,7 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
             f"✓ Created {num_baseline_chunks} chunk(s) (effectively non-chunked)"
         )
 
+    indexer._update_k_cache(k_fp8, k_scale, metadata_baseline)
     topk_indices_baseline = indexer.sparse_attn_indexer(metadata_baseline,
                                                         hidden_states, q_fp8,
                                                         k_fp8, k_scale, weights)
@@ -1416,6 +1422,7 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk,
         cache_manager=cache_manager,
         num_ctx_tokens=total_context_tokens,
         num_tokens=total_context_tokens,
+        max_draft_tokens=next_n - 1,
     )
     Indexer.prepare(metadata_context)
     indexer._update_k_cache(k_context_fp8, k_context_scale, metadata_context)
@@ -1448,16 +1455,24 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk,
         cache_manager=cache_manager,
         num_ctx_tokens=0,
         num_tokens=num_gen_tokens,
+        max_draft_tokens=next_n - 1,
     )
     Indexer.prepare(metadata_gen_write)
     indexer._update_k_cache(k_fp8, k_scale, metadata_gen_write)
 
     # Test with custom CUDA kernel
-    metadata_custom = _create_mock_metadata(request_ids, batch_size, 0,
-                                            batch_size, seq_lens.clone(),
+    metadata_custom = _create_mock_metadata(request_ids,
+                                            batch_size,
+                                            0,
+                                            batch_size,
+                                            seq_lens.clone(),
                                             final_lens.clone(),
-                                            num_cached_tokens, cache_manager, 0,
-                                            num_gen_tokens, max_model_len)
+                                            num_cached_tokens,
+                                            cache_manager,
+                                            0,
+                                            num_gen_tokens,
+                                            max_model_len,
+                                            max_draft_tokens=next_n - 1)
 
     Indexer.prepare(metadata_custom)
     indexer._update_k_cache(k_fp8, k_scale, metadata_custom)
@@ -1474,11 +1489,18 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk,
         pytest.skip(f"Custom topk not available: {e}")
 
     # Test with PyTorch fallback
-    metadata_fallback = _create_mock_metadata(request_ids, batch_size, 0,
-                                              batch_size, seq_lens.clone(),
+    metadata_fallback = _create_mock_metadata(request_ids,
+                                              batch_size,
+                                              0,
+                                              batch_size,
+                                              seq_lens.clone(),
                                               final_lens.clone(),
-                                              num_cached_tokens, cache_manager,
-                                              0, num_gen_tokens, max_model_len)
+                                              num_cached_tokens,
+                                              cache_manager,
+                                              0,
+                                              num_gen_tokens,
+                                              max_model_len,
+                                              max_draft_tokens=next_n - 1)
 
     Indexer.prepare(metadata_fallback)
     indexer._update_k_cache(k_fp8, k_scale, metadata_fallback)
