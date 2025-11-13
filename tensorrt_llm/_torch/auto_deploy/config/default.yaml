@@ -77,14 +77,17 @@ transforms:
   detect_sharding:
     stage: sharding
     simple_shard_only: false
-    sharding_source: ['heuristic']
+    # NOTE: The order implies the priority of the sharding sources.
+    # Example: if both manual and heuristic try to apply sharding to layer L,
+    #only "manual" transformation will be applied.
+    sharding_source: ['heuristic'] # 'manual', 'factory'
     support_partial_config: true
     sharding_dims: ['tp', 'ep', 'bmm']
     # default TP sharding config
     manual_config:
         head_dim : 128
         tp_plan :
-        # mamba SSM layers
+          # mamba SSM layers
           in_proj: mamba
           out_proj: rowwise
           # attention layers
@@ -92,6 +95,9 @@ transforms:
           k_proj: colwise
           v_proj: colwise
           o_proj: rowwise
+          # NOTE: for performance reason, consider not sharding the following
+          # layers at all. Commenting out the following layers will replicate
+          # them across ranks.
           # MLP and shared experts in MoE layers
           gate_proj: colwise
           up_proj: colwise
