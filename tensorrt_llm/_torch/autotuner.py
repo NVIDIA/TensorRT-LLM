@@ -880,7 +880,6 @@ class AutoTuner:
             are used to ensure accurate timing.
         """
         stream = torch.cuda.current_stream()
-        stream = torch.cuda.Stream()
         graph = torch.cuda.CUDAGraph()
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
@@ -901,7 +900,7 @@ class AutoTuner:
             # TODO: This is build time sensitive, O(tactic_num * impl_num * num_profile * tunable_ops)
             # Consider apply a preprofiling to estimate the kernel execution time, then decide the necessity.
             if not use_cudagraph:
-                delay_kernel(self.stream_delay_micro_secs)
+                delay_kernel(self.stream_delay_micro_secs, stream=stream)
 
             start.record()
 
