@@ -201,7 +201,7 @@ class FuseRMSNorm(BaseTransform):
         # Register pattern for gated RMSNorm
         register_ad_pattern(
             search_fn=_gated_rmsnorm_pattern_ref,
-            replace_fn=partial(_gated_rmsnorm_replacement),
+            replace_fn=_gated_rmsnorm_replacement,
             patterns=patterns,
             dummy_args=make_dummy_args_gated(group_size, eps),
             op_ignore_types=op_ignore_types,
