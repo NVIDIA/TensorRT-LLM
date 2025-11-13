@@ -879,6 +879,7 @@ class RocketKVCacheManager(KVCacheManager):
         assert not kv_cache_config.enable_block_reuse, "RocketKV cache requires block reuse to be disabled in KV cache config"
         self.kt_tokens_per_block = next_power_of_2(
             math.ceil(tokens_per_block / sparse_attn_config.page_size))
+        self.kt_cache_dtype = sparse_attn_config.kt_cache_dtype
 
         super().__init__(
             kv_cache_config,
@@ -912,7 +913,7 @@ class RocketKVCacheManager(KVCacheManager):
             torch.empty((self.num_blocks, self.kt_tokens_per_block,
                          num_kv_heads, head_dim * 2),
                         device="cuda",
-                        dtype=torch.bfloat16)
+                        dtype=self.kt_cache_dtype)
             for _ in range(self.num_local_layers)
         ]
         self.max_kt_blocks_per_seq = self.num_blocks
@@ -1028,13 +1029,19 @@ class RocketKVCacheManager(KVCacheManager):
         sparse_attn_config = model_config.sparse_attention_config
         kt_tokens_per_block = next_power_of_2(
             math.ceil(tokens_per_block / sparse_attn_config.page_size))
-        kv_factor = 2 + 2 * kt_tokens_per_block / tokens_per_block
+        kt_factor = 2
+        if sparse_attn_config.kt_cache_dtype == torch.float8_e5m2:
+            kt_factor = 1
+        kv_factor = 2 + kt_factor * kt_tokens_per_block / tokens_per_block
         mem_per_token *= kv_factor
         return mem_per_token
 
     def get_cache_bytes_per_token(self):
         # 2 for K and V, 2 * kt_tokens_per_block / tokens_per_block for KT cache
-        kv_factor = self.kv_factor + 2 * self.kt_tokens_per_block / self.tokens_per_block
+        kt_factor = 2
+        if self.kt_cache_dtype == torch.float8_e5m2:
+            kt_factor = 1
+        kv_factor = self.kv_factor + kt_factor * self.kt_tokens_per_block / self.tokens_per_block
         cache_size_per_token = math.ceil(
             kv_factor * sum(self.num_kv_heads_per_layer) * self.head_dim)
 
