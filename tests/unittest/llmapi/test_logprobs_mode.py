@@ -35,6 +35,8 @@ def test_logprobs_mode_basic(logprobs_mode, temperature, top_k):
         temperature=temperature,
         top_k=top_k,
         logprobs_mode=logprobs_mode,
+        return_context_logits=True,
+        return_generation_logits=True,
     )
 
     prompts = ["The future of AI is"]

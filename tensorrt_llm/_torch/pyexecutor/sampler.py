@@ -1879,6 +1879,7 @@ class TorchSampler(Sampler):
 
             # Compute raw logprobs or logits based on mode
             if logprobs_mode == "raw_logprobs":
+                logits_cuda = raw_logits_cuda[:sum_steps]
                 logprobs_cuda = F.log_softmax(
                     logits_cuda[logprobs_logit_indices_cuda].to(
                         dtype=torch.float32, non_blocking=True
@@ -1887,6 +1888,7 @@ class TorchSampler(Sampler):
                 )
             elif logprobs_mode == "raw_logits":
                 # Return unnormalized logits
+                logits_cuda = raw_logits_cuda[:sum_steps]
                 logprobs_cuda = logits_cuda[logprobs_logit_indices_cuda].to(
                     dtype=torch.float32, non_blocking=True
                 )
