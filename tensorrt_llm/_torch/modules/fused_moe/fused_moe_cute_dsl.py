@@ -202,13 +202,13 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         )
 
     def forward_chunk_unquantized(
-        self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
-        router_logits: torch.Tensor,
-        output_dtype: Optional[torch.dtype] = None,
-        all_rank_num_tokens: Optional[List[int]] = None,
-        use_dp_padding: Optional[bool] = None,
-        repeating_info: tuple = (True, True),
+            self,
+            x: Union[torch.Tensor, Fp4QuantizedTensor],
+            router_logits: torch.Tensor,
+            output_dtype: Optional[torch.dtype] = None,
+            all_rank_num_tokens: Optional[List[int]] = None,
+            use_dp_padding: Optional[bool] = None,
+            repeating_info: tuple = (True, True),
     ) -> torch.Tensor:
         assert not self.has_any_quant
         return super().forward_chunk(x,
@@ -219,13 +219,13 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                                      repeating_info=repeating_info)
 
     def forward_chunk_fp8_block_scales(
-        self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
-        router_logits: torch.Tensor,
-        output_dtype: Optional[torch.dtype] = None,
-        all_rank_num_tokens: Optional[List[int]] = None,
-        use_dp_padding: Optional[bool] = None,
-        repeating_info: tuple = (True, True),
+            self,
+            x: Union[torch.Tensor, Fp4QuantizedTensor],
+            router_logits: torch.Tensor,
+            output_dtype: Optional[torch.dtype] = None,
+            all_rank_num_tokens: Optional[List[int]] = None,
+            use_dp_padding: Optional[bool] = None,
+            repeating_info: tuple = (True, True),
     ) -> torch.Tensor:
         assert self.has_deepseek_fp8_block_scales
 
@@ -313,13 +313,13 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         return h4
 
     def forward_chunk_nvfp4(
-        self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
-        router_logits: torch.Tensor,
-        output_dtype: Optional[torch.dtype] = None,
-        all_rank_num_tokens: Optional[List[int]] = None,
-        use_dp_padding: Optional[bool] = None,
-        repeating_info: tuple = (True, True),
+            self,
+            x: Union[torch.Tensor, Fp4QuantizedTensor],
+            router_logits: torch.Tensor,
+            output_dtype: Optional[torch.dtype] = None,
+            all_rank_num_tokens: Optional[List[int]] = None,
+            use_dp_padding: Optional[bool] = None,
+            repeating_info: tuple = (True, True),
     ) -> torch.Tensor:
         assert self.has_nvfp4
 
@@ -434,13 +434,13 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         return x
 
     def forward_chunk(
-        self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
-        router_logits: torch.Tensor,
-        output_dtype: Optional[torch.dtype] = None,
-        all_rank_num_tokens: Optional[List[int]] = None,
-        use_dp_padding: Optional[bool] = None,
-        repeating_info: tuple = (True, True),
+            self,
+            x: Union[torch.Tensor, Fp4QuantizedTensor],
+            router_logits: torch.Tensor,
+            output_dtype: Optional[torch.dtype] = None,
+            all_rank_num_tokens: Optional[List[int]] = None,
+            use_dp_padding: Optional[bool] = None,
+            repeating_info: tuple = (True, True),
     ) -> torch.Tensor:
         if self.has_any_quant:
             if self.has_nvfp4:
