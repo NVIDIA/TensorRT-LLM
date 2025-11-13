@@ -15,3 +15,5 @@ Efficient-Large-Model/VILA1.5-3b:
 # the metric here is for model sanity checking.
 nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16:
   - accuracy: 26.67
+mistralai/Mistral-Small-3.1-24B-Instruct-2503:
+  - accuracy: 57.0
