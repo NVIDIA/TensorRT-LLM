@@ -12,9 +12,10 @@ LABEL com.nvidia.eula="https://www.nvidia.com/en-us/agreements/enterprise-softwa
 LABEL com.nvidia.ai-terms="https://www.nvidia.com/en-us/agreements/enterprise-software/product-specific-terms-for-ai-products/"
 
 # https://www.gnu.org/software/bash/manual/html_node/Bash-Startup-Files.html
-# The default values come from `nvcr.io/nvidia/pytorch`
-ENV BASH_ENV=${BASH_ENV:-/etc/bash.bashrc}
-ENV ENV=${ENV:-/etc/shinit_v2}
+ARG SH_ENV="/etc/shinit_v2"
+ENV ENV=${SH_ENV}
+ARG BASH_ENV="/etc/bash.bashrc"
+ENV BASH_ENV=${BASH_ENV}
 
 ARG GITHUB_MIRROR=""
 RUN echo "Using GitHub mirror: $GITHUB_MIRROR"
