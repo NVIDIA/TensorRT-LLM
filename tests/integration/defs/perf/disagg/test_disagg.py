@@ -79,7 +79,7 @@ class TestDisaggBenchmark:
 
             # Wait for completion (with early failure detection)
             completed, error_msg = JobManager.wait_for_completion(
-                job_id, 7200, test_config, check_early_failure=False
+                job_id, 7200, test_config, check_early_failure=True
             )
             if not completed:
                 JobManager.cancel_job(job_id)

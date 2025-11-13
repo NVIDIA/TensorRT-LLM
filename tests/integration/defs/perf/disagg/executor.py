@@ -379,8 +379,8 @@ class JobManager:
         """
         # Key error patterns
         error_patterns = [
-            (r"\[E\]\s+Traceback", "TRT-LLM error traceback detected"),
-            (r"srun: error:", "SLURM error detected"),
+            (r"\[E\]\s+Traceback[\s\S]*?mpi4py\.MPI\.Comm\.allgather", "MPI communication error detected"),
+            (r"\[E\]\s+Traceback[\s\S]*?pickle data was truncated", "Pickle serialization error detected"),
         ]
         
         try:
