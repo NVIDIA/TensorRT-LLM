@@ -195,6 +195,8 @@ def get_test_config(test_desc, example_dir, test_root):
         (8, f"{test_configs_root}/disagg_config_ctxpp4_genpp4.yaml"),
         "ctxpp4_gentp4":
         (8, f"{test_configs_root}/disagg_config_ctxpp4_gentp4.yaml"),
+        "llama4_kv_cache_overflow":
+        (8, f"{test_configs_root}/disagg_config_llama4_kv_cache_overflow.yaml"),
         "deepseek_v3_lite_fp8_mpi":
         (4,
          f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_mpi.yaml"
@@ -1768,3 +1770,179 @@ def test_disaggregated_deepseek_v3_lite_bf16_empty_batch(
     print(f"E2EL: {e2el} ms, TTFT: {ttft} ms")
 
     assert e2el > 0 and ttft > 0
+
+
+@pytest.mark.skip_less_device(8)
+@pytest.mark.skip_less_device_memory(80000)
+def test_llama4_long_context_kv_cache_overflow(disaggregated_test_root,
+                                               disaggregated_example_root,
+                                               llm_venv):
+    """
+    RCCA: https://nvbugspro.nvidia.com/bug/5555681
+    """
+    import tempfile
+    import time
+
+    import requests
+
+    # Get model path directly without using fixture
+    models_root = llm_models_root()
+    llama_model_path = os.path.join(models_root, "llama4-models", "nvidia",
+                                    "Llama-4-Maverick-17B-128E-Instruct-FP8")
+
+    # Update config file with actual model path
+    test_configs_root = os.path.join(os.path.dirname(__file__), "test_configs")
+    config_template = os.path.join(
+        test_configs_root, "disagg_config_llama4_kv_cache_overflow.yaml")
+
+    # Create a temporary config file with the actual model path
+    with open(config_template, 'r') as f:
+        config_content = f.read()
+
+    # Replace placeholder with actual model path
+    config_content = config_content.replace("PLACEHOLDER_MODEL_PATH",
+                                            llama_model_path)
+
+    # Write to temporary file
+    # 写入临时文件
+    temp_config = tempfile.NamedTemporaryFile(
+        mode='w',
+        suffix='.yaml',
+        delete=False,
+        dir=llm_venv.get_working_directory())
+    temp_config.write(config_content)
+    temp_config.close()
+
+    # We'll use genai-perf to generate synthetic long inputs
+    # This is more realistic and can generate 128k tokens
+    artifact_dir = os.path.join(llm_venv.get_working_directory(),
+                                "benchmark-results")
+
+    # Set environment variables for debugging
+    env = llm_venv._new_env.copy()
+    # Get num_ranks from config
+    num_ranks = 8  # 4 for context + 4 for generation
+
+    cleanup_output_files()
+    run_env = env.copy()
+
+    workers_cmd = [
+        'mpirun', '--allow-run-as-root', '--oversubscribe', '-n',
+        str(num_ranks), 'trtllm-serve', 'disaggregated_mpi_worker', '-c',
+        temp_config.name
+    ]
+
+    server_start_timeout = 900
+    server_cmd = [
+        'trtllm-serve', 'disaggregated', '--server_start_timeout',
+        str(server_start_timeout), '-c', temp_config.name
+    ]
+
+    try:
+        with (  # Start workers
+                open('output_workers.log', 'w') as output_workers,
+                popen(workers_cmd,
+                      stdout=output_workers,
+                      stderr=subprocess.STDOUT,
+                      env=run_env,
+                      cwd=llm_venv.get_working_directory()) as workers_proc,
+                # Start server
+                open('output_disagg.log', 'w') as output_disagg,
+                popen(server_cmd,
+                      stdout=output_disagg,
+                      stderr=subprocess.STDOUT,
+                      env=run_env,
+                      cwd=llm_venv.get_working_directory()) as server_proc):
+
+            # Wait for disaggregated server to be ready
+            # 等待 disaggregated 服务器就绪
+            server_url = "http://localhost:8000"
+            max_wait = 600  # 20 minutes - increased timeout for large model initialization
+            start_wait = time.time()
+            server_ready = False
+
+            logger.info(f"Waiting for server at {server_url} to be ready...")
+            while time.time() - start_wait < max_wait:
+                try:
+                    response = requests.get(f"{server_url}/health", timeout=5)
+                    if response.status_code == 200:
+                        logger.info("✓ Server is ready!")
+                        server_ready = True
+                        break
+                except Exception as e:
+                    logger.debug(f"Server not ready yet: {e}")
+                time.sleep(5)
+
+            if not server_ready:
+                raise RuntimeError(
+                    f"Server did not become ready within {max_wait} seconds")
+
+            # Give it a few more seconds to fully initialize
+            logger.info("Waiting 10 more seconds for full initialization...")
+            time.sleep(10)
+
+            # Use genai-perf to generate load with 128k token inputs
+            # This better reproduces the KV cache overflow bug
+            logger.info(
+                "Running genai-perf with 128k token synthetic inputs...")
+
+            genai_perf_cmd = [
+                'genai-perf',
+                'profile',
+                '--model',
+                llama_model_path,
+                '--tokenizer',
+                llama_model_path,
+                '--endpoint-type',
+                'chat',
+                '--endpoint',
+                '/v1/chat/completions',
+                '--streaming',
+                '--url',
+                'localhost:8000',
+                '--synthetic-input-tokens-mean',
+                '128000',  # 128k tokens to exceed buffer
+                '--synthetic-input-tokens-stddev',
+                '0',
+                '--output-tokens-mean',
+                '100',
+                '--output-tokens-stddev',
+                '0',
+                '--extra-inputs',
+                'max_tokens:100',
+                '--extra-inputs',
+                'min_tokens:100',
+                '--extra-inputs',
+                'ignore_eos:true',
+                '--concurrency',
+                '1',
+                '--warmup-request-count',
+                '8',
+                '--num-dataset-entries',
+                '64',
+                '--random-seed',
+                '100',
+                '--artifact-dir',
+                artifact_dir,
+                '--',
+                '-v',
+                '-H',
+                'Authorization: Bearer NOT USED',
+                '-H',
+                'Accept: text/event-stream',
+                '-p',
+                '200000'
+            ]
+
+            logger.info(f"Running command: {' '.join(genai_perf_cmd[:10])}...")
+            check_call(genai_perf_cmd,
+                       env=env,
+                       poll_procs=[workers_proc, server_proc])
+    finally:
+        # Cleanup temporary config file
+        if os.path.exists(temp_config.name):
+            os.unlink(temp_config.name)
+        server_proc.terminate()
+        workers_proc.terminate()
+        server_proc.wait()
+        workers_proc.wait()
