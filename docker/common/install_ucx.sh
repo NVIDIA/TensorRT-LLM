@@ -13,7 +13,7 @@ CUDA_PATH="/usr/local/cuda"
 mkdir -p /third-party-source
 
 rm -rf ${UCX_INSTALL_PATH}
-curl -L ${GITHUB_URL}/openucx/ucx/archive/refs/heads/${UCX_VERSION}.tar.gz -o ucx-${UCX_VERSION}.tar.gz
+curl -L ${GITHUB_URL}/openucx/ucx/archive/refs/heads/v${UCX_VERSION}.tar.gz -o ucx-${UCX_VERSION}.tar.gz
 cp ucx-${UCX_VERSION}.tar.gz /third-party-source/
 tar -xzf ucx-${UCX_VERSION}.tar.gz
 mv ucx-${UCX_VERSION} ucx
