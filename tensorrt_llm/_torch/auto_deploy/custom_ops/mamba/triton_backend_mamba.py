@@ -112,6 +112,10 @@ def _triton_ssm_prepare_metadata_fake(
         torch.empty(num_seq, dtype=torch.long, device=slot_idx.device),
         torch.empty(num_seq, dtype=torch.bool, device=slot_idx.device),
         torch.empty(num_seq + 1, dtype=torch.int32, device=slot_idx.device),  # cu seqlens
+        # Note(suyogg): *Potential issue alert* Technically, the shape of chunk indices and
+        # chunk offsets is dependent on cu_seqlens, which is in-turn dependent
+        # on the input sequence lengths. I don't know of a good way to handle this in fake
+        # mode... but what I have here right now doesn't seem to be break anything...:shrug:.
         torch.empty(num_seq, dtype=torch.int32, device=slot_idx.device),  # chunk indices
         torch.empty(num_seq, dtype=torch.int32, device=slot_idx.device),  # chunk offsets
         torch.empty(1, num_seq, dtype=torch.int32, device=slot_idx.device),  # seq idx prefill
