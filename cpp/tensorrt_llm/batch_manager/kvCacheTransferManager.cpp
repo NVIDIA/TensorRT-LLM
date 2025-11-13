@@ -222,8 +222,8 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
 // Relying on decoder syncing GPU with CPU to ensure that blocks are ready
 // for offload/onboard/partial copy is dangerous. We have an asynchronous decoder
 // that may not synchronize or synchronize at a later point in the execution stream.
-// To avoid synchronization issues caused by changes to decoder design we introduce
-// a new method SyncWithBufferManager() that ensures that internal copy streams
+// To avoid synchronization issues caused by changes to decoder design we rely on
+// KVCacheTransferManager::syncWithBufferManager() that ensures that internal copy streams
 // will wait for prefill and decode kernels that have already been scheduled.
 //
 // Earlier versions of this code did not account for all possible cases where a new block copy
