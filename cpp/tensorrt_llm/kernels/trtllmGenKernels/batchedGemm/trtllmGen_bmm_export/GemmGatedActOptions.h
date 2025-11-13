@@ -161,11 +161,8 @@ inline bool checkAndUpdateGemmGatedActOptions(
             ") must be a multiple of ", hiddenGranularity, " for block-scaled outputs.");
     }
 
-    std::cout << "checking gemm options instead" << std::endl;
     auto isValid = gemm::checkAndUpdateGemmOptions(options, cudaArch,
         /* tpGrpSize */ 1, updateOptions);
-    std::cout << "finished checking gemm options" << std::endl;
-    std::cout << "the result is " << isValid << std::endl;
 
     if (!isValid)
     {
