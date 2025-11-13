@@ -6,8 +6,31 @@ import torch
 from utils.llm_data import llm_models_root
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs to run this test")
-def test_deepseek_r1_ctx_tep(llm_root):
+@pytest.mark.parametrize("world_size", [1, 4])
+def test_deepseek_r1_ctx_dep(llm_root, world_size):
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"needs {world_size:d} GPUs to run this test")
+    model_root = llm_models_root(check=True)
+    check_call(
+        [
+            "./mpi_launch.sh",
+            "./run_single.sh",
+            "config_ctx.yaml",
+            "--model",
+            model_root / "DeepSeek-R1" / "DeepSeek-R1-0528-FP4-v2",
+        ],
+        cwd=llm_root / "examples" / "layer_wise_benchmarks",
+        env={
+            **os.environ,
+            "NP": f"{world_size:d}",
+        },
+    )
+
+
+@pytest.mark.parametrize("world_size", [1, 4])
+def test_deepseek_r1_ctx_tep(llm_root, world_size):
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"needs {world_size:d} GPUs to run this test")
     model_root = llm_models_root(check=True)
     check_call(
         [
@@ -22,14 +45,16 @@ def test_deepseek_r1_ctx_tep(llm_root):
         cwd=llm_root / "examples" / "layer_wise_benchmarks",
         env={
             **os.environ,
-            "NP": "4",
+            "NP": f"{world_size:d}",
             "TRTLLM_ENABLE_PDL": "1",
         },
     )
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs to run this test")
-def test_deepseek_v32_ctx_dep(llm_root):
+@pytest.mark.parametrize("world_size", [1, 4])
+def test_deepseek_v32_ctx_dep(llm_root, world_size):
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"needs {world_size:d} GPUs to run this test")
     model_root = llm_models_root(check=True)
     check_call(
         [
@@ -44,13 +69,15 @@ def test_deepseek_v32_ctx_dep(llm_root):
         cwd=llm_root / "examples" / "layer_wise_benchmarks",
         env={
             **os.environ,
-            "NP": "4",
+            "NP": f"{world_size:d}",
         },
     )
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs to run this test")
-def test_deepseek_r1_gen_scaled_from_16_dep(llm_root):
+@pytest.mark.parametrize("world_size", [4])
+def test_deepseek_r1_gen_scaled_from_16_dep(llm_root, world_size):
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"needs {world_size:d} GPUs to run this test")
     model_root = llm_models_root(check=True)
     check_call(
         [
@@ -66,15 +93,15 @@ def test_deepseek_r1_gen_scaled_from_16_dep(llm_root):
         cwd=llm_root / "examples" / "layer_wise_benchmarks",
         env={
             **os.environ,
-            "NP": "4",
+            "NP": f"{world_size:d}",
         },
     )
 
 
-@pytest.mark.parametrize("tp_size", [1, 2, 4])
-def test_qwen3_next_gen_tep(llm_root, tp_size):
-    if torch.cuda.device_count() < tp_size:
-        pytest.skip(f"needs {tp_size:d} GPUs to run this test")
+@pytest.mark.parametrize("world_size", [1, 4])
+def test_qwen3_next_gen_tep(llm_root, world_size):
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"needs {world_size:d} GPUs to run this test")
     model_root = llm_models_root(check=True)
     check_call(
         [
@@ -91,7 +118,7 @@ def test_qwen3_next_gen_tep(llm_root, tp_size):
         cwd=llm_root / "examples" / "layer_wise_benchmarks",
         env={
             **os.environ,
-            "NP": f"{tp_size:d}",
+            "NP": f"{world_size:d}",
             "TRTLLM_ENABLE_PDL": "1",
         },
     )
