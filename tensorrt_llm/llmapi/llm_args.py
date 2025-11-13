@@ -326,6 +326,7 @@ class _ParallelConfig(StrictBaseModel):
     moe_tp_size: int = -1
     moe_ep_size: int = -1
     cp_config: dict = Field(default_factory=dict)
+    pp_partition: Optional[List[int]] = Field(default=None)
     enable_attention_dp: bool = False
     enable_lm_head_tp_in_adp: bool = False
 
@@ -372,6 +373,7 @@ class _ParallelConfig(StrictBaseModel):
                        gpus_per_node=self.gpus_per_node,
                        tp_size=self.tp_size,
                        pp_size=self.pp_size,
+                       pp_partition=self.pp_partition,
                        cp_size=self.cp_size,
                        cp_config=self.cp_config,
                        enable_attention_dp=self.enable_attention_dp,
@@ -1587,6 +1589,12 @@ class BaseLlmArgs(StrictBaseModel):
         description="Enable LM head TP in attention dp.",
         status="prototype")
 
+    pp_partition: Optional[List[int]] = Field(
+        default=None,
+        description=
+        "Pipeline parallel partition, a list of each rank's layer number.",
+        status="prototype")
+
     cp_config: Optional[dict] = Field(default_factory=dict,
                                       description="Context parallel config.",
                                       status="prototype")
@@ -1843,6 +1851,7 @@ class BaseLlmArgs(StrictBaseModel):
             moe_ep_size=self.moe_expert_parallel_size,
             enable_attention_dp=self.enable_attention_dp,
             enable_lm_head_tp_in_adp=self.enable_lm_head_tp_in_adp,
+            pp_partition=self.pp_partition,
             cp_config=self.cp_config)
         return self
 
