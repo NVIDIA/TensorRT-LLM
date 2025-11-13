@@ -15,7 +15,7 @@
 
 import os
 
-# Disable UCC to WAR allgather issue before DLFW 25.12 upgrade.
+# Disable UCC to WAR allgather issue before NGC PyTorch 25.12 upgrade.
 os.environ["OMPI_MCA_coll_ucc_enable"] = "0"
 
 
