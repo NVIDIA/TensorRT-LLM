@@ -43,7 +43,7 @@ void fused_qk_norm_rope(
     double low,    // threshold for high frequency
     double high,   // threshold for low frequency
     double attention_factor, // attention_factor applied on cos and sin
-    bool is_qk_norm        // Whether to apply QK norm
+    bool is_qk_norm          // Whether to apply QK norm
 )
 {
     // Input validation
@@ -75,8 +75,7 @@ void fused_qk_norm_rope(
         static_cast<float>(base),
         !is_neox, // interleave
         reinterpret_cast<int const*>(position_ids.data_ptr()), static_cast<float>(factor), static_cast<float>(low),
-        static_cast<float>(high), static_cast<float>(attention_factor), stream,
-        is_qk_norm);
+        static_cast<float>(high), static_cast<float>(attention_factor), stream, is_qk_norm);
 }
 
 // Register the PyTorch operators

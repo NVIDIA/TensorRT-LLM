@@ -14,10 +14,10 @@ from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
+from ..modules.qk_norm_attention import QKNormRoPEAttention
 from ..modules.rms_norm import RMSNorm
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
-from ..modules.qk_norm_attention import QKNormRoPEAttention
 
 OLD_QWEN_ATTENTION = False
 
@@ -37,7 +37,8 @@ if OLD_QWEN_ATTENTION:
                     type=PositionEmbeddingType.from_string(
                         config.rope_scaling["type"]),
                     rope=RopeParams.from_config(config),
-                    mrope_section=config.rope_scaling.get('mrope_section', None))
+                    mrope_section=config.rope_scaling.get(
+                        'mrope_section', None))
                 # if "type" in config.rope_scaling:
                 #     pos_type = config.rope_scaling["type"]
                 # elif "rope_type" in config.rope_scaling:
@@ -70,6 +71,7 @@ if OLD_QWEN_ATTENTION:
             )
 
 else:
+
     class QwenAttention(QKNormRoPEAttention):
 
         def __init__(

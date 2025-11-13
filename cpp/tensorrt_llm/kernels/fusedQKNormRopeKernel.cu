@@ -72,7 +72,7 @@ __global__ void fusedQKNormRopeKernel(
     float high,   // threshold for low frequency
     float attention_factor, // attention_factor applied on cos and sin
     // stop of parameters for yarn
-    bool is_qk_norm        // Whether to apply QK norm
+    bool is_qk_norm // Whether to apply QK norm
 )
 {
     int const warpsPerBlock = blockDim.x / 32;
