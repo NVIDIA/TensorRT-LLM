@@ -1290,6 +1290,13 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                             torch_compile):
         if torch_compile and pp_size > 1:
             pytest.skip("PP with torch.compile is not supported yet.")
+
+        if pp_size > 1 and mtp_nextn > 0:
+            num_hidden_layers = 30
+            pp_partition = [num_hidden_layers // pp_size + 1] * pp_size
+            pp_partition[-1] = num_hidden_layers - sum(pp_partition[:-1])
+        else:
+            pp_partition = None
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
@@ -1307,6 +1314,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         with LLM(self.MODEL_PATH,
                  tensor_parallel_size=tp_size,
                  pipeline_parallel_size=pp_size,
+                 pp_partition=pp_partition,
                  moe_expert_parallel_size=ep_size,
                  kv_cache_config=kv_cache_config,
                  **pytorch_config,
