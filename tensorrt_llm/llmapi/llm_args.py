@@ -1563,11 +1563,20 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "Timeout in milliseconds for KV cache transfer. Requests exceeding this timeout will be cancelled."
     )
 
+    kv_transfer_sender_future_timeout_ms: Optional[int] = Field(
+        default=1000,
+        gt=0,
+        description=
+        "Timeout in milliseconds to wait for the sender future to be ready when scheduled batch size is 0. This allows the request to be eventually cancelled by the user or because of kv_transfer_timeout_ms"
+    )
+
     def _to_pybind(self):
         return _CacheTransceiverConfig(
             backend=_CacheTransceiverBackendType.from_string(self.backend),
             max_tokens_in_buffer=self.max_tokens_in_buffer,
-            kv_transfer_timeout_ms=self.kv_transfer_timeout_ms)
+            kv_transfer_timeout_ms=self.kv_transfer_timeout_ms,
+            kv_transfer_sender_future_timeout_ms=self.
+            kv_transfer_sender_future_timeout_ms)
 
 
 @dataclass
