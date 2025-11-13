@@ -73,11 +73,11 @@ class SessionTracker:
         """Record end time and trigger information collection."""
         self.end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"📅 Session ended: {self.end_time}")
-        
+
         # Prepare log file path
         output_path = EnvManager.get_output_path()
         log_file = os.path.join(output_path, "session_collect.log")
-        
+
         job_name = f"{EnvManager.get_slurm_job_name()}-session-collect"
         run_result = run_job(SESSION_COLLECT_CMD_TYPE, job_name, log_file=log_file)
 

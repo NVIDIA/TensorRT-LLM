@@ -90,11 +90,11 @@ class SlurmRunCommandBuilder:
                 # Install TensorRT-LLM wheel first, then run simple_collect.py
                 # Note: Use --no-deps to avoid overwriting container's pre-installed packages (like torch)
                 install_cmd = f"""
-                    cd {repo_dir}    
+                    cd {repo_dir}
                     echo '📦 Step 1: Installing TensorRT-LLM wheel...'
                     pip3 install {trtllm_wheel_path} || echo '⚠️  Wheel install failed, continuing...'
                     echo '✅ Wheel installation completed'
-                    
+
                     echo '🚀 Step 2: Running simple_collect.py...'
                     cd {work_dir}
                     python3 {work_dir}/simple_collect.py {output_path}
@@ -135,12 +135,12 @@ class SlurmRunCommandBuilder:
 
     def run_job(self, cmd_type: str, job_name: str, log_file: str = None) -> Dict[str, Any]:
         """Execute srun job.
-        
+
         Args:
             cmd_type: Type of command to execute
             job_name: Name for the SLURM job
             log_file: Optional path to save command output
-            
+
         Returns:
             Dict with status and message
         """
@@ -155,13 +155,10 @@ class SlurmRunCommandBuilder:
                 print(f"   📝 Saving output to: {log_file}")
                 # Use Python file redirection to avoid shell quoting issues
                 import subprocess
-                with open(log_file, 'w') as f:
+
+                with open(log_file, "w") as f:
                     result = subprocess.run(
-                        full_command,
-                        stdout=f,
-                        stderr=subprocess.STDOUT,
-                        timeout=7200,
-                        text=True
+                        full_command, stdout=f, stderr=subprocess.STDOUT, timeout=7200, text=True
                     )
                     if result.returncode != 0:
                         raise subprocess.CalledProcessError(result.returncode, full_command)
@@ -169,7 +166,7 @@ class SlurmRunCommandBuilder:
                 output = ""  # Output is in file
             else:
                 output = check_output(full_command, timeout=7200)
-            
+
             return {"status": True, "msg": "Job executed successfully", "output": output}
         except Exception as e:
             print(f"Job execution failed: {e}")
@@ -233,7 +230,7 @@ class JobManager:
     @staticmethod
     def backup_logs(job_id: str, test_config, result_dir: str, is_passed: bool) -> Optional[str]:
         """Backup logs and config files to test_id directory.
-        
+
         Args:
             job_id: SLURM job ID
             test_config: TestConfig object
@@ -255,12 +252,12 @@ class JobManager:
                 print("   📦 Copying result directory to backup...")
                 print(f"   📁 Source: {result_dir}")
                 print(f"   📁 Destination: {backup_dir}")
-                
+
                 # Remove old backup if it exists
                 if os.path.exists(backup_dir):
-                    print(f"   ⚠️  Warning: Backup directory already exists, removing old backup")
+                    print("   ⚠️  Warning: Backup directory already exists, removing old backup")
                     shutil.rmtree(backup_dir)
-                
+
                 shutil.copytree(result_dir, backup_dir)
                 print(f"   ✅ Backup created successfully: {backup_dir}")
 
@@ -290,10 +287,10 @@ class JobManager:
     @staticmethod
     def cleanup_result_dir(result_dir: str) -> bool:
         """Clean up result directory.
-        
+
         Args:
             result_dir: Result directory path
-            
+
         Returns:
             True if successful, False otherwise
         """
@@ -310,10 +307,10 @@ class JobManager:
     @staticmethod
     def get_result_dir(test_config) -> str:
         """Get result directory.
-        
+
         Args:
             test_config: TestConfig object
-            
+
         Returns:
             Result directory path
         """
@@ -355,7 +352,6 @@ class JobManager:
         config_data = test_config.config_data
         # Get result directory
         result_dir = JobManager.get_result_dir(test_config)
-       
 
         # Call the internal implementation method
         check_result = JobManager._check_job_result(
@@ -368,32 +364,38 @@ class JobManager:
             timestamps=timestamps,
             test_name=test_name,
         )
-        
+
         is_passed = check_result["success"]
         # Backup logs and config files
         JobManager.backup_logs(job_id, test_config, result_dir, is_passed)
         # Clean up result directory
         JobManager.cleanup_result_dir(result_dir)
-        
+
         return check_result
 
     @staticmethod
     def check_for_early_failure(job_id: str, test_config) -> tuple[bool, Optional[str]]:
         """Check logs for early failure indicators.
-        
+
         Args:
             job_id: SLURM job ID
             test_config: TestConfig object
-            
+
         Returns:
             tuple: (has_error, error_message)
         """
         # Key error patterns
         error_patterns = [
-            (r"\[E\]\s+Traceback[\s\S]*?mpi4py\.MPI\.Comm\.allgather", "MPI communication error detected"),
-            (r"\[E\]\s+Traceback[\s\S]*?pickle data was truncated", "Pickle serialization error detected"),
+            (
+                r"\[E\]\s+Traceback[\s\S]*?mpi4py\.MPI\.Comm\.allgather",
+                "MPI communication error detected",
+            ),
+            (
+                r"\[E\]\s+Traceback[\s\S]*?pickle data was truncated",
+                "Pickle serialization error detected",
+            ),
         ]
-        
+
         try:
             # Check gen and ctx server logs if result_dir exists
             try:
@@ -406,25 +408,25 @@ class JobManager:
                         if (is_gen_log or is_ctx_log) and filename.endswith(".log"):
                             log_path = os.path.join(result_dir, filename)
                             try:
-                                with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
+                                with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
                                     # Read last 100KB
                                     f.seek(0, 2)
                                     file_size = f.tell()
                                     f.seek(max(0, file_size - 102400), 0)
                                     recent_content = f.read()
-                                    
+
                                     for pattern, error_msg in error_patterns:
                                         if re.search(pattern, recent_content, re.MULTILINE):
                                             return True, f"{error_msg} in {filename}"
                             except Exception as e:
                                 print(f"   ⚠️  Warning: Failed to check {filename}: {e}")
-            except Exception as e:
+            except Exception:
                 # result_dir might not exist yet, that's OK
                 pass
-                
+
         except Exception as e:
             print(f"   ⚠️  Warning: Error during early failure check: {e}")
-        
+
         return False, None
 
     @staticmethod
@@ -449,16 +451,17 @@ class JobManager:
             return "ERROR"
 
     @staticmethod
-    def wait_for_completion(job_id: str, timeout: int = 3600, test_config=None, 
-                           check_early_failure: bool = True) -> tuple[bool, Optional[str]]:
+    def wait_for_completion(
+        job_id: str, timeout: int = 3600, test_config=None, check_early_failure: bool = True
+    ) -> tuple[bool, Optional[str]]:
         """Wait for job completion with optional early failure detection.
-        
+
         Args:
             job_id: SLURM job ID
             timeout: Maximum wait time in seconds
             test_config: TestConfig object (required for early failure detection)
             check_early_failure: Whether to check logs for early failures
-            
+
         Returns:
             tuple: (completed_successfully, error_message)
                 - (True, None): Job completed normally
@@ -508,8 +511,12 @@ class JobManager:
 
             # Check for early failures (only when job is running and test_config is provided)
             current_time = time.time()
-            if (check_early_failure and test_config and status == "RUNNING" and 
-                current_time - last_failure_check >= failure_check_interval):
+            if (
+                check_early_failure
+                and test_config
+                and status == "RUNNING"
+                and current_time - last_failure_check >= failure_check_interval
+            ):
                 has_error, error_msg = JobManager.check_for_early_failure(job_id, test_config)
                 if has_error:
                     print(f"   🚨 Early failure detected: {error_msg}")

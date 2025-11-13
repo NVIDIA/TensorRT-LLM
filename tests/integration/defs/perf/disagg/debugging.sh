@@ -6,6 +6,11 @@ cd /lustre/fsw/portfolios/coreai/users/fredricz/tensorrt_llm/tests/integration/d
 
 source ./perf/disagg/envs/.env_oci
 
+# Skip clang-format, check all files
+$env:SKIP="clang-format"
+pre-commit run --all-files
+
+
 # Local test cases collect
 export WORK_DIR="/mnt/c/code/TensorRT-LLM/tests/integration/defs/perf/disagg"
 export OUTPUT_PATH=/mnt/c/code/TensorRT-LLM/tests/integration/defs/perf/disagg/output

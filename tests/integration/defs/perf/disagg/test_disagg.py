@@ -107,6 +107,7 @@ class TestDisaggBenchmark:
             test_tracker.end_test_case()
             raise e
 
+
 if __name__ == "__main__":
     """Run benchmark tests"""
     pytest.main([__file__, "-v"])
