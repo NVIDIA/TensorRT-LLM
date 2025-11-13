@@ -696,5 +696,7 @@ def create_py_executor(
 
     _adjust_torch_mem_fraction()
 
+    logger.info(f"{llm_args}")
+
     py_executor.start_worker()
     return py_executor
