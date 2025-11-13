@@ -18,6 +18,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/cuteDslKernels/moeUtils.h"
+#include "tensorrt_llm/kernels/moe_utils.cuh"
 #include "tensorrt_llm/kernels/quantization.cuh"
 #include "tensorrt_llm/kernels/quantization.h"
 
@@ -429,7 +430,9 @@ INSTANTIATE_MOE_ACTIVATION(__nv_bfloat16, __nv_bfloat16, uint8_t);
 #endif
 #ifdef ENABLE_FP4
 INSTANTIATE_MOE_ACTIVATION(half, __nv_fp4_e2m1, uint8_t);
+#ifdef ENABLE_BF16
 INSTANTIATE_MOE_ACTIVATION(__nv_bfloat16, __nv_fp4_e2m1, uint8_t);
+#endif
 #endif
 #undef INSTANTIATE_MOE_ACTIVATION
 
