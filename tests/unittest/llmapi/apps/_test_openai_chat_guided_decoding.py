@@ -333,6 +333,7 @@ You are a helpful assistant."""
         model=model_name,
         messages=messages,
         max_completion_tokens=256,
+        temperature=0.0,
         response_format={
             "type": "structural_tag",
             "format": {
