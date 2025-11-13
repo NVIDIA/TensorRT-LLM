@@ -116,6 +116,8 @@ def _triton_ssm_prepare_metadata_fake(
         # chunk offsets is dependent on cu_seqlens, which is in-turn dependent
         # on the input sequence lengths. I don't know of a good way to handle this in fake
         # mode... but what I have here right now doesn't seem to be break anything...:shrug:.
+        # Let's investigate if there is still any upside in insisting on prepare metadata to be
+        # a torch custom op. https://github.com/NVIDIA/TensorRT-LLM/issues/9053.
         torch.empty(num_seq, dtype=torch.int32, device=slot_idx.device),  # chunk indices
         torch.empty(num_seq, dtype=torch.int32, device=slot_idx.device),  # chunk offsets
         torch.empty(1, num_seq, dtype=torch.int32, device=slot_idx.device),  # seq idx prefill
