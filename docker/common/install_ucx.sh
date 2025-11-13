@@ -2,19 +2,21 @@
 set -ex
 
 UCX_VERSION="v1.20.x"
-UCX_COMMIT="f656dbdf93e72e60b5d6ca78b9e3d9e744e789bd"
+GITHUB_URL="https://github.com"
+if [ -n "${GITHUB_MIRROR}" ]; then
+    GITHUB_URL=${GITHUB_MIRROR}
+fi
+
 UCX_INSTALL_PATH="/usr/local/ucx/"
 CUDA_PATH="/usr/local/cuda"
-UCX_REPO="https://github.com/openucx/ucx.git"
 
 mkdir -p /third-party-source
 
 rm -rf ${UCX_INSTALL_PATH}
-git clone -b ${UCX_VERSION} ${UCX_REPO}
-cd ucx
-git checkout ${UCX_COMMIT}
-cd ..
-tar -czf /third-party-source/ucx-${UCX_VERSION}.tar.gz ucx
+curl -L ${GITHUB_URL}/openucx/ucx/archive/refs/tags/${UCX_VERSION}.tar.gz -o ucx-${UCX_VERSION}.tar.gz
+cp ucx-${UCX_VERSION}.tar.gz /third-party-source/
+tar -xzf ucx-${UCX_VERSION}.tar.gz
+mv ucx-${UCX_VERSION} ucx
 cd ucx
 ./autogen.sh
 ./contrib/configure-release       \
