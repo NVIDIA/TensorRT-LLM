@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@dev-yuanjingx-add_custom_ssh_option', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -1000,7 +1000,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     timeout: false,
                     script: Utils.sshUserCmd(
                         remote,
-                        scriptExecPathNode
+                        scriptExecPathNode,
+                        "-o ConnectTimeout=600"
                     )
                 )
             }
