@@ -211,7 +211,7 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vecto
     int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas, void* workspace, CUstream stream, int device,
     int32_t configIndex)
 {
-    std::cout << "run 1" << std::endl;
+    std::cout << "run 1 fixed" << std::endl;
     std::cout << ptrBias << std::endl;
     auto bmm = BatchedGemmInterface();
 
@@ -253,6 +253,9 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vecto
     gemmData.mProblemDimensions.mK = k;
     gemmData.mProblemDimensions.mRank = 0;
     gemmData.mProblemDimensions.mWorldSize = 1;
+    gemmData.mProblemDimensions.mValidM = m;
+    gemmData.mProblemDimensions.mValidN = n;
+    gemmData.mProblemDimensions.mValidK = k;
 
     // Inputs
     gemmData.mInputBuffers.mPtrA = mOptions.transposeMmaOutput ? b : a;
@@ -374,6 +377,9 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(int32_t m
     gemmData.mProblemDimensions.mRank = 0;
     gemmData.mProblemDimensions.mWorldSize = 1;
     gemmData.mProblemDimensions.mMaxNumCtasInTokenDim = maxNumCtasInBatchDim;
+    gemmData.mProblemDimensions.mValidM = m;
+    gemmData.mProblemDimensions.mValidN = n;
+    gemmData.mProblemDimensions.mValidK = k;
     auto cmpFunc = [&configs, &gemmData, &bmm, &multiProcessorCount](int64_t idx0, int64_t idx1)
     {
         auto const& optionsA = configs[idx0].mOptions;
@@ -487,6 +493,9 @@ bool TrtllmGenBatchedGemmRunner::isValidConfigIndex(int32_t configIndex, int32_t
     gemmData.mProblemDimensions.mRank = 0;
     gemmData.mProblemDimensions.mWorldSize = 1;
     gemmData.mProblemDimensions.mMaxNumCtasInTokenDim = maxNumCtasInBatchDim;
+    gemmData.mProblemDimensions.mValidM = m;
+    gemmData.mProblemDimensions.mValidN = n;
+    gemmData.mProblemDimensions.mValidK = k;
 
     auto const& config = configs[configIndex];
 
