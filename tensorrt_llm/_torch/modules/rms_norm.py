@@ -20,6 +20,7 @@ from typing import Optional, Tuple, TypeAlias, Union, cast
 import torch
 from torch import nn
 
+from ..cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..utils import Fp4QuantizedTensor
 
@@ -39,6 +40,7 @@ class RMSNorm(nn.Module):
         has_weights: bool = True,
         use_gemma: bool = False,
         quantize_type: Optional[str] = None,
+        use_cuda_tile: bool = False,
     ):
         super().__init__()
 
@@ -49,6 +51,10 @@ class RMSNorm(nn.Module):
                 raise NotImplementedError(
                     f"Quantize type {quantize_type} not implemented in RMSNorm")
         self.is_nvfp4 = quantize_type == "nvfp4"
+        if use_cuda_tile and not IS_CUDA_TILE_AVAILABLE:
+            raise ValueError(
+                "cuda.tile is not available, please install cuda-tile pypi package"
+            )
 
         if has_weights:
             if not use_gemma:
@@ -65,6 +71,7 @@ class RMSNorm(nn.Module):
                                  persistent=False)
         self.variance_epsilon = eps
         self.use_gemma = use_gemma
+        self.use_cuda_tile = use_cuda_tile
 
     def forward(
         self,
@@ -127,8 +134,30 @@ class RMSNorm(nn.Module):
             hidden_states_fused = Fp4QuantizedTensor(normed_fp4_u8, sf_fused)
             return (hidden_states_fused,
                     residual_out) if has_residual else hidden_states_fused
-
-        if IS_FLASHINFER_AVAILABLE:
+        elif self.use_cuda_tile:
+            if isinstance(residual, torch.Tensor):
+                # Use fused residual kernel
+                hidden_states = hidden_states.contiguous()
+                residual = residual.contiguous()
+                torch.ops.trtllm.cuda_tile_rms_norm_fuse_residual_(
+                    x=hidden_states,
+                    residual=residual,
+                    weight=self.weight,
+                    eps=self.variance_epsilon,
+                    static_persistent=True,
+                    gather=True,
+                    use_gemma=self.use_gemma,
+                )
+            else:
+                hidden_states = torch.ops.trtllm.cuda_tile_rms_norm(
+                    x=hidden_states,
+                    weight=self.weight,
+                    eps=self.variance_epsilon,
+                    static_persistent=True,
+                    gather=True,
+                    use_gemma=self.use_gemma,
+                )
+        elif IS_FLASHINFER_AVAILABLE:
             from ..custom_ops import (flashinfer_fused_add_rmsnorm,
                                       flashinfer_gemma_fused_add_rmsnorm,
                                       flashinfer_gemma_rmsnorm,
