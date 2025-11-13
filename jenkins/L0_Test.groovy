@@ -927,7 +927,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 if (cluster.containerRuntime == ContainerRuntime.ENROOT) {
                     mounts = [
                         "/lustre/fs1/portfolios/coreai/projects/coreai_tensorrt_ci:/scratch.trt_llm_data:ro",
-                        "/home/svc_tensorrt:/home/svc_tensorrt",
                         "/home/svc_tensorrt/.cache:/root/.cache",
                         // workspace needs to be explicitly mounted if container runtime is enroot to avoid chroot error
                         "${jobWorkspace}",
@@ -965,6 +964,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                 srunArgs = [
                     "--container-image=$containerImageArg",
+                    "--container-workdir=/home/svc_tensorrt/bloom/scripts",
                     "--container-mounts=$mounts",
                     "--container-env=NVIDIA_IMEX_CHANNELS"
                 ]
