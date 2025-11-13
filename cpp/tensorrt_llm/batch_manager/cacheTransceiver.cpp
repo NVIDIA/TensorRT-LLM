@@ -142,7 +142,9 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         kvFactor = 1;
     }
     mCacheState = std::make_unique<executor::kv_cache::CacheState>(cacheStateModelCfg, worldConfig,
-        attentionLayerNumPerPP, dataType, attentionType, kvFactor, cacheManager->isEnableBlockReuse());
+        attentionLayerNumPerPP, dataType, attentionType, kvFactor, cacheManager->isEnableBlockReuse(),
+        cacheManager->isEnableIndexerKCache(), cacheManager->getIndexerKCacheIndexHeadDim(),
+        cacheManager->getIndexerKCacheQuantBlockSize());
 
     if (mCacheState->getParallelConfig().mEnableAttentionDP)
     {
@@ -171,7 +173,19 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
 
     std::optional<size_t> maxNumTokens = mCacheTransceiverConfig.value().getMaxTokensInBuffer();
 
-    mCacheTransBufferManager = std::make_unique<kv_cache_manager::CacheTransBufferManager>(cacheManager, maxNumTokens);
+    mCacheTransBufferManagers.push_back(
+        std::make_unique<kv_cache_manager::CacheTransBufferManager>(cacheManager, maxNumTokens));
+    if (isMLA && cacheManager->isEnableIndexerKCache())
+    {
+        mCacheTransBufferManagers.push_back(
+            std::make_unique<kv_cache_manager::CacheTransBufferManager>(cacheManager, maxNumTokens, true));
+    }
+    mCacheTransBufferManagerPtrs.clear();
+    mCacheTransBufferManagerPtrs.reserve(mCacheTransBufferManagers.size());
+    for (auto& manager : mCacheTransBufferManagers)
+    {
+        mCacheTransBufferManagerPtrs.push_back(manager.get());
+    }
     if (backendType.value() == executor::CacheTransceiverConfig::BackendType::UCX)
     {
         std::lock_guard<std::mutex> lock(mDllMutex);
@@ -194,13 +208,13 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     else if (backendType.value() == executor::CacheTransceiverConfig::BackendType::NIXL)
     {
         mManager = std::make_unique<tensorrt_llm::executor::kv_cache::AgentConnectionManager>(
-            mCacheTransBufferManager.get(), *mCacheState, "nixl");
+            mCacheTransBufferManagerPtrs, *mCacheState, "nixl");
         TLLM_LOG_INFO("NIXL Connection Manager created");
     }
     else if (backendType.value() == executor::CacheTransceiverConfig::BackendType::MOONCAKE)
     {
         mManager = std::make_unique<tensorrt_llm::executor::kv_cache::AgentConnectionManager>(
-            mCacheTransBufferManager.get(), *mCacheState, "mooncake");
+            mCacheTransBufferManagerPtrs, *mCacheState, "mooncake");
         TLLM_LOG_INFO("MOONCAKE Connection Manager created");
     }
     else if (backendType.value() == executor::CacheTransceiverConfig::BackendType::MPI)
@@ -215,7 +229,7 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     }
 
     auto makeFormatter = [cacheManager, isMLA, this]()
-    { return createCacheFormatter(cacheManager, mCacheTransBufferManager.get(), isMLA); };
+    { return createCacheFormatter(cacheManager, mCacheTransBufferManagerPtrs, isMLA); };
 
     mCacheSender = std::make_unique<CacheSender>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter());
     mCacheReceiver

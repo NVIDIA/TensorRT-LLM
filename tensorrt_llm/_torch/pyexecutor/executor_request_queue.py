@@ -50,7 +50,7 @@ class ExecutorRequestQueue:
     def __init__(self, dist: Distributed, enable_attention_dp: bool,
                  max_batch_size: int, max_beam_width: int,
                  max_num_active_requests: int, enable_iter_perf_stats: bool,
-                 batch_wait_timeout_ms: float, is_disaggregated: bool):
+                 batch_wait_timeout_ms: float):
         self.dist = dist
         self.request_queue: queue.Queue[RequestQueueItem] = queue.Queue()
         self.waiting_queue: deque[RequestQueueItem] = deque()
@@ -59,7 +59,6 @@ class ExecutorRequestQueue:
         self.max_batch_size = max_batch_size
         self.max_beam_width = max_beam_width
         self.max_num_active_requests = max_num_active_requests
-        self.is_disaggregated = is_disaggregated
         self.enqueue_lock = threading.Lock()
         self.next_request_id = max_batch_size
         self.enable_iter_perf_stats = enable_iter_perf_stats
