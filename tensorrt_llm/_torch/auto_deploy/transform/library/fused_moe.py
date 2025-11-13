@@ -317,7 +317,7 @@ def _find_final_hidden_state_node(
         if not (hasattr(mul_node, "args") and len(mul_node.args) >= 2):
             return None
         index_node = mul_node.args[1]
-        index_add_node = bfs(
+        index_add_node, _ = bfs(
             index_node, lambda n: is_op(n, torch.ops.aten.index_add_), boundary=end_boundary
         )
         if not index_add_node:
@@ -383,7 +383,7 @@ def _remove_dead_inplace_nodes_in_region(
         return is_op(n, {torch.ops.aten.index_add_}) and len(n.users) == 0
 
     try:
-        node_to_remove = bfs(start_boundary, target, attr_next="users", boundary=end_boundary)
+        node_to_remove, _ = bfs(start_boundary, target, attr_next="users", boundary=end_boundary)
         graph.erase_node(node_to_remove)
         return True
     except RuntimeError:
@@ -458,7 +458,7 @@ class MatchMoePattern(BaseTransform):
                 lambda node: is_op(node, torch.ops.aten.one_hot),
                 attr_next="all_input_nodes",
                 boundary=start_boundary,
-            ).args[0]
+            )[0].args[0]
             if not selected_experts:
                 continue
 
@@ -510,7 +510,10 @@ class MatchMoePattern(BaseTransform):
             num_moe_patterns += 1
 
         info = TransformInfo(
-            skipped=False, num_matches=num_moe_patterns, is_clean=False, has_valid_shapes=False
+            skipped=False,
+            num_matches=num_moe_patterns,
+            is_clean=num_moe_patterns == 0,
+            has_valid_shapes=num_moe_patterns == 0,
         )
         return gm, info
 
@@ -754,7 +757,10 @@ class FuseMoe(BaseTransform):
             fused_key_counter = _insert_fused_moe_ops(gm)
 
         info = TransformInfo(
-            skipped=False, num_matches=fused_key_counter, is_clean=False, has_valid_shapes=False
+            skipped=False,
+            num_matches=fused_key_counter,
+            is_clean=fused_key_counter == 0,
+            has_valid_shapes=fused_key_counter == 0,
         )
         return gm, info
 
@@ -779,7 +785,7 @@ class FuseFP8Moe(BaseTransform):
         info = TransformInfo(
             skipped=(fused_key_counter == 0),
             num_matches=fused_key_counter,
-            is_clean=False,
-            has_valid_shapes=False,
+            is_clean=fused_key_counter == 0,
+            has_valid_shapes=fused_key_counter == 0,
         )
         return gm, info

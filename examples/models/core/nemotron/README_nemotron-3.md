@@ -1,4 +1,4 @@
-# Nemotron
+# Nemotron-3
 
 This document demonstrates how to build the Nemotron models using TensorRT LLM and run on a single GPU or multiple GPUs.
 

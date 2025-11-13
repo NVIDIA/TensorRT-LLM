@@ -719,6 +719,7 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
         self,
         inputs: List[torch.Tensor],
         tactic: List[int] = [-1, -1],
+        output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert isinstance(tactic, list)
 
@@ -735,7 +736,7 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
             self.intermediate_size, self.hidden_size_output,
             self.local_expert_offset, self.local_num_experts,
             self.routed_scaling_factor, self.routing_method_type, tactic,
-            args.topk_weights, args.topk_ids)
+            args.topk_weights, args.topk_ids, output)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile,
@@ -852,7 +853,8 @@ def mxe4m3_mxe2m1_block_scale_moe_runner(
         routing_method_type: int,
         act_type: int,
         topk_weights: Optional[torch.Tensor] = None,
-        topk_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+        topk_ids: Optional[torch.Tensor] = None,
+        output: Optional[torch.Tensor] = None) -> torch.Tensor:
 
     tuner = AutoTuner.get()
     kernel_runner = MxE4m3MxE2m1BlockScaleMoERunner(
@@ -905,7 +907,8 @@ def mxe4m3_mxe2m1_block_scale_moe_runner(
     input_tensors[
         0] = routing_logits  # replace dummy routing logits with actual routing logits
     return kernel_runner(input_tensors,
-                         tactic=[-1, -1] if best_tactic == -1 else best_tactic)
+                         tactic=[-1, -1] if best_tactic == -1 else best_tactic,
+                         output=output)
 
 
 @dataclass(frozen=True)
@@ -1003,7 +1006,8 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
             self.n_group, self.topk_group, self.intermediate_size, None,
             self.local_expert_offset, self.local_num_experts,
             self.routed_scaling_factor, self.routing_method_type, tactic,
-            args.topk_weights, args.topk_ids)
+            args.topk_weights, args.topk_ids, None
+        )  # TODO: Currently user provided output is only supported in w4a8_mxfp4_mxfp8
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile,

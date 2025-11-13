@@ -343,6 +343,7 @@ def test_nemotron_h_cuda_graph_overlap_scheduler():
         )
 
 
+@pytest.mark.skip(reason="https://nvbugs/5626259")
 def test_nemotron_h_chunked_prefill():
     # Long prompts (~100 tokens) to make sure chunked prefill is enabled
     # (At the time of development, tokens_per_block isn't configurable from the LLM API,

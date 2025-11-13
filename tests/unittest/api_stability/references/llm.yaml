@@ -18,6 +18,10 @@ methods:
         annotation: Optional[dict]
         default: null
         status: prototype
+      pp_partition:
+        annotation: Optional[List[int]]
+        default: null
+        status: prototype
       # Stats
       iter_stats_max_iterations:
         annotation: Optional[int]
@@ -194,6 +198,10 @@ methods:
       ray_worker_extension_cls:
         annotation: Optional[str]
         default: null
+        status: prototype
+      enable_sleep:
+        annotation: bool
+        default: False
         status: prototype
     return_annotation: None
   generate:

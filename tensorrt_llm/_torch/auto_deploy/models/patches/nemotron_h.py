@@ -7,7 +7,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from einops import rearrange
-from transformers import AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM
 
 from tensorrt_llm._torch.auto_deploy.models.patches.bamba import _bamba_mixer_torch_forward
 
@@ -92,7 +92,7 @@ def _nemotron_h_block_forward(
 def _nemotron_h_moe_forward(self, hidden_states: torch.Tensor):
     """
     Uses NemotronH router (returns indices, weights) and dispatches through auto_deploy::torch_moe
-    with act_fn='relu2'. Falls back to original forward if any expert has bias.
+    with act_fn='relu2'. Handles both latent MOE and direct MOE architectures.
     """
 
     residuals = hidden_states
@@ -100,6 +100,14 @@ def _nemotron_h_moe_forward(self, hidden_states: torch.Tensor):
     topk_indices, topk_weights = self.gate(hidden_states)
     x_flat = hidden_states.view(-1, hidden_states.shape[-1])
 
+    # Check if this is a latent MOE (has fc1_latent_proj and fc2_latent_proj)
+    has_latent_proj = hasattr(self, "fc1_latent_proj") and hasattr(self, "fc2_latent_proj")
+
+    if has_latent_proj:
+        # Latent MOE: project to latent space before routing
+        x_flat = self.fc1_latent_proj(x_flat)
+
+    # Route through experts (operates in latent space if latent MOE, full space otherwise)
     out_flat = torch.ops.auto_deploy.torch_moe(
         x_flat,
         topk_indices,
@@ -110,6 +118,10 @@ def _nemotron_h_moe_forward(self, hidden_states: torch.Tensor):
         act_fn="relu2",
         mlp_style="mlp",
     )
+
+    if has_latent_proj:
+        # Latent MOE: project back from latent space
+        out_flat = self.fc2_latent_proj(out_flat)
 
     out = out_flat.view(*orig_shape)
     out = out + self.shared_experts(residuals)
@@ -143,6 +155,34 @@ def get_model_from_config_patched(config, **kwargs):
 
 # TODO: figure out how this can be incorporated into the export patch system
 AutoModelForCausalLM.from_config = get_model_from_config_patched
+
+_config_from_pretrained_original = AutoConfig.from_pretrained
+_nemotron_h_base_model_tp_plan = {
+    "in_proj": "mamba",
+    "out_proj": "rowwise",
+    "q_proj": "colwise",
+    "k_proj": "colwise",
+    "v_proj": "colwise",
+    "o_proj": "rowwise",
+    "up_proj": "colwise",
+    "down_proj": "rowwise",
+    # "*": "gather",
+}
+
+
+def get_config_from_pretrained_patched(*args, **kwargs):
+    ret = _config_from_pretrained_original(*args, **kwargs)
+    config = ret[0] if isinstance(ret, tuple) else ret
+    # heuristic to check if it's a NemotronH MoE Model
+    model_type = getattr(config, "model_type", None)
+    num_moe_layers = getattr(config, "layers_block_type", []).count("moe")
+    if model_type == "nemotron_h" and num_moe_layers > 0:
+        config.base_model_tp_plan = _nemotron_h_base_model_tp_plan
+    return (config, *ret[1:]) if isinstance(ret, tuple) else config
+
+
+# TODO: figure out how this can be incorporated into the export patch system
+AutoConfig.from_pretrained = get_config_from_pretrained_patched
 
 # TODO: figure out how this can be incorporated into the export patch system
 # Only patch if the module isn't available
