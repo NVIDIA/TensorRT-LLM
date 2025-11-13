@@ -228,13 +228,6 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # Only consider sequences that are long enough for sparse kv indices prediction in context phase
         self.k_context_lens[:valid_batch_size] = self.prompt_lens_cpu[
             valid_seq_indices] - self.window_size
-        if valid_batch_size > 0:
-            # Maximum context length of RocketKV key for valid sequences for padding
-            self.max_rocket_k_ctx_len = self.k_context_lens[:
-                                                            valid_batch_size].max(
-                                                            ).item()
-        else:
-            self.max_rocket_k_ctx_len = 0
 
         sparse_counts_ctx = torch.zeros(self.num_contexts,
                                         dtype=torch.int32,
@@ -258,6 +251,17 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.k_context_lens[:valid_batch_size], dim=0)
         self.k_cu_seqlens_cuda[:valid_batch_size + 1].copy_(
             self.k_cu_seqlens[:valid_batch_size + 1], non_blocking=True)
+
+        if valid_batch_size > 0:
+            # Maximum context length of RocketKV key for valid sequences for padding
+            self.max_rocket_k_ctx_len = self.k_context_lens[:
+                                                            valid_batch_size].max(
+                                                            ).item()
+            self.total_rocket_k_ctx_tokens = self.k_cu_seqlens[
+                valid_batch_size].item()
+        else:
+            self.max_rocket_k_ctx_len = 0
+            self.total_rocket_k_ctx_tokens = 0
 
         self.valid_batch_size = valid_batch_size
         self.total_sparse_ctx_indices = self.sparse_offsets_ctx[
@@ -357,6 +361,7 @@ class RocketTrtllmAttention(TrtllmAttention):
                 metadata.context_cumsum_cuda,
                 metadata.valid_seq_indices_cuda,
                 metadata.k_cu_seqlens_cuda,
+                metadata.total_rocket_k_ctx_tokens,
                 self.num_heads,
                 self.num_kv_heads,
                 self.head_dim,
@@ -453,20 +458,15 @@ class RocketTrtllmAttention(TrtllmAttention):
         q = q.view(-1, self.num_kv_heads, self.num_heads // self.num_kv_heads,
                    self.head_dim)
 
-        q_abs = torch.abs(q)
-        q_mask = torch.zeros_like(q)
+        return q, k
 
-        i1 = torch.topk(q_abs.mean(dim=2, keepdim=True), self.topr,
+    @torch.compile(dynamic=True)
+    def topr_filter(self, q: torch.Tensor) -> torch.Tensor:
+        i1 = torch.topk(q.abs().sum(dim=2, keepdim=True), self.topr,
                         dim=-1).indices
-
+        q_mask = torch.zeros_like(q)
         q_mask.scatter_(-1, i1.expand_as(q[..., :self.topr]), 1)
-
-        q_valid = q * q_mask
-
-        dim_pos = torch.where(q_valid.sum(dim=2) > 0, self.head_dim,
-                              0).to(torch.int32)
-
-        return q_valid, k, dim_pos
+        return q * q_mask
 
     def sparse_attn_predict(
         self,
@@ -478,7 +478,10 @@ class RocketTrtllmAttention(TrtllmAttention):
         if metadata.num_generations == 0:
             return None, None
 
-        q, k, dim_pos = self.preprocess_for_gen(q, k, metadata)
+        q, k = self.preprocess_for_gen(q, k, metadata)
+
+        if self.topr < self.head_dim:
+            q = self.topr_filter(q)
 
         kt_cache_tensor = metadata.kv_cache_manager.get_kt_buffers(
             self.layer_idx)
@@ -501,7 +504,6 @@ class RocketTrtllmAttention(TrtllmAttention):
             q,
             kt_cache_tensor,
             metadata.kt_cache_block_offsets[metadata.num_contexts:],
-            dim_pos,
             metadata.kv_lens_cuda_runtime[metadata.num_contexts:],
             metadata.cum_kt_lens_cuda,
             metadata.page_size,
