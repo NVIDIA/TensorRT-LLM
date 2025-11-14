@@ -1,7 +1,7 @@
 # DeepSeek‑V3, DeepSeek-R1, and DeepSeek-V3.2-Exp
 
 This guide walks you through the examples to run the DeepSeek‑V3/DeepSeek-R1/DeepSeek-V3.2-Exp models using NVIDIA's TensorRT LLM framework with the PyTorch backend.
-**DeepSeek-R1 and DeepSeek-V3 share exact same model architecture other than weights differences, and share same code path in TensorRT-LLM. DeepSeek-V3.2-Exp features DeepSeek Sparse Attention (DSA), but otherwise shares the same code as DeepSeek-R1 and DeepSeek-V3 in TensorRT-LLM. For brevity we only provide one model example, the example command to be used interchangeably by only replacing the model name to the other one**.
+**DeepSeek-R1 and DeepSeek-V3 share exact same model architecture other than weights differences, and share same code path in TensorRT LLM. DeepSeek-V3.2-Exp features DeepSeek Sparse Attention (DSA), but otherwise shares the same code as DeepSeek-R1 and DeepSeek-V3 in TensorRT LLM. For brevity we only provide one model example, the example command to be used interchangeably by only replacing the model name to the other one**.
 
 
 To benchmark the model with best configurations, refer to [DeepSeek R1 benchmarking blog](../../../../docs/source/blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.md).
@@ -89,7 +89,7 @@ To quickly run DeepSeek-V3, [examples/llm-api/quickstart_advanced.py](../llm-api
 cd examples/llm-api
 python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --tp_size 8
 ```
-Please include `--tokens_per_block 64` when running DeepSeek-V3.2-Exp, as this model requires a KV cache block size of 64.
+Please include `--tokens_per_block 64` when running DeepSeek-V3.2-Exp, as this model uses the deep_gemm.fp8_paged_mqa_logits kernel, which requires a KV cache block size of 64.
 
 The model will be run by PyTorch backend and generate outputs like:
 ```
@@ -747,7 +747,7 @@ FP8 KV Cache and MLA quantization could be enabled, which delivers two key perfo
 - Compression of the latent KV cache enables larger batch sizes, resulting in higher throughput;
 - MLA kernel of the generation phase is accelerated by FP8 arithmetic and reduced KV cache memory access.
 
-FP8 KV Cache and MLA is supported on Hopper and Blackwell for DeepSeek-V3 and DeepSeek-R1, while it is only supported on Blackwell for DeepSeek-V3.2-Exp. The accuracy loss is small, with GSM8k accuracy drop less than 1%.
+FP8 KV Cache and MLA is supported on Hopper and Blackwell for DeepSeek-V3 and DeepSeek-R1, while it is only supported on Blackwell for DeepSeek-V3.2-Exp. The accuracy loss is small, with GPQA accuracy drop less than 1%.
 - On Hopper we use the [FP8 FlashMLA kernel](https://github.com/deepseek-ai/FlashMLA/pull/54) from community.
 - On Blackwell we use the kernel generated from an internal code-gen based solution called `trtllm-gen`.
 
@@ -865,7 +865,7 @@ python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --enable_chunked_pref
 - **Configuration Files:** Verify that the configuration files are correctly formatted to avoid runtime issues.
 
 ## Known Issues
-- DeepSeek-V3.2-Exp cannot support KV Cache Reuse and Chunked Prefill now. When running `quickstart_advanced.py`, please include `--disable_kv_cache_reuse` to disable KV Cache Reuse. When using `trtllm-eval`/`trtllm-serve`/`trtllm-bench`, please include the following configuration in the extra llm_api options:
+- Support for KV Cache Reuse and Chunked Prefill in DeepSeek-V3.2-Exp is currently under development. When running `quickstart_advanced.py`, please include `--disable_kv_cache_reuse` to disable KV Cache Reuse. When using `trtllm-eval`/`trtllm-serve`/`trtllm-bench`, please include the following configuration in the extra llm_api options:
 ```
 kv_cache_config:
     enable_block_reuse: false
