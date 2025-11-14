@@ -127,16 +127,3 @@ job_id=${SLURM_JOB_ID}
 if [ -n "${job_id}" ]; then
     echo "${SLURM_JOB_NODELIST}" > ${log_path}/job_${job_id}.txt
 fi
-
-echo "Benchmark done, gracefully shutting down server and workers..."
-kill -9 $(ps aux | grep '[s]tart_server.sh' | awk '{print $2}') >/dev/null 2>&1 || true
-kill -9 $(ps aux | grep '[s]tart_worker.sh' | awk '{print $2}') >/dev/null 2>&1 || true
-kill -9 $(ps aux | grep '[t]rtllm-serve' | awk '{print $2}') >/dev/null 2>&1 || true
-sleep 20  # Give processes some time to clean up
-
-# Check if there are any remaining processes
-if pgrep -f "trtllm-serve"; then
-    echo "Warning: Some processes may still be running"
-else
-    echo "All processes successfully terminated"
-fi

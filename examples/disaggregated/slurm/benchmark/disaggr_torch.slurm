@@ -36,9 +36,16 @@ full_logdir=${24}
 container_mount=${25}
 container_image=${26}
 build_wheel=${27}
+trtllm_wheel_path=${28}
 
 # Profiling
-nsys_on=${28}
+nsys_on=${29}
+
+# Accuracy evaluation
+enable_accuracy_test=${30}
+accuracy_model=${31}
+accuracy_tasks=${32}
+model_args_extra=${33}
 
 # Print all parsed arguments
 echo "Parsed arguments:"
@@ -74,12 +81,18 @@ echo "  container_image: ${container_image}"
 echo "  model_path: ${model_path}"
 echo "  trtllm_repo: ${trtllm_repo}"
 echo "  build_wheel: ${build_wheel}"
+echo "  trtllm_wheel_path: ${trtllm_wheel_path}"
 echo "  work_dir: ${work_dir}"
 echo "  nsys_on: ${nsys_on}"
+echo
+echo "Accuracy Configuration:"
+echo "  enable_accuracy_test: ${enable_accuracy_test}"
+echo "  accuracy_model: ${accuracy_model}"
+echo "  accuracy_tasks: ${accuracy_tasks}"
+echo "  model_args_extra: ${model_args_extra}"
 
 container_name="disaggr-test"
 
-# Log directory is now passed directly
 echo "Log directory: ${full_logdir}"
 
 # Function to cleanup on failure
@@ -102,8 +115,20 @@ if ! srun -l --container-image=${container_image} \
     cleanup_on_failure "Failed to start container. Check ${full_logdir}/container_launch.log"
 fi
 
-# Build TensorRT-LLM if needed
-if [ -d "${trtllm_repo}" ]; then
+# Install TensorRT-LLM
+if [ -n "${trtllm_wheel_path}" ]; then
+    # Install from pre-built wheel if path is provided
+    echo "Installing TensorRT-LLM from wheel: ${trtllm_wheel_path}..."
+    if ! srun --container-name=${container_name} \
+        --container-mounts=${container_mount} --no-container-mount-home \
+        --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
+        bash -c "pip install ${trtllm_wheel_path}" \
+        &> ${full_logdir}/install.log; then
+        cleanup_on_failure "TensorRT-LLM wheel installation failed. Check ${full_logdir}/install.log for details"
+    fi
+    echo "TensorRT-LLM wheel installation completed successfully"
+elif [ -d "${trtllm_repo}" ]; then
+    # Build and install from repository if no wheel path provided
     echo "Installing TensorRT-LLM from ${trtllm_repo}..."
     TRT_LLM_GIT_COMMIT=$(git -C ${trtllm_repo} rev-parse --short HEAD 2>/dev/null || echo "unknown")
     echo "TRT_LLM_GIT_COMMIT: ${TRT_LLM_GIT_COMMIT}"
@@ -202,6 +227,21 @@ srun -l --container-name=${container_name} \
     bash ${work_dir}/start_server.sh ${num_ctx_servers} ${num_gen_servers} ${full_logdir} ${work_dir} \
     &> ${full_logdir}/output_server.log &
 
+# Run accuracy evaluation if enabled
+if [ "${enable_accuracy_test}" = "true" ]; then
+    echo "Starting accuracy evaluation..."
+    if ! srun -l --container-name=${container_name} \
+        --container-mounts=${container_mount} \
+        --mpi=pmix --overlap -N 1 -n 1 \
+        bash ${work_dir}/accuracy_eval.sh \
+        "${full_logdir}" "${accuracy_model}" "${accuracy_tasks}" "${model_path}" \
+        "${model_args_extra}" \
+        &> ${full_logdir}/accuracy_eval.log; then
+        cleanup_on_failure "Accuracy evaluation failed. Check ${full_logdir}/accuracy_eval.log for details"
+    fi
+    echo "Accuracy evaluation completed successfully"
+fi
+
 # Start benchmarking
 echo "Starting benchmark..."
 if [ "${use_nv_sa_benchmark}" = "true" ]; then
@@ -226,6 +266,7 @@ else
     fi
 fi
 echo "Benchmark completed successfully"
+
 echo "Total runtime: $SECONDS seconds"
 
 # try to kill the server and workers
