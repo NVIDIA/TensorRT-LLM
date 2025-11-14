@@ -2565,8 +2565,7 @@ class PyTorchModelEngine(ModelEngine):
                                        new_tensors_device,
                                        cache_indirection_buffer,
                                        num_accepted_tokens_device,
-                                       req_id_to_old_request,
-                                       resource_manager)
+                                       req_id_to_old_request, resource_manager)
 
     @torch.inference_mode()
     @with_model_extra_attrs(lambda self: self.model.extra_attrs)
@@ -2654,7 +2653,8 @@ class PyTorchModelEngine(ModelEngine):
             inputs, gather_ids = self._prepare_inputs(
                 padded_requests, kv_cache_manager, attn_metadata, spec_metadata,
                 new_tensors_device, cache_indirection_buffer,
-                num_accepted_tokens_device, req_id_to_old_request, resource_manager)
+                num_accepted_tokens_device, req_id_to_old_request,
+                resource_manager)
 
             self.iter_counter += 1
             with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
