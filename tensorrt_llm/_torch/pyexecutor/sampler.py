@@ -865,7 +865,12 @@ class TorchSampler(Sampler):
 
         return False
 
-    def _handle_finish_reasons(self, request: LlmRequest, finish_reasons: torch.Tensor):
+    def _handle_finish_reasons(
+        self,
+        request: LlmRequest,
+        finish_reasons: torch.Tensor,
+        finish_reasons_list: list[list[list[int]]],
+    ):
         """Check if all beams of a request have finished and set the request state accordingly
 
         Args:
@@ -884,7 +889,7 @@ class TorchSampler(Sampler):
             request.state = LlmRequestState.GENERATION_COMPLETE
             for beam_idx in range(request.sampling_config.beam_width):
                 request.set_finished_reason(
-                    finish_reasons[DEFAULT_STEP_IDX, request.py_seq_slot, beam_idx], beam_idx
+                    finish_reasons_list[request.py_seq_slot][DEFAULT_STEP_IDX][beam_idx], beam_idx
                 )
             return True
         return False
@@ -944,8 +949,8 @@ class TorchSampler(Sampler):
         count: int,
     ):
         if request.py_return_log_probs:
+            beam_width = request.sampling_config.beam_width
             if self._use_beam_search:
-                beam_width = request.sampling_config.beam_width
                 topk_log_probs_vals = self.store.new_log_probs[request.py_seq_slot].view(
                     beam_width, count, -1
                 )
@@ -1589,7 +1594,7 @@ class TorchSampler(Sampler):
                 for beam_idx in range(req.sampling_config.beam_width):
                     add_token(req, new_tokens_list, beam_idx=beam_idx)
                 self.handle_logprobs(req, state, count=1)
-            self._handle_finish_reasons(req, state.host.finish_reasons)
+            self._handle_finish_reasons(req, state.host.finish_reasons, finish_reasons)
             req.py_decoding_iter += 1
 
         for req_idx, req in enumerate(
@@ -1610,7 +1615,7 @@ class TorchSampler(Sampler):
                         # Beam search does not support speculative decoding.
                         add_token(req, new_tokens_list, beam_idx=beam_idx)
                     self.handle_logprobs(req, state, count=1)
-                self._handle_finish_reasons(req, state.host.finish_reasons)
+                self._handle_finish_reasons(req, state.host.finish_reasons, finish_reasons)
                 req.py_num_accepted_draft_tokens = 0
                 req.py_rewind_len = 0
 
