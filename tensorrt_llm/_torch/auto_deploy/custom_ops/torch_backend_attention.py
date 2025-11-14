@@ -363,6 +363,7 @@ def torch_backend_prepare_metadata(
     pages_per_seq: torch.Tensor,
     slot_idx: torch.Tensor,
     page_size: int,
+    chunk_size: int,
 ) -> List[torch.Tensor]:
     """Prepare metadata for torch backend attention (similar to triton backend)."""
     num_seq = SequenceInfo._get_sanitized_num_sequences(position_ids, seq_len)
