@@ -17,8 +17,8 @@ l0_gb202:
   # ------------- PyTorch tests ---------------
   - unittest/_torch/modeling -k "modeling_mllama"
   - unittest/_torch/modeling -k "modeling_out_of_tree"
-  - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_nvfp4[dtype0]
-  - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_nvfp4[dtype1]
+  - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_nvfp4[CUTLASS-dtype0]
+  - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_nvfp4[CUTLASS-dtype1]
   # - unittest/_torch/modeling -k "modeling_qwen" # https://nvbugs/5234573
   - unittest/_torch/attention/test_attention_mla.py
   - test_e2e.py::test_ptp_quickstart_bert[VANILLA-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]

@@ -94,10 +94,6 @@ set(TOP_LEVEL_DIR "${PROJECT_SOURCE_DIR}/..")
 target_compile_definitions(${BATCH_MANAGER_STATIC_TARGET}
                            PUBLIC TOP_LEVEL_DIR="${TOP_LEVEL_DIR}")
 
-if(ENABLE_CUFILE)
-  target_link_libraries(${BATCH_MANAGER_STATIC_TARGET} PUBLIC ${CUFILE_LIBRARY})
-endif()
-
 if(ENABLE_UCX)
   find_package(ucx REQUIRED)
   find_package(ucxx REQUIRED)
@@ -107,3 +103,8 @@ if(ENABLE_UCX)
   target_link_libraries(${BATCH_MANAGER_STATIC_TARGET} PUBLIC)
 
 endif()
+
+find_library(TORCH_PYTHON_LIB torch_python REQUIRED
+             HINTS ${TORCH_INSTALL_PREFIX}/lib)
+target_link_libraries(${BATCH_MANAGER_STATIC_TARGET}
+                      PUBLIC ${TORCH_PYTHON_LIB} Python3::Python pg_utils)

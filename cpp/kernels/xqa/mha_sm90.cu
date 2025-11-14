@@ -2078,9 +2078,13 @@ __device__ inline RegColWiseVec loadGmemColWiseVecWithDup(ShmQWiseVec const& gme
     for (uint32_t i = 0; i < exactDiv(ShmQWiseVec::size, gmma::instNBase); i++)
     {
         static_assert(nbThrdsPerInstNBase * RegColWiseVec::size == exactDiv(ShmQWiseVec::size, GmmaAccCoreMat::cols));
-        ret[i] = reinterpret_cast<
-            Vec<Vec<float, GmmaAccCoreMat::cols>, exactDiv(ShmQWiseVec::size, GmmaAccCoreMat::cols)> const&>(
-            gmemVec)[mha::min(i * nbThrdsPerInstNBase + idx, bound)];
+        uint32_t const clampedIdx = mha::min(i * nbThrdsPerInstNBase + idx, bound);
+        uint32_t const baseOffset = clampedIdx * GmmaAccCoreMat::cols;
+#pragma unroll
+        for (uint32_t j = 0; j < GmmaAccCoreMat::cols; j++)
+        {
+            ret[i][j] = gmemVec[baseOffset + j];
+        }
     }
     return ret;
 }

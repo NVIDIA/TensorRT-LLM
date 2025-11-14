@@ -34,17 +34,18 @@ void test(bool const isTestValid, SizeType32 beamWidth = 1, std::optional<SizeTy
     std::optional<RandomSeedType> randomSeed = no, std::optional<FloatType> temperature = no,
     std::optional<SizeType32> minLength = no, std::optional<FloatType> beamSearchDiversityRate = no,
     std::optional<FloatType> repetitionPenalty = no, std::optional<FloatType> presencePenalty = no,
-    std::optional<FloatType> frequencyPenalty = no, std::optional<FloatType> lengthPenalty = no,
-    std::optional<SizeType32> earlyStopping = no, std::optional<SizeType32> noRepeatNgramSize = no,
-    std::optional<SizeType32> numReturnSequences = no, std::optional<FloatType> minP = no,
-    std::optional<std::vector<SizeType32>> beamWidthArray = no)
+    std::optional<FloatType> frequencyPenalty = no, std::optional<SizeType32> promptIgnoreLength = no,
+    std::optional<FloatType> lengthPenalty = no, std::optional<SizeType32> earlyStopping = no,
+    std::optional<SizeType32> noRepeatNgramSize = no, std::optional<SizeType32> numReturnSequences = no,
+    std::optional<FloatType> minP = no, std::optional<std::vector<SizeType32>> beamWidthArray = no)
 {
-    // 19 parameters for SamplingConfig, from `beamWidth` to `beamWidthArray`
+    // 20 parameters for SamplingConfig, from `beamWidth` to `beamWidthArray`
     try
     {
         auto sc = SamplingConfig(beamWidth, topK, topP, topPMin, topPResetIds, topPDecay, randomSeed, temperature,
-            minLength, beamSearchDiversityRate, repetitionPenalty, presencePenalty, frequencyPenalty, lengthPenalty,
-            earlyStopping, noRepeatNgramSize, numReturnSequences, minP, beamWidthArray);
+            minLength, beamSearchDiversityRate, repetitionPenalty, presencePenalty, frequencyPenalty,
+            promptIgnoreLength, lengthPenalty, earlyStopping, noRepeatNgramSize, numReturnSequences, minP,
+            beamWidthArray);
 
         // Come here if `sc` is valid
         if (!isTestValid)
@@ -102,18 +103,20 @@ TEST(SamplingConfigTest, validInputs)
     test(true, 1, no, no, no, no, no, no, no, no, no, no, 1.f);
     // Frequency penalty
     test(true, 1, no, no, no, no, no, no, no, no, no, no, no, 1.f);
+    // Prompt ignore length
+    test(true, 1, no, no, no, no, no, no, no, no, no, no, no, no, 1);
     // Length penalty
-    test(true, 1, no, no, no, no, no, no, no, no, no, no, no, no, 1.f);
-    // Early stopping
     test(true, 1, no, no, no, no, no, no, no, no, no, no, no, no, no, 1.f);
+    // Early stopping
+    test(true, 1, no, no, no, no, no, no, no, no, no, no, no, no, no, no, 1.f);
     // No repeat ngram size
-    test(true, 1, no, no, no, no, no, no, no, no, no, no, no, no, no, no, 2);
+    test(true, 1, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, 2);
     // NumReturnSequences
-    test(true, 4, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, 2);
+    test(true, 4, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, 2);
     // MinP
-    test(true, 1, no, 0.9, no, no, no, no, no, no, no, no, no, no, no, no, no, no, 0.5f);
+    test(true, 1, no, 0.9, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, 0.5f);
     // BeamWidthArray
-    test(true, 5, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no,
+    test(true, 5, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no,
         std::vector<SizeType32>{2, 3, 4, 5});
 }
 
@@ -156,32 +159,35 @@ TEST(SamplingConfigTest, invalidInputs)
 
     // Skip presence penalty, frequency penalty, no test
 
-    // Neg length penalty
+    // Neg prompt ignore length
     test(false, 1, no, no, no, no, no, no, no, no, no, no, no, no, -1);
 
-    // Neg early stopping
+    // Neg length penalty
     test(false, 1, no, no, no, no, no, no, no, no, no, no, no, no, no, -1);
 
-    // Neg no repeat ngram size
+    // Neg early stopping
     test(false, 1, no, no, no, no, no, no, no, no, no, no, no, no, no, no, -1);
 
+    // Neg no repeat ngram size
+    test(false, 1, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, -1);
+
     // Neg or zero numReturnSequences
-    test(false, 1, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, 0);
+    test(false, 1, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, 0);
 
     // numReturnSequences > beamWidth
-    test(false, 2, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, 4);
+    test(false, 2, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, 4);
 
     // Neg minP
-    test(false, 1, no, 0.9, no, no, no, no, no, no, no, no, no, no, no, no, no, no, -1.f);
+    test(false, 1, no, 0.9, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, -1.f);
 
     // Neg / Large minP
-    test(false, 1, no, 0.9, no, no, no, no, no, no, no, no, no, no, no, no, no, no, -1.f);
-    test(false, 1, no, 0.9, no, no, no, no, no, no, no, no, no, no, no, no, no, no, +2.f);
+    test(false, 1, no, 0.9, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, -1.f);
+    test(false, 1, no, 0.9, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, +2.f);
 
     // BeamWidthArray with neg / large beamWidth
-    test(false, 4, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no,
+    test(false, 4, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no,
         std::vector<SizeType32>{2, 3, 4, -1});
-    test(false, 4, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no,
+    test(false, 4, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no,
         std::vector<SizeType32>{2, 3, 4, 65536});
 }
 
@@ -264,6 +270,12 @@ TEST(SamplingConfigTest, getterSetter)
         auto sc = SamplingConfig();
         sc.setFrequencyPenalty(0.5f);
         EXPECT_EQ(sc.getFrequencyPenalty(), 0.5f);
+    }
+    // Prompt ignore length
+    {
+        auto sc = SamplingConfig();
+        sc.setPromptIgnoreLength(1);
+        EXPECT_EQ(sc.getPromptIgnoreLength(), 1);
     }
     // Length penalty
     {

@@ -83,7 +83,7 @@ protected:
 
         mCacheManager = std::make_unique<KVCacheManager>(numLayers, numHeads, sizePerHead, tokensPerBlock,
             blocksPerWindow, maxNumSequences, maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow},
-            std::nullopt, dataType, sinkTokenLength, stream, std::nullopt, enableBlockReuse, onboardBlocks, cacheType,
+            std::nullopt, dataType, sinkTokenLength, stream, kvMaxNumTokens, enableBlockReuse, onboardBlocks, cacheType,
             std::nullopt, nullptr, true);
 
         mCacheManager->allocatePools(false);
@@ -108,9 +108,11 @@ protected:
 
 TEST_F(AgentCommTest, AgentConnectionManagerBasic)
 {
-    auto connectionManager = std::make_unique<AgentConnectionManager>(mTransBufferManager.get(), *mCacheState);
+    std::vector<CacheTransBufferManager*> bufferManagers{mTransBufferManager.get()};
+    auto connectionManager = std::make_unique<AgentConnectionManager>(bufferManagers, *mCacheState);
     ASSERT_TRUE(connectionManager != nullptr);
-    ASSERT_TRUE(connectionManager->getCacheTransBufferManager() != nullptr);
+    ASSERT_EQ(connectionManager->getCacheTransBufferManagers().size(), bufferManagers.size());
+    ASSERT_TRUE(connectionManager->getCacheTransBufferManagers().front() != nullptr);
     ASSERT_EQ(connectionManager->getDeviceId(), 0);
     ASSERT_TRUE(!connectionManager->getAgentName().empty());
     ASSERT_TRUE(connectionManager->getAgent() != nullptr);
@@ -121,8 +123,9 @@ TEST_F(AgentCommTest, AgentConnectionManagerBasic)
 
 TEST_F(AgentCommTest, AgentConnectionManagerConnect)
 {
-    auto connectionManager0 = std::make_unique<AgentConnectionManager>(mTransBufferManager.get(), *mCacheState);
-    auto connectionManager1 = std::make_unique<AgentConnectionManager>(mTransBufferManager.get(), *mCacheState);
+    std::vector<CacheTransBufferManager*> bufferManagers{mTransBufferManager.get()};
+    auto connectionManager0 = std::make_unique<AgentConnectionManager>(bufferManagers, *mCacheState);
+    auto connectionManager1 = std::make_unique<AgentConnectionManager>(bufferManagers, *mCacheState);
     auto agentName0 = connectionManager0->getAgentName();
     auto agentName1 = connectionManager1->getAgentName();
     ASSERT_TRUE(!agentName0.empty());
@@ -144,18 +147,18 @@ TEST_F(AgentCommTest, AgentConnectionManagerConnect)
     tensorrt_llm::executor::DataTransceiverState dataTransceiverState0{cacheState0, commState0};
     tensorrt_llm::executor::DataTransceiverState dataTransceiverState1{cacheState1, commState1};
     tensorrt_llm::batch_manager::RequestInfo sendRequestInfo{requestId, dataTransceiverState0};
-    size_t cacheBufferId = 0;
+    std::vector<std::optional<size_t>> cacheBufferIds{std::optional<size_t>{0}};
     int validConnectionIdx = 0;
     // convert to AgentConnection
     auto agentConnection0 = const_cast<tensorrt_llm::executor::kv_cache::AgentConnection*>(
         dynamic_cast<tensorrt_llm::executor::kv_cache::AgentConnection const*>(connection0));
-    agentConnection0->sendRequestAndBufferInfo(sendRequestInfo, cacheBufferId, validConnectionIdx);
+    agentConnection0->sendRequestAndBufferInfo(sendRequestInfo, cacheBufferIds, validConnectionIdx);
 
     tensorrt_llm::batch_manager::RequestInfo recvRequestInfo;
     auto connection1 = connectionManager1->recvConnectionAndRequestInfo(recvRequestInfo);
     ASSERT_EQ(recvRequestInfo.getRequestId(), requestId);
 
-    auto sendBuffer = mTransBufferManager->getSendBuffer(cacheBufferId);
+    auto sendBuffer = mTransBufferManager->getSendBuffer(cacheBufferIds[0].value());
     auto sendSize = 1024;
     std::vector<char> sendData(sendSize);
     std::fill(sendData.begin(), sendData.end(), 'a');
@@ -172,7 +175,7 @@ TEST_F(AgentCommTest, AgentConnectionManagerConnect)
 
     future.wait();
 
-    auto recvBuffer = mTransBufferManager->getRecvBuffer(cacheBufferId);
+    auto recvBuffer = mTransBufferManager->getRecvBuffer(cacheBufferIds[0].value());
     std::vector<char> recvData(sendSize);
     TLLM_CUDA_CHECK(cudaMemcpy(recvData.data(), recvBuffer->data(), sendSize, cudaMemcpyDeviceToHost));
     for (size_t i = 0; i < sendSize; i++)

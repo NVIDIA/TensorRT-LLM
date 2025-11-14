@@ -284,8 +284,8 @@ void verifyOutput(RequestList const& finishedRequestList,
 }
 
 // Pick a different endId at random from one of the expected tokens
-std::vector<TokenIdType> pickRandomEndIds(TestData const& testData, TrtGptModelType const& modelType,
-    std::vector<SizeType32> const& givenInputLengths, SizeType32 const maxNewTokens, bool replaceLogits)
+std::vector<TokenIdType> pickRandomEndIds(TestData const& testData, std::vector<SizeType32> const& givenInputLengths,
+    SizeType32 const maxNewTokens, bool replaceLogits)
 {
     auto const nbGivenInputs = testData.nbGivenInputs;
     auto const beamWidth = testData.beamWidth;
@@ -328,9 +328,9 @@ std::vector<TokenIdType> pickRandomEndIds(TestData const& testData, TrtGptModelT
     return endIds;
 }
 
-TestData loadTestData(ModelSpec const& modelSpec, TrtGptModelType const& modelType, ModelIds const modelIds,
-    BeamResult const& beamResult, ITensor const& givenInput, SizeType32 const maxBeamWidth, bool const useRandomEndId,
-    bool const replaceLogits, BufferManager& manager)
+TestData loadTestData(ModelSpec const& modelSpec, ModelIds const modelIds, BeamResult const& beamResult,
+    ITensor const& givenInput, SizeType32 const maxBeamWidth, bool const useRandomEndId, bool const replaceLogits,
+    BufferManager& manager)
 {
     auto const [givenInputLengths, nbGivenInputs, maxInputLength] = getGivenInputLengths(givenInput, modelIds.padId);
     auto const& [beamWidth, resultsFile, contextLogitsFile, genLogitsFile, cumLogProbsFile, logProbsFile] = beamResult;
@@ -353,7 +353,7 @@ TestData loadTestData(ModelSpec const& modelSpec, TrtGptModelType const& modelTy
 
     if (useRandomEndId)
     {
-        testData.endIds = pickRandomEndIds(testData, modelType, givenInputLengths, maxNewTokens, replaceLogits);
+        testData.endIds = pickRandomEndIds(testData, givenInputLengths, maxNewTokens, replaceLogits);
     }
     else
     {
@@ -409,9 +409,8 @@ TestData loadTestData(ModelSpec const& modelSpec, TrtGptModelType const& modelTy
 }
 
 std::tuple<std::vector<SizeType32>, std::unordered_map<SizeType32, TestData>> loadTestData(ModelSpec const& modelSpec,
-    TrtGptModelType const& modelType, ModelIds const modelIds, BeamResults const& resultsFilesBeamWidths,
-    ITensor const& givenInput, SizeType32 const maxBeamWidth, bool const useRandomEndId, bool const replaceLogits,
-    BufferManager& manager)
+    ModelIds const modelIds, BeamResults const& resultsFilesBeamWidths, ITensor const& givenInput,
+    SizeType32 const maxBeamWidth, bool const useRandomEndId, bool const replaceLogits, BufferManager& manager)
 {
     // Map between beam width, and expected results for that beam width
     std::unordered_map<SizeType32, TestData> beamWidthTestData;
@@ -424,8 +423,8 @@ std::tuple<std::vector<SizeType32>, std::unordered_map<SizeType32, TestData>> lo
         EXPECT_EQ(std::find(beamWidths.begin(), beamWidths.end(), beamWidth), beamWidths.end());
         beamWidths.push_back(beamWidth);
 
-        auto testData = loadTestData(modelSpec, modelType, modelIds, beamResult, givenInput, maxBeamWidth,
-            useRandomEndId, replaceLogits, manager);
+        auto testData = loadTestData(
+            modelSpec, modelIds, beamResult, givenInput, maxBeamWidth, useRandomEndId, replaceLogits, manager);
         beamWidthTestData.emplace(beamWidth, std::move(testData));
     }
 
@@ -435,9 +434,8 @@ std::tuple<std::vector<SizeType32>, std::unordered_map<SizeType32, TestData>> lo
 RequestList runGptModelInference(std::shared_ptr<TrtGptModel>& trtGptModel, std::vector<SizeType32> const& beamWidths,
     std::unordered_map<SizeType32, TestData> const& beamWidthTestData, SizeType32 batchSize, SizeType32 nbGivenInputs,
     SizeType32 maxInputLength, SizeType32 padId, std::vector<SizeType32> const& givenInputLengths,
-    TokenIdType const* givenInputData, ModelSpec const& modelSpec, TrtGptModelIfbTestType testType,
-    TrtGptModelType modelType, int maxReqPerStep, bool prepopulateKVCache, bool enableStreamingMode,
-    bool enableBlockReuse)
+    TokenIdType const* givenInputData, ModelSpec const& modelSpec, TrtGptModelIfbTestType testType, int maxReqPerStep,
+    bool prepopulateKVCache, bool enableStreamingMode, bool enableBlockReuse)
 {
     // Fill the requests using givenInput
     // requestList will have batchSize requests
@@ -641,8 +639,8 @@ void runIfbTest(fs::path const& modelPath, ModelSpec const& modelSpec, ModelIds 
 
     auto const maxBeamWidth = executorConfig.getMaxBeamWidth();
     // Load expected outputs for each beam width value
-    auto [beamWidths, beamWidthTestData] = loadTestData(modelSpec, modelType, modelIds, resultsFilesBeamWidths,
-        *givenInput, maxBeamWidth, useRandomEndId, modelSpec.mReplaceLogits, manager);
+    auto [beamWidths, beamWidthTestData] = loadTestData(modelSpec, modelIds, resultsFilesBeamWidths, *givenInput,
+        maxBeamWidth, useRandomEndId, modelSpec.mReplaceLogits, manager);
 
     int const worldSize = modelSpec.mTPSize * modelSpec.mPPSize * modelSpec.mCPSize;
     auto const worldConfig = WorldConfig::mpi(worldSize, modelSpec.mTPSize, modelSpec.mPPSize, modelSpec.mCPSize);
@@ -663,14 +661,14 @@ void runIfbTest(fs::path const& modelPath, ModelSpec const& modelSpec, ModelIds 
         // Prepopulate KV cache for speculative decoding test
         bool const prepopulateKVCache = modelSpec.mMaxDraftTokens > 0;
         auto finishedRequestList = runGptModelInference(trtGptModel, beamWidths, beamWidthTestData, batchSize,
-            nbGivenInputs, maxInputLength, padId, givenInputLengths, givenInputData, modelSpec, testType, modelType,
-            maxReqPerStep, prepopulateKVCache, enableStreamingMode, modelSpec.mKVCacheReuse);
+            nbGivenInputs, maxInputLength, padId, givenInputLengths, givenInputData, modelSpec, testType, maxReqPerStep,
+            prepopulateKVCache, enableStreamingMode, modelSpec.mKVCacheReuse);
 
         if (prepopulateKVCache)
         {
             // Call the 2nd time with prefilled KV cache
             finishedRequestList = runGptModelInference(trtGptModel, beamWidths, beamWidthTestData, batchSize,
-                nbGivenInputs, maxInputLength, padId, givenInputLengths, givenInputData, modelSpec, testType, modelType,
+                nbGivenInputs, maxInputLength, padId, givenInputLengths, givenInputData, modelSpec, testType,
                 maxReqPerStep, false, enableStreamingMode, modelSpec.mKVCacheReuse);
         }
 

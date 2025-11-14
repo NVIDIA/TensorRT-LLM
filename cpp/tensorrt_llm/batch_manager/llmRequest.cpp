@@ -69,7 +69,6 @@ void LlmRequest::createSerializedResult(
 /// Note that there is some dependency on the order of operations in this method. Modify with care!
 std::optional<executor::Result> LlmRequest::createResult(bool useFastLogits, int32_t mpiWorldRank)
 {
-    TLLM_CHECK(!isDisaggContextCompleteState());
     if (!(isFinished() || (mIsStreaming && mState == LlmRequestState::kGENERATION_IN_PROGRESS)))
     {
         return std::nullopt;

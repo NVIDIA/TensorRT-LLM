@@ -69,7 +69,7 @@ size_t genericFp4GemmKernelLauncherSm120(void* D, void const* A, void const* B, 
         int* occupancy)                                                                                                \
     {                                                                                                                  \
         throw std::runtime_error(                                                                                      \
-            "[TensorRT-LLM Error][FP4 gemm Runner] TensorRT-LLM is not compiled with support for this Architecture."); \
+            "[TensorRT LLM Error][FP4 gemm Runner] TensorRT LLM is not compiled with support for this Architecture."); \
     }
 
 #else
@@ -224,7 +224,7 @@ size_t genericFp4GemmKernelLauncherSm120(void* D, void const* A, void const* B, 
         {                                                                                                              \
             std::string errMsg = "SMEM size exceeds maximum allowed. Required " + std::to_string(smem_size) + ", got " \
                 + std::to_string(mMaxSmemSize);                                                                        \
-            throw std::runtime_error("[TensorRT-LLM Error][FP4 gemm Runner] " + errMsg);                               \
+            throw std::runtime_error("[TensorRT LLM Error][FP4 gemm Runner] " + errMsg);                               \
         }                                                                                                              \
         /* // Return workspace size */                                                                                 \
         if (!A && !B && !D)                                                                                            \
@@ -235,7 +235,7 @@ size_t genericFp4GemmKernelLauncherSm120(void* D, void const* A, void const* B, 
         {                                                                                                              \
             std::string errMsg("Requested workspace size insufficient. Required "                                      \
                 + std::to_string(gemm.get_workspace_size(args)) + ", got " + std::to_string(workspaceBytes));          \
-            throw std::runtime_error("[TensorRT-LLM Error][FP4 gemm Runner] " + errMsg);                               \
+            throw std::runtime_error("[TensorRT LLM Error][FP4 gemm Runner] " + errMsg);                               \
         }                                                                                                              \
         auto initStatus = gemm.initialize(args, workspace);                                                            \
         if (initStatus != cutlass::Status::kSuccess)                                                                   \
@@ -243,14 +243,14 @@ size_t genericFp4GemmKernelLauncherSm120(void* D, void const* A, void const* B, 
             auto cudaErrMsg = cudaGetErrorString(cudaGetLastError());                                                  \
             std::string errMsg = "Failed to initialize cutlass FP4 gemm. Error: "                                      \
                 + std::string(cutlass::cutlassGetStatusString(initStatus)) + " " + cudaErrMsg;                         \
-            throw std::runtime_error("[TensorRT-LLM Error][FP4 gemm Runner] " + errMsg);                               \
+            throw std::runtime_error("[TensorRT LLM Error][FP4 gemm Runner] " + errMsg);                               \
         }                                                                                                              \
         auto runStatus = gemm.run(args, workspace, stream, nullptr, tensorrt_llm::common::getEnvEnablePDL());          \
         if (runStatus != cutlass::Status::kSuccess)                                                                    \
         {                                                                                                              \
             std::string errMsg                                                                                         \
                 = "Failed to run cutlass FP4 gemm. Error: " + std::string(cutlass::cutlassGetStatusString(runStatus)); \
-            throw std::runtime_error("[TensorRT-LLM Error][FP4 gemm Runner] " + errMsg);                               \
+            throw std::runtime_error("[TensorRT LLM Error][FP4 gemm Runner] " + errMsg);                               \
         }                                                                                                              \
         return gemm.get_workspace_size(args);                                                                          \
     }

@@ -79,7 +79,22 @@ public:
     {
         if (!isTracing)
         {
+#if CUDA_VERSION >= 13000
+            cudaMemLocation location;
+            if (dstDevice == cudaCpuDeviceId)
+            {
+                location.type = cudaMemLocationTypeHost;
+                location.id = 0;
+            }
+            else
+            {
+                location.type = cudaMemLocationTypeDevice;
+                location.id = dstDevice;
+            }
+            checkCuda(cudaMemPrefetchAsync(get(), sizeof(T) * size(), location, 0, stream));
+#else
             checkCuda(cudaMemPrefetchAsync(get(), sizeof(T) * size(), dstDevice, stream));
+#endif
         }
     }
 
@@ -507,6 +522,9 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
 #endif
 #if IS_MLA
 #if USE_PAGED_KV_CACHE
+#if PAGED_KV_CACHE_LAYOUT == 1
+        // VLLM format: K and V share the same pageList, no copy needed
+#else
         for (uint32_t idxReq = 0; idxReq < batchSize; idxReq++)
         {
             for (uint32_t idxBeam = 0; idxBeam < beamWidth; idxBeam++)
@@ -517,6 +535,7 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
                 }
             }
         }
+#endif
 #else
         static_assert(false, "not implemented");
 #endif
@@ -691,7 +710,11 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
 #else
             &output[0][0][0], &qHeads[0][0][0],
 #endif
+#if PAGED_KV_CACHE_LAYOUT == 1 && USE_PAGED_KV_CACHE
+            cacheKHeads.get(), cacheVHeads.get(),
+#else
             cacheHeads.get(),
+#endif
 #if USE_PAGED_KV_CACHE
             pageListArg,
 #endif
@@ -790,7 +813,13 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
         float ms;
         checkCuda(cudaEventElapsedTime(&ms, tic, toc));
         ms /= nbIters;
+#if CUDA_VERSION >= 13000
+        int memoryClockRateKHz;
+        checkCuda(cudaDeviceGetAttribute(&memoryClockRateKHz, cudaDevAttrMemoryClockRate, device));
+        float const bandwidth = 2.f * prop.memoryBusWidth * memoryClockRateKHz * 1000 / 8;
+#else
         float const bandwidth = 2.f * prop.memoryBusWidth * prop.memoryClockRate * 1000 / 8;
+#endif
 #if BEAM_WIDTH == 1
         size_t nbLoadedCacheTokens = seqLen * beamWidth * batchSize;
 #else
@@ -819,7 +848,11 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
         {
             printf("done\n");
             printf("time: %f ms\n", ms);
+#if CUDA_VERSION >= 13000
+            printf("mem bus width = %d\nmem clock rate = %d\n", prop.memoryBusWidth, memoryClockRateKHz);
+#else
             printf("mem bus width = %d\nmem clock rate = %d\n", prop.memoryBusWidth, prop.memoryClockRate);
+#endif
             printf("bandwidth = %e\n", (float) bandwidth);
             printf("traffic=%e\n", (float) totalTraffic);
         }

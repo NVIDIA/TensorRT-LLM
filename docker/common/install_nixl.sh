@@ -15,7 +15,11 @@ if [ "$(uname -m)" != "amd64" ] && [ "$(uname -m)" != "x86_64" ]; then
   GDS_PATH="$CUDA_PATH/targets/sbsa-linux"
 fi
 
+if [ -n "${GITHUB_MIRROR}" ]; then
+  export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
+fi
 pip3 install --no-cache-dir meson ninja pybind11
+
 git clone --depth 1 -b ${NIXL_VERSION} ${NIXL_REPO}
 cd nixl
 

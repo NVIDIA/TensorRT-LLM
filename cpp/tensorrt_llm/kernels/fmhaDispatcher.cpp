@@ -46,7 +46,10 @@ QkvLayout AttentionInputLayoutToQkvLayout(AttentionInputLayout layout)
 
 FmhaDispatcher::FmhaDispatcher(MHARunnerFixedParams fixedParams)
     : mFixedParams(fixedParams)
-    , mUseTllmGen(tensorrt_llm::common::isSM100Family())
+    // TRTLLM-GEN only supports power of 2 head sizes.
+    // The exception will fall back to fmha v2.
+    // Please update fmha_v2/setup.py if you want to add more supported head sizes.
+    , mUseTllmGen(tensorrt_llm::common::isSM100Family() && fixedParams.headSize != 80)
 {
     if (mUseTllmGen)
     {
@@ -114,6 +117,13 @@ bool FmhaDispatcher::isSupported()
         // the kernel is supported.
         tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
         tllmRunnerParams.mAttentionWindowSize = INT_MAX;
+        // Set the kernel type and mask type if sparseMLA is used.
+        if (mFixedParams.useSparseMLA)
+        {
+            tllmRunnerParams.mSparseMla = true;
+            tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
+            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
+        }
 
         foundKernels = mTllmGenFMHARunner->isSupported(tllmRunnerParams);
     }
@@ -214,6 +224,17 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         // For mla chunked prefill
         tllmRunnerParams.softmaxStatsPtr = reinterpret_cast<float2*>(runnerParams.softmaxStatsPtr);
         tllmRunnerParams.stream = runnerParams.stream;
+        // Set the sparse attention parameters if sparseMLA is used.
+        if (mFixedParams.useSparseMLA)
+        {
+            tllmRunnerParams.mSparseMla = true;
+            tllmRunnerParams.mSparseMlaTopK = runnerParams.sparse_params.sparse_mla_topk;
+            tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
+            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
+            tllmRunnerParams.kvPageIdxPtr
+                = reinterpret_cast<int const*>(runnerParams.sparse_params.sparse_attn_indices);
+            tllmRunnerParams.kvPtr = runnerParams.sparse_params.sparse_mla_kv_cache_pool;
+        }
 
         mTllmGenFMHARunner->run(tllmRunnerParams);
     }

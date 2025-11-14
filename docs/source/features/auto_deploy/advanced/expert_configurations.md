@@ -1,6 +1,6 @@
 # Expert Configuration of LLM API
 
-For advanced TensorRT-LLM users, the full set of `tensorrt_llm._torch.auto_deploy.llm_args.LlmArgs` is exposed. Use at your own risk. The argument list may diverge from the standard TRT-LLM argument list.
+For advanced TensorRT LLM users, the full set of `tensorrt_llm._torch.auto_deploy.llm_args.LlmArgs` is exposed. Use at your own risk. The argument list may diverge from the standard TensorRT LLM argument list.
 
 - All configuration fields used by the AutoDeploy core pipeline, `InferenceOptimizer`, are exposed exclusively in `AutoDeployConfi`g in `tensorrt_llm._torch.auto_deploy.llm_args`.
   Please make sure to refer to those first.
@@ -63,15 +63,15 @@ args:
     num_hidden_layers: 12
     hidden_size: 1024
   world_size: 4
-  compile_backend: torch-compile
-  attn_backend: triton
   max_seq_len: 2048
   max_batch_size: 16
   transforms:
-    sharding:
-      strategy: auto
-    quantization:
-      enabled: false
+    detect_sharding:
+      support_partial_config: true
+    insert_cached_attention:
+      backend: triton
+    compile_model:
+      backend: torch-compile
 
 prompt:
   batch_size: 8
@@ -79,13 +79,6 @@ prompt:
     max_tokens: 150
     temperature: 0.8
     top_k: 50
-
-benchmark:
-  enabled: true
-  num: 20
-  bs: 4
-  isl: 1024
-  osl: 256
 ```
 
 Create an additional override file (e.g., `production.yaml`):
@@ -94,11 +87,10 @@ Create an additional override file (e.g., `production.yaml`):
 # production.yaml
 args:
   world_size: 8
-  compile_backend: torch-opt
   max_batch_size: 32
-
-benchmark:
-  enabled: false
+  transforms:
+    compile_model:
+      backend: torch-opt
 ```
 
 Then use these configurations:
@@ -107,18 +99,18 @@ Then use these configurations:
 # Using single YAML config
 python build_and_run_ad.py \
   --model "meta-llama/Meta-Llama-3.1-8B-Instruct" \
-  --yaml-configs my_config.yaml
+  --yaml-extra my_config.yaml
 
 # Using multiple YAML configs (deep merged in order, later files have higher priority)
 python build_and_run_ad.py \
   --model "meta-llama/Meta-Llama-3.1-8B-Instruct" \
-  --yaml-configs my_config.yaml production.yaml
+  --yaml-extra my_config.yaml production.yaml
 
 # Targeting nested AutoDeployConfig with separate YAML
 python build_and_run_ad.py \
   --model "meta-llama/Meta-Llama-3.1-8B-Instruct" \
-  --yaml-configs my_config.yaml \
-  --args.yaml-configs autodeploy_overrides.yaml
+  --yaml-extra my_config.yaml \
+  --args.yaml-extra autodeploy_overrides.yaml
 ```
 
 ## Configuration Precedence and Deep Merging
@@ -126,7 +118,7 @@ python build_and_run_ad.py \
 The configuration system follows a precedence order in which higher priority sources override lower priority ones:
 
 1. **CLI Arguments** (highest priority) - Direct command line arguments
-1. **YAML Configs** - Files specified via `--yaml-configs` and `--args.yaml-configs`
+1. **YAML Configs** - Files specified via `--yaml-extra` and `--args.yaml-extra`
 1. **Default Settings** (lowest priority) - Built-in defaults from the config classes
 
 **Deep Merging**: Unlike simple overwriting, deep merging recursively combines nested dictionaries. For example:
@@ -152,12 +144,12 @@ args:
 **Nested Config Behavior**: When using nested configurations, outer YAML configuration files become initialization settings for inner objects, giving them higher precedence:
 
 ```bash
-# The outer yaml-configs affects the entire ExperimentConfig
-# The inner args.yaml-configs affects only the AutoDeployConfig
+# The outer yaml-extra affects the entire ExperimentConfig
+# The inner args.yaml-extra affects only the AutoDeployConfig
 python build_and_run_ad.py \
   --model "meta-llama/Meta-Llama-3.1-8B-Instruct" \
-  --yaml-configs experiment_config.yaml \
-  --args.yaml-configs autodeploy_config.yaml \
+  --yaml-extra experiment_config.yaml \
+  --args.yaml-extra autodeploy_config.yaml \
   --args.world-size=8  # CLI override beats both YAML configs
 ```
 

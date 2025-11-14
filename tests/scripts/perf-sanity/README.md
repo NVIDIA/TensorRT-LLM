@@ -6,7 +6,6 @@ Benchmarking scripts for TensorRT-LLM serving performance tests with configurati
 
 - Run performance benchmarks across multiple model configurations
 - Manage test cases through YAML configuration files
-- Generate comprehensive CSV reports with complete test case coverage
 - Support selective execution of specific test cases
 
 ## Scripts Overview
@@ -16,123 +15,120 @@ Benchmarking scripts for TensorRT-LLM serving performance tests with configurati
 
 **Structure**:
 ```yaml
-test_cases:
-  - id: 1
-    model: "70B-FP8"
-    gpus: 1
-    tp: 1
-    ep: 1
-    attn_backend: "TRTLLM"
-    moe_backend: ""
-    enable_attention_dp: false
-    free_gpu_mem_fraction: 0.9
-    max_batch_size: 512
-    isl: 1024
-    osl: 1024
-    max_num_tokens: 16384
+server_configs:
+  - name: "r1_fp4_dep4"
+    model_name: "deepseek_r1_0528_fp4"
+    tp: 4
+    ep: 4
+    pp: 1
+    attention_backend: "TRTLLM"
+    moe_backend: "CUTLASS"
     moe_max_num_tokens: ""
-    concurrency_iterations:
-      - [1, 10]
-      - [8, 10]
-      - [64, 5]
-      - [512, 2]
+    enable_attention_dp: true
+    enable_chunked_prefill: false
+    max_num_tokens: 2176
+    disable_overlap_scheduler: false
+    kv_cache_dtype: "fp8"
+    enable_block_reuse: false
+    free_gpu_memory_fraction: 0.8
+    max_batch_size: 256
+    enable_padding: true
+    client_configs:
+      - name: "con1_iter1_1024_1024"
+        concurrency: 1
+        iterations: 1
+        isl: 1024
+        osl: 1024
+        random_range_ratio: 0.0
+      - name: "con8_iter1_1024_1024"
+        concurrency: 8
+        iterations: 1
+        isl: 1024
+        osl: 1024
+        random_range_ratio: 0.0
+
+  - name: "r1_fp4_tep4"
+    model_name: "deepseek_r1_0528_fp4"
+    tp: 4
+    ep: 4
+    pp: 1
+    attention_backend: "TRTLLM"
+    moe_backend: "CUTLASS"
+    moe_max_num_tokens: ""
+    enable_attention_dp: false
+    enable_chunked_prefill: false
+    max_num_tokens: 2176
+    disable_overlap_scheduler: false
+    kv_cache_dtype: "fp8"
+    enable_block_reuse: false
+    free_gpu_memory_fraction: 0.8
+    max_batch_size: 256
+    enable_padding: true
+    client_configs:
+      - name: "con1_iter1_1024_1024"
+        concurrency: 1
+        iterations: 1
+        isl: 1024
+        osl: 1024
+        random_range_ratio: 0.0
+      - name: "con8_iter1_1024_1024"
+        concurrency: 8
+        iterations: 1
+        isl: 1024
+        osl: 1024
+        random_range_ratio: 0.0
 ```
-
-**Configuration Fields**:
-- `id`: Unique identifier for the test case
-- `model`: Model name (e.g., "70B-FP8", "Scout-FP4")
-- `gpus`: Number of GPUs to use
-- `tp`: Tensor parallelism size
-- `ep`: Expert parallelism size
-- `attn_backend`: Attention backend ("TRTLLM", "FLASHINFER")
-- `moe_backend`: MoE backend ("DEEPGEMM", "TRTLLM", "CUTLASS", "")
-- `enable_attention_dp`: Enable attention data parallelism
-- `free_gpu_mem_fraction`: GPU memory fraction to reserve
-- `max_batch_size`: Maximum batch size
-- `isl`: Input sequence length
-- `osl`: Output sequence length
-- `max_num_tokens`: Maximum number of tokens
-- `moe_max_num_tokens`: Maximum number of tokens for MoE
-- `concurrency_iterations`: List of [concurrency, iteration] pairs
-
 
 ### 2. `run_benchmark_serve.py` - Main Benchmark Runner
 **Purpose**: Executes performance benchmarks based on YAML configuration files.
 
 **Usage**:
 ```bash
-python run_benchmark_serve.py --output_folder <output_folder> --config_file <config_file> [--skip <skip_pattern>] [--select <select_pattern>]
+python run_benchmark_serve.py --log_folder <log_folder> --config_file <config_file> [--select <select_pattern>] [--timeout 5400]
 ```
 
 **Arguments**:
-- `--output_folder`: Directory to store benchmark results (required)
+- `--log_folder`: Directory to store benchmark logs (required)
 - `--config_file`: Path to YAML configuration file (required)
-- `--skip`: Skip pattern for specific test cases/concurrencies (optional, default: no skipping)
-- `--select`: Select pattern for specific test cases/concurrencies (optional, default: all test cases)
+- `--select`: Select pattern for specific Server and Client Config. (optional, default: all test cases)
+- `--timeout`: Timeout for server setup. (optional, default: 3600 seconds)
 
 **Examples**:
 ```bash
-# Run all test cases
-python run_benchmark_serve.py --output_folder results --config_file benchmark_config.yaml --skip default --select default
-
-# Skip specific test cases
-python run_benchmark_serve.py --output_folder results --config_file benchmark_config.yaml --skip "2-1,4"
-
-# Run specific concurrencies from specific test cases
-python run_benchmark_serve.py --output_folder results --config_file benchmark_config.yaml --select "1,2-3"
+# Select
+python run_benchmark_serve.py --log_folder ./results --config_file benchmark_config.yaml --select "r1_fp4_dep4:con8_iter1_1024_1024,r1_fp4_tep4:con1_iter1_1024_1024"
 
 ```
 
-**Skip Pattern**:
-Format: `"test_case1,test_case2,test_case3"` or `"test_case1-concurrency1,test_case2-concurrency3"`
-- `"2,4"`: Skip test cases 2 and 4 entirely
-- `"2-1,4-2"`: Skip test case 2's 1st concurrency and test case 4's 2nd concurrency
-- `"default"` or empty: No skipping (default)
-
-**Select Pattern**:
-Format: `"test_case1,test_case2,test_case3"` or `"test_case1-concurrency1,test_case2-concurrency3"`
-- `"1,3,5"`: Run only test cases 1, 3, and 5 (all concurrencies)
-- `"1-1,2-3"`: Run test case 1's 1st concurrency and test case 2's 3rd concurrency
-- `"default"` or empty: Run all test cases (default)
-
-
 ### 3. `parse_benchmark_results.py` - Results Parser
-**Purpose**: Parses benchmark log files and generates comprehensive CSV reports with all test cases from the configuration file.
+**Purpose**: Print log's perf.
+
+**Arguments**:
+- `--log_folder`: Directory to store benchmark logs (required)
 
 **Usage**:
 ```bash
-python parse_benchmark_results.py --input_folder <input_folder> --output_csv <output_csv> --config_file <config_file>
+python parse_benchmark_results.py --log_folder <log_folder>
 ```
 
-**Arguments**:
-- `input_folder`: Folder containing benchmark log files (serve.*.log) (required)
-- `output_csv`: Output CSV filename for the results table (required)
-- `config_file`: Path to benchmark_config.yaml file (required)
-
-**Examples**:
-```bash
-python parse_benchmark_results.py --config_file ./benchmark_logs --output_csv results.csv --input_folder ./benchmark_config.yaml
-
-```
 
 ### 4. `benchmark-serve.sh` - SLURM Job Script
 **Usage**:
 ```bash
-sbatch benchmark-serve.sh [IMAGE] [bench_dir] [output_dir] [select_pattern] [skip_pattern]
+sbatch benchmark-serve.sh [IMAGE] [bench_dir] [log_folder] [select_pattern]
 ```
 
 **Parameters**:
 - `IMAGE`: Docker image (default: tensorrt-llm-staging/release:main-x86_64)
 - `bench_dir`: Directory containing config file and benchmark scripts (default: current directory)
-- `output_dir`: Directory containing output logs and csv. (default: current directory)
+- `log_folder`: Directory containing output logs and csv. (default: current directory)
 - `select_pattern`: Select pattern (default: default - all test cases)
-- `skip_pattern`: Skip pattern (default: default - no skipping)
 
 **Examples**:
 ```bash
 
 bench_dir="/path/to/benchmark/scripts"
-output_dir="/path/to/store/output/files"
-sbatch --reservation=RES--COM-3970 --qos=reservation -D ${output_dir} ${bench_dir}/benchmark-serve.sh urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/release:main-x86_64 ${bench_dir} ${output_dir} "1-1" ""
+log_folder="/path/to/store/output/files"
+sbatch --reservation=RES--COM-3970 --qos=reservation -D ${log_folder} ${bench_dir}/benchmark-serve.sh urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/release:main-x86_64 ${bench_dir} ${log_folder} "r1_fp4_dep4:con8_iter1_1024_1024,r1_fp4_tep4:con1_iter1_1024_1024"
 
 ```

@@ -69,7 +69,7 @@ std::unique_ptr<texec::kv_cache::ConnectionManager> makeOneUcxConnectionManager(
         void* ret = dllGetSym(handle, name);
 
         TLLM_CHECK_WITH_INFO(ret != nullptr,
-            "Unable to load UCX wrapper library symbol, possible cause is that TensorRT-LLM library is not "
+            "Unable to load UCX wrapper library symbol, possible cause is that TensorRT LLM library is not "
             "built with UCX support, please rebuild in UCX-enabled environment.");
         return ret;
     };

@@ -7,9 +7,9 @@ from torch.nn.parameter import Parameter
 
 from tensorrt_llm.functional import AllReduceParams
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.math_utils import ceil_div
 
 from ..distributed import allgather
-from ..utils import create_lm_head_tp_mapping
 from .linear import Linear, TensorParallelMode
 
 
@@ -32,14 +32,13 @@ class LMHead(Linear):
         mapping: Optional[Mapping] = None,
         tensor_parallel_mode: Optional[TensorParallelMode] = None,
         gather_output: bool = False,
+        use_custom_cublas_mm: bool = False,
     ):
         local_in_features = embedding_dim
         local_out_features = num_embeddings
         mapping = mapping or Mapping()
         self.enable_lm_head_tp_in_adp = mapping.enable_attention_dp and \
             getattr(mapping, 'enable_lm_head_tp_in_adp', False)
-        if self.enable_lm_head_tp_in_adp:
-            mapping = create_lm_head_tp_mapping(mapping)
 
         tp_size = mapping.tp_size
 
@@ -64,6 +63,7 @@ class LMHead(Linear):
             mapping=mapping,
             tensor_parallel_mode=tensor_parallel_mode,
             gather_output=gather_output,
+            use_custom_cublas_mm=use_custom_cublas_mm,
         )
 
         if tensor_parallel_mode == TensorParallelMode.ROW:
@@ -78,18 +78,6 @@ class LMHead(Linear):
         self.weight = Parameter(torch.empty(weight_shape, dtype=dtype))
         self.register_parameter("bias", None)
 
-        # For LM head TP in ADP, we need to slice the weight for the LM head
-        self.lm_head_slice_obj = None
-        if self.enable_lm_head_tp_in_adp:
-            tp_rank = self.mapping.tp_rank
-            tp_size = self.mapping.tp_size
-            slice_width = math.ceil(self.out_features / tp_size)
-            slice_start = tp_rank * slice_width
-            slice_end = min((tp_rank + 1) * slice_width, self.out_features)
-            slice_obj = [slice(None)] * len(self.weight.shape)
-            slice_obj[0] = slice(slice_start, slice_end)
-            self.lm_head_slice_obj = tuple(slice_obj)
-
     @property
     def vocab_size_padded(self) -> int:
         if self.tp_mode == TensorParallelMode.COLUMN and self.gather_output:
@@ -102,10 +90,18 @@ class LMHead(Linear):
         input: torch.Tensor,
         *,
         all_reduce_params: Optional[AllReduceParams] = None,
+        mapping_lm_head_tp: Optional[Mapping] = None,
         is_spec_decoding_head: bool = False,
     ) -> torch.Tensor:
         if is_spec_decoding_head and self.enable_lm_head_tp_in_adp:
-            output = F.linear(input, self.weight[self.lm_head_slice_obj], None)
+            # For LM head TP in ADP, we need to slice the weight for the LM head
+            tp_rank = mapping_lm_head_tp.tp_rank
+            tp_size = mapping_lm_head_tp.tp_size
+            slice_width = ceil_div(self.out_features, tp_size)
+            slice_start = tp_rank * slice_width
+            slice_end = min((tp_rank + 1) * slice_width, self.out_features)
+            output = F.linear(input, self.weight[slice_start:slice_end, :],
+                              None)
         else:
             output = super().forward(input, all_reduce_params=all_reduce_params)
         if (self.tp_mode == TensorParallelMode.COLUMN and self.gather_output
@@ -203,6 +199,7 @@ class Embedding(LMHead):
         tensor_parallel_mode: Optional[TensorParallelMode] = None,
         gather_output: bool = False,
         enable_torch_compile_for_embedding: Optional[bool] = False,
+        use_custom_cublas_mm: bool = False,
     ):
         super().__init__(
             embedding_dim=embedding_dim,
@@ -211,6 +208,7 @@ class Embedding(LMHead):
             mapping=mapping,
             tensor_parallel_mode=tensor_parallel_mode,
             gather_output=gather_output,
+            use_custom_cublas_mm=use_custom_cublas_mm,
         )
 
         self.enable_torch_compile_for_embedding = enable_torch_compile_for_embedding

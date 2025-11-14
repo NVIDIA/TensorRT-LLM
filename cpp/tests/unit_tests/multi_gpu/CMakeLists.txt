@@ -12,5 +12,7 @@
 add_subdirectory(kernels)
 
 add_gtest(cacheTransceiverTest cacheTransceiverTest.cpp)
+target_link_libraries(cacheTransceiverTest PRIVATE ${Python3_LIBRARIES})
+
 add_gtest(mpiUtilsTest mpiUtilsTest.cpp)
 add_gtest(userBufferTest userBufferTest.cpp)

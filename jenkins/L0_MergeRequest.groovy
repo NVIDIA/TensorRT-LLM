@@ -232,11 +232,11 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
                     resources:
                       requests:
                         cpu: '2'
-                        memory: 5Gi
+                        memory: 10Gi
                         ephemeral-storage: 25Gi
                       limits:
                         cpu: '2'
-                        memory: 5Gi
+                        memory: 10Gi
                         ephemeral-storage: 25Gi
                     imagePullPolicy: Always"""
         nodeLabelPrefix = "cpu"
@@ -381,9 +381,7 @@ def preparation(pipeline, testFilter, globalVars)
 def launchReleaseCheck(pipeline)
 {
     stages = {
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: """apt-get update && apt-get install \
-            python3-pip \
-            -y""")
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y python3-pip")
         sh "pip3 config set global.break-system-packages true"
         sh "git config --global --add safe.directory \"*\""
         // Step 1: Clone TRT-LLM source codes
@@ -516,16 +514,17 @@ def getGithubMRChangedFile(pipeline, githubPrApiUrl, function, filePath="") {
     def result = null
     def pageId = 0
     withCredentials([
-        string(
-            credentialsId: 'github-token-trtllm-ci',
-            variable: 'GITHUB_API_TOKEN'
+        usernamePassword(
+            credentialsId: 'github-cred-trtllm-ci',
+            usernameVariable: 'NOT_USED_YET',
+            passwordVariable: 'GITHUB_API_TOKEN'
         ),
     ]) {
         while(true) {
             pageId += 1
             def rawDataJson = pipeline.sh(
                 script: """
-                    curl --header "Authorization: Bearer $GITHUB_API_TOKEN" \
+                    curl --header "Authorization: Bearer \${GITHUB_API_TOKEN}" \
                          --url "${githubPrApiUrl}/files?page=${pageId}&per_page=20"
                 """,
                 returnStdout: true
@@ -630,6 +629,7 @@ def getAutoTriggerTagList(pipeline, testFilter, globalVars) {
     def specialFileToTagMap = [
         "tensorrt_llm/_torch/models/modeling_deepseekv3.py": ["-DeepSeek-"],
         "cpp/kernels/fmha_v2/": ["-FMHA-"],
+        "tensorrt_llm/_torch/models/modeling_gpt_oss.py": ["-GptOss-"],
     ]
     for (file in changedFileList) {
         for (String key : specialFileToTagMap.keySet()) {
@@ -704,6 +704,8 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_torch/pyexecutor/_util.py",
         "tensorrt_llm/_torch/pyexecutor/model_engine.py",
         "tensorrt_llm/_torch/pyexecutor/py_executor.py",
+        "tensorrt_llm/evaluate/json_mode_eval.py",
+        "tensorrt_llm/evaluate/mmlu.py",
         "tensorrt_llm/executor/",
         "tensorrt_llm/functional.py",
         "tensorrt_llm/llmapi/",

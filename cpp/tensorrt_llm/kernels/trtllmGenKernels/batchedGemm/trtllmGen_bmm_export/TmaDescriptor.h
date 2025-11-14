@@ -184,7 +184,7 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, tg::MmaKind mmaKind, st
         char const* errorString;
         cuGetErrorString(result, &errorString);
         std::stringstream ss;
-        ss << "Error: Failed to initialize the TMA descriptor " << result << std::endl;
+        ss << "Error: Failed to initialize the TMA descriptor. " << errorString << std::endl;
 
         ss << "tmaFormat: " << static_cast<int>(tmaDataFormat) << " dim: " << dim << " gmem: " << gmemAddr << std::endl;
 
@@ -288,7 +288,7 @@ inline CUtensorMap buildSfTmaDescriptor(tg::Dtype dtype, std::vector<uint64_t> c
         char const* errorString;
         cuGetErrorString(result, &errorString);
         std::stringstream ss;
-        ss << "Error: Failed to initialize the TMA descriptor for SF " << errorString << std::endl;
+        ss << "Error: Failed to initialize the TMA descriptor for SF. " << errorString << std::endl;
 
         ss << "tmaFormat: " << static_cast<int>(tmaDataFormat) << " dim: " << dim << " gmem: " << gmemAddr << std::endl;
 

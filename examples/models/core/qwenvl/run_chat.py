@@ -14,8 +14,10 @@
 # limitations under the License.
 import re
 
+# isort: off
 import torch
 from run import QWenInfer, parse_arguments, vit_process
+# isort: on
 
 
 def make_display(port=8006):

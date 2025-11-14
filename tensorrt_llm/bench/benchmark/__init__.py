@@ -105,7 +105,7 @@ def get_llm(runtime_config: RuntimeConfig, kwargs: dict):
     """
     llm_cls = LLM
 
-    if runtime_config.backend != "tensorrt":
+    if runtime_config.backend != None:
         ignore_trt_only_args(kwargs, runtime_config.backend)
 
     if runtime_config.backend == 'pytorch':

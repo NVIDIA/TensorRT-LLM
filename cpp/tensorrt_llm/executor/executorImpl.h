@@ -79,6 +79,17 @@ class Executor::Impl
     using LlmRequestPtr = std::shared_ptr<batch_manager::LlmRequest>;
     using RequestList = std::list<LlmRequestPtr>;
 
+    // When block reuse is enabled for context worker for disaggregated serving,
+    // we need to store the last block id so that we can unpin the block when
+    // the request is finished.
+    struct InTransmissionItem
+    {
+        LlmRequestPtr request;
+        std::optional<SizeType32> lastBlockId;
+    };
+
+    using InTransList = std::list<InTransmissionItem>;
+
 public:
     Impl(std::filesystem::path const& modelPath, std::optional<std::filesystem::path> const& encoderModelPath,
         [[maybe_unused]] ModelType modelType, ExecutorConfig const& executorConfig);
@@ -206,7 +217,7 @@ private:
 
     void terminateCancelledRequests(RequestList& activeRequests);
 
-    void terminateContextFinishedRequests(RequestList& inTransmissionRequests);
+    void terminateContextFinishedRequests(InTransList& inTransmissionRequests);
 
     void appendNewResponses(std::vector<Response>&& newResponses);
 
@@ -215,7 +226,7 @@ private:
     ///        and returned for bookkeeping.
     /// @return A list of requests that have completed.
     RequestList populateNewResponses(
-        RequestList& activeRequests, RequestList& inTransmissionRequests, std::vector<Response>& newResponses);
+        RequestList& activeRequests, InTransList& inTransmissionRequests, std::vector<Response>& newResponses);
 
     void executionLoop();
 

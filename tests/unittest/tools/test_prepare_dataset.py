@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import pytest
-from utils.cpp_paths import llm_root  # noqa: F401
 from utils.llm_data import llm_models_root
 
 # Constants for test configuration
@@ -54,7 +53,7 @@ class TestPrepareDatasetLora:
         Build the base command for running prepare_dataset.py.
 
         Args:
-            llm_root: Path to the TensorRT-LLM root directory
+            llm_root: Path to the TensorRT LLM root directory
 
         Returns:
             List[str]: Base command components
@@ -116,7 +115,7 @@ class TestPrepareDatasetLora:
         output.
 
         Args:
-            llm_root: Path to the TensorRT-LLM root directory
+            llm_root: Path to the TensorRT LLM root directory
             **kwargs: Keyword arguments for LoRA configuration
 
         Returns:

@@ -10,7 +10,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm._utils import mpi_disabled, nvtx_range
 from tensorrt_llm.mapping import CpType
 
 from ..distributed import Distributed
@@ -18,6 +18,7 @@ from .llm_request import (ExecutorRequest, LlmRequest,
                           executor_request_to_llm_request)
 
 SHUTDOWN_REQUEST_ID = -1
+CONTROL_REQUEST_ID = -2
 
 
 @dataclasses.dataclass
@@ -35,7 +36,12 @@ class RequestQueueItem:
 
     @property
     def is_normal_request(self):
-        return not (self.is_shutdown_request or self.is_canceled_request)
+        return not (self.is_shutdown_request or self.is_canceled_request
+                    or self.is_control_request)
+
+    @property
+    def is_control_request(self):
+        return self.id == CONTROL_REQUEST_ID
 
 
 class ExecutorRequestQueue:
@@ -44,7 +50,7 @@ class ExecutorRequestQueue:
     def __init__(self, dist: Distributed, enable_attention_dp: bool,
                  max_batch_size: int, max_beam_width: int,
                  max_num_active_requests: int, enable_iter_perf_stats: bool,
-                 batch_wait_timeout_ms: float, is_disaggregated: bool):
+                 batch_wait_timeout_ms: float):
         self.dist = dist
         self.request_queue: queue.Queue[RequestQueueItem] = queue.Queue()
         self.waiting_queue: deque[RequestQueueItem] = deque()
@@ -53,13 +59,13 @@ class ExecutorRequestQueue:
         self.max_batch_size = max_batch_size
         self.max_beam_width = max_beam_width
         self.max_num_active_requests = max_num_active_requests
-        self.is_disaggregated = is_disaggregated
         self.enqueue_lock = threading.Lock()
         self.next_request_id = max_batch_size
         self.enable_iter_perf_stats = enable_iter_perf_stats
         self.start_times = {}
         self.active = True
         self.batch_wait_timeout_ms = batch_wait_timeout_ms
+        self.send_requests_handler = None
 
         # State tracking
         self.num_fetch_requests = 0
@@ -68,6 +74,10 @@ class ExecutorRequestQueue:
         self.new_active_requests_queue_latency_ms = 0
         self.is_shutdown = False
         self.should_exclude_last_generation_logits = False
+        self.control_requests: List[RequestQueueItem] = []
+        self.request_accumulated: List[RequestQueueItem] = []
+
+        self._disable_mpi = mpi_disabled()
 
     def _get_from_request_queue(
             self,
@@ -249,6 +259,10 @@ class ExecutorRequestQueue:
             self.request_queue.put(
                 RequestQueueItem(req_id, is_canceled_request=True))
 
+    def enqueue_control_request(self):
+        with self.enqueue_lock:
+            self.request_queue.put(RequestQueueItem(id=CONTROL_REQUEST_ID))
+
     def enqueue_shutdown_request(self):
         with self.enqueue_lock:
             self.request_queue.put(RequestQueueItem(SHUTDOWN_REQUEST_ID))
@@ -266,14 +280,30 @@ class ExecutorRequestQueue:
         all_ranks_num_active_requests: Optional[List[int]] = None
     ) -> List[RequestQueueItem]:
         """Common logic for fetching and processing requests from the queue."""
+        # Block new request processing while control requests are pending.
+        # Control requests must be handled exclusively to ensure proper synchronization.
+        if len(self.control_requests) != 0:
+            return []
         # Calculate timeout
-        timeout = None if (total_num_active_requests == 0) and len(
-            self.waiting_queue) == 0 else datetime.timedelta(0)
+        idle = (total_num_active_requests == 0) and len(self.waiting_queue) == 0
+        if idle:
+            # In Ray path (TLLM_DISABLE_MPI=1), use a periodic heartbeat timeout so rank 0
+            # reaches the broadcast path regularly to prevent trtllm-serve timeout when idle.
+            timeout = datetime.timedelta(
+                seconds=1200) if self._disable_mpi else None
+        else:
+            timeout = datetime.timedelta(0)
 
         # Fetch requests from rank 0
         new_requests = []
         if self.dist.rank == 0:
-            new_requests = self._get_from_request_queue(timeout)
+            # Process accumulated requests that were queued during control request handling.
+            if len(self.request_accumulated) != 0:
+                new_requests.extend(self.request_accumulated)
+                self.request_accumulated.clear()
+                # Reset timeout to 0 to avoid hanging when no new requests are available
+                timeout = datetime.timedelta(0)
+            new_requests.extend(self._get_from_request_queue(timeout))
 
         # Broadcast requests and handle Python objects
         new_requests, py_request_objects = self._handle_request_broadcasting(
@@ -433,10 +463,12 @@ class ExecutorRequestQueue:
                 new_requests, "py_multimodal_data")
             py_scheduling_params = self._collect_py_objects_from_requests(
                 new_requests, "py_scheduling_params")
+            py_num_logprobs = self._collect_py_objects_from_requests(
+                new_requests, "py_num_logprobs")
             py_request_objects = tuple(
                 filter(None, [
                     py_logits_post_processors, py_multimodal_data,
-                    py_scheduling_params
+                    py_scheduling_params, py_num_logprobs
                 ]))
         else:
             py_request_objects = None
@@ -455,12 +487,17 @@ class ExecutorRequestQueue:
             new_requests: List[RequestQueueItem]) -> List[RequestQueueItem]:
         """Validate and filter requests, handling shutdown signals."""
         valid_new_requests = []
-        for req_item in new_requests:
+        for idx, req_item in enumerate(new_requests):
             if req_item.is_shutdown_request:
                 self.is_shutdown = True
                 break
             elif req_item.is_canceled_request:
                 self.canceled_req_ids.append(req_item.id)
+            elif req_item.is_control_request:
+                self.control_requests.append(req_item)
+                if self.dist.rank == 0:
+                    self.request_accumulated.extend(new_requests[idx + 1:])
+                break
             else:
                 valid_new_requests.append(req_item)
 
@@ -548,6 +585,7 @@ class ExecutorRequestQueue:
                     req_id_to_obj[item.id] = obj
         return None if not req_id_to_obj else (attribute_name, req_id_to_obj)
 
+    @nvtx_range("_broadcast_new_requests")
     def _broadcast_new_requests(
             self, new_requests: List[RequestQueueItem], py_request_objects
     ) -> Tuple[List[RequestQueueItem], Optional[Dict]]:
@@ -566,10 +604,16 @@ class ExecutorRequestQueue:
 
         # Send payloads
         if not self.dist.is_first_pp_rank:
-            payloads = self.dist.recv_object(self.dist.prev_pp_rank, tag)
+            with nvtx_range("recv_requests_from_prev_pp"):
+                payloads = self.dist.recv_object(self.dist.prev_pp_rank, tag)
 
         if not self.dist.is_last_pp_rank:
-            self.dist.send_object(payloads, self.dist.next_pp_rank, tag)
+            with nvtx_range("send_requests_to_next_pp"):
+                if self.send_requests_handler is not None:
+                    with nvtx_range("wait_prev_send_requests_handler"):
+                        self.send_requests_handler.wait()
+                self.send_requests_handler = self.dist.isend_object(
+                    payloads, self.dist.next_pp_rank, tag)
 
         return payloads
 
@@ -596,6 +640,72 @@ class ExecutorRequestQueue:
                     self.new_active_requests_queue_latency_ms += now - self.start_times.pop(
                         child_id)
 
+    # Note: Helix parallelism is a decode-only feature run with disaggregated serving. This function gets called on gen server
+    # during initialization of a new request.
+    def _merge_helix_requests(self, new_requests: list[RequestQueueItem],
+                              tokens_per_block: int):
+        req_with_children = []
+        num_cp_ranks = self.dist.cp_size
+        curr_cp_rank = self.dist.cp_rank
+
+        # For each request, partition the input_token_ids into blocks and then partition blocks across CP ranks.
+        # Currently, the partitioning is such that contiguous blocks are assigned to the same CP rank (as opposed
+        # to round-robin).
+        for req_item in new_requests:
+            all_input_ids = torch.tensor(req_item.request.input_token_ids,
+                                         dtype=torch.int64).unsqueeze(0)
+            input_len = all_input_ids.shape[-1]
+
+            num_total_blocks = (input_len + tokens_per_block -
+                                1) // tokens_per_block
+            if num_total_blocks < num_cp_ranks:
+                raise ValueError(
+                    f"There aren't enough tokens to get at least one block per CP rank. num_total_blocks {num_total_blocks} < num_cp_ranks {num_cp_ranks}. Please use smaller tokens_per_block for KV cache or reduce the number of CP ranks."
+                )
+
+            # Padding to ensure torch.stack used with torch.tensor_split works properly.
+            padding_len = 0
+            if input_len % tokens_per_block != 0:
+                padding_len = tokens_per_block - (input_len % tokens_per_block)
+                padding_ids = torch.zeros([1, padding_len], dtype=torch.int64)
+                all_input_ids = torch.cat((all_input_ids, padding_ids), dim=-1)
+            all_position_ids = torch.arange(0,
+                                            input_len + padding_len,
+                                            dtype=torch.int64).unsqueeze(0)
+
+            input_id_blocks_per_rank = torch.tensor_split(
+                torch.stack(all_input_ids.split(tokens_per_block, dim=-1)),
+                num_cp_ranks)
+            position_id_blocks_per_rank = torch.tensor_split(
+                torch.stack(all_position_ids.split(tokens_per_block, dim=-1)),
+                num_cp_ranks)
+
+            # Get the input_ids and position_ids for this rank.
+            input_ids_this_rank = input_id_blocks_per_rank[
+                curr_cp_rank].flatten().tolist()
+            position_ids_this_rank = position_id_blocks_per_rank[
+                curr_cp_rank].flatten().tolist()
+
+            # Undo the padding. Only last rank's last block will be padded right now
+            # given contiguous block assignment.
+            if curr_cp_rank == num_cp_ranks - 1 and padding_len > 0:
+                input_ids_this_rank = input_ids_this_rank[:-padding_len]
+                position_ids_this_rank = position_ids_this_rank[:-padding_len]
+
+            req = executor_request_to_llm_request(
+                req_id=req_item.id,
+                executor_request=req_item.request,
+                child_req_ids=req_item.child_req_ids,
+                exclude_last_generation_logits=self.
+                _should_exclude_last_generation_logits(),
+                input_token_ids=input_ids_this_rank,
+                position_ids=position_ids_this_rank,
+            )
+            req_with_children.append(req)
+            if req.child_requests:
+                req_with_children.extend(req.child_requests)
+        return req_with_children
+
     @nvtx_range("_merge_requests")
     def _merge_requests(
             self, new_requests: list[RequestQueueItem]) -> List[LlmRequest]:
@@ -604,20 +714,24 @@ class ExecutorRequestQueue:
             cp_type = cp_config['cp_type']
             if cp_type == CpType.STAR:
                 return self._merge_star_attention_requests(new_requests)
-            elif cp_type == CpType.RING:
-                raise NotImplementedError("ring attention not implemented yet")
+            elif cp_type == CpType.HELIX:
+                # Take the usual route below.
+                return self._merge_helix_requests(
+                    new_requests,
+                    tokens_per_block=cp_config['tokens_per_block'])
             else:
-                raise NotImplementedError(f'unsupport cp type {cp_type}')
-        else:
-            req_with_children = []
-            for req_item in new_requests:
-                req = executor_request_to_llm_request(
-                    req_item.id, req_item.request, req_item.child_req_ids,
-                    self._should_exclude_last_generation_logits())
-                req_with_children.append(req)
-                if req.child_requests:
-                    req_with_children.extend(req.child_requests)
-            return req_with_children
+                raise NotImplementedError(
+                    f'Unsupported cp type {cp_type.name}.')
+
+        req_with_children = []
+        for req_item in new_requests:
+            req = executor_request_to_llm_request(
+                req_item.id, req_item.request, req_item.child_req_ids,
+                self._should_exclude_last_generation_logits())
+            req_with_children.append(req)
+            if req.child_requests:
+                req_with_children.extend(req.child_requests)
+        return req_with_children
 
     def _merge_star_attention_requests(
             self, new_requests: list[RequestQueueItem]) -> List[LlmRequest]:
