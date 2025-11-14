@@ -756,7 +756,7 @@ class AutoTuner:
                     self.stats.tuned_op_successful_configs[
                         custom_op] = self.stats.tuned_op_successful_configs.get(
                             custom_op, 0) + 1
-                    logger.debug(
+                    logger.info(
                         f"[Autotuner] Profiling runner={runners[best_runner_id]}, tactic={best_tactic} for cache_key={cache_key}."
                     )
                 else:
@@ -835,7 +835,7 @@ class AutoTuner:
                         f"[Autotuner] Failed when profiling runner={runner}, tactic={tac}, shapes={shapes}. Set TLLM_LOG_LEVEL=DEBUG for more details.",
                         key=(custom_op, "warning_autotuning_profile_failure"),
                     )
-                    logger.debug_once(
+                    logger.info_once(
                         f"[Autotuner] Exception captured: {e}",
                         key=(custom_op, "debug_autotuning_exception"),
                     )
@@ -960,7 +960,7 @@ class AutoTuner:
             avg_time = pure_profile(stream, self.repeat)
 
         shapes = self._get_input_sizes(inputs)
-        logger.debug(
+        logger.info(
             f"[Autotuner] Profiled runner={runner}, tactic={tactic}, shapes={shapes}: {avg_time:.6f}ms."
         )
 
@@ -1046,7 +1046,7 @@ class AutoTuner:
                 p.shapes[spec.input_idx][spec.dim_idx] = DynamicDim(
                     min_value, opt_value, max_value)
             generated_profiles.append(p)
-            logger.debug(f"[Autotuner] Generated profile: {p}")
+            logger.info(f"[Autotuner] Generated profile: {p}")
         return generated_profiles
 
     @classmethod
@@ -1191,13 +1191,13 @@ class AutoTuner:
         self.stats = AutoTunerStatistics()
 
     def print_profiling_cache(self):
-        logger.debug(f"[Autotuner] The profiling_cache entries:")
-        logger.debug(
+        logger.info(f"[Autotuner] The profiling_cache entries:")
+        logger.info(
             f"[Autotuner] Cache contents: (custom_op, runner, hash(attributes), shape_profiles) -> (runner_id, tactic, shape_profile(ignored))"
         )
         for key, value in self.profiling_cache.cache.items():
             runner_id, tactic, min_time = value
-            logger.debug(
+            logger.info(
                 f"[Autotuner] {key}: (runner_id={runner_id}, tactic={tactic}, min_time={min_time})"
             )
 
@@ -1274,7 +1274,7 @@ class AutoTuner:
             runner_idx = runners.index(runner)
             runner_tactic_list.append((runner_idx, tactic))
 
-        logger.debug(
+        logger.info(
             f"[Autotuner][replay]: Testing configuration: {runner_tactic_list}")
 
         # Replay the contexts with given (runner, tactic) pairs
