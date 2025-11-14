@@ -75,7 +75,7 @@ def load_weight_shard(
         # For integrated GPU systems (e.g., DGX Spark), CPU and GPU share limited physical memory.
         # Avoiding device transfers reduces memory consumption and unnecessary data copies,
         # enabling support for larger models on memory-constrained systems.
-        logger.warning(
+        logger.debug(
             f"[load_weight_shard] Skipping device transfer from {weight.device} to {device} on integrated GPU to conserve shared memory."
         )
         device = weight.device
