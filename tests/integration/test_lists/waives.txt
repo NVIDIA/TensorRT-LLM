@@ -411,6 +411,6 @@ disaggregated/test_auto_scaling.py::test_disagg_server_restart[etcd-round_robin]
 disaggregated/test_auto_scaling.py::test_worker_restart[http-load_balancing] SKIP (https://nvbugs/5649010)
 disaggregated/test_auto_scaling.py::test_worker_restart[http-round_robin] SKIP (https://nvbugs/5649010)
 disaggregated/test_disaggregated.py::test_disaggregated_mixed[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/5661926)
-accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_chunked_prefill[cutlass-auto] SKIP (https://nvbugs/5569696)
-accuracy/test_llm_api_pytorch.py::TestNemotronH_56B_Base::test_auto_dtype[tp8-cuda_graph=True] SKIP (https://nvbugs/5569696)
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_chunked_prefill[cutlass-auto] SKIP (https://nvbugs/5608790)
+accuracy/test_llm_api_pytorch.py::TestNemotronH_56B_Base::test_auto_dtype[tp8-cuda_graph=True] SKIP (https://nvbugs/5640697)
 test_e2e.py::test_trtllm_multimodal_benchmark_serving SKIP (https://nvbugs/5647825)
