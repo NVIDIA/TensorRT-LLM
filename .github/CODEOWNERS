@@ -159,7 +159,6 @@ docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
 /cpp/include/tensorrt_llm/batch_manager/kvCacheManager.h @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/include/tensorrt_llm/batch_manager/kvCacheEventManager.h @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/include/tensorrt_llm/batch_manager/kvCacheTransferManager.h @NVIDIA/trt-llm-kv-cache-manager-devs
-/cpp/include/tensorrt_llm/batch_manager/kvCacheTransferManager.h @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/include/tensorrt_llm/batch_manager/evictionPolicy.h @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/tensorrt_llm/batch_manager/allocateKvCache.cpp @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/tests/unit_tests/batch_manager/kvCacheManagerTest.cpp @NVIDIA/trt-llm-kv-cache-manager-devs
