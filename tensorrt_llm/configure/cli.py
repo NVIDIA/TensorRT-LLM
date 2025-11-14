@@ -13,7 +13,7 @@ class CommonOptions(BaseModel):
     """Common options for all subcommands of the trtllm-configure CLI tool."""
 
     output: Optional[Path] = Field(
-        default=Path("config.yaml"),
+        default=None,
         description="YAML file path where the optimized config will be written.",
         validation_alias=AliasChoices("output", "o"),
     )

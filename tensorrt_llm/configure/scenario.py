@@ -26,7 +26,7 @@ class BaseScenario(BaseModel):
 
     model: str = Field(description="HuggingFace ID of the model being deployed")
     gpu: GPU = Field(description="GPU SKU used in the deployment")
-    num_gpus: int = Field(description="Number of GPUs available in the deployment")
+    num_gpus: PositiveInt = Field(description="Number of GPUs available in the deployment")
 
 
 class BenchmarkScenario(BaseScenario):
