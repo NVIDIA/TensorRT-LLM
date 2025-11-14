@@ -959,6 +959,13 @@ private:
         // MIN_LATENCY.
         if (mStrategy != AllReduceStrategyType::AUTO)
         {
+            // Check TWOSHOT constraint: seq_len >= tp_size
+            if (mStrategy == AllReduceStrategyType::TWOSHOT && seq_len < mGroup.size())
+            {
+                TLLM_LOG_WARNING("TWOSHOT strategy requires seq_len >= tp_size (%zu < %zu), falling back to ONESHOT",
+                    seq_len, mGroup.size());
+                return AllReduceStrategyType::ONESHOT;
+            }
             return mStrategy;
         }
         else
