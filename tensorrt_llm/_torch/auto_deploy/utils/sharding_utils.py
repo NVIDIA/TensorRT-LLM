@@ -1199,7 +1199,7 @@ class ShardingDim(Enum):
     BMM = "bmm"
 
 
-class ShardingConfig(BaseModel):
+class ShardingTransformContainer(BaseModel):
     """Configuration for sharding the model."""
 
     factory_source: ShardingConfigSource = Field(default=ShardingConfigSource.UNKNOWN)
@@ -1228,6 +1228,28 @@ class ShardingConfig(BaseModel):
             EPShardingInfo: self.ep_transforms,
             ParameterUpdateInfo: self.parameter_update_transforms,
         }
+
+    def init_params(self, other):
+        """
+        Copy parameters from ShardingTransformConfig. The class is not
+        imported here to avoid circular imports.
+        """
+        self.factory_source = other.factory_source
+        self.rank = other.rank
+        self.world_size = other.world_size
+        self.factory_config = other.factory_config
+        self.manual_config = other.manual_config
+        self.simple_shard_only = other.simple_shard_only
+        self.support_partial_config = other.support_partial_config
+        self.sharding_dims = other.sharding_dims
+        self.sharding_source = other.sharding_source
+        self.factory_source = (
+            self.factory_config.get("source", ShardingConfigSource.UNKNOWN)
+            if self.factory_config
+            else ShardingConfigSource.UNKNOWN
+        )
+        self.validate_config(ShardingSource.MANUAL)
+        self.validate_config(ShardingSource.FACTORY)
 
     @model_validator(mode="after")
     def _validate_and_normalize(self):
