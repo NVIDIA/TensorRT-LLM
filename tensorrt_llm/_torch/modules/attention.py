@@ -414,9 +414,12 @@ class Attention(nn.Module):
 
         out_scale = None
         out_scale_sf = None
+        has_awq_pre_quant_scale = hasattr(
+            self.o_proj,
+            'pre_quant_scale') and self.o_proj.pre_quant_scale is not None
         # Don't set out_scale if o_proj has pre_quant_scale - this prevents FP8/FP4 output
         # and keeps attention output in BF16 for better precision when applying pre_quant_scale
-        if self.has_quant_scale and self.o_proj.pre_quant_scale is None:
+        if self.has_quant_scale and not has_awq_pre_quant_scale:
             out_scale = self.o_proj.inv_input_scale
         if hasattr(
                 self.o_proj,
