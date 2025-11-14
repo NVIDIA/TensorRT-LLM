@@ -8,8 +8,7 @@ endif()
 # =============
 
 # Use FlashMLA submodule
-set(FLASH_MLA_SOURCE_DIR
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../../3rdparty/flash-mla)
+set(FLASH_MLA_SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/flashmla-src)
 get_filename_component(FLASH_MLA_SOURCE_DIR ${FLASH_MLA_SOURCE_DIR} ABSOLUTE)
 
 if(NOT EXISTS ${FLASH_MLA_SOURCE_DIR})
