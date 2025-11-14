@@ -82,6 +82,7 @@ class CutlassMoEOp(MoEOp):
                                               False),
                 min_latency_mode=min_latency_mode,
                 use_fused_finalize=use_fused_finalize,
+                activation_type=module.activation_type,
             )
 
         # Set tuning configuration
