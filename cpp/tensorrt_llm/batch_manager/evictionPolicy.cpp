@@ -174,17 +174,21 @@ void LRUEvictionPolicy::claimBlock(BlockPtr block, std::optional<executor::Reten
     {
         mFreeQueues[cacheLevel][getPriorityIdx(block->getPriority())].erase(*mFreeBlockIterators[id]);
         mNumFreeBlocksPerLevel[cacheLevel] -= 1;
+        mFreeBlockIterators[id] = std::nullopt;
     }
-
-    mFreeBlockIterators[id] = std::nullopt;
 
     if (priority.has_value())
     {
         block->setPriority(*priority);
     }
 
+    // It is safe to call erase even if block is not found in mExpiringBlockHeap.
     mExpiringBlockHeap.erase(block);
-    block->setDurationMs(durationMs);
+
+    if (durationMs.has_value())
+    {
+        block->setDurationMs(durationMs);
+    }
 }
 
 std::chrono::steady_clock::time_point::duration LRUEvictionPolicy::getTime() const
