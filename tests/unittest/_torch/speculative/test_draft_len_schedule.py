@@ -13,13 +13,17 @@ from utils.util import similar
 
 
 # # ============================================================================
-# # Fixture: Force single-worker mode
-# # Used in test 2, as it needs to check the states of the executor
+# # Fixture: Force single-worker mode for all tests in this module
 # # ============================================================================
-@pytest.fixture(scope="function")
-def enforce_single_worker(monkeypatch):
-    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+@pytest.fixture(scope="module", autouse=True)
+def enforce_single_worker():
+    """Force single-worker mode for all tests in this module."""
+    import os
+
+    os.environ["TLLM_WORKER_USE_SINGLE_PROCESS"] = "1"
     yield
+    if "TLLM_WORKER_USE_SINGLE_PROCESS" in os.environ:
+        del os.environ["TLLM_WORKER_USE_SINGLE_PROCESS"]
 
 
 # # ============================================================================
@@ -146,9 +150,7 @@ def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
     ],
 )
 @pytest.mark.high_cuda_memory
-def test_draft_len_schedule_functionality(
-    enforce_single_worker, drafter_type: str, draft_schedule: dict
-):
+def test_draft_len_schedule_functionality(drafter_type: str, draft_schedule: dict):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
