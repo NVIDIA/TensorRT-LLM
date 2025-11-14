@@ -12,7 +12,7 @@ import yaml
 
 from tensorrt_llm.logger import logger
 
-TEST_PORT = 18000
+TEST_PORT = 8000
 HEARTBEAT_INTERVAL = 1
 INACTIVE_TIMEOUT = 2
 
@@ -192,13 +192,13 @@ def verify_cluster_info(ready,
 
 
 def terminate(*args):
-    try:
-        for arg in args:
-            if arg and isinstance(arg, subprocess.Popen):
-                arg.terminate()
+    for arg in args:
+        if arg and isinstance(arg, subprocess.Popen):
+            try:
+                arg.kill()
                 arg.wait(timeout=10)
-    except Exception:
-        pass
+            except Exception:
+                print(f"Failed to terminate process {arg.pid}")
 
 
 def request_completion(model_name, prompt, port=TEST_PORT):

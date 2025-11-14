@@ -1,3 +1,4 @@
+import json
 import uuid
 from functools import partial
 from typing import (Any, Callable, Coroutine, Dict, Iterable, List, Literal,
@@ -185,6 +186,36 @@ def parse_chat_message_content(
         content,
         mm_data_tracker,
     )
+    if role == "assistant":
+        result.update(_parse_assistant_message_content(message))
+    elif role == "tool":
+        result.update(_parse_tool_message_content(message))
+    return result
+
+
+# Adapted from: https://github.com/vllm-project/vllm/blob/4574d48bab9c4e38b7c0a830eeefc8f0980e8c58/vllm/entrypoints/chat_utils.py#L1406
+def _parse_assistant_message_content(message: Dict[str, Any]) -> Dict[str, Any]:
+    result = {}
+    tool_calls = message.get("tool_calls")
+    if tool_calls is not None:
+        result["tool_calls"] = []
+        for item in tool_calls:
+            if content := item["function"].get("arguments"):
+                if isinstance(content, str):
+                    item["function"]["arguments"] = json.loads(content)
+                else:
+                    item["function"]["arguments"] = content
+            else:
+                item["function"]["arguments"] = {}
+            result["tool_calls"].append(item)
+
+    return result
+
+
+def _parse_tool_message_content(message: Dict[str, Any]) -> Dict[str, Any]:
+    result = {}
+    if "tool_call_id" in message:
+        result["tool_call_id"] = message["tool_call_id"]
     return result
 
 
@@ -215,12 +246,6 @@ def parse_chat_messages_coroutines(
 
     return conversation, mm_data_tracker.retrieve_all_async(
     ), mm_placeholder_counts
-
-
-def check_multiple_response(n: int, backend: Optional[str]):
-    if n > 1 and backend == "pytorch":
-        raise ValueError(
-            "Multiple response is not supported in PyTorch workflow")
 
 
 def make_tool_call_id(id_type: str = "random", func_name=None, idx=None):

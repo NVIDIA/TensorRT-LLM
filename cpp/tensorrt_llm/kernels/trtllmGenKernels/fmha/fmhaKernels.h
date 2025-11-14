@@ -506,7 +506,8 @@ private:
                 }
                 // The keepsMmaAbForGeneration sparseMla kernels only support numHeadsQPerKv = 128.
                 TLLM_CHECK_WITH_INFO(!params.mSparseMla || params.mNumHeadsQPerKv == 128,
-                    "The keepsMmaAbForGeneration sparseMla kernels only support numHeadsQPerKv = 128");
+                    "The keepsMmaAbForGeneration sparseMla kernels only support numHeadsQPerKv = 128, got %d",
+                    params.mNumHeadsQPerKv);
                 // The 2CTA keepsMmaAbForGeneration kernel is used when the numHeadsQPerKv is 128.
                 if (params.mNumHeadsQPerKv == 128)
                 {

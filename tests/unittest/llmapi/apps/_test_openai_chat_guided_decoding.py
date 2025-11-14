@@ -102,6 +102,48 @@ def test_json_schema(client: openai.OpenAI, model_name: str):
     jsonschema.validate(json.loads(message.content), json_schema)
 
 
+def test_openai_compatible_json_schema(client: openai.OpenAI, model_name: str):
+    json_schema = {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "pattern": "^[\\w]+$"
+            },
+            "population": {
+                "type": "integer"
+            },
+        },
+        "required": ["name", "population"],
+    }
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a helpful assistant.",
+        },
+        {
+            "role":
+            "user",
+            "content":
+            "Give me the information of the capital of France in the JSON format.",
+        },
+    ]
+    chat_completion = client.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        max_completion_tokens=256,
+        response_format={
+            "type": "json_schema",
+            "json_schema": json_schema
+        },
+    )
+
+    message = chat_completion.choices[0].message
+    assert message.content is not None
+    assert message.role == "assistant"
+    jsonschema.validate(json.loads(message.content), json_schema)
+
+
 def test_json_schema_user_profile(client: openai.OpenAI, model_name: str):
     json_schema = {
         "type": "object",

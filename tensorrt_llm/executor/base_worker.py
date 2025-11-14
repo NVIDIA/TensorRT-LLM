@@ -40,7 +40,30 @@ from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
 
 __all__ = [
     "BaseWorker",
+    "_init_hf_modules",
 ]
+
+
+def _init_hf_modules():
+    """Initialize cached HuggingFace modules for models with trust_remote_code=True.
+
+    This is safe to call multiple times (idempotent) and should be called:
+    1. At module import time (for main process and spawned subprocesses)
+    2. At worker_main entry (for forked processes or external MPI ranks)
+
+    References: https://github.com/vllm-project/vllm/pull/871
+    """
+    try:
+        from transformers.dynamic_module_utils import init_hf_modules
+        init_hf_modules()
+        logger.debug("HF modules initialized")
+    except ImportError as e:
+        logger.warning(f"ImportError initializing HF modules: {e}")
+    except Exception as e:
+        logger.error(f"Exception initializing HF modules: {e}")
+
+
+_init_hf_modules()
 
 
 class BaseWorker(GenerationExecutor):
@@ -175,7 +198,7 @@ class BaseWorker(GenerationExecutor):
                     create_autodeploy_executor
                 create_executor = create_autodeploy_executor
                 assert isinstance(self.llm_args, ADLlmArgs)
-                args["ad_config"] = self.llm_args.get_pytorch_backend_config()
+                args["ad_config"] = self.llm_args
                 args["tokenizer"] = self._tokenizer
             else:
                 raise ValueError(f"Unsupported backend config: {self._backend}")
@@ -184,7 +207,7 @@ class BaseWorker(GenerationExecutor):
             self.mapping = self.llm_args.parallel_config.to_mapping()
             self.checkpoint_loader = None
             if self._backend == "pytorch":
-                from tensorrt_llm._torch.pyexecutor.config import \
+                from tensorrt_llm._torch.pyexecutor.model_loader import \
                     _construct_checkpoint_loader
                 self.checkpoint_loader = _construct_checkpoint_loader(
                     self.llm_args.backend, self.llm_args.checkpoint_loader,

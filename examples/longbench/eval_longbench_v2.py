@@ -28,7 +28,8 @@ from transformers import AutoTokenizer
 
 # Add tensorrt_llm imports
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import KvCacheConfig, RocketSparseAttentionConfig
+from tensorrt_llm.llmapi import (CudaGraphConfig, KvCacheConfig,
+                                 RocketSparseAttentionConfig)
 from tensorrt_llm.logger import logger
 
 # Chat templates mapping
@@ -362,6 +363,10 @@ def initialize_llm(args: argparse.Namespace) -> Tuple[LLM, AutoTokenizer]:
             sparse_attention_config = None
             logger.info("Using standard attention")
 
+        cuda_graph_config = CudaGraphConfig(
+            max_batch_size=args.max_batch_size
+        ) if args.attention_backend == "TRTLLM" else None
+
         # Initialize LLM
         llm = LLM(
             model=args.model_path,
@@ -372,8 +377,7 @@ def initialize_llm(args: argparse.Namespace) -> Tuple[LLM, AutoTokenizer]:
             tensor_parallel_size=args.tensor_parallel_size,
             max_seq_len=args.max_seq_len,
             max_num_tokens=args.max_num_tokens,
-            cuda_graph_config=None,
-            torch_compile_config=None,
+            cuda_graph_config=cuda_graph_config,
         )
 
         # Initialize tokenizer

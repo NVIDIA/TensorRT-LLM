@@ -50,7 +50,7 @@ class ExecutorRequestQueue:
     def __init__(self, dist: Distributed, enable_attention_dp: bool,
                  max_batch_size: int, max_beam_width: int,
                  max_num_active_requests: int, enable_iter_perf_stats: bool,
-                 batch_wait_timeout_ms: float, is_disaggregated: bool):
+                 batch_wait_timeout_ms: float):
         self.dist = dist
         self.request_queue: queue.Queue[RequestQueueItem] = queue.Queue()
         self.waiting_queue: deque[RequestQueueItem] = deque()
@@ -59,13 +59,13 @@ class ExecutorRequestQueue:
         self.max_batch_size = max_batch_size
         self.max_beam_width = max_beam_width
         self.max_num_active_requests = max_num_active_requests
-        self.is_disaggregated = is_disaggregated
         self.enqueue_lock = threading.Lock()
         self.next_request_id = max_batch_size
         self.enable_iter_perf_stats = enable_iter_perf_stats
         self.start_times = {}
         self.active = True
         self.batch_wait_timeout_ms = batch_wait_timeout_ms
+        self.send_requests_handler = None
 
         # State tracking
         self.num_fetch_requests = 0
@@ -609,15 +609,11 @@ class ExecutorRequestQueue:
 
         if not self.dist.is_last_pp_rank:
             with nvtx_range("send_requests_to_next_pp"):
-                if self._disable_mpi:
-                    isend_payload = self.dist.isend_object(
-                        payloads,
-                        self.dist.next_pp_rank,
-                        tag,
-                    )
-                    isend_payload.wait()
-                else:
-                    self.dist.send_object(payloads, self.dist.next_pp_rank, tag)
+                if self.send_requests_handler is not None:
+                    with nvtx_range("wait_prev_send_requests_handler"):
+                        self.send_requests_handler.wait()
+                self.send_requests_handler = self.dist.isend_object(
+                    payloads, self.dist.next_pp_rank, tag)
 
         return payloads
 

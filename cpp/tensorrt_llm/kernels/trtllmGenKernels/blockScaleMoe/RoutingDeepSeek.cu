@@ -613,22 +613,8 @@ void run(Data& data, void* stream)
     TLLM_CHECK_WITH_INFO(data.mNumExpertGroups >= data.mNumLimitedGroups,
         "Routing kernel expects top groups %d to be limited by #expert groups %d", data.mNumLimitedGroups,
         data.mNumExpertGroups);
-    if (data.mNumExpertGroups > 1)
-    {
-        TLLM_CHECK_WITH_INFO(data.mNumExpertGroups <= MaxNumGroups,
-            "Routing kernel expects #experts groups %d to be <= #warps %d", data.mNumExpertGroups, MaxNumGroups);
-        TLLM_CHECK_WITH_INFO(data.mNumExperts % data.mNumExpertGroups == 0,
-            "Routing kernel expects #experts %d to be a multiple of #expert groups %d", data.mNumExperts,
-            data.mNumExpertGroups);
-        TLLM_CHECK_WITH_INFO(data.mNumExperts / data.mNumExpertGroups <= WarpSize,
-            "Routing kernel expects #experts per group <= warp size, got %d, data.mNumExpertGroups %d",
-            data.mNumExperts / data.mNumExpertGroups, data.mNumExpertGroups);
-    }
-    else
-    {
-        TLLM_CHECK_WITH_INFO(data.mTopK <= topk::MaxNumTopK, "Routing kernel expects top K %d to be <= #warps %d",
-            data.mTopK, topk::MaxNumTopK);
-    }
+    // Note: Routing-specific constraints (experts per group, topK limits) are checked later
+    // only when routing is actually needed (data.mPtrTopKIds == nullptr)
     TLLM_CHECK_WITH_INFO(
         data.mNumExperts % 4 == 0, "Routing kernel expects #experts %d to be a multiple of 4.", data.mNumExperts);
     int const numBlocks = data.mNumTokens;
@@ -663,6 +649,25 @@ void run(Data& data, void* stream)
     int const maxTokensCoop = (numBlocksCoop * numThreadsHist * 64) / data.mTopK;
     if (data.mPtrTopKIds == nullptr)
     {
+        // Routing needs to be executed - validate routing kernel constraints
+        if (data.mNumExpertGroups > 1)
+        {
+            TLLM_CHECK_WITH_INFO(data.mNumExpertGroups <= MaxNumGroups,
+                "Routing kernel expects #expert groups %d to be <= max groups %d", data.mNumExpertGroups, MaxNumGroups);
+            TLLM_CHECK_WITH_INFO(data.mNumExperts % data.mNumExpertGroups == 0,
+                "Routing kernel expects #experts %d to be a multiple of #expert groups %d", data.mNumExperts,
+                data.mNumExpertGroups);
+            TLLM_CHECK_WITH_INFO(data.mNumExperts / data.mNumExpertGroups <= WarpSize,
+                "Routing kernel expects #experts per group <= warp size (%d), got %d experts / %d groups = %d experts "
+                "per group",
+                WarpSize, data.mNumExperts, data.mNumExpertGroups, data.mNumExperts / data.mNumExpertGroups);
+        }
+        else
+        {
+            TLLM_CHECK_WITH_INFO(data.mTopK <= topk::MaxNumTopK, "Routing kernel expects top K %d to be <= max topk %d",
+                data.mTopK, topk::MaxNumTopK);
+        }
+
         int const numThreadsMain = data.mNumExperts < NumDeepseekExperts ? NumDeepseekExperts : NumKimiK2Experts;
         LAUNCH_ROUTING_DEEPSEEK(data,
             /*coopLaunch=*/false, routingMainKernel, numBlocks, numThreadsMain,
