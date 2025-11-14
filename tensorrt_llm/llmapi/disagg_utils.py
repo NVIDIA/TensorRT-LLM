@@ -3,10 +3,10 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
-import yaml
 from mpi4py.MPI import COMM_WORLD, Comm
 
 from .._utils import global_mpi_rank, global_mpi_size
+from .llm_utils import load_yaml_maybe_env_override
 
 __all__ = [
     'ServerConfig',
@@ -103,13 +103,10 @@ def get_ctx_gen_server_urls(
 
 def parse_disagg_config_file(yaml_config_file: str):
 
-    with open(yaml_config_file, 'r') as file:
+    config = load_yaml_maybe_env_override(yaml_config_file)
+    disagg_server_config = extract_disagg_cfg(**config)
 
-        config = yaml.safe_load(file)
-
-        disagg_server_config = extract_disagg_cfg(**config)
-
-        return disagg_server_config
+    return disagg_server_config
 
 
 def extract_disagg_cfg(hostname: str = 'localhost',
@@ -328,6 +325,5 @@ def parse_metadata_server_config_file(
     if metadata_server_config_file is None:
         return None
 
-    with open(metadata_server_config_file, 'r') as file:
-        config = yaml.safe_load(file)
-        return MetadataServerConfig(**config)
+    config = load_yaml_maybe_env_override(metadata_server_config_file)
+    return MetadataServerConfig(**config)

@@ -3041,13 +3041,29 @@ def update_llm_args_with_extra_dict(
 def update_llm_args_with_extra_options(llm_args: Dict,
                                        extra_llm_api_options: str) -> Dict:
     if extra_llm_api_options is not None:
-        with open(extra_llm_api_options, 'r') as f:
-            llm_args_dict = yaml.safe_load(f)
-            # Apply environment variable overrides from config file
-            apply_env_overrides(llm_args_dict, extra_llm_api_options)
-            llm_args = update_llm_args_with_extra_dict(llm_args, llm_args_dict,
-                                                       extra_llm_api_options)
+        llm_args_dict = load_yaml_maybe_env_override(extra_llm_api_options)
+        llm_args = update_llm_args_with_extra_dict(llm_args, llm_args_dict,
+                                                   extra_llm_api_options)
     return llm_args
+
+
+def load_yaml_maybe_env_override(file_path: str) -> Dict:
+    """Load YAML file and optionally apply env_overrides section.
+
+    Reads a YAML configuration file and automatically processes any
+    'env_overrides' section to set environment variables. Config file
+    values take precedence over existing shell environment variables.
+
+    Args:
+        file_path: Path to YAML config file
+
+    Returns:
+        Config dictionary with env_overrides processed and removed
+    """
+    with open(file_path, 'r') as f:
+        config = yaml.safe_load(f)
+    apply_env_overrides(config, file_path)
+    return config
 
 
 def get_model_format(model_dir: str,

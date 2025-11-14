@@ -9,7 +9,6 @@ from typing import Any, Dict, Mapping, Optional, Sequence
 
 import click
 import torch
-import yaml
 from strenum import StrEnum
 from torch.cuda import device_count
 
@@ -28,7 +27,8 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               extract_disagg_cluster_config,
                                               parse_disagg_config_file,
                                               parse_metadata_server_config_file)
-from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_options
+from tensorrt_llm.llmapi.llm_utils import (load_yaml_maybe_env_override,
+                                           update_llm_args_with_extra_options)
 from tensorrt_llm.llmapi.mpi_session import find_free_port
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.logger import logger, severity_map
@@ -512,8 +512,8 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
 
     encoder_args_extra_dict = {}
     if extra_encoder_options is not None:
-        with open(extra_encoder_options, 'r') as f:
-            encoder_args_extra_dict = yaml.safe_load(f)
+        encoder_args_extra_dict = load_yaml_maybe_env_override(
+            extra_encoder_options)
     encoder_args = update_llm_args_with_extra_dict(llm_args,
                                                    encoder_args_extra_dict)
 

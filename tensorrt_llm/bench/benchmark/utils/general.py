@@ -83,14 +83,14 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
     mamba_ssm_cache_dtype = params.get("mamba_ssm_cache_dtype", "auto")
     kv_cache_config = {}
     if extra_llm_api_options:
-        with open(extra_llm_api_options, 'r') as f:
-            llm_args_dict = yaml.safe_load(f)
-            kv_cache_config = llm_args_dict.get("kv_cache_config", {
-                "dtype": "auto",
-            })
-            kv_cache_dtype = kv_cache_config.get("dtype", "auto")
-            mamba_ssm_cache_dtype = kv_cache_config.get("mamba_ssm_cache_dtype",
-                                                        mamba_ssm_cache_dtype)
+        from tensorrt_llm.llmapi.llm_utils import load_yaml_maybe_env_override
+        llm_args_dict = load_yaml_maybe_env_override(extra_llm_api_options)
+        kv_cache_config = llm_args_dict.get("kv_cache_config", {
+            "dtype": "auto",
+        })
+        kv_cache_dtype = kv_cache_config.get("dtype", "auto")
+        mamba_ssm_cache_dtype = kv_cache_config.get("mamba_ssm_cache_dtype",
+                                                    mamba_ssm_cache_dtype)
 
         enable_chunked_prefill = llm_args_dict.get("enable_chunked_prefill",
                                                    enable_chunked_prefill)
