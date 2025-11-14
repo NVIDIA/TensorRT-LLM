@@ -157,13 +157,11 @@ class AccuracyTask:
                 spec_dec_algo (str): Speculative decoding algorithm. Defaults to None.
                 extra_acc_spec (str): Extra accuracy specifications. Defaults to None.
         """
-
         for entry in self.reference:
             matched = True
             for key, value in acc_specs.items():
                 default = 'auto' if key == 'dtype' else None
-                entry_value = entry.get(key, default)
-                if entry_value != value:
+                if entry.get(key, default) != value:
                     matched = False
                     break
             if matched:
