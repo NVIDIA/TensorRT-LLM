@@ -447,7 +447,7 @@ void initConfigBindings(pybind11::module_& m)
 
     py::class_<tle::CacheTransceiverConfig>(m, "CacheTransceiverConfig")
         .def(py::init<std::optional<tle::CacheTransceiverConfig::BackendType>, std::optional<size_t>,
-                 std::optional<int>>(),
+                 std::optional<int>, std::optional<int>>(),
             py::arg("backend") = std::nullopt, py::arg("max_tokens_in_buffer") = std::nullopt,
             py::arg("kv_transfer_timeout_ms") = std::nullopt,
             py::arg("kv_transfer_sender_future_timeout_ms") = std::nullopt)
