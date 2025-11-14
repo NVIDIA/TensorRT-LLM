@@ -20,7 +20,7 @@ except ModuleNotFoundError:
     from tensorrt_llm import ray_stub as ray
 
 from .._ray_utils import unwrap_ray_errors
-from .._utils import mpi_disabled, nvtx_range_debug
+from .._utils import mpi_disabled, nvtx_range_debug, ray_use_rpc
 from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.tracer import global_tracer
@@ -275,7 +275,7 @@ class GenerationResultBase:
         # torch backend will use trtllm sampler in beam search mode, but it does not support return logprobs incrementally
         self.use_trtllm_sampler = sampling_params.use_beam_search and sampling_params.best_of > 1
 
-        if ray_queue is not None:
+        if ray_queue is not None and not ray_use_rpc():
             if has_event_loop():
                 self.aqueue = ray_queue
                 self.queue = self.aqueue
@@ -557,7 +557,7 @@ class GenerationResultBase:
         else:
             raise ValueError(f"Unknown response type: {response}")
 
-        if self._done and mpi_disabled():
+        if self._done and mpi_disabled() and not ray_use_rpc():
             assert hasattr(
                 self.queue, "unregister"
             ), "Ray path should be activated for unregistering the Ray queue."
@@ -790,7 +790,7 @@ class GenerationResult(GenerationResultBase):
     ) -> None:
         use_async_queue = has_event_loop()
         shared_queue = None
-        if executor and executor.use_ray_queue():
+        if executor and executor.use_ray_queue() and not ray_use_rpc():
             shared_queue = executor.async_response_queue_weakref if use_async_queue else executor.sync_response_queue_weakref
 
         super().__init__(
@@ -855,7 +855,7 @@ class GenerationResult(GenerationResultBase):
         return response
 
     def _result_step(self, timeout: Optional[float] = None):
-        if mpi_disabled():
+        if mpi_disabled() and not ray_use_rpc():
             with unwrap_ray_errors():
                 response = ray.get(self.queue.get.remote(self.request_id))
             response = self._handle_ray_response(response)
@@ -866,7 +866,7 @@ class GenerationResult(GenerationResultBase):
 
     async def _aresult_step(self):
         assert self.aqueue is not None, "The asyncio event loop was not present during initialization, so async operations are not available."
-        if mpi_disabled():
+        if mpi_disabled() and not ray_use_rpc():
             response = await self.aqueue.get_async.remote(self.request_id)
             response = self._handle_ray_response(response)
         else:
