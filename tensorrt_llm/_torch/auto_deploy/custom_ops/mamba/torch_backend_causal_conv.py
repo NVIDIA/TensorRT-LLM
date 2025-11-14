@@ -342,7 +342,7 @@ class TorchBackendCausalConv(AttentionDescriptor):
                 in_channels,
                 kernel_size,
                 device=si.device,
-                dtype=cache_config.dtype or inp_fake.dtype,
+                dtype=inp_fake.dtype,
             )
 
         return {"conv_state_cache": _get_conv_cache}
