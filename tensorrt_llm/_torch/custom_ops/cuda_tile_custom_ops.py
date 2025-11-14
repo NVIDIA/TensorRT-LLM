@@ -22,8 +22,8 @@ if IS_CUDA_TILE_AVAILABLE:
         static_persistent: bool,
         gather: bool,
     ) -> torch.Tensor:
-        x = x.contiguous()
-        weight = weight.contiguous()
+        x = x.clone().contiguous()
+        weight = weight.clone().contiguous()
 
         # Allocate output tensor
         y = torch.empty_like(x)

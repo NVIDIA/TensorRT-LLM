@@ -78,7 +78,20 @@ class RMSNorm(nn.Module):
             return_residual = False
             residual = None
 
-        if IS_FLASHINFER_AVAILABLE:
+        if self.use_cuda_tile:
+            from ..custom_ops.cuda_tile_custom_ops import cutile_rms_norm
+
+            if isinstance(residual, torch.Tensor):
+                # TODO: Fuse residual handing to cudatile_rms_norm.
+                residual = (hidden_states.float() + residual.float()).to(hidden_states.dtype)
+            hidden_states = cutile_rms_norm(
+                x=hidden_states,
+                weight=self.weight,
+                eps=self.variance_epsilon,
+                static_persistent=False,
+                gather=True,
+            )
+        elif IS_FLASHINFER_AVAILABLE:
             from ..custom_ops import (flashinfer_fused_add_rmsnorm,
                                       flashinfer_gemma_fused_add_rmsnorm,
                                       flashinfer_gemma_rmsnorm,
@@ -100,19 +113,6 @@ class RMSNorm(nn.Module):
                 else:
                     hidden_states = flashinfer_gemma_rmsnorm(
                         hidden_states, self.weight, self.variance_epsilon)
-        elif self.cuda_tile:
-            from ..custom_ops.cuda_tile_custom_ops import cutile_rms_norm
-
-            if isinstance(residual, torch.Tensor):
-                # TODO: Fuse residual handing to cudatile_rms_norm.
-                residual = (hidden_states.float() + residual.float()).to(hidden_states.dtype)
-            hidden_states = cutile_rms_norm(
-                x=hidden_states,
-                weight=self.weight,
-                eps=self.variance_epsilon,
-                static_persistent=True,
-                gather=False,
-            )
         else:
             input_dtype = hidden_states.dtype
             hidden_states = hidden_states.to(torch.float32)

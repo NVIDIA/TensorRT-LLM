@@ -3,7 +3,6 @@ from ..cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
 
 if IS_CUDA_TILE_AVAILABLE:
     import cuda.tile as ct
-    import numpy as np
 
 
     @ct.kernel
@@ -40,13 +39,13 @@ if IS_CUDA_TILE_AVAILABLE:
                 allow_tma=False,
                 latency=1,
             )
-            wj = ct.astype(wj, np.float32)
+            wj = ct.astype(wj, ct.float32)
             xj = ct.load(
                 x, index=(row, j), shape=(1, TILE_SIZE),
                 allow_tma=False,
                 latency=1,
             )
-            xj = ct.astype(xj, np.float32)
+            xj = ct.astype(xj, ct.float32)
             yj = xj * rms * wj
             yj = ct.astype(yj, x.dtype)
             ct.store(
@@ -68,14 +67,14 @@ if IS_CUDA_TILE_AVAILABLE:
     ):
         """Standard RMSNorm kernel for non-static persistent mode with ptr loads"""
         row = ct.bid(0)
-        _rms = ct.full((TILE_SIZE,), 0.0, dtype=np.float32)
+        _rms = ct.full((TILE_SIZE,), 0.0, dtype=ct.float32)
         num_tiles = ct.cdiv(N, TILE_SIZE)
-        offsets = ct.arange(TILE_SIZE, dtype=np.int32)
+        offsets = ct.arange(TILE_SIZE, dtype=ct.int32)
 
         for j in range(0, num_tiles):
             offs = j * TILE_SIZE + offsets
             xj = ct.gather(x, (row, offs), latency=1)
-            xj = ct.astype(xj, np.float32)
+            xj = ct.astype(xj, ct.float32)
             _rms += xj * xj
 
         # Calculate RMS Norm
@@ -85,9 +84,9 @@ if IS_CUDA_TILE_AVAILABLE:
         for j in range(0, num_tiles):
             offs = j * TILE_SIZE + offsets
             wj = ct.gather(w, offs, latency=1)
-            wj = ct.astype(wj, np.float32)
+            wj = ct.astype(wj, ct.float32)
             xj = ct.gather(x, (row, offs), latency=1)
-            xj = ct.astype(xj, np.float32)
+            xj = ct.astype(xj, ct.float32)
             yj = xj * rms * wj
             yj = ct.astype(yj, x.dtype)
             ct.scatter(out, (row, offs), yj, latency=1)
@@ -118,7 +117,7 @@ if IS_CUDA_TILE_AVAILABLE:
 
         # Load weight vector once (shared across all blocks processed by this program)
         w = ct.load(W, index=(0,), shape=(TILE_SIZE_N,))
-        w = ct.astype(w, np.float32)
+        w = ct.astype(w, ct.float32)
 
         # Static persistent loop: each program processes multiple blocks
         num_tiles_x = ct.num_blocks(0)
@@ -128,7 +127,7 @@ if IS_CUDA_TILE_AVAILABLE:
                 X, index=(current_block, 0), shape=(TILE_SIZE_M, TILE_SIZE_N),
                 latency=10,  # +2% perf from this hint
             )
-            x = ct.astype(x, np.float32)
+            x = ct.astype(x, ct.float32)
 
             # Step 1: Compute x^2
             x_squared = ct.mul(x, x)
@@ -139,11 +138,11 @@ if IS_CUDA_TILE_AVAILABLE:
             )  # Shape: [TILE_SIZE_M, 1]
 
             # Step 3: Compute variance (divide by N)
-            N_f32 = ct.full((TILE_SIZE_M, 1), N * 1.0, dtype=np.float32)
+            N_f32 = ct.full((TILE_SIZE_M, 1), N * 1.0, dtype=ct.float32)
             variance = ct.truediv(x2_sum, N_f32)
 
             # Step 4: Add epsilon and compute rsqrt
-            eps_tensor = ct.full((TILE_SIZE_M, 1), eps, dtype=np.float32)
+            eps_tensor = ct.full((TILE_SIZE_M, 1), eps, dtype=ct.float32)
             variance_eps = ct.add(variance, eps_tensor)
             rsqrt_var = ct.rsqrt(variance_eps)
 
@@ -153,7 +152,7 @@ if IS_CUDA_TILE_AVAILABLE:
             # Step 6: Apply linear transformation
             # Broadcast weight to match input shape
             w_broadcasted = ct.reshape(w, (1, TILE_SIZE_N))
-            b_broadcasted = ct.full((1, TILE_SIZE_N), 0.0, dtype=np.float32)
+            b_broadcasted = ct.full((1, TILE_SIZE_N), 0.0, dtype=ct.float32)
 
             # Apply linear transformation: y = x_normalized * w + b
             y = ct.mul(x_normalized, w_broadcasted)
