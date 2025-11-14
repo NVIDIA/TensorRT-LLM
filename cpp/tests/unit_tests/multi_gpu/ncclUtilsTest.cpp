@@ -227,7 +227,7 @@ protected:
         }
 
         // Check if NCCL symmetric is supported
-        auto& ncclHelper = tensorrt_llm::runtime::ub::NCCLUserBufferAllocator::getNCCLHelper();
+        auto& ncclHelper = nccl_util::NCCLHelper::getInstance();
         if (!ncclHelper.isLoaded())
         {
             GTEST_SKIP() << "NCCL library with symmetric memory support is not available";
@@ -547,7 +547,7 @@ protected:
         }
 
         // Check if NCCL symmetric is supported
-        auto& ncclHelper = tensorrt_llm::runtime::ub::NCCLUserBufferAllocator::getNCCLHelper();
+        auto& ncclHelper = nccl_util::NCCLHelper::getInstance();
         if (!ncclHelper.isLoaded())
         {
             GTEST_SKIP() << "NCCL library with symmetric memory support is not available";
