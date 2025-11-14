@@ -700,12 +700,6 @@ def _(
 
 class NVFP4GemmUnifiedRunner(TunableRunner):
     runner_dict = dict()
-    op_dict = {
-        "cuda_core": torch.ops.trtllm.cuda_core_nvfp4_gemm,
-        "cutlass": torch.ops.trtllm.nvfp4_gemm,
-        "cublaslt": torch.ops.trtllm.nvfp4_gemm_cublaslt,
-        "cutedsl": torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell,
-    }
 
     def __init__(self, to_userbuffers: bool, output_dtype: torch.dtype):
         super().__init__()
@@ -772,18 +766,47 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
         self,
         inputs: List[torch.Tensor],
         tactic: str = "cutlass",
+        **kwargs,
     ) -> torch.Tensor:
         act_fp4, weight, act_sf, weight_scale, alpha = inputs
-        assert tactic in self.op_dict, f"Invalid tactic: {tactic}"
-        return self.op_dict[tactic](
-            act_fp4,
-            weight,
-            act_sf,
-            weight_scale,
-            alpha,
-            self.output_dtype,
-            self.to_userbuffers,
-        )
+
+        if tactic == "cuda_core":
+            # Unswizzle the activation scale factors
+            # act_sf is swizzled, need to reverse it for cuda_core_nvfp4_gemm
+            m = act_fp4.shape[0]
+            act_sf_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
+                act_sf.view((m + 128 - 1) // 128 * 128, -1))
+
+            # Call CUDA Core NVFP4 GEMM
+            return torch.ops.trtllm.cuda_core_nvfp4_gemm(
+                act_fp4,
+                weight,
+                act_sf_unswizzled,
+                weight_scale,
+                alpha,
+                bias=None,
+                out_dtype=self.output_dtype,
+                to_userbuffers=self.to_userbuffers)
+        elif tactic == "cutlass":
+            return torch.ops.trtllm.nvfp4_gemm(act_fp4, weight, act_sf,
+                                               weight_scale, alpha,
+                                               self.output_dtype,
+                                               self.to_userbuffers)
+        elif tactic == "cublaslt":
+            return torch.ops.trtllm.nvfp4_gemm_cublaslt(act_fp4, weight, act_sf,
+                                                        weight_scale, alpha,
+                                                        self.output_dtype,
+                                                        self.to_userbuffers)
+        elif tactic == "cutedsl":
+            return torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
+                act_fp4, weight, act_sf, weight_scale, alpha, self.output_dtype)
+        elif tactic == -1:
+            return torch.ops.trtllm.nvfp4_gemm(act_fp4, weight, act_sf,
+                                               weight_scale, alpha,
+                                               self.output_dtype,
+                                               self.to_userbuffers)
+        else:
+            raise ValueError(f"Invalid tactic: {tactic}")
 
 
 @torch.library.custom_op("trtllm::nvfp4_gemm_unified", mutates_args=())

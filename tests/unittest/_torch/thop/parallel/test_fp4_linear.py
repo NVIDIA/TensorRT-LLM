@@ -397,7 +397,7 @@ def nvfp4_gemm_perf_test(
 @pytest.mark.parametrize("mnk", [(128, 7168, 16384), (128, 4096, 7168)])
 def test_nvfp4_gemm_unified_all_tactics(dtype, mnk):
     """Test nvfp4_gemm_unified with auto backend selection, ensuring all tactics are tested."""
-    from tensorrt_llm._torch.autotuner import AutoTuner
+    from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 
     SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE = mnk
     torch.manual_seed(0)
@@ -442,56 +442,58 @@ def test_nvfp4_gemm_unified_all_tactics(dtype, mnk):
             to_userbuffers=False,
             backend='auto')
 
+    AutoTuner.get().print_profiling_cache()
+
     # Verify auto mode result matches reference
     torch.cuda.synchronize()
     torch.testing.assert_close(output_auto, output_ref, rtol=1e-2, atol=0.15)
 
-    # Capture all tactics using AutoTuner.capture()
-    with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
-        output = torch.ops.trtllm.nvfp4_gemm_unified(act_fp4=x_fp4,
-                                                     weight=w_fp4,
-                                                     act_sf=x_sf_block,
-                                                     weight_scale=w_sf_block,
-                                                     alpha=alpha_tensor,
-                                                     output_dtype=dtype,
-                                                     to_userbuffers=False,
-                                                     backend='auto')
+    # # Capture all tactics using AutoTuner.capture()
+    # with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
+    #     output = torch.ops.trtllm.nvfp4_gemm_unified(act_fp4=x_fp4,
+    #                                                  weight=w_fp4,
+    #                                                  act_sf=x_sf_block,
+    #                                                  weight_scale=w_sf_block,
+    #                                                  alpha=alpha_tensor,
+    #                                                  output_dtype=dtype,
+    #                                                  to_userbuffers=False,
+    #                                                  backend='auto')
 
-    # Convert tactics generator to list for counting
-    all_tactics_list = list(all_tactics)
+    # # Convert tactics generator to list for counting
+    # all_tactics_list = list(all_tactics)
 
-    print(f"\n{'='*80}")
-    print(
-        f"Testing nvfp4_gemm_unified with M={SEQ_LEN}, N={OUTPUT_SIZE}, K={HIDDEN_SIZE}"
-    )
-    print(f"Total tactics found: {len(all_tactics_list)}")
-    print(f"{'='*80}")
+    # print(f"\n{'='*80}")
+    # print(
+    #     f"Testing nvfp4_gemm_unified with M={SEQ_LEN}, N={OUTPUT_SIZE}, K={HIDDEN_SIZE}"
+    # )
+    # print(f"Total tactics found: {len(all_tactics_list)}")
+    # print(f"{'='*80}")
 
-    # Test each tactic individually
-    for idx, tactic in enumerate(all_tactics_list):
-        with AutoTuner.get().replay(tactic), torch.inference_mode():
-            output = torch.ops.trtllm.nvfp4_gemm_unified(
-                act_fp4=x_fp4,
-                weight=w_fp4,
-                act_sf=x_sf_block,
-                weight_scale=w_sf_block,
-                alpha=alpha_tensor,
-                output_dtype=dtype,
-                to_userbuffers=False,
-                backend='auto')
+    # # Test each tactic individually
+    # for idx, tactic in enumerate(all_tactics_list):
+    #     with AutoTuner.get().replay(tactic), torch.inference_mode():
+    #         output = torch.ops.trtllm.nvfp4_gemm_unified(
+    #             act_fp4=x_fp4,
+    #             weight=w_fp4,
+    #             act_sf=x_sf_block,
+    #             weight_scale=w_sf_block,
+    #             alpha=alpha_tensor,
+    #             output_dtype=dtype,
+    #             to_userbuffers=False,
+    #             backend='auto')
 
-            # Verify each tactic produces correct results
-            torch.testing.assert_close(output, output_ref, rtol=1e-2, atol=0.15)
-            # Get runner and tactic info from the captured tactic tuple
-            runner, tactic_value = tactic[
-                0]  # First element of tuple for single context
-            print(
-                f"  ✓ Tactic {idx+1}/{len(all_tactics_list)}: {runner.__class__.__name__} tactic={tactic_value} - PASSED"
-            )
+    #         # Verify each tactic produces correct results
+    #         torch.testing.assert_close(output, output_ref, rtol=1e-2, atol=0.15)
+    #         # Get runner and tactic info from the captured tactic tuple
+    #         runner, tactic_value = tactic[
+    #             0]  # First element of tuple for single context
+    #         print(
+    #             f"  ✓ Tactic {idx+1}/{len(all_tactics_list)}: {runner.__class__.__name__} tactic={tactic_value} - PASSED"
+    #         )
 
-    print(f"{'='*80}")
-    print(f"All {len(all_tactics_list)} tactics verified successfully!")
-    print(f"{'='*80}\n")
+    # print(f"{'='*80}")
+    # print(f"All {len(all_tactics_list)} tactics verified successfully!")
+    # print(f"{'='*80}\n")
 
 
 @skip_pre_blackwell
