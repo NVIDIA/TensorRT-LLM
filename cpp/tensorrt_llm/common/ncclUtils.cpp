@@ -159,7 +159,6 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
 {
     TLLM_CHECK_WITH_INFO(comm != nullptr, "NCCL communicator cannot be null");
     TLLM_CHECK_WITH_INFO(size > 0, "Buffer size must be greater than 0");
-    TLLM_CHECK_WITH_INFO(isCommValid(comm), "NCCL communicator has been cleaned up or is invalid");
 
     std::lock_guard<std::mutex> lock(mMutex);
 
@@ -290,13 +289,10 @@ size_t NCCLWindowAllocator::getBufferInUseCount(ncclComm_t comm) const
 
 bool NCCLWindowAllocator::isCommValid(ncclComm_t comm) const noexcept
 {
-    if (!comm)
-    {
-        return false;
-    }
-
-    std::lock_guard<std::mutex> lock(mMutex);
-    return mRegisteredComms.find(comm) != mRegisteredComms.end() || mBufferPool.find(comm) == mBufferPool.end();
+    // Simply check for null - all non-null comms are valid
+    // We don't track cleaned-up comms because NCCL can reuse memory addresses,
+    // making pointer-based tracking unreliable. New comms will be registered when used.
+    return comm != nullptr;
 }
 
 NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm, size_t size, int handle)
@@ -358,7 +354,7 @@ NCCLWindowBuffer NCCLWindowAllocator::searchBufferLocked(ncclComm_t comm, void* 
 
 void NCCLWindowAllocator::registerBufferCleanup(ncclComm_t comm)
 {
-    // Only register once per communicator
+    // Don't register if already registered
     if (mRegisteredComms.find(comm) != mRegisteredComms.end())
     {
         return;
@@ -374,9 +370,12 @@ void NCCLWindowAllocator::registerBufferCleanup(ncclComm_t comm)
 void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
 {
     std::lock_guard<std::mutex> lock(mMutex);
+
     auto commIt = mBufferPool.find(comm);
     if (commIt == mBufferPool.end())
     {
+        // No buffers to clean up
+        mRegisteredComms.erase(comm);
         return;
     }
 
