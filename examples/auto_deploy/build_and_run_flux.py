@@ -307,6 +307,19 @@ def main(argv=None):
     # Load config from YAML
     config = load_config(args.config)
 
+    # Restore quantizers
+    if args.restore_from:
+        ad_logger.info(f"Restoring model from {args.restore_from}")
+        try:
+            mto.restore(model, args.restore_from)
+            quant_state_dict = model.state_dict()
+            load_buffers_and_params(
+                model, quant_state_dict, strict_missing=False, strict_unexpected=False, clone=False
+            )
+        except Exception as e:
+            ad_logger.error(f"Failed to restore model from {args.restore_from}: {e}")
+            raise
+
     # Export to graph module with config params
     ad_logger.info("Exporting model to graph module...")
     export_config = config["export"]
@@ -317,18 +330,6 @@ def main(argv=None):
         clone=export_config.get("clone", False),
         strict=export_config.get("strict", False),
     )
-
-    if args.restore_from:
-        ad_logger.info(f"Restoring model from {args.restore_from}")
-        try:
-            mto.restore(model, args.restore_from)
-            quant_state_dict = model.state_dict()
-            load_buffers_and_params(
-                gm, quant_state_dict, strict_missing=False, strict_unexpected=False, clone=False
-            )
-        except Exception as e:
-            ad_logger.error(f"Failed to restore model from {args.restore_from}: {e}")
-            raise
 
     # Apply inference optimizer fusions
     optimizer_config = config.get("optimizer")
