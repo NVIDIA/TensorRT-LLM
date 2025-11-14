@@ -11,6 +11,7 @@ def test_trtllm_configure_subcommand_basic(tmp_path: Path):
     output_path = tmp_path / "test_config.yaml"
 
     mock_config = LlmArgs()
+    mock_config.max_batch_size = 1
     mock_config.kv_cache_free_gpu_memory_fraction = 0.9
 
     cmd = InferenceMaxSubCommand(
@@ -34,5 +35,7 @@ def test_trtllm_configure_subcommand_basic(tmp_path: Path):
     with open(output_path, "r") as f:
         loaded_config = yaml.safe_load(f)
 
+    assert "max_batch_size" in loaded_config
+    assert loaded_config["max_batch_size"] == 1
     assert "kv_cache_free_gpu_memory_fraction" in loaded_config
     assert loaded_config["kv_cache_free_gpu_memory_fraction"] == 0.9
