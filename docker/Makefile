@@ -56,10 +56,6 @@ NGC_STAGING_REPO   ?= nvcr.io/nvstaging/tensorrt-llm
 NGC_REPO           ?= nvcr.io/nvidia/tensorrt-llm
 NGC_USE_STAGING    ?= 0
 NGC_AUTO_REPO      ?= $(if $(filter 1,$(NGC_USE_STAGING)),$(NGC_STAGING_REPO),$(NGC_REPO))
-SH_ENV             ?= $(shell docker inspect --format='{{range .Config.Env}}{{println .}}{{end}}' $(BASE_IMAGE):$(BASE_TAG) \
-    				  | grep '^ENV=' | sed 's/^[^=]*=//' 2>/dev/null)
-BASH_ENV           ?= $(shell docker inspect --format='{{range .Config.Env}}{{println .}}{{end}}' $(BASE_IMAGE):$(BASE_TAG) \
-    				  | grep '^BASH_ENV=' | sed 's/^[^=]*=//' 2>/dev/null)
 
 define add_local_user
 	docker build \
@@ -79,8 +75,16 @@ define rewrite_tag
 $(shell echo $(IMAGE_WITH_TAG) | sed "s/\/tensorrt-llm:/\/tensorrt-llm-staging:/g")
 endef
 
+base_pull:
+	@echo "Pulling base image: $(BASE_IMAGE):$(BASE_TAG)"
+	docker pull $(BASE_IMAGE):$(BASE_TAG)
+
 %_build: DEVEL_IMAGE = $(if $(findstring 1,$(JENKINS_DEVEL)),$(shell . ../jenkins/current_image_tags.properties && echo $$LLM_DOCKER_IMAGE))
-%_build:
+%_build: SH_ENV      = $(shell docker inspect --format='{{range .Config.Env}}{{println .}}{{end}}' $(BASE_IMAGE):$(BASE_TAG) \
+				  	   | grep '^ENV=' | sed 's/^[^=]*=//' 2>/dev/null)
+%_build: BASH_ENV    = $(shell docker inspect --format='{{range .Config.Env}}{{println .}}{{end}}' $(BASE_IMAGE):$(BASE_TAG) \
+    				   | grep '^BASH_ENV=' | sed 's/^[^=]*=//' 2>/dev/null)
+%_build: base_pull
 	@echo "Building docker image: $(IMAGE_WITH_TAG)"
 	docker buildx build $(DOCKER_BUILD_OPTS) $(DOCKER_BUILD_ARGS) \
 		--progress $(DOCKER_PROGRESS) \
