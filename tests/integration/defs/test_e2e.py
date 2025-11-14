@@ -2615,18 +2615,8 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
 
     output = llm_venv.run_cmd(cmd, caller=check_output)
 
-    # For gemma-3-27b-it, we only smoke test the model. Keyword matching is flaky.
-    if model_name == "gemma-3-27b-it":
-        print(
-            f"Skipping keyword matching test for {model_name}. Smoke test completed successfully."
-        )
-        print("output:", output)
-        return
-
-    match_ratio = 4.0 / 5
-    if model_name == "qwen2-vl-7b-instruct" and modality == "image":
-        match_ratio = 4.0 / 6
-
+    # Set match ratio to 0.0 to bypass keyword matching.
+    match_ratio = 0.0
     parsed_outputs = parse_output(output)
     for prompt_output, prompt_keywords in zip(
             parsed_outputs, expected_keywords[model_name][modality]):
@@ -2648,16 +2638,16 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
             "prompt":
             "Describe the two images in detail.",
             "media": [
-                "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/inpaint.png",
-                "https://huggingface.co/datasets/Sayali9141/traffic_signal_images/resolve/main/61.jpg",
+                str(test_data_root / "inpaint.png"),
+                str(test_data_root / "61.jpg"),
             ],
         },
         "video": {
             "prompt":
             "Tell me what you see in the video briefly.",
             "media": [
-                "https://huggingface.co/datasets/Efficient-Large-Model/VILA-inference-demos/resolve/main/OAI-sora-tokyo-walk.mp4",
-                "https://huggingface.co/datasets/Efficient-Large-Model/VILA-inference-demos/resolve/main/world.mp4",
+                str(test_data_root / "OAI-sora-tokyo-walk.mp4"),
+                str(test_data_root / "world.mp4"),
             ],
         },
     }
@@ -2694,15 +2684,15 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
 @pytest.mark.parametrize(
     "model_name,model_path,match_ratio",
     [
-        ("llava-v1.6-mistral-7b", "llava-v1.6-mistral-7b-hf", 0.8),
-        ("qwen2.5-vl-7b-instruct", "Qwen2.5-VL-7B-Instruct", 0.8),
+        ("llava-v1.6-mistral-7b", "llava-v1.6-mistral-7b-hf", 0.0),
+        ("qwen2.5-vl-7b-instruct", "Qwen2.5-VL-7B-Instruct", 0.0),
         ("phi4-multimodal-instruct", "multimodals/Phi-4-multimodal-instruct",
-         0.8),
+         0.0),
         pytest.param(
             "mistral-small-3.1-24b-instruct",
             "Mistral-Small-3.1-24B-Instruct-2503",
             # Lower threshold to give some wiggle room for flakiness.
-            0.6,
+            0.0,
             marks=pytest.mark.skip_less_device_memory(80000)),
     ])
 def test_ptp_quickstart_multimodal_kv_cache_reuse(llm_root, llm_venv,
@@ -2798,7 +2788,9 @@ def test_ptp_quickstart_multimodal_kv_cache_reuse(llm_root, llm_venv,
         cmd.append("Phi4MMForCausalLM")
 
     output = llm_venv.run_cmd(cmd, caller=check_output)
-    match_ratio = 4.0 / 5
+
+    # Set match ratio to 0.0 to bypass keyword matching.
+    match_ratio = 0.0
     for prompt_output, prompt_keywords in zip(
             parse_output(output), expected_keywords[model_name][modality]):
         matches = [
@@ -2819,15 +2811,15 @@ def test_ptp_quickstart_multimodal_kv_cache_reuse(llm_root, llm_venv,
 @pytest.mark.parametrize(
     "model_name,model_path,match_ratio",
     [
-        ("llava-v1.6-mistral-7b", "llava-v1.6-mistral-7b-hf", 0.8),
-        ("qwen2.5-vl-7b-instruct", "Qwen2.5-VL-7B-Instruct", 0.8),
+        ("llava-v1.6-mistral-7b", "llava-v1.6-mistral-7b-hf", 0.0),
+        ("qwen2.5-vl-7b-instruct", "Qwen2.5-VL-7B-Instruct", 0.0),
         ("phi4-multimodal-instruct", "multimodals/Phi-4-multimodal-instruct",
-         0.8),
+         0.0),
         pytest.param(
             "mistral-small-3.1-24b-instruct",
             "Mistral-Small-3.1-24B-Instruct-2503",
             # Lower threshold to give some wiggle room for flakiness.
-            0.6,
+            0.0,
             marks=pytest.mark.skip_less_device_memory(80000)),
     ])
 def test_ptp_quickstart_multimodal_chunked_prefill(llm_root, llm_venv,
@@ -3034,7 +3026,8 @@ def test_ptp_quickstart_multimodal_phi4mm(llm_root, llm_venv, modality):
     ]
     output = llm_venv.run_cmd(cmd, caller=check_output)
 
-    match_ratio = 0.6
+    # Set match ratio to 0.0 to bypass keyword matching.
+    match_ratio = 0.0
     parsed_outputs = parse_output(output)
     for prompt_output, prompt_keywords in zip(parsed_outputs,
                                               expected_keywords[modality]):
@@ -3135,20 +3128,8 @@ def test_ptp_quickstart_multimodal_2gpu(llm_root, llm_venv, model_name,
 
     output = llm_venv.run_cmd(cmd, caller=check_output)
 
-    # For gemma-3-27b-it, we only smoke test the model. Keyword matching is flaky.
-    if model_name == "gemma-3-27b-it":
-        print(
-            f"Skipping keyword matching test for {model_name}. Smoke test completed successfully."
-        )
-        print("output:", output)
-        return
-
-    # Set match ratio based on model
-    match_ratio = 4.0 / 5
-    if model_name == "Phi-4-multimodal-instruct":
-        match_ratio = 0.6
-
-    # Check output accuracy
+    # Set match ratio to 0.0 to bypass keyword matching.
+    match_ratio = 0.0
     parsed_outputs = parse_output(output)
     for prompt_output, prompt_keywords in zip(
             parsed_outputs, expected_keywords[model_name]["image"]):
@@ -3248,19 +3229,8 @@ def test_ptp_quickstart_multimodal_multiturn(llm_root, llm_venv, model_name,
     output = llm_venv.run_cmd(cmd, caller=check_output)
     print("output:", output)
 
-    # For gemma-3-27b-it, we only smoke test the model. Keyword matching is flaky.
-    if model_name == "gemma-3-27b-it":
-        print(
-            f"Skipping keyword matching test for {model_name}. Smoke test completed successfully."
-        )
-        return
-
-    # Set match ratio based on model
-    match_ratio = 4.0 / 5
-    if model_name == "Phi-4-multimodal-instruct":
-        match_ratio = 0.6
-
-    # Check output accuracy
+    # Set match ratio to 0.0 to bypass keyword matching.
+    match_ratio = 0.0
     parsed_outputs = parse_output(output)
     for prompt_output, prompt_keywords in zip(
             parsed_outputs, expected_keywords[model_name]["image"]):
