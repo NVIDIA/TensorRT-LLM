@@ -513,7 +513,144 @@ class PyTorchModelEngine(ModelEngine):
         # Reset the global cuda graph dummy request to None in warmup.
         self.cuda_graph_runner.padding_dummy_request = None
 
-        # TODO: current warmup_request is not suitable for context parallelism.
+        def get_cuda_graph_warmup_request(batch_size):
+            available_blocks = kv_cache_manager.get_num_free_blocks()
+            if available_blocks >= batch_size:
+                result = ScheduledRequests()
+                result.context_requests = []
+                # Add (batch_size - 1) dummy requests with seq_len=1.
+                # Should only need one more page per request.
+                requests = kv_cache_manager.add_dummy_requests(
+                    list(range(batch_size - 1)),
+                    is_gen=True,
+                    max_num_draft_tokens=self.max_draft_len,
+                    use_mrope=use_mrope,
+                )
+                available_tokens = kv_cache_manager.get_num_available_tokens(
+                    self.max_draft_len)
+
+                # Add one dummy request with the maximum possible sequence length.
+                # The sequence length is limited by both the max_seq_len and the number of available blocks.
+                token_num = max(1, min(available_tokens, self.max_seq_len - 1))
+                max_seq_len_request = kv_cache_manager.add_dummy_requests(
+                    request_ids=[batch_size - 1],
+                    token_nums=[token_num],
+                    is_gen=True,
+                    max_num_draft_tokens=self.max_draft_len,
+                    use_mrope=use_mrope,
+                )[0]
+                # Add the longest request before all other seq_len=1 request to simulate the padding CUDA graph case.
+                # This batch contains both the longest request and the shortest requests,
+                # it also contains the maximum number of requests and the maximum token number,
+                # which simulates the extreme case for the padding CUDA graph.
+                # Thus we can replay this CUDA graph in all other cases.
+                requests.insert(0, max_seq_len_request)
+                result.generation_requests = requests
+                if spec_resource_manager is not None:
+                    spec_resource_manager.add_dummy_requests(
+                        request_ids=list(range(batch_size)))
+            else:
+                result = None
+            return result
+
+        def get_torch_compile_warmup_request(batch_size,
+                                             num_tokens_per_request):
+            available_blocks = kv_cache_manager.get_num_free_blocks()
+            if available_blocks >= batch_size * math.ceil(
+                    num_tokens_per_request / kv_cache_manager.tokens_per_block):
+                # Should only need (at most) one more page per request.
+                is_gen = num_tokens_per_request == 1
+
+                requests = kv_cache_manager.add_dummy_requests(
+                    list(range(batch_size)), [num_tokens_per_request] *
+                    batch_size if not is_gen else None,
+                    is_gen=is_gen,
+                    max_num_draft_tokens=self.max_draft_len)
+
+                if spec_resource_manager is not None:
+                    spec_resource_manager.add_dummy_requests(
+                        request_ids=list(range(batch_size)))
+
+                result = ScheduledRequests()
+                result.context_requests = []
+                result.generation_requests = []
+                if is_gen:
+                    result.generation_requests = requests
+                else:
+                    result.context_requests = requests
+            else:
+                result = None
+            return result
+
+        def get_autotune_warmup_request():
+            available_tokens = kv_cache_manager.get_num_available_tokens(
+                self.max_draft_len)
+            num_tokens_per_request = min(
+                min(available_tokens, self.max_seq_len - 1),
+                self.max_num_tokens)
+            # Number of tokens required per request must be rounded up to whole number of blocks
+            num_tokens_required_per_request = (
+                (num_tokens_per_request + kv_cache_manager.tokens_per_block - 1)
+                // kv_cache_manager.tokens_per_block
+            ) * kv_cache_manager.tokens_per_block
+
+            available_blocks = kv_cache_manager.get_num_free_blocks()
+
+            maximum_tunable_num_tokens = min(
+                self.batch_size * num_tokens_per_request, self.max_num_tokens,
+                available_blocks * kv_cache_manager.tokens_per_block)
+
+            # Calculate number of full-length requests and remaining tokens
+            # Each request has num_tokens_per_request tokens, except possibly the last one
+            # Calculations are also limited by how many KV cache blocks are available
+            full_len_request_num = min(
+                maximum_tunable_num_tokens // num_tokens_per_request,
+                max(1, available_tokens // num_tokens_required_per_request))
+            remaining_tokens = min(
+                maximum_tunable_num_tokens % num_tokens_per_request,
+                max(
+                    0, available_tokens -
+                    full_len_request_num * num_tokens_required_per_request))
+
+            request_num = full_len_request_num if remaining_tokens == 0 else full_len_request_num + 1
+
+            requests = kv_cache_manager.add_dummy_requests(
+                request_ids=list(range(full_len_request_num)),
+                token_nums=[num_tokens_per_request] * full_len_request_num,
+                is_gen=False,
+                max_num_draft_tokens=self.max_draft_len)
+
+            if remaining_tokens > 0:
+                final_request = kv_cache_manager.add_dummy_requests(
+                    request_ids=[full_len_request_num],
+                    token_nums=[remaining_tokens],
+                    is_gen=False,
+                    max_num_draft_tokens=self.max_draft_len)
+
+                requests += final_request
+
+            if spec_resource_manager is not None:
+                spec_resource_manager.add_dummy_requests(
+                    request_ids=list(range(request_num)))
+
+            result = ScheduledRequests()
+            result.context_requests = requests
+            result.generation_requests = []
+
+            return result
+
+        @contextlib.contextmanager
+        def release_batch(result: ScheduledRequests | None):
+            try:
+                yield result
+            finally:
+                if result is not None:
+                    for req in result.all_requests():
+                        kv_cache_manager.free_resources(req)
+                        if spec_resource_manager is not None:
+                            spec_resource_manager.free_resources(req)
+
+        # TODO: current warmup_request is not suitable for star attention
         cp_type = self.mapping.cp_config.get('cp_type', None)
         if cp_type is not None:
             logger.info("[ModelEngine::warmup] Skipping warmup for cp_type: ",
