@@ -284,7 +284,7 @@ class CudaBackendCausalConv(AttentionDescriptor):
                 in_channels,
                 max(1, kernel_size - 1),
                 device=si.device,
-                dtype=cache_config.dtype or inp_fake.dtype,
+                dtype=inp_fake.dtype,
             )
 
         return {"conv_state_cache": _get_conv_cache}
