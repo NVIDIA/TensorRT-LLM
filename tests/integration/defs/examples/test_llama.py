@@ -33,7 +33,8 @@ from defs.common import (convert_weights, generate_summary_cmd,
 from defs.conftest import (get_device_count, get_device_memory,
                            get_host_total_memory, get_sm_version,
                            skip_fp8_pre_ada, skip_no_nvls, skip_post_blackwell,
-                           skip_pre_ada, skip_pre_blackwell)
+                           skip_post_blackwell_ultra, skip_pre_ada,
+                           skip_pre_blackwell)
 # yapf: enable
 from defs.trt_test_alternative import check_call, exists
 
@@ -288,6 +289,7 @@ def test_llm_llama_v1_manage_weights_1gpu_summarize(llama_example_root,
 
 
 @skip_pre_blackwell
+@skip_post_blackwell_ultra
 @pytest.mark.parametrize("data_type", ['bfloat16', 'float16'])
 @pytest.mark.parametrize("fp4_type", ["plugin", "ootb", "disable"],
                          ids=["fp4_plugin", "fp4_ootb", "disable_fp4"])
@@ -2187,6 +2189,7 @@ def test_llm_llama_code_llama_1gpu_summary(
     venv_check_call(llm_venv, summary_cmd)
 
 
+@skip_post_blackwell_ultra
 @pytest.mark.timeout(7200)
 @pytest.mark.skip_less_device_memory(40000)
 @pytest.mark.parametrize("num_beams", [1, 4],
@@ -3383,6 +3386,7 @@ def test_llm_llama_v3_2_smoothquant_1node_single_gpu(
 @pytest.mark.timeout(7200)
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.skip_less_device(4)
+@skip_post_blackwell_ultra
 @pytest.mark.parametrize("fp8_quant",
                          [pytest.param(True, marks=skip_post_blackwell), False],
                          ids=['enable_fp8', 'disable_fp8'])

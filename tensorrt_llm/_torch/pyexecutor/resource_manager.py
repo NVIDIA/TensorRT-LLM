@@ -813,16 +813,43 @@ class KVCacheManager(BaseResourceManager):
         return (self.get_num_free_blocks() * self.tokens_per_block -
                 self.num_extra_kv_tokens - max_num_draft_tokens)
 
-    def get_buffers(self, layer_idx: int) -> Optional[torch.Tensor]:
+    def get_buffers(self,
+                    layer_idx: int,
+                    kv_layout: str = "NHD") -> Optional[torch.Tensor]:
+        ''' Slice KV tensor for a specified layer and reshape it.
+
+        1. Slice:
+            [max_num_pages, num_layers, kv_factor, page_size * num_kv_heads * head_dim] ->
+            [max_num_pages, kv_factor, page_size * num_kv_heads * head_dim]
+
+        2. Reshape:
+            kv_layout = "NHD" -> [max_num_pages, kv_factor, page_size, num_kv_heads, head_dim]
+            kv_layout = "HND" -> [max_num_pages, kv_factor, num_kv_heads, page_size, head_dim]
+
+        Note that different attention backend/implementation can have different KV layouts,
+        "kv_layout" should be set accordingly to avoid surprises.
+        '''
         layer_offset = self.layer_offsets[layer_idx]
         result = self.impl.get_primary_pool_data(layer_offset)
-        return result.reshape(
-            result.shape[0],
-            self.kv_factor,
-            self.tokens_per_block,
-            self.num_kv_heads_per_layer[layer_offset],
-            self.head_dim,
-        )
+
+        assert kv_layout in ["NHD",
+                             "HND"], f"Unsupported kv_layout: {kv_layout}"
+        if kv_layout == "NHD":
+            return result.reshape(
+                result.shape[0],
+                self.kv_factor,
+                self.tokens_per_block,
+                self.num_kv_heads_per_layer[layer_offset],
+                self.head_dim,
+            )
+        else:
+            return result.reshape(
+                result.shape[0],
+                self.kv_factor,
+                self.num_kv_heads_per_layer[layer_offset],
+                self.tokens_per_block,
+                self.head_dim,
+            )
 
     def get_indexer_k_cache_pool_data(self, layer_idx: int) -> torch.Tensor:
         result = self.impl.get_indexer_k_cache_pool_data(layer_idx)

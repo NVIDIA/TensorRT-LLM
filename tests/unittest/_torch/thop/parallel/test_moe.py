@@ -1178,6 +1178,36 @@ class TestMoeFp4:
                                   use_autotune=False,
                                   use_topk_as_input=use_topk_as_input)
 
+    @pytest.mark.parametrize("num_tokens", [1, 256, 1024])
+    @pytest.mark.parametrize("hidden_size", [1024])
+    @pytest.mark.parametrize("intermediate_size", [1024, 768])
+    @pytest.mark.parametrize(
+        "routing_info",
+        [
+            pytest.param(
+                {
+                    "num_experts": 288,
+                    "top_k": 8,
+                    "padding": 8,
+                    "n_groups": 8,
+                    "top_k_groups": 4,
+                    "routed_scaling": 2.5,
+                    "has_routing_bias": True,
+                    "routing_method_type": RoutingMethodType.DeepSeekV3
+                },
+                id="RoutingDSv3"),
+        ],
+    )
+    def test_online_eplb288_topk_input(self, num_tokens, hidden_size,
+                                       intermediate_size, routing_info):
+        # although we don't need to run router with num_expert 288, but we do need MoE run with num_slots 288 for EPLB with redundant experts.
+        self.run_moe_fp4_test(num_tokens,
+                              hidden_size,
+                              intermediate_size,
+                              routing_info,
+                              use_autotune=True,
+                              use_topk_as_input=True)
+
     def run_moe_fp4_test(self, num_tokens: int, hidden_size: int,
                          intermediate_size: int, routing_info: dict,
                          use_autotune: bool, use_topk_as_input: bool) -> None:
@@ -1209,9 +1239,9 @@ class TestMoeFp4:
         assert num_experts % 4 == 0
 
         if use_topk_as_input:
-            if routing_method_type != RoutingMethodType.DeepSeekV3 or num_tokens != 150 or use_autotune:
+            if routing_method_type != RoutingMethodType.DeepSeekV3:
                 pytest.skip(
-                    "use_topk_as_input is tested only with routing_method_type=DeepSeekV3 and num_tokens=150 and use_autotune=False"
+                    "use_topk_as_input is tested only with routing_method_type=DeepSeekV3"
                 )
 
         if are_groups_valid(top_k_groups, n_groups):
@@ -1469,9 +1499,9 @@ class TestMoeFp4:
             assert top_k < (top_k_groups * num_experts / n_groups)
 
         if use_topk_as_input:
-            if routing_method_type != RoutingMethodType.DeepSeekV3 or num_tokens != 150 or use_autotune:
+            if routing_method_type != RoutingMethodType.DeepSeekV3:
                 pytest.skip(
-                    "use_topk_as_input is tested only with routing_method_type=DeepSeekV3 and num_tokens=150 and use_autotune=False"
+                    "use_topk_as_input is tested only with routing_method_type=DeepSeekV3"
                 )
 
         if routing_method_type == RoutingMethodType.DeepSeekV3:
