@@ -35,8 +35,17 @@ class RpcWorker(BaseWorker):
         - `shutdown`: Shutdown the worker.
     """
 
-    # Number of RPC server workers
-    NUM_WORKERS = 6
+    # Default number of RPC server workers
+    # Increased to handle concurrent requests and prevent thread pool exhaustion
+    # Need enough workers for: submit requests + fetch_responses + other operations
+    # Can be overridden via constructor parameter
+    DEFAULT_NUM_WORKERS = 32
+
+    # Default timeout for fetch_responses in seconds
+    # This is a short timeout to prevent blocking the event loop while still allowing
+    # responses to be fetched efficiently. The value is tuned to balance responsiveness
+    # and CPU usage. Can be overridden via constructor parameter.
+    DEFAULT_FETCH_TIMEOUT = 0.1
 
     def __init__(
         self,
@@ -48,17 +57,25 @@ class RpcWorker(BaseWorker):
         hf_model_dir: Optional[Path] = None,
         tokenizer: Optional[TokenizerBase] = None,
         llm_args: Optional[BaseLlmArgs] = None,
+        num_workers: Optional[int] = None,
+        fetch_timeout: Optional[float] = None,
     ) -> None:
         super().__init__(
             engine=engine,
             executor_config=executor_config,
-            is_llm_executor=is_llm_executor,
-            llm_args=llm_args,
             batched_logits_processor=batched_logits_processor,
             postproc_worker_config=postproc_worker_config,
+            is_llm_executor=is_llm_executor,
             hf_model_dir=hf_model_dir,
             tokenizer=tokenizer,
+            llm_args=llm_args,
         )
+
+        # Configure number of RPC workers
+        self.num_workers = num_workers if num_workers is not None else self.DEFAULT_NUM_WORKERS
+
+        # Configure fetch timeout
+        self._fetch_timeout = fetch_timeout if fetch_timeout is not None else self.DEFAULT_FETCH_TIMEOUT
 
         # Extract garbage_collection_gen0_threshold from llm_args if available
         self.garbage_collection_gen0_threshold = (
@@ -70,25 +87,37 @@ class RpcWorker(BaseWorker):
         self._response_queue = Queue()
         self.set_result_queue(self._response_queue)
 
+        # Note: We don't create a persistent ThreadPoolExecutor anymore
+        # to avoid thread leaks. Instead, we use asyncio.to_thread() which
+        # manages threads internally.
+
     def submit(self, request: GenerationRequest):
         """ Submits a request to the worker. """
         with nvtx_range_debug("RpcWorker.submit",
                               color="blue",
                               category="Worker"):
+            logger_debug(f"[worker] Submitting request {request.id}",
+                         color="green")
             super().submit(request)
+            logger_debug(f"[worker] Submitted request {request.id}",
+                         color="green")
 
     def fetch_responses(self, timeout: Optional[float] = None) -> list:
-        logger_debug(f"RpcWorker {mpi_rank()} is fetching responses",
+        logger_debug(f"[worker] RpcWorker {mpi_rank()} is fetching responses",
                      color="yellow")
         with nvtx_range_debug("RpcWorker.fetch_responses",
                               color="orange",
                               category="Worker"):
             # NOTE: This is a blocking call, it will wait for the responses to be available.
-            responses = super().await_responses(timeout)
+            # Use the configured fetch timeout if no timeout is provided
+            actual_timeout = timeout if timeout is not None else self._fetch_timeout
+            responses = super().await_responses(timeout=actual_timeout)
             self._await_response_helper.responses_handler(responses)
-
+            logger_debug(f"[worker] Fetched {len(responses)} responses",
+                         color="green")
         qsize = self._response_queue.qsize()
-        logger_debug(f"RpcWorker returning {qsize} responses", color="yellow")
+        logger_debug(f"[worker] RpcWorker returning {qsize} responses",
+                     color="yellow")
 
         all_responses = []
         for _ in range(qsize):
@@ -98,11 +127,8 @@ class RpcWorker(BaseWorker):
 
     async def fetch_responses_async(self,
                                     timeout: Optional[float] = None) -> list:
-        # A really async version of fetch_responses
-        logger_debug(f"RpcWorker {mpi_rank()} is fetching responses async",
-                     color="yellow")
-
-        # First, await any pending responses without blocking the event loop
+        # Use asyncio.to_thread to avoid blocking the event loop
+        # This is similar to fetch_stats_async and fetch_kv_cache_events_async
         responses = await asyncio.to_thread(self.fetch_responses,
                                             timeout=timeout)
         return responses
@@ -116,19 +142,20 @@ class RpcWorker(BaseWorker):
         return await asyncio.to_thread(self.fetch_kv_cache_events)
 
     # for streaming performance
+    # This will be called by the RpcProxy to fetch responses in a loop.
     async def fetch_responses_loop_async(self) -> AsyncGenerator[list, None]:
         while not self.shutdown_event.is_set():
             responses = await self.fetch_responses_async()
             if responses:  # Only yield if there are actual responses
                 logger_debug(
-                    f"RpcWorker {mpi_rank()} is yielding responses: {responses}",
+                    f"[worker] RpcWorker {mpi_rank()} is yielding responses: {responses}",
                     color="yellow")
                 yield responses  # batching the responses to opt IPC performance
             else:
                 # Small delay to prevent busy waiting when no responses
                 await asyncio.sleep(0)
         logger_debug(
-            f"RpcWorker {mpi_rank()} quitting fetch_responses_loop_async",
+            f"[worker] RpcWorker {mpi_rank()} quitting fetch_responses_loop_async",
             color="yellow")
 
     async def _generic_fetch_loop_async(
@@ -152,7 +179,7 @@ class RpcWorker(BaseWorker):
             # Always yield data, even if empty, to prevent the client looks like hanging
             # TODO: Remove the empty data to reduce the IPC overhead
             yield [serializer(item) for item in data]
-        logger_debug(f"RpcWorker {mpi_rank()} quitting {method_name}",
+        logger_debug(f"[worker] RpcWorker {mpi_rank()} quitting {method_name}",
                      color="yellow")
 
     async def fetch_stats_loop_async(
@@ -184,11 +211,12 @@ class RpcWorker(BaseWorker):
         super().setup_engine()
 
     def shutdown(self):
-        logger_debug(f"RPC worker {mpi_rank()} is shutting down",
+        logger_debug(f"[worker] RpcWorker #{mpi_rank()} is shutting down",
                      color="yellow")
         self.shutdown_event.set()
         super().shutdown()
-        logger_debug(f"RPC worker {mpi_rank()} is shutdown", color="yellow")
+        logger_debug(f"[worker] RpcWorker #{mpi_rank()} is shutdown",
+                     color="yellow")
 
     def start(self):
         pass
@@ -228,22 +256,27 @@ class RpcWorker(BaseWorker):
             # The non-leader worker will setup the engine immediately.
             # The leader worker will wait for the RPC call to propagate the
             # potential error.
-            logger_debug(f"Worker {mpi_rank()} is setting up the engine",
-                         color="yellow")
+            logger_debug(
+                f"[worker] Worker {mpi_rank()} is setting up the engine",
+                color="yellow")
             worker.setup_engine()
 
         else:
-            logger_debug(f"Worker {mpi_rank()} is creating the RPC service",
-                         color="yellow")
+            logger_debug(
+                f"[worker] Worker {mpi_rank()} is creating the RPC service with {worker.num_workers} workers",
+                color="yellow")
             # Step 2: Create the RPC service, it will expose all the APIs of the worker as remote call to the client
             # Set num_workers to larger than 1 since there are some streaming tasks runs infinitely, such as await_responses_async.
-            rpc_server = RPCServer(worker, num_workers=RpcWorker.NUM_WORKERS)
+            rpc_server = RPCServer(worker, num_workers=worker.num_workers)
             rpc_server.bind(rpc_addr)
             rpc_server.start()
+            logger_debug(f"[worker] RPC server {mpi_rank()} is started",
+                         color="yellow")
 
             # Step 3: Wait for the worker to shutdown
             logger_debug(
-                f"Worker {mpi_rank()} is waiting for the worker to shutdown")
+                f"[worker] Worker {mpi_rank()} is waiting for shutdown event",
+                color="yellow")
             worker.shutdown_event.wait()
             rpc_server.shutdown()
 

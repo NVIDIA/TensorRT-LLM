@@ -1,7 +1,9 @@
 import asyncio
 import atexit
+import concurrent.futures
 import json
 import threading
+import time
 from typing import Optional
 
 from .._utils import nvtx_range_debug
@@ -14,7 +16,7 @@ from .postproc_worker import PostprocWorkerConfig
 from .request import GenerationRequest
 from .result import GenerationResult
 from .rpc import RPCClient
-from .rpc.rpc_common import get_unique_ipc_addr
+from .rpc.rpc_common import RPCCancelled, get_unique_ipc_addr
 from .rpc_worker import RpcWorker
 from .utils import (ErrorResponse, create_mpi_comm_session,
                     get_spawn_proxy_process_env, is_llm_response)
@@ -43,6 +45,15 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         """
         GenerationExecutorRpcProxy.INSTANCE_COUNTER += 1
         self.rpc_addr = get_unique_ipc_addr()
+
+        # Initialize event loop components first
+        self._shutdown_event = threading.Event()
+        self.main_loop_task_obj = None
+        self.main_loop = None
+        self.main_loop_started = threading.Event()
+        self._fetch_responses_loop_started = threading.Event()
+
+        # Create RPC client without event loop first (it will create its own)
         self.rpc_client = RPCClient(self.rpc_addr)
 
         postproc_worker_config = postproc_worker_config or PostprocWorkerConfig(
@@ -59,13 +70,7 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         self._results = {}
 
         self._create_mpi_session(model_world_size, mpi_session)
-
-        self._shutdown_event = threading.Event()
         self.worker_kwargs = worker_kwargs
-
-        self.main_loop_task_obj = None
-        self.main_loop = None
-        self.main_loop_thread = None
 
         self.launch_workers()
 
@@ -75,6 +80,12 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
 
         # Setup main loop after engine is ready
         self.setup_mainloop()
+        # Wait for fetch_responses_loop to start
+        if not self._fetch_responses_loop_started.wait(timeout=5.0):
+            raise RuntimeError(
+                "Fetch responses loop failed to start within timeout")
+
+        time.sleep(4)
 
     def launch_workers(self):
         logger.debug(f"Launching workers")
@@ -100,11 +111,14 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
                 handler_method(data)
         except asyncio.CancelledError:
             logger.debug(f"{method_name} task cancelled")
+        except RPCCancelled:
+            logger.debug(f"{method_name} task cancelled")
         except Exception as e:
             logger.error(f"Error in {method_name}: {e}")
             raise
 
     async def _fetch_responses_loop_async(self):
+        self._fetch_responses_loop_started.set()  # Signal that loop has started
         await self._generic_fetch_loop_async(
             fetch_method_name="fetch_responses_loop_async",
             handler_method=self.handle_responses,
@@ -127,32 +141,82 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         async def main_loop_task():
             tasks = [
                 self._fetch_responses_loop_async(),
-                self._fetch_stats_loop_async(),
-                self._fetch_kv_cache_events_loop_async(),
+                # FIXME: We may change the LLM.get_stats/_async API, and remove such logic
+                # Let user fetch stats via RPC is much simpler and more reliable
+                # self._fetch_stats_loop_async()
             ]
-            # Only add kv_cache_events loop if it's enabled
-            if self._iter_kv_events_result:
-                tasks.append(self._fetch_kv_cache_events_loop_async())
+            # if self._iter_kv_events_result is not None:
+            #tasks.append(self._fetch_kv_cache_events_loop_async())
             await asyncio.gather(*tasks)
 
-        def _run_main_loop_task():
-            """Local method to run the main loop task."""
-            self.main_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self.main_loop)
+        # Check if there's already a running event loop in the current thread
+        try:
+            existing_loop = asyncio.get_running_loop()
+            # If we're already in an async context, schedule the task on the existing loop
+            logger_debug(
+                "[proxy] Found existing event loop, scheduling main loop task on it",
+                color="yellow")
+            self.main_loop = existing_loop
+            self.main_loop_task_obj = asyncio.create_task(main_loop_task())
+            self.main_loop_started.set()
+            # No need to create a new thread since we're using the existing loop
+            self.main_loop_thread = None
+        except RuntimeError:
+            # No running loop, create one in a separate thread
+            logger_debug(
+                "[proxy] No existing event loop, creating new one in separate thread",
+                color="yellow")
 
-            self.main_loop_task_obj = self.main_loop.create_task(
-                main_loop_task())
-            try:
-                self.main_loop.run_until_complete(self.main_loop_task_obj)
-            except asyncio.CancelledError:
-                pass  # Task cancellation is expected during shutdown
-            finally:
-                self.main_loop.close()
+            def _run_main_loop_task():
+                """Local method to run the main loop task."""
+                self.main_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(self.main_loop)
 
-        self.main_loop_thread = threading.Thread(target=_run_main_loop_task,
-                                                 daemon=True,
-                                                 name="rpc_proxy_main_loop")
-        self.main_loop_thread.start()
+                self.main_loop_task_obj = self.main_loop.create_task(
+                    main_loop_task())
+                # Signal that the main loop is ready
+                self.main_loop_started.set()
+                try:
+                    self.main_loop.run_until_complete(self.main_loop_task_obj)
+                except asyncio.CancelledError:
+                    pass  # Task cancellation is expected during shutdown
+                except RuntimeError as e:
+                    # This can happen if the event loop is stopped while task is running
+                    error_str = str(e)
+                    if "Event loop stopped before Future completed" in error_str:
+                        # This is expected during shutdown - ignore it
+                        logger.debug(
+                            f"[proxy] Expected shutdown error: {error_str}")
+                    else:
+                        # This is an unexpected RuntimeError - log and re-raise
+                        logger.error(
+                            f"[proxy] Unexpected RuntimeError in main loop: {error_str}"
+                        )
+                        raise
+                finally:
+                    # Ensure all pending tasks are cancelled before closing
+                    try:
+                        pending = asyncio.all_tasks(self.main_loop)
+                        for task in pending:
+                            if not task.done():
+                                task.cancel()
+                    except Exception as e:
+                        logger.debug(
+                            f"[proxy] Error cancelling pending tasks: {e}")
+
+                    # Close the event loop
+                    try:
+                        self.main_loop.close()
+                    except Exception as e:
+                        logger.debug(f"[proxy] Error closing event loop: {e}")
+
+            self.main_loop_thread = threading.Thread(target=_run_main_loop_task,
+                                                     daemon=True)
+            self.main_loop_thread.start()
+            # Wait for the main loop to be ready before continuing
+            if not self.main_loop_started.wait(timeout=5.0):
+                raise RuntimeError("Main loop failed to start within timeout")
+
         atexit.register(self.shutdown)
 
     def handle_responses(self, responses: list[GenerationResult]) -> bool:
@@ -194,6 +258,10 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
 
         if async_queues:
             _SyncQueue.notify_many(event_loop, async_queues)
+
+        logger_debug(
+            f"[proxy] fetched {len(responses)} responses and notified {len(async_queues)} async queues",
+            color="green")
 
     def _handle_iteration_data(self, data, result_singleton, data_type: str):
         """Generic method to handle iteration data received from RPC worker.
@@ -287,13 +355,8 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
         request.set_id(self._get_next_client_id())
+        client_id = request.id
         logprob_params = self._get_logprob_params(request)
-
-        # submit is a fire-and-forget operation, don't need to wait for response
-        with nvtx_range_debug("GenerationExecutorRpcProxy.submit",
-                              color="green",
-                              category="Proxy"):
-            self.rpc_client.submit(request).remote(need_response=False)
 
         result = GenerationResult(
             request,
@@ -301,7 +364,24 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
             executor=self,
             disaggregated_params=request.disaggregated_params,
             logprob_params=logprob_params)
-        self._results[request.id] = result
+
+        # Register the result before sending the request to avoid race condition
+        self._results[client_id] = result
+
+        with nvtx_range_debug("GenerationExecutorRpcProxy.submit",
+                              color="green",
+                              category="Proxy"):
+            try:
+                # submit is a fire-and-forget operation, don't need to wait for response
+                self.rpc_client.submit(request).remote(need_response=False)
+            except Exception as e:
+                # Clean up on error
+                self._results.pop(client_id, None)
+                raise
+
+            logger_debug(
+                f"[proxy] Submitted request {request.id} to RPC worker",
+                color="green")
 
         return result
 
@@ -312,8 +392,10 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         return self.rpc_client.setup_engine().remote(need_response=True)
 
     def shutdown_remote(self):
-        logger_debug(f"Shutting down rpc remote", color="yellow")
-        self.rpc_client.shutdown().remote()
+        logger_debug(f"[proxy] Shutting down rpc remote", color="yellow")
+        # WAR: the server's event_loop may stop before sending the response back.
+        # The MpiPoolSession will wait for the server to shutdown before shutting down the mpi session.
+        self.rpc_client.shutdown().remote(need_response=False)
 
     def abort_request(self, request_id: int) -> None:
         return self.rpc_client.abort_request(request_id).remote()
@@ -322,43 +404,65 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         if self._shutdown_event.is_set():
             return
         self._shutdown_event.set()
-        logger_debug(f"Shutting down GenerationExecutorRpcProxy",
+        logger_debug(f"[proxy] Shutting down GenerationExecutorRpcProxy",
                      color="yellow")
 
         # 1. shutdown the rpc server (PyExecutor Rank 0 + RPC server)
         self.shutdown_remote()
 
         # 2. stop the main loop, so that no new rpc requests
-        if self.main_loop and self.main_loop_task_obj:
-            logger_debug("Cancelling main loop task.", color="yellow")
-            # The cancel() is thread-safe
+        if self.main_loop:
             try:
-                self.main_loop.call_soon_threadsafe(
-                    self.main_loop_task_obj.cancel)
-            except Exception as e:
-                logger_debug(f"Error cancelling main loop task: {e}",
-                             color="yellow")
+                # Cancel the main task if it exists
+                if self.main_loop_task_obj and not self.main_loop_task_obj.done(
+                ):
+                    self.main_loop_task_obj.cancel()
+                    try:
+                        self.main_loop_task_obj.result(timeout=2.0)
+                    except (asyncio.CancelledError,
+                            concurrent.futures.CancelledError):
+                        pass  # Expected when cancelling
+                    except Exception as e:
+                        logger.warning(f"Error cancelling main task: {e}")
 
-        # Only join if we're not calling from the main_loop_thread itself
-        # (e.g., during garbage collection in that thread)
-        if self.main_loop_thread and threading.current_thread(
-        ) != self.main_loop_thread:
-            self.main_loop_thread.join()
+                # Only stop the event loop if we created it (have a thread)
+                if self.main_loop_thread:
+                    # Stop the event loop
+                    self.main_loop.call_soon_threadsafe(self.main_loop.stop)
+
+                    # Wait for the thread to complete with timeout
+                    self.main_loop_thread.join(timeout=5.0)
+                    if self.main_loop_thread.is_alive():
+                        logger.warning("Main loop thread did not exit cleanly")
+                else:
+                    logger.debug("Using external event loop, not stopping it")
+            except Exception as e:
+                logger.warning(f"Error during main loop shutdown: {e}")
 
         # 3. shutdown the mpi session, this should wait until all the PyExecutor
         # processes are shutdown
-        if self.mpi_session is not None:
-            logger_debug(f"Shutting down mpi session", color="yellow")
-            self.mpi_session.shutdown()
-            logger_debug(f"Mpi session shutdown", color="yellow")
-            self.mpi_session = None
+        if hasattr(self, 'mpi_session') and self.mpi_session is not None:
+            try:
+                logger_debug(f"[proxy] Shutting down mpi session",
+                             color="yellow")
+                self.mpi_session.shutdown()
+                logger_debug(f"[proxy] Mpi session shutdown", color="yellow")
+                self.mpi_session = None
+            except Exception as e:
+                logger.warning(f"Error during MPI session shutdown: {e}")
 
-        self.rpc_client.close()
+        try:
+            if hasattr(self, 'rpc_client'):
+                self.rpc_client.close()
+        except Exception as e:
+            logger.warning(f"Error during RPC client close: {e}")
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
+        logger_debug("[proxy] GenerationExecutorRpcProxy is exiting",
+                     color="yellow")
         self.shutdown()
 
     def _create_mpi_session(self, model_world_size: int,
@@ -366,11 +470,11 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
         if mpi_session is None:
             if mpi_process_pre_spawned:
-                logger_debug('create comm session ...\n', "yellow")
+                logger_debug('[proxy] create comm session ...\n', "yellow")
                 self.mpi_session = create_mpi_comm_session(model_world_size)
             else:
-                logger_debug('create pool session ...\n', "yellow")
+                logger_debug('[proxy] create pool session ...\n', "yellow")
                 self.mpi_session = MpiPoolSession(n_workers=model_world_size)
         else:
-            logger_debug('using external mpi session ...\n', "yellow")
+            logger_debug('[proxy] using external mpi session ...\n', "yellow")
             self.mpi_session = mpi_session
