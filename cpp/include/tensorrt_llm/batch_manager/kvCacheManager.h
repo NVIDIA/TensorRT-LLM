@@ -595,6 +595,21 @@ public:
 
     ~WindowBlockManager();
 
+    [[nodiscard]] bool isEnableIndexerKCache() const
+    {
+        return mEnableIndexerKCache;
+    }
+
+    [[nodiscard]] SizeType32 getIndexerKCacheQuantBlockSize() const
+    {
+        return mIndexerKCacheQuantBlockSize;
+    }
+
+    [[nodiscard]] SizeType32 getIndexerKCacheIndexHeadDim() const
+    {
+        return mIndexerKCacheIndexHeadDim;
+    }
+
     void allocatePools(bool useUvm);
 
     void releasePools();
@@ -809,6 +824,9 @@ public:
         return mBufferManager;
     }
 
+    //! \brief Sync internal streams used by transfer manager with buffer manager stream
+    void syncTransferManagerWithBufferManager();
+
     //! \brief Perform per-request bookkeeping
     void refreshBlocks();
 
@@ -1020,6 +1038,21 @@ public:
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         std::optional<kvc::BaseAgentConfig> agentConfig = std::nullopt, bool enableIndexerKCache = false,
         SizeType32 indexerKCacheQuantBlockSize = 128, SizeType32 indexerKCacheIndexHeadDim = 0);
+
+    [[nodiscard]] bool isEnableIndexerKCache() const
+    {
+        return mIsEnableIndexerKCache;
+    }
+
+    [[nodiscard]] SizeType32 getIndexerKCacheQuantBlockSize() const
+    {
+        return mIndexerKCacheQuantBlockSize;
+    }
+
+    [[nodiscard]] SizeType32 getIndexerKCacheIndexHeadDim() const
+    {
+        return mIndexerKCacheIndexHeadDim;
+    }
 
     BlockManager(BlockManager const&) = delete;
     BlockManager& operator=(BlockManager const&) = delete;
@@ -1283,6 +1316,9 @@ public:
     //! \brief Store newest block for reuse
     void storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
 
+    //! \brief Sync internal streams used by transfer manager with buffer manager stream
+    void syncTransferManagerWithBufferManager();
+
     //! \brief Perform per-request bookkeeping
     void refreshBlocks();
 
@@ -1398,6 +1434,10 @@ private:
     std::vector<SizeType32> mAbsolutePoolToRelativePoolIndex;
     // Record what sequences are currently managed by the block manager
     std::set<LlmRequest::RequestIdType> mManagedSequences;
+
+    bool mIsEnableIndexerKCache{false};
+    SizeType32 mIndexerKCacheQuantBlockSize{0};
+    SizeType32 mIndexerKCacheIndexHeadDim{0};
 };
 
 struct OffsetTableDimensions
@@ -1500,6 +1540,10 @@ public:
 
     [[nodiscard]] virtual bool isEnableBlockReuse() const = 0;
 
+    [[nodiscard]] virtual bool isEnableIndexerKCache() const = 0;
+    [[nodiscard]] virtual SizeType32 getIndexerKCacheIndexHeadDim() const = 0;
+    [[nodiscard]] virtual SizeType32 getIndexerKCacheQuantBlockSize() const = 0;
+
     // void removeToken(SizeType32 seqSlotIdx);
     virtual void rewindKVCache(LlmRequest::RequestIdType requestId, SizeType32 rewindLengths) = 0;
 
@@ -1546,6 +1590,7 @@ public:
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getIndexerKCachePool() const = 0;
     [[nodiscard]] virtual SizeType32 getPoolLayerIdx(SizeType32 layer_idx) const = 0;
 
+    virtual void syncTransferManagerWithBufferManager() = 0;
     virtual void refreshBlocks() = 0;
     virtual void flushIterationEvents() = 0;
     virtual void resetReuseState() = 0;
@@ -1834,6 +1879,21 @@ public:
         return mEnableBlockReuse;
     }
 
+    [[nodiscard]] bool isEnableIndexerKCache() const override
+    {
+        return mBlockManager.isEnableIndexerKCache();
+    }
+
+    [[nodiscard]] SizeType32 getIndexerKCacheIndexHeadDim() const override
+    {
+        return mBlockManager.getIndexerKCacheIndexHeadDim();
+    }
+
+    [[nodiscard]] SizeType32 getIndexerKCacheQuantBlockSize() const override
+    {
+        return mBlockManager.getIndexerKCacheQuantBlockSize();
+    }
+
     void removeToken(LlmRequest::RequestIdType requestId);
     void rewindKVCache(LlmRequest::RequestIdType requestId, SizeType32 rewindLengths) override;
 
@@ -1910,6 +1970,11 @@ public:
     SizeType32 getPoolLayerIdx(SizeType32 layer_idx) const override
     {
         return mBlockManager.getPoolLayerIdx(layer_idx);
+    }
+
+    void syncTransferManagerWithBufferManager() override
+    {
+        mBlockManager.syncTransferManagerWithBufferManager();
     }
 
     //! \brief Perform per-iteration bookkeeping
