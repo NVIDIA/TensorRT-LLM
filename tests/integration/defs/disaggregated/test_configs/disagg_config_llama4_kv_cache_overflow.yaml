@@ -1,20 +1,4 @@
-# Configuration for reproducing KV cache buffer overflow bug
-# RCCA: https://nvbugspro.nvidia.com/bug/5555681
-#
-# This config uses Llama-4-Scout-17B-16E-Instruct model (16 experts MoE)
-# and intentionally sets max_tokens_in_buffer to a small value (2048)
-# to trigger illegal memory access when transferring large KV cache (~16k tokens)
-# between disaggregated context and generation workers.
-# 这个配置使用Llama-4-Scout-17B-16E-Instruct模型（16专家MoE）
-# 并故意将max_tokens_in_buffer设置为较小值(2048)
-# 以触发在disaggregated context和generation workers之间传输大KV cache(~16k tokens)时的非法内存访问
-#
-# Scout model is smaller than Maverick (16E vs 128E) so should have less memory pressure
-# Scout模型比Maverick更小（16E vs 128E），所以内存压力会小得多
-
-# NOTE: This will be replaced with absolute path in the test
-# 注意：这个路径会在测试中被替换为绝对路径
-model: PLACEHOLDER_MODEL_PATH
+model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
 hostname: localhost
 port: 8000
 backend: pytorch
@@ -26,20 +10,19 @@ context_servers:
   moe_expert_parallel_size: 1
   enable_attention_dp: false
   max_num_tokens: 8192
-  max_seq_len: 257000  # Reduced from 257000 to fit in GPU memory
-  max_input_len: 256000  # Reduced from 256000
+  max_seq_len: 257000
+  max_input_len: 256000
   max_batch_size: 1
   trust_remote_code: true
   enable_chunked_prefill: true
   kv_cache_config:
-    enable_block_reuse: false  # Disable block reuse to save memory
-    free_gpu_memory_fraction: 0.3  # Increase memory allocation significantly
+    enable_block_reuse: false
+    free_gpu_memory_fraction: 0.3
   disable_overlap_scheduler: true
-  cuda_graph_config: null  # Disable CUDA graph to reduce memory usage
+  cuda_graph_config: null
   cache_transceiver_config:
     backend: UCX
     # Intentionally small to reproduce buffer overflow bug
-    # 故意设置为小值以复现缓冲区溢出bug
     max_tokens_in_buffer: 2048
   urls:
     - "localhost:8001"
@@ -51,20 +34,19 @@ generation_servers:
   moe_expert_parallel_size: 1
   enable_attention_dp: false
   max_num_tokens: 8192
-  max_seq_len: 257000  # Reduced from 257000 to fit in GPU memory
-  max_input_len: 256000  # Reduced from 256000
+  max_seq_len: 257000
+  max_input_len: 256000
   max_batch_size: 1
   trust_remote_code: true
   enable_chunked_prefill: true
   kv_cache_config:
-    enable_block_reuse: false  # Disable block reuse to save memory
-    free_gpu_memory_fraction: 0.3  # Increase memory allocation significantly
+    enable_block_reuse: false
+    free_gpu_memory_fraction: 0.3
   disable_overlap_scheduler: true
-  cuda_graph_config: null  # Disable CUDA graph to reduce memory usage
+  cuda_graph_config: null
   cache_transceiver_config:
     backend: UCX
     # Intentionally small to reproduce buffer overflow bug
-    # 故意设置为小值以复现缓冲区溢出bug
     max_tokens_in_buffer: 2048
   urls:
     - "localhost:8002"
