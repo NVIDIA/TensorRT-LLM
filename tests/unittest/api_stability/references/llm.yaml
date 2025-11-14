@@ -123,6 +123,10 @@ methods:
         annotation: Union[str, tensorrt_llm.llmapi.llm_args.SamplerType]
         default: auto
         status: beta
+      sampler_enable_async_worker:
+        annotation: bool
+        default: False
+        status: prototype
       enable_iter_perf_stats:
         annotation: bool
         default: False

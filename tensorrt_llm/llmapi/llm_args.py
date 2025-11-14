@@ -2579,7 +2579,7 @@ class TorchLlmArgs(BaseLlmArgs):
     sampler_enable_async_worker: bool = Field(
         default=False,
         description="Enable the async worker in the sampler for D->H copies",
-        status="beta")
+        status="prototype")
 
     enable_iter_perf_stats: bool = Field(
         default=False,
