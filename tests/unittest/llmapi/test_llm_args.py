@@ -814,14 +814,14 @@ class TestApplyEnvOverrides:
         # Cleanup
         del os.environ[test_var]
 
-    def test_apply_env_overrides_shell_precedence(self):
-        """Test that shell environment takes precedence over config."""
+    def test_apply_env_overrides_config_overrides_shell(self):
+        """Test that config values override existing shell environment variables."""
         import os
 
         from tensorrt_llm.llmapi.llm_args import apply_env_overrides
 
-        # Setup
-        test_var = "TEST_ENV_VAR_PRECEDENCE"
+        # Setup - set a shell environment variable
+        test_var = "TEST_ENV_VAR_OVERRIDE"
         os.environ[test_var] = "shell_value"
 
         config_dict = {"env_overrides": {test_var: "config_value"}}
@@ -829,8 +829,8 @@ class TestApplyEnvOverrides:
         # Apply env overrides
         apply_env_overrides(config_dict)
 
-        # Verify shell value was preserved
-        assert os.environ[test_var] == "shell_value"
+        # Verify config value overrode the shell value
+        assert os.environ[test_var] == "config_value"
 
         # Cleanup
         del os.environ[test_var]
@@ -947,6 +947,64 @@ class TestApplyEnvOverrides:
 
         # env_overrides should still be removed
         assert "env_overrides" not in config_dict
+
+    def test_apply_env_overrides_logging_on_conflict(self, caplog):
+        """Test that overriding existing env vars logs at INFO level with both values."""
+        import logging
+        import os
+
+        from tensorrt_llm.llmapi.llm_args import apply_env_overrides
+
+        # Setup
+        test_var = "TEST_ENV_VAR_LOGGING"
+        os.environ[test_var] = "old_shell_value"
+
+        config_dict = {"env_overrides": {test_var: "new_config_value"}}
+
+        # Apply env overrides with logging capture
+        with caplog.at_level(logging.INFO):
+            apply_env_overrides(config_dict, "/path/to/config.yaml")
+
+        # Verify the environment variable was overridden
+        assert os.environ[test_var] == "new_config_value"
+
+        # Verify INFO-level logging shows the override
+        assert any("Overriding TEST_ENV_VAR_LOGGING" in record.message
+                   for record in caplog.records)
+        assert any("old_shell_value" in record.message
+                   and "new_config_value" in record.message
+                   for record in caplog.records)
+
+        # Cleanup
+        del os.environ[test_var]
+
+    def test_apply_env_overrides_logging_on_new_var(self, caplog):
+        """Test that setting new env vars logs at INFO level."""
+        import logging
+        import os
+
+        from tensorrt_llm.llmapi.llm_args import apply_env_overrides
+
+        # Setup
+        test_var = "TEST_ENV_VAR_NEW_LOGGING"
+        if test_var in os.environ:
+            del os.environ[test_var]
+
+        config_dict = {"env_overrides": {test_var: "new_value"}}
+
+        # Apply env overrides with logging capture
+        with caplog.at_level(logging.INFO):
+            apply_env_overrides(config_dict)
+
+        # Verify the environment variable was set
+        assert os.environ[test_var] == "new_value"
+
+        # Verify INFO-level logging shows the setting
+        assert any(f"Setting {test_var}='new_value'" in record.message
+                   for record in caplog.records)
+
+        # Cleanup
+        del os.environ[test_var]
 
     def test_update_llm_args_with_extra_options_applies_env_overrides(self):
         """Test that update_llm_args_with_extra_options calls apply_env_overrides."""

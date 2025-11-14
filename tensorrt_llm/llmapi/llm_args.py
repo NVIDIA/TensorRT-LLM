@@ -2954,8 +2954,8 @@ def apply_env_overrides(config_dict: Dict,
     """Apply environment variable overrides from config file.
 
     Extracts and applies environment variables from the 'env_overrides' section
-    of the config dictionary. Shell environment variables take precedence over
-    config file values.
+    of the config dictionary. Config file values ALWAYS take precedence and will
+    override any existing shell environment variables.
 
     Args:
         config_dict: Configuration dictionary potentially containing 'env_overrides'
@@ -2977,12 +2977,12 @@ def apply_env_overrides(config_dict: Dict,
     for key, value in env_overrides.items():
         str_value = str(value)
         if key in os.environ:
-            logger.debug(
-                f"Skipping {key}={str_value} (already set to {os.environ[key]})"
-            )
+            old_value = os.environ[key]
+            os.environ[key] = str_value
+            logger.info(f"Overriding {key}: '{old_value}' -> '{str_value}'")
         else:
             os.environ[key] = str_value
-            logger.info(f"Setting {key}={str_value}")
+            logger.info(f"Setting {key}='{str_value}'")
 
 
 def update_llm_args_with_extra_dict(
