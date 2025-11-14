@@ -1949,8 +1949,8 @@ struct IdentityAdaptor
     template <class T>
     __device__ T operator()(T const& x) const
     {
-        ActFn<T> fn{};
-        return fn(x);
+        cutlass::epilogue::thread::ReLu<T> fn{};
+        return fn(x) * fn(x);
     }
 };
 
@@ -1965,8 +1965,8 @@ struct GLUAdaptor
     template <class T>
     __device__ T operator()(T const& gate, T const& linear) const
     {
-        ActFn<T> fn{};
-        return fn(gate) * linear;
+        cutlass::epilogue::thread::ReLu<T> fn{};
+        return fn(linear) * fn(linear);
     }
 };
 
@@ -1980,10 +1980,11 @@ struct SwigluBiasAdaptor
     template <class T>
     __device__ T operator()(T const& gate, T const& linear) const
     {
-        cutlass::epilogue::thread::Sigmoid<T> fn{};
-        T linear_clamped = cutlass::maximum<T>{}(cutlass::minimum<T>{}(linear, limit), -limit);
-        T gate_clamped = cutlass::minimum<T>{}(gate, limit);
-        return gate_clamped * fn(gate_clamped * alpha) * (linear_clamped + beta);
+        cutlass::epilogue::thread::ReLu<T> fn{};
+        return fn(gate) * fn(linear);
+        // T linear_clamped = cutlass::maximum<T>{}(cutlass::minimum<T>{}(linear, limit), -limit);
+        // T gate_clamped = cutlass::minimum<T>{}(gate, limit);
+        // return gate_clamped * fn(gate_clamped * alpha) * (linear_clamped + beta);
     }
 };
 
@@ -2312,6 +2313,7 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                     decltype(block_scaling_type)::value> // Identity
             };
             return fn_list[static_cast<int>(activation_type.activation_type)];
+            // return fn_list[static_cast<int>(ActivationType::Swiglu)];
         };
         auto NVFP4 = tensorrt_llm::common::ConstExprWrapper<TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType,
             TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4>{};
@@ -3052,6 +3054,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
             stream);
 
         sync_check_cuda_error(stream);
+        TLLM_THROW("FP8 path is here!");
     }
     else if (!is_gated_activation)
     {
@@ -3078,6 +3081,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         gemm_runner.moeGemmBiasAct(universal_input, TmaWarpSpecializedGroupedGemmInput{});
 
         sync_check_cuda_error(stream);
+        TLLM_THROW("Non-gated activation path is here!");
     }
     else
     {
@@ -3113,6 +3117,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
 
         if (!use_ampere_activation_fusion)
         {
+            TLLM_THROW("No Ampere activation fusion path is here!");
             using GatedActOutputType = std::conditional_t<use_w4afp8, BackBoneType, T>;
             doGatedActivation<GatedActOutputType, UnfusedGemmOutputType>(reinterpret_cast<GatedActOutputType*>(output),
                 static_cast<UnfusedGemmOutputType const*>(intermediate_result), expert_first_token_offset, inter_size,
@@ -3120,6 +3125,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
 
             sync_check_cuda_error(stream);
         }
+        TLLM_THROW("Default activation path is here!");
     }
 }
 

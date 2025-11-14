@@ -540,7 +540,7 @@ class NemotronHMOE(nn.Module):
             # Default values
             override_quant_config=None,
             aux_stream_dict=None,
-            weight_loading_mode=MoEWeightLoadingMode.VANILLA,
+            weight_loading_mode=MoEWeightLoadingMode.VANILLA if model_config.moe_backend == 'VANILLA' else MoEWeightLoadingMode.FUSED_GATE_UP_PROJ,
             bias=self.mlp_bias,
             apply_router_weight_on_input=False,
             swiglu_alpha=None,

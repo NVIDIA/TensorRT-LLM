@@ -376,6 +376,7 @@ public:
         auto const num_experts_total = static_cast<int>(num_experts_on_rank * ep_size);
         auto parallelism_config = kernels::MOEParallelismConfig(tp_size, tp_rank, ep_size, ep_rank);
         ActivationType base_activation_type = ActivationType::Swiglu;
+        // Todo
         if (swiglu_alpha.has_value())
         {
             CHECK_INPUT(swiglu_alpha.value(), at::ScalarType::Float);

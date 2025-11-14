@@ -34,7 +34,7 @@ class NemotronHHfWeightMapper(HfWeightMapper):
             if "A_log" in key:
                 key = key.replace("A_log", "A")
 
-            if "_scale" in key:
+            if  ("mixer.in_proj" in key or "mixer.out_proj" in key) and "_scale" in key:
                 new_weights[key] = weights[name]
             elif "A" in key:
                 w = split(weights[name], tp_size, tp_rank)
@@ -94,6 +94,46 @@ class NemotronHHfWeightMapper(HfWeightMapper):
             elif "mixer.norm.weight" in key:
                 w = split(weights[name], tp_size, tp_rank)
                 new_weights[key] = w
+            # Remap MoE expert weights. (Keep shared expert weights separate)
+            elif "mixer.experts." in key:
+                if self.config.moe_backend == 'VANILLA':
+                    new_weights[key] = weights[name]
+                else:
+                    load_weight_type = "FUSED_GATE_UP_PROJ"
+                    if load_weight_type == "VANILLA":
+                        if "up_proj" in key:
+                            w1_key = key.replace("up_proj", "w1")
+                            w3_key = key.replace("up_proj", "w3")
+                            new_weights[w1_key] = weights[name]
+                            new_weights[w3_key] = weights[name]
+                        elif "down_proj" in key:
+                            key = key.replace("down_proj", "w2")
+                            new_weights[key] = weights[name]
+                        else:
+                            raise ValueError(f"Unknown MoE weight: {key}")
+                    elif load_weight_type == "FUSED_GATE_UP_PROJ":
+                        if "up_proj" in key:
+                            if "_scale" not in key:
+                                # Handle with weights.
+                                key = key.replace("up_proj", "gate_up_proj")
+                                new_weights[key] = torch.concat([weights[name], weights[name]], dim=1)
+                            else:
+                                # Handle with scale
+                                key = key.replace("up_proj", "gate_up_proj")
+                                new_weights[key] = weights[name]
+                        elif "down_proj" in key:
+                            key = key.replace("down_proj", "down_proj")
+                            new_weights[key] = weights[name]
+                        else:
+                            raise ValueError(f"Unknown MoE weight: {key}")
+
+
+
+                    # for key in new_weights.keys():
+                    #     if "model.layers.15.mixer.experts.0" in key:
+                    #         print("="*100)
+                    #         print(f"{key}: {new_weights[key].shape} {new_weights[key]=!r}")
+                    #         print("="*100)
             else:
                 new_weights[key] = weights[name]
 
