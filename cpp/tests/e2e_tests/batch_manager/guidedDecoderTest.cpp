@@ -137,7 +137,7 @@ public:
                 decoderInputBuffers.decoderRequests.push_back(llmReq);
             }
         }
-        decoderInputBuffers.logits = mLogits;
+        decoderInputBuffers.decoderLogits = mLogits;
 
         // Context phase
         resetLogits();

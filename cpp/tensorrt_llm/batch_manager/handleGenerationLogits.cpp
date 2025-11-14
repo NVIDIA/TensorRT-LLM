@@ -85,7 +85,7 @@ void HandleGenerationLogits::operator()(DecoderInputBuffers& inputBuffers, Reque
 
     auto& decoderRequests = inputBuffers.decoderRequests;
     decoderRequests.reserve(decoderRequests.size() + generationRequests.size());
-    auto& allDecoderLogits = inputBuffers.logits;
+    auto& allDecoderLogits = inputBuffers.decoderLogits;
     allDecoderLogits.reserve(allDecoderLogits.size() + generationRequests.size());
 
     for (auto const& llmReq : generationRequests)
