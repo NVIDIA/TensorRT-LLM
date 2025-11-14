@@ -694,7 +694,7 @@ class AsyncWorkerMixin:
     MAX_WORKERS = 1
 
     def _async_worker_active(self) -> bool:
-        return self._async_worker is not None
+        return hasattr(self, "_async_worker") and self._async_worker is not None
 
     def _async_worker_init(self, enable_async_worker: bool):
         self._enable_async_worker = enable_async_worker
@@ -706,21 +706,21 @@ class AsyncWorkerMixin:
 
     def async_worker_start(self):
         assert self.async_worker_enabled()
-        assert not self._async_worker_active()
+        if not self._async_worker_active():
 
-        def _async_worker_initializer(device_id):
-            # The current device is set per thread, so we need to set it again
-            # here
-            torch.cuda.set_device(device_id)
-            # Submit the host copies in a separate stream to prevent the
-            # blocking copies from gating subsequent async work
-            torch.cuda.set_stream(torch.cuda.Stream())
+            def _async_worker_initializer(device_id):
+                # The current device is set per thread, so we need to set it
+                # again here
+                torch.cuda.set_device(device_id)
+                # Submit the host copies in a separate stream to prevent the
+                # blocking copies from gating subsequent async work
+                torch.cuda.set_stream(torch.cuda.Stream())
 
-        self._async_worker = futures.ThreadPoolExecutor(
-            max_workers=self.MAX_WORKERS,
-            initializer=_async_worker_initializer,
-            initargs=(torch.cuda.current_device(),),
-        )
+            self._async_worker = futures.ThreadPoolExecutor(
+                max_workers=self.MAX_WORKERS,
+                initializer=_async_worker_initializer,
+                initargs=(torch.cuda.current_device(),),
+            )
 
     def async_worker_stop(self):
         assert self.async_worker_enabled()
@@ -774,8 +774,11 @@ class AsyncWorkerMixin:
         cuda_event.record()
 
         # Transfer ownership to worker_futures and re-initialize
-        worker_futures = self._async_worker_futures
-        self._async_worker_futures = []
+        if self._async_worker_active():
+            worker_futures = self._async_worker_futures
+            self._async_worker_futures = []
+        else:
+            worker_futures = None
 
         return SamplerEvent(cuda_event=cuda_event, worker_futures=worker_futures)
 

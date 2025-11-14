@@ -363,6 +363,10 @@ class PyExecutor:
                     target=self._event_loop_wrapper, daemon=True)
                 self.worker_thread.start()
                 self.worker_started = True
+            # Start the sampler's async worker, if it is enabled
+            if (isinstance(self.sampler, AsyncWorkerMixin)
+                    and self.sampler.async_worker_enabled()):
+                self.sampler.async_worker_start()
 
     def _set_global_steady_clock_offset(self):
         assert self.global_rank >= 0, "rank should be >= 0"
