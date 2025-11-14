@@ -213,7 +213,9 @@ public:
     // Get the number of buffers in use for a communicator
     size_t getBufferInUseCount(ncclComm_t comm) const;
 
-    // Check if a communicator is still valid (hasn't been cleaned up)
+    // Check if a communicator is valid (non-null)
+    // Note: We don't track cleaned-up comms because NCCL can reuse memory addresses.
+    // All non-null comms are considered valid and will be registered when first used.
     bool isCommValid(ncclComm_t comm) const noexcept;
 
     NCCLWindowAllocator(NCCLWindowAllocator const&) = delete;
