@@ -122,6 +122,7 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
             tok_ids.append(llm_spec.tokenizer.encode(prompts))
 
     sampling_params = SamplingParams(max_tokens=128, temperature=0)
+
     for i in range(len(tok_ids)):
         num_tokens = 0
         num_drafted = 0
@@ -515,7 +516,7 @@ def test_eagle3_cdl_sampling(disable_overlap_scheduler: bool):
 
     prompts = ["The president of the United States is"]
 
-    sampling_params = SamplingParams(max_tokens=20, temperature=0, top_p=0.9)
+    sampling_params = SamplingParams(max_tokens=20, temperature=1.0, top_p=0.9)
     llm_spec.generate(prompts, sampling_params)
     llm_spec.shutdown()
 

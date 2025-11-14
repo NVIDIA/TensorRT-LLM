@@ -551,6 +551,9 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
     , mEventManager{std::move(eventManager)}
     , mStream{stream}
     , mCacheType{cacheType}
+    , mIsEnableIndexerKCache{enableIndexerKCache}
+    , mIndexerKCacheQuantBlockSize{indexerKCacheQuantBlockSize}
+    , mIndexerKCacheIndexHeadDim{indexerKCacheIndexHeadDim}
 {
     if (agentConfig.has_value())
         mLoopbackAgent = makeLoopbackAgent("nixl", &agentConfig.value());

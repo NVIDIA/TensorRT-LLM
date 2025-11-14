@@ -29,7 +29,6 @@ strenum = "^0.4.15"
 sentencepiece = ">=0.1.99"
 tensorrt = ">=10.13.0,<10.14.0"
 torch = ">=2.9.0a0,<=2.9.0"
-torchvision = "^0.24.0"
 nvidia-modelopt = {version = ">=0.37.0,<0.38.0", extras = ["torch"]}
 nvidia-nccl-cu13 = "2.27.7"
 nvidia-cuda-nvrtc = "^13.0.88"

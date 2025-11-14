@@ -1565,14 +1565,14 @@ files = [
 
 [[package]]
 name = "nvidia-cudnn-cu12"
-version = "9.15.0.57"
+version = "9.15.1.9"
 description = "cuDNN runtime libraries"
 optional = false
 python-versions = ">=3"
 files = [
-    {file = "nvidia_cudnn_cu12-9.15.0.57-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:fb5f2ee98668c54ccc7ff5dcdd2ceadad2720e1dc00c6e422f16f7d4ff226681"},
-    {file = "nvidia_cudnn_cu12-9.15.0.57-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:7b45341e138834df304ba4190b6ce31b69f9a688de776c56f789127bef907b50"},
-    {file = "nvidia_cudnn_cu12-9.15.0.57-py3-none-win_amd64.whl", hash = "sha256:16bc0770797354548c005d4029fca63dbd18badfc7561fafd26959f9c49a6102"},
+    {file = "nvidia_cudnn_cu12-9.15.1.9-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:2520692ef9d7804f4f02c8f3a127b24d568bb944ab1ccee0ab946a64699acf36"},
+    {file = "nvidia_cudnn_cu12-9.15.1.9-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:343d9b4bdba9df2f4acf5e8d8582fd40b66ee65fa5cff7702d58ebdc0c077dfa"},
+    {file = "nvidia_cudnn_cu12-9.15.1.9-py3-none-win_amd64.whl", hash = "sha256:478a605c3f027e18740fd70884ee706ebcd852cf20a0069cdc24cf855319cc5f"},
 ]
 
 [package.dependencies]

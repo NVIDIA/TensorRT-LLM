@@ -6,6 +6,7 @@
 /jenkins @NVIDIA/trt-llm-ci-infra-devs @NVIDIA/trt-llm-infra-devs
 ### Setup
 /docker @NVIDIA/trt-llm-setup-infra-devs @NVIDIA/trt-llm-infra-devs
+/.pre-commit-config.yaml @NVIDIA/trt-llm-setup-infra-devs @NVIDIA/trt-llm-infra-devs
 ### Github workflows
 /.github @NVIDIA/trt-llm-gh-workflows-infra-devs @NVIDIA/trt-llm-infra-devs
 /.coderabbit.yaml @NVIDIA/trt-llm-gh-workflows-infra-devs @NVIDIA/trt-llm-infra-devs
