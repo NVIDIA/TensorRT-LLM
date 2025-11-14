@@ -8,9 +8,11 @@ import ray
 import torch
 
 from tensorrt_llm._ray_utils import control_action_decorator
+from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm._torch.virtual_memory import (materialize_with_tag,
                                                 release_with_tag,
                                                 verify_sleep_wakeup_tags)
+from tensorrt_llm._utils import ray_use_rpc
 
 from ..bindings import executor as tllm
 from ..builder import Engine
@@ -21,6 +23,7 @@ from .base_worker import BaseWorker
 from .postproc_worker import PostprocWorkerConfig
 from .request import GenerationRequest
 from .result import GenerationResult
+from .rpc_worker import RpcWorkerMixin
 
 __all__ = [
     "RayGPUWorker",
@@ -83,7 +86,6 @@ class RayWorkerWrapper:
         self.worker.abort_request(request_id)
 
     def report_device_id(self) -> str:
-        from tensorrt_llm._torch.utils import get_device_uuid
         local_id = self.physical_to_local_id(self.gpu)
         return get_device_uuid(local_id)
 
@@ -100,6 +102,9 @@ class RayWorkerWrapper:
         else:
             raise AttributeError(
                 f"The RayGPUWorker has no method called '{method_name}'.")
+
+    def shutdown(self):
+        return self.worker.shutdown()
 
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
@@ -150,7 +155,7 @@ class RayWorkerWrapper:
         return ExtendedWorker
 
 
-class RayGPUWorker(BaseWorker):
+class RayGPUWorker(RpcWorkerMixin, BaseWorker):
 
     def __init__(
         self,
@@ -163,6 +168,7 @@ class RayGPUWorker(BaseWorker):
         hf_model_dir: Optional[Path] = None,
         tokenizer: Optional[TokenizerBase] = None,
         llm_args: Optional[BaseLlmArgs] = None,
+        rpc_addr: Optional[str] = None,
     ) -> None:
         global logger
         from tensorrt_llm.logger import logger
@@ -178,65 +184,30 @@ class RayGPUWorker(BaseWorker):
             llm_args=llm_args,
         )
 
-        if not self._is_pytorch_backend:
-            raise ValueError(f"Ray GPU worker only supports PyTorch backend.")
-
         self.device_id = device_id
-
-        # Override rank attributes using torch
         self.global_rank = torch.distributed.get_rank()
         if self.global_rank > 1:
             logger.set_rank(self.global_rank)
 
-        self.setup_engine()
+        if ray_use_rpc():
+            if rpc_addr is None:
+                raise RuntimeError(
+                    "RPC mode enabled but no rpc_addr provided to RayGPUWorker")
+            self.init_rpc_worker(self.global_rank, rpc_addr)
+            self.start_rpc_server()
+        else:
+            self.setup_engine()
 
-    def _get_comm_ranks_device_id(self):
-        # Make sure C++ executor would use same devices/ranks as py_executor
-        global_rank = torch.distributed.get_rank()
-        world_size = torch.distributed.get_world_size()
-        comm_ranks = [None] * world_size
-        device_ids = [None] * world_size
-
-        torch.distributed.all_gather_object(comm_ranks, global_rank)
-        torch.distributed.all_gather_object(device_ids, self.device_id)
-
-        self._configure_affinity(self.device_id)
-
-        return comm_ranks, device_ids
+    def setup_engine(self):
+        if torch.distributed.is_initialized(
+        ) and torch.distributed.get_world_size() > 1:
+            torch.distributed.barrier()
+        super().setup_engine()
 
     def enqueue_request(self,
                         request: GenerationRequest,
                         result_wait_queue: Queue | None = None) -> int:
         return self._enqueue_request(request, result_wait_queue)
-
-    def submit(self, request: GenerationRequest):
-        raise NotImplementedError(
-            "Ray GPU worker does not support submit() yet.")
-
-    def shutdown(self):
-
-        if self.doing_shutdown:
-            return
-        else:
-            self.doing_shutdown = True
-
-        logger.debug(f'Worker {self.rank} shutting down...')
-
-        if self.engine is not None:
-            self.engine.shutdown()
-            self.engine = None
-
-            assert self._executor_config is None, "An empty executor_config is expected in shutdown when LLM arguments are defined."
-            if (self.llm_args.backend == "pytorch"
-                    and hasattr(self, "checkpoint_loader")
-                    and self.checkpoint_loader is not None):
-                self.checkpoint_loader.cleanup()
-                self.checkpoint_loader = None
-
-        # Check if there are any errors from the threads before shutdown.
-        self._handle_background_error()
-
-        logger.debug(f"Worker {self.rank} shutdown done.")
 
     @control_action_decorator
     def sleep(self, sleep_tags: List[str]):
@@ -269,6 +240,63 @@ class RayGPUWorker(BaseWorker):
         except Exception as e:
             logger.error(f"Encountered an error in wakeup")
             raise e
+
+    def start(self):
+        pass
+
+    def shutdown(self):
+
+        if self.doing_shutdown:
+            return
+        else:
+            self.doing_shutdown = True
+
+        logger.debug(f'Worker {self.rank} shutting down...')
+
+        if hasattr(self, 'shutdown_event'):
+            self.shutdown_event.set()
+
+        if hasattr(self, 'rpc_server') and self.rpc_server is not None:
+            logger.info(f"[Rank {self.global_rank}] Shutting down RPC server")
+            try:
+                self.rpc_server.shutdown()
+            except Exception as e:
+                # Suppress errors during RPC server shutdown
+                # These can occur if the server is already closed or during cleanup
+                logger.debug(
+                    f"[Rank {self.global_rank}] Suppressed error during RPC server shutdown: {e}"
+                )
+            self.rpc_server = None
+
+        if self.engine is not None:
+            self.engine.shutdown()
+            self.engine = None
+
+            assert self._executor_config is None, "An empty executor_config is expected in shutdown when LLM arguments are defined."
+            if (self.llm_args.backend == "pytorch"
+                    and hasattr(self, "checkpoint_loader")
+                    and self.checkpoint_loader is not None):
+                self.checkpoint_loader.cleanup()
+                self.checkpoint_loader = None
+
+        # Check if there are any errors from the threads before shutdown.
+        self._handle_background_error()
+
+        logger.debug(f"Worker {self.rank} shutdown done.")
+
+    def _get_comm_ranks_device_id(self):
+        # Make sure C++ executor would use same devices/ranks as py_executor
+        global_rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        comm_ranks = [None] * world_size
+        device_ids = [None] * world_size
+
+        torch.distributed.all_gather_object(comm_ranks, global_rank)
+        torch.distributed.all_gather_object(device_ids, self.device_id)
+
+        self._configure_affinity(self.device_id)
+
+        return comm_ranks, device_ids
 
     def __enter__(self):
         return self

@@ -524,6 +524,13 @@ def mpi_disabled() -> bool:
     return os.environ.get("TLLM_DISABLE_MPI") == "1"
 
 
+def ray_use_rpc() -> bool:
+    """True if TLLM_RAY_USE_RPC is set to "1", False otherwise.
+    # TODO: deprecate this once Ray is fully moved to use RPC client/server.
+    """
+    return os.environ.get("TLLM_RAY_USE_RPC") == "1"
+
+
 def mpi_rank():
     if mpi_disabled():
         try:
