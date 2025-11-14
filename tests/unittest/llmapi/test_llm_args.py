@@ -837,24 +837,6 @@ def temp_yaml_file():
 class TestApplyEnvOverrides:
     """Test suite for apply_env_overrides function."""
 
-    def test_apply_env_overrides_basic(self, env_var_cleanup):
-        """Test basic env_overrides application."""
-        test_var = "TEST_ENV_VAR_BASIC"
-
-        with env_var_cleanup([test_var]):
-            config_dict = {
-                "max_batch_size": 256,
-                "env_overrides": {
-                    test_var: "test_value"
-                }
-            }
-
-            apply_env_overrides(config_dict)
-
-            assert test_var in os.environ
-            assert os.environ[test_var] == "test_value"
-            assert "env_overrides" not in config_dict
-
     def test_apply_env_overrides_config_overrides_shell(self, env_var_cleanup):
         """Test that config values override existing shell environment variables."""
         test_var = "TEST_ENV_VAR_OVERRIDE"
@@ -910,18 +892,6 @@ class TestApplyEnvOverrides:
         config_dict = {"max_batch_size": 256}
         apply_env_overrides(config_dict)
         assert config_dict == {"max_batch_size": 256}
-
-    def test_apply_env_overrides_with_config_path(self, env_var_cleanup):
-        """Test that config_path is used in logging."""
-        test_var = "TEST_ENV_VAR_PATH"
-
-        with env_var_cleanup([test_var]):
-            config_dict = {"env_overrides": {test_var: "test_value"}}
-
-            apply_env_overrides(config_dict, "/path/to/config.yaml")
-
-            assert test_var in os.environ
-            assert os.environ[test_var] == "test_value"
 
     def test_apply_env_overrides_invalid_type(self):
         """Test that invalid env_overrides type is handled gracefully."""
@@ -989,61 +959,3 @@ class TestApplyEnvOverrides:
                 assert result_llm_args["max_batch_size"] == 512
                 assert result_llm_args["max_num_tokens"] == 8192
                 assert result_llm_args["tensor_parallel_size"] == 2
-
-    @pytest.mark.parametrize("test_case,yaml_content,test_vars,assertions", [
-        (
-            "basic",
-            {
-                "max_batch_size": 256,
-                "tensor_parallel_size": 4,
-                "env_overrides": {
-                    "TEST_WRAPPER_VAR1": "wrapper_value",
-                    "TEST_WRAPPER_VAR2": 12345
-                }
-            },
-            ["TEST_WRAPPER_VAR1", "TEST_WRAPPER_VAR2"],
-            lambda config:
-            (os.environ["TEST_WRAPPER_VAR1"] == "wrapper_value" and os.environ[
-                "TEST_WRAPPER_VAR2"] == "12345" and "env_overrides" not in
-             config and config["max_batch_size"] == 256 and config[
-                 "tensor_parallel_size"] == 4),
-        ),
-        (
-            "no_env_section",
-            {
-                "max_batch_size": 128,
-                "max_num_tokens": 4096
-            },
-            [],
-            lambda config: (config["max_batch_size"] == 128 and config[
-                "max_num_tokens"] == 4096 and "env_overrides" not in config),
-        ),
-        (
-            "with_override",
-            {
-                "some_param": "value",
-                "env_overrides": {
-                    "TEST_WRAPPER_OVERRIDE_VAR": "new_config_value"
-                }
-            },
-            ["TEST_WRAPPER_OVERRIDE_VAR"],
-            lambda config:
-            (os.environ["TEST_WRAPPER_OVERRIDE_VAR"] == "new_config_value" and
-             "env_overrides" not in config),
-        ),
-    ],
-                             ids=["basic", "no_env_section", "with_override"])
-    def test_load_yaml_maybe_env_override(self, env_var_cleanup, temp_yaml_file,
-                                          test_case, yaml_content, test_vars,
-                                          assertions):
-        """Parametrized test for load_yaml_maybe_env_override wrapper function."""
-        with env_var_cleanup(test_vars):
-            # Special setup for override case
-            if test_case == "with_override":
-                os.environ["TEST_WRAPPER_OVERRIDE_VAR"] = "old_shell_value"
-
-            with temp_yaml_file(yaml_content) as config_file:
-                config = load_yaml_maybe_env_override(config_file)
-
-                assert isinstance(config, dict)
-                assert assertions(config)

@@ -94,6 +94,7 @@ from ..logger import logger, severity_map
               help="Flag for HF transformers.")
 @click.option("--config",
               "--extra_llm_api_options",
+              "extra_llm_api_options",
               type=str,
               default=None,
               help="Path to a YAML file that overwrites the parameters. "

@@ -63,6 +63,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 @optgroup.option(
     "--config",
     "--extra_llm_api_options",
+    "extra_llm_api_options",
     type=str,
     default=None,
     help=

@@ -304,6 +304,7 @@ class ChoiceWithAlias(click.Choice):
 @click.option(
     "--config",
     "--extra_llm_api_options",
+    "extra_llm_api_options",
     type=str,
     default=None,
     help=
