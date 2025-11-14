@@ -25,6 +25,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
+from ..attention_backend.trtllm import TrtllmAttention
 from ..distributed import MPIDist, TorchDist
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
@@ -391,6 +392,16 @@ def create_py_executor(
     else:
         draft_model_engine = None
 
+    # TODO: Overlap scheduler is not supported for below cases:
+    # 1. non-CDL is used
+    # 2. non-TrtllmAttention attention backend is used
+    if has_draft_model_engine and (not use_chain_drafter or not issubclass(
+            draft_model_engine.attn_backend, TrtllmAttention)):
+        logger.warning(
+            "Overlap scheduler is not supported for non-CDL or non-TrtllmAttention backend."
+        )
+        llm_args.disable_overlap_scheduler = True
+
     # PyTorchModelEngine modifies these fields, update them
     model_engine_max_seq_len = model_engine.max_seq_len
     net_max_seq_len = model_engine_max_seq_len
@@ -697,6 +708,8 @@ def create_py_executor(
             )
 
     _adjust_torch_mem_fraction()
+
+    logger.info(f"{llm_args}")
 
     py_executor.start_worker()
     return py_executor
