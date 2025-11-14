@@ -331,11 +331,14 @@ def main(argv=None):
             raise
 
     # Apply inference optimizer fusions
-    optimizer_config = config["optimizer"]
-    ad_logger.info("Applying inference optimizer fusions (FP8 and FP4)...")
-    optimizer = InferenceOptimizer(factory=None, config=optimizer_config)
-    gm = optimizer(cm=None, mod=gm)
-    ad_logger.info("Inference optimizer fusions applied successfully")
+    optimizer_config = config.get("optimizer")
+    if optimizer_config:
+        ad_logger.info("Applying inference optimizer fusions (FP8 and FP4)...")
+        optimizer = InferenceOptimizer(factory=None, config=optimizer_config)
+        gm = optimizer(cm=None, mod=gm)
+        ad_logger.info("Inference optimizer fusions applied successfully")
+    else:
+        ad_logger.info("No optimizer transforms configured, skipping optimizer fusions")
 
     # Compile model with config params
     compile_config = config["compile"]
