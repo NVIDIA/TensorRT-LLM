@@ -61,6 +61,7 @@ def cuda_causal_conv_prepare_metadata(
     pages_per_seq: torch.Tensor,
     slot_idx: torch.Tensor,
     page_size: int,
+    chunk_size: int,
 ) -> List[torch.Tensor]:
     """Prepare metadata for cached causal conv (CUDA backend).
 
@@ -75,13 +76,13 @@ def cuda_causal_conv_prepare_metadata(
 
     slot_idx_sanitized = slot_idx[:num_seq].clone().to(torch.long)
     # This is only used during prefill to determine if we should use the initial states from the cache.
-    use_initial_states = input_pos > 0
+    use_initial_states = input_pos[:num_seq] > 0
     return (seq_len_sanitized, seq_start, slot_idx_sanitized, use_initial_states)
 
 
 @cuda_causal_conv_prepare_metadata.register_fake
 def cuda_causal_conv_prepare_metadata_fake(
-    position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size
+    position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size, chunk_size
 ):
     seq_len_sanitized = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
     num_seq = len(seq_len_sanitized)
@@ -182,7 +183,7 @@ def _cuda_cached_causal_conv1d(
 
         # Scatter outputs back to y
         y_prefill = y_varlen.transpose(0, 1)  # [total_prefill_tokens, C_out]
-        y_flat[:total_prefill_tokens].copy_(y_prefill.to(y_flat.dtype))
+        y_flat[:total_prefill_tokens].copy_(y_prefill)
 
     # DECODE: batch update for single-token sequences
     if num_decode > 0:
@@ -208,7 +209,7 @@ def _cuda_cached_causal_conv1d(
         )
 
     # Custom op must not return an alias of any input; return a fresh tensor
-    return y.contiguous().clone()
+    return y
 
 
 @_cuda_cached_causal_conv1d.register_fake
@@ -283,7 +284,7 @@ class CudaBackendCausalConv(AttentionDescriptor):
                 in_channels,
                 max(1, kernel_size - 1),
                 device=si.device,
-                dtype=cache_config.dtype or inp_fake.dtype,
+                dtype=inp_fake.dtype,
             )
 
         return {"conv_state_cache": _get_conv_cache}

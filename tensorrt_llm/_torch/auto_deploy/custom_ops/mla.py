@@ -182,6 +182,7 @@ def prepare_fused_mla_metadata(
     pages_per_seq: torch.Tensor,
     slot_idx: torch.Tensor,
     page_size: int,
+    chunk_size: int,
 ) -> List[torch.Tensor]:
     num_seq = SequenceInfo._get_sanitized_num_sequences(position_ids, seq_len)
     seq_start = torch.zeros_like(seq_len[:num_seq])
@@ -196,7 +197,7 @@ def prepare_fused_mla_metadata(
 
 @prepare_fused_mla_metadata.register_fake
 def prepare_fused_mla_metadata_fake(
-    position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size
+    position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size, chunk_size
 ):
     return (
         torch.empty_like(seq_len),

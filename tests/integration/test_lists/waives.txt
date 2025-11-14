@@ -410,3 +410,7 @@ examples/test_multimodal.py::test_llm_multimodal_general[Qwen2-VL-7B-Instruct-pp
 disaggregated/test_auto_scaling.py::test_disagg_server_restart[etcd-round_robin] SKIP (https://nvbugs/5633340)
 disaggregated/test_auto_scaling.py::test_worker_restart[http-load_balancing] SKIP (https://nvbugs/5649010)
 disaggregated/test_auto_scaling.py::test_worker_restart[http-round_robin] SKIP (https://nvbugs/5649010)
+disaggregated/test_disaggregated.py::test_disaggregated_mixed[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/5661926)
+unittest/_torch/sampler/test_torch_sampler.py::TestBatchedSampling SKIP (https://nvbugs/5661877)
+test_e2e.py::test_ptp_quickstart_multimodal[mistral-small-3.1-24b-instruct-Mistral-Small-3.1-24B-Instruct-2503-mixture_text_image-True] SKIP (https://nvbugs/5568836)
+test_e2e.py::test_trtllm_multimodal_benchmark_serving SKIP (https://nvbugs/5647825)
