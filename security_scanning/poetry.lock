@@ -2029,6 +2029,7 @@ optional = false
 python-versions = ">=3.7"
 files = [
     {file = "meson-1.9.1-py3-none-any.whl", hash = "sha256:f824ab770c041a202f532f69e114c971918ed2daff7ea56583d80642564598d0"},
+    {file = "meson-1.9.1.tar.gz", hash = "sha256:4e076606f2afff7881d195574bddcd8d89286f35a17b4977a216f535dc0c74ac"},
 ]
 
 [package.extras]
@@ -5731,4 +5732,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.0"
 python-versions = ">=3.10,<3.13"
-content-hash = "d6d3ca8f08190d667bfd4599463e6bcac3c8f3146bc2a321b51ac28d6235cfa3"
+content-hash = "7b8e9d34b0342c3b578f2bcfd74194b19c1fc542dec901752b8d0647a312a489"

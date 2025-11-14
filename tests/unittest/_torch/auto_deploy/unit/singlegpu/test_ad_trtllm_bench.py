@@ -6,7 +6,6 @@ import pytest
 import yaml
 from _model_test_utils import get_small_model_config
 from click.testing import CliRunner
-from utils.cpp_paths import llm_root  # noqa: F401
 
 from tensorrt_llm.commands.bench import main
 

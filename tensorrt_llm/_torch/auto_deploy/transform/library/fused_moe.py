@@ -19,7 +19,7 @@ def _insert_fused_moe_ops(gm: GraphModule) -> int:
         if not is_op(node, torch.ops.auto_deploy.torch_moe):
             continue
 
-        (mlp_style_val,) = extract_op_args(node, "mlp_style")
+        (mlp_style_val, act_fn_val) = extract_op_args(node, "mlp_style", "act_fn")
 
         hidden_states, selected_experts, routing_weights, w1_list, w2_list, w3_list = (
             extract_op_args(
@@ -50,7 +50,7 @@ def _insert_fused_moe_ops(gm: GraphModule) -> int:
             fused_w_up_experts = torch.stack([gm.get_parameter(n.target) for n in w1_list], dim=0)
             new_key_w_up = f"fused_moe_w1_stacked_{fused_key_counter}"
             # Triton fused MoE op supports mlp only.
-            replacement_op = torch.ops.auto_deploy.triton_moe_fused
+            replacement_op = torch.ops.auto_deploy.trtllm_moe_fused
 
         else:
             raise ValueError(f"Unknown mlp_style: {mlp_style_val}")
@@ -75,6 +75,10 @@ def _insert_fused_moe_ops(gm: GraphModule) -> int:
                     graph.get_attr(new_key_w_up),
                     graph.get_attr(new_key_w_down),
                 ),
+                kwargs={
+                    "mlp_style": mlp_style_val,
+                    "act_fn": act_fn_val,
+                },
             )
 
         node.replace_all_uses_with(new_node)
@@ -510,7 +514,10 @@ class MatchMoePattern(BaseTransform):
             num_moe_patterns += 1
 
         info = TransformInfo(
-            skipped=False, num_matches=num_moe_patterns, is_clean=False, has_valid_shapes=False
+            skipped=False,
+            num_matches=num_moe_patterns,
+            is_clean=num_moe_patterns == 0,
+            has_valid_shapes=num_moe_patterns == 0,
         )
         return gm, info
 
@@ -706,7 +713,7 @@ def _stack_fp8_moe_weights(gm: GraphModule) -> int:
         # Create new node with get_attr for stacked parameters
         with graph.inserting_before(node):
             new_node = graph.call_function(
-                torch.ops.auto_deploy.triton_quant_fp8_moe,
+                torch.ops.auto_deploy.trtllm_quant_fp8_moe_fused,
                 args=(
                     hidden_states,
                     selected_experts,
@@ -754,7 +761,10 @@ class FuseMoe(BaseTransform):
             fused_key_counter = _insert_fused_moe_ops(gm)
 
         info = TransformInfo(
-            skipped=False, num_matches=fused_key_counter, is_clean=False, has_valid_shapes=False
+            skipped=False,
+            num_matches=fused_key_counter,
+            is_clean=fused_key_counter == 0,
+            has_valid_shapes=fused_key_counter == 0,
         )
         return gm, info
 
@@ -779,7 +789,7 @@ class FuseFP8Moe(BaseTransform):
         info = TransformInfo(
             skipped=(fused_key_counter == 0),
             num_matches=fused_key_counter,
-            is_clean=False,
-            has_valid_shapes=False,
+            is_clean=fused_key_counter == 0,
+            has_valid_shapes=fused_key_counter == 0,
         )
         return gm, info
