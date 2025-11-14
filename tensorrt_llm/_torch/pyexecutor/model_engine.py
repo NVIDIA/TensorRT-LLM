@@ -1584,8 +1584,6 @@ class PyTorchModelEngine(ModelEngine):
                     request.py_num_accepted_draft_tokens)
 
             sequence_lengths.append(1 + self.original_max_draft_len)
-            num_accepted_draft_tokens.append(
-                request.py_num_accepted_draft_tokens)
             request_accepted_path[
                 request.
                 py_request_id] = request.py_num_accepted_draft_tokens_indices
