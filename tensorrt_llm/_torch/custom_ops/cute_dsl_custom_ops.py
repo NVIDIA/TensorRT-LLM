@@ -762,8 +762,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return self.__class__.tuning_config_cache[key]
 
         def forward(self, inputs: List[torch.Tensor],
-                    tactic: Optional[tuple]) -> torch.Tensor:
-            if isinstance(inputs, int):
+                    tactic: Optional[int]) -> torch.Tensor:
+            if isinstance(tactic, int):
                 tile_size = tactic
             else:
                 tile_size = 128
