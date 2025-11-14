@@ -1,7 +1,7 @@
 #!/bin/bash
 set -ex
 
-UCX_VERSION="v1.20.x"
+UCX_VERSION="v1.19.x"
 UCX_INSTALL_PATH="/usr/local/ucx/"
 CUDA_PATH="/usr/local/cuda"
 UCX_REPO="https://github.com/openucx/ucx.git"
