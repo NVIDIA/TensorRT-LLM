@@ -34,10 +34,12 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <fcntl.h>
 #include <filesystem>
 #include <memory>
 #include <set>
 #include <thread>
+#include <unistd.h>
 #include <variant>
 
 using namespace tensorrt_llm::batch_manager;
@@ -212,7 +214,10 @@ void writePatternToOffloadedBlocksGDS(
             {
                 buffer[i] = i & mask;
             }
-            ::write(fd, buffer.data(), poolBlockSize * sizeof(T));
+            auto const bytesToWrite = static_cast<size_t>(poolBlockSize) * sizeof(T);
+            auto const written = ::write(fd, buffer.data(), bytesToWrite);
+            EXPECT_EQ(written, static_cast<ssize_t>(bytesToWrite))
+                << "Failed to write pattern to offloaded block file " << filename;
             ::close(fd);
         }
     }
@@ -3575,7 +3580,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowWithReuseTest)
     auto numAllocatedPrimaryBlocks = blockManager.getNumAllocatedBlocks() - blocksInSecondaryPool;
     EXPECT_THAT(seq0.getCacheBlockIds(onlyWindowSize).at(beamIdx), ::testing::ElementsAreArray({0, 1, 2, 3, 4}));
 
-    EXPECT_NO_THROW(kvCacheManager.removeSequence(requestId, llmRequest));
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(requestId, llmRequest)));
     numAllocatedPrimaryBlocks = blockManager.getNumAllocatedBlocks() - blocksInSecondaryPool;
     EXPECT_EQ(numAllocatedPrimaryBlocks, 0);
     // store blocks 0, 1, 2, 3, 4  for reuse ([1000,1001,1002,1003], [1004,1005,1006,1007], [1008,1009,1010,1011],
@@ -3601,7 +3606,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowWithReuseTest)
     kvCacheManager.addToken(requestId);
     numTokens = llmRequest->getNumTokens(beamIdx);
     EXPECT_THAT(seq1.getCacheBlockIds(onlyWindowSize).at(beamIdx), ::testing::ElementsAreArray({0, 5, 6}));
-    EXPECT_NO_THROW(kvCacheManager.removeSequence(requestId, llmRequest));
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(requestId, llmRequest)));
 
     ///////////////////////////////////////////////////////////////////////////
     // add a medium request and then remove it
@@ -3615,7 +3620,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowWithReuseTest)
     GenerationRequest const& seq2 = kvCacheManager.getSequence(requestId);
     EXPECT_EQ(llmRequest->getContextCurrentPosition(), 9);
     EXPECT_THAT(seq2.getCacheBlockIds(onlyWindowSize).at(beamIdx), ::testing::ElementsAreArray({0, 1, 7}));
-    EXPECT_NO_THROW(kvCacheManager.removeSequence(requestId, llmRequest));
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(requestId, llmRequest)));
 
     ///////////////////////////////////////////////////////////////////////////
     // add a longer request within attention window and try to reuse
@@ -3637,7 +3642,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowWithReuseTest)
     llmRequest->addNewToken(1016, beamIdx);
     kvCacheManager.addToken(requestId);
     EXPECT_THAT(seq3.getCacheBlockIds(onlyWindowSize).at(beamIdx), ::testing::ElementsAreArray({0, 1, 2, 8, 9}));
-    EXPECT_NO_THROW(kvCacheManager.removeSequence(requestId, llmRequest));
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(requestId, llmRequest)));
 }
 
 TEST_F(KVCacheManagerTest, KVCacheManagerSWAInvalidateReuseTest)
@@ -3715,8 +3720,8 @@ TEST_F(KVCacheManagerTest, KVCacheManagerSWAInvalidateReuseTest)
     EXPECT_FALSE(blockManager.isSequenceValidForStoreForReuse(seq0.getRequestId(), onlyWindowSize));
     EXPECT_TRUE(blockManager.isSequenceValidForStoreForReuse(seq1.getRequestId(), onlyWindowSize));
 
-    EXPECT_NO_THROW(kvCacheManager.removeSequence(seq0.getRequestId(), llmRequest0));
-    EXPECT_NO_THROW(kvCacheManager.removeSequence(seq1.getRequestId(), llmRequest1));
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(seq0.getRequestId(), llmRequest0)));
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(seq1.getRequestId(), llmRequest1)));
 }
 
 TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowAttentionWithReuseTest)
@@ -3806,7 +3811,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowAttentionWithReuseTest)
     assertBlocks(seq0, {0, 1, 2}, {0, 1, 2});
     auto numAllocatedPrimaryBlocks = blockManager.getNumAllocatedBlocks() - blocksInSecondaryPoolPerWindow * numWindows;
 
-    EXPECT_NO_THROW(kvCacheManager.removeSequence(requestId, llmRequest));
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(requestId, llmRequest)));
     numAllocatedPrimaryBlocks = blockManager.getNumAllocatedBlocks() - blocksInSecondaryPoolPerWindow * numWindows;
     EXPECT_EQ(numAllocatedPrimaryBlocks, 0);
     // For both windows, store blocks 0, 1, 2  for reuse ([1000,1001,1002,1003], [1004,1005,1006,1007],
@@ -3832,7 +3837,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowAttentionWithReuseTest)
     llmRequest->addNewToken(1009, beamIdx);
     kvCacheManager.addToken(requestId);
     assertBlocks(seq1, {0, 3, 4}, {0, 3, 4});
-    EXPECT_NO_THROW(kvCacheManager.removeSequence(requestId, llmRequest));
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(requestId, llmRequest)));
 }
 
 TEST_F(KVCacheManagerTest, KVCacheManagerEventStreamOverflow)
