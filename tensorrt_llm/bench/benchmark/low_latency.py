@@ -47,18 +47,12 @@ from tensorrt_llm.sampling_params import SamplingParams
 )
 @optgroup.option(
     "--config",
-    type=str,
-    default=None,
-    help=
-    "Path to a YAML file that overwrites the parameters specified by trtllm-bench."
-)
-@optgroup.option(
     "--extra_llm_api_options",
     type=str,
     default=None,
     help=
-    "Path to a YAML file that overwrites the parameters specified by trtllm-bench."
-)
+    "Path to a YAML file that overwrites the parameters specified by trtllm-bench. "
+    "Can be specified as either --config or --extra_llm_api_options.")
 @optgroup.option(
     "--backend",
     type=click.Choice(ALL_SUPPORTED_BACKENDS),
@@ -199,19 +193,6 @@ def latency_command(
 ) -> None:
     """Run a latency test on a TRT-LLM engine."""
     logger.info("Preparing to run latency benchmark...")
-
-    # Validate that both --config and --extra_llm_api_options are not specified
-    config = params.get("config")
-    extra_llm_api_options = params.get("extra_llm_api_options")
-    if config is not None and extra_llm_api_options is not None:
-        raise click.UsageError(
-            "Cannot specify both --config and --extra_llm_api_options. "
-            "Please use only one of these flags.")
-
-    # Merge config flags (env_overrides handled by centralized loader)
-    config_file = config or extra_llm_api_options
-    if config_file is not None:
-        params["extra_llm_api_options"] = config_file
 
     # Parameters from CLI
     # Model, experiment, and engine params

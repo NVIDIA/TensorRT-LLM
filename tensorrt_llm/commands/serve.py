@@ -303,18 +303,12 @@ class ChoiceWithAlias(click.Choice):
               help="Flag for HF transformers.")
 @click.option(
     "--config",
-    type=str,
-    default=None,
-    help=
-    "Path to a YAML file that overwrites the parameters specified by trtllm-serve."
-)
-@click.option(
     "--extra_llm_api_options",
     type=str,
     default=None,
     help=
-    "Path to a YAML file that overwrites the parameters specified by trtllm-serve."
-)
+    "Path to a YAML file that overwrites the parameters specified by trtllm-serve. "
+    "Can be specified as either --config or --extra_llm_api_options.")
 @click.option(
     "--reasoning_parser",
     type=click.Choice(ReasoningParserFactory.parsers.keys()),
@@ -367,9 +361,9 @@ def serve(
         ep_size: Optional[int], cluster_size: Optional[int],
         gpus_per_node: Optional[int], kv_cache_free_gpu_memory_fraction: float,
         num_postprocess_workers: int, trust_remote_code: bool,
-        config: Optional[str], extra_llm_api_options: Optional[str],
-        reasoning_parser: Optional[str], tool_parser: Optional[str],
-        metadata_server_config_file: Optional[str], server_role: Optional[str],
+        extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
+        tool_parser: Optional[str], metadata_server_config_file: Optional[str],
+        server_role: Optional[str],
         fail_fast_on_attention_window_too_large: bool,
         otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
         disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str]):
@@ -378,15 +372,6 @@ def serve(
     MODEL: model name | HF checkpoint path | TensorRT engine path
     """
     logger.set_level(log_level)
-
-    # Validate that both --config and --extra_llm_api_options are not specified
-    if config is not None and extra_llm_api_options is not None:
-        raise click.UsageError(
-            "Cannot specify both --config and --extra_llm_api_options. "
-            "Please use only one of these flags.")
-
-    # Merge config flags (prefer --config over --extra_llm_api_options)
-    config_file = config or extra_llm_api_options
 
     llm_args, _ = get_llm_args(
         model=model,
@@ -410,8 +395,8 @@ def serve(
         otlp_traces_endpoint=otlp_traces_endpoint,
         enable_chunked_prefill=enable_chunked_prefill)
 
-    # Load config file if provided (handles env_overrides internally)
-    llm_args = update_llm_args_with_extra_options(llm_args, config_file)
+    llm_args = update_llm_args_with_extra_options(llm_args,
+                                                  extra_llm_api_options)
 
     metadata_server_cfg = parse_metadata_server_config_file(
         metadata_server_config_file)

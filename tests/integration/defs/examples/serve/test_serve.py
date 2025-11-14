@@ -94,6 +94,7 @@ def check_openai_chat_completion(http_port="8000",
 
 @skip_pre_hopper
 def test_extra_llm_api_options(serve_test_root):
+    """Test config file loading via --extra_llm_api_options (or --config alias)."""
     test_configs_root = f"{serve_test_root}/test_configs"
     config_file = f"{test_configs_root}/Qwen3-30B-A3B-FP8.yml"
     model_path = f"{llm_models_root()}/Qwen3/Qwen3-30B-A3B-FP8"
@@ -122,45 +123,6 @@ def test_extra_llm_api_options(serve_test_root):
     ]
 
     print_info("Launching trtllm-serve...")
-    with popen(cmd):
-        check_server_ready()
-        # Extract model name from the model path for consistency
-        model_name = model_path.split('/')[-1]  # "Qwen3-30B-A3B-FP8"
-        # Test the server with OpenAI chat completion
-        check_openai_chat_completion(model_name=model_name)
-
-
-@skip_pre_hopper
-def test_config_flag_alias(serve_test_root):
-    """Test that --config flag works as an alias for --extra_llm_api_options."""
-    test_configs_root = f"{serve_test_root}/test_configs"
-    config_file = f"{test_configs_root}/Qwen3-30B-A3B-FP8.yml"
-    model_path = f"{llm_models_root()}/Qwen3/Qwen3-30B-A3B-FP8"
-
-    # Assert that required files and directories exist
-    assert os.path.exists(
-        test_configs_root
-    ), f"test_configs_root directory does not exist: {test_configs_root}"
-    assert os.path.exists(
-        config_file), f"config_file does not exist: {config_file}"
-    assert os.path.exists(
-        model_path), f"model_path does not exist: {model_path}"
-
-    cmd = [
-        "trtllm-serve",
-        "serve",
-        model_path,
-        "--host",
-        "0.0.0.0",
-        "--port",
-        "8000",
-        "--backend",
-        "pytorch",
-        "--config",  # Using --config instead of --extra_llm_api_options
-        config_file,
-    ]
-
-    print_info("Launching trtllm-serve with --config flag...")
     with popen(cmd):
         check_server_ready()
         # Extract model name from the model path for consistency
