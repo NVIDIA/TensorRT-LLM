@@ -186,15 +186,9 @@ def test_prepare_metadata_cuda(conv_env):
     pages_per_seq = torch.ones(b, device=device, dtype=torch.int32)
     slot_idx = torch.tensor([2, 0, 1, 3], device=device, dtype=torch.int32)
     page_size = 128
-
+    chunk_size = 128
     out = torch.ops.auto_deploy.cuda_causal_conv_prepare_metadata(
-        position_ids,
-        seq_len,
-        input_pos,
-        cache_loc,
-        pages_per_seq,
-        slot_idx,
-        page_size,
+        position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size, chunk_size
     )
     assert len(out) == 4
     seq_len_s, seq_start, slot_s, use_initial_states = out

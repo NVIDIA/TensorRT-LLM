@@ -9,7 +9,6 @@ max_seq_len: 9220  # 8192 + 1024 + 4
 enable_attention_dp: true
 
 # Model init args
-max_num_tokens: 20480
 moe_backend: CUTLASS
 use_cuda_graph: false
 

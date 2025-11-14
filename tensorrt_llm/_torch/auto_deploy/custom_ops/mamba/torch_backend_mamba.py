@@ -120,6 +120,7 @@ def _torch_ssm_prepare_metadata(
     pages_per_seq: torch.Tensor,
     slot_idx: torch.Tensor,
     page_size: int,
+    chunk_size: int,
 ) -> List[torch.Tensor]:
     """Prepare metadata for cached SSM transform.
 
@@ -143,7 +144,7 @@ def _torch_ssm_prepare_metadata(
 
 @_torch_ssm_prepare_metadata.register_fake
 def _torch_ssm_prepare_metadata_fake(
-    position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size
+    position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size, chunk_size
 ):
     # Use the same sanitization logic to determine sizes in fake mode
     seq_len_sanitized = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
