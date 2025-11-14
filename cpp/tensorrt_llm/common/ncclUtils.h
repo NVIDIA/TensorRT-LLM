@@ -18,7 +18,6 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/kernels/userbuffers/ub_allocator.h"
 
 #if ENABLE_MULTI_DEVICE
 #include <nccl.h>
@@ -41,6 +40,60 @@ namespace tensorrt_llm::common::nccl_util
 {
 
 #if ENABLE_MULTI_DEVICE
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+
+//==============================================================================
+// NCCL Helper - Dynamic Library Loading
+//==============================================================================
+
+// Helper class for dynamically loading NCCL symbols (ncclMemAlloc, ncclCommWindowRegister)
+// This allows the code to work with NCCL libraries that may or may not have these symbols
+class NCCLHelper
+{
+public:
+    static NCCLHelper& getInstance();
+
+    // Dynamic loading function type definition
+    using ncclCommWindowRegisterFunc = ncclResult_t (*)(ncclComm_t, void*, size_t, ncclWindow_t*, int);
+    using ncclMemAllocFunc = ncclResult_t (*)(void**, size_t);
+
+    // Get function pointer for ncclCommWindowRegister
+    ncclCommWindowRegisterFunc getNCCLCommWindowRegister();
+
+    // Get function pointer for ncclMemAlloc
+    ncclMemAllocFunc getNCCLMemAlloc();
+
+    // Check if NCCL library is successfully loaded
+    bool isLoaded() const;
+
+    NCCLHelper(NCCLHelper const&) = delete;
+    NCCLHelper& operator=(NCCLHelper const&) = delete;
+    NCCLHelper(NCCLHelper&&) = delete;
+    NCCLHelper& operator=(NCCLHelper&&) = delete;
+
+private:
+    NCCLHelper();
+    ~NCCLHelper();
+
+    void loadNCCLLibrary();
+    void* loadLibraryHandle(char const* libName);
+    void* getSymbolAddress(void* handle, char const* symbolName);
+
+#ifdef _WIN32
+    HMODULE mLibraryHandle;
+#else
+    void* mLibraryHandle;
+#endif
+
+    ncclCommWindowRegisterFunc mNCCLCommWindowRegister;
+    ncclMemAllocFunc mNCCLMemAlloc;
+    bool mIsLoaded;
+};
 
 //==============================================================================
 // NCCL Resource Management
