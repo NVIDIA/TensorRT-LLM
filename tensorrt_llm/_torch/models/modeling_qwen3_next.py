@@ -827,7 +827,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         conv_states,
         ssm_states,
         num_decodes,
-        cu_seqlens,
         **kwargs,
     ):
         mixed_qkv = kwargs["mixed_qkv"]
@@ -836,7 +835,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         cache_indices = kwargs["cache_indices"]
         query_start_loc = torch.arange(0,
                                        num_decodes + 1,
-                                       device=cu_seqlens.device).to(torch.long)
+                                       dtype=torch.long,
+                                       device=mixed_qkv.device)
 
         mixed_qkv = causal_conv1d_update(
             mixed_qkv,
@@ -890,13 +890,13 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         batch_size = kwargs["batch_size"]
         has_initial_states = kwargs["has_initial_states"][:batch_size]
         cache_indices = kwargs["cache_indices"]
-        query_start_loc = kwargs["query_start_loc"][:batch_size + 1]
+        query_start_loc = kwargs["query_start_loc"]
+        query_start_loc_long = kwargs["query_start_loc_long"]
         num_prefill_tokens = kwargs["num_prefill_tokens"]
         num_decode_tokens = kwargs["num_decode_tokens"]
         state_indices_p = kwargs["state_indices_p"]
         state_indices_d = kwargs["state_indices_d"]
         num_prefill = kwargs["num_prefill"]
-        num_decode = kwargs["num_decode"]
 
         conv_states_to_use = conv_states
 
@@ -964,19 +964,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         recurrent_state = ssm_states[cache_indices]
 
-        if num_decode > 0:
-            # TODO set it in mambaCacheManager
-            decode_query_start_loc = torch.arange(
-                1, num_decode + 1,
-                device=query_start_loc.device)  # num_decode 个
-            decode_query_start_loc = decode_query_start_loc + query_start_loc[
-                num_prefill]
-            new_query_start_loc = torch.cat(
-                [query_start_loc[:num_prefill + 1], decode_query_start_loc])
-        else:
-            new_query_start_loc = query_start_loc
-
-        new_query_start_loc = new_query_start_loc.to(torch.long)
         core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
             q=query,
             k=key,
@@ -985,7 +972,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             beta=beta,
             initial_state=recurrent_state,
             output_final_state=True,
-            cu_seqlens=new_query_start_loc,
+            cu_seqlens=query_start_loc_long,
             head_first=False,
             use_qk_l2norm_in_kernel=True,
         )
@@ -1030,8 +1017,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         ssm_states = attn_metadata.kv_cache_manager.get_ssm_states(
             self.layer_idx)
         if num_prefills > 0:
-            ssm_states[state_indices_p] = 0
-            # conv_states[state_indices_p] = 0 # not necessary
+            ssm_states[state_indices_p].zero_()
+            # conv_states[state_indices_p].zero_() # not necessary
 
         def _compute_projected_states_qkvz():
             return self.in_proj_qkvz(hidden_states)
@@ -1072,20 +1059,20 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             "z": z,
             "has_initial_states": has_initial_states,
             "cache_indices": state_indices,
-            "query_start_loc": mamba_metadata.cu_seqlens,
+            "query_start_loc": mamba_metadata.query_start_loc,
+            "query_start_loc_long": mamba_metadata.query_start_loc_long,
             "batch_size": attn_metadata.seq_lens.shape[0],
             "num_prefill_tokens": num_prefill_tokens,
             "num_decode_tokens": num_decode_tokens,
             "state_indices_p": state_indices_p,
             "state_indices_d": state_indices_d,
             "num_prefill": num_prefills,
-            "num_decode": num_decodes,
+            "num_decodes": num_decodes,
         }
         if num_prefills > 0:
             attn_out = self.forward_extend(conv_states, ssm_states, **kwargs)
         else:
-            attn_out = self.forward_decode(conv_states, ssm_states, num_decodes,
-                                           mamba_metadata.cu_seqlens, **kwargs)
+            attn_out = self.forward_decode(conv_states, ssm_states, **kwargs)
 
         z_shape_og = z.shape
         # reshape input data into 2D tensor
