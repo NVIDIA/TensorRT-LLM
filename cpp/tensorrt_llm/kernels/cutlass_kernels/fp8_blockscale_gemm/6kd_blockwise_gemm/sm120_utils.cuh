@@ -29,7 +29,6 @@
 
 using namespace cute;
 using namespace cutlass;
-using namespace cutlass::gemm;
 
 namespace sm120_blockscaled_gemm
 {
