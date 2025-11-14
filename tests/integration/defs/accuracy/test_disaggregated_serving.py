@@ -289,6 +289,46 @@ def launch_disaggregated_llm(
         tokenizer = load_hf_tokenizer(model_name)
         yield DuckLLM(args, tokenizer, generate_async)
 
+        try:
+            print(
+                "Waiting for pending request futures to finish before fetching perf_metrics..."
+            )
+            for future in getattr(thread_pool, "futures", []):
+                try:
+                    future.result(timeout=300)
+                except concurrent.futures.TimeoutError:
+                    print("Timeout waiting for a future to complete.")
+                except Exception as e:
+                    print(f"Future completed with error: {e}")
+        except Exception as e:
+            print(f"Error while waiting for futures: {e}")
+
+        perf_paths = ["/v1/perf_metrics", "/perf_metrics"]
+        perf_fetched = False
+        for path in perf_paths:
+            perf_url = f"http://localhost:8000{path}"
+            try:
+                print(f"Fetching perf metrics from {perf_url}")
+                resp = requests.get(perf_url, timeout=10)
+                if resp.status_code == 200:
+                    try:
+                        metrics = resp.json()
+                        print("perf_metrics JSON:")
+                        print(json.dumps(metrics, indent=2, ensure_ascii=False))
+                    except ValueError:
+                        print("perf_metrics returned non-JSON response:",
+                              resp.text)
+                    perf_fetched = True
+                    break
+                else:
+                    print(
+                        f"perf_metrics returned status {resp.status_code}: {resp.text}"
+                    )
+            except requests.exceptions.RequestException as e:
+                print(f"Error fetching {perf_url}: {e}")
+        if not perf_fetched:
+            print("Unable to fetch perf_metrics from any known path.")
+
 
 def run_parallel_test(model_name: str,
                       model_path: str,
@@ -1012,12 +1052,14 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
     def test_nixl_backend(self):
         ctx_server_config = {
             "disable_overlap_scheduler": True,
+            "perf_metrics_max_requests": 10000,
             "cache_transceiver_config": {
                 "backend": "NIXL"
             }
         }
         gen_server_config = {
             "disable_overlap_scheduler": True,
+            "perf_metrics_max_requests": 10000,
             "cache_transceiver_config": {
                 "backend": "NIXL"
             }
@@ -1026,6 +1068,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "hostname": "localhost",
             "port": 8000,
             "backend": "pytorch",
+            "perf_metrics_max_requests": 10000,
             "context_servers": {
                 "num_instances": 1,
                 "urls": ["localhost:8001"]
