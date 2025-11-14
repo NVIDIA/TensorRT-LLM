@@ -805,7 +805,7 @@ class TRTLLMGenFusedMoE(MoE):
         self._load_balancer_done_set_cpu_stage(is_last_call)
 
         if use_dp_padding:
-            rank = self.mapping.tp_rank
+            rank = self.parallel_rank
             final_hidden_states = final_hidden_states[:
                                                       all_rank_num_tokens[rank]]
 

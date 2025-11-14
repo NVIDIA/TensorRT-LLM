@@ -727,10 +727,10 @@ class AutoTuner:
         new_tuning_failure_occured = False
 
         for p in profiles:
-            tensors = self._prepare_input_tensors(p, inputs)
             is_cache_hit, *_ = self.profiling_cache.search_cache(
                 custom_op, runners, p.get_opt_shapes(), tuning_config)
             if not is_cache_hit:
+                tensors = self._prepare_input_tensors(p, inputs)
                 # Initialize runner and tactic as None in case of no valid tactic or runners are found
                 best_runner_id, best_tactic, min_time, has_tuning_failure_occured = self._profile_runners(
                     custom_op, runners, tensors, p, tuning_config, **kwargs)
