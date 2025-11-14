@@ -121,8 +121,8 @@ class ADEngine(ModelEngine):
             page_size=attn_page_size,
             max_num_tokens=max_num_tokens,
             vocab_size_padded=factory.vocab_size_padded,
+            chunk_size=factory.chunk_size,
         )
-
         # TODO (lucaslie): consider how we move args around InferenceOptimizer.__init__,
         # ADEngine.__init__, and ADEngine.build_from_config. Seems a bit unnatural atm.
 
@@ -167,7 +167,6 @@ class ADEngine(ModelEngine):
 
         # build model
         self.model = get_inference_model(self.cache_seq_interface)
-
         # start fresh with fixed seed
         torch.manual_seed(42)
 
@@ -324,7 +323,6 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     torch.cuda.set_device(rank)
     port = mpi_dist.broadcast(dist.get_free_port())  # use MPI broadcast to pick a free port
     dist.initialize_or_skip(rank, world_size, port)
-
     # some config
     assert ad_config.max_beam_width <= 1, "_autodeploy + beam_search is not supported"
 
