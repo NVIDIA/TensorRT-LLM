@@ -18,6 +18,7 @@ import copy
 import io
 import os
 import re
+import socket
 import subprocess
 import time
 from datetime import datetime
@@ -26,10 +27,11 @@ from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional
 
 import requests
+import yaml
 from _pytest.nodes import Item
 from _pytest.python import Function
 from defs.trt_test_alternative import (check_output, popen, print_error,
-                                       print_info)
+                                       print_info, print_warning)
 
 from ..common import get_trt_llm_lib_dir, venv_mpi_check_output
 from ..local_venv import PythonVenvRunnerImpl
@@ -235,22 +237,23 @@ class PerfBenchScriptTestCmds(NamedTuple):
         return cmd_str
 
 
-class PerfServerClientBenchmarkCmds(NamedTuple):
+class PerfAggrScriptTestCmds(NamedTuple):
     server_cmds: List[str]
     client_cmds: List[List[str]]
     names: List[str]
     working_dir: str
 
-    def wait_for_endpoint_ready(self, url: str, timeout: int = 5400):
+    def wait_for_endpoint_ready(self, url: str, timeout: int = 7200):
         start = time.monotonic()
         while time.monotonic() - start < timeout:
             try:
-                time.sleep(10)
+                time.sleep(1)
                 if requests.get(url).status_code == 200:
-                    print(f"endpoint {url} is ready")
+                    print_info(f"endpoint {url} is ready")
                     return
             except Exception as err:
-                print(f"endpoint {url} is not ready, with exception: {err}")
+                print_info(
+                    f"endpoint {url} is not ready, with exception: {err}")
         print_error(
             f"Endpoint {url} did not become ready within {timeout} seconds")
 
@@ -269,10 +272,10 @@ class PerfServerClientBenchmarkCmds(NamedTuple):
                           env=venv._new_env,
                           shell=True) as server_proc):
                 self.wait_for_endpoint_ready(
-                    "http://localhost:8000/v1/models",
+                    f"http://localhost:8000/health",
                     timeout=7200)  # 120 minutes for large models
-                output += subprocess.check_output(self.client_cmds[cmd_idx],
-                                                  env=venv._new_env).decode()
+                output += check_output(self.client_cmds[cmd_idx],
+                                       env=venv._new_env)
                 # Write output to client file path
                 with open(client_file_path, 'w') as client_ctx:
                     client_ctx.write(output)
@@ -282,7 +285,7 @@ class PerfServerClientBenchmarkCmds(NamedTuple):
         return output
 
     def get_cmd_str(self, cmd_idx) -> List[str]:
-        return ["server-benchmark tests, please check config files"]
+        return ["aggr_server tests, please check config files"]
 
 
 class PerfDisaggScriptTestCmds(NamedTuple):
@@ -345,6 +348,232 @@ class PerfDisaggScriptTestCmds(NamedTuple):
 
     def get_cmd_str(self, cmd_idx) -> List[str]:
         return ["disaggregated server tests, please check config files"]
+
+
+class PerfMultiNodeDisaggScriptTestCmds(NamedTuple):
+    ctx_server_cmds: List[str]
+    gen_server_cmds: List[str]
+    disagg_server_cmds: List[str]
+    benchmark_cmds: List[List[str]]
+    working_dir: str
+    num_ctx_servers: int
+    num_gen_servers: int
+
+    def _generate_disagg_server_config(self,
+                                       cmd_idx: int,
+                                       worker_port: int = 8336,
+                                       server_port: int = 8333) -> str:
+        print_info(
+            f"Generating disagg server config for command index {cmd_idx}")
+        # Wait for all hostname files to be created
+        hostnames_folder = os.path.join(self.working_dir, "hostnames")
+        print_info(f"Waiting for hostnames folder: {hostnames_folder}")
+
+        expected_count = self.num_ctx_servers + self.num_gen_servers
+        timeout = 7200  # 2 hours
+        start_time = time.time()
+        while True:
+            if time.time() - start_time > timeout:
+                raise TimeoutError(
+                    f"Time out. Hostnames files are not ready after {timeout}s")
+            time.sleep(10)
+            if not os.path.exists(hostnames_folder):
+                continue
+            hostnames = os.listdir(hostnames_folder)
+            if len(hostnames) >= expected_count:
+                break
+            print_info(
+                f"Waiting for hostnames in {hostnames_folder}, current: {len(hostnames)}, expected: {expected_count}"
+            )
+        print_info(f"All hostnames found in {hostnames_folder}")
+
+        # Read ctx and gen hostnames
+        ctx_hostnames = []
+        gen_hostnames = []
+        for hostname_file in hostnames:
+            hostname_file_path = os.path.join(hostnames_folder, hostname_file)
+            with open(hostname_file_path, 'r') as f:
+                actual_hostname = f.read().strip()
+                print_info(f"Hostname: {actual_hostname} in {hostname_file}")
+
+            if hostname_file.startswith("CTX"):
+                ctx_hostnames.append(actual_hostname)
+            elif hostname_file.startswith("GEN"):
+                gen_hostnames.append(actual_hostname)
+        print_info(f"ctx_hostnames: {ctx_hostnames}")
+        print_info(f"gen_hostnames: {gen_hostnames}")
+
+        # Get current hostname
+        current_hostname = socket.gethostname()
+        print_info(f"Current hostname: {current_hostname}")
+
+        # Generate server config
+        server_config = {
+            'hostname': current_hostname,
+            'port': server_port,
+            'backend': 'pytorch',
+            'context_servers': {
+                'num_instances': num_ctx_servers,
+                'urls': [f'{host}:{worker_port}' for host in ctx_hostnames]
+            },
+            'generation_servers': {
+                'num_instances': num_gen_servers,
+                'urls': [f'{host}:{worker_port}' for host in gen_hostnames]
+            }
+        }
+
+        config_path = os.path.join(self.working_dir, "server_config.yaml")
+        with open(config_path, 'w') as f:
+            yaml.dump(server_config, f)
+        print_info(f"Server config file {config_path} generated")
+
+        return config_path
+
+    def wait_for_endpoint_ready(self, url: str, timeout: int = 7200):
+        start = time.monotonic()
+        while time.monotonic() - start < timeout:
+            try:
+                time.sleep(10)
+                if requests.get(url).status_code == 200:
+                    print_info(f"endpoint {url} is ready")
+                    return
+            except Exception as err:
+                print_info(
+                    f"endpoint {url} is not ready, with exception: {err}")
+        print_error(
+            f"Endpoint {url} did not become ready within {timeout} seconds")
+
+    def wait_for_benchmark_ready(self,
+                                 benchmark_status_file: str,
+                                 disagg_server_idx: str,
+                                 timeout: int = 7200):
+        print_info(
+            f"Server {disagg_server_idx} waiting for benchmark status file: {benchmark_status_file}"
+        )
+        start_time = time.time()
+        while True:
+            if os.path.exists(benchmark_status_file):
+                print_info(
+                    f"Benchmark status file found, terminating server {disagg_server_idx}"
+                )
+                break
+            if time.time() - start_time > timeout:
+                print_error(
+                    f"Timeout waiting for benchmark status file after {timeout}s, terminating server {disagg_server_idx}"
+                )
+                break
+            time.sleep(10)  # Check every 10 seconds
+
+    def run_cmd(self, cmd_idx: int, venv, disagg_server_idx: str) -> str:
+        output = ""
+        timeout = 7200  # 2 hours
+        benchmark_status_file = os.path.join(self.working_dir,
+                                             f"benchmark_status.{cmd_idx}.txt")
+
+        if "CTX" in disagg_server_idx or "GEN" in disagg_server_idx:
+            server_file_path = os.path.join(
+                self.working_dir,
+                f"trtllm-serve.{cmd_idx}.{disagg_server_idx}.log")
+            is_ctx = "CTX" in disagg_server_idx
+            server_cmd = self.ctx_server_cmds[
+                cmd_idx] if is_ctx else self.gen_server_cmds[cmd_idx]
+            try:
+                print_info(f"Starting server: {disagg_server_idx}")
+                with (  # Start server process
+                        open(server_file_path, 'w') as server_ctx,
+                        popen(server_cmd,
+                              stdout=server_ctx,
+                              stderr=subprocess.STDOUT,
+                              env=venv._new_env,
+                              shell=True) as server_proc):
+                    # Wait for benchmark status file to appear
+                    self.wait_for_benchmark_ready(benchmark_status_file,
+                                                  disagg_server_idx, timeout)
+                    # Kill the server
+                    server_proc.terminate()
+                    try:
+                        server_proc.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        print_warning(
+                            f"Server {disagg_server_idx} did not terminate gracefully, killing..."
+                        )
+                        server_proc.kill()
+                        server_proc.wait()
+            finally:
+                print_info(f"Server {disagg_server_idx} stopped")
+
+        elif disagg_server_idx == "DISAGG":
+            disagg_server_file_path = os.path.join(
+                self.working_dir, f"trtllm-serve.{cmd_idx}.disagg.log")
+            benchmark_file_path = os.path.join(
+                self.working_dir, f"trtllm-benchmark.{cmd_idx}.disagg.log")
+            disagg_server_cmd = self.disagg_server_cmds[cmd_idx]
+            benchmark_cmd = self.benchmark_cmds[cmd_idx]
+            benchmark_success = False
+            try:
+                # Generate disagg server config (this will wait for all hostnames)
+                self._generate_disagg_server_config(cmd_idx)
+                # Start disagg server
+                print_info("Starting disagg server")
+                with (open(disagg_server_file_path, 'w') as disagg_server_ctx,
+                      popen(disagg_server_cmd,
+                            stdout=disagg_server_ctx,
+                            stderr=subprocess.STDOUT,
+                            env=venv._new_env,
+                            shell=True) as disagg_server_proc):
+                    # Wait for server to be ready
+                    self.wait_for_endpoint_ready(
+                        f"http://localhost:8333/health", timeout=timeout)
+                    # Run benchmark
+                    print_info("Running benchmark")
+                    try:
+                        # Run benchmark
+                        output = check_output(benchmark_cmd, env=venv._new_env)
+                        # Write benchmark output
+                        with open(benchmark_file_path, 'w') as benchmark_ctx:
+                            benchmark_ctx.write(output)
+                        benchmark_success = True
+                        print_info("Benchmark completed successfully")
+                    except Exception as e:
+                        print_error(f"Benchmark failed: {e}")
+                        benchmark_success = False
+                        raise
+                    finally:
+                        # Create benchmark status file
+                        status = "success" if benchmark_success else "failed"
+                        with open(benchmark_status_file, 'w') as status_file:
+                            status_file.write(status)
+                        print_info(
+                            f"Benchmark status file created: {benchmark_status_file} with status: {status}"
+                        )
+                    # Kill the server
+                    disagg_server_proc.terminate()
+                    try:
+                        disagg_server_proc.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        print_warning(
+                            "Disagg server did not terminate gracefully, killing..."
+                        )
+                        disagg_server_proc.kill()
+                        disagg_server_proc.wait()
+            except Exception as e:
+                # Make sure to create status file even on error
+                if not os.path.exists(benchmark_status_file):
+                    with open(benchmark_status_file, 'w') as status_file:
+                        status_file.write("failed")
+                    print_info(
+                        f"Benchmark status file created with failed status due to error"
+                    )
+                print_error(f"Error in DISAGG node: {e}")
+                raise
+            finally:
+                print_info("DISAGG node stopped")
+        return output
+
+    def get_cmd_str(self, cmd_idx) -> List[str]:
+        return [
+            "multi-node disaggregated server tests, please check config files"
+        ]
 
 
 class AbstractPerfScriptTestClass(abc.ABC):
@@ -453,6 +682,10 @@ class AbstractPerfScriptTestClass(abc.ABC):
         is_prepare_dataset_cmd = 'prepare_dataset' in commands.get_cmd_str(
             cmd_idx)
 
+        is_perf_sanity_test = "perf_sanity" in full_test_name
+        is_multi_node_disagg_test = self._config.runtime == "multi_node_disagg_server" and self._config.disagg_configs[
+            0]['disagg_server_idx'] == "DISAGG"
+
         # Start the timer.
         self._start_timestamp = datetime.utcnow()
         try:
@@ -460,7 +693,8 @@ class AbstractPerfScriptTestClass(abc.ABC):
                 # Capture the stdout from _gpu_clock_lock because the pipeline JUnit update script tries to parse
                 # the log to find the GPU clocks.
                 with io.StringIO() as buf:
-                    if self._gpu_clock_lock:
+                    # Perf-sanity test doesn't lock gpu clock
+                    if self._gpu_clock_lock and not is_perf_sanity_test:
                         # Lock GPU clock and start monitoring.
                         with contextlib.redirect_stdout(
                                 buf), self._gpu_clock_lock, tmpDir:
@@ -513,9 +747,9 @@ class AbstractPerfScriptTestClass(abc.ABC):
         # Only save perf result if the result is valid.
         if self._result_state == "valid":
             # Parse the perf result from the test outputs.
-            if is_prepare_dataset_cmd:
+            if is_prepare_dataset_cmd or is_multi_node_disagg_test:
                 print_info(
-                    f"skip writing perf result when calling generating dataset in trtllm-bench"
+                    f"skip writing perf result when calling generating dataset in trtllm-bench or running disagg server."
                 )
                 outputs.pop(cmd_idx)
             else:
