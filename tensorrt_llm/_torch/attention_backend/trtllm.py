@@ -1084,7 +1084,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.is_spec_decoding_enabled = is_spec_decoding_enabled and (
             get_sm_version() < 100 or get_sm_version() == 120)
 
-        if get_sm_version() >= 100:
+        if get_sm_version() >= 100 and get_sm_version() != 120:
             if is_spec_dec_tree or is_spec_dec_dynamic_tree:
                 assert not is_spec_dec_tree, "Spec-dec tree is not supported on this machine. Please use a pre-Blackwell machine for a spec-dec tree."
                 assert not is_spec_dec_dynamic_tree, "Spec-dec dynamic tree is not supported on this machine. Please use a pre-Blackwell machine for a spec-dec dynamic tree."
