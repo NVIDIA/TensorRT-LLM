@@ -5,7 +5,6 @@ from typing import List, Optional, Type
 
 import torch
 
-from ..._utils import get_sm_version
 from ..attention_backend.trtllm import AttentionBackend, TrtllmAttention
 from ..pyexecutor.resource_manager import BaseResourceManager
 
@@ -117,17 +116,11 @@ class SpeculativeDecodingMode(IntEnum):
             # 1-model has separate logic for handling draft tokens
             return False
 
-        if issubclass(attention_backend,
-                      TrtllmAttention) and self.is_mtp_eagle():
-            # TRTLLM MLA does not work with the chunked context mode.
-            return False
-
-        return not issubclass(attention_backend,
-                              TrtllmAttention) or get_sm_version() != 100
+        return not issubclass(attention_backend, TrtllmAttention)
 
     def attention_need_spec_dec_mode(
         self,
-        spec_resource_manager: BaseResourceManager,
+        spec_resource_manager: Optional[BaseResourceManager],
         is_draft_model: bool,
         attention_backend: Type[AttentionBackend],
         use_chain_drafter: bool,
@@ -137,9 +130,10 @@ class SpeculativeDecodingMode(IntEnum):
         If true, the attention backend kernel needs to run in spec-dec mode (multi-token query mode).
         """
         is_trtllm_attention = issubclass(attention_backend, TrtllmAttention)
-        return self.is_eagle3_one_model() or (
+
+        return self.is_eagle3_one_model() or not is_draft_model or (
             self.is_eagle3() and spec_resource_manager.is_first_draft
-            and is_trtllm_attention and use_chain_drafter and is_draft_model)
+            and is_trtllm_attention)
 
     @staticmethod
     def from_string(name: Optional[str]) -> "SpeculativeDecodingMode":
