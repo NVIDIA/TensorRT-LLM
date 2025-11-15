@@ -62,6 +62,17 @@ PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
 # Set to a path to save detailed tracing of PyTorch operations.
 PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 
+# Environment variable to force Python GC every N calls to _update_requests.
+FORCE_GC_EVERY_ITERS_ENV_VAR_NAME = "TLLM_FORCE_GC_EVERY_ITERS"
+try:
+    FORCE_GC_EVERY_ITERS = int(
+        os.environ.get(FORCE_GC_EVERY_ITERS_ENV_VAR_NAME, "0"))
+except (TypeError, ValueError):
+    print(
+        f"Warning: cannot parse {FORCE_GC_EVERY_ITERS_ENV_VAR_NAME} as an integer, using default value 0"
+    )
+    FORCE_GC_EVERY_ITERS = 0
+
 # Unique tag base to avoid collisions with token/logits comms
 TERMINATION_COMM_TAG_BASE = 20000
 
@@ -2089,6 +2100,16 @@ class PyExecutor:
     def _update_requests(self,
                          sample_state: SampleState,
                          resource_manager: Optional[ResourceManager] = None):
+        # Optionally force Python GC every N calls to _update_requests if enabled via env var.
+        if FORCE_GC_EVERY_ITERS != 0:
+            if not hasattr(self, "_force_gc_iter_counter"):
+                self._force_gc_iter_counter = 0
+            self._force_gc_iter_counter += 1
+            if self._force_gc_iter_counter == FORCE_GC_EVERY_ITERS:
+                import gc
+                gc.collect()
+                self._force_gc_iter_counter = 0
+
         try:
             self.sampler.update_requests(sample_state, resource_manager)
         except Exception as e:
