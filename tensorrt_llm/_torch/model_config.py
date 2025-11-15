@@ -22,7 +22,7 @@ from tensorrt_llm.llmapi.llm_args import (DeepSeekSparseAttentionConfig,
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.quantization.mode import QuantAlgo
+from tensorrt_llm.quantization.mode import ActivationScheme, QuantAlgo
 
 TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
 
@@ -331,6 +331,81 @@ class ModelConfig(Generic[TConfig]):
                 'block.*.attn.out', 'block.*.mlp.gate', 'block.*.attn.qkv',
                 'embedding', 'unembedding'
             ]
+        # FP8 per-tensor checkpoints.
+        elif hf_quant_config.get("quant_method") == "fp8":
+            quant_config.quant_algo = QuantAlgo.FP8
+        # W4A8_AWQ checkpoints.
+        elif hf_quant_config.get("quant_method") == "w4a8_awq":
+            quant_config.quant_algo = QuantAlgo.W4A8_AWQ
+            quant_config.group_size = hf_quant_config.get(
+                "weight_group_size", 128)
+        else:
+            raise NotImplementedError(
+                f"Unsupported quantization_config: {hf_quant_config}.")
+
+        # set kv_cache_quant_algo
+        quant_config.kv_cache_quant_algo = QuantAlgo(hf_quant_config.get("kv_cache_quant_method").upper()) \
+            if hf_quant_config.get("kv_cache_quant_method") else None
+        # set activation_scheme
+        quant_config.activation_scheme = ActivationScheme(hf_quant_config.get("activation_scheme").upper()) \
+            if hf_quant_config.get("activation_scheme") else None
+        # set exclude_modules
+        if quant_config.exclude_modules:
+            if hf_quant_config.get("ignored_layers"):
+                quant_config.exclude_modules += hf_quant_config.get(
+                    "ignored_layers")
+        else:
+            quant_config.exclude_modules = hf_quant_config.get("ignored_layers")
+
+        # set exclude_quantization
+        hf_ignored_quantization_config = hf_quant_config.get(
+            "ignored_quantization_config")
+        if hf_ignored_quantization_config:
+            quant_config.exclude_quantization = {
+                "kv_cache_quant_algo":
+                QuantAlgo(
+                    hf_ignored_quantization_config.get(
+                        "kv_cache_quant_method").upper())
+                if hf_ignored_quantization_config.get("kv_cache_quant_method")
+                else None,
+                "activation_scheme":
+                ActivationScheme(
+                    hf_ignored_quantization_config.get(
+                        "activation_scheme").upper())
+                if hf_ignored_quantization_config.get("activation_scheme") else
+                None,
+                "group_size":
+                128,
+            }
+            if hf_ignored_quantization_config.get(
+                    "quant_method"
+            ) == "fp8" and hf_ignored_quantization_config.get(
+                    "weight_block_size", []):
+                quant_config.exclude_quantization[
+                    "quant_algo"] = QuantAlgo.FP8_BLOCK_SCALES
+                block_size = hf_ignored_quantization_config.get(
+                    "weight_block_size", [])
+                assert tuple(block_size) == (
+                    128,
+                    128), "FP8_BLOCK_SCALES only supports block_size=(128,128)"
+                quant_config.exclude_quantization["group_size"] = block_size[0]
+            elif hf_ignored_quantization_config.get("quant_method") == "fp8":
+                quant_config.exclude_quantization["quant_algo"] = QuantAlgo.FP8
+            elif hf_ignored_quantization_config.get(
+                    "quant_method") == "w4a8_awq":
+                quant_config.exclude_quantization[
+                    "quant_algo"] = QuantAlgo.W4A8_AWQ
+                quant_config.exclude_quantization[
+                    "group_size"] = hf_ignored_quantization_config.get(
+                        "weight_group_size", 128)
+            else:
+                raise NotImplementedError(
+                    f"Unsupported quantization_config.ignored_quantization_config: "
+                    f"{hf_ignored_quantization_config}.")
+
+        logger.info(
+            f"Load quantization config from pretrained config, quant_config: {quant_config}"
+        )
 
         return quant_config, layer_quant_config
 
