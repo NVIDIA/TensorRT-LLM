@@ -67,10 +67,6 @@ class SpeculativeDecodingMode(IntEnum):
         ) or self.is_ngram()
 
     def support_overlap_scheduler(self):
-        # TODO: fix accuracy issue
-        if self.is_mtp_eagle():
-            return False
-
         return self.is_mtp_one_model() or self.is_eagle3_one_model(
         ) or self.has_draft_model()
 
