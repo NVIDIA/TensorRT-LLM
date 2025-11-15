@@ -419,6 +419,13 @@ void updateKVCacheTransferBW(std::shared_ptr<CacheTransceiverComm> const& mComm,
 void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLeastRequestNum)
 {
     bool blockAll = !atLeastRequestNum.has_value();
+    std::optional<int> senderFutureTimeoutMs = std::nullopt;
+    // If blockAll is true, we want to block and not use a timeout
+    if (!blockAll && mCacheTransceiverConfig.has_value())
+    {
+        senderFutureTimeoutMs = mCacheTransceiverConfig->getKvTransferSenderFutureTimeoutMs();
+    }
+
     auto syncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mGroupTPInDPComm : mGroupTensorParaComm;
     std::vector<LlmRequest::RequestIdType> contextCompleteRequestIds;
     for (auto&& [request, future] : mSenderFutures)
@@ -476,16 +483,36 @@ void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLe
         {
             try
             {
-                future.get();
-                request->setState(LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
+                // Wait for up to a specified timeout
+                auto status = future.wait_for(std::chrono::milliseconds(senderFutureTimeoutMs.value_or(0)));
+                if (status == std::future_status::ready || !senderFutureTimeoutMs.has_value())
+                {
+                    future.get();
+                    request->setState(LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
+                    it = mSenderFutures.erase(it);
+                }
+                else if (status == std::future_status::timeout)
+                {
+                    TLLM_LOG_WARNING("Timed out waiting for context transfer for request %ld after %d milliseconds.",
+                        request->mRequestId, senderFutureTimeoutMs.value());
+                    ++it;
+                }
+                else
+                {
+                    TLLM_LOG_ERROR(
+                        "Future returned unexpected status for request %ld. Marking as error", request->mRequestId);
+
+                    request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                    it = mSenderFutures.erase(it);
+                }
             }
             catch (std::exception const& e)
             {
                 TLLM_LOG_ERROR(
                     "Error occurred during context transfer for request %ld: %s", request->mRequestId, e.what());
                 request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                it = mSenderFutures.erase(it);
             }
-            it = mSenderFutures.erase(it);
         }
         else
         {
