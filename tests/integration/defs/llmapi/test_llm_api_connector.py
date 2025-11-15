@@ -14,10 +14,10 @@
 # limitations under the License.
 
 import math
+from time import sleep
 from unittest.mock import MagicMock, patch
 
 import pytest
-from time import sleep
 
 from tensorrt_llm import LLM, DisaggregatedParams, SamplingParams
 from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig, KvCacheConfig,

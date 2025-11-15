@@ -778,7 +778,8 @@ def executor_request_to_llm_request(
         arrival_time=getattr(executor_request, "py_arrival_time", None),
         py_multimodal_data=getattr(executor_request, "py_multimodal_data",
                                    None),
-        kv_cache_retention_config=executor_request.kv_cache_retention_config, using_kv_connector=using_kv_connector)
+        kv_cache_retention_config=executor_request.kv_cache_retention_config,
+        using_kv_connector=using_kv_connector)
     if child_req_ids:
         for child_id in child_req_ids:
             llm_request.create_child_request(child_id)

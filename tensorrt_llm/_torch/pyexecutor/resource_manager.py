@@ -422,9 +422,8 @@ class KVCacheManager(BaseResourceManager):
                                        == self.mapping.cp_size - 1 else 0),
                             req_beam_width, req)
                 else:
-                    if self.impl.add_sequence(req.py_request_id,
-                                               req.prompt_len, req_beam_width,
-                                               req):
+                    if self.impl.add_sequence(req.py_request_id, req.prompt_len,
+                                              req_beam_width, req):
                         for _ in range(self.num_extra_kv_tokens):
                             self.impl.add_token(req.py_request_id)
                         for _ in range(get_draft_token_length(req)):
