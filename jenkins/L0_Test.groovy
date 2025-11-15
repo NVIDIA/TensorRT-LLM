@@ -921,8 +921,48 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 taskArgs = [
                     *taskArgs,
                 ]
+
+                def containerImageArg = container
+                def srunPrologue = ""
+                if (cluster.containerRuntime == ContainerRuntime.ENROOT) {
+                    mounts = [
+                        "/lustre/fs1/portfolios/coreai/projects/coreai_tensorrt_ci:/scratch.trt_llm_data:ro",
+                        "/home/svc_tensorrt/bloom/scripts",
+                        "/home/svc_tensorrt/.cache:/root/.cache",
+                    ].join(",")
+
+                    def enrootImagePath = "/lustre/fs1/portfolios/coreai/projects/coreai_tensorrt_ci/users/svc_tensorrt/containers/container-\${SLURM_JOB_ID}.sqsh"
+                    containerImageArg = enrootImagePath
+
+                    srunPrologue = """
+                    export ENROOT_CACHE_PATH='/home/svc_tensorrt/.cache/enroot'
+
+                    retry_command() {
+                        local cmd=\$1
+                        local max_attempts=\${2:-3}
+                        local delay=\${3:-60}
+                        local attempt=1
+
+                        until \$cmd
+                        do
+                            if ((attempt >= max_attempts))
+                            then
+                                echo "Command '\$cmd' failed after \$max_attempts attempts"
+                                return 1
+                            fi
+
+                            echo "Command '\$cmd' failed (attempt \$attempt of \$max_attempts). Retrying in \${delay}s..."
+                            sleep \$delay
+                            ((attempt++))
+                        done
+                    }
+
+                    retry_command "enroot import -o $enrootImagePath -- docker://$container"
+                    """.replaceAll("(?m)^\\s*", "")
+                }
+
                 srunArgs = [
-                    "--container-image=$container",
+                    "--container-image=$containerImageArg",
                     "--container-workdir=/home/svc_tensorrt/bloom/scripts",
                     "--container-mounts=$mounts",
                     "--container-env=NVIDIA_IMEX_CHANNELS"
@@ -951,6 +991,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export NVIDIA_IMEX_CHANNELS=0
                     export NVIDIA_IMEX_CHANNELS=0
                     export NVIDIA_VISIBLE_DEVICES=\$(seq -s, 0 \$((\$(nvidia-smi --query-gpu=count -i 0 --format=noheader)-1)))
+
+                    ${srunPrologue}
+
                     chmod +x $scriptRunNode
                     srun --kill-on-bad-exit=1 ${srunArgs.join(" ")} ${scriptRunNode}
                 """.replaceAll("(?m)^\\s*", "")
@@ -2718,7 +2761,7 @@ def launchTestJobs(pipeline, testFilter)
         // Disable GB300 stages due to nodes will be offline temporarily.
         // "GB300-PyTorch-1": ["gb300-single", "l0_gb300", 1, 1],
         "GB200-4_GPUs-PyTorch-1": ["gb200-trtllm", "l0_gb200_multi_gpus", 1, 1, 4],
-        "GB200-4_GPUs-PyTorch-Post-Merge-1": ["gb200-trtllm", "l0_gb200_multi_gpus", 1, 1, 4],
+        "GB200-4_GPUs-PyTorch-Post-Merge-1": ["gb200-x4-oci", "l0_gb200_multi_gpus", 1, 1, 4],
         // "GB300-4_GPUs-PyTorch-Post-Merge-1": ["gb300-trtllm", "l0_gb300_multi_gpus", 1, 1, 4],
     ]
     fullSet += SBSASlurmTestConfigs.keySet()
@@ -2735,7 +2778,7 @@ def launchTestJobs(pipeline, testFilter)
     multiNodesSBSAConfigs = [:]
     def numMultiNodeTests = 3
     multiNodesSBSAConfigs += (1..numMultiNodeTests).collectEntries { i ->
-        ["GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-${i}".toString(), ["gb200-trtllm", "l0_gb200_multi_nodes", i, numMultiNodeTests, 8, 2]]
+        ["GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-${i}".toString(), ["gb200-oci-trtllm", "l0_gb200_multi_nodes", i, numMultiNodeTests, 8, 2]]
     }
     fullSet += multiNodesSBSAConfigs.keySet()
 
