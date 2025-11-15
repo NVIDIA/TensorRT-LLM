@@ -88,6 +88,34 @@ def _nemotron_h_block_forward(
         return hidden_states
 
 
+def _nemotron_h_topk_router_forward(self, hidden_states):
+    """
+    Forward pass for NemotronHTopkRouter using the optimized noaux_tc_op kernel.
+
+    This replaces the original forward method which used pure PyTorch operations
+    with a fused CUDA kernel that performs:
+    1. Sigmoid activation of logits
+    2. Group-based expert selection
+    3. Top-k selection within selected groups
+    4. Normalized weight computation
+    """
+    hidden_states = hidden_states.view(-1, self.config.hidden_size)
+    router_logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))
+
+    # Use the fused noaux_tc_op kernel which applies sigmoid internally
+    # and performs group-based top-k selection with normalization
+    topk_weights, topk_indices = torch.ops.trtllm.noaux_tc_op(
+        router_logits,
+        self.e_score_correction_bias,
+        self.n_group,
+        self.topk_group,
+        self.top_k,
+        self.routed_scaling_factor,
+    )
+
+    return topk_indices, topk_weights
+
+
 # Note: we assume experts have no bias for now
 def _nemotron_h_moe_forward(self, hidden_states: torch.Tensor):
     """
@@ -138,6 +166,7 @@ CUSTOM_MODULE_PATCHES: Dict[str, List[Tuple[str, Callable]]] = {
     ],
     "NemotronHBlock": [("forward", _nemotron_h_block_forward)],
     "NemotronHMOE": [("forward", _nemotron_h_moe_forward)],
+    "NemotronHTopkRouter": [("forward", _nemotron_h_topk_router_forward)],
 }
 
 
