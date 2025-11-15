@@ -202,7 +202,7 @@ class TRTLLMGenFusedMoE(MoE):
             or self.has_w4a8_mxfp4_fp8 or self.has_w4a8_mxfp4_mxfp8, "TRTLLMGenFusedMoE only supports fp8_block_scaling, nvfp4, w4a16_mxfp4, w4a8_mxfp4_fp8 and w4a8_mxfp4_mxfp8 dtypes."
 
         if self.bias or self.swiglu_alpha is not None or self.swiglu_beta is not None or self.swiglu_limit is not None:
-            assert self.has_w4a16_mxfp4 or self.has_w4a8_mxfp4_fp8 or self.has_w4a8_mxfp4_mxfp8, "TRTLLMGenFusedMoE only supports mxfp4 quantization with bias, swiglu_alpha, swiglu_beta and swiglu_limit."
+            assert self.has_nvfp4 or self.has_w4a16_mxfp4 or self.has_w4a8_mxfp4_fp8 or self.has_w4a8_mxfp4_mxfp8, "TRTLLMGenFusedMoE supports bias/swiglu only for nvfp4 and mxfp4 variants."
 
     def _get_quant_method(self):
         if self.quant_config is not None:
@@ -236,7 +236,7 @@ class TRTLLMGenFusedMoE(MoE):
         self._weights_created = True
         self._check_configs()
 
-        if (self.has_w4a16_mxfp4 or self.has_w4a8_nvfp4_fp8
+        if (self.has_nvfp4 or self.has_w4a16_mxfp4 or self.has_w4a8_nvfp4_fp8
                 or self.has_w4a8_mxfp4_fp8
                 or self.has_w4a8_mxfp4_mxfp8) and not self.bias:
             self.w3_w1_bias = nn.Parameter(torch.zeros(
@@ -559,8 +559,13 @@ class TRTLLMGenFusedMoE(MoE):
                 hidden_states_scale_linear_fp4.view(torch.float8_e4m3fn),
                 self.w3_w1_weight,
                 self.w3_w1_weight_scale.view(torch.float8_e4m3fn),
+                self.w3_w1_bias,
+                self.swiglu_alpha,
+                self.swiglu_beta,
+                self.swiglu_limit,
                 self.w2_weight,
                 self.w2_weight_scale.view(torch.float8_e4m3fn),
+                self.w2_bias,
                 self.fc31_scale_c.data,
                 self.fc31_alpha.data,
                 self.fc2_alpha.data,

@@ -26,6 +26,7 @@
             "numStagesMma": 1,
             "numSlicesForSplitK": 1,
             "useDeepSeekFp8": false,
+            "biasType": "m",
             "useShuffledMatrixA": true
         },
         "BatchedGemmFp4LowLatency": {
