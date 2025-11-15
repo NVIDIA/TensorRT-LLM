@@ -1858,7 +1858,7 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
         sh "cat ${currentRerunTestList}"
         def xmlFile = "${rerunDir}/rerun_results_${times}.xml"
         // change the testCmdLine for rerun
-        def noNeedLine = ["--splitting-algorithm", "--splits", "--group", "--waives-file", "--cov"]
+        def noNeedLine = ["--splitting-algorithm", "--splits", "--group", "--cov"]
         def needToChangeLine = ["--test-list", "--csv", "--junit-xml"]
         def newTestCmdLine = testCmdLine.findAll { cmd ->
             !noNeedLine.any { line -> cmd.contains(line) } && !needToChangeLine.any { line -> cmd.contains(line) }
