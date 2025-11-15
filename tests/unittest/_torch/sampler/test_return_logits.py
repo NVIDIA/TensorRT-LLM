@@ -154,20 +154,23 @@ def test_generate_with_return_logits(
         else:
             assert output.context_logits is None
 
-        if gather_generation_logits:
-            gen_logits = output.outputs[0].generation_logits
-            assert gen_logits is not None
-            assert gen_logits.ndim == 2
-            assert gen_logits.shape[0] == sampling_params.max_tokens
-            assert torch.argmax(gen_logits,
-                                dim=1).tolist() == output.outputs[0].token_ids
-        else:
-            assert output.outputs[0].generation_logits is None
+        for sequence in output.outputs:
+            assert sequence.length == sampling_params.max_tokens
 
-        if return_log_probs:
-            assert len(output.outputs[0].logprobs) == sampling_params.max_tokens
-        else:
-            assert len(output.outputs[0].logprobs) == 0
+            if gather_generation_logits:
+                gen_logits = sequence.generation_logits
+                assert gen_logits is not None
+                assert gen_logits.ndim == 2
+                assert gen_logits.shape[0] == sampling_params.max_tokens
+                assert torch.argmax(gen_logits,
+                                    dim=1).tolist() == sequence.token_ids
+            else:
+                assert sequence.generation_logits is None
+
+            if return_log_probs:
+                assert len(sequence.logprobs) == sampling_params.max_tokens
+            else:
+                assert len(sequence.logprobs) == 0
 
 
 @force_ampere  # Save H100 resource
@@ -218,22 +221,24 @@ def test_generate_async_with_return_logits(
         else:
             assert output.context_logits is None
 
-        if gather_generation_logits:
-            gen_logits = output.outputs[0].generation_logits
-            assert gen_logits is not None
-            assert gen_logits.ndim == 2
-            assert gen_logits.shape[0] == 1
-            try:
-                assert torch.argmax(
-                    gen_logits,
-                    dim=1).tolist()[0] == output.outputs[0].token_ids[-1]
-            except AssertionError:
-                # FIXME: Remove xfail once the bug is fixed
-                pytest.xfail("Known bug: https://nvbugs/5573238")
-        else:
-            assert output.outputs[0].generation_logits is None
+        for sequence in output.outputs:
+            assert sequence.length == idx + 1
 
-        if return_log_probs:
-            assert len(output.outputs[0].logprobs) == idx + 1
-        else:
-            assert len(output.outputs[0].logprobs) == 0
+            if gather_generation_logits:
+                gen_logits = sequence.generation_logits
+                assert gen_logits is not None
+                assert gen_logits.ndim == 2
+                assert gen_logits.shape[0] == 1
+                try:
+                    assert torch.argmax(
+                        gen_logits, dim=1).tolist()[0] == sequence.token_ids[-1]
+                except AssertionError:
+                    # FIXME: Remove xfail once the bug is fixed
+                    pytest.xfail("Known bug: https://nvbugs/5573238")
+            else:
+                assert sequence.generation_logits is None
+
+            if return_log_probs:
+                assert len(sequence.logprobs) == idx + 1
+            else:
+                assert len(sequence.logprobs) == 0

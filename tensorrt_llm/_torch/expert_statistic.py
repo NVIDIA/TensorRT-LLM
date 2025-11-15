@@ -29,11 +29,15 @@ class ExpertStatistic:
             rank_id, start, stop)
 
     @staticmethod
-    def set_iter(iter_id: int) -> bool:
+    def should_record() -> bool:
         if ExpertStatistic.expert_statistic_obj is not None:
-            return ExpertStatistic.expert_statistic_obj._set_iter(iter_id)
-        else:
-            return False
+            return ExpertStatistic.expert_statistic_obj._should_record
+        return False
+
+    @staticmethod
+    def set_iter(iter_id: int) -> None:
+        if ExpertStatistic.expert_statistic_obj is not None:
+            ExpertStatistic.expert_statistic_obj._set_iter(iter_id)
 
     @staticmethod
     def set_layer(layer_id: int) -> None:
@@ -57,10 +61,10 @@ class ExpertStatistic:
         self._records = {}
 
     @property
-    def should_record(self) -> bool:
+    def _should_record(self) -> bool:
         return self.current_iter_id is not None and self.start <= self.current_iter_id < self.stop
 
-    def _set_iter(self, iter_id: int) -> bool:
+    def _set_iter(self, iter_id: int) -> None:
         self.current_iter_id = iter_id
         if iter_id == self.stop:
             logger.info(
@@ -74,14 +78,13 @@ class ExpertStatistic:
                     json.dump(self._meta_info, f)
             safetensors.torch.save_file(
                 self._records, f"{path}/rank{self.rank_id}.safetensors")
-        return self.should_record
 
     def _set_layer(self, layer: int) -> None:
         self.current_layer = layer
 
     def _maybe_add_info(self, expert_count: int,
                         token_selected_experts: torch.Tensor) -> None:
-        if not self.should_record:
+        if not self._should_record:
             return
 
         if self._meta_info is None:
