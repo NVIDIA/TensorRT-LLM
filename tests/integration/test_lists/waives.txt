@@ -414,3 +414,4 @@ test_e2e.py::test_ptp_quickstart_multimodal[mistral-small-3.1-24b-instruct-Mistr
 test_e2e.py::test_trtllm_multimodal_benchmark_serving SKIP (https://nvbugs/5647825)
 unittest/_torch/modules/test_fused_moe.py::test_fused_moe_alltoall_fp4[MNNVL] SKIP (https://nvbugs/5664904)
 unittest/_torch/modules/test_fused_moe.py::test_fused_moe_alltoall_fp4[DeepEP] SKIP (https://nvbugs/5664904)
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus_online_eplb[mtp_nextn=2-moe_backend=WIDEEP] SKIP (Unknown failure)
