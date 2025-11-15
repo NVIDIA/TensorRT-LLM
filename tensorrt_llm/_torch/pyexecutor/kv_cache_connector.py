@@ -392,9 +392,6 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         # Requests that have been returned from get_finished locally, but haven't yet been returned by all workers.
         self.local_finished_async_requests = AsyncRequests(dict(), dict())
 
-        # Requests that have finished loading asynchronously.
-        self.finished_async_loading_requests = dict()
-
         self._scheduler_output = None
         self.scheduler_output_manager = KvCacheConnectorSchedulerOutputManager()
 
@@ -430,10 +427,6 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             request, num_tokens)
 
         return num_tokens
-
-    def should_add_sequence(self, request: LlmRequest) -> bool:
-        req_id = request.request_id
-        return req_id not in self.finished_async_loading_requests
 
     def build_scheduler_output(self, scheduled_batch: ScheduledRequests,
                                kv_cache_manager: "KVCacheManager"):
@@ -474,9 +467,6 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         Returns:
             Whether the request is performing asynchronous saving operations. If true, we do not immediately call free_resources on the request.
         """
-
-        if req.request_id in self.finished_async_loading_requests:
-            del self.finished_async_loading_requests[req.request_id]
 
         saving_async = self._run_on_leader(
             lambda: self.scheduler.request_finished(req, cache_block_ids))
@@ -532,7 +522,6 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         # For requests that have finished loading, move them back to the context state.
         for id, req in all_finished.loading.items():
             req.state = LlmRequestState.CONTEXT_INIT
-            self.finished_async_loading_requests[id] = req
 
         # Return the requests that have finished saving.
         # The execution loop will call _terminate_request on these requests.

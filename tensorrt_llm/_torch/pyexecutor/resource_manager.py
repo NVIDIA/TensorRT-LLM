@@ -440,10 +440,6 @@ class KVCacheManager(BaseResourceManager):
                 for _ in range(get_draft_token_length(req)):
                     self.impl.add_token(req.py_request_id)
 
-    def _kv_connector_should_add_sequence(self, request: LlmRequest) -> bool:
-        return self.kv_connector_manager is None or self.kv_connector_manager.should_add_sequence(
-            request)
-
     def add_dummy_requests(
         self,
         request_ids: List[int],
