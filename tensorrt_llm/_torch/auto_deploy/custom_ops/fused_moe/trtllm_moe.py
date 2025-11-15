@@ -1,6 +1,6 @@
 import torch
 
-from tensorrt_llm._torch.custom_ops.torch_custom_ops import ActivationType
+from tensorrt_llm._torch.utils import ActivationType
 
 
 @torch.library.custom_op("auto_deploy::trtllm_moe_fused", mutates_args=())
