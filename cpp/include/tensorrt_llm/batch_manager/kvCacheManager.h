@@ -1507,7 +1507,8 @@ public:
     /// @param llmRequest Optional request to use for KV cache lookup.
     /// @details If llmRequest is supplied and KV cache reuse is enabled, try to recover KV cache blocks for
     /// inputLength - 1 tokens and populate prepopulatedPromptLen.
-    /// @return True if the sequence was added, False if the sequence was not added because it was already in the manager.
+    /// @return True if the sequence was added, False if the sequence was not added because it was already in the
+    /// manager.
     virtual bool addSequence(LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
         OptionalRef<LlmRequest> llmRequest = std::nullopt)
         = 0;

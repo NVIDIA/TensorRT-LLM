@@ -416,7 +416,8 @@ void updateKVCacheTransferBW(std::shared_ptr<CacheTransceiverComm> const& mComm,
     }
 }
 
-void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLeastRequestNum)
+std::tuple<std::vector<LlmRequest::RequestIdType>, std::vector<LlmRequest::RequestIdType>>
+CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLeastRequestNum)
 {
     bool blockAll = !atLeastRequestNum.has_value();
     auto syncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mGroupTPInDPComm : mGroupTensorParaComm;
@@ -468,6 +469,9 @@ void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLe
         toCompleteIdSet.insert(request->mRequestId);
     }
 
+    std::vector<LlmRequest::RequestIdType> completedRequestIds;
+    std::vector<LlmRequest::RequestIdType> errorRequestIds;
+
     // Complete all the requests in toCompleteIdSet
     for (auto it = mSenderFutures.begin(); it != mSenderFutures.end();)
     {
@@ -477,13 +481,13 @@ void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLe
             try
             {
                 future.get();
-                request->setState(LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
+                completedRequestIds.push_back(request->mRequestId);
             }
             catch (std::exception const& e)
             {
                 TLLM_LOG_ERROR(
                     "Error occurred during context transfer for request %ld: %s", request->mRequestId, e.what());
-                request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                errorRequestIds.push_back(request->mRequestId);
             }
             it = mSenderFutures.erase(it);
         }
@@ -492,6 +496,7 @@ void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLe
             ++it;
         }
     }
+    return std::make_tuple(completedRequestIds, errorRequestIds);
 }
 
 void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastRequestNum)

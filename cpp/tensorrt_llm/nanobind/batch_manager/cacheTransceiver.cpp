@@ -25,6 +25,7 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/shared_ptr.h>
+#include <nanobind/stl/tuple.h>
 #include <nanobind/stl/unique_ptr.h>
 #include <nanobind/stl/vector.h>
 #include <nanobind/trampoline.h>
@@ -60,7 +61,8 @@ public:
         NB_OVERRIDE_PURE(requestAndReceiveAsync, llmRequest);
     }
 
-    void checkContextTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override
+    std::tuple<std::vector<tb::LlmRequest::RequestIdType>, std::vector<tb::LlmRequest::RequestIdType>>
+    checkContextTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override
     {
         NB_OVERRIDE_PURE(checkContextTransferStatus, atLeastRequestNum);
     }
@@ -88,7 +90,14 @@ void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
         .def("respond_and_send_async", &BaseCacheTransceiver::respondAndSendAsync)
         .def("request_and_receive_sync", &BaseCacheTransceiver::requestAndReceiveSync)
         .def("request_and_receive_async", &BaseCacheTransceiver::requestAndReceiveAsync)
-        .def("check_context_transfer_status", &BaseCacheTransceiver::checkContextTransferStatus)
+        .def(
+            "check_context_transfer_status",
+            [](tb::BaseCacheTransceiver& self, std::optional<int> const& atLeastRequestNum)
+            {
+                auto result = self.checkContextTransferStatus(atLeastRequestNum);
+                return nb::make_tuple(std::get<0>(result), std::get<1>(result));
+            },
+            nb::arg("at_least_request_num") = std::nullopt)
         .def("check_gen_transfer_status", &BaseCacheTransceiver::checkGenTransferStatus)
         .def("check_gen_transfer_complete", &BaseCacheTransceiver::checkGenTransferComplete)
         .def("cancel_request", &BaseCacheTransceiver::cancelRequest);

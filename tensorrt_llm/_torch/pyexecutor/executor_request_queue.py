@@ -700,8 +700,7 @@ class ExecutorRequestQueue:
                 _should_exclude_last_generation_logits(),
                 input_token_ids=input_ids_this_rank,
                 position_ids=position_ids_this_rank,
-                using_kv_connector=self.using_kv_connector
-            )
+                using_kv_connector=self.using_kv_connector)
             req_with_children.append(req)
             if req.child_requests:
                 req_with_children.extend(req.child_requests)
@@ -727,7 +726,9 @@ class ExecutorRequestQueue:
         req_with_children = []
         for req_item in new_requests:
             req = executor_request_to_llm_request(
-                req_item.id, req_item.request, req_item.child_req_ids,
+                req_item.id,
+                req_item.request,
+                req_item.child_req_ids,
                 self._should_exclude_last_generation_logits(),
                 using_kv_connector=self.using_kv_connector)
             req_with_children.append(req)
@@ -780,8 +781,11 @@ class ExecutorRequestQueue:
                                      self.dist.cp_config['cp_anchor_size'])
 
             req = executor_request_to_llm_request(
-                req_id, exe_req, self._should_exclude_last_generation_logits(),
-                ctx_blocks_list, using_kv_connector=self.using_kv_connector)
+                req_id,
+                exe_req,
+                self._should_exclude_last_generation_logits(),
+                ctx_blocks_list,
+                using_kv_connector=self.using_kv_connector)
             req.gen_iters = 0
             req.ctx_iters = 0
             req.ctx_blocks = ctx_blocks

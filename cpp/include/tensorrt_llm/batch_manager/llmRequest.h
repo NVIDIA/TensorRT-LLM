@@ -142,7 +142,8 @@ public:
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt, bool usingKvConnector = false)
+        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt,
+        bool usingKvConnector = false)
         : mRequestId(requestId)
         , mPromptLen(inputTokens->size())
         , mMaxNewTokens(maxNewTokens)
@@ -2054,8 +2055,8 @@ protected:
     std::optional<CacheSaltIDType> mCacheSaltID{std::nullopt};
 
 private:
-    void initialize(
-        VecTokens const& inputTokens, bool outputLogProbs, std::optional<TimePoint> arrivalTime = std::nullopt, bool usingKvConnector = false)
+    void initialize(VecTokens const& inputTokens, bool outputLogProbs,
+        std::optional<TimePoint> arrivalTime = std::nullopt, bool usingKvConnector = false)
     {
         // If we're using the KV connector, we always want to mark it as a disaggregated generation request.
         // If it later turns out that we don't want to use the connector, we move it to the context init state.
@@ -2247,7 +2248,8 @@ public:
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt, bool usingKvConnector = false)
+        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt,
+        bool usingKvConnector = false)
         : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),
             samplingConfig, isStreaming, endId, padId, std::move(embeddingBias), std::move(badWordsList),
             std::move(stopWordsList),
