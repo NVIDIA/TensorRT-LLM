@@ -837,7 +837,7 @@ class MTPWorker(nn.Module):
                 attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
             ctx_input_ids = input_ids[:attn_metadata.num_ctx_tokens]
             ctx_is_think = (ctx_input_ids ==
-                            self.spec_config.BEGIN_THINKING_PHASE_TOKEN).int()
+                            self.spec_config.begin_thinking_phase_token).int()
             ctx_is_think_cumsum = torch.cumsum(ctx_is_think, dim=0)
             ctx_last_cumsum = ctx_is_think_cumsum[
                 last_tokens_idx[:num_contexts]]
@@ -863,8 +863,8 @@ class MTPWorker(nn.Module):
                 mtp_relaxed_delta_pool, num_accepted_tokens, accepted_tokens,
                 mtp_num_modules, batch_size, num_contexts,
                 self.spec_config.relaxed_topk, self.spec_config.relaxed_delta,
-                self.spec_config.BEGIN_THINKING_PHASE_TOKEN,
-                self.spec_config.END_THINKING_PHASE_TOKEN)
+                self.spec_config.begin_thinking_phase_token,
+                self.spec_config.end_thinking_phase_token)
 
         # Strict acceptance
         else:
