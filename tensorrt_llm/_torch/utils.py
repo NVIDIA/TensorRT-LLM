@@ -31,6 +31,8 @@ EventType = Enum(
 )
 
 
+# IMPORTANT: Keep the same order of activation functions in this enum and the enum in
+# cpp/tensorrt_llm/kernels/cutlass_kernels/include/common.h
 class ActivationType(IntEnum):
     Gelu = 0
     Relu = 1
