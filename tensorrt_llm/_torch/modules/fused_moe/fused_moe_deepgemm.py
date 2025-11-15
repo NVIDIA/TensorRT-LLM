@@ -474,7 +474,6 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
     ) -> torch.Tensor:
         if isinstance(x, Fp4QuantizedTensor):
             assert output_dtype is not None
-            output_dtype = output_dtype
         else:
             output_dtype = x.dtype
 

@@ -80,6 +80,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mPtrExpertCounts = expertCountHistogram;
         routingData.mPtrPermutedIdxSize = permutedIdxSize;
         routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
+        routingData.mPtrPermutedIdxToExpandedIdx = permutedIdxToExpandedIdx;
         routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
         routingData.mPtrTopKWeights = expertWeights;
 
@@ -122,6 +123,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mPtrExpertCounts = expertCountHistogram;
         routingData.mPtrPermutedIdxSize = permutedIdxSize;
         routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
+        routingData.mPtrPermutedIdxToExpandedIdx = permutedIdxToExpandedIdx;
         routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
         routingData.mPtrTopKWeights = expertWeights;
 
@@ -177,6 +179,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mPtrExpertCounts = expertCountHistogram;
         routingData.mPtrPermutedIdxSize = permutedIdxSize;
         routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
+        routingData.mPtrPermutedIdxToExpandedIdx = permutedIdxToExpandedIdx;
         routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
         routingData.mPtrTopKWeights = expertWeights;
         routingData.mPtrTopKIds = expertIds;
