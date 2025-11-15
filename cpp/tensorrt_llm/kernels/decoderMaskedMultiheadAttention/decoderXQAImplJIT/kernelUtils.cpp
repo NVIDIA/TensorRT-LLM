@@ -95,7 +95,13 @@ bool supportConfigQGMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlu
     {
         return false;
     }
-    if (xqaParams.kv_cache_data_type != DATA_TYPE_E4M3)
+    if (!contains({DATA_TYPE_FP16, DATA_TYPE_BF16, DATA_TYPE_E4M3}, xqaParams.kv_cache_data_type))
+    {
+        return false;
+    }
+    // currently only support XQA QGMMA FP/BF16 KV Cache for spec decoding
+    // todo: need more perf data to enable XQA QGMMA for non spec decoding
+    if (contains({DATA_TYPE_FP16, DATA_TYPE_BF16}, xqaParams.kv_cache_data_type) && !xqaParams.multi_query_tokens)
     {
         return false;
     }
