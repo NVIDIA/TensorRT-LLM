@@ -41,7 +41,8 @@ l0_dgx_b200:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[dep4_latency_moe_cutlass-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[dep4_latency_moe_cutlass-torch_compile=True] ISOLATION
   - accuracy/test_llm_api_pytorch.py::TestQwen3NextThinking::test_auto_dtype[tp4ep4]
-  - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_ucx[DeepSeek-V3-Lite-fp8]
+  - disaggregated/test_disaggregated_parametrized.py::test_disagg[ds_v3_lite_ucx]
+  - disaggregated/test_disaggregated_parametrized.py::test_disagg[ds_v3_lite_nixl]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[tp4-trtllm-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[ep4-cutlass-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[ep4-triton-auto]
@@ -49,11 +50,8 @@ l0_dgx_b200:
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[dp4-trtllm-fp8]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4a16[dp4-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4a16[dp4-fp8]
-  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[trtllm]
-  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[cutlass]
-  - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[DeepSeek-V3-Lite-bf16]
-  - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[llama-3.1-8b-instruct-hf-fp8]
-  - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_nixl[DeepSeek-V3-Lite-fp8]
+  - disaggregated/test_disaggregated_benchmark.py::test_disaggregated_benchmark_on_diff_backends[DeepSeek-V3-Lite-bf16]
+  - disaggregated/test_disaggregated_benchmark.py::test_disaggregated_benchmark_on_diff_backends[llama-3.1-8b-instruct-hf-fp8]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp8_tp4
   - accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp8_tp2pp2
   - accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_nvfp4_tp4
@@ -75,10 +73,10 @@ l0_dgx_b200:
     - unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu4"
     - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=False-attn_backend=TRTLLM-torch_compile=False]
     - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp2pp2-fp8kv=False-attn_backend=TRTLLM-torch_compile=False]
-    - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_genpp2[TinyLlama-1.1B-Chat-v1.0]
-    - disaggregated/test_disaggregated.py::test_disaggregated_ctxtp2_genpp2[TinyLlama-1.1B-Chat-v1.0]
-    - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_gentp2[TinyLlama-1.1B-Chat-v1.0]
-    - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp4_gentp4[TinyLlama-1.1B-Chat-v1.0]
+    - disaggregated/test_disaggregated_parametrized.py::test_disagg[1ctx_tp1pp2_1gen_tp1pp2]
+    - disaggregated/test_disaggregated_parametrized.py::test_disagg[1ctx_tp2pp1_1gen_tp1pp2]
+    - disaggregated/test_disaggregated_parametrized.py::test_disagg[1ctx_tp1pp2_1gen_tp2pp1]
+    - disaggregated/test_disaggregated_parametrized.py::test_disagg[1ctx_tp1pp4_1gen_tp4pp1]
     - examples/test_ray.py::test_llm_inference_distributed_ray[tp2pp2]
     - examples/test_ray.py::test_ray_disaggregated_serving[tp2]
 - condition:
@@ -195,4 +193,4 @@ l0_dgx_b200:
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[dp4-triton-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[trtllm]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[cutlass]
-  - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[llama-v3-8b-hf]
+  - disaggregated/test_disaggregated_benchmark.py::test_disaggregated_benchmark_on_diff_backends[llama-v3-8b-hf]
