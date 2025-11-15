@@ -477,17 +477,24 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     # TODO: remove this function when fp8_paged_mqa_logits can support MTP > 1.
     def update_spec_dec_param(
         self,
+        batch_size,
         is_spec_decoding_enabled,
         is_spec_dec_tree,
         is_spec_dec_dynamic_tree,
-        max_draft_tokens,
+        max_draft_len,
+        max_total_draft_tokens,
+        model_is_wrapped: bool = False,
+        spec_metadata: Optional['SpecMetadata'] = None,
+        spec_tree_manager: Optional['SpecTreeManager'] = None,
         spec_decoding_tensor: Optional['SpecDecodingTensor'] = None,
     ):
-        super().update_spec_dec_param(is_spec_decoding_enabled,
+        super().update_spec_dec_param(batch_size, is_spec_decoding_enabled,
                                       is_spec_dec_tree,
-                                      is_spec_dec_dynamic_tree,
-                                      max_draft_tokens, spec_decoding_tensor)
-        self.max_draft_tokens = max_draft_tokens
+                                      is_spec_dec_dynamic_tree, max_draft_len,
+                                      max_total_draft_tokens, model_is_wrapped,
+                                      spec_metadata, spec_tree_manager,
+                                      spec_decoding_tensor)
+        self.max_draft_tokens = max_draft_len
         init_shape = self.kv_lens_expanded_host.shape[0]
         if self.max_num_sequences * (1 + self.max_draft_tokens) != init_shape:
             capture_graph = torch.cuda.is_current_stream_capturing()

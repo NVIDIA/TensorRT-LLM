@@ -171,6 +171,8 @@ class NGramDrafter(Drafter):
         assert ngram_pool_manager is not None, "NGram needs a resource manager to maintain the pool."
         self.spec_config = spec_config
         self.max_draft_len = spec_config.max_draft_len
+        self.max_total_draft_tokens = spec_config.max_total_draft_tokens
+        assert self.max_draft_len == self.max_total_draft_tokens, "NGram only supports linear tree."
         self.spec_resource_manager = ngram_pool_manager
 
     def prepare_draft_tokens(
