@@ -1,27 +1,30 @@
-// Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-// Licensed under the Apache License, Version 2.0 (the "License");
-// http://www.apache.org/licenses/LICENSE-2.0
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 // Inspired by vLLM's moe_align_kernel.cu and ported to TensorRT-LLM
 
-#include <ATen/ATen.h>
-#include <ATen/cuda/Atomic.cuh>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include "moeAlignKernels.h"
+#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include <cub/cub.cuh>
-#include <torch/extension.h>
 
 #define CEILDIV(x, y) (((x) + (y) -1) / (y))
 #define WARP_SIZE 32
 
-namespace auto_deploy
-{
-namespace moe
+namespace tensorrt_llm::kernels
 {
 
 template <typename scalar_t>
@@ -204,68 +207,74 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(scalar_t const* _
     }
 }
 
-} // namespace moe
-} // namespace auto_deploy
-
-void moe_align_block_size_cuda(torch::Tensor topk_ids, int64_t num_experts, int64_t block_size,
-    torch::Tensor sorted_token_ids, torch::Tensor experts_ids, torch::Tensor num_tokens_post_pad)
+template <typename scalar_t>
+void invokeMoeAlignBlockSizeTyped(scalar_t const* topk_ids, int32_t* sorted_token_ids, int32_t* expert_ids,
+    int32_t* num_tokens_post_pad, int32_t num_experts, int32_t block_size, int32_t numel, int32_t max_num_tokens_padded,
+    cudaStream_t stream)
 {
-
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
     int64_t padded_num_experts = ((num_experts + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
     int experts_per_warp = WARP_SIZE;
     int threads = 1024;
     threads = ((threads + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
 
     // BlockScan uses 1024 threads and assigns one thread per expert.
-    TORCH_CHECK(padded_num_experts < 1024, "padded_num_experts must be less than 1024");
+    TLLM_CHECK_WITH_INFO(padded_num_experts < 1024, "padded_num_experts must be less than 1024");
 
-    AT_DISPATCH_INTEGRAL_TYPES(topk_ids.scalar_type(), "moe_align_block_size_kernel",
-        [&]
-        {
-            // calc needed amount of shared mem for `cumsum` tensors
-            auto options_int = torch::TensorOptions().dtype(torch::kInt).device(topk_ids.device());
-            torch::Tensor cumsum_buffer = torch::empty({num_experts + 1}, options_int);
-            bool small_batch_expert_mode = (topk_ids.numel() < 1024) && (num_experts <= 64);
+    // Allocate temporary cumsum buffer
+    int32_t* cumsum_buffer;
+    cudaMallocAsync(&cumsum_buffer, (num_experts + 1) * sizeof(int32_t), stream);
+    cudaMemsetAsync(cumsum_buffer, 0, (num_experts + 1) * sizeof(int32_t), stream);
 
-            if (small_batch_expert_mode)
-            {
-                const int32_t threads = std::max((int32_t) num_experts, (int32_t) WARP_SIZE);
-                const int32_t shared_mem_size = ((threads + 1) * num_experts + (num_experts + 1)) * sizeof(int32_t);
+    bool small_batch_expert_mode = (numel < 1024) && (num_experts <= 64);
 
-                auto small_batch_expert_kernel
-                    = auto_deploy::moe::moe_align_block_size_small_batch_expert_kernel<scalar_t>;
-                small_batch_expert_kernel<<<1, threads, shared_mem_size, stream>>>(topk_ids.data_ptr<scalar_t>(),
-                    sorted_token_ids.data_ptr<int32_t>(), experts_ids.data_ptr<int32_t>(),
-                    num_tokens_post_pad.data_ptr<int32_t>(), num_experts, block_size, topk_ids.numel(),
-                    sorted_token_ids.size(0));
-            }
-            else
-            {
-                auto align_kernel = auto_deploy::moe::moe_align_block_size_kernel<scalar_t>;
+    if (small_batch_expert_mode)
+    {
+        const int32_t thread_count = std::max((int32_t) num_experts, (int32_t) WARP_SIZE);
+        const int32_t shared_mem_size = ((thread_count + 1) * num_experts + (num_experts + 1)) * sizeof(int32_t);
 
-                size_t num_warps = CEILDIV(padded_num_experts, experts_per_warp);
-                size_t shared_mem_size = num_warps * experts_per_warp * sizeof(int32_t);
+        moe_align_block_size_small_batch_expert_kernel<scalar_t><<<1, thread_count, shared_mem_size, stream>>>(topk_ids,
+            sorted_token_ids, expert_ids, num_tokens_post_pad, num_experts, block_size, numel, max_num_tokens_padded);
+    }
+    else
+    {
+        size_t num_warps = CEILDIV(padded_num_experts, experts_per_warp);
+        size_t shared_mem_size = num_warps * experts_per_warp * sizeof(int32_t);
 
-                align_kernel<<<1, threads, shared_mem_size, stream>>>(topk_ids.data_ptr<scalar_t>(),
-                    sorted_token_ids.data_ptr<int32_t>(), experts_ids.data_ptr<int32_t>(),
-                    num_tokens_post_pad.data_ptr<int32_t>(), num_experts, padded_num_experts, experts_per_warp,
-                    block_size, topk_ids.numel(), cumsum_buffer.data_ptr<int32_t>(), sorted_token_ids.size(0));
+        moe_align_block_size_kernel<scalar_t><<<1, threads, shared_mem_size, stream>>>(topk_ids, sorted_token_ids,
+            expert_ids, num_tokens_post_pad, num_experts, padded_num_experts, experts_per_warp, block_size, numel,
+            cumsum_buffer, max_num_tokens_padded);
 
-                const int block_threads = std::min(256, (int) threads);
-                const int num_blocks = (topk_ids.numel() + block_threads - 1) / block_threads;
-                const int max_blocks = 65535;
-                const int actual_blocks = std::min(num_blocks, max_blocks);
+        int const block_threads = std::min(256, (int) threads);
+        int const num_blocks = (numel + block_threads - 1) / block_threads;
+        int const max_blocks = 65535;
+        int const actual_blocks = std::min(num_blocks, max_blocks);
 
-                auto sort_kernel = auto_deploy::moe::count_and_sort_expert_tokens_kernel<scalar_t>;
-                sort_kernel<<<actual_blocks, block_threads, 0, stream>>>(topk_ids.data_ptr<scalar_t>(),
-                    sorted_token_ids.data_ptr<int32_t>(), cumsum_buffer.data_ptr<int32_t>(), topk_ids.numel());
-            }
-        });
+        count_and_sort_expert_tokens_kernel<scalar_t>
+            <<<actual_blocks, block_threads, 0, stream>>>(topk_ids, sorted_token_ids, cumsum_buffer, numel);
+    }
+
+    cudaFreeAsync(cumsum_buffer, stream);
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+void invokeMoeAlignBlockSize(void const* topk_ids, int32_t topk_ids_dtype_size, int32_t* sorted_token_ids,
+    int32_t* expert_ids, int32_t* num_tokens_post_pad, int32_t num_experts, int32_t block_size, int32_t numel,
+    int32_t max_num_tokens_padded, cudaStream_t stream)
 {
-    m.def("moe_align_block_size", &moe_align_block_size_cuda, "MoE align block size (CUDA)");
+    // Dispatch based on dtype size
+    if (topk_ids_dtype_size == sizeof(int32_t))
+    {
+        invokeMoeAlignBlockSizeTyped(static_cast<int32_t const*>(topk_ids), sorted_token_ids, expert_ids,
+            num_tokens_post_pad, num_experts, block_size, numel, max_num_tokens_padded, stream);
+    }
+    else if (topk_ids_dtype_size == sizeof(int64_t))
+    {
+        invokeMoeAlignBlockSizeTyped(static_cast<int64_t const*>(topk_ids), sorted_token_ids, expert_ids,
+            num_tokens_post_pad, num_experts, block_size, numel, max_num_tokens_padded, stream);
+    }
+    else
+    {
+        TLLM_CHECK_WITH_INFO(false, "Unsupported topk_ids dtype size: %d", topk_ids_dtype_size);
+    }
 }
+
+} // namespace tensorrt_llm::kernels
