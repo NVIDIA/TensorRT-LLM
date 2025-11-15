@@ -191,7 +191,8 @@ class ModelLoader:
                  sparse_attention_config: Optional["SparseAttentionConfig"],
                  max_num_tokens: int,
                  max_seq_len: Optional[int],
-                 lora_config: Optional[LoraConfig] = None):
+                 lora_config: Optional[LoraConfig] = None,
+                 weight_sharing_model: Optional[torch.nn.Module] = None):
         """
         Initializes the ModelLoader.
 
@@ -210,6 +211,7 @@ class ModelLoader:
         self.max_num_tokens = max_num_tokens
         self.max_seq_len = max_seq_len
         self.lora_config = lora_config
+        self.weight_sharing_model = weight_sharing_model
 
     def load(
         self,
@@ -306,6 +308,12 @@ class ModelLoader:
                 logger.info("moe_load_balancer finalizing model...")
                 moe_load_balancer.finalize_model()
                 logger.info("moe_load_balancer finalize model done")
+
+            if self.weight_sharing_model is not None:
+                model.load_state_dict(self.weight_sharing_model.state_dict(),
+                                      assign=True)
+                # Free up duplicate model weights allocated before weight sharing
+                torch.cuda.empty_cache()
 
             torch.cuda.current_stream().synchronize()
 
