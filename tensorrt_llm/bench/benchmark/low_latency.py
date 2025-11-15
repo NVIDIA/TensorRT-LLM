@@ -46,12 +46,14 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Path to a serialized TRT-LLM engine.",
 )
 @optgroup.option(
+    "--config",
     "--extra_llm_api_options",
+    "extra_llm_api_options",
     type=str,
     default=None,
     help=
-    "Path to a YAML file that overwrites the parameters specified by trtllm-bench."
-)
+    "Path to a YAML file that overwrites the parameters specified by trtllm-bench. "
+    "Can be specified as either --config or --extra_llm_api_options.")
 @optgroup.option(
     "--backend",
     type=click.Choice(ALL_SUPPORTED_BACKENDS),
@@ -192,6 +194,7 @@ def latency_command(
 ) -> None:
     """Run a latency test on a TRT-LLM engine."""
     logger.info("Preparing to run latency benchmark...")
+
     # Parameters from CLI
     # Model, experiment, and engine params
     options = get_general_cli_options(params, bench_env)

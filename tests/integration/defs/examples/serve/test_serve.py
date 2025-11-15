@@ -94,6 +94,7 @@ def check_openai_chat_completion(http_port="8000",
 
 @skip_pre_hopper
 def test_extra_llm_api_options(serve_test_root):
+    """Test config file loading via --extra_llm_api_options (or --config alias)."""
     test_configs_root = f"{serve_test_root}/test_configs"
     config_file = f"{test_configs_root}/Qwen3-30B-A3B-FP8.yml"
     model_path = f"{llm_models_root()}/Qwen3/Qwen3-30B-A3B-FP8"

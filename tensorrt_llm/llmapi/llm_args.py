@@ -2955,6 +2955,42 @@ class TorchLlmArgs(BaseLlmArgs):
         return executor_config
 
 
+def apply_env_overrides(config_dict: Dict,
+                        config_path: Optional[str] = None) -> None:
+    """Apply environment variable overrides from config file.
+
+    Extracts and applies environment variables from the 'env_overrides' section
+    of the config dictionary. Config file values ALWAYS take precedence and will
+    override any existing shell environment variables.
+
+    Args:
+        config_dict: Configuration dictionary potentially containing 'env_overrides'
+        config_path: Optional path to config file for logging context
+    """
+    if 'env_overrides' not in config_dict:
+        return
+
+    env_overrides = config_dict.pop('env_overrides')
+    if not isinstance(env_overrides, dict):
+        logger.warning(
+            f"env_overrides must be a dictionary, got {type(env_overrides).__name__}"
+        )
+        return
+
+    config_context = f" from {config_path}" if config_path else ""
+    logger.info(f"Processing environment variable overrides{config_context}")
+
+    for key, value in env_overrides.items():
+        str_value = str(value)
+        if key in os.environ:
+            old_value = os.environ[key]
+            os.environ[key] = str_value
+            logger.info(f"Overriding {key}: '{old_value}' -> '{str_value}'")
+        else:
+            os.environ[key] = str_value
+            logger.info(f"Setting {key}='{str_value}'")
+
+
 def update_llm_args_with_extra_dict(
         llm_args: Dict,
         llm_args_dict: Dict,
@@ -3011,11 +3047,29 @@ def update_llm_args_with_extra_dict(
 def update_llm_args_with_extra_options(llm_args: Dict,
                                        extra_llm_api_options: str) -> Dict:
     if extra_llm_api_options is not None:
-        with open(extra_llm_api_options, 'r') as f:
-            llm_args_dict = yaml.safe_load(f)
-            llm_args = update_llm_args_with_extra_dict(llm_args, llm_args_dict,
-                                                       extra_llm_api_options)
+        llm_args_dict = load_yaml_maybe_env_override(extra_llm_api_options)
+        llm_args = update_llm_args_with_extra_dict(llm_args, llm_args_dict,
+                                                   extra_llm_api_options)
     return llm_args
+
+
+def load_yaml_maybe_env_override(file_path: str) -> Dict:
+    """Load YAML file and optionally apply env_overrides section.
+
+    Reads a YAML configuration file and automatically processes any
+    'env_overrides' section to set environment variables. Config file
+    values take precedence over existing shell environment variables.
+
+    Args:
+        file_path: Path to YAML config file
+
+    Returns:
+        Config dictionary with env_overrides processed and removed
+    """
+    with open(file_path, 'r') as f:
+        config = yaml.safe_load(f)
+    apply_env_overrides(config, file_path)
+    return config
 
 
 def get_model_format(model_dir: str,

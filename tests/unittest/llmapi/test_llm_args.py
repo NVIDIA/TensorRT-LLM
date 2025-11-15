@@ -1,4 +1,7 @@
+import contextlib
+import logging
 import tempfile
+from typing import List
 
 import pydantic_core
 import pytest
@@ -778,3 +781,181 @@ class TestStrictBaseModelArbitraryArgs:
                 pydantic_core._pydantic_core.ValidationError) as exc_info:
             TestConfig(field1="test", field2=100, extra_field="should_fail")
         assert "extra_field" in str(exc_info.value)
+
+
+@pytest.fixture
+def enable_tllm_logger_propagation():
+    """Fixture to temporarily enable TRT-LLM logger propagation for caplog."""
+    tllm_logger = logging.getLogger("TRT-LLM")
+    original_propagate = tllm_logger.propagate
+    tllm_logger.propagate = True
+    yield
+    tllm_logger.propagate = original_propagate
+
+
+@pytest.fixture
+def env_var_cleanup():
+    """Fixture that provides a context manager for env var cleanup."""
+
+    @contextlib.contextmanager
+    def cleanup_vars(var_names: List[str]):
+        """Clean up environment variables before and after test."""
+        # Clean before
+        for var in var_names:
+            if var in os.environ:
+                del os.environ[var]
+        try:
+            yield
+        finally:
+            # Clean after
+            for var in var_names:
+                if var in os.environ:
+                    del os.environ[var]
+
+    return cleanup_vars
+
+
+@pytest.fixture
+def temp_yaml_file():
+    """Fixture that provides a function to create temporary YAML files."""
+
+    @contextlib.contextmanager
+    def create_yaml(content: dict):
+        """Create a temporary YAML file with the given content."""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml',
+                                         delete=False) as f:
+            yaml.dump(content, f)
+            filepath = f.name
+        try:
+            yield filepath
+        finally:
+            os.unlink(filepath)
+
+    return create_yaml
+
+
+class TestApplyEnvOverrides:
+    """Test suite for apply_env_overrides function."""
+
+    def test_apply_env_overrides_config_overrides_shell(self, env_var_cleanup):
+        """Test that config values override existing shell environment variables."""
+        test_var = "TEST_ENV_VAR_OVERRIDE"
+
+        with env_var_cleanup([test_var]):
+            os.environ[test_var] = "shell_value"
+            config_dict = {"env_overrides": {test_var: "config_value"}}
+
+            apply_env_overrides(config_dict)
+
+            assert os.environ[test_var] == "config_value"
+
+    def test_apply_env_overrides_multiple_vars(self, env_var_cleanup):
+        """Test applying multiple environment variables."""
+        test_vars = ["TEST_VAR_1", "TEST_VAR_2", "TEST_VAR_3"]
+
+        with env_var_cleanup(test_vars):
+            config_dict = {
+                "env_overrides": {
+                    "TEST_VAR_1": "value1",
+                    "TEST_VAR_2": "value2",
+                    "TEST_VAR_3": "value3"
+                }
+            }
+
+            apply_env_overrides(config_dict)
+
+            assert os.environ["TEST_VAR_1"] == "value1"
+            assert os.environ["TEST_VAR_2"] == "value2"
+            assert os.environ["TEST_VAR_3"] == "value3"
+
+    def test_apply_env_overrides_type_conversion(self, env_var_cleanup):
+        """Test that different value types are converted to strings."""
+        test_vars = ["TEST_INT", "TEST_BOOL", "TEST_STR"]
+
+        with env_var_cleanup(test_vars):
+            config_dict = {
+                "env_overrides": {
+                    "TEST_INT": 123,
+                    "TEST_BOOL": True,
+                    "TEST_STR": "string_value"
+                }
+            }
+
+            apply_env_overrides(config_dict)
+
+            assert os.environ["TEST_INT"] == "123"
+            assert os.environ["TEST_BOOL"] == "True"
+            assert os.environ["TEST_STR"] == "string_value"
+
+    def test_apply_env_overrides_no_env_section(self):
+        """Test that function handles missing env_overrides section."""
+        config_dict = {"max_batch_size": 256}
+        apply_env_overrides(config_dict)
+        assert config_dict == {"max_batch_size": 256}
+
+    def test_apply_env_overrides_invalid_type(self):
+        """Test that invalid env_overrides type is handled gracefully."""
+        config_dict = {"env_overrides": "not_a_dict"}
+        apply_env_overrides(config_dict)
+        assert "env_overrides" not in config_dict
+
+    @pytest.mark.parametrize("test_case,expected_log", [
+        ("conflict", "Overriding TEST_ENV_VAR"),
+        ("new", "Setting TEST_ENV_VAR"),
+    ])
+    def test_apply_env_overrides_logging(self, caplog,
+                                         enable_tllm_logger_propagation,
+                                         env_var_cleanup, test_case,
+                                         expected_log):
+        """Test logging for env var conflicts and new vars."""
+        test_var = f"TEST_ENV_VAR_{test_case.upper()}"
+
+        with env_var_cleanup([test_var]):
+            if test_case == "conflict":
+                os.environ[test_var] = "old_value"
+                config_dict = {"env_overrides": {test_var: "new_value"}}
+                expected_value = "new_value"
+            else:  # new
+                config_dict = {"env_overrides": {test_var: "new_value"}}
+                expected_value = "new_value"
+
+            with caplog.at_level(logging.INFO, logger="TRT-LLM"):
+                apply_env_overrides(
+                    config_dict,
+                    "/path/to/config.yaml" if test_case == "conflict" else None)
+
+            assert os.environ[test_var] == expected_value
+            assert any(expected_log in record.message
+                       for record in caplog.records)
+
+    def test_update_llm_args_with_extra_options_applies_env_overrides(
+            self, env_var_cleanup, temp_yaml_file):
+        """Test that update_llm_args_with_extra_options calls apply_env_overrides."""
+        test_vars = [
+            "TEST_CENTRALIZED_VAR1", "TEST_CENTRALIZED_VAR2",
+            "TEST_CENTRALIZED_VAR3"
+        ]
+
+        with env_var_cleanup(test_vars):
+            yaml_content = {
+                "max_batch_size": 512,
+                "max_num_tokens": 8192,
+                "env_overrides": {
+                    "TEST_CENTRALIZED_VAR1": "value1",
+                    "TEST_CENTRALIZED_VAR2": 42,
+                    "TEST_CENTRALIZED_VAR3": True
+                }
+            }
+
+            with temp_yaml_file(yaml_content) as config_file:
+                base_llm_args = {"tensor_parallel_size": 2}
+                result_llm_args = update_llm_args_with_extra_options(
+                    base_llm_args, config_file)
+
+                assert os.environ["TEST_CENTRALIZED_VAR1"] == "value1"
+                assert os.environ["TEST_CENTRALIZED_VAR2"] == "42"
+                assert os.environ["TEST_CENTRALIZED_VAR3"] == "True"
+                assert "env_overrides" not in result_llm_args
+                assert result_llm_args["max_batch_size"] == 512
+                assert result_llm_args["max_num_tokens"] == 8192
+                assert result_llm_args["tensor_parallel_size"] == 2
