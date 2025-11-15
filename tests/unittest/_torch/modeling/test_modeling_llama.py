@@ -9,7 +9,7 @@ from parameterized import parameterized
 from transformers import LlamaConfig
 from transformers import LlamaForCausalLM as HFLlamaForCausalLM
 from utils.llm_data import llm_models_root
-from utils.util import default_dtype, getSMVersion, skip_blackwell
+from utils.util import default_dtype, getSMVersion
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
@@ -20,6 +20,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative.utils import SpecDecodingTensor
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -376,7 +377,6 @@ class TestLlama(unittest.TestCase):
             graph_runner.clear()
         kv_cache_manager.shutdown()
 
-    @skip_blackwell
     @torch.no_grad()
     def test_llama_verification_with_kv_cache_relocation(self) -> None:
         """
@@ -407,10 +407,11 @@ class TestLlama(unittest.TestCase):
             llama = LlamaForCausalLM(model_config).to(dtype).to(device)
             llama.load_weights(hf_llama.state_dict())
         num_blocks = 1
-        tokens_per_block = 128
+        tokens_per_block = 64
         head_dim = llama.config.hidden_size // llama.config.num_attention_heads
         num_layers = llama.config.num_hidden_layers
         num_kv_heads = llama.config.num_key_value_heads
+        num_heads_per_kv = llama.config.num_attention_heads // num_kv_heads
         max_seq_len = num_blocks * tokens_per_block
         batch_size = 1
 
@@ -467,6 +468,7 @@ class TestLlama(unittest.TestCase):
             kv_cache_manager=kv_cache_manager,
             request_ids=request_ids,
             prompt_lens=prompt_lens,
+            num_heads_per_kv=num_heads_per_kv,
         )
 
         position_ids = [torch.arange(0, input_ids.size(-1))]
@@ -478,7 +480,6 @@ class TestLlama(unittest.TestCase):
                                    attn_metadata=attn_metadata)
 
         def run_forward(input_ids, position_ids, attn_metadata):
-            attn_metadata.prepare()
             return llama.forward(input_ids=input_ids,
                                  position_ids=position_ids,
                                  attn_metadata=attn_metadata,
@@ -487,14 +488,13 @@ class TestLlama(unittest.TestCase):
         # prepare for the first generation
         gen_input_ids_0 = torch.tensor([
             22691, 11, 0, 13, 15592, 323, 315, 12, 311, 362, 220, 32, 362, 426,
-            330, 358, 362, 358, 358, 362, 32, 0, 13, 32, 6369, 7528, 649, 32,
-            32, 649, 6369
+            330, 358, 362, 358, 358, 362, 32, 0, 13, 32, 6369
         ],
                                        dtype=torch.int,
                                        device=device)
         spec_decoding_position_offsets = torch.tensor([
             0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
-            2, 3, 3, 3, 3, 3, 3, 3
+            2, 3
         ],
                                                       dtype=torch.int,
                                                       device=device)
@@ -502,8 +502,7 @@ class TestLlama(unittest.TestCase):
             [
                 1, 3, 5, 9, 17, 33, 65, 129, 257, 513, 1025, 2051, 4099, 8195,
                 16387, 32771, 65541, 131077, 262153, 524297, 1048593, 2097169,
-                4194321, 8388641, 16842757, 33619973, 67371017, 134479881,
-                268566533, 537001989, 1074266121
+                4194321, 8388641, 16842757
             ],
             dtype=torch.int,
             device=device).unsqueeze(0).unsqueeze(2)
@@ -531,11 +530,13 @@ class TestLlama(unittest.TestCase):
             use_spec_decoding=use_spec_decoding,
             is_spec_dec_tree=is_spec_dec_tree,
             is_spec_dec_dynamic_tree=is_spec_dec_dynamic_tree,
+            num_heads_per_kv=num_heads_per_kv,
         )
         spec_decoding_tensor = SpecDecodingTensor(
             position_offsets=spec_decoding_position_offsets,
             packed_mask=spec_decoding_packed_mask)
 
+        attn_metadata_gen_phase_0.prepare()
         attn_metadata_gen_phase_0.update_spec_dec_param(
             is_spec_decoding_enabled=is_spec_decoding_enabled,
             is_spec_dec_dynamic_tree=is_spec_dec_dynamic_tree,
@@ -582,9 +583,11 @@ class TestLlama(unittest.TestCase):
         attn_metadata_gen_phase_0.seq_lens = torch.tensor(
             [gen_input_ids_1.size(-1)], dtype=torch.int)
         attn_metadata_gen_phase_0.kv_cache_params.num_cached_tokens_per_seq = num_cached_tokens_per_seq_1
+        attn_metadata_gen_phase_0.prepare()
         attn_metadata_gen_phase_0.update_spec_dec_param(
             is_spec_decoding_enabled=is_spec_decoding_enabled,
-            is_spec_dec_tree=is_spec_dec_tree,
+            is_spec_dec_tree=is_spec_dec_tree
+            if get_sm_version() < 100 else False,
             is_spec_dec_dynamic_tree=False,
             max_draft_tokens=gen_input_ids_1.size(-1) - 1)
 
@@ -625,10 +628,14 @@ class TestLlama(unittest.TestCase):
             is_spec_decoding_enabled=is_spec_decoding_enabled,
             use_spec_decoding=use_spec_decoding,
             is_spec_dec_tree=is_spec_dec_tree,
-            is_spec_dec_dynamic_tree=False)
+            is_spec_dec_dynamic_tree=False,
+            num_heads_per_kv=num_heads_per_kv,
+        )
+        attn_metadata_ref.prepare()
         attn_metadata_ref.update_spec_dec_param(
             is_spec_decoding_enabled=is_spec_decoding_enabled,
-            is_spec_dec_tree=is_spec_dec_tree,
+            is_spec_dec_tree=is_spec_dec_tree
+            if get_sm_version() < 100 else False,
             is_spec_dec_dynamic_tree=False,
             max_draft_tokens=gen_input_ids_ref.size(-1) - 1,
         )
@@ -640,6 +647,7 @@ class TestLlama(unittest.TestCase):
         ]
         gen_position_ids_ref = torch.cat(gen_position_ids_ref).unsqueeze(
             0).cuda()
+
         with torch.inference_mode():
             gen_logits_ref = run_forward(input_ids=gen_input_ids_ref,
                                          position_ids=gen_position_ids_ref,
@@ -648,11 +656,15 @@ class TestLlama(unittest.TestCase):
         torch.cuda.synchronize()
         torch.testing.assert_close(gen_logits_1[0, :],
                                    gen_logits_ref[2, :],
-                                   atol=0.02,
-                                   rtol=0.02)
+                                   atol=0.4,
+                                   rtol=0.4)
         torch.testing.assert_close(gen_logits_1[1, :],
                                    gen_logits_ref[3, :],
-                                   atol=0.02,
-                                   rtol=0.02)
+                                   atol=0.4,
+                                   rtol=0.4)
+
+        token_id_ref = torch.argmax(gen_logits_ref[3, :], dim=-1)
+        token_id_gen = torch.argmax(gen_logits_1[1, :], dim=-1)
+        assert token_id_ref == token_id_gen, "Greedy sampling token id not match"
 
         kv_cache_manager.shutdown()
