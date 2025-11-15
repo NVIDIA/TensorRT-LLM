@@ -99,6 +99,7 @@ class TuningConfig:
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
     tune_max_num_tokens: int = None
     inputs_pre_hook: Callable = None
+    use_cudagraph: bool = True
 
 
 @dataclass(unsafe_hash=True)
@@ -524,7 +525,7 @@ class AutoTuner:
     """
     _instance = None
 
-    def __init__(self, warmup=3, repeat=10, stream_delay_micro_secs=1000):
+    def __init__(self, warmup=3, repeat=30, stream_delay_micro_secs=1000):
         self.repeat = repeat
         self.warmup = warmup
         self.stream_delay_micro_secs = stream_delay_micro_secs
@@ -533,8 +534,6 @@ class AutoTuner:
 
         # Add statistics tracking
         self.stats = AutoTunerStatistics()
-
-        self.profiling_debug = True
 
         # Current captured choose_one() contexts
         self._active_capture: Optional['AutoTuner.TacticsCapture'] = None
@@ -811,7 +810,12 @@ class AutoTuner:
             for tac in valid_tactics:
                 try:
                     time_measured = self._profile_single_kernel(
-                        runner, input_tensors, tac, **kwargs)
+                        runner=runner,
+                        inputs=input_tensors,
+                        tactic=tac,
+                        use_cudagraph=tuning_config.use_cudagraph,
+                        **kwargs,
+                    )
                 except Exception as e:
                     # Handle None tensors for optional inputs
                     shapes = self._get_input_sizes(input_tensors)
@@ -857,6 +861,7 @@ class AutoTuner:
         runner: TunableRunner,
         inputs: List[torch.Tensor],
         tactic: Any,
+        use_cudagraph: bool = True,
         **kwargs,
     ) -> float:
         """Profile a single kernel implementation for performance measurement.
@@ -875,22 +880,38 @@ class AutoTuner:
             are used to ensure accurate timing.
         """
         stream = torch.cuda.current_stream()
-        # warm up, no timing
-        for _ in range(self.warmup):
-            runner(inputs, tactic=tactic, **kwargs)
-        stream.synchronize()
-
-        # Delay the profiled kernel launch to eliminate affects of host time overhead in profiling.
-        # TODO: This is build time sensitive, O(tactic_num * impl_num * num_profile * tunable_ops)
-        # Consider apply a preprofiling to estimate the kernel execution time, then decide the necessity.
-        delay_kernel(self.stream_delay_micro_secs, stream)
+        graph = torch.cuda.CUDAGraph()
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
 
-        start.record(stream=stream)
-        for _ in range(self.repeat):
-            runner(inputs, tactic=tactic, **kwargs)
-        end.record(stream=stream)
+        with torch.cuda.stream(stream):
+            # warm up, no timing
+            for _ in range(self.warmup):
+                runner(inputs, tactic=tactic, **kwargs)
+
+            if use_cudagraph:
+                with torch.cuda.graph(graph):
+                    for _ in range(self.repeat):
+                        runner(inputs, tactic=tactic, **kwargs)
+
+            stream.synchronize()
+
+            # Delay the profiled kernel launch to eliminate affects of host time overhead in profiling.
+            # TODO: This is build time sensitive, O(tactic_num * impl_num * num_profile * tunable_ops)
+            # Consider apply a preprofiling to estimate the kernel execution time, then decide the necessity.
+            if not use_cudagraph:
+                delay_kernel(self.stream_delay_micro_secs, stream=stream)
+
+            start.record()
+
+            if use_cudagraph:
+                graph.replay()
+            else:
+                for _ in range(self.repeat):
+                    runner(inputs, tactic=tactic, **kwargs)
+
+            end.record()
+
         stream.synchronize()
 
         avg_time = start.elapsed_time(end) / self.repeat
