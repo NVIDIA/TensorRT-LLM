@@ -32,8 +32,6 @@ from .quantization_utils import (
     modelopt_fp4_scale_to_cutlass_fp4_scale,
 )
 
-INSERT_ALL_REDUCE = False
-
 
 def validate_allreduce_strategy(v):
     """Convert string names like 'AUTO' to AllReduceStrategy enum.
@@ -148,7 +146,6 @@ def _validate_sharded_shapes(
             [next_lin_node],
             include=lambda n: is_op(n, [torch.ops.aten.split_with_sizes]),
         )
-        world_size = min(world_size, 4)
         for split_node in split_nodes:
             orig_sizes = split_node.args[1]
             new_sizes = [orig_sizes[i] // world_size for i in range(len(orig_sizes))]
@@ -190,9 +187,6 @@ def shard_weight_tensor(
         Tuple of (sharded_tensor, sharded_shape)
     """
 
-    def ceil(x: int, y: int) -> int:
-        return (x + y - 1) // y
-
     def split_tensor(
         t: torch.Tensor,
         d: int = dim,
@@ -209,7 +203,7 @@ def shard_weight_tensor(
                 + f"Splitting tensor to {num_groups} chunks"
             )
             return torch.tensor_split(t, max_split_size, dim=d)[r // num_groups]
-        return torch.tensor_split(t, min(ws, 4), dim=d)[r // ceil(ws, 4)]
+        return torch.tensor_split(t, ws, dim=d)[r]
 
     # Handle fused weights
     if fused_weight_dims is not None:
@@ -219,10 +213,6 @@ def shard_weight_tensor(
             fused_dims: list = fused_weight_dims,
             d: int = dim,
         ) -> torch.Tensor:
-            # dim_d = t.shape[d]
-            # num_parts = 1
-            # part_size = dim_d // num_parts
-            # fused_dims = [part_size] * num_parts
             return torch.cat(
                 [split_tensor(w) for w in torch.split(t, fused_dims, dim=d)],
                 dim=d,
@@ -541,14 +531,12 @@ def _shard_parameter_node(
         return
 
     # figure out the right dist op
-    if dim == 0:
-        # Column split -> all_gather
-        fn_dist = torch.ops.auto_deploy.torch_dist_all_gather.default
-        dist_args = (node, -1)
-    else:
-        # Row split -> all_reduce with strategy
-        fn_dist = torch.ops.auto_deploy.torch_dist_all_reduce.default
-        dist_args = (node, allreduce_strategy.name)
+    dist_lookup = {
+        0: (torch.ops.auto_deploy.torch_dist_all_gather.default, -1),
+        1: (torch.ops.auto_deploy.torch_dist_all_reduce.default,),
+    }
+
+    fn_dist, *dist_args = dist_lookup[dim]
 
     # add reduction node
     with gm.graph.inserting_after(node):
