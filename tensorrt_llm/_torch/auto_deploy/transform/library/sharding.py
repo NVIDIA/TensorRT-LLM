@@ -16,10 +16,8 @@ Our sharding algorithm for tensor parallelism (TP) is based on the following ste
        happens automatically via the checkpoint loading hook added in step 2c.
 """
 
-import operator
 import re
-from collections import defaultdict
-from typing import DefaultDict, Dict, List, Set, Tuple, Type, Union
+from typing import Dict, List, Tuple, Type, Union
 
 import torch
 from pydantic import Field
@@ -33,7 +31,6 @@ from ...utils.node_utils import (
     extract_weight_node,
     filtered_nodes,
     get_all_layer_subgraphs,
-    identify_regions_between_residuals,
     is_any_lin_op,
     is_op,
     subgraph,
@@ -191,7 +188,6 @@ class Sharding(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         local_rank, world_size = shared_config.local_rank, shared_config.world_size
-
         if world_size < 2:
             ad_logger.info("Skipping sharding for single device")
             return gm, TransformInfo(
@@ -233,7 +229,7 @@ class Sharding(BaseTransform):
 
                 # run TP sharding across ranks
                 if ShardingDim.TP in sharding_config.sharding_dims:
-                    info += detect_column_row_shard_new(gm, sharding_config)
+                    info += detect_column_row_shard(gm, sharding_config)
 
                 # run EP sharding across ranks
                 if ShardingDim.EP in sharding_config.sharding_dims:
@@ -793,7 +789,7 @@ def detect_ssm_shard(
     )
 
 
-def detect_column_row_shard_new(
+def detect_column_row_shard(
     gm: GraphModule,
     sharding_config: ShardingConfig,
 ) -> TransformInfo:
@@ -814,11 +810,7 @@ def detect_column_row_shard_new(
     splitting, e.g., the individual heads into smaller shards.
     """
     ad_logger.debug("Before sharding graph: " + str(gm))
-
     rank, world_size = sharding_config.rank, sharding_config.world_size
-    if world_size < 2:
-        ad_logger.info("Skipping TP sharding for single device")
-        return TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
 
     assert isinstance(gm, GraphModule), "Expecting GraphModule"
     ad_logger.info("Running TP sharding detection")
@@ -923,222 +915,6 @@ def detect_column_row_shard_new(
     ad_logger.info(
         f"Found {num_shards} TP shards (simple: {num_simple_shards}, row-col: {num_column_row_shards}, "
         f"ssm: {num_ssm_shards}, attention: {num_attention_shards})"
-    )
-    return TransformInfo(
-        skipped=False, num_matches=num_shards, is_clean=False, has_valid_shapes=False
-    )
-
-
-def detect_column_row_shard(
-    gm: GraphModule,
-    sharding_config: ShardingConfig,
-) -> TransformInfo:
-    """A transformation to apply sharding to the model following tensor parallelism.
-
-    The transformation is based on the following steps:
-
-    1. Identify boundary nodes between residual nodes to identify shardable regions.
-    2. Identify the GEMM nodes that can be sharded
-    3. Trace through the subgraph using DFS/BFS between each pair of boundary nodes
-    4. Account for each node in the trace to ensure the op is correct even after sharding. This is
-       necessary to ensure that the sharding is correct and we need to be able to account for
-       **all** nodes in the subgraph. The subgraph here is defined as the region between the first
-       linear node to the last linear node of an identified sharding region.
-    # 5. Shard the GEMM nodes or skip accordingly.
-
-    min_local_shape is the minimum size of the local tensor shard, to prevent TP parallelism
-    splitting, e.g., the individual heads into smaller shards.
-    """
-    ad_logger.debug("Before sharding graph: " + str(gm))
-
-    rank, world_size = sharding_config.rank, sharding_config.world_size
-    if world_size < 2:
-        ad_logger.info("Skipping TP sharding for single device")
-        return TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
-
-    assert isinstance(gm, GraphModule), "Expecting GraphModule"
-
-    ad_logger.info("Running TP sharding detection")
-    # find boundary nodes of regions we want to shard
-    boundary_nodes = identify_regions_between_residuals(gm)
-
-    layer_subgraphs, unprocessed_linear_nodes = get_all_layer_subgraphs(gm)
-
-    # TODO: continue updating these lists
-    # pointwise ops that don't affect the sharder
-    pointwise_ops = {
-        torch.ops.aten.gelu,
-        torch.ops.aten.leaky_relu,
-        torch.ops.aten.mul,
-        torch.ops.aten.relu,
-        torch.ops.aten.sigmoid,
-        torch.ops.aten.silu,
-        torch.ops.aten.tanh,
-        torch.ops.aten.contiguous,
-    }
-
-    # acceptable attention nodes between sharded GEMMs
-    shardable_attention_nodes = {
-        torch.ops.auto_deploy.torch_attention_sdpa,
-        torch.ops.auto_deploy.torch_attention,
-    }
-
-    # This is a heuristic. Basically, we assume those are okay to shard if we also encounter an
-    # attention node because we know that those ops must be compatible with the attention op. Now
-    # since the attention op is shardable, we will assume those are as well if used in conjunction
-    # with the attention op.
-    shardable_nodes_with_attention = {
-        torch.ops.aten.view,
-        torch.ops.aten.reshape,
-        torch.ops.auto_deploy.flashinfer_rope,
-        operator.getitem,
-    }
-
-    # let's look at linear nodes we can identify between pairs of boundary nodes
-    # There is three potential cases we can handle:
-    # 1. No linear nodes:
-    #       --> just continue
-    # 2. Two groups of linear nodes and we can account for all to the view nodes:
-    #       --> row_split (dim 0) 1st group + check for supported nodes +
-    #           col_split (dim 1) 2nd group + all_reduce output of 2nd group
-    # 3. Linear nodes that are not in two groups or we cannot account for all nodes:
-    #       --> row_split (dim 0 of weight) + all_gather (dim -1 of output) output
-    num_shards = 0
-    num_simple_shards = 0
-    num_row_col_shards = 0
-    for n_start, n_end in zip(boundary_nodes[:-1], boundary_nodes[1:]):
-        # we iterate through all nodes between the two boundary nodes and store linear nodes
-        # sorted by their input activation node. We also store remaining nodes.
-        nodes_linear: DefaultDict[Node, List[Node]] = defaultdict(list)
-        attention_nodes: Set[Node] = set()
-        attention_related_nodes: Set[Node] = set()
-        unaccounted_nodes: Set[Node] = set()
-        current_node = n_start
-        while current_node != n_end:
-            if is_any_lin_op(current_node):
-                nodes_linear[current_node.args[0]].append(current_node)
-            elif is_op(current_node, shardable_attention_nodes):
-                attention_nodes.add(current_node)
-            elif is_op(current_node, shardable_nodes_with_attention):
-                attention_related_nodes.add(current_node)
-            elif not is_op(current_node, pointwise_ops):
-                unaccounted_nodes.add(current_node)
-            current_node = current_node.next
-            assert current_node, "Could not identify next node"
-
-        # nothing to shard
-        if len(nodes_linear) == 0:
-            continue
-
-        num_shards += 1
-
-        if sharding_config.simple_shard_only:
-            ad_logger.debug(f"Forcing Simple Shard: Linear groups: {nodes_linear}")
-            num_simple_shards += _process_simple_shard(
-                nodes_linear, rank, world_size, sharding_config
-            )
-            continue
-
-        # simple shard when we have != 2 groups of linear nodes
-        if len(nodes_linear) != 2:
-            ad_logger.debug(f"Linear groups: {nodes_linear}")
-            num_simple_shards += _process_simple_shard(
-                nodes_linear, rank, world_size, sharding_config
-            )
-            continue
-
-        # let's look at the unnacounted nodes. They are okay as long as they fall before the
-        # first linear node or after the last linear node, i.e., outside the sharded region
-        lin_nodes_flat: Set[Node] = {n for group in nodes_linear.values() for n in group}
-        lin_nodes_passed: Set[Node] = set()
-        current_node = n_start
-        while current_node != n_end:
-            # check if this is another linear node
-            if current_node in lin_nodes_flat:
-                lin_nodes_passed.add(current_node)
-
-            # check if we are OUTSIDE sharded region
-            if len(lin_nodes_passed) == 0 or lin_nodes_passed == lin_nodes_flat:
-                # remove node from unaccounted nodes since we are outside and it doesn't matter
-                unaccounted_nodes.discard(current_node)
-                attention_related_nodes.discard(current_node)
-                attention_nodes.discard(current_node)
-
-            current_node = current_node.next
-
-        # let's post-process the attention-related nodes
-        # we can disregard them if we also see attention nodes and we assume they are compatible
-        if len(attention_nodes) > 0:
-            attention_related_nodes.clear()
-
-        # check if any unaccounted nodes are left. If so, do a simply shard
-        if unaccounted_nodes or attention_related_nodes:
-            ad_logger.debug(f"Unaccounted nodes: {unaccounted_nodes}")
-            num_simple_shards += _process_simple_shard(
-                nodes_linear, rank, world_size, sharding_config
-            )
-            continue
-
-        # If we can account for all sharded nodes, we can do a two-way shard
-        # --> row_split (dim 0) + col_split (dim 1) + all_reduce
-
-        # check if we are sharding the attention block
-        if attention_nodes:
-            if len(attention_nodes) > 1:
-                # Column-row shard boundary region detection is probably wrong - there should be
-                # only one attention operation. Fall back to simple shard.
-                ad_logger.debug(f"More than one attention node: {unaccounted_nodes}")
-                num_simple_shards += _process_simple_shard(
-                    nodes_linear, rank, world_size, sharding_config
-                )
-                continue
-            # Extract head dimension. We cannot shard below the head_dim size.
-            # Assume that head_dim is the last (innermost) dimension of the tensor
-            min_local_shape = attention_nodes.pop().meta["val"].shape[-1]
-        else:
-            min_local_shape = 1
-
-        # We are inserting column-row shard for each group of linear enodes
-        # This may require parameter update of nodes whose args depend on (sharded) dimensions,
-        # such as view or split nodes.
-        nodes_to_column_shard = list(nodes_linear.values())[0]
-        nodes_to_row_shard = list(nodes_linear.values())[1]
-        if len(nodes_to_row_shard) != 1:
-            ad_logger.warning(
-                "Expecting only one linear node for row sharding, but got %s",
-                len(nodes_to_row_shard),
-            )
-            num_simple_shards += _process_simple_shard(
-                nodes_linear, rank, world_size, sharding_config
-            )
-            continue
-
-        # column-row sharding
-        _process_column_sharding(
-            gm,
-            linear_nodes=nodes_to_column_shard,
-            sharding_config=sharding_config,
-            rank=rank,
-            world_size=world_size,
-            min_local_shape=min_local_shape,
-        )
-
-        # shard single row node
-        sharding_config.weight_sharding_transforms.append(
-            WeightShardingInfo.from_node(
-                nodes_to_row_shard[0],
-                split_dim=SplitDimension.ROW,
-                rank=rank,
-                world_size=world_size,
-                dist_op="all_reduce",
-                min_local_shape=min_local_shape,
-            )
-        )
-
-        num_row_col_shards += 1
-
-    ad_logger.info(
-        f"Found {num_shards} TP shards (simple: {num_simple_shards}, row-col: {num_row_col_shards})"
     )
     return TransformInfo(
         skipped=False, num_matches=num_shards, is_clean=False, has_valid_shapes=False
