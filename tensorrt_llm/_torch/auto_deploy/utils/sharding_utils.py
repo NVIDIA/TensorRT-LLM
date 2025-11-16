@@ -1329,7 +1329,6 @@ class ShardingSource(Enum):
 class ShardingDim(Enum):
     """Enum for sharding dimension."""
 
-    SSM = "ssm"
     TP = "tp"
     EP = "ep"
     BMM = "bmm"
@@ -1357,7 +1356,7 @@ class ShardingTransformContainer(BaseModel):
         default_factory=lambda: [ShardingSource.HEURISTIC]
     )
     sharding_dims: List[ShardingDim] = Field(
-        default_factory=lambda: [ShardingDim.SSM, ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
+        default_factory=lambda: [ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
     )
     allreduce_strategy: AllReduceStrategy = Field(
         default=AllReduceStrategy.AUTO,
