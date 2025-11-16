@@ -796,7 +796,7 @@ def detect_ssm_shard(
     )
 
 
-def detect_column_row_shard_new(
+def detect_column_row_shard(
     gm: GraphModule,
     sharding_config: ShardingTransformContainer,
 ) -> TransformInfo:
@@ -817,11 +817,7 @@ def detect_column_row_shard_new(
     splitting, e.g., the individual heads into smaller shards.
     """
     ad_logger.debug("Before sharding graph: " + str(gm))
-
     rank, world_size = sharding_config.rank, sharding_config.world_size
-    if world_size < 2:
-        ad_logger.info("Skipping TP sharding for single device")
-        return TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
 
     assert isinstance(gm, GraphModule), "Expecting GraphModule"
     ad_logger.info("Running TP sharding detection")

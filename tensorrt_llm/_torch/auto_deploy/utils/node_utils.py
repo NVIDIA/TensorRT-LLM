@@ -660,9 +660,15 @@ def get_layer_after_linear_node(
     def boundary_condition(node: Node) -> bool:
         return is_any_lin_op(node)  # or is_op(node, ops=[torch.ops.aten.arange, torch.ops.aten.to])
 
-    # last linear node (output embedding) cannot be a part of any layer
-    def filter_condition(node: Node) -> bool:
-        return is_any_lin_op(node) and node != linear_nodes[-1]
+    # If the last linear node is the output embedding, it cannot be a part of any layer
+    if "lm_head" in extract_weight_node(linear_nodes[-1]).name:
+
+        def filter_condition(node: Node) -> bool:
+            return is_any_lin_op(node) and node != linear_nodes[-1]
+    else:
+
+        def filter_condition(node: Node) -> bool:
+            return is_any_lin_op(node)
 
     lin_nodes_in_subgraph = []
     start_lin_index = terminating_indices[-1] + 1
