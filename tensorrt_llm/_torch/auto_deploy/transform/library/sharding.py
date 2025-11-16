@@ -154,7 +154,7 @@ class ShardingTransformConfig(TransformConfig):
     support_partial_config: bool = Field(default=False)
     # Which sharding dimensions to run: any subset of {"tp", "ep", "bmm"}
     sharding_dims: List[ShardingDim] = Field(
-        default_factory=lambda: [ShardingDim.SSM, ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
+        default_factory=lambda: [ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
     )
 
 
@@ -191,7 +191,6 @@ class Sharding(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         local_rank, world_size = shared_config.local_rank, shared_config.world_size
-        # world_size = 2
 
         if world_size < 2:
             ad_logger.info("Skipping sharding for single device")
@@ -231,8 +230,6 @@ class Sharding(BaseTransform):
                 ad_logger.info(
                     f"Running autodeploy sharding heuristics: {sharding_config.sharding_dims}"
                 )
-                # if ShardingDim.SSM in sharding_config.sharding_dims:
-                #     info += detect_ssm_shard(gm, sharding_config)
 
                 # run TP sharding across ranks
                 if ShardingDim.TP in sharding_config.sharding_dims:
@@ -824,8 +821,11 @@ def detect_column_row_shard_new(
         return TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
 
     assert isinstance(gm, GraphModule), "Expecting GraphModule"
-
     ad_logger.info("Running TP sharding detection")
+    linear_nodes = list(filtered_nodes(gm.graph.nodes, is_any_lin_op))
+    if len(linear_nodes) == 0:
+        ad_logger.warning("Could not find any linear nodes in the graph. Skipping TP sharding.")
+        return TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
 
     layer_subgraphs, unprocessed_linear_nodes = get_all_layer_subgraphs(gm)
 

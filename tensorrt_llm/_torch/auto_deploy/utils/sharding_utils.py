@@ -1189,7 +1189,6 @@ class ShardingSource(Enum):
 class ShardingDim(Enum):
     """Enum for sharding dimension."""
 
-    SSM = "ssm"
     TP = "tp"
     EP = "ep"
     BMM = "bmm"
@@ -1208,7 +1207,7 @@ class ShardingConfig(BaseModel):
         default_factory=lambda: [ShardingSource.HEURISTIC]
     )
     sharding_dims: List[ShardingDim] = Field(
-        default_factory=lambda: [ShardingDim.SSM, ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
+        default_factory=lambda: [ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
     )
     weight_sharding_transforms: List[WeightShardingInfo] = Field(default_factory=list)
     parameter_update_transforms: List[ParameterUpdateInfo] = Field(default_factory=list)
