@@ -92,10 +92,10 @@ class ModelList(OpenAIBaseModel):
 
 
 class ResponseFormat(OpenAIBaseModel):
-    # type must be one of "text", "json", "json_object", or "structural_tag"
-    type: Literal["text", "json", "json_object", "regex", "ebnf",
+    type: Literal["text", "json", "json_schema", "json_object", "regex", "ebnf",
                   "structural_tag"]
     schema: Optional[dict] = None
+    json_schema: Optional[dict] = None
     regex: Optional[str] = None
     ebnf: Optional[str] = None
     format: Optional[xgrammar.structural_tag.Format] = None
@@ -193,6 +193,12 @@ def _response_format_to_guided_decoding_params(
                 "The 'schema' field is required when response_format.type is 'json'."
             )
         return GuidedDecodingParams(json=response_format.schema)
+    elif response_format.type == "json_schema":
+        if response_format.json_schema is None:
+            raise ValueError(
+                "The 'json_schema' field is required when response_format.type is 'json_schema'."
+            )
+        return GuidedDecodingParams(json=response_format.json_schema)
     elif response_format.type == "json_object":
         return GuidedDecodingParams(json_object=True)
     elif response_format.type == "regex":
@@ -396,6 +402,12 @@ ChatCompletionContentPartParam = Union[OpenAIChatCompletionContentPartParam,
 
 class CustomChatCompletionMessageParam(TypedDict, total=False):
     """Enables custom roles in the Chat Completion API."""
+
+    # This is so custom fields not in any of the `ChatCompletionMessage<XYZ>Param` defined by OpenAI
+    # are still allowed.
+    # Examples include: assistant messages with `reasoning` / `reasoning_content`.
+    __pydantic_config__ = ConfigDict(extra="allow")  # type: ignore
+
     role: Required[str]
     """The role of the message's author."""
 

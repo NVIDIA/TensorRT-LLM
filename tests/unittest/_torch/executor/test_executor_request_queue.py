@@ -42,8 +42,7 @@ def executor_queue(mock_dist):
                                 max_beam_width=1,
                                 max_num_active_requests=16,
                                 enable_iter_perf_stats=True,
-                                batch_wait_timeout_ms=0.0,
-                                is_disaggregated=False)
+                                batch_wait_timeout_ms=0.0)
 
 
 @pytest.fixture
@@ -55,8 +54,7 @@ def integration_queue(mock_dist):
                                 max_beam_width=2,
                                 max_num_active_requests=8,
                                 enable_iter_perf_stats=True,
-                                batch_wait_timeout_ms=0.0,
-                                is_disaggregated=False)
+                                batch_wait_timeout_ms=0.0)
 
 
 def test_executor_queue_init(executor_queue, mock_dist):
@@ -65,7 +63,6 @@ def test_executor_queue_init(executor_queue, mock_dist):
     assert not executor_queue.enable_attention_dp
     assert executor_queue.max_beam_width == 1
     assert executor_queue.max_num_active_requests == 16
-    assert not executor_queue.is_disaggregated
     assert executor_queue.next_request_id == 8
     assert executor_queue.enable_iter_perf_stats
     assert executor_queue.active
@@ -124,8 +121,7 @@ def test_merge_helix_requests_with_padding(mock_dist):
                                               max_beam_width=1,
                                               max_num_active_requests=16,
                                               enable_iter_perf_stats=True,
-                                              batch_wait_timeout_ms=0.0,
-                                              is_disaggregated=True)
+                                              batch_wait_timeout_ms=0.0)
 
         # Mock _should_exclude_last_generation_logits.
         with patch.object(executor_queue,
@@ -181,8 +177,7 @@ def test_merge_helix_requests_without_padding(mock_dist):
                                               max_beam_width=1,
                                               max_num_active_requests=16,
                                               enable_iter_perf_stats=True,
-                                              batch_wait_timeout_ms=0.0,
-                                              is_disaggregated=True)
+                                              batch_wait_timeout_ms=0.0)
 
         # Mock _should_exclude_last_generation_logits.
         with patch.object(executor_queue,
@@ -235,8 +230,7 @@ def test_merge_helix_requests_insufficient_blocks_error(mock_dist):
                                               max_beam_width=1,
                                               max_num_active_requests=16,
                                               enable_iter_perf_stats=True,
-                                              batch_wait_timeout_ms=0.0,
-                                              is_disaggregated=True)
+                                              batch_wait_timeout_ms=0.0)
 
         with pytest.raises(
                 ValueError,
@@ -598,8 +592,7 @@ def attention_dp_queue(mock_dist_attention_dp):
                                  max_beam_width=2,
                                  max_num_active_requests=8,
                                  enable_iter_perf_stats=True,
-                                 batch_wait_timeout_ms=0.0,
-                                 is_disaggregated=False)
+                                 batch_wait_timeout_ms=0.0)
     # Initialize all_ranks_num_active_requests
     return queue
 

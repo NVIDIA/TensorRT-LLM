@@ -339,11 +339,12 @@ def maybe_compile(func=None, **compile_kwargs):
     """
 
     def decorator(f):
+        compiled_func = torch.compile(f, **compile_kwargs)
 
         def wrapper(*args, **kwargs):
             if is_piecewise_running():
                 return f(*args, **kwargs)
-            return torch.compile(f, **compile_kwargs)(*args, **kwargs)
+            return compiled_func(*args, **kwargs)
 
         return wrapper
 
