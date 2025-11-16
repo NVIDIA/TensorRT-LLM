@@ -824,8 +824,11 @@ def detect_column_row_shard_new(
         return TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
 
     assert isinstance(gm, GraphModule), "Expecting GraphModule"
-
     ad_logger.info("Running TP sharding detection")
+    linear_nodes = list(filtered_nodes(gm.graph.nodes, is_any_lin_op))
+    if len(linear_nodes) == 0:
+        ad_logger.warning("Could not find any linear nodes in the graph. Skipping TP sharding.")
+        return TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
 
     layer_subgraphs, unprocessed_linear_nodes = get_all_layer_subgraphs(gm)
 
