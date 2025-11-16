@@ -1,5 +1,5 @@
-import os
 import asyncio
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
@@ -80,16 +80,16 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             self.master_port = get_free_port()
             self.use_rpc = ray_use_rpc()
 
-            self.worker_kwargs = dict(**worker_kwargs,
-                                 postproc_worker_config=postproc_worker_config,
-                                 is_llm_executor=is_llm_executor)
-            if not has_event_loop():
-                self.init_workers_sync()
+            self.worker_kwargs = dict(
+                **worker_kwargs,
+                postproc_worker_config=postproc_worker_config,
+                is_llm_executor=is_llm_executor)
 
             if self.use_rpc:
                 self.init_rpc_executor()
-                worker_kwargs['rpc_addr'] = self.rpc_addr
-                self.create_workers(RayGPUWorker, worker_kwargs)
+                self.worker_kwargs['rpc_addr'] = self.rpc_addr
+                if not has_event_loop():
+                    self.init_workers_sync()
                 self.setup_engine_remote()
                 self.setup_mainloop(tasks=[self._fetch_responses_loop_async],
                                     thread_name="ray_executor_main_loop")
@@ -111,7 +111,8 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
                     self.response_sync_queue)
                 self.response_queue.warmup.remote()
                 self.response_sync_queue.warmup.remote()
-                self.create_workers(RayGPUWorker, worker_kwargs)
+                if not has_event_loop():
+                    self.init_workers_sync()
 
         except Exception as e:
             self.shutdown()
@@ -149,25 +150,16 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
     def init_workers_sync(self):
         self.create_workers(RayGPUWorker, self.worker_kwargs)
         try:
-            ray.get([worker.__ray_ready__.remote() for worker in self.workers])
+            ray.get(self._get_worker_ready_futures())
         except ray.exceptions.ActorDiedError as e:
-            if "The actor died because of an error raised in its creation task" in str(
-                    e):
-                raise RuntimeError(
-                    "RayGPUWorker died during initialization") from e
-            raise
+            raise RuntimeError("RayGPUWorker died during initialization") from e
 
     async def init_workers_async(self):
         self.create_workers(RayGPUWorker, self.worker_kwargs)
         try:
-            await asyncio.gather(*[worker.__ray_ready__.remote() for worker in self.workers])
+            await asyncio.gather(*self._get_worker_ready_futures())
         except ray.exceptions.ActorDiedError as e:
-            if "The actor died because of an error raised in its creation task" in str(
-                    e):
-                raise RuntimeError(
-                    "RayGPUWorker died during initialization") from e
-            raise
-
+            raise RuntimeError("RayGPUWorker died during initialization") from e
 
     @unwrap_ray_errors()
     def call_all_ray_workers(self, func: str, leader_only: bool,
@@ -333,6 +325,9 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         if self.has_start_local_cluser and ray.is_initialized():
             logger.debug("Shutting down Ray cluster")
             ray.shutdown()
+
+    def _get_worker_ready_futures(self):
+        return [worker.__ray_ready__.remote() for worker in self.workers]
 
     def _get_placement_group(self,
                              tp_size: int) -> Tuple[PlacementGroup, List[int]]:
