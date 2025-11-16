@@ -1,3 +1,4 @@
+import gc
 import importlib
 import os
 from pathlib import Path
@@ -217,6 +218,8 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
             torch.cuda.synchronize()
             release_with_tag(*tags)
             torch.cuda.synchronize()
+            gc.collect()
+            torch.cuda.empty_cache()
         except Exception as e:
             logger.error(f"Encountered an error in sleep: {e}")
             raise e

@@ -6,6 +6,8 @@ from tensorrt_llm._ray_utils import control_action_decorator
 from tensorrt_llm._torch.modules.fused_moe.moe_load_balancer import MoeLoadBalancer
 from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm.logger import logger
+import pickle
+import base64
 
 
 class WorkerExtension:

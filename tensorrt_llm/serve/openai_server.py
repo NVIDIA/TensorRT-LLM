@@ -1022,8 +1022,8 @@ class OpenAIServer:
             "kv_cache",
             "model",
             "draft_model"]
-        #await self.llm._collective_rpc('sleep', args=(tags,))
-        print(f"david: release_memory {tags}")
+        #self.llm._collective_rpc('sleep', args=(tags,))
+        print(f"HTTP received: release_memory {tags}")
         return JSONResponse(content={"status": "success"})
 
     async def resume_memory(self, request: MemoryUpdateRequest) -> JSONResponse:
@@ -1037,14 +1037,14 @@ class OpenAIServer:
             "kv_cache",
             "model",
             "draft_model"]
-        #await self.llm._collective_rpc('wakeup', args=(tags,))
-        print(f"david: resume_memory {tags}")
+        #self.llm._collective_rpc('wakeup', args=(tags,))
+        print(f"HTTP received: resume_memory {tags}")
         return JSONResponse(content={"status": "success"})
 
     async def update_weights(self, request: UpdateWeightsRequest) -> JSONResponse:
         #await self.llm.update_weights_from_ipc_handles_async(request.weights)
-        print(f"david: update_weights {request.weights}")
-        await self.llm._collective_rpc('update_weights', args=(request.weights,))
+        print(f"HTTP received: update_weights")
+        self.llm._collective_rpc('update_weights', args=(request.weights,))
         return JSONResponse(content={"status": "success"})
 
     async def __call__(self, host, port, sockets: list[socket.socket] | None = None):

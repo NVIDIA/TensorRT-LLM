@@ -8,8 +8,9 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum, EnumMeta
 from pathlib import Path
-from typing import (Any, ClassVar, Dict, List, Literal, Optional, Set, Tuple,
-                    Type, TypeAlias, TypeVar, Union, get_args, get_origin)
+from typing import (TYPE_CHECKING, Any, ClassVar, Dict, List, Literal, Optional,
+                    Set, Tuple, Type, TypeAlias, TypeVar, Union, get_args,
+                    get_origin)
 
 import torch
 import yaml
@@ -18,6 +19,11 @@ from pydantic import Field as PydanticField
 from pydantic import PrivateAttr, field_validator, model_validator
 from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
+
+try:
+    from ray.util.placement_group import PlacementGroup
+except ImportError:
+    PlacementGroup = None
 
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
@@ -2743,6 +2749,26 @@ class TorchLlmArgs(BaseLlmArgs):
         "Allows users to extend the functions of the RayGPUWorker class.",
         status="prototype")
 
+    # Ray placement group config. Namings TBD.
+    placement_groups: Optional[List[Any]] = Field(
+        default=None,
+        description="List of Ray placement groups, one per node. "
+        "Each element must be a ray.util.placement_group.PlacementGroup instance.",
+        exclude_from_json=True,
+        status="prototype")
+
+    placement_bundle_indices: Optional[List[List[int]]] = Field(
+        default=None,
+        description="List of bundle indices for each placement group. "
+        "Outer list corresponds to placement_groups, inner list contains bundle indices for that group. ",
+        status="prototype")
+
+    per_worker_gpu_share: Optional[float] = Field(
+        default=None,
+        description="GPU fraction per worker for colocation scenarios. "
+        "Example: 0.1 means 10 actors can share one GPU. Defaults to 1.0 (one actor per GPU).",
+        status="prototype")
+
     enable_sleep: bool = Field(
         default=False,
         description=
@@ -3050,6 +3076,44 @@ class TorchLlmArgs(BaseLlmArgs):
             raise ValueError(
                 f"ray_worker_extension_cls is only supported with orchestrator_type='ray'"
             )
+        return self
+
+    @model_validator(mode='after')
+    def validate_ray_placement_config(self) -> 'TorchLlmArgs':
+        has_pgs = self.placement_groups is not None
+        has_indices = self.placement_bundle_indices is not None
+
+        if (has_pgs or has_indices) and self.orchestrator_type != "ray":
+            raise ValueError(
+                "placement_groups is only supported with orchestrator_type='ray'"
+            )
+
+        if has_pgs != has_indices:
+            raise ValueError(
+                "placement_groups and placement_bundle_indices must be provided together"
+            )
+
+        if has_pgs:
+            if len(self.placement_groups) != len(self.placement_bundle_indices):
+                raise ValueError(
+                    f"placement_groups length ({len(self.placement_groups)}) must equal "
+                    f"placement_bundle_indices length ({len(self.placement_bundle_indices)})"
+                )
+
+        if self.per_worker_gpu_share is not None:
+            if not (0 < self.per_worker_gpu_share <= 1.0):
+                raise ValueError(
+                    f"per_worker_gpu_share must be between 0 and 1.0, "
+                    f"got {self.per_worker_gpu_share}")
+
+        if has_pgs:
+            if PlacementGroup is not None:
+                for i, pg in enumerate(self.placement_groups):
+                    if not isinstance(pg, PlacementGroup):
+                        raise TypeError(
+                            f"placement_groups[{i}] must be a Ray PlacementGroup, "
+                            f"got {type(pg).__name__}")
+
         return self
 
     def get_executor_config(

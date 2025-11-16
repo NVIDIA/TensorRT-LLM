@@ -1,5 +1,5 @@
-import os
 import asyncio
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
@@ -8,8 +8,7 @@ except ModuleNotFoundError as e:
     e.msg = """Cannot import Ray. Please install 'ray' package to use ray orchestrator"""
     raise
 
-from ray.util.placement_group import (PlacementGroup,
-                                      PlacementGroupSchedulingStrategy,
+from ray.util.placement_group import (PlacementGroupSchedulingStrategy,
                                       get_current_placement_group,
                                       placement_group)
 
@@ -79,17 +78,17 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             self.master_address = ray.util.get_node_ip_address()
             self.master_port = get_free_port()
 
-            self.worker_kwargs = dict(**worker_kwargs,
-                                 postproc_worker_config=postproc_worker_config,
-                                 is_llm_executor=is_llm_executor)
-            if not has_event_loop():
-                self.init_workers_sync()
+            self.worker_kwargs = dict(
+                **worker_kwargs,
+                postproc_worker_config=postproc_worker_config,
+                is_llm_executor=is_llm_executor)
 
             self.init_rpc_executor()
             # Inject the generated HMAC key into worker_kwargs for workers
             worker_kwargs['hmac_key'] = self.hmac_key
             worker_kwargs['rpc_addr'] = self.rpc_addr
-            self.create_workers(RayGPUWorker, worker_kwargs)
+            if not has_event_loop():
+                self.init_workers_sync()
             self.setup_engine_remote()
             self.setup_mainloop(tasks=[self._fetch_responses_loop_async],
                                 thread_name="ray_executor_main_loop")
@@ -101,9 +100,13 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             raise e
 
     def create_workers(self, worker_cls, worker_kwargs):
+        llm_args = worker_kwargs.get("llm_args")
+
         # When set to be a fraction, it allows Ray to schedule
         # multiple actors on a single GPU for colocate use cases.
-        num_gpus = float(os.getenv("TRTLLM_RAY_PER_WORKER_GPUS", "1.0"))
+        num_gpus = (llm_args.per_worker_gpu_share if llm_args
+                    and llm_args.per_worker_gpu_share is not None else float(
+                        os.getenv("TRTLLM_RAY_PER_WORKER_GPUS", "1.0")))
         logger.debug(f"{num_gpus=} for each worker.")
 
         runtime_env = ray.runtime_env.RuntimeEnv()
@@ -114,42 +117,40 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             "MASTER_PORT": str(self.master_port)
         })
 
-        self.placement_group, self.bundle_indices = self._get_placement_group(
-            tp_size=self.tp_size)
+        placement_groups, self.bundle_indices = self._get_placement_group(
+            tp_size=self.tp_size, worker_kwargs=worker_kwargs)
 
-        self.workers = [
-            RayWorkerWrapper.options(
+        if isinstance(placement_groups, list):
+            self.placement_group = None
+        else:
+            self.placement_group = placement_groups
+
+        self.workers = []
+        for rank in range(self.world_size):
+            pg = placement_groups[rank] if isinstance(
+                placement_groups, list) else placement_groups
+            worker = RayWorkerWrapper.options(
                 num_gpus=num_gpus,
-                runtime_env=runtime_env,  # per-actor env
+                runtime_env=runtime_env,
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
-                    placement_group=self.placement_group,
+                    placement_group=pg,
                     placement_group_bundle_index=self.bundle_indices[rank],
                 )).remote(worker_cls, worker_kwargs, self.world_size, rank)
-            for rank in range(self.world_size)
-        ]
+            self.workers.append(worker)
 
     def init_workers_sync(self):
         self.create_workers(RayGPUWorker, self.worker_kwargs)
         try:
-            ray.get([worker.__ray_ready__.remote() for worker in self.workers])
+            ray.get(self._get_worker_ready_futures())
         except ray.exceptions.ActorDiedError as e:
-            if "The actor died because of an error raised in its creation task" in str(
-                    e):
-                raise RuntimeError(
-                    "RayGPUWorker died during initialization") from e
-            raise
+            raise RuntimeError("RayGPUWorker died during initialization") from e
 
     async def init_workers_async(self):
         self.create_workers(RayGPUWorker, self.worker_kwargs)
         try:
-            await asyncio.gather(*[worker.__ray_ready__.remote() for worker in self.workers])
+            await asyncio.gather(*self._get_worker_ready_futures())
         except ray.exceptions.ActorDiedError as e:
-            if "The actor died because of an error raised in its creation task" in str(
-                    e):
-                raise RuntimeError(
-                    "RayGPUWorker died during initialization") from e
-            raise
-
+            raise RuntimeError("RayGPUWorker died during initialization") from e
 
     @unwrap_ray_errors()
     def call_all_ray_workers(self, func: str, leader_only: bool,
@@ -188,6 +189,20 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
                 refs.append(w.call_worker_method.remote(method, *args,
                                                         **kwargs))
         return refs if non_block else ray.get(refs)
+
+    @unwrap_ray_errors()
+    async def collective_rpc_async(
+            self,
+            method: str,
+            args: tuple = (),
+            kwargs: Optional[dict] = None,
+            unique_reply_rank: Optional[int] = None) -> list[Any]:
+        refs = self.collective_rpc(method,
+                                   args,
+                                   kwargs,
+                                   non_block=True,
+                                   unique_reply_rank=unique_reply_rank)
+        return await asyncio.gather(*refs)
 
     def submit(self, request: "GenerationRequest") -> "GenerationResult":
         """
@@ -283,15 +298,51 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             logger.debug("Shutting down Ray cluster")
             ray.shutdown()
 
-    def _get_placement_group(self,
-                             tp_size: int) -> Tuple[PlacementGroup, List[int]]:
+    def _get_worker_ready_futures(self):
+        return [worker.__ray_ready__.remote() for worker in self.workers]
+
+    def _get_placement_group(
+            self,
+            tp_size: int,
+            worker_kwargs: Dict = None) -> Tuple[Any, List[int]]:
         """
         Either use the existing placement group from driver script (e.g., in the case of RL FW integration),
         or create a default PACK placement group where each bundle has tp_size GPUs.
          - When tp_size ≤ GPUs per node, keep one TP group per node.
          - When tp_size >  GPUs per node, allow a TP group span nodes.
          - rank 0 must be put on the driver node
+
+        Returns:
+            Tuple of (placement_group(s), bundle_indices)
+            - placement_group(s) can be a single PlacementGroup or a List[PlacementGroup]
+            - bundle_indices is always a List[int]
         """
+        llm_args = worker_kwargs.get("llm_args") if worker_kwargs else None
+
+        if llm_args and hasattr(
+                llm_args,
+                'placement_groups') and llm_args.placement_groups is not None:
+            total_workers = sum(
+                len(indices) for indices in llm_args.placement_bundle_indices)
+            if total_workers != self.world_size:
+                raise ValueError(
+                    f"Total bundle indices ({total_workers}) must equal world_size ({self.world_size})"
+                )
+
+            logger.info(
+                f"Creating {self.world_size} workers with external placement groups"
+            )
+
+            flat_pgs = []
+            flat_indices = []
+            for pg, indices in zip(llm_args.placement_groups,
+                                   llm_args.placement_bundle_indices):
+                for idx in indices:
+                    flat_pgs.append(pg)
+                    flat_indices.append(idx)
+
+            return flat_pgs, flat_indices
+
         bundle_indices = os.getenv("TRTLLM_RAY_BUNDLE_INDICES", None)
 
         if bundle_indices:

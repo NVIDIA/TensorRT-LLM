@@ -49,6 +49,7 @@ from .tokenizer import TokenizerBase, _xgrammar_tokenizer_info
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 from .utils import (append_docstring, exception_handler, get_device_count,
                     logger_debug, set_api_status)
+from ray.util.placement_group import PlacementGroup, placement_group
 
 
 class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
@@ -1163,10 +1164,3 @@ LLM.__doc__ = \
 
     Parameters:
 """ + TORCH_LLM_DOCSTRING
-
-class AsyncLLM(LLM):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-    async def async_init_phase(self):
-        await self._executor.init_workers_async()
