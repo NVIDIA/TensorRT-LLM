@@ -16,7 +16,6 @@ Our sharding algorithm for tensor parallelism (TP) is based on the following ste
        happens automatically via the checkpoint loading hook added in step 2c.
 """
 
-import operator
 import re
 from collections import defaultdict
 from typing import Any, DefaultDict, Dict, List, Set, Tuple, Type, Union
@@ -34,7 +33,6 @@ from ...utils.node_utils import (
     extract_weight_node,
     filtered_nodes,
     get_all_layer_subgraphs,
-    identify_regions_between_residuals,
     is_any_lin_op,
     is_op,
     subgraph,
@@ -796,7 +794,7 @@ def detect_ssm_shard(
     )
 
 
-def detect_column_row_shard_new(
+def detect_column_row_shard(
     gm: GraphModule,
     sharding_config: ShardingTransformContainer,
 ) -> TransformInfo:
@@ -817,11 +815,7 @@ def detect_column_row_shard_new(
     splitting, e.g., the individual heads into smaller shards.
     """
     ad_logger.debug("Before sharding graph: " + str(gm))
-
     rank, world_size = sharding_config.rank, sharding_config.world_size
-    if world_size < 2:
-        ad_logger.info("Skipping TP sharding for single device")
-        return TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
 
     assert isinstance(gm, GraphModule), "Expecting GraphModule"
     ad_logger.info("Running TP sharding detection")
