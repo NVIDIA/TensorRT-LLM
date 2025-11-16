@@ -605,5 +605,12 @@ class ModelConfig(Generic[TConfig]):
     def get_num_attention_layers(self):
         if is_nemotron_hybrid(self.pretrained_config):
             return self.pretrained_config.hybrid_override_pattern.count("*")
+        elif hasattr(
+                self.pretrained_config, "architectures"
+        ) and self.pretrained_config.architectures is not None and self.pretrained_config.architectures[
+                0] in ["Qwen3NextForCausalLM"]:
+            # Qwen3NextForCausalLM has hybrid attention pattern(1:3 full attention:linear attention),
+            # we need to calculate the number of fullattention layers
+            return self.pretrained_config.num_hidden_layers // self.pretrained_config.full_attention_interval
         else:
             return self.pretrained_config.num_hidden_layers
