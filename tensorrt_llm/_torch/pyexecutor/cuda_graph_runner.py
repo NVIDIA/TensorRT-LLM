@@ -61,7 +61,7 @@ class CUDAGraphRunnerConfig:
     max_beam_width: int
     max_num_tokens: int
     spec_config: Optional[DecodingBaseConfig]
-    cuda_graph_mem_pool: Any
+    cuda_graph_mem_pool: torch.cuda.MemPool
     use_mrope: bool
     original_max_draft_len: int
     original_max_total_draft_tokens: int
@@ -98,7 +98,9 @@ class CUDAGraphRunner:
         self.graph_outputs: Dict[Tuple[int, int, int],
                                  Callable[[], Optional[torch.Tensor]]] = {}
         self.graph_metadata: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
-        self.memory_pool = config.cuda_graph_mem_pool
+        self.memory_pool = config.cuda_graph_mem_pool if config.cuda_graph_mem_pool else torch.cuda.MemPool(
+        )
+        self.memory_pool_handle = self.memory_pool.id
         self.padding_dummy_request: Optional["Request"] = None
 
         self.shared_static_tensors: Dict[str, torch.Tensor] = {}
@@ -293,7 +295,7 @@ class CUDAGraphRunner:
                 if postprocess_fn is not None:
                     postprocess_fn(capture_inputs)
 
-            with torch.cuda.graph(graph, pool=self.memory_pool):
+            with torch.cuda.graph(graph, pool=self.memory_pool_handle):
                 output = _setup_spec_decoding_and_forward(
                     key, forward_fn, capture_inputs)
             if postprocess_fn is not None:
@@ -301,7 +303,6 @@ class CUDAGraphRunner:
 
         self.graphs[key] = graph
         self.graph_outputs[key] = make_weak_ref(output)
-        self.memory_pool = graph.pool()
 
     def replay(self, key: Tuple[int, int, int],
                current_inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
@@ -427,6 +428,6 @@ class CUDAGraphRunner:
         self.graph_outputs.clear()
         self.graph_metadata.clear()
         self.padding_dummy_request = None
-        del self.memory_pool
-        self.memory_pool = None
+        del self.memory_pool_handle
+        self.memory_pool_handle = None
         torch.cuda.empty_cache()
