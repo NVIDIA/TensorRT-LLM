@@ -1584,7 +1584,7 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         # affected by CP. For other layers, CP ranks are repurposed to TP. This shall be undone
         # at the end of __init__.
         if model_config.mapping.cp_size > 1:
-            logger.info(
+            print(
                 f"[DeepseekV3ForCausalLM::__init__] Repurposing KVP ranks to TP while keeping other details the same."
             )
             self.mapping_with_cp = copy.deepcopy(model_config.mapping)
@@ -1603,7 +1603,6 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                 tp_size=original_tp_size * original_cp_size,
                 pp_size=model_config.mapping.pp_size,
                 moe_ep_size=model_config.mapping.moe_ep_size,
-                auto_parallel=model_config.mapping.auto_parallel,
                 enable_attention_dp=model_config.mapping.enable_attention_dp)
             model_config._frozen = True
         ###############################################################################
@@ -1658,7 +1657,7 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         ###############################################################################
         # Undo any manipulations done to mapping.
         if self.mapping_with_cp is not None:
-            logger.info(
+            print(
                 f"[DeepseekV3ForCausalLM::__init__] Restoring original mapping."
             )
             model_config._frozen = False

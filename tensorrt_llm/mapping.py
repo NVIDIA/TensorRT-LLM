@@ -67,7 +67,7 @@ class MappingBase:
         #################################################################
         # TODO: Remove this hardcoding.
         if cp_size > 1:
-            assert cp_type == CpType.HELIX
+            cp_config = {"cp_type": CpType.HELIX}
         #################################################################
         moe_world_size = tp_size if cp_type == CpType.ULYSSES else tp_size * cp_size
 

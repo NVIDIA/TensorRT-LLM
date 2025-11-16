@@ -181,8 +181,9 @@ public:
         [[maybe_unused]] MlaParams<T> mla_params;
         if (op.isMLAEnabled())
         {
-            TORCH_CHECK(mla_tensor_params.size() == 1,
-                "Expecting 1 tensor for custom MLA tensor params: helix_position_offsets.");
+            std::cerr << "[attentionOp::run] mla_tensor_params.size() = " << mla_tensor_params.size() << std::endl;
+            TORCH_CHECK(mla_tensor_params.size() == 2,
+                "Expecting 2 tensor for custom MLA tensor params: helix_position_offsets and helix_inactive_rank.");
             if (is_context && op.mUseSparseAttention)
             {
                 if (latent_cache.has_value())

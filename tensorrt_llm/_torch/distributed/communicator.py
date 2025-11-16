@@ -1,3 +1,4 @@
+import copy
 import math
 import pickle  # nosec B403
 from abc import ABC, abstractmethod
@@ -359,8 +360,8 @@ class MPIDist(Distributed):
                 moe_cluster_size=self.mapping.moe_cluster_size,
                 moe_tp_size=self.mapping.moe_tp_size,
                 moe_ep_size=self.mapping.moe_ep_size,
-                attn_tp_size=self.mapping.attn_tp_size,
-                attn_cp_size=self.mapping.attn_cp_size,
+                # attn_tp_size=self.mapping.attn_tp_size,
+                # attn_cp_size=self.mapping.attn_cp_size,
                 enable_attention_dp=self.mapping.enable_attention_dp,
                 enable_lm_head_tp_in_adp=self.mapping.enable_lm_head_tp_in_adp)
             self.mapping = mapping_without_helix

@@ -1382,7 +1382,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         softmax_stats_tensor: Optional[torch.Tensor] = None,
         helix_position_offsets: Optional[torch.Tensor] = None,
         enable_attn_nvfp4_output: bool = True,
-        helix_position_offsets: Optional[torch.Tensor] = None,
         output: Optional[torch.Tensor] = None,
         output_sf: Optional[torch.Tensor] = None,
         attention_sinks: Optional[torch.Tensor] = None,
