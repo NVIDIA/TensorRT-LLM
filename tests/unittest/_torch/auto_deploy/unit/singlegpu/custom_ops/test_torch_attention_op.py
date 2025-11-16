@@ -479,7 +479,7 @@ class TestTorchBackendAttention:
 
         # Test metadata preparation
         result = torch.ops.auto_deploy.torch_cached_attention_prepare_metadata(
-            position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, 128
+            position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, 128, 128
         )
 
         # Verify result structure

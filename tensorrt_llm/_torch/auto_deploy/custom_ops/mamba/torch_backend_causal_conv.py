@@ -147,6 +147,7 @@ def torch_causal_conv_prepare_metadata(
     pages_per_seq: torch.Tensor,
     slot_idx: torch.Tensor,
     page_size: int,
+    chunk_size: int,
 ) -> List[torch.Tensor]:
     """Prepare metadata for cached causal conv.
 
@@ -341,7 +342,7 @@ class TorchBackendCausalConv(AttentionDescriptor):
                 in_channels,
                 kernel_size,
                 device=si.device,
-                dtype=cache_config.dtype or inp_fake.dtype,
+                dtype=inp_fake.dtype,
             )
 
         return {"conv_state_cache": _get_conv_cache}
