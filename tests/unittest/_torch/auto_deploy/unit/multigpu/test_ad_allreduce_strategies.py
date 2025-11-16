@@ -6,11 +6,20 @@ from pathlib import Path
 
 import pytest
 import torch
+import torch.nn as nn
 import yaml
 from click.testing import CliRunner
 from utils.cpp_paths import llm_root  # noqa: F401
 
+from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
+from tensorrt_llm._torch.auto_deploy.utils.sharding_utils import (
+    ShardingConfig,
+    SplitDimension,
+    WeightShardingInfo,
+)
 from tensorrt_llm.commands.bench import main
+from tensorrt_llm.functional import AllReduceStrategy
 
 
 class TimeoutError(Exception):
@@ -105,24 +114,7 @@ def _prepare_dataset(root_dir: str, temp_dir: str, model_path_or_name: str, num_
     ],
 )
 def test_allreduce_strategies(llm_root, shared_dataset, allreduce_strategy):  # noqa: F811
-    """Test different allreduce strategies with multi-GPU configuration.
-
-    This test validates that allreduce strategies are correctly passed through the
-    transform pipeline to the custom op execution. The strategy is configured in the
-    detect_sharding transform and passed as an explicit function argument to the
-    torch_dist_all_reduce custom op.
-
-    Implementation flow:
-        transforms.detect_sharding.allreduce_strategy (YAML config)
-            ↓ (transform creation)
-        ShardingTransformConfig.allreduce_strategy
-            ↓ (transform application)
-        WeightShardingInfo.allreduce_strategy
-            ↓ (graph node insertion)
-        torch_dist_all_reduce(tensor, strategy)
-            ↓ (custom op execution)
-        trtllm_allreduce(tensor, op, strategy=strategy)
-            ↓ (TRT-LLM AllReduce with specified strategy)
+    """Test different allreduce strategies with multi-GPU configuration making sure that there are no crashes or hangs.
 
     Configuration:
         The allreduce_strategy is set in the transforms config:
@@ -213,3 +205,108 @@ def test_allreduce_strategies(llm_root, shared_dataset, allreduce_strategy):  # 
                 f"Test timed out after {TEST_TIMEOUT_SECONDS}s for strategy {allreduce_strategy}. "
                 f"This might indicate a hang (e.g., TWOSHOT without C++ fix). Error: {e}"
             )
+
+
+@pytest.mark.parametrize(
+    "strategy",
+    [
+        "AUTO",
+        "NCCL",
+        "TWOSHOT",
+        "MIN_LATENCY",
+    ],
+)
+def test_allreduce_strategy_propagation(strategy):
+    """Test that allreduce_strategy is correctly propagated to graph nodes.
+
+    This test verifies that when we set an allreduce_strategy on the ShardingConfig,
+    it gets properly injected into the transforms and passed to the torch_dist_all_reduce
+    nodes in the compiled graph.
+    """
+
+    # Create a simple MLP model
+    class SimpleMLP(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear1 = nn.Linear(128, 256, bias=False)
+            self.linear2 = nn.Linear(256, 128, bias=False)
+
+        def forward(self, x):
+            return self.linear2(torch.relu(self.linear1(x)))
+
+    model = SimpleMLP()
+    dummy_input = torch.randn(2, 128)
+
+    # Export to graph
+    gm = torch_export_to_gm(model, (dummy_input,))
+
+    # Find linear nodes in the graph
+    from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op
+
+    linear_nodes = [node for node in gm.graph.nodes if is_linear_op(node)]
+    assert len(linear_nodes) == 2, f"Expected 2 linear nodes, found {len(linear_nodes)}"
+
+    linear1_node, linear2_node = linear_nodes[0], linear_nodes[1]
+
+    # Create sharding config with specified strategy
+    rank, world_size = 0, 4
+    sharding_config = ShardingConfig(
+        rank=rank, world_size=world_size, allreduce_strategy=AllReduceStrategy[strategy]
+    )
+
+    # Add transforms: column shard linear1, row shard linear2 (triggers allreduce)
+    sharding_config.add(
+        WeightShardingInfo(
+            target_node=linear1_node.name,
+            rank=rank,
+            world_size=world_size,
+            split_dim=SplitDimension.COLUMN,
+            dist_op=None,
+        )
+    )
+    sharding_config.add(
+        WeightShardingInfo(
+            target_node=linear2_node.name,
+            rank=rank,
+            world_size=world_size,
+            split_dim=SplitDimension.ROW,
+            dist_op="all_reduce",
+        )
+    )
+
+    # Verify transforms have the strategy injected
+    assert len(sharding_config.weight_sharding_transforms) == 2
+    for transform in sharding_config.weight_sharding_transforms:
+        assert transform.allreduce_strategy == AllReduceStrategy[strategy], (
+            f"Transform {transform.target_node} should have strategy {strategy}, got {transform.allreduce_strategy}"
+        )
+
+    # Apply transforms
+    for transform in sharding_config.weight_sharding_transforms:
+        node = next((n for n in gm.graph.nodes if n.name == transform.target_node), None)
+        if node:
+            transform.check_and_apply(gm, node)
+
+    gm.recompile()
+
+    # Verify the graph contains torch_dist_all_reduce nodes with correct strategy
+    allreduce_nodes = [
+        node for node in gm.graph.nodes if is_op(node, torch.ops.auto_deploy.torch_dist_all_reduce)
+    ]
+
+    # Should have exactly one allreduce node (from linear2 row sharding)
+    assert len(allreduce_nodes) == 1, f"Expected 1 allreduce node, found {len(allreduce_nodes)}"
+
+    # Verify the allreduce node has the correct strategy argument
+    allreduce_node = allreduce_nodes[0]
+    # torch_dist_all_reduce signature: (input, strategy_name)
+    assert len(allreduce_node.args) == 2, (
+        f"Expected 2 args for allreduce node, got {len(allreduce_node.args)}"
+    )
+
+    strategy_arg = allreduce_node.args[1]
+    assert strategy_arg == strategy, (
+        f"Expected allreduce strategy '{strategy}', got '{strategy_arg}'"
+    )
+
+    print(f"✓ Test passed: allreduce_strategy '{strategy}' correctly propagated to graph node")

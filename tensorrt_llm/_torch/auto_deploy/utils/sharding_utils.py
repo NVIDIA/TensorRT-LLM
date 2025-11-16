@@ -571,26 +571,13 @@ class SplitDimension(IntEnum):
 
 
 class ShardingTransformInfo(BaseModel, ABC):
-    """Abstract base class for transformation configurations.
-
-    NOTE: allreduce_strategy will be automatically injected by ShardingConfig.add()
-    if not provided at creation time. The strategy comes from the parent ShardingConfig.
-    """
+    """Abstract base class for transformation configurations."""
 
     model_config = ConfigDict(frozen=True)  # Makes the model immutable and hashable
 
     target_node: str
     rank: int
     world_size: int
-    allreduce_strategy: Optional[AllReduceStrategy] = None  # Set by ShardingConfig.add() if None
-
-    @field_validator("allreduce_strategy", mode="before")
-    @classmethod
-    def _validate_allreduce_strategy(cls, v):
-        """Convert string names like 'AUTO' to AllReduceStrategy enum."""
-        if v is None:
-            return None
-        return validate_allreduce_strategy(v)
 
     def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
         """
@@ -627,7 +614,11 @@ class LayerType(Enum):
 
 
 class WeightShardingInfo(ShardingTransformInfo):
-    """Configuration for TP sharding transformations."""
+    """Configuration for TP sharding transformations.
+
+    NOTE: allreduce_strategy will be automatically injected by ShardingConfig.add()
+    if not provided at creation time. The strategy comes from the parent ShardingConfig.
+    """
 
     split_dim: SplitDimension
     dist_op: Optional[Literal["all_reduce", "all_gather"]] = None
@@ -635,6 +626,7 @@ class WeightShardingInfo(ShardingTransformInfo):
     layer_type: LayerType = LayerType.MLP
     # used for TP sharding of fused weights
     fused_weight_dims: Optional[list] = None
+    allreduce_strategy: Optional[AllReduceStrategy] = None  # Set by ShardingConfig.add() if None
 
     def quantization_cb(
         self,
@@ -708,18 +700,9 @@ class WeightShardingInfo(ShardingTransformInfo):
 
 
 class ParameterUpdateInfo(ShardingTransformInfo):
-    """Configuration for node args sharding transformations.
+    """Configuration for node args sharding transformations."""
 
-    NOTE: This transformation doesn't insert distributed operations, so
-    allreduce_strategy has a default value (unlike other transformations).
-    """
-
-    target_node: str
-    rank: int
-    world_size: int
     args: tuple
-    # ParameterUpdateInfo doesn't insert distributed ops, so strategy doesn't matter
-    allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO
 
     def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
         """Validate the transformation configuration."""
@@ -1176,10 +1159,13 @@ def _insert_sharded_mxfp4_mlp_ep(
 
 
 class EPShardingInfo(ShardingTransformInfo):
-    """Configuration for EP sharding transformations."""
+    """Configuration for EP sharding transformations.
 
-    rank: int
-    world_size: int
+    NOTE: allreduce_strategy will be automatically injected by ShardingConfig.add()
+    if not provided at creation time. The strategy comes from the parent ShardingConfig.
+    """
+
+    allreduce_strategy: Optional[AllReduceStrategy] = None  # Set by ShardingConfig.add() if None
 
     @classmethod
     def from_node(cls, node: Node, **kwargs) -> "EPShardingInfo":
@@ -1343,9 +1329,9 @@ class ShardingConfig(BaseModel):
         Automatically propagates allreduce_strategy from this config to the transform
         if the transform doesn't already have one set.
         """
-        # Inject allreduce_strategy from config into transform if it's None
+        # Inject allreduce_strategy from config into transform if it has the attribute and it's None
         # This creates a new transform instance with the strategy set
-        if transform.allreduce_strategy is None:
+        if hasattr(transform, "allreduce_strategy") and transform.allreduce_strategy is None:
             # Create a new transform with the strategy injected
             transform_dict = transform.model_dump()
             transform_dict["allreduce_strategy"] = self.allreduce_strategy

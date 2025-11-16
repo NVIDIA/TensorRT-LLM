@@ -211,6 +211,7 @@ class Sharding(BaseTransform):
         sharding_config.rank = local_rank
         sharding_config.world_size = world_size
         sharding_config.allreduce_strategy = self.config.allreduce_strategy
+        ad_logger.info(f"Using allreduce strategy: {sharding_config.allreduce_strategy.name}")
         sharding_config.predefined_config = factory.get_sharding_config() if factory else {}
         sharding_config.factory_source = (
             sharding_config.predefined_config.get("source", ShardingConfigSource.UNKNOWN)
