@@ -1400,18 +1400,17 @@ class PyExecutor:
                         self.guided_decoder.add_batch(scheduled_batch)
                         self.guided_decoder.init_disagg_gen_requests()
 
-                previous_tensors = self.previous_batch and self.previous_batch.sample_state
-                # If there are previous draft tokens, we need to update the target requests to accept some draft tokens.
-                # When there's any accepted tokens, we can't directly use the previous batch's outputs in this iteration for the target model,
-                # so we'll set the target model's input to None and skip updating the target requests after target model forward.
-                use_previous_draft_tokens = self.has_previous_draft_tokens
-                if self.drafter is not None and (self.use_spec_decode
-                                                 or use_previous_draft_tokens):
-                    target_inputs = self._handle_speculative_decoding(
-                        scheduled_batch, previous_tensors,
-                        previous_tensors_device)
+                    previous_tensors = self.previous_batch and self.previous_batch.sample_state
+                    # If there are previous draft tokens, we need to update the target requests to accept some draft tokens.
+                    # When there's any accepted tokens, we can't directly use the previous batch's outputs in this iteration for the target model,
+                    # so we'll set the target model's input to None and skip updating the target requests after target model forward.
+                    use_previous_draft_tokens = self.has_previous_draft_tokens
+                    if self.drafter is not None and (self.use_spec_decode or
+                                                     use_previous_draft_tokens):
+                        target_inputs = self._handle_speculative_decoding(
+                            scheduled_batch, previous_tensors,
+                            previous_tensors_device)
 
-                if can_queue:
                     # Use the draft_model's outputs if we've launched the draft model.
                     # Otherwise, use the previous batch's outputs.
                     if (target_inputs is not None
