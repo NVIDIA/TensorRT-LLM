@@ -824,9 +824,9 @@ class NVFP4LinearMethod(LinearMethodBase):
                                                      act_sf,
                                                      module.weight_scale,
                                                      module.alpha, module.dtype)
-        # Take the dim of out_features if padded.
+        # Take the dim of out_features if padded. Make sure the output is contiguous
         if output.shape[-1] > module.out_features:
-            output = output[..., :module.out_features]
+            output = output[..., :module.out_features].contiguous()
 
         if bias is not None:
             output = output + bias
