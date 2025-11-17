@@ -1986,7 +1986,7 @@ class PyExecutor:
                     request.py_kv_transfer_start_time = None
                     request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
 
-            self.async_transfer_manager.end_transfer(request_id)
+            self.async_transfer_manager.end_transfer(request)
 
         self._check_cache_transfer_errors("context requests")
 

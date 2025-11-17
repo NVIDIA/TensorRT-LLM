@@ -47,10 +47,15 @@ class RequestQueueItem:
 class ExecutorRequestQueue:
     """Handles fetching and processing of new requests from the request queue."""
 
-    def __init__(self, dist: Distributed, enable_attention_dp: bool,
-                 max_batch_size: int, max_beam_width: int,
-                 max_num_active_requests: int, enable_iter_perf_stats: bool,
-                 batch_wait_timeout_ms: float, using_kv_connector: bool):
+    def __init__(self,
+                 dist: Distributed,
+                 enable_attention_dp: bool,
+                 max_batch_size: int,
+                 max_beam_width: int,
+                 max_num_active_requests: int,
+                 enable_iter_perf_stats: bool,
+                 batch_wait_timeout_ms: float,
+                 using_kv_connector: bool = False):
         self.dist = dist
         self.request_queue: queue.Queue[RequestQueueItem] = queue.Queue()
         self.waiting_queue: deque[RequestQueueItem] = deque()
