@@ -248,13 +248,13 @@ To do the benchmark, run the following command:
 
 ```bash
 # generate synthetic dataset
-python ${YOUR_WORK_PATH}/benchmarks/cpp/prepare_dataset.py \
-        --stdout \
-        --tokenizer nvidia/DeepSeek-R1-FP4 \
+trtllm-bench --model nvidia/DeepSeek-R1-FP4 \
+        dataset \
+        --output dataset.txt \
         token-norm-dist \
         --input-mean 1024 --output-mean 2048 \
         --input-stdev 0 --output-stdev 0 \
-        --num-requests 49152 > dataset.txt
+        --num-requests 49152
 
 YOUR_DATA_PATH=./dataset.txt
 
@@ -350,13 +350,14 @@ To do the benchmark, run the following command:
 
 ```bash
 # generate synthetic dataset
-python ${YOUR_WORK_PATH}/benchmarks/cpp/prepare_dataset.py \
-        --stdout \
-        --tokenizer deepseek-ai/DeepSeek-R1 \
+trtllm-bench --model nvidia/DeepSeek-R1-FP4 \
+        dataset \
+        --output dataset.txt \
         token-norm-dist \
         --input-mean 1024 --output-mean 2048 \
         --input-stdev 0 --output-stdev 0 \
-        --num-requests 5120 > dataset.txt
+        --num-requests 5120
+
 YOUR_DATA_PATH=./dataset.txt
 
 cat >./extra-llm-api-config.yml<<EOF
@@ -401,7 +402,7 @@ Average request latency (ms):                     181540.5739
 
 ## Exploring more ISL/OSL combinations
 
-To benchmark TensorRT LLM on DeepSeek models with more ISL/OSL combinations, you can use `prepare_dataset.py` to generate the dataset and use similar commands mentioned in the previous section. TensorRT LLM is working on enhancements that can make the benchmark process smoother.
+To benchmark TensorRT LLM on DeepSeek models with more ISL/OSL combinations, you can use the `trtllm-bench dataset` subcommand to generate the dataset and use similar commands mentioned in the previous section. TensorRT LLM is working on enhancements that can make the benchmark process smoother.
 ### WIP: Enable more features by default
 
 Currently, there are some features that need to be enabled through a user-defined file `extra-llm-api-config.yml`, such as CUDA graph, overlap scheduler and attention dp. We're working on to enable those features by default, so that users can get good out-of-the-box performance on DeepSeek models.
@@ -414,7 +415,7 @@ For more details on `max_batch_size` and `max_num_tokens`, refer to [Tuning Max 
 
 ### MLA chunked context
 
-MLA currently supports the chunked context feature on both Hopper and Blackwell GPUs. You can use `--enable_chunked_context` to enable it. This feature is primarily designed to reduce TPOT (Time Per Output Token). The default chunk size is set to `max_num_tokens`. If you want to achieve a lower TPOT, you can appropriately reduce the chunk size. However, please note that this will also decrease overall throughput. Therefore, a trade-off needs to be considered. 
+MLA currently supports the chunked context feature on both Hopper and Blackwell GPUs. You can use `--enable_chunked_context` to enable it. This feature is primarily designed to reduce TPOT (Time Per Output Token). The default chunk size is set to `max_num_tokens`. If you want to achieve a lower TPOT, you can appropriately reduce the chunk size. However, please note that this will also decrease overall throughput. Therefore, a trade-off needs to be considered.
 
 For more details on `max_num_tokens`, refer to [Tuning Max Batch Size and Max Num Tokens](../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.md).
 
