@@ -17,6 +17,7 @@
 
 #include "refAttention.h"
 #include <cstdint>
+#include <cstdio>
 
 template <typename T>
 Vec<float, validElemsPerHead> toF32Head(Vec<T, validElemsPerHead> const& src)
@@ -50,7 +51,8 @@ using Vector = Matrix<Type, Size, 1>;
 template <typename MathElem, uint32_t tileSize, bool isPaged, bool useBeamSearch>
 Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refFlashAttention(IOHead const* q,
     CacheSeq<isPaged, useBeamSearch> const& k, CacheSeq<isPaged, useBeamSearch> const& v, uint32_t seqLen, float qScale,
-    float kvScale, float xScale, uint32_t slidingWinSize, float* attentionSinks)
+    float kvScale, float xScale, uint32_t slidingWinSize, float* attentionSinks, float skip_softmax_threshold,
+    uint32_t* skipped_block_count, uint32_t* total_block_count)
 {
     uint32_t const nbTiles = divUp(seqLen, tileSize);
     auto gemm1Acc = Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor>::Zero().eval();
@@ -88,7 +90,23 @@ Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refFlashAt
             }
         }
 
-        Eigen::Vector<float, headGrpSize> const tileRowMax = gemm0Acc.rowwise().maxCoeff().cwiseMax(rowMax).eval();
+        Eigen::Vector<float, headGrpSize> const localRowMax = gemm0Acc.rowwise().maxCoeff().eval();
+        Eigen::Vector<float, headGrpSize> const tileRowMax = localRowMax.cwiseMax(rowMax).eval();
+
+        // printf("\n===================\n");
+
+        // add skip softmax threshold here
+        if (skip_softmax_threshold > 0)
+        {
+            *total_block_count += 1;
+            auto const skip_softmax_mask = ((localRowMax - tileRowMax).array().exp() < skip_softmax_threshold);
+            bool const skip_block = skip_softmax_mask.all() && (idxTile != nbTiles - 1);
+            if (skip_block)
+            {
+                *skipped_block_count += 1;
+                continue;
+            }
+        }
 
         Eigen::Matrix<float, headGrpSize, tileSize, Eigen::RowMajor> tileX
             = (gemm0Acc.colwise() - tileRowMax).array().exp().eval();
@@ -138,7 +156,8 @@ Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refFlashAt
     template Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor>                                     \
     refFlashAttention<prec, tileSize, isPaged, useBeamSearch>(IOHead const* q,                                         \
         CacheSeq<isPaged, useBeamSearch> const& k, CacheSeq<isPaged, useBeamSearch> const& v, uint32_t seqLen,         \
-        float qScale, float kvScale, float xScale, uint32_t slidingWinSize, float* attentionSinks)
+        float qScale, float kvScale, float xScale, uint32_t slidingWinSize, float* attentionSinks,                     \
+        float skip_softmax_threshold, uint32_t* skipped_block_count, uint32_t* total_block_count)
 
 INSTANTIATE_refFlashAttention(CacheElem, 64, false, false);
 INSTANTIATE_refFlashAttention(CacheElem, 64, false, true);

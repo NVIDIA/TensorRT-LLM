@@ -49,6 +49,10 @@ static_assert(specDecQLen * headGrpSize <= 32, "SPEC_Q_SEQ_LEN macro value is to
 #define SWAP_AB (!SPEC_DEC)
 #endif
 
+#if SKIP_SOFTMAX_ATTN
+static_assert(SWAP_AB && USE_PAGED_KV_CACHE && !SPEC_DEC && BEAM_WIDTH == 1, "SKIP_SOFTMAX_ATTN is not supported.");
+#endif
+
 #define IS_SUPPORTED_F16_CASE (CACHE_ELEM_ENUM == 0 && !SPEC_DEC && SWAP_AB && !USE_INPUT_KV && !LOW_PREC_OUTPUT)
 
 inline constexpr bool swapAB = SWAP_AB;
@@ -138,25 +142,36 @@ using PaddedOutHead = PaddedInputHead;
 
 struct alignas(128) SharedMem
 {
+    using QBuffer = Vec<Array2D<LdGrain, ctaNbQHeads, grainsPerQPart>, nbQParts>;
     using KBuffer = Array2D<LdGrain, gemm0CtaTileNbTokens, exactDiv(cacheHeadPartBytes, grainBytes)>;
-    static constexpr uint32_t nbKBuf = 2;
-    KBuffer k[nbKBuf]; // as is loaded from global mem.
     using XBuffer = Vec<Array2D<LdGrain, ctaNbQHeads, grainsPerXPart>, nbXParts>;
-    static constexpr uint32_t nbXBuf
-        = 2 * (gemm0CtaTileNbTokens >= gemm1CtaTileNbTokens ? 1 : exactDiv(gemm1CtaTileNbTokens, gemm0CtaTileNbTokens));
     using VBuffer = Vec<Array2D<LdGrain, gemm1CtaTileNbTokens, exactDiv(cacheHeadPartBytes, grainBytes),
                             sizeof(XBuffer) % (cacheHeadPartBytes * 8) == 0>,
         cacheHeadNbParts>;
 #if !SWAP_AB
     using VTBuffer = Array2D<LdGrain, headElems, exactDiv(gemm1CtaTileNbTokens, cacheElemsPerGrain), true>;
 #endif
-    static constexpr uint32_t nbVBuf = 2;
 #if CACHE_ELEM_ENUM == 0
     using OutSwizzleBuf = Array2D<LdGrain, ctaNbQHeads, grainsPerPaddedInputHead>;
 #elif CACHE_ELEM_ENUM == 2
     using OutSwizzleBuf = Array2D<Vec<Vec<InputElem, 4>, 4>, ctaNbQHeads, exactDiv(headElems, 4 * 4)>;
 #endif
+
+    static constexpr uint32_t nbKBuf = 2;
+#if SKIP_SOFTMAX_ATTN
+    static constexpr uint32_t nbVBuf = 3; // @fixme: skip_softmax_attn: for skip softmax attn, an extra VBuffer is used
+    static constexpr uint32_t nbXBuf
+        = 3 * (gemm0CtaTileNbTokens >= gemm1CtaTileNbTokens ? 1 : exactDiv(gemm1CtaTileNbTokens, gemm0CtaTileNbTokens));
+#else
+    static constexpr uint32_t nbVBuf = 2;
+    static constexpr uint32_t nbXBuf
+        = 2 * (gemm0CtaTileNbTokens >= gemm1CtaTileNbTokens ? 1 : exactDiv(gemm1CtaTileNbTokens, gemm0CtaTileNbTokens));
+#endif
     static_assert(nbXBuf == nbVBuf);
+
+    // note: buffers used for GMMA may have additional alignment requirements
+    KBuffer k[nbKBuf]; // as is loaded from global mem.
+    QBuffer q;         // For gmma math. Conversion done if needed.
 
     union ReusedXVOutSwizzleBuf
     {
@@ -196,9 +211,6 @@ struct alignas(128) SharedMem
         return reusedXVOutSwizzleBuf[i].outSwizzle;
     }
 
-    using QBuffer = Vec<Array2D<LdGrain, ctaNbQHeads, grainsPerQPart>, nbQParts>;
-    QBuffer q; // For gmma math. Conversion done if needed.
-
     // @fixme: move these into reusedXVOutSwizzleBuf
 #if SWAP_AB
     ShmQWiseVec xColMax[nbXBuf];
@@ -220,6 +232,11 @@ struct alignas(128) SharedMem
     Vec<KVCachePageIndex, nbPagesPerTile> pages[2]; // one for K and one for V
 #endif
 
+#if SKIP_SOFTMAX_ATTN
+    uint32_t skipSoftmaxVotesGemm0ToV[nbXBuf];     // guarded by skipSoftmaxXBar
+    uint32_t skipSoftmaxVotesGemm0ToGemm1[nbXBuf]; // guarded by xBar
+#endif
+
     // mem barriers
 
     CtaBarrierPair qBar;
@@ -229,6 +246,9 @@ struct alignas(128) SharedMem
     CtaBarrierPair vtBar[nbVBuf];
 #endif
     CtaBarrierPair xBar[nbXBuf];
+#if SKIP_SOFTMAX_ATTN
+    CtaBarrierPair skipSoftmaxXBar[nbXBuf]; // for V to wait for X to be ready
+#endif
 
     // used internally in the gemm0 warp group
     // @fixme: use separate arrive and wait for all usage
@@ -425,8 +445,13 @@ __device__ void warpGrpApplyMask(Gemm0Acc& acc, SpecDec const& specDec,
 #endif
 
 #if SWAP_AB
+#if SKIP_SOFTMAX_ATTN
+__device__ RegColWiseVec computeWarpGrpColMax_sync(CtaBarrier& warpGrpBar, ShmQWiseVec& smemColMax, Gemm0Acc const& src,
+    float skipSoftmaxThreshold, uint32_t* smemSkipVote, bool& shouldSkipSoftmaxAttn);
+#else
 __device__ RegColWiseVec computeWarpGrpColMax_sync(
     CtaBarrier& warpGrpBar, ShmQWiseVec& smemColMax, Gemm0Acc const& src);
+#endif
 __device__ void warpGrpApplyMask(uint32_t warpRank, Gemm0Acc& acc, uint32_t validRowBeg, uint32_t validRowEnd);
 __device__ void warpGrpOnlineSoftmax(Gemm0Acc& acc, RegColWiseVec const& colMax);
 __device__ RegColWiseVec computeWarpColSum(Gemm0Acc& src);
@@ -676,6 +701,12 @@ CUBIN_EXPORT __global__
 #if SPEC_DEC
             SpecDecParams const specDecParams,
 #endif
+#if SKIP_SOFTMAX_ATTN
+            float const* __restrict__ const skipSoftmaxThresholdPtr,
+#if SKIP_SOFTMAX_ATTN_BLOCK_STATS
+            uint32_t* __restrict__ skipped_block_count, uint32_t* __restrict__ total_block_count,
+#endif
+#endif
             uint32_t* __restrict__ const semaphores
             = nullptr, // [nbReq][nbKHeads][divUp(specDecParams.qSeqLen, inputTokensPerCta)]
             void* __restrict__ const scratch = nullptr)
@@ -753,6 +784,14 @@ CUBIN_EXPORT __global__
     uint32_t const nbSubSeq = isMultiBlockMode ? mha::min(nbTilesInUse / multiBlockMinNbTilesPerCta, maxNbSubSeq) : 1;
     static_assert(multiBlockMinNbTiles >= multiBlockMinNbTilesPerCta * 2);
     assert(isMultiBlockMode == (nbSubSeq > 1));
+#if SKIP_SOFTMAX_ATTN
+    if (isMultiBlockMode)
+    {
+        printf("MultiBlockMode is not implemented for skip softmax attention!\n");
+        __trap();
+    }
+    float const skipSoftmaxThreshold = skipSoftmaxThresholdPtr == nullptr ? 0.0f : skipSoftmaxThresholdPtr[0];
+#endif
     if (idxSubSeq >= nbSubSeq)
     {
         return;
@@ -776,21 +815,28 @@ CUBIN_EXPORT __global__
     assert(dynamicSmemSize() >= sizeof(SharedMem));
     SharedMem& smem = *reinterpret_cast<SharedMem*>(&smemByteBuf[0]);
 
-    constexpr uint32_t nbBuffers = 2;
-    static_assert(nbBuffers == SharedMem::nbKBuf && nbBuffers == SharedMem::nbVBuf && nbBuffers == SharedMem::nbXBuf);
-    if (wid < nbBuffers)
+    constexpr uint32_t maxNbBuffers = SharedMem::nbXBuf;
+    static_assert(maxNbBuffers >= SharedMem::nbKBuf && maxNbBuffers == SharedMem::nbVBuf);
+    if (wid < maxNbBuffers)
     {
         if (warpElectSync())
         {
-            smem.kBar[wid].initialize(gemm0NbThrds, gemm0NbThrds + warp_size);
+            if (wid < SharedMem::nbKBuf)
+            {
+                smem.kBar[wid].initialize(gemm0NbThrds, gemm0NbThrds + warp_size);
+            }
+
             smem.vBar[wid].initialize(gemm1NbThrds, gemm1NbThrds + warp_size);
 #if !SWAP_AB
             smem.vtBar[wid].initialize(gemm1NbThrds * 2, gemm1NbThrds * 2);
 #endif
             smem.xBar[wid].initialize(gemm0NbThrds + gemm1NbThrds, gemm0NbThrds + gemm1NbThrds);
+#if SKIP_SOFTMAX_ATTN
+            smem.skipSoftmaxXBar[wid].initialize(gemm0NbThrds + warp_size, gemm0NbThrds + warp_size);
+#endif
         }
     }
-    else if (wid == nbBuffers)
+    else if (wid == maxNbBuffers)
     {
         if (warpElectSync())
         {
@@ -817,6 +863,10 @@ CUBIN_EXPORT __global__
     {
 #if SPEC_DEC
         SpecDec const specDec{specDecParams, idxReq, idxInputSubSeq, cacheSeqLen};
+#endif
+
+#if SKIP_SOFTMAX_ATTN_BLOCK_STATS
+        uint32_t local_skipped_block_count = 0;
 #endif
 
         // QK gemm
@@ -940,9 +990,42 @@ CUBIN_EXPORT __global__
                 }
             }
 #endif
+
+            uint32_t const idxXBuf = idxIter % SharedMem::nbXBuf;
+            auto& xBar = smem.xBar[idxXBuf];
             // update colMax in shared mem and get a register copy
 #if SWAP_AB
+#if SKIP_SOFTMAX_ATTN
+            bool shouldSkipSoftmaxAttn = false;
+            auto& skipSoftmaxXBar = smem.skipSoftmaxXBar[idxXBuf];
+            skipSoftmaxXBar.consumed.arrive_and_wait();
+            if (threadIdx.x == 0)
+            {
+                smem.skipSoftmaxVotesGemm0ToV[idxXBuf] = 1U;
+            }
+            smem.gemm0WarpGrpBar.arrive_and_wait();
+
+            RegColWiseVec const colMax = computeWarpGrpColMax_sync(smem.gemm0WarpGrpBar, smem.gemm0CurrentSeqMax, acc,
+                idxIter == nbIters - 1 ? 0.0f : skipSoftmaxThreshold, &smem.skipSoftmaxVotesGemm0ToV[idxXBuf],
+                shouldSkipSoftmaxAttn);
+            unused(skipSoftmaxXBar.produced.arrive());
+            if (idxIter != nbIters - 1 && shouldSkipSoftmaxAttn)
+            {
+                xBar.consumed.arrive_and_wait();
+                if (threadIdx.x == 0)
+                {
+                    smem.skipSoftmaxVotesGemm0ToGemm1[idxXBuf] = 1U;
+#if SKIP_SOFTMAX_ATTN_BLOCK_STATS
+                    local_skipped_block_count++;
+#endif
+                }
+                asm volatile("fence.proxy.async.shared::cta;\n"); // maybe not used
+                unused(xBar.produced.arrive());
+                continue;
+            }
+#else
             RegColWiseVec const colMax = computeWarpGrpColMax_sync(smem.gemm0WarpGrpBar, smem.gemm0CurrentSeqMax, acc);
+#endif
             warpGrpOnlineSoftmax(acc, colMax);
 #else
             RegRowWiseVec const rowMax = computeWarpGrpRowMax_sync(warpRank, smem.gemm0CurrentSeqMax, acc);
@@ -959,8 +1042,6 @@ CUBIN_EXPORT __global__
             // map 1 to fp8_max before conversion to fp8
             acc = acc * kE4M3_MAX;
 
-            uint32_t const idxXBuf = idxIter % SharedMem::nbXBuf;
-            auto& xBar = smem.xBar[idxXBuf];
             // @fixme: for fp16/bf16, try not to transpose acc here, and leave it to the next GEMM.
 #if SWAP_AB
             storeGemm0AccToShm(warpRank, laneId(), smem.xBuf(idxXBuf), xBar.consumed, acc);
@@ -989,13 +1070,25 @@ CUBIN_EXPORT __global__
             storeShmRowWiseVec(warpRank, smem.xRowMax[idxXBuf], rowMax);
             storeShmRowWiseVec(warpRank, smem.xRowSum[idxXBuf], rowSum);
 #endif
-
+#if SKIP_SOFTMAX_ATTN
+            if (threadIdx.x == 0)
+            {
+                smem.skipSoftmaxVotesGemm0ToGemm1[idxXBuf] = shouldSkipSoftmaxAttn;
+            }
+#endif
             __syncwarp();
             // the release semantics of arrive does not work for async consumers like gmma. additional fence is
             // needed.
             asm volatile("fence.proxy.async.shared::cta;\n");
             unused(xBar.produced.arrive());
         }
+#if SKIP_SOFTMAX_ATTN && SKIP_SOFTMAX_ATTN_BLOCK_STATS
+        if (threadIdx.x == 0)
+        {
+            atomicAdd(skipped_block_count, local_skipped_block_count);
+            atomicAdd(total_block_count, nbIters);
+        }
+#endif
         unused(smem.qBar.consumed.arrive());
     }
     else if (warpIdx.z == 1)
@@ -1043,7 +1136,23 @@ CUBIN_EXPORT __global__
             uint32_t idxVTile = idxVTileInit + idxIter * nbSubSeq;
             auto const idxVBuf = idxIter % SharedMem::nbVBuf;
             auto const idxXBuf = idxVBuf;
+            auto& xBar = smem.xBar[idxXBuf];
             auto& vBar = smem.vBar[idxVBuf];
+            xBar.produced.arrive_and_wait();
+#if SKIP_SOFTMAX_ATTN
+            bool shouldSkipSoftmaxAttn = smem.skipSoftmaxVotesGemm0ToGemm1[idxXBuf]; // guarded by xBar
+            if (idxIter != nbIters - 1 && shouldSkipSoftmaxAttn)
+            {
+                vBar.produced.arrive_and_wait();
+                unused(xBar.consumed.arrive());
+#if SWAP_AB
+                unused(vBar.consumed.arrive());
+#else
+                static_assert(false, "not implemented");
+#endif
+                continue;
+            }
+#endif
             arrive_tx_and_wait(vBar.produced, exactDiv(sizeof(SharedMem::VBuffer), gemm1NbThrds));
             auto const& vBuf = smem.vBuf(idxVBuf);
 #if !SWAP_AB
@@ -1054,8 +1163,6 @@ CUBIN_EXPORT __global__
             vBar.consumed.arrive();
             vtBar.produced.arrive();
 #endif
-            auto& xBar = smem.xBar[idxXBuf];
-            xBar.produced.arrive_and_wait();
 #if !defined(NDEBUG) && DBG_PRINT
 #if SWAP_AB
             if (threadIdx.x == 0)
@@ -1471,8 +1578,31 @@ CUBIN_EXPORT __global__
                     tensorMap
 #endif
             };
+#if SKIP_SOFTMAX_ATTN
+            for (auto& b : smem.skipSoftmaxXBar)
+            {
+                unused(b.consumed.arrive());
+            }
+#endif
             for (uint32_t idxIter = 0; idxIter < nbIters; idxIter++)
             {
+                uint32_t const idxVBuf = idxIter % SharedMem::nbVBuf;
+                auto& vBar = smem.vBar[idxVBuf];
+#if SKIP_SOFTMAX_ATTN
+                uint32_t idxXBuf = idxIter % SharedMem::nbXBuf;
+                auto& skipSoftmaxXBar = smem.skipSoftmaxXBar[idxXBuf];
+                skipSoftmaxXBar.produced.arrive_and_wait();
+                bool shouldSkipSoftmaxAttn = smem.skipSoftmaxVotesGemm0ToV[idxXBuf];
+                skipSoftmaxXBar.consumed.arrive();
+                if (idxIter != nbIters - 1 && shouldSkipSoftmaxAttn)
+                {
+                    vBar.consumed.arrive_and_wait();
+                    vBar.produced.arrive_tx(0, 0);
+                    // GEMM1 Warp Group will wait on vBar.produced with no tx_count
+                    continue;
+                }
+#endif
+
                 uint32_t const idxVTile = idxVTileInit + idxIter * nbSubSeq;
                 vTileLoader.loadPages(idxVTile);
 #if USE_INPUT_KV || ENABLE_PDL == 2
@@ -1506,8 +1636,6 @@ CUBIN_EXPORT __global__
                 }
 #endif
 
-                uint32_t const idxVBuf = idxIter % SharedMem::nbVBuf;
-                auto& vBar = smem.vBar[idxVBuf];
                 vBar.consumed.arrive_and_wait();
                 if (warpElectSync())
                 {
@@ -1533,6 +1661,7 @@ CUBIN_EXPORT __global__
     {
         return;
     }
+    // todo: skip_softmax_attn: fix multiblockmode
     bool& smemIsLastCta = smem.isLastCta;
     if (threadIdx.x == gemm1NbThrds - 1U && threadIdx.z == 0)
     {
@@ -1992,8 +2121,13 @@ __device__ inline void warpGrpApplyMask(Gemm0Acc& acc, SpecDec const& specDec,
 #endif // SPEC_DEC
 
 // smemColMax is persistent across multiple iterations
+#if SKIP_SOFTMAX_ATTN
+__device__ inline RegColWiseVec computeWarpGrpColMax_sync(CtaBarrier& warpGrpBar, ShmQWiseVec& smemColMax,
+    Gemm0Acc const& src, float skipSoftmaxThreshold, uint32_t* smemSkipVote, bool& shouldSkipSoftmaxAttn)
+#else
 __device__ inline RegColWiseVec computeWarpGrpColMax_sync(
     CtaBarrier& warpGrpBar, ShmQWiseVec& smemColMax, Gemm0Acc const& src)
+#endif
 {
     auto colMax = RegColWiseVec::filled(Vec<float, 2>::filled(safeInitRowMax));
 #pragma unroll
@@ -2042,6 +2176,39 @@ __device__ inline RegColWiseVec computeWarpGrpColMax_sync(
         }
     }
     warpGrpBar.arrive_and_wait();
+#if SKIP_SOFTMAX_ATTN
+    bool localShouldSkip = true;
+    if (lane < 4)
+    {
+#pragma unroll
+        for (uint32_t n = 0; n < src.cols; n++)
+        {
+#pragma unroll
+            for (uint32_t j = 0; j < 2; j++)
+            {
+                if (8 * n + 2 * lane + j < headGrpSize)
+                {
+                    localShouldSkip
+                        &= exp2f((colMax[n][j] - smemColMax[8 * n + 2 * lane + j]) * log2e) < skipSoftmaxThreshold;
+                }
+            }
+        }
+    }
+    localShouldSkip = __all_sync(0xffffffff, static_cast<int>(localShouldSkip));
+    if (warpElectSync())
+    {
+        atomicAnd(smemSkipVote, static_cast<uint32_t>(localShouldSkip));
+    }
+    warpGrpBar.arrive_and_wait();
+
+    shouldSkipSoftmaxAttn = static_cast<bool>(smemSkipVote[0]);
+    if (shouldSkipSoftmaxAttn)
+    {
+        // todo: fixme: here we do not handle last block properly
+        return colMax;
+    }
+#endif
+
     uint32_t const idxInQuad = lane % 4;
 
 #pragma unroll
@@ -3269,6 +3436,12 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if SPEC_DEC
     SpecDecParams const& specDecParams,
 #endif
+#if SKIP_SOFTMAX_ATTN
+    float const* __restrict__ const skipSoftmaxThresholdPtr,
+#if SKIP_SOFTMAX_ATTN_BLOCK_STATS
+    uint32_t* __restrict__ skipped_block_count, uint32_t* __restrict__ total_block_count,
+#endif
+#endif
     uint32_t* semaphores, void* scratch, cudaStream_t stream)
 {
     if (beamWidth != 1)
@@ -3310,6 +3483,8 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
     // gridDim.z == nbKHeads * batchSize && gridDim.y == nbSubSeqPerSeq && gridDim.x == nbInputSeqSplit
     dim3 const dimGrid{divUp(qSeqLen, inputTokensPerCta), nbSubSeqPerSeq, nbKHeads * batchSize};
     dim3 const dimCta{warp_size * gmmaWarpsPerGrp, 1, 3};
+    // printf("dimGrid: %d, %d, %d\n", dimGrid.x, dimGrid.y, dimGrid.z);
+    // printf("dimCta: %d, %d, %d\n", dimCta.x, dimCta.y, dimCta.z);
     auto const launchCfg = makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, ENABLE_PDL != 0);
 #if USE_PAGED_KV_CACHE
     uint32_t const maxNbPagesPerSeq = exactDiv(maxSeqLen, tokensPerPage);
@@ -3371,6 +3546,12 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #endif
 #if SPEC_DEC
         specDecParams,
+#endif
+#if SKIP_SOFTMAX_ATTN
+        skipSoftmaxThresholdPtr,
+#if SKIP_SOFTMAX_ATTN_BLOCK_STATS
+        skipped_block_count, total_block_count,
+#endif
 #endif
         semaphores, scratch);
 #else

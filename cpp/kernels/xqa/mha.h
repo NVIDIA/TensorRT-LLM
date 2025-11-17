@@ -128,6 +128,12 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t const nbKHeads,
 #if SPEC_DEC
     SpecDecParams const& specDecParams,
 #endif
+#if SKIP_SOFTMAX_ATTN
+    float const* __restrict__ const skipSoftmaxThresholdPtr,
+#if SKIP_SOFTMAX_ATTN_BLOCK_STATS
+    uint32_t* __restrict__ skipped_block_count, uint32_t* __restrict__ total_block_count,
+#endif
+#endif
     uint32_t* semaphores, void* scratch, cudaStream_t stream);
 
 void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
@@ -167,6 +173,12 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
                                             // int8/fp8 KV cache.
 #if SPEC_DEC
     SpecDecParams const& specDecParams,
+#endif
+#if SKIP_SOFTMAX_ATTN
+    float const* __restrict__ const skipSoftmaxThresholdPtr,
+#if SKIP_SOFTMAX_ATTN_BLOCK_STATS
+    uint32_t* __restrict__ skipped_block_count, uint32_t* __restrict__ total_block_count,
+#endif
 #endif
     uint32_t* semaphores, void* scratch, cudaStream_t stream);
 

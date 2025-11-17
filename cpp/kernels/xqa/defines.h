@@ -129,6 +129,14 @@ static_assert(SPEC_DEC, "SPEC_Q_SEQ_LEN should only be used when SPEC_DEC is ena
 #define SLIDING_WINDOW 0
 #endif
 
+#ifndef SKIP_SOFTMAX_ATTN
+#define SKIP_SOFTMAX_ATTN 1
+#endif
+
+#ifndef SKIP_SOFTMAX_ATTN_BLOCK_STATS
+#define SKIP_SOFTMAX_ATTN_BLOCK_STATS 1
+#endif
+
 // 0 - no PDL
 // 1 - naive PDL
 // 2 - aggressive PDL (implemented only in mha_sm90.cu for now)
