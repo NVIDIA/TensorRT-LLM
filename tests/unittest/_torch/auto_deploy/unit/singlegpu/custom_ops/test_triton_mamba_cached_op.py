@@ -114,7 +114,7 @@ def test_triton_context_flattened_and_state_writeback(mamba_env):
     )
 
     max_batch_size = 2
-    slot_idx = torch.tensor([1], device=device, dtype=torch.int32)
+    slot_idx = torch.tensor([1], device=device, dtype=torch.long)
     ssm_state_cache_torch = torch.randn(
         max_batch_size, num_heads, head_dim, ssm_state_size, device=device, dtype=dtype
     )
@@ -123,6 +123,18 @@ def test_triton_context_flattened_and_state_writeback(mamba_env):
     seq_len = torch.tensor(lens, device=device, dtype=torch.int32)
     seq_start = torch.tensor([0, lens[0]], device=device, dtype=torch.int32)
     use_initial_states = torch.tensor([0] * batch, device=device).to(torch.bool)
+    cu_seqlens = torch.cat(
+        [
+            torch.zeros(1, dtype=torch.int32, device=device),
+            torch.cumsum(seq_len.to(torch.int32), dim=0),
+        ],
+        dim=0,
+    )
+    seq_idx_prefill = torch.repeat_interleave(
+        torch.arange(len(lens), device=device, dtype=torch.int32),
+        seq_len,
+    ).view(1, -1)
+    batch_info_tensor = torch.tensor([len(lens), sum(lens), 0], dtype=torch.int32)
     # Torch reference
     y_torch = torch.ops.auto_deploy.torch_cached_ssm(
         hidden_states,
@@ -154,6 +166,11 @@ def test_triton_context_flattened_and_state_writeback(mamba_env):
         seq_start,
         slot_idx,
         use_initial_states,
+        cu_seqlens,
+        None,  # chunk indices
+        None,  # chunk offsets
+        seq_idx_prefill,
+        batch_info_tensor,
         ssm_state_cache_triton,
         time_step_limit,
         chunk_size,
