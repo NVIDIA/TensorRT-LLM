@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "userbuffersManager.h"
+#include "tensorrt_llm/common/logger.h"
 
 namespace tensorrt_llm::runtime::ub
 {
@@ -33,10 +34,15 @@ void UserBuffersManager::initialize(int64_t tp_size, int64_t pp_size, int64_t cp
     int64_t gpus_per_node, int64_t buffer_size, bool use_nccl_symmetric)
 {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (use_nccl_symmetric)
+    {
+        TLLM_LOG_WARNING(
+            "The 'use_nccl_symmetric' parameter is deprecated and no longer necessary. "
+            "NCCL_SYMMETRIC strategy now uses NCCLWindowAllocator from ncclUtils directly, "
+            "and does not require UserBuffer allocator initialization. "
+            "This parameter will be ignored.");
+    }
     tensorrt_llm::runtime::WorldConfig world_config(tp_size, pp_size, cp_size, rank, gpus_per_node);
-#if ENABLE_MULTI_DEVICE
-    UserBufferAllocator::Instance().use_nccl_symmetric = use_nccl_symmetric;
-#endif
     tensorrt_llm::runtime::ub::ub_initialize(world_config);
     TLLM_CHECK(tensorrt_llm::runtime::ub::ub_is_initialized());
     buffer_size_ = buffer_size;

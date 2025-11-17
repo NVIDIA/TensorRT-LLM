@@ -112,12 +112,12 @@ public:
 
     // Register a resource cleanup function for a specific NCCL communicator.
     // The cleanup function will be called before ncclCommDestroy.
-    // Thread-safe: Uses per-comm mutex to serialize operations on the same comm.
+    // Thread-safe: Uses global mutex to serialize all operations.
     void registerResource(ncclComm_t comm, ResourceCleanupFunc cleanup, char const* debugName = nullptr);
 
     // Cleanup all resources associated with a communicator. Called automatically by
     // the shared_ptr deleter before ncclCommDestroy.
-    // Thread-safe: Uses per-comm mutex to serialize cleanup operations.
+    // Thread-safe: Uses global mutex to serialize cleanup operations.
     // Order-preserving: Resources are cleaned up in registration order.
     void cleanupResources(ncclComm_t comm) noexcept;
 
@@ -138,12 +138,8 @@ private:
 
     using ResourceEntry = std::pair<ResourceCleanupFunc, std::string>;
 
-    // Get or create a mutex for a specific communicator (must be called with mMutex held)
-    std::unique_ptr<std::mutex>& getCommMutexLocked(ncclComm_t comm);
-
     mutable std::mutex mMutex;
     std::unordered_map<ncclComm_t, std::vector<ResourceEntry>> mCommResources;
-    std::unordered_map<ncclComm_t, std::unique_ptr<std::mutex>> mCommMutexes; // Per-comm mutexes for serialization
 };
 
 // RAII helper to register a resource with a NCCL communicator.

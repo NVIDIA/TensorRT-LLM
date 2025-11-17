@@ -44,21 +44,12 @@ void NcclCommResourceManager::registerResource(ncclComm_t comm, ResourceCleanupF
         return;
     }
 
-    std::unique_ptr<std::mutex>* commMutexPtr = nullptr;
-    {
-        std::lock_guard<std::mutex> mapLock(mMutex);
-        commMutexPtr = &getCommMutexLocked(comm);
-    }
+    std::lock_guard<std::mutex> lock(mMutex);
+    auto& resources = mCommResources[comm];
+    resources.emplace_back(std::move(cleanup), debugName ? debugName : "unnamed");
 
-    std::lock_guard<std::mutex> commLock(**commMutexPtr);
-    {
-        std::lock_guard<std::mutex> mapLock(mMutex);
-        auto& resources = mCommResources[comm];
-        resources.emplace_back(std::move(cleanup), debugName ? debugName : "unnamed");
-
-        TLLM_LOG_TRACE("[NCCLUtil] Registered resource '%s' for NCCL comm %p (total: %zu)",
-            debugName ? debugName : "unnamed", static_cast<void*>(comm), resources.size());
-    }
+    TLLM_LOG_TRACE("[NCCLUtil] Registered resource '%s' for NCCL comm %p (total: %zu)",
+        debugName ? debugName : "unnamed", static_cast<void*>(comm), resources.size());
 }
 
 void NcclCommResourceManager::cleanupResources(ncclComm_t comm) noexcept
@@ -69,31 +60,25 @@ void NcclCommResourceManager::cleanupResources(ncclComm_t comm) noexcept
     }
 
     std::vector<ResourceEntry> resourcesToClean;
-    std::unique_ptr<std::mutex>* commMutexPtr = nullptr;
 
     {
-        std::lock_guard<std::mutex> mapLock(mMutex);
-        commMutexPtr = &getCommMutexLocked(comm);
-    }
-
-    {
-        std::lock_guard<std::mutex> commLock(**commMutexPtr);
+        std::lock_guard<std::mutex> lock(mMutex);
+        auto it = mCommResources.find(comm);
+        if (it == mCommResources.end())
         {
-            std::lock_guard<std::mutex> mapLock(mMutex);
-            auto it = mCommResources.find(comm);
-            if (it != mCommResources.end())
-            {
-                // Move resources out (preserves order) and remove from map
-                resourcesToClean = std::move(it->second);
-                mCommResources.erase(it);
-
-                TLLM_LOG_TRACE("[NCCLUtil] Cleaning up %zu resources for NCCL comm %p", resourcesToClean.size(),
-                    static_cast<void*>(comm));
-            }
+            // Nothing registered for this comm, nothing to clean up
+            return;
         }
+
+        // Move resources out (preserves order) and remove from map
+        resourcesToClean = std::move(it->second);
+        mCommResources.erase(it);
+
+        TLLM_LOG_TRACE(
+            "[NCCLUtil] Cleaning up %zu resources for NCCL comm %p", resourcesToClean.size(), static_cast<void*>(comm));
     }
 
-    // Clean up outside the per-comm lock to avoid deadlocks
+    // Clean up outside the lock to avoid deadlocks if cleanup functions try to access the manager
     // Order is preserved: resources are cleaned up in registration order
     for (auto& [cleanup, name] : resourcesToClean)
     {
@@ -114,12 +99,6 @@ void NcclCommResourceManager::cleanupResources(ncclComm_t comm) noexcept
                 name.c_str(), static_cast<void*>(comm));
         }
     }
-
-    // Clean up the mutex after cleanup is complete
-    {
-        std::lock_guard<std::mutex> lock(mMutex);
-        mCommMutexes.erase(comm);
-    }
 }
 
 bool NcclCommResourceManager::hasResources(ncclComm_t comm) const noexcept
@@ -133,16 +112,6 @@ size_t NcclCommResourceManager::getResourceCount(ncclComm_t comm) const noexcept
     std::lock_guard<std::mutex> lock(mMutex);
     auto it = mCommResources.find(comm);
     return it != mCommResources.end() ? it->second.size() : 0;
-}
-
-std::unique_ptr<std::mutex>& NcclCommResourceManager::getCommMutexLocked(ncclComm_t comm)
-{
-    auto it = mCommMutexes.find(comm);
-    if (it == mCommMutexes.end())
-    {
-        it = mCommMutexes.emplace(comm, std::make_unique<std::mutex>()).first;
-    }
-    return it->second;
 }
 
 //==============================================================================
@@ -491,12 +460,24 @@ void NCCLWindowAllocator::registerBufferCleanup(ncclComm_t comm)
 
 void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
 {
+    if (!comm)
+    {
+        return;
+    }
+
     std::lock_guard<std::mutex> lock(mMutex);
+
+    // Check if we've already cleaned up this communicator
+    if (mRegisteredComms.find(comm) == mRegisteredComms.end())
+    {
+        // Already cleaned up or never registered
+        return;
+    }
 
     auto commIt = mBufferPool.find(comm);
     if (commIt == mBufferPool.end())
     {
-        // No buffers to clean up
+        // No buffers to clean up, but mark as cleaned
         mRegisteredComms.erase(comm);
         return;
     }
@@ -504,27 +485,61 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
     TLLM_LOG_TRACE(
         "[NCCLUtil] Cleaning up %zu NCCL window buffers for comm %p", commIt->second.size(), static_cast<void*>(comm));
 
+    // Check for buffers still in use - this shouldn't happen if cleanup is called properly,
+    // but we log a warning if it does
+    size_t inUseCount = 0;
+    for (auto const& entry : commIt->second)
+    {
+        if (entry.inUse)
+        {
+            ++inUseCount;
+        }
+    }
+    if (inUseCount > 0)
+    {
+        TLLM_LOG_WARNING(
+            "[NCCLUtil] Cleaning up %zu buffers still marked as in-use for comm %p. "
+            "This may indicate buffers weren't properly released before cleanup.",
+            inUseCount, static_cast<void*>(comm));
+    }
+
     for (auto& entry : commIt->second)
     {
         if (entry.buffer.isValid())
         {
-            // Deregister the window
-            if (entry.buffer.window)
+            // Deregister the window - the communicator is still valid at this point
+            // (cleanup happens before ncclCommDestroy), but we need to be careful
+            // if buffers are still in use by active operations
+            if (entry.buffer.window && comm)
             {
+                // Note: Even if buffer is marked inUse, we must deregister since
+                // the communicator is being destroyed. The communicator is valid,
+                // but we should handle potential errors gracefully.
                 ncclResult_t result = ncclCommWindowDeregister(comm, entry.buffer.window);
                 if (result != ncclSuccess)
                 {
-                    TLLM_LOG_WARNING("[NCCLUtil] ncclCommWindowDeregister failed with error: %d", result);
+                    TLLM_LOG_WARNING(
+                        "[NCCLUtil] ncclCommWindowDeregister failed with error: %d for comm %p, "
+                        "window %p (buffer inUse: %d)",
+                        result, static_cast<void*>(comm), static_cast<void*>(entry.buffer.window), entry.inUse);
                 }
             }
 
             // Free device memory using ncclMemFree
+            // This should be safe even if deregister failed
             if (entry.buffer.ptr)
             {
-                ncclResult_t ncclResult = ncclMemFree(entry.buffer.ptr);
-                if (ncclResult != ncclSuccess)
+                try
                 {
-                    TLLM_LOG_WARNING("[NCCLUtil] ncclMemFree failed with error: %d", ncclResult);
+                    ncclResult_t ncclResult = ncclMemFree(entry.buffer.ptr);
+                    if (ncclResult != ncclSuccess)
+                    {
+                        TLLM_LOG_WARNING("[NCCLUtil] ncclMemFree failed with error: %d", ncclResult);
+                    }
+                }
+                catch (...)
+                {
+                    TLLM_LOG_ERROR("[NCCLUtil] Exception during ncclMemFree for ptr %p", entry.buffer.ptr);
                 }
             }
 
