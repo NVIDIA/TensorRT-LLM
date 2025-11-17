@@ -116,6 +116,7 @@ class SequenceInfo:
         page_size: int = 0,
         max_num_tokens: Optional[int] = None,
         vocab_size_padded: Optional[int] = None,
+        chunk_size: Optional[int] = None,
     ):
         """Initialize the SequenceInfo object.
 
@@ -142,7 +143,10 @@ class SequenceInfo:
         self.max_batch_size = max_batch_size
         self.page_size = page_size if page_size > 0 else max_seq_len
         self.vocab_size_padded = vocab_size_padded
-
+        self.chunk_size = chunk_size
+        # Chunk size is an input to a custom op, so we need to set a default value if it is not provided.
+        if self.chunk_size is None:
+            self.chunk_size = 128
         # NOTE (lucaslie): WAR to address issue when using flashinfer attention with
         # (max_batch_size, max_seq_len) input in trtllm runtime.
         # see https://github.com/NVIDIA/TensorRT-LLM/issues/4504
@@ -193,7 +197,7 @@ class SequenceInfo:
             "input_pos": torch.empty(self.max_batch_size, dtype=torch.int),
             "cache_loc": torch.empty(max_num_cache_loc_assignments, dtype=torch.int),
             "pages_per_seq": torch.empty(self.max_batch_size, dtype=torch.int),
-            "slot_idx": torch.empty(self.max_batch_size, dtype=torch.int),
+            "slot_idx": torch.empty(self.max_batch_size, dtype=torch.long),
             # OTHER FIELDS WHERE WE NEED EFFICIENT HOST<>DEVICE TRANSFER
             "_gather_idx": torch.empty(self.max_num_tokens, dtype=torch.int),
         }
@@ -203,7 +207,9 @@ class SequenceInfo:
         # NOTE: order of keys is relevant here!
         self._uncached_arg_names = ("input_ids", "position_ids")
         self._cached_arg_names = ("seq_len", "input_pos", "cache_loc", "pages_per_seq", "slot_idx")
-        self._cached_constants = ("page_size",)
+        # page_size is the size of attentionkv-cache pages.
+        # chunk_size is used in mamba prefill kernels to split the context into chunks.
+        self._cached_constants = ("page_size", "chunk_size")
         ############################################################################################
 
         # EXTRA TENSOR FIELDS ######################################################################
