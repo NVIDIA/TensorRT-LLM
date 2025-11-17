@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION &
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
  * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -486,6 +486,7 @@ public:
 
             common_enqueue_params.input_seq_length = input_seq_length;
             AttentionOp::EnqueueGenerationParams<T> enqueue_params{common_enqueue_params};
+            enqueue_params.layer_idx = op.mLayerIdx;
             enqueue_params.beam_width = beam_width;
             enqueue_params.num_requests = num_requests;
             enqueue_params.cache_indir = beam_width == 1
@@ -501,16 +502,44 @@ public:
             }
             if (op.mIsSpecDecodingEnabled && op.mUseSpecDecoding)
             {
-                TORCH_CHECK(spec_decoding_tensor_params.size() == 3,
-                    "Expecting 3 tensors for spec-dec mode, spec_decoding_generation_lengths, "
-                    "spec_decoding_position_offsets and spec_decoding_packed_mask.");
-                TORCH_CHECK(spec_decoding_tensor_params[0].has_value(),
-                    "Expecting spec_decoding_generation_lengths spec-dec mode.");
-                TORCH_CHECK(spec_decoding_tensor_params[1].has_value(),
-                    "Expecting spec_decoding_position_offsets spec-dec mode.");
-                TORCH_CHECK(
-                    spec_decoding_tensor_params[2].has_value(), "Expecting spec_decoding_packed_mask spec-dec mode.");
-
+                bool useTllmGen = tensorrt_llm::common::isSM100Family();
+                if (useTllmGen)
+                {
+                    TORCH_CHECK(spec_decoding_tensor_params.size() == 6,
+                        "Expecting 6 tensors for spec-dec mode, spec_decoding_generation_lengths, "
+                        "spec_decoding_position_offsets, spec_decoding_packed_mask, spec_decoding_bl_tree_mask_offset, "
+                        "spec_decoding_bl_tree_mask and spec_bl_tree_first_sparse_mask_offset_kv.");
+                    TORCH_CHECK(spec_decoding_tensor_params[0].has_value(),
+                        "Expecting spec_decoding_generation_lengths spec-dec mode.");
+                    TORCH_CHECK(spec_decoding_tensor_params[1].has_value(),
+                        "Expecting spec_decoding_position_offsets spec-dec mode.");
+                    TORCH_CHECK(spec_decoding_tensor_params[2].has_value(),
+                        "Expecting spec_decoding_packed_mask spec-dec mode.");
+                    TORCH_CHECK(spec_decoding_tensor_params[3].has_value(),
+                        "Expecting spec_decoding_bl_tree_mask_offset spec-dec mode.");
+                    TORCH_CHECK(spec_decoding_tensor_params[4].has_value(),
+                        "Expecting spec_decoding_bl_tree_mask spec-dec mode.");
+                    TORCH_CHECK(spec_decoding_tensor_params[5].has_value(),
+                        "Expecting spec_bl_tree_first_sparse_mask_offset_kv spec-dec mode.");
+                    enqueue_params.spec_decoding_bl_tree_mask_offset
+                        = spec_decoding_tensor_params[3].value().data_ptr<int64_t>();
+                    enqueue_params.spec_decoding_bl_tree_mask
+                        = spec_decoding_tensor_params[4].value().data_ptr<uint32_t>();
+                    enqueue_params.spec_bl_tree_first_sparse_mask_offset_kv
+                        = spec_decoding_tensor_params[5].value().data_ptr<int32_t>();
+                }
+                else
+                {
+                    TORCH_CHECK(spec_decoding_tensor_params.size() == 3,
+                        "Expecting 3 tensors for spec-dec mode, spec_decoding_generation_lengths, "
+                        "spec_decoding_position_offsets and spec_decoding_packed_mask.");
+                    TORCH_CHECK(spec_decoding_tensor_params[0].has_value(),
+                        "Expecting spec_decoding_generation_lengths spec-dec mode.");
+                    TORCH_CHECK(spec_decoding_tensor_params[1].has_value(),
+                        "Expecting spec_decoding_position_offsets spec-dec mode.");
+                    TORCH_CHECK(spec_decoding_tensor_params[2].has_value(),
+                        "Expecting spec_decoding_packed_mask spec-dec mode.");
+                }
                 enqueue_params.spec_decoding_generation_lengths
                     = spec_decoding_tensor_params[0].value().data_ptr<int32_t>();
                 enqueue_params.spec_decoding_position_offsets

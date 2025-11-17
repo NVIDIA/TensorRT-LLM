@@ -1,7 +1,7 @@
 import contextlib
 import threading
 from dataclasses import dataclass
-from enum import Enum
+from enum import Enum, IntEnum
 from typing import Dict, List
 
 import torch
@@ -29,6 +29,20 @@ EventType = Enum(
     ['Main', *aux_stream_name_list],
     start=0,
 )
+
+
+# IMPORTANT: Keep the same order of activation functions in this enum and the enum in
+# cpp/tensorrt_llm/kernels/cutlass_kernels/include/common.h
+class ActivationType(IntEnum):
+    Gelu = 0
+    Relu = 1
+    Silu = 2
+    Swiglu = 3
+    Geglu = 4
+    SwigluBias = 5
+    Identity = 6
+    Relu2 = 7
+    InvalidType = 8
 
 
 def set_torch_compiling(enable: bool):
