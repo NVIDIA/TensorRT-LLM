@@ -242,6 +242,7 @@ To serve the model using `trtllm-serve`:
 cat >./extra-llm-api-config.yml <<EOF
 cuda_graph_config:
     enable_padding: true
+    enable_block_reuse: false
     max_batch_size: 1024
 enable_attention_dp: false
 kv_cache_config:
@@ -255,19 +256,8 @@ EOF
 cat >./extra-llm-api-config.yml <<EOF
 cuda_graph_config:
   enable_padding: true
-  batch_sizes:
-  - 1024
-  - 896
-  - 512
-  - 256
-  - 128
-  - 64
-  - 32
-  - 16
-  - 8
-  - 4
-  - 2
-  - 1
+  enable_block_reuse: false
+  max_batch_size: 2048
 kv_cache_config:
   dtype: fp8
 stream_interval: 10
@@ -280,6 +270,7 @@ EOF
 cat >./extra-llm-api-config.yml <<EOF
 cuda_graph_config:
     enable_padding: true
+    enable_block_reuse: false
     max_batch_size: 1024
 enable_attention_dp: false
 kv_cache_config:
@@ -297,6 +288,7 @@ EOF
 cat >./extra-llm-api-config.yml <<EOF
 cuda_graph_config:
     enable_padding: true
+    enable_block_reuse: false
     max_batch_size: 512
 enable_attention_dp: true
 kv_cache_config:
@@ -314,7 +306,7 @@ trtllm-serve \
   --host localhost \
   --port 8000 \
   --backend pytorch \
-  --max_batch_size 1024 \
+  --max_batch_size 2048 \
   --max_num_tokens 8192 \
   --tp_size 8 \
   --ep_size 8 \
