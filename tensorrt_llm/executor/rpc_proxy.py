@@ -87,7 +87,7 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
 
     def shutdown_remote(self):
         logger_debug(f"Shutting down rpc remote", color="yellow")
-        self.rpc_client.shutdown().remote()
+        self.rpc_client.shutdown().remote(need_response=False)
 
     def abort_request(self, request_id: int) -> None:
         return self.rpc_client.abort_request(request_id).remote()
@@ -117,7 +117,9 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
         # (e.g., during garbage collection in that thread)
         if self.main_loop_thread and threading.current_thread(
         ) != self.main_loop_thread:
-            self.main_loop_thread.join()
+            self.main_loop_thread.join(timeout=2.0)
+            if self.main_loop_thread.is_alive():
+                logger.warning("Main loop thread did not exit gracefully")
 
         # 3. shutdown the mpi session, this should wait until all the PyExecutor
         # processes are shutdown
