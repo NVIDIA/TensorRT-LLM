@@ -640,7 +640,7 @@ class SampleStateTensorsHostTorch(SampleStateTensors):
 @dataclass(kw_only=True)
 class SampleStateTorch(SampleState):
     host: SampleStateTensorsHostTorch
-    beam_histories: list[BeamHistory | None]
+    beam_histories: list[BeamHistory | None] | None = None
 
 
 class TorchSampler(Sampler):
@@ -692,7 +692,9 @@ class TorchSampler(Sampler):
             return self.Store(
                 new_tokens=int_tensor(self.NEW_TOKENS_SHAPE),
                 finish_reasons=int_tensor(self.NEW_TOKENS_SHAPE),
-                cache_indirection=int_tensor(self.CACHE_INDIRECTION_SHAPE),
+                cache_indirection=torch.zeros(
+                    self.CACHE_INDIRECTION_SHAPE, device="cuda", dtype=torch.int
+                ),
                 cache_indirection_buffer=int_tensor(self.CACHE_INDIRECTION_SHAPE),
                 cum_log_probs=torch.zeros(
                     self.CACHE_INDIRECTION_SHAPE[:-1], device="cuda", dtype=torch.float32
@@ -719,7 +721,7 @@ class TorchSampler(Sampler):
         max_num_sequences: int
         max_beam_width: int
         max_total_draft_tokens: int
-        disable_overlap_scheduler: bool
+        disable_overlap_scheduler: bool = False
         disable_flash_infer_sampling: bool = False
 
     def __init__(self, args: Args):
@@ -877,7 +879,10 @@ class TorchSampler(Sampler):
             request.state = LlmRequestState.GENERATION_COMPLETE
             for beam_idx in range(request.sampling_config.beam_width):
                 request.set_finished_reason(
-                    finish_reasons_list[request.py_seq_slot][DEFAULT_STEP_IDX][beam_idx], beam_idx
+                    FinishReason(
+                        finish_reasons_list[request.py_seq_slot][DEFAULT_STEP_IDX][beam_idx]
+                    ),
+                    beam_idx,
                 )
             return True
         return False
@@ -1082,7 +1087,10 @@ class TorchSampler(Sampler):
         for idx in eagle_paths[longest_match_path_idx][:longest_accepted_len]:
             add_token(request, new_tokens_list, beam_idx=self.DEFAULT_BEAM_IDX, step=cast(int, idx.item()))
             num_accepted_draft_tokens += 1
-            if self.finish_if_reason(request, finish_reasons, step=num_accepted_draft_tokens):
+            if self.finish_if_reason(request,
+                        finish_reasons,
+                        step=num_accepted_draft_tokens,
+                        beam_idx=DEFAULT_BEAM_IDX,):
                 break
 
         assert num_accepted_draft_tokens <= longest_accepted_len
@@ -1092,6 +1100,15 @@ class TorchSampler(Sampler):
 
         return num_accepted_draft_tokens - 1
 
+
+    def setup_sampler_step(self, requests: ScheduledRequests):
+        """Setup the sampler step for the requests
+
+        Args:
+            requests: list[LlmRequest]. The requests to setup the sampler step for
+        """
+        if self._use_beam_search:
+            self._prepare_beam_search(requests)
 
     def _prepare_beam_search(
         self,
@@ -1103,12 +1120,11 @@ class TorchSampler(Sampler):
         initialize/reset the buffers for the request
         """
         for request in requests:
-            if (
-                not request.is_finished
-                and request.is_context_init_state
-                and request.is_last_context_chunk
+            if not request.is_finished and (
+                (request.is_context_init_state and request.is_last_context_chunk)
+                or request.is_disagg_generation_transmission_complete
             ):
-                if request.py_num_logprobs > 1:
+                if request.py_return_log_probs and request.py_num_logprobs > 1:
                     raise ValueError("Beam search does not support multiple logprobs")
                 self.store.cache_indirection[request.py_seq_slot, :, request.py_prompt_len].fill_(0)
                 self.store.cum_log_probs[request.py_seq_slot].fill_(0)
@@ -1572,7 +1588,7 @@ class TorchSampler(Sampler):
                 or req.context_remaining_length != 0
             ):
                 continue
-            if beam_histories[req_idx] is not None:
+            if beam_histories is not None and beam_histories[req_idx] is not None:
                 self._finalize_beam(
                     req,
                     beam_histories[req_idx],
@@ -1592,7 +1608,7 @@ class TorchSampler(Sampler):
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
             if req.sampling_config.beam_width > 1:
-                if beam_histories[req_idx] is not None:
+                if beam_histories is not None and beam_histories[req_idx] is not None:
                     self._finalize_beam(
                         req,
                         beam_histories[req_idx],
@@ -2219,7 +2235,10 @@ class TorchSampler(Sampler):
         )
         max_lengths_tensor = torch.tensor(
             [
-                ([min(req.py_max_new_tokens, self.max_seq_len)] * self.max_beam_width)
+                (
+                    [min(req.py_max_new_tokens, self.max_seq_len - req.orig_prompt_len)]
+                    * self.max_beam_width
+                )
                 for req in requests
             ]
             * self.max_tokens
