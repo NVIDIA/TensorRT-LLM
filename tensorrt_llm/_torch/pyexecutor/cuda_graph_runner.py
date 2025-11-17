@@ -164,7 +164,6 @@ class CUDAGraphRunner:
     def maybe_get_cuda_graph(
         self,
         batch: ScheduledRequests,
-        iter_counter: int,
         enable_spec_decode: bool,
         attn_metadata: Any,
         spec_metadata: Optional[Any] = None,
@@ -180,7 +179,7 @@ class CUDAGraphRunner:
         - The key for the graph, if applicable.
         """
         # disable when doing statistic
-        if ExpertStatistic.set_iter(iter_counter):
+        if ExpertStatistic.should_record():
             return None, None, None
 
         can_run_cuda_graph = batch.can_run_cuda_graph

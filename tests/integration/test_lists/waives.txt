@@ -416,3 +416,7 @@ unittest/_torch/modules/test_fused_moe.py::test_fused_moe_alltoall_fp4[MNNVL] SK
 unittest/_torch/modules/test_fused_moe.py::test_fused_moe_alltoall_fp4[DeepEP] SKIP (https://nvbugs/5664904)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus_online_eplb[mtp_nextn=2-moe_backend=WIDEEP] SKIP (https://nvbugs/5665736)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus_online_eplb[fp8kv=True-moe_backend=WIDEEP] SKIP (https://nvbugs/5665736)
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus_static_eplb SKIP (https://nvbugs/5666070)
+unittest/_torch/modules/test_fused_moe.py::test_fused_moe_alltoall[DeepEPLowLatency] SKIP (https://nvbugs/5664904)
+unittest/_torch/modules/test_fused_moe.py::test_fused_moe_alltoall[DeepEP] SKIP (https://nvbugs/5664904)
+unittest/_torch/modules/test_fused_moe.py::test_fused_moe_alltoall[MNNVL] SKIP (https://nvbugs/5664904)

@@ -153,7 +153,6 @@ class ADEngine(ModelEngine):
         self.llm_args.batch_wait_timeout_iters = 0
         self.llm_args.batch_wait_max_tokens_ratio = 0.0
         self.llm_args.max_num_tokens = seq_info.max_num_tokens
-        self.iter_counter = 0
 
         # NOTE (lucaslie): not a declared base member in the base class; required by PyExecutor...
         self.max_beam_width = max_beam_width
