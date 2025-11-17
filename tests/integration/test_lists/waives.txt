@@ -26,6 +26,7 @@ examples/test_qwen.py::test_llm_qwen1_5_moe_single_gpu_lora[qwen1.5_moe_a2.7b_ch
 perf/test_perf.py::test_perf[llama_v3.1_70b-cppmanager-exe-plugin_ifb-float16-input_output_len:512,200-quant:fp8-tp:4] SKIP (SKIP due to timeout of quantization)
 perf/test_perf.py::test_perf[llama_v3.1_70b-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128+512,32-quant:fp8-gpus:8] SKIP (SKIP due to timeout of quantization)
 cpp/test_e2e.py::test_model[-encoder-90] SKIP (waive Encoder-only test because it doesn't take batched input)
+full:L40S/examples/test_commandr.py::test_llm_commandr_plus_4gpus_summary[disable_weight_only] SKIP (skip on L40S commit f9a0fcb0)
 full:GH200/unittest/trt/model_api/test_model_quantization.py SKIP (https://nvbugspro.nvidia.com/bug/4979955)
 examples/test_gemma.py::test_llm_hf_gemma_quantization_1gpu[gemma-7b-int8_sq-bfloat16-8] SKIP (https://nvbugs/4988782)
 examples/test_llama.py::test_llm_llama_v3_8b_1048k_long_context_ppl[SlimPajama-6B-Llama-3-8B-Instruct-Gradient-1048k] SKIP (https://nvbugs/4993898)
