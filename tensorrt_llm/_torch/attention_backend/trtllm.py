@@ -904,13 +904,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.block_ids_per_seq[:self.num_generations, :num_blocks].copy_(
             block_ids_per_seq[self.num_contexts:], non_blocking=True)
 
-        self.kv_lens_cuda_runtime = self.kv_lens_cuda[:self.num_seqs]
-        self.kv_lens_runtime = self.kv_lens[:self.num_seqs]
-        self.prompt_lens_cuda_runtime = self.prompt_lens_cuda[:self.num_seqs]
-        self.prompt_lens_cpu_runtime = self.prompt_lens_cpu[:self.num_seqs]
-        self.host_request_types_runtime = self.host_request_types[:self.
-                                                                  num_seqs]
-
     def pre_process_for_chunked_prefill(
         self,
         chunked_seq_len: torch.Tensor,
