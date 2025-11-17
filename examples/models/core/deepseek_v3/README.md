@@ -311,7 +311,6 @@ trtllm-serve \
   --tp_size 8 \
   --ep_size 8 \
   --pp_size 1 \
-  --kv_cache_free_gpu_memory_fraction 0.9 \
   --extra_llm_api_options ./extra-llm-api-config.yml
 ```
 It's possible seeing OOM issues on some configs. Considering reducing `kv_cache_free_gpu_mem_fraction` to a smaller value as a workaround. We're working on the investigation and addressing the problem. If you are using max-throughput config, reduce `max_num_tokens` to `3072` to avoid OOM issues.
