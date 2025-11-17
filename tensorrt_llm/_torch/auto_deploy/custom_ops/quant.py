@@ -106,11 +106,8 @@ def trtllm_quant_fp8_linear(
 
     enable_cuda_core = False
     if torch.cuda.is_available():
-        capability = torch.cuda.get_device_capability(torch.device("cuda:0"))
-        # enable cuda core for sm89 and sm120
-        enable_cuda_core = (capability[0] == 8 and capability[1] == 9) or (
-            capability[0] == 12 and capability[1] == 0
-        )
+        capability = torch.cuda.get_device_capability(0)
+        enable_cuda_core = capability == (8, 9) or capability == (12, 0)
     # Use TensorRT-LLM FP8 scaled matrix multiply
     # Choose between CUDA core (for small M) and cuBLAS (for large M) implementations
     if (
