@@ -376,13 +376,13 @@ typing_extensions = ">=4.2.0"
 
 [[package]]
 name = "click"
-version = "8.3.0"
+version = "8.3.1"
 description = "Composable command line interface toolkit"
 optional = false
 python-versions = ">=3.10"
 files = [
-    {file = "click-8.3.0-py3-none-any.whl", hash = "sha256:9b9f285302c6e3064f4330c05f05b81945b2a39544279343e6e7c5f27a9baddc"},
-    {file = "click-8.3.0.tar.gz", hash = "sha256:e7b8232224eba16f4ebe410c25ced9f7875cb5f3263ffc93cc3e8da705e229c4"},
+    {file = "click-8.3.1-py3-none-any.whl", hash = "sha256:981153a64e25f12d547d3426c367a4857371575ee7ad18df2a6183ab0545b2a6"},
+    {file = "click-8.3.1.tar.gz", hash = "sha256:12ff4785d337a1bb490bb7e9c2b1ee5da3112e94a8622f26a6c77f5d2fc6842a"},
 ]
 
 [package.dependencies]
@@ -1565,14 +1565,14 @@ files = [
 
 [[package]]
 name = "nvidia-cudnn-cu12"
-version = "9.15.1.9"
+version = "9.16.0.29"
 description = "cuDNN runtime libraries"
 optional = false
 python-versions = ">=3"
 files = [
-    {file = "nvidia_cudnn_cu12-9.15.1.9-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:2520692ef9d7804f4f02c8f3a127b24d568bb944ab1ccee0ab946a64699acf36"},
-    {file = "nvidia_cudnn_cu12-9.15.1.9-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:343d9b4bdba9df2f4acf5e8d8582fd40b66ee65fa5cff7702d58ebdc0c077dfa"},
-    {file = "nvidia_cudnn_cu12-9.15.1.9-py3-none-win_amd64.whl", hash = "sha256:478a605c3f027e18740fd70884ee706ebcd852cf20a0069cdc24cf855319cc5f"},
+    {file = "nvidia_cudnn_cu12-9.16.0.29-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:4b09c43096db582f110c5572d0bcbd98b30d709e860a8f73c6c3846baa83b8d2"},
+    {file = "nvidia_cudnn_cu12-9.16.0.29-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:78d05b4434dacc7dd9bc903d5c33a2f28a5f0064d02568ef7b2418f89f6c5922"},
+    {file = "nvidia_cudnn_cu12-9.16.0.29-py3-none-win_amd64.whl", hash = "sha256:142e2bd646a4573ab17d61a24c6359155cdfe1f34c67fc305b71222a7ae45b8e"},
 ]
 
 [package.dependencies]
