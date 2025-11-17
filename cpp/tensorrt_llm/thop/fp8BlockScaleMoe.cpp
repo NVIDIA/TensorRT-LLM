@@ -32,7 +32,6 @@ namespace torch_ext
 namespace btg = batchedGemm::trtllm::gen;
 using tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::RoutingMethodType;
 using MoeRunnerType = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner;
-using tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::computeSelectedTileN;
 
 at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logits,
     std::optional<at::Tensor> const& routing_bias, at::Tensor const& hidden_states,
@@ -321,7 +320,7 @@ class FP8BlockScaleMoeRunner : public torch::CustomClassHolder
 
 public:
     explicit FP8BlockScaleMoeRunner()
-        : mSupportedTileN{8, 16, 32, 64, 128}
+        : mSupportedTileN{8, 16, 32, 64}
     {
         for (int tileN : mSupportedTileN)
         {
@@ -336,11 +335,6 @@ public:
         std::vector<std::vector<int64_t>> tactics;
         for (auto& [tileN, runner] : mRunners)
         {
-            auto chosen = computeSelectedTileN(mSupportedTileN, numTokens, topK, numLocalExperts);
-            if (chosen.find(tileN) == chosen.end())
-            {
-                continue;
-            }
             auto config_indices_per_runner
                 = runner->getValidConfigIndices(topK, hiddenSize, intermediateSize, numLocalExperts, numTokens);
             for (auto cfg : config_indices_per_runner)

@@ -16,10 +16,10 @@
  */
 #pragma once
 
-#include <cstdint>
 #include <cassert>
-#include <vector>
+#include <cstdint>
 #include <string>
+#include <vector>
 #ifndef TLLM_GEN_EXPORT_INTERFACE
 #include "trtllm/gen/MmaDecl.h"
 #else

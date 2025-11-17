@@ -824,9 +824,8 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
 
     def __init__(self, num_experts: int, top_k: int, n_group: Optional[int],
                  topk_group: Optional[int], intermediate_size: int,
-                 valid_hidden_size: int, valid_intermediate_size: int,
-                 local_expert_offset: int, local_num_experts: int,
-                 routed_scaling_factor: Optional[float],
+                 hidden_size_output: int, local_expert_offset: int,
+                 local_num_experts: int, routed_scaling_factor: Optional[float],
                  routing_method_type: int, act_type: int):
 
         self.num_experts = num_experts
@@ -834,8 +833,7 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
         self.n_group = n_group
         self.topk_group = topk_group
         self.intermediate_size = intermediate_size
-        self.valid_hidden_size = valid_hidden_size
-        self.valid_intermediate_size = valid_intermediate_size
+        self.hidden_size_output = hidden_size_output
         self.local_expert_offset = local_expert_offset
         self.local_num_experts = local_num_experts
         self.routed_scaling_factor = routed_scaling_factor
@@ -852,8 +850,7 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
         return hash((
             self.top_k,
             self.intermediate_size,
-            self.valid_hidden_size,
-            self.valid_intermediate_size,
+            self.hidden_size_output,
             self.local_num_experts,
             self.act_type,
         ))
@@ -865,8 +862,7 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
 
         return (self.top_k == other.top_k
                 and self.intermediate_size == other.intermediate_size
-                and self.valid_hidden_size == other.valid_hidden_size and
-                self.valid_intermediate_size == other.valid_intermediate_size
+                and self.hidden_size_output == other.hidden_size_output
                 and self.local_num_experts == other.local_num_experts
                 and self.act_type == other.act_type)
 
@@ -896,11 +892,10 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
             args.gemm1_beta, args.gemm1_clamp_limit, args.gemm2_weights,
             args.gemm2_weights_scale, args.gemm2_bias, None, None, None,
             self.num_experts, self.top_k, self.n_group, self.topk_group,
-            self.intermediate_size, self.valid_hidden_size,
-            self.valid_intermediate_size, self.local_expert_offset,
-            self.local_num_experts, self.routed_scaling_factor,
-            self.routing_method_type, tactic, args.topk_weights, args.topk_ids,
-            output)
+            self.intermediate_size, self.hidden_size_output,
+            self.local_expert_offset, self.local_num_experts,
+            self.routed_scaling_factor, self.routing_method_type, tactic,
+            args.topk_weights, args.topk_ids, output)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile,
@@ -919,8 +914,6 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
             self.intermediate_size,
             self.local_num_experts,
             num_tokens,
-            self.valid_hidden_size or hidden_size,
-            self.valid_intermediate_size or self.intermediate_size,
         )
 
         return tactics
@@ -1020,8 +1013,7 @@ def mxe4m3_mxe2m1_block_scale_moe_runner(
         n_group: Optional[int],
         topk_group: Optional[int],
         intermediate_size: int,
-        valid_hidden_size: Optional[int],
-        valid_intermediate_size: Optional[int],
+        hidden_size_output: int,
         local_expert_offset: int,
         local_num_experts: int,
         routed_scaling_factor: Optional[float],
@@ -1038,8 +1030,7 @@ def mxe4m3_mxe2m1_block_scale_moe_runner(
         n_group,
         topk_group,
         intermediate_size,
-        valid_hidden_size,
-        valid_intermediate_size,
+        hidden_size_output,
         local_expert_offset,
         local_num_experts,
         routed_scaling_factor,
@@ -1124,7 +1115,6 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
 
     def __init__(self, num_experts: int, top_k: int, n_group: Optional[int],
                  topk_group: Optional[int], intermediate_size: int,
-                 valid_hidden_size: int, valid_intermediate_size: int,
                  local_expert_offset: int, local_num_experts: int,
                  routed_scaling_factor: Optional[float],
                  routing_method_type: int, act_type: int):
@@ -1134,8 +1124,6 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
         self.n_group = n_group
         self.topk_group = topk_group
         self.intermediate_size = intermediate_size
-        self.valid_hidden_size = valid_hidden_size
-        self.valid_intermediate_size = valid_intermediate_size
         self.local_expert_offset = local_expert_offset
         self.local_num_experts = local_num_experts
         self.routed_scaling_factor = routed_scaling_factor
@@ -1152,8 +1140,6 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
         return hash((
             self.top_k,
             self.intermediate_size,
-            self.valid_hidden_size,
-            self.valid_intermediate_size,
             self.local_num_experts,
             self.act_type,
         ))
@@ -1165,8 +1151,6 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
 
         return (self.top_k == other.top_k
                 and self.intermediate_size == other.intermediate_size
-                and self.valid_hidden_size == other.valid_hidden_size and
-                self.valid_intermediate_size == other.valid_intermediate_size
                 and self.local_num_experts == other.local_num_experts
                 and self.act_type == other.act_type)
 
@@ -1195,8 +1179,7 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
             args.gemm2_weights, args.gemm2_weights_scale, args.gemm2_bias,
             args.output1_scale_scalar, args.output1_scale_gate_scalar,
             args.output2_scale_scalar, self.num_experts, self.top_k,
-            self.n_group, self.topk_group, self.intermediate_size,
-            self.valid_hidden_size, self.valid_intermediate_size,
+            self.n_group, self.topk_group, self.intermediate_size, None,
             self.local_expert_offset, self.local_num_experts,
             self.routed_scaling_factor, self.routing_method_type, tactic,
             args.topk_weights, args.topk_ids, None
@@ -1219,8 +1202,6 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
             self.intermediate_size,
             self.local_num_experts,
             num_tokens,
-            self.valid_hidden_size or hidden_size,
-            self.valid_intermediate_size or self.intermediate_size,
         )
 
         return tactics
@@ -1302,8 +1283,6 @@ def e4m3_mxe2m1_block_scale_moe_runner(
         n_group: Optional[int],
         topk_group: Optional[int],
         intermediate_size: int,
-        valid_hidden_size: Optional[int],
-        valid_intermediate_size: Optional[int],
         local_expert_offset: int,
         local_num_experts: int,
         routed_scaling_factor: Optional[float],
@@ -1319,8 +1298,6 @@ def e4m3_mxe2m1_block_scale_moe_runner(
         n_group,
         topk_group,
         intermediate_size,
-        valid_hidden_size,
-        valid_intermediate_size,
         local_expert_offset,
         local_num_experts,
         routed_scaling_factor,
@@ -1404,7 +1381,6 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
 
     def __init__(self, num_experts: int, top_k: int, n_group: Optional[int],
                  topk_group: Optional[int], intermediate_size: int,
-                 valid_hidden_size: int, valid_intermediate_size: int,
                  local_expert_offset: int, local_num_experts: int,
                  routed_scaling_factor: Optional[float],
                  routing_method_type: int, act_type: int):
@@ -1414,8 +1390,6 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
         self.n_group = n_group
         self.topk_group = topk_group
         self.intermediate_size = intermediate_size
-        self.valid_hidden_size = valid_hidden_size
-        self.valid_intermediate_size = valid_intermediate_size
         self.local_expert_offset = local_expert_offset
         self.local_num_experts = local_num_experts
         self.routed_scaling_factor = routed_scaling_factor
@@ -1432,8 +1406,6 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
         return hash((
             self.top_k,
             self.intermediate_size,
-            self.valid_hidden_size,
-            self.valid_intermediate_size,
             self.local_num_experts,
             self.act_type,
         ))
@@ -1445,8 +1417,6 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
 
         return (self.top_k == other.top_k
                 and self.intermediate_size == other.intermediate_size
-                and self.valid_hidden_size == other.valid_hidden_size and
-                self.valid_intermediate_size == other.valid_intermediate_size
                 and self.local_num_experts == other.local_num_experts
                 and self.act_type == other.act_type)
 
@@ -1475,8 +1445,7 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
             args.gemm1_alpha, args.gemm1_beta, args.gemm1_clamp_limit,
             args.gemm2_weights, args.gemm2_weights_scale, args.gemm2_bias,
             self.num_experts, self.top_k, self.n_group, self.topk_group,
-            self.intermediate_size, self.valid_hidden_size,
-            self.valid_intermediate_size, self.local_expert_offset,
+            self.intermediate_size, self.local_expert_offset,
             self.local_num_experts, self.routed_scaling_factor,
             self.routing_method_type, tactic, args.topk_weights, args.topk_ids)
 
@@ -1495,8 +1464,6 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
             self.top_k,
             hidden_size,
             self.intermediate_size,
-            self.valid_hidden_size or hidden_size,
-            self.valid_intermediate_size or self.intermediate_size,
             self.local_num_experts,
             num_tokens,
         )
@@ -1577,8 +1544,6 @@ def bf16_mxe2m1_block_scale_moe_runner(
         n_group: Optional[int],
         topk_group: Optional[int],
         intermediate_size: int,
-        valid_hidden_size: Optional[int],
-        valid_intermediate_size: Optional[int],
         local_expert_offset: int,
         local_num_experts: int,
         routed_scaling_factor: Optional[float],
@@ -1594,8 +1559,6 @@ def bf16_mxe2m1_block_scale_moe_runner(
         n_group,
         topk_group,
         intermediate_size,
-        valid_hidden_size,
-        valid_intermediate_size,
         local_expert_offset,
         local_num_experts,
         routed_scaling_factor,

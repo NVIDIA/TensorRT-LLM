@@ -22,6 +22,8 @@
 
 #ifdef TLLM_ENABLE_CUDA
 #include <cuda.h>
+#include <cutlass/cutlass.h>
+#include <cutlass/half.h>
 #endif
 
 namespace batchedGemm
