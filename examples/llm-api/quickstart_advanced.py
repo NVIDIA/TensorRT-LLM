@@ -23,6 +23,10 @@ def add_llm_args(parser):
                         type=str,
                         nargs="+",
                         help="A single or a list of text prompts.")
+    parser.add_argument('--checkpoint_format',
+                        type=str,
+                        default=None,
+                        help="Model checkpoint format.")
     # Build config
     parser.add_argument("--max_seq_len",
                         type=int,
@@ -237,6 +241,7 @@ def setup_llm(args, **kwargs):
     llm = LLM(
         model=args.model_dir,
         backend='pytorch',
+        checkpoint_format=args.checkpoint_format,
         disable_overlap_scheduler=args.disable_overlap_scheduler,
         kv_cache_config=kv_cache_config,
         attn_backend=args.attention_backend,

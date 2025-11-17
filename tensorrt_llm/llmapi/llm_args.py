@@ -757,6 +757,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
     max_non_leaves_per_layer: Optional[int] = None
     eagle3_one_model: Optional[bool] = True
     eagle3_layers_to_capture: Optional[Set[int]] = None
+    eagle3_mistral_large_3: Optional[bool] = True
 
     def __init__(self, **kwargs):
         super().__init__()
@@ -778,6 +779,10 @@ class EagleDecodingConfig(DecodingBaseConfig):
                             "Wrong eagle choices type. Eagle choices should be a List[List[int]] or a string like [[0], [1], [2], [0, 0], [0, 1]]."
                         )
             setattr(self, attr_name, attr_value)
+
+        if self.eagle3_mistral_large_3:
+            assert self.eagle3_one_model, "eagle3_mistral_large_3 is only supported when eagle3_one_model is True"
+            self.eagle3_layers_to_capture = {-1}
 
         assert self.max_draft_len is not None, "max_draft_len is required for Eagle"
 

@@ -49,6 +49,7 @@ from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, MoEAllReduceParams, allgather)
 from ..model_config import ModelConfig
+from ..models.checkpoints.mistral.weight_mapper import MistralLarge3WeightMapper
 from ..modules.attention import MLA
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
@@ -126,6 +127,22 @@ def weight_dequant(x: torch.Tensor,
     return y
 
 
+def dequant_tensor_fp8(x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    """
+    Dequantizes the given weight tensor using the provided scale
+    to imitate DS fp8 recipe until per tensor is supported.
+
+    Args:
+        x (torch.Tensor): The quantized weight tensor of shape (M, N).
+        s (torch.Tensor): The scale tensor of shape 0.
+    """
+    assert x.is_contiguous() and s.is_contiguous(
+    ), 'Input tensors must be contiguous'
+    assert x.dim() == 2, 'Weight tensor must have 2 dimensions'
+    assert s.dim() == 0, 'Weight tensor must have 0 dimensions'
+    return x.to(torch.float32) * s
+
+
 @torch.compile(dynamic=True)
 def moe_reduce_add_shared_output(routed_output, shared_output):
     routed_output = torch.sum(routed_output, dim=1, keepdim=False)
@@ -140,7 +157,10 @@ class DeepseekV3WeightLoader:
         self.model_config = model.model_config
         self.is_draft_model = is_draft_model
 
-    def load_weights(self, weights: Dict):
+    def load_weights(self,
+                     weights: Dict,
+                     weight_mapper=None,
+                     skip_modules: List[str] = []):
 
         def rename_moe_weight(weights: Dict, rename_rules: Dict):
             result = {}
@@ -283,6 +303,8 @@ class DeepseekV3WeightLoader:
                                  desc="Loading weights"):
             if len(module._parameters) <= 0 or name.startswith("draft_model"):
                 continue
+            elif any(skip_module in name for skip_module in skip_modules):
+                continue
             else:
                 names = name.split('.')
                 parent_module_name = '.'.join(names[:-1])
@@ -411,7 +433,12 @@ class DeepseekV3WeightLoader:
                 else:
                     module_weights = filter_weights(name, weights)
                     if hasattr(module, 'load_weights'):
-                        module.load_weights(weights=[module_weights])
+                        try:
+                            module.load_weights(weights=[module_weights])
+                        except:
+                            raise ValueError(
+                                f"Couldn't load {name}, shape {module.weight.shape}, weights: {module_weights.keys()}"
+                            )
                     else:
                         for n, p in module.named_parameters():
                             p.data.copy_(module_weights[n][:])
@@ -664,20 +691,27 @@ class DeepseekV3Gate(nn.Module):
         fuse_routing_kernel: bool = True,
         apply_routing: bool = False,
         moe_backend: str = 'CUTLASS',
+        topk_method: str = "noaux_tc",
     ):
         super().__init__()
         self.weight = nn.Parameter(torch.empty((num_experts, hidden_size),
                                                dtype=dtype),
                                    requires_grad=False)
         self.moe_backend = moe_backend
+        self.topk_method = topk_method
         if moe_backend == 'TRTLLM':
             bias_dtype = torch.bfloat16
         else:
             bias_dtype = torch.float32
 
-        self.e_score_correction_bias = nn.Parameter(torch.empty(
-            (num_experts), dtype=bias_dtype),
-                                                    requires_grad=False)
+        if topk_method == "noaux_tc":
+            self.e_score_correction_bias = nn.Parameter(torch.empty(
+                (num_experts), dtype=bias_dtype),
+                                                        requires_grad=False)
+        else:
+            self.e_score_correction_bias = nn.Parameter(torch.zeros(
+                (num_experts), dtype=bias_dtype),
+                                                        requires_grad=False)
 
         assert not apply_routing, "DeepseekV3Gate routing is called inside MoE"
 
@@ -701,9 +735,10 @@ class DeepseekV3Gate(nn.Module):
 
         self.weight.copy_(weights[0]["weight"][:])
 
-        self.e_score_correction_bias.copy_(
-            weights[0]["e_score_correction_bias"][:].to(
-                self.e_score_correction_bias.dtype))
+        if self.topk_method == "noaux_tc":
+            self.e_score_correction_bias.copy_(
+                weights[0]["e_score_correction_bias"][:].to(
+                    self.e_score_correction_bias.dtype))
 
     @property
     def routing_method(self) -> DeepSeekV3MoeRoutingMethod:
@@ -741,7 +776,6 @@ class Deepseekv3MoE(nn.Module):
                  override_quant_config: Optional[QuantConfig] = None,
                  layer_idx: Optional[int] = None):
         from ..distributed import AllReduce
-
         super().__init__()
         config = model_config.pretrained_config
         self.top_k = top_k
@@ -756,7 +790,8 @@ class Deepseekv3MoE(nn.Module):
             dtype=dtype,
             fuse_routing_kernel=True,
             apply_routing=False,
-            moe_backend=model_config.moe_backend)
+            moe_backend=model_config.moe_backend,
+            topk_method=getattr(config, "topk_method", "noaux_tc"))
         self.experts = create_moe(
             num_experts=num_experts,
             routing_method=self.gate.routing_method,
@@ -1240,7 +1275,6 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             if self.next_layer_layernorm is not None:
                 hidden_states, residual = self.next_layer_layernorm(
                     hidden_states, residual)
-
         return hidden_states, residual
 
     def forward_mlp(
@@ -1505,6 +1539,7 @@ class DeepseekV3Model(DecoderModel):
 
 @register_auto_model("DeepseekV32ForCausalLM")
 @register_auto_model("DeepseekV3ForCausalLM")
+@register_auto_model("MistralLarge3ForCausalLM")
 class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                                                         PretrainedConfig]):
 
@@ -1601,8 +1636,14 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                                return_context_logits=return_context_logits,
                                **kwargs)
 
-    def load_weights(self, weights: Dict):
+    def load_weights(self, weights: Dict, weight_mapper=None):
         weight_loader = DeepseekV3WeightLoader(self)
+        # TODO: remove when DeepSeek is integrated with _load_weights_impl_v2
+        if weight_mapper is not None:
+            if isinstance(weight_mapper, MistralLarge3WeightMapper):
+                params_map = weight_mapper.mistral_llm_mapping
+                weights = weight_mapper.rename_by_params_map(
+                    weights=weights, params_map=params_map)
         weight_loader.load_weights(weights)
 
     def post_load_weights(self):
