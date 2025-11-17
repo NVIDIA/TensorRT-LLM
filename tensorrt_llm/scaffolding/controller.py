@@ -9,7 +9,9 @@ from torch.nn import functional as F
 from tensorrt_llm.executor.result import GenerationResult
 from tensorrt_llm.logger import logger
 from tensorrt_llm.scaffolding.math_utils import get_digit_majority_vote_result
-from tensorrt_llm.scaffolding.task import GenerationTask, Task
+from tensorrt_llm.scaffolding.task import (AssistantMessage, ChatTask,
+                                           GenerationTask, MCPCallTask, Task,
+                                           UserMessage)
 
 
 class Controller(ABC):
@@ -61,12 +63,14 @@ class NativeGenerationController(Controller):
         self.sampling_params = sampling_params
         self.streaming = streaming
 
+    # [GenerationTask] -> [GenerationTask] | [ChatTask] -> [ChatTask]
     def process(self, tasks: List[Task], **kwargs):
         for task in tasks:
             task.worker_tag = self.WorkerTag.GENERATION
             for key, value in self.sampling_params.items():
                 if getattr(task, key) is None:
                     setattr(task, key, value)
+
             task.streaming_output_flag = self.streaming
 
         yield tasks
@@ -194,6 +198,57 @@ class PRMController(NativeRewardController):
             scores.append(score)
 
         self.scores = scores
+
+
+class ChatWithMCPController(Controller):
+
+    class WorkerTag(Enum):
+        TOOLCALL = "tool_call"
+
+    def __init__(self,
+                 generation_controller: Controller,
+                 system_prompts=None,
+                 max_iterations: int = 3,
+                 tools: Any = None):
+        super().__init__()
+        self.generation_controller = generation_controller
+        self.system_prompts = system_prompts
+        self.tools = tools
+        self.max_iterations = max_iterations
+
+    def generate(self, prompt: str, **kwargs) -> GenerationResult:
+        chat_task = ChatTask.create_from_prompt(prompt, self.system_prompts,
+                                                self.tools)
+
+        yield from self.process([chat_task], **kwargs)
+        chat_task.output_str = chat_task.messages[-1].content
+
+        return chat_task.create_scaffolding_output()
+
+    # [ChatTask] -> [ChatTask]
+    def process(self, tasks: List[Task], **kwargs):
+        assert len(tasks) == 1, "ChatWithMCPController only supports one task"
+        chat_task = tasks[0]
+        for _ in range(self.max_iterations):
+            yield from self.generation_controller.process([chat_task])
+            response_message = chat_task.messages[-1]
+            assert isinstance(
+                response_message,
+                AssistantMessage), "response is not AssistantMessage"
+            if response_message.tool_calls is not None:
+                tool_calls = response_message.tool_calls
+                mcp_tasks = [
+                    MCPCallTask.create_mcptask(tool_call.function.name,
+                                               tool_call.function.arguments,
+                                               self.WorkerTag.TOOLCALL)
+                    for tool_call in tool_calls
+                ]
+                yield mcp_tasks
+                for mcp_task in mcp_tasks:
+                    if mcp_task.result_str is not None:
+                        chat_task.add_message(UserMessage(mcp_task.result_str))
+            else:
+                break
 
 
 # Controller runs a single generation task with majority vote.
