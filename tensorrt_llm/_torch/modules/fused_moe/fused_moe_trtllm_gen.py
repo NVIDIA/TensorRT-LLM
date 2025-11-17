@@ -286,7 +286,7 @@ class TRTLLMGenFusedMoE(MoE):
                     False)
         elif self.has_w4a8_mxfp4_mxfp8:
             x, x_sf = torch.ops.trtllm.mxfp8_quantize(
-                x, False, alignment=self.quant_method.weight_alignment)
+                x, False, alignment=self.quant_method.input_hidden_alignment)
             x_row, x_col = x.shape[0], x.shape[1]
         elif self.has_deepseek_fp8_block_scales:
             # No change required before communication
@@ -612,6 +612,9 @@ class TRTLLMGenFusedMoE(MoE):
                 n_group,
                 topk_group,
                 intermediate_size_per_partition_padded,
+                self.hidden_size,  # valid_hidden_size
+                self.quant_method.
+                intermediate_size_per_partition_lean,  # valid_intermediate_size
                 self.
                 slot_start,  # local_expert_start;  use ep_rank if stride!=1
                 self.expert_size_per_partition,  # local_expert_size
@@ -695,6 +698,9 @@ class TRTLLMGenFusedMoE(MoE):
                 n_group,
                 topk_group,
                 intermediate_size_per_partition_padded,
+                self.hidden_size,  # valid_hidden_size_per_partition
+                self.quant_method.
+                intermediate_size_per_partition_lean,  # valid_intermediate_size_per_partition
                 self.
                 slot_start,  # local_expert_start;  use ep_rank if stride!=1
                 self.expert_size_per_partition,  # local_expert_size
@@ -710,7 +716,9 @@ class TRTLLMGenFusedMoE(MoE):
             if not post_quant_comm:
                 # TRTLLM-Gen uses linear SF layout for the mxfp8 input.
                 mxfp8_x, sf = torch.ops.trtllm.mxfp8_quantize(
-                    x, False, alignment=self.quant_method.weight_alignment)
+                    x,
+                    False,
+                    alignment=self.quant_method.input_hidden_alignment)
             else:
                 mxfp8_x, sf = x, x_sf
 
@@ -736,7 +744,9 @@ class TRTLLMGenFusedMoE(MoE):
                 n_group,
                 topk_group,
                 intermediate_size_per_partition_padded,
-                self.hidden_size,
+                self.hidden_size,  # valid_hidden_size
+                self.quant_method.
+                intermediate_size_per_partition_lean,  # valid_intermediate_size
                 self.
                 slot_start,  # local_expert_start;  use ep_rank if stride!=1
                 self.expert_size_per_partition,  # local_expert_size
@@ -805,7 +815,7 @@ class TRTLLMGenFusedMoE(MoE):
         self._load_balancer_done_set_cpu_stage(is_last_call)
 
         if use_dp_padding:
-            rank = self.mapping.tp_rank
+            rank = self.parallel_rank
             final_hidden_states = final_hidden_states[:
                                                       all_rank_num_tokens[rank]]
 
