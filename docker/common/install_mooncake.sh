@@ -6,7 +6,7 @@ if [ -n "${GITHUB_MIRROR}" ]; then
     GITHUB_URL=${GITHUB_MIRROR}
 fi
 
-MOONCAKE_VERSION="v0.3.7.post2"
+MOONCAKE_VERSION="0.3.7.post2"
 MOONCAKE_INSTALL_PATH="/usr/local/Mooncake"
 
 apt-get update
@@ -43,7 +43,7 @@ make install
 cd ../..
 rm -rf yalantinglibs
 
-curl -L ${GITHUB_URL}/kvcache-ai/Mooncake/archive/refs/tags/${MOONCAKE_VERSION}.tar.gz -o Mooncake-${MOONCAKE_VERSION}.tar.gz
+curl -L ${GITHUB_URL}/kvcache-ai/Mooncake/archive/refs/tags/v${MOONCAKE_VERSION}.tar.gz -o Mooncake-${MOONCAKE_VERSION}.tar.gz
 tar -xzf Mooncake-${MOONCAKE_VERSION}.tar.gz
 mv Mooncake-${MOONCAKE_VERSION} Mooncake
 cd Mooncake
