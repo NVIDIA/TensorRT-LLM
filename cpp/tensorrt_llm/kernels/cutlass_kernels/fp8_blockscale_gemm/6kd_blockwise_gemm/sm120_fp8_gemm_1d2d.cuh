@@ -27,16 +27,8 @@ template <typename KT>
 struct SM120BlockScaledKernel
 {
 
-    static constexpr int MaxThreadsPerBlock = 128;
+    static constexpr int MaxThreadsPerBlock = 256;
     static constexpr int MinBlocksPerMultiprocessor = 1;
-
-    static constexpr int NumThreadsPerWarp = 32;
-    static constexpr int NumThreadsPerWarpGroup = 128;
-    static constexpr int NumWarpsPerWarpGroup = NumThreadsPerWarpGroup / NumThreadsPerWarp;
-    static constexpr int NumTmaWarpGroups = 1;
-    static constexpr int NumMmaWarpGroups = 1;
-    static constexpr int NumProducerThreads = NumTmaWarpGroups; // only one thread execute tma copy
-    static constexpr int NumConsumerThreads = NumMmaWarpGroups * NumThreadsPerWarpGroup;
 
     using ProblemShape = typename KT::ProblemShape;
 
@@ -284,20 +276,17 @@ struct SM120BlockScaledKernel
     CUTE_DEVICE
     void operator()(Params const& params, char* smem_buf)
     {
-
         SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
         int thread_idx = int(threadIdx.x);
         int lane_idx = canonical_lane_idx();
         int warp_idx = canonical_warp_idx_sync();
         int warp_group_idx = canonical_warp_group_idx();
         int lane_predicate = cute::elect_one_sync();
-        bool is_tma_thread = warp_idx == 0 && lane_predicate;
 
-        if (is_tma_thread)
+        if (warp_idx == 4 && lane_predicate)
         {
             prefetch_tma_descriptors(params);
         }
-        __syncthreads();
 
         // producer part
         auto sA_ = make_tensor(make_smem_ptr(shared_storage.tensors.load.smem_A.begin()),
@@ -352,19 +341,16 @@ struct SM120BlockScaledKernel
         // A
         auto s2r_copy_A = make_tiled_copy_A(typename KT::SmemCopyAtomA{}, mma);
         auto s2r_thr_copy_A = s2r_copy_A.get_thread_slice(thread_idx);
-        // (((_16,_2,_2,_2),(_16,_1)),(_4,_4,(_1,_2))):(((_128,_16,_2048,_0),(_1,_0)),(_4096,_32,(_0,_16384)))
         auto tXsA = s2r_thr_copy_A.partition_S(sA); // (CPY,CPY_M,CPY_K,PIPE)
         auto tXrA = s2r_thr_copy_A.retile_D(tCrA);  // (CPY,CPY_M,CPY_K)
         // B
-
         auto s2r_copy_B = make_tiled_copy_B(typename KT::SmemCopyAtomB{}, mma);
         auto s2r_thr_copy_B = s2r_copy_B.get_thread_slice(thread_idx);
-        // (((_8,_2,_2,_2,_2),(_16,_1)),(_4,_4,(_1,_2))):(((_128,_16,_2048,_0,_1024),(_1,_0)),(_4096,_32,(_0,_16384)))
         auto tXsB = s2r_thr_copy_B.partition_S(sB); // (CPY,CPY_M,CPY_K,PIPE)
         auto tXrB = s2r_thr_copy_B.retile_D(tCrB);  // (CPY,CPY_M,CPY_K)
 
         auto s2r_copy_SFA = make_tiled_copy_impl(
-            typename KT::SmemCopyAtomSF{}, KT::get_layoutSFA_TV(mma), select<0, 2>(tile_shape(mma)));
+            typename KT::SmemCopyAtomSF{}, KT::get_layoutSFA_TV(mma), make_shape(size<0>(tile_shape(mma)), _1{}));
         auto s2r_thr_copy_SFA = s2r_copy_SFA.get_thread_slice(thread_idx);
         auto tXsSFA = s2r_thr_copy_SFA.partition_S(sSFA);                        // (CPY,CPY_M,CPY_K,PIPE)
         auto tCrSFA = KT::partition_fragment_SFA(sSFA(_, _, Int<0>{}), thr_mma); // (MMA,MMA_M,MMA_K)
@@ -389,132 +375,100 @@ struct SM120BlockScaledKernel
         auto* sf_full_mbar = recast_ptr<FullBarrier>(&shared_storage.barriers.sf_full_mbar[0]);
         auto* sf_empty_mbar = recast_ptr<EmptyBarrier>(&shared_storage.barriers.sf_empty_mbar[0]);
 
-        static_assert(NumProducerThreads == 1, "NumProducerThreads must be 1");
-        static_assert(NumConsumerThreads == 128, "NumConsumerThreads must be 128");
         // init barriers
-        if (is_tma_thread)
+        if (warp_idx == 4 && lane_predicate)
         {
-#pragma unroll
-            for (uint32_t i = 0; i < KT::SF_Stages; ++i)
-            {
-                sf_full_mbar[i].init(NumProducerThreads);
-                sf_empty_mbar[i].init(NumConsumerThreads);
-            }
+            sf_full_mbar[0].init(1);
+            sf_empty_mbar[0].init(128);
 
-#pragma unroll
+            CUTE_UNROLL
             for (uint32_t i = 0; i < KT::AB_Stages; ++i)
             {
-                ab_full_mbar[i].init(NumProducerThreads);
-                ab_empty_mbar[i].init(NumConsumerThreads);
+                ab_full_mbar[i].init(1);
+                ab_empty_mbar[i].init(128);
             }
-            cutlass::arch::fence_barrier_init();
         }
+        cutlass::arch::fence_barrier_init();
         __syncthreads();
 
-        auto g2s_copy_AB = [&](auto& k_tile_idx, auto& write_stage)
-        {
-            auto& ab_full_barrier = ab_full_mbar[write_stage];
-            auto tma_copy_a = params.tma_load_a.with(*recast_ptr<ProducerBarrierType>(&ab_full_barrier));
-            cute::copy(tma_copy_a, tAgA(_, _, _, k_tile_idx), tAsA(_, _, _, write_stage));
-            auto tma_copy_b = params.tma_load_b.with(*recast_ptr<ProducerBarrierType>(&ab_full_barrier));
-            cute::copy(tma_copy_b, tBgB(_, _, _, k_tile_idx), tBsB(_, _, _, write_stage));
-            ab_full_barrier.arrive_and_expect_tx(KT::TmaABTransactionBytes);
-        };
-
-        auto g2s_copy_SF = [&](auto& sf_tile_idx)
-        {
-            auto& sf_full_barrier = sf_full_mbar[0];
-            auto tma_copy_sfa = params.tma_load_sfa.with(*recast_ptr<ProducerBarrierType>(&sf_full_barrier));
-            cute::copy(tma_copy_sfa, tAgSFA(_, _, _, sf_tile_idx), tAsSFA(_, _, _, Int<0>{}));
-            auto tma_copy_sfb = params.tma_load_sfb.with(*recast_ptr<ProducerBarrierType>(&sf_full_barrier));
-            cute::copy(tma_copy_sfb, tBgSFB(_, _, _, sf_tile_idx), tBsSFB(_, _, _, Int<0>{}));
-            sf_full_barrier.arrive_and_expect_tx(KT::TmaSFTransactionBytes);
-        };
-
-        auto s2r_copy_AB = [&](auto& read_stage)
-        {
-            cute::copy(s2r_copy_A, tXsA(_, _, _, read_stage), tXrA);
-            cute::copy(s2r_copy_B, tXsB(_, _, _, read_stage), tXrB);
-            ab_empty_mbar[read_stage].arrive();
-        };
-
-        auto s2r_copy_SF = [&]()
-        {
-            cute::copy(s2r_copy_SFA, tXsSFA(_, _, _, Int<0>{}), tXrSFA);
-            cute::copy(s2r_copy_SFB, tXsSFB(_, _, _, Int<0>{}), tXrSFB);
-            sf_empty_mbar[0].arrive();
-        };
-
-        uint32_t phase = 0;
         int32_t sf_tile_count = cute::size<2>(gSFA);
-        clear(accum);
-        int32_t sf_tile_index = 0;
 
-        // prefetch one sf tile and four ab tiles
-        if (is_tma_thread)
+        constexpr uint32_t kNumTMARegisters = 40;
+        constexpr uint32_t kNumMathRegisters = 232;
+
+        if (warp_idx >= 4)
         {
-            sf_empty_mbar[0].wait(phase ^ 1);
-            g2s_copy_SF(sf_tile_index);
-            CUTE_UNROLL
-            for (int write_stage = 0; write_stage < KT::AB_Stages; ++write_stage)
+            cutlass::arch::warpgroup_reg_dealloc<kNumTMARegisters>();
+            if (warp_idx == 4)
             {
-                ab_empty_mbar[write_stage].wait(phase ^ 1);
-                int32_t k_tile_index = sf_tile_index * 4 + write_stage;
-                g2s_copy_AB(k_tile_index, write_stage);
-            }
-        }
-        ++sf_tile_index;
-        __syncthreads();
-
-        // main loop
-        while (sf_tile_index < sf_tile_count)
-        {
-            sf_full_mbar[0].wait(phase);
-            s2r_copy_SF();
-            CUTE_UNROLL
-            for (int read_stage = 0; read_stage < KT::AB_Stages; ++read_stage)
-            {
-                ab_full_mbar[read_stage].wait(phase);
-                s2r_copy_AB(read_stage);
-                auto tCrSFA_stage = tCrSFA_frg(_, _, _, read_stage);
-                auto tCrSFB_stage = tCrSFB_frg(_, _, _, read_stage);
-                cute::gemm(mma, make_zip_tensor(tCrA, tCrSFA_stage), make_zip_tensor(tCrB, tCrSFB_stage), accum);
-            }
-            phase ^= 1; // flip phase
-
-            if (is_tma_thread)
-            {
-                sf_empty_mbar[0].wait(phase ^ 1);
-                g2s_copy_SF(sf_tile_index);
-                CUTE_UNROLL
-                for (int write_stage = 0; write_stage < KT::AB_Stages; ++write_stage)
+                uint32_t phase = 1;
+                if (lane_predicate)
                 {
-                    ab_empty_mbar[write_stage].wait(phase ^ 1);
-                    int k_tile_index = sf_tile_index * 4 + write_stage;
-                    g2s_copy_AB(k_tile_index, write_stage);
+                    for (int32_t sf_tile_idx = 0; sf_tile_idx < sf_tile_count; ++sf_tile_idx)
+                    {
+                        sf_empty_mbar[0].wait(phase);
+                        auto& sf_full_barrier = sf_full_mbar[0];
+                        auto tma_copy_sfa
+                            = params.tma_load_sfa.with(*recast_ptr<ProducerBarrierType>(&sf_full_barrier));
+                        cute::copy(tma_copy_sfa, tAgSFA(_, _, _, sf_tile_idx), tAsSFA(_, _, _, Int<0>{}));
+                        auto tma_copy_sfb
+                            = params.tma_load_sfb.with(*recast_ptr<ProducerBarrierType>(&sf_full_barrier));
+                        cute::copy(tma_copy_sfb, tBgSFB(_, _, _, sf_tile_idx), tBsSFB(_, _, _, Int<0>{}));
+                        sf_full_mbar[0].arrive_and_expect_tx(KT::TmaSFTransactionBytes);
+
+                        int32_t k_tile_idx = sf_tile_idx * 4;
+                        CUTE_UNROLL
+                        for (int32_t write_stage = 0; write_stage < KT::AB_Stages; ++write_stage)
+                        {
+                            ab_empty_mbar[write_stage].wait(phase);
+                            auto& ab_full_barrier = ab_full_mbar[write_stage];
+                            auto tma_copy_a
+                                = params.tma_load_a.with(*recast_ptr<ProducerBarrierType>(&ab_full_barrier));
+                            cute::copy(tma_copy_a, tAgA(_, _, _, k_tile_idx), tAsA(_, _, _, write_stage));
+                            auto tma_copy_b
+                                = params.tma_load_b.with(*recast_ptr<ProducerBarrierType>(&ab_full_barrier));
+                            cute::copy(tma_copy_b, tBgB(_, _, _, k_tile_idx), tBsB(_, _, _, write_stage));
+                            ab_full_mbar[write_stage].arrive_and_expect_tx(KT::TmaABTransactionBytes);
+                            k_tile_idx += 1;
+                        }
+                        phase ^= 1; // flip phase
+                    }
                 }
+                __syncwarp();
             }
-            ++sf_tile_index;
-            __syncthreads();
+            cutlass::arch::NamedBarrier::sync(128, 2);
         }
-
-        // math tail
-        sf_full_mbar[0].wait(phase);
-        s2r_copy_SF();
-        CUTE_UNROLL
-        for (int read_stage = 0; read_stage < KT::AB_Stages; ++read_stage)
+        else
         {
-            ab_full_mbar[read_stage].wait(phase);
-            s2r_copy_AB(read_stage);
-            auto tCrSFA_stage = tCrSFA_frg(_, _, _, read_stage);
-            auto tCrSFB_stage = tCrSFB_frg(_, _, _, read_stage);
-            cute::gemm(mma, make_zip_tensor(tCrA, tCrSFA_stage), make_zip_tensor(tCrB, tCrSFB_stage), accum);
-        }
+            cutlass::arch::warpgroup_reg_alloc<kNumMathRegisters>();
+            clear(accum);
+            uint32_t phase = 0;
+            for (int32_t sf_tile_idx = 0; sf_tile_idx < sf_tile_count; ++sf_tile_idx)
+            {
+                sf_full_mbar[0].wait(phase);
+                cute::copy(s2r_copy_SFA, tXsSFA(_, _, _, Int<0>{}), tXrSFA);
+                cute::copy(s2r_copy_SFB, tXsSFB(_, _, _, Int<0>{}), tXrSFB);
+                sf_empty_mbar[0].arrive();
 
-        // store
-        __syncthreads();
-        epilogue_with_smem(accum, shared_storage, params, blk_coord);
-        // tma_store(accum, shared_storage, params, blk_coord);
+                cute::for_each(cute::make_int_sequence<KT::AB_Stages>{},
+                    [&](auto read_stage)
+                    {
+                        ab_full_mbar[read_stage].wait(phase);
+                        cute::copy(s2r_copy_A, tXsA(_, _, _, read_stage), tXrA);
+                        cute::copy(s2r_copy_B, tXsB(_, _, _, read_stage), tXrB);
+                        ab_empty_mbar[read_stage].arrive();
+
+                        auto tCrSFA_stage = tCrSFA_frg(_, _, _, read_stage);
+                        auto tCrSFB_stage = tCrSFB_frg(_, _, _, read_stage);
+                        cute::gemm(
+                            mma, make_zip_tensor(tCrA, tCrSFA_stage), make_zip_tensor(tCrB, tCrSFB_stage), accum);
+                    });
+                phase ^= 1; // flip phase
+            }
+            cutlass::arch::NamedBarrier::sync(128, 1);
+            epilogue_with_smem(accum, shared_storage, params, blk_coord);
+            // tma_store(accum, shared_storage, params, blk_coord);
+        }
     }
 };
 
