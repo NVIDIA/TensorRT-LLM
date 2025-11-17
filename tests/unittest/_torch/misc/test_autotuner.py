@@ -140,6 +140,10 @@ def test_autotuner_cache_basic():
     with autotune():
         torch.ops.autotuner_test.get_best_gemm_tactic(torch.randn(M, 64), w)
 
+    # This tests the logic of print_profiling_cache and print_statistics
+    AutoTuner.get().print_profiling_cache()
+    AutoTuner.get().print_statistics()
+
     m = M * 2
     while m >= 1:
         best_tactic = torch.ops.autotuner_test.get_best_gemm_tactic(
