@@ -597,6 +597,7 @@ class TRTLLMGenFusedMoE(MoE):
                 token_selected_experts,
                 output=moe_output,
             )
+            self.use_workspace_output = True
         else:
             raise NotImplementedError(
                 "TRTLLMGenFusedMoE only supports fp8_block_scaling, nvfp4, w4a16_mxfp4, w4a8_mxfp4_mxfp8 and w4a8_mxfp4_fp8 dtypes."
@@ -776,12 +777,11 @@ class TRTLLMGenFusedMoE(MoE):
             x, x_sf = self.quantize_input(x, post_quant_comm=False)
 
         moe_output: Optional[torch.Tensor] = None
-        use_workspace_output = False
+        self.use_workspace_output = False
         # TODO: use_workspace_output only supports w4a8_mxfp4_mxfp8 (gpt-oss) for now
         if self.alltoall_method_type == AlltoallMethodType.NVLinkOneSided and self.has_w4a8_mxfp4_mxfp8:
             moe_output = self.moe_a2a.get_combine_payload_tensor_in_workspace(
                 runtime_max_tokens_per_rank, self.hidden_size, torch.bfloat16)
-            use_workspace_output = True
 
         # Call the extracted run_moe interface
         # Determine router_logits based on post_quant_comm
@@ -818,7 +818,7 @@ class TRTLLMGenFusedMoE(MoE):
             elif self.alltoall_method_type == AlltoallMethodType.NVLinkOneSided:
                 # If use_workspace_output=True, the MoE result is already in workspace
                 # Otherwise, we need to reshape and pass it
-                if use_workspace_output:
+                if self.use_workspace_output:
                     # Workspace payload is returned as 2D [ep_size * max_tokens, hidden]; reshape to 3D.
                     hidden = final_hidden_states.shape[-1]
                     payload = moe_output.view(self.ep_size,

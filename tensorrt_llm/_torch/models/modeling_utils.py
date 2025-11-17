@@ -558,6 +558,7 @@ class DecoderModelForCausalLM(nn.Module,
 
     def load_weights(self,
                      weights: Dict,
+                     params_map: Optional[Dict] = None,
                      weight_mapper: Optional["BaseWeightMapper"] = None,
                      skip_modules: List[str] = [],
                      allow_partial_loading: bool = False):
@@ -569,6 +570,7 @@ class DecoderModelForCausalLM(nn.Module,
             _load_weights_impl(self,
                                weights,
                                skip_modules,
+                               params_map=params_map,
                                preload_weight_modules=preload_weight_modules,
                                allow_partial_loading=allow_partial_loading)
         else:
@@ -576,6 +578,7 @@ class DecoderModelForCausalLM(nn.Module,
                                   weights,
                                   weight_mapper,
                                   skip_modules,
+                                  params_map=params_map,
                                   preload_weight_modules=preload_weight_modules,
                                   allow_partial_loading=allow_partial_loading)
 

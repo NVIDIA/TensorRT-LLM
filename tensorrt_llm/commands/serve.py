@@ -178,6 +178,12 @@ def launch_server(
     model = llm_args["model"]
     if backend == 'pytorch':
         llm_args.pop("build_config", None)
+        if isinstance(
+                llm_args["tokenizer"],
+                str) and llm_args["checkpoint_format"] == "mistral_large_3":
+            from tensorrt_llm.llmapi.tokenizer import MistralTokenizer
+            llm_args["tokenizer"] = MistralTokenizer.from_pretrained(
+                llm_args["tokenizer"])
         llm = PyTorchLLM(**llm_args)
     elif backend == '_autodeploy':
         from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM

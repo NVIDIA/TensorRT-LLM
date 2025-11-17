@@ -1,3 +1,4 @@
+import copy
 import dataclasses
 import os
 from typing import Any, Dict, List, Optional, Tuple
@@ -14,6 +15,9 @@ from tensorrt_llm._torch.attention_backend.interface import (
     PositionalEmbeddingParams, RopeParams)
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_pixtral
+from tensorrt_llm._torch.models.checkpoints.mistral.weight_mapper import \
+    MistralWeightMapper
+from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV3ForCausalLM
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     find_input_mm_embeds, fuse_input_embeds, get_multimodal_embeddings)
 from tensorrt_llm._torch.models.modeling_utils import (DecoderModel,
@@ -37,6 +41,8 @@ from tensorrt_llm.inputs import (BaseMultimodalDummyInputsBuilder,
                                  register_input_processor)
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi import SamplingParams
+from tensorrt_llm.llmapi.tokenizer import (MistralTokenizer,
+                                           PixtralProcessorAdapter)
 from tensorrt_llm.logger import logger
 
 _MULTIMODAL_ENV_NAME = "TLLM_MULTIMODAL_DISAGGREGATED"
@@ -233,13 +239,27 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
                          **kwargs)
         self._config = config
         self._dtype = self._config.torch_dtype
-        self._tokenizer = tokenizer if tokenizer is not None else AutoTokenizer.from_pretrained(
-            model_path)
+        if tokenizer is not None:
+            self._tokenizer = tokenizer
+        else:
+            try:
+                self._tokenizer = AutoTokenizer.from_pretrained(
+                    model_path,
+                    use_fast=self.use_fast,
+                    trust_remote_code=trust_remote_code)
+            except ValueError:
+                self._tokenizer = MistralTokenizer.from_pretrained(model_path)
         self._model_path = model_path
-        self._processor = AutoProcessor.from_pretrained(
-            model_path,
-            use_fast=self.use_fast,
-            trust_remote_code=trust_remote_code)
+        if isinstance(self._tokenizer, MistralTokenizer):
+            # spatial_merge_size = getattr(config, "spatial_merge_size", None) or getattr(
+            #     config.vision_config, "spatial_merge_size")
+            self._processor = PixtralProcessorAdapter(
+                tokenizer=self._tokenizer)
+        else:
+            self._processor = AutoProcessor.from_pretrained(
+                model_path,
+                use_fast=self.use_fast,
+                trust_remote_code=trust_remote_code)
 
     @property
     def config(self) -> PretrainedConfig:
@@ -266,7 +286,8 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         images = inputs.get("multi_modal_data", {}).get("image")
-        do_rescale = self.processor.image_processor.do_rescale
+        do_rescale = getattr(self.processor.image_processor, "do_rescale",
+                             False)
         if images is not None and isinstance(images[0], torch.Tensor):
             # The default multimodal input loader will normalize images to [0, 1] when the requested
             # format is "pt" (pytorch tensors), but not for "pil" (PIL images).
@@ -331,6 +352,7 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
 
 
 @register_auto_model("Mistral3ForConditionalGeneration")
+@register_auto_model("PixtralForConditionalGeneration")
 @register_input_processor(
     Mistral3InputProcessor,
     model_type="mistral3",
@@ -365,34 +387,45 @@ class Mistral3VLM(PreTrainedModel):
         config = model_config.pretrained_config
         super().__init__(config)
 
-        self.model_config = model_config
-
-        llm_model_config = self._get_sub_model_config(model_config,
-                                                      "text_config")
-        # This is necessary for the auto weight mapper to figure out what it needs.
-        llm_model_config.pretrained_config.architectures = config.architectures
-        self.llm = MistralForCausalLM(llm_model_config)
-
-        self._device = "cuda"
-        # NOTE: current `modelopt` does not support quantizing the vision portion.
-        vision_model_config = self._get_sub_model_config(model_config,
-                                                         "vision_config",
-                                                         quant_config=None)
-        self._vision_tower = modeling_pixtral.PixtralVisionModel(
-            vision_model_config)
-        self._multi_modal_projector = Mistral3MultiModalProjector(model_config)
-        vision_feature_layer = config.vision_feature_layer
+        vision_feature_layer = getattr(config, "vision_feature_layer", -1)
         if vision_feature_layer != -1:
             raise ValueError(
                 f"Using intermediate layers ({vision_feature_layer}) in the `PixtralVisionModel` "
                 f"is not supported. Please use `vision_feature_layer=-1`.")
 
+        self._device = "cuda"
         self.model_dtype = getattr(config, "torch_dtype", torch.bfloat16)
-
-        self._image_token_ids = torch.tensor([config.image_token_index],
+        image_token_index = getattr(
+            config, "image_token_index", None) or getattr(
+                config.vision_config, "image_token_id", None)
+        self._image_token_ids = torch.tensor([image_token_index],
                                              dtype=torch.int32,
                                              device=self._device)
+
+        model_config_cp = copy.deepcopy(model_config)
+
+        llm_model_config = self._get_sub_model_config(model_config_cp,
+                                                      "text_config")
+        self.model_config = model_config_cp
+        llm_class = MistralForCausalLM
+        if llm_model_config.pretrained_config.architectures[
+                0] == "MistralLarge3ForCausalLM":
+            llm_class = DeepseekV3ForCausalLM
+        # This is necessary for the auto weight mapper to figure out what it needs.
+        llm_model_config.pretrained_config.architectures = config.architectures
+        self.llm = llm_class(llm_model_config)
+        self.model_config.extra_attrs.update(llm_model_config.extra_attrs)
+        # NOTE: current `modelopt` does not support quantizing the vision portion.
+        vision_model_config = self._get_sub_model_config(model_config_cp,
+                                                         "vision_config",
+                                                         quant_config=None)
+        self._vision_tower = modeling_pixtral.PixtralVisionModel(
+            vision_model_config)
+        self._multi_modal_projector = Mistral3MultiModalProjector(
+            model_config).eval().to(self._device)
+
         self._post_config()
+        self.is_loaded = True
 
     # This is necessary because the executor looks at
     # `model.model_config.pretrained_config.vocab_size`.
@@ -400,18 +433,36 @@ class Mistral3VLM(PreTrainedModel):
         self.config = self.llm.config
         self.model_config.pretrained_config = self.llm.config
 
-    def load_weights(self, weights: Dict, *args, **kwargs):
+    def load_weights(self, weights: Dict, weight_mapper=None, *args, **kwargs):
+        llm_params_map, vit_params_map = None, None
+        if weight_mapper:
+            if isinstance(weight_mapper, MistralWeightMapper):
+                vit_params_map = weight_mapper.pixtral_mapping
+
         llm_weights = _filter_weights(weights, "language_model.")
-        self.llm.load_weights(llm_weights, *args, **kwargs)
+        self.llm.load_weights(llm_weights,
+                              weight_mapper=weight_mapper,
+                              *args,
+                              **kwargs)
 
         vit_weights = _filter_weights(weights, "vision_tower.")
-        self._vision_tower.load_weights(vit_weights, *args, **kwargs)
+        self._vision_tower.load_weights(vit_weights,
+                                        params_map=vit_params_map,
+                                        *args,
+                                        **kwargs)
 
         mm_projector_weights = _filter_weights(weights,
                                                "multi_modal_projector.")
-        # `_load_weights_impl` assumes `config.hidden_size` exists, which is not the case for the
-        # top-level `Mistral3Config`.
-        self._multi_modal_projector.load_state_dict(mm_projector_weights)
+        if vit_params_map is not None:
+            mm_projector_weights = weight_mapper.rename_by_params_map(
+                weights=mm_projector_weights, params_map=vit_params_map)
+
+        try:
+            self._multi_modal_projector.load_state_dict(mm_projector_weights)
+        except Exception as e:
+            # FIXME
+            logger.error(f"Error loading multi_modal_projector weights: {e}")
+            # raise e
 
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
@@ -423,6 +474,7 @@ class Mistral3VLM(PreTrainedModel):
         input_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         return_context_logits: bool = False,
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Forward method."""
@@ -455,6 +507,7 @@ class Mistral3VLM(PreTrainedModel):
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             return_context_logits=return_context_logits,
+            spec_metadata=spec_metadata,
         )
 
     @staticmethod
@@ -465,16 +518,41 @@ class Mistral3VLM(PreTrainedModel):
     ) -> ModelConfig:
         # Extract the subconfig from the `transformers` config and shove it into our own
         # `ModelConfig` class.
+        assert name in [
+            "text_config", "vision_config"
+        ], f"Expected subconfig name to be either 'text_config' or 'vision_config'. Got {name} instead."
+        pretrained_config = getattr(model_config.pretrained_config, name)
+        # ModelOpt currently doesn't quantize the vision part. Without setting quant config to None,
+        # weight loading fails for vision.
+        # quant_config = model_config.quant_config if name == "text_config" else None
+
         sub_model_config: ModelConfig[MistralConfig] = dataclasses.replace(
             model_config,
-            pretrained_config=getattr(model_config.pretrained_config, name),
+            pretrained_config=pretrained_config,
+            # attention_backend=preferred_backend, # TODO FIXME
             **changes,
         )
+        if name == "text_config":
+            sub_model_config._frozen = False
+            sub_model_config.skip_create_weights_in_init = True
+            sub_model_config._frozen = True
+
         # Make sure some fields that are not explicitly included in the sub config, but present
         # in the top-level config, are replicated.
         if (hasattr(sub_model_config.pretrained_config, "torch_dtype")
                 and sub_model_config.pretrained_config.torch_dtype is None):
             sub_model_config.pretrained_config.torch_dtype = model_config.pretrained_config.torch_dtype
+
+        if name == "vision_config":
+            pretrained_config = sub_model_config.pretrained_config
+            defaults = {
+                "head_dim": pretrained_config.hidden_size //
+                pretrained_config.num_attention_heads,
+                "hidden_act": "silu",
+            }
+            for attr, default in defaults.items():
+                if not hasattr(pretrained_config, attr):
+                    setattr(pretrained_config, attr, default)
 
         return sub_model_config
 
@@ -572,6 +650,12 @@ class Mistral3VLM(PreTrainedModel):
     def mm_token_ids(self):
         return self._image_token_ids
 
+    def load_draft_weights(
+            self,
+            weights: Dict,
+            weight_mapper: Optional[MistralWeightMapper] = None) -> None:
+        self.llm.load_draft_weights(weights, weight_mapper=weight_mapper)
+
 
 # Original implementation:
 # https://github.com/huggingface/transformers/blob/v4.51.3/src/transformers/models/mistral3/modeling_mistral3.py#L66
@@ -586,7 +670,9 @@ class Mistral3PatchMerger(torch.nn.Module):
         self.config = config
 
         hidden_size = config.vision_config.hidden_size
-        self._spatial_merge_size = config.spatial_merge_size
+        self._spatial_merge_size = getattr(
+            config, "spatial_merge_size", None) or getattr(
+                config.vision_config, "spatial_merge_size")
         self._patch_size = config.vision_config.patch_size
         self.merging_layer = Linear(
             in_features=hidden_size * self._spatial_merge_size**2,
@@ -624,8 +710,8 @@ class Mistral3PatchMerger(torch.nn.Module):
         image_features = self.merging_layer(image_features)
         return image_features
 
-    def load_weights(self, weights):
-        _load_weights_impl(self, weights)
+    def load_weights(self, weights, *args, **kwargs):
+        _load_weights_impl(self, weights, *args, **kwargs)
 
 
 # Original implementation:
@@ -650,21 +736,22 @@ class Mistral3MultiModalProjector(torch.nn.Module):
         )
         self.patch_merger = Mistral3PatchMerger(model_config)
         # We have hidden_size * the number of vision feature layers
-        num_feature_layers = 1 if isinstance(config.vision_feature_layer,
-                                             int) else len(
-                                                 config.vision_feature_layer)
+        vision_feature_layer = getattr(config, "vision_feature_layer", -1)
+        num_feature_layers = 1 if isinstance(vision_feature_layer,
+                                             int) else len(vision_feature_layer)
         self.linear_1 = Linear(
             in_features=config.vision_config.hidden_size * num_feature_layers,
             out_features=config.text_config.hidden_size,
-            bias=config.multimodal_projector_bias,
+            bias=getattr(config, "multimodal_projector_bias", None),
             dtype=dtype,
             mapping=model_config.mapping,
         )
-        self.act = ACT2FN[config.projector_hidden_act]
+        projector_hidden_act = getattr(config, "projector_hidden_act", "gelu")
+        self.act = ACT2FN[projector_hidden_act]
         self.linear_2 = Linear(
             in_features=config.text_config.hidden_size,
             out_features=config.text_config.hidden_size,
-            bias=config.multimodal_projector_bias,
+            bias=getattr(config, "multimodal_projector_bias", None),
             dtype=dtype,
             mapping=model_config.mapping,
         )
@@ -678,8 +765,8 @@ class Mistral3MultiModalProjector(torch.nn.Module):
         hidden_states = self.linear_2(hidden_states)
         return hidden_states
 
-    def load_weights(self, weights):
-        _load_weights_impl(self, weights)
+    def load_weights(self, weights, *args, **kwargs):
+        _load_weights_impl(self, weights, *args, **kwargs)
 
 
 def _filter_weights(weights: Dict[str, torch.Tensor],

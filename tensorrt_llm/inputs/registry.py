@@ -585,6 +585,16 @@ def create_input_processor(
             logger.debug(
                 f"Unable to load HF config from {model_path_or_dir}: {e}. Falling back."
             )
+    elif checkpoint_format in ("mistral", "mistral_large_3"):
+        logger.debug(f"Detected checkpoint_format={checkpoint_format}.")
+        from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
+            MistralConfigLoader
+        model_config = MistralConfigLoader().load(model_path_or_dir)
+        config = model_config.pretrained_config
+
+        if tokenizer is None:
+            from tensorrt_llm.llmapi.tokenizer import MistralTokenizer
+            tokenizer = MistralTokenizer.from_pretrained(model_path_or_dir)
     else:
         logger.debug(
             f"checkpoint_format={checkpoint_format}; skipping HF config load.")

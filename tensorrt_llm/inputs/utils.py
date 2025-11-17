@@ -19,12 +19,14 @@ from torchvision.transforms import ToTensor
 from transformers import AutoProcessor, ProcessorMixin
 from transformers.utils import logging
 
+from tensorrt_llm.inputs import BaseMultimodalInputProcessor
 from tensorrt_llm.inputs.multimodal import (MultimodalServerConfig,
                                             default_hasher)
 from tensorrt_llm.inputs.registry import (MULTIMODAL_PLACEHOLDER_REGISTRY,
                                           MultimodalPlaceholderPlacement)
 from tensorrt_llm.llmapi.llm_utils import ModelLoader
-from tensorrt_llm.llmapi.tokenizer import TokenizerBase, TransformersTokenizer
+from tensorrt_llm.llmapi.tokenizer import (MistralTokenizer, TokenizerBase,
+                                           TransformersTokenizer)
 
 logger = logging.get_logger(__name__)
 
@@ -579,6 +581,13 @@ def apply_chat_template(
     if model_type in HF_CHAT_TEMPLATE_EXCEPTIONS:
         # special path for models like llava-llama
         return "".join([conv["content"] for conv in conversation])
+
+    if isinstance(tokenizer, MistralTokenizer):
+        return tokenizer.apply_chat_template(
+            conversation=conversation,
+            tokenize=False,  # add_generation_prompt=add_generation_prompt,
+            tools=tools)
+
     if isinstance(tokenizer, TransformersTokenizer):
         tokenizer = tokenizer.tokenizer  # we need the TokenizerBase for apply_chat_template
 
@@ -610,6 +619,7 @@ def default_multimodal_input_loader(
         model_type: str,
         modality: str,
         prompts: List[str],
+        processor: Optional[BaseMultimodalInputProcessor] = None,
         media: Optional[Union[List[str], List[List[str]]]] = None,
         image_data_format: str = "pt",
         num_frames: int = 8,
@@ -720,8 +730,7 @@ def default_multimodal_input_loader(
     if tokenizer is None and model_type not in HF_CHAT_TEMPLATE_EXCEPTIONS:
         tokenizer = ModelLoader.load_hf_tokenizer(model_dir, use_fast=True)
 
-    processor = None
-    if model_type not in HF_CHAT_TEMPLATE_EXCEPTIONS:
+    if processor is None and model_type not in HF_CHAT_TEMPLATE_EXCEPTIONS:
         processor = AutoProcessor.from_pretrained(model_dir,
                                                   use_fast=True,
                                                   trust_remote_code=True)

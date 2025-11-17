@@ -48,7 +48,9 @@ class QuantAlgo(StrEnum, metaclass=BaseEnumMeta):
 
 
 QUANT_ALGO_LIST = list(set(QuantAlgo) - {QuantAlgo.INT8})
-KV_CACHE_QUANT_ALGO_LIST = [QuantAlgo.FP8, QuantAlgo.INT8, QuantAlgo.NVFP4]
+KV_CACHE_QUANT_ALGO_LIST = [
+    QuantAlgo.FP8, QuantAlgo.INT8, QuantAlgo.NVFP4, QuantAlgo.NO_QUANT
+]
 W8A8_SQ_PLUGIN_LIST = [
     QuantAlgo.W8A8_SQ_PER_TENSOR_PLUGIN,
     QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN,

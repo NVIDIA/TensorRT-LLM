@@ -1082,6 +1082,10 @@ class _TorchLLM(BaseLLM):
                                                       checkpoint_format)
         self._tokenizer = self.input_processor.tokenizer
 
+        logger.debug(
+            f"Created input_processor={self.input_processor} with a tokenizer {self._tokenizer}"
+        )
+
         # TODO: revisit gather_context_logits
         return_logits = self.args.gather_generation_logits
         self._executor = self._executor_cls.create(

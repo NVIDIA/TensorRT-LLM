@@ -108,7 +108,8 @@ class OpenAIServer:
             from tensorrt_llm._torch.pyexecutor.config_utils import \
                 load_pretrained_config
             self.model_config = load_pretrained_config(hf_tokenizer_path,
-                                                       trust_remote_code=trust_remote_code)
+                                                       trust_remote_code=trust_remote_code,
+                                                       checkpoint_format=llm.args.checkpoint_format)
         except Exception:
             logger.debug("Failed to load AutoConfig for %s", hf_tokenizer_path)
             self.model_config = None
@@ -492,8 +493,14 @@ class OpenAIServer:
             ]
             # Pass the tokenizer vocabulary size so ``logit_bias`` can be
             # expanded into an embedding bias tensor in the sampler.
+            if hasattr(self.tokenizer.tokenizer, "vocab_size"):
+                vocab_size = self.tokenizer.tokenizer.vocab_size
+            elif hasattr(self.tokenizer.tokenizer, "_vocab_size"):
+                vocab_size = self.tokenizer.tokenizer._vocab_size
+            else:
+                raise ValueError(f"Tokenizer {self.tokenizer.tokenizer} has no attribute vocab_size or _vocab_size.")
             sampling_params = request.to_sampling_params(
-                vocab_size=self.tokenizer.tokenizer.vocab_size,
+                vocab_size=vocab_size,
                 gather_generation_logits=self.llm.args.gather_generation_logits,
                 backend=self.llm.args.backend)
             postproc_args = ChatPostprocArgs.from_request(request)
@@ -740,8 +747,14 @@ class OpenAIServer:
             postproc_params_collection: List[Optional[PostprocParams]] = []
             # Pass the tokenizer vocabulary size so ``logit_bias`` can be
             # expanded into an embedding bias tensor in the sampler.
+            if hasattr(self.tokenizer.tokenizer, "vocab_size"):
+                vocab_size = self.tokenizer.tokenizer.vocab_size
+            elif hasattr(self.tokenizer.tokenizer, "_vocab_size"):
+                vocab_size = self.tokenizer.tokenizer._vocab_size
+            else:
+                raise ValueError(f"Tokenizer {self.tokenizer.tokenizer} has no attribute vocab_size or _vocab_size.")
             sampling_params = request.to_sampling_params(
-                vocab_size=self.tokenizer.tokenizer.vocab_size)
+                vocab_size=vocab_size)
             # TODO: better way to enable metrics
             if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
                 sampling_params.return_perf_metrics = True
@@ -863,8 +876,14 @@ class OpenAIServer:
             else:
                 request.stop_token_ids = harmony_stop_tokens
 
+            if hasattr(self.tokenizer.tokenizer, "vocab_size"):
+                vocab_size = self.tokenizer.tokenizer.vocab_size
+            elif hasattr(self.tokenizer.tokenizer, "_vocab_size"):
+                vocab_size = self.tokenizer.tokenizer._vocab_size
+            else:
+                raise ValueError(f"Tokenizer {self.tokenizer.tokenizer} has no attribute vocab_size or _vocab_size.")
             sampling_params = request.to_sampling_params(
-                vocab_size=self.tokenizer.tokenizer.vocab_size)
+                vocab_size=vocab_size)
             sampling_params.detokenize = False  # Harmony adapter handles detokenization
 
             postproc_args = ChatCompletionPostprocArgs.from_request(request)
