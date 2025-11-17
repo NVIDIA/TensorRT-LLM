@@ -1,0 +1,1 @@
+test_disagg.py::TestDisaggBenchmark::test_benchmark[disagg_perf_file:deepseek-r1-fp4_000_1k1k_ctx:1_gen:4_tep:8_bs:32_eplb:0_mtp:3_ccbackend:NIXL]
