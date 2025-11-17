@@ -6,7 +6,7 @@ from .common import ReduceOp, get_rank_world_size, is_ompi
 try:
     from ....mapping import Mapping
     from ...distributed import AllReduce, allgather
-    from ...modules.linear import AllReduceFusionOp, AllReduceParams, AllReduceStrategy
+    from ...modules.linear import AllReduceStrategy
 
     # Cache AllReduce modules to avoid recreating on every call
     # This is critical for CUDA graph compatibility - recreating modules during
@@ -34,55 +34,6 @@ try:
         torch_op = _allreduce_cache[cache_key]
         return torch_op(tensor, all_reduce_params=all_reduce_params)
 
-    @torch.library.custom_op(
-        "dist::fused_allreduce_residual_rmsnorm", mutates_args=(), device_types="cuda"
-    )
-    def fused_allreduce_residual_rmsnorm(
-        tensor: torch.Tensor, residual: torch.Tensor, norm_weight: torch.Tensor, eps: float
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Fusing allreduce, residual (add), and hf_rms_norm together.
-
-        When TRT-LLM ops are available (MPI mode), uses the fused kernel.
-        Otherwise, falls back to separate operations using torch distributed.
-        """
-        # Only use TRT-LLM fused op when running with MPI
-        if is_trtllm_op_available():
-            all_reduce_params = AllReduceParams(
-                fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                bias=None,
-                residual=residual,
-                norm_weight=norm_weight,
-                eps=eps,
-            )
-            return trtllm_allreduce(tensor, ReduceOp.SUM, all_reduce_params=all_reduce_params)
-        else:
-            # Fallback: unfused implementation using torch distributed
-            # This is used in demollm mode without MPI
-            from .common import all_reduce as torch_all_reduce
-
-            # 1. All-reduce the tensor
-            tensor_reduced = tensor.clone()
-            torch_all_reduce(tensor_reduced, op=ReduceOp.SUM)
-
-            # 2. Add residual
-            tensor_with_residual = tensor_reduced + residual
-
-            # 3. Apply RMSNorm using PyTorch's built-in function
-            norm_out = torch.nn.functional.rms_norm(
-                tensor_with_residual,
-                normalized_shape=(tensor_with_residual.size(-1),),
-                weight=norm_weight,
-                eps=eps,
-            )
-
-            return norm_out, tensor_with_residual
-
-    @fused_allreduce_residual_rmsnorm.register_fake
-    def fused_allreduce_residual_rmsnorm_fake(
-        tensor: torch.Tensor, residual: torch.Tensor, norm_weight: torch.Tensor, eps: float
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return torch.empty_like(tensor), torch.empty_like(tensor)
-
     TRTLLM_OP_AVAILABLE = True
 except ImportError:
 
@@ -93,6 +44,31 @@ except ImportError:
         raise ImportError("TRT-LLM is not available.")
 
     TRTLLM_OP_AVAILABLE = False
+
+
+# Custom op registration must be outside try-except to ensure it's always available
+# The backend pattern will handle which implementation to use at runtime
+@torch.library.custom_op(
+    "dist::fused_allreduce_residual_rmsnorm", mutates_args=(), device_types="cuda"
+)
+def fused_allreduce_residual_rmsnorm(
+    tensor: torch.Tensor, residual: torch.Tensor, norm_weight: torch.Tensor, eps: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fusing allreduce, residual (add), and hf_rms_norm together.
+
+    When TRT-LLM ops are available (MPI mode), uses the fused kernel.
+    Otherwise, falls back to separate operations using torch distributed.
+    """
+    from .backend import get_dist_backend
+
+    return get_dist_backend().fused_allreduce_residual_rmsnorm(tensor, residual, norm_weight, eps)
+
+
+@fused_allreduce_residual_rmsnorm.register_fake
+def fused_allreduce_residual_rmsnorm_fake(
+    tensor: torch.Tensor, residual: torch.Tensor, norm_weight: torch.Tensor, eps: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(tensor), torch.empty_like(tensor)
 
 
 def is_trtllm_op_available():

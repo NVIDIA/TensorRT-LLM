@@ -9,8 +9,7 @@ from torch import nn
 
 from tensorrt_llm._torch.autotuner import autotune
 
-from ..distributed import common as dist
-from ..distributed import trtllm as trtllm_dist
+from ..distributed.backend import get_dist_backend
 from .torch_libs.float8_python_api import addmm_float8_unwrapped
 
 TRTLLM_FP4_OP_AVAILABLE = True
@@ -243,13 +242,9 @@ def fused_fp8_linear_all_reduce(
     input_scale: Optional[torch.Tensor] = None,
     weight_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    out = torch.ops.auto_deploy.torch_quant_fp8_linear(
+    return get_dist_backend().fused_fp8_linear_all_reduce(
         input, weight_fp8, bias, input_scale, weight_scale
     )
-    if trtllm_dist.is_trtllm_op_available():
-        return trtllm_dist.trtllm_allreduce(out, op=dist.ReduceOp.SUM)
-    dist.all_reduce(out, op=dist.ReduceOp.SUM)
-    return out
 
 
 @fused_fp8_linear_all_reduce.register_fake

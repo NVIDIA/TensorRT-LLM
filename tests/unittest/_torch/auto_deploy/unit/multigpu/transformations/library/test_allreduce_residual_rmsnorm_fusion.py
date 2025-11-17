@@ -5,6 +5,7 @@ import torch
 from _dist_test_utils import get_device_counts
 from torch.export import export
 
+import tensorrt_llm._torch.auto_deploy  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.distributed import common as dist
 from tensorrt_llm._torch.auto_deploy.distributed.trtllm import is_trtllm_op_available
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm

@@ -4,8 +4,7 @@ from typing import Optional
 
 import torch
 
-from ..distributed import common as dist
-from ..distributed import trtllm as trtllm_dist
+from ..distributed.backend import get_dist_backend
 
 
 @torch.library.custom_op("auto_deploy::torch_linear_simple", mutates_args=())
@@ -37,11 +36,7 @@ def fused_linear_all_reduce(
     input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
 ) -> torch.Tensor:
     """Fused linear followed by all_reduce on the output."""
-    output = torch.ops.aten.linear(input, weight, bias)
-    if trtllm_dist.is_trtllm_op_available():
-        return trtllm_dist.trtllm_allreduce(output, op=dist.ReduceOp.SUM)
-    dist.all_reduce(output, op=dist.ReduceOp.SUM)
-    return output
+    return get_dist_backend().fused_linear_all_reduce(input, weight, bias)
 
 
 @fused_linear_all_reduce.register_fake
