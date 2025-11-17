@@ -170,9 +170,9 @@ def parse_arguments() -> argparse.Namespace:
                         default=False,
                         action='store_true',
                         help='Print iteration logs during execution')
-    parser.add_argument('--use_cuda_graph', default=False, action='store_true')
+    parser.add_argument('--use_cuda_graph', default=True, action='store_true')
     parser.add_argument('--cuda_graph_padding_enabled',
-                        default=False,
+                        default=True,
                         action='store_true')
     parser.add_argument('--cuda_graph_batch_sizes',
                         nargs='+',
