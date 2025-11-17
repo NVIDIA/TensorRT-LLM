@@ -221,6 +221,8 @@ class ScaffoldingLlm:
         async def stop_task_on_loop():
             await self.task_queue.put(None)
             await self.main_loop_stop_event.wait()
+            for worker in self.workers.values():
+                await worker.async_shutdown()
 
         asyncio.run_coroutine_threadsafe(stop_task_on_loop(), self.loop)
 

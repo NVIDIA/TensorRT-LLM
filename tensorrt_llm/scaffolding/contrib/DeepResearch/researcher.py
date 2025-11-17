@@ -1,17 +1,12 @@
 import logging
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import List
 
-from tensorrt_llm.scaffolding import Controller, Task
-from tensorrt_llm.scaffolding.contrib.mcp import ChatTask, MCPCallTask, MCPController
+from tensorrt_llm.scaffolding import ChatTask, Controller, SystemMessage, Task, UserMessage
 
-from .prompts import (
-    compress_research_simple_human_message,
-    compress_system_prompt,
-    research_system_prompt,
-)
-from .utils import AssistantMessage, SystemMessage, UserMessage, get_today_str
+from .prompts import compress_research_simple_human_message, research_system_prompt
+from .tools import reflection_tool, tavily_search_tool
+from .utils import get_today_str
 
 LOGGER = logging.getLogger()
 
@@ -29,97 +24,65 @@ class ResearchTask(Task):
         return task
 
 
+class Compressor(Controller):
+    def __init__(
+        self,
+        generation_controller: Controller,
+        system_prompts: list[SystemMessage],
+        max_iterations: int = 3,
+    ):
+        super().__init__()
+        self.generation_controller = generation_controller
+        self.system_prompts = system_prompts
+        self.max_iterations = max_iterations
+
+    def clone(self):
+        return Compressor(
+            self.generation_controller.clone(), self.system_prompts, self.max_iterations
+        )
+
+    def process(self, tasks: List[Task], **kwargs):
+        assert len(tasks) == 1 and isinstance(tasks[0], ChatTask), (
+            "Compressor only supports one ChatTask"
+        )
+        compress_task = ChatTask.create_from_prompt(None, self.system_prompts)
+        compress_task.add_messages(tasks[0].messages)
+        compress_task.add_message(UserMessage(compress_research_simple_human_message))
+
+        for i in range(self.max_iterations):
+            yield from self.generation_controller.process([compress_task])
+            if compress_task.finish_reason == "finish":
+                break
+            if i < self.max_iterations - 1:
+                compress_task.messages.pop()
+
+        tasks[0].output_str = compress_task.output_str
+        return
+
+
 class Researcher(Controller):
-    class WorkerTag(Enum):
-        GENERATION = "generation"
+    tools = [tavily_search_tool, reflection_tool]
 
-    def __init__(self, max_tools_iter: int = 3, max_compress_iter: int = 3):
-        # TODO: Add more tools (e.g., MCP tools) beyond search.
-        self.tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "tavily_search",
-                    "description": "For conducting web searches to gather information",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"query": {"type": "string"}},
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "reflection",
-                    "description": "For reflection and strategic planning during research",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"reflection": {"type": "string"}},
-                    },
-                },
-            },
-        ]
+    def __init__(self, chat_with_tools_controller: Controller, compress_controller: Controller):
+        super().__init__()
+        self.chat_with_tools_controller = chat_with_tools_controller
+        self.compress_controller = compress_controller
 
-        self.max_tools_iter = max_tools_iter
-        self.max_compress_iter = max_compress_iter
+    def clone(self):
+        return Researcher(
+            chat_with_tools_controller=self.chat_with_tools_controller.clone(),
+            compress_controller=self.compress_controller.clone(),
+        )
 
     def process(self, research_tasks: List[ResearchTask], **kwargs):
-        for research_task in research_tasks:
-            research_prompt_messages = [
-                SystemMessage(research_system_prompt.format(date=get_today_str())).to_dict(),
-                UserMessage(research_task.research_topic).to_dict(),
-            ]
+        chat_task = ChatTask.create_from_prompt(
+            research_tasks[0].research_topic,
+            [SystemMessage(research_system_prompt.format(date=get_today_str()))],
+        )
 
-            research_tools_messages = []
-            chat_with_tools_task = ChatTask.from_messages(
-                research_prompt_messages + research_tools_messages, self.tools
-            )
-            chat_with_tools_task.worker_tag = Researcher.WorkerTag.GENERATION
+        yield from self.chat_with_tools_controller.process([chat_task])
 
-            for _ in range(self.max_tools_iter):
-                yield [chat_with_tools_task]
+        yield from self.compress_controller.process([chat_task])
 
-                if chat_with_tools_task.finish_reason != "tool_calls":
-                    break
-
-                if chat_with_tools_task.output_str is not None:
-                    research_tools_messages.append(
-                        AssistantMessage(chat_with_tools_task.output_str).to_dict()
-                    )
-
-                mcp_call_tasks = [
-                    MCPCallTask.create_mcptask(
-                        tool_call.function.name, tool_call.function.arguments
-                    )
-                    for tool_call in chat_with_tools_task.tool_calls
-                ]
-
-                for mcp_call_task in mcp_call_tasks:
-                    mcp_call_task.worker_tag = MCPController.WorkerTag.MCP
-
-                yield mcp_call_tasks
-
-                for mcp_call_task in mcp_call_tasks:
-                    research_tools_messages.append(UserMessage(mcp_call_task.output_str).to_dict())
-
-                chat_with_tools_task = ChatTask.from_messages(
-                    research_prompt_messages + research_tools_messages, self.tools
-                )
-                chat_with_tools_task.worker_tag = Researcher.WorkerTag.GENERATION
-
-            compress_prompt_messages = [
-                SystemMessage(compress_system_prompt.format(date=get_today_str())).to_dict()
-            ]
-
-            compress_messages = research_tools_messages + [
-                UserMessage(compress_research_simple_human_message).to_dict()
-            ]
-            compress_task = ChatTask.from_messages(compress_prompt_messages + compress_messages)
-            compress_task.worker_tag = Researcher.WorkerTag.GENERATION
-
-            for _ in range(self.max_compress_iter):
-                yield [compress_task]
-                research_task.research_result = compress_task.output_str
-                if compress_task.finish_reason == "finish":
-                    break
+        research_tasks[0].research_result = chat_task.output_str
         return

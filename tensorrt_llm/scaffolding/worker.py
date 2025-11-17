@@ -1,7 +1,7 @@
 import asyncio
 import copy
 from abc import ABC
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 
 import openai
 from transformers import AutoTokenizer
@@ -12,7 +12,8 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig, SchedulerConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
 from .result import ScaffoldingOutput
-from .task import GenerationTask, StreamGenerationTask, Task, TaskStatus
+from .task import (AssistantMessage, ChatTask, GenerationTask, MCPCallTask,
+                   StreamGenerationTask, Task, TaskStatus)
 
 ExecutorCls = GenerationExecutor
 
@@ -33,6 +34,9 @@ class Worker(ABC):
     task_handlers = {}
 
     def shutdown(self):
+        pass
+
+    async def async_shutdown(self):
         pass
 
     def __enter__(self):
@@ -71,13 +75,16 @@ class OpenaiWorker(Worker):
         self.model = model
         self.async_client = async_client
 
-    def convert_task_params(self, task: GenerationTask):
+    def convert_task_params(self, task: GenerationTask | ChatTask):
         params = {
             "model": self.model,
-            "prompt": task.input_str,
         }
+
+        if not isinstance(task, ChatTask):
+            params["prompt"] = task.input_str
+            add_param_if_not_none(params, "echo", [task.echo])
+
         add_param_if_not_none(params, "best_of", [task.best_of])
-        add_param_if_not_none(params, "echo", [task.echo])
         add_param_if_not_none(params, "frequency_penalty",
                               [task.frequency_penalty])
         add_param_if_not_none(params, "logit_bias", [task.logit_bias])
@@ -99,13 +106,16 @@ class OpenaiWorker(Worker):
                                            response: openai.Completion):
         task.output_str = response.choices[0].text
         task.output_tokens = response.choices[0].token_ids
+        task.finish_reason = response.choices[0].finish_reason
+        task.logprobs = response.choices[0].logprobs
 
     async def generation_handler(self, task: GenerationTask) -> TaskStatus:
         params = self.convert_task_params(task)
 
         # Make the API call
         try:
-            response = await self.async_client.completions.create(**params)
+            response = await self.async_client.completions.create(
+                max_completion_tokens=task.max_tokens, **params)
             self.fill_generation_task_with_response(task, response)
 
             return TaskStatus.SUCCESS
@@ -115,11 +125,31 @@ class OpenaiWorker(Worker):
             print('Openai client get exception: ' + str(e))
             return TaskStatus.WORKER_EXECEPTION
 
-    def shutdown(self):
-        # OpenAI client doesn't require explicit cleanup
-        pass
+    async def chat_handler(self, task: ChatTask) -> TaskStatus:
+        params = self.convert_task_params(task)
+        params["messages"] = task.messages_to_dict_content()
+        params["model"] = self.model
+        if task.tools is not None:
+            params["tools"] = [tool.to_dict() for tool in task.tools]
 
-    task_handlers = {GenerationTask: generation_handler}
+        try:
+            response = await self.async_client.chat.completions.create(**params)
+            task.finish_reason = response.choices[0].finish_reason
+            content = response.choices[0].message.content
+            reasoning = response.choices[0].message.reasoning
+            reasoning_content = response.choices[0].message.reasoning_content
+            tool_calls = response.choices[0].message.tool_calls
+            task.messages.append(
+                AssistantMessage(content, reasoning, reasoning_content,
+                                 tool_calls))
+            return TaskStatus.SUCCESS
+
+        except Exception as e:
+            # Handle errors
+            print('Openai chat client get exception: ' + str(e))
+            return TaskStatus.WORKER_EXECEPTION
+
+    task_handlers = {GenerationTask: generation_handler, ChatTask: chat_handler}
 
 
 # worker inherit from OpenaiWorker
@@ -229,7 +259,7 @@ class TRTLLMWorker(Worker):
         else:
             result = await self.llm.generate_async(
                 task.input_str, sampling_params=sampling_params)
-        #task.result = result
+
         self.fill_task_with_result(task, result)
 
         # TODO: error handle
@@ -265,3 +295,71 @@ class TRTLLMWorker(Worker):
         GenerationTask: generation_handler,
         StreamGenerationTask: stream_generation_handler
     }
+
+
+import asyncio
+import json
+
+from mcp import ClientSession
+from mcp.client.sse import sse_client
+
+
+class MCPWorker(Worker):
+
+    def __init__(
+        self,
+        urls: List[str],
+    ):
+        self.urls = urls
+
+    @classmethod
+    def init_with_urls(cls, urls: List[str]):
+        worker = cls(urls)
+        return worker
+
+    async def _main_loop_async_client_iter(self, url: str, index: int):
+        async with sse_client(url) as streams:
+            async with ClientSession(*streams) as session:
+                await session.initialize()
+                response = await session.list_tools()
+                tools = response.tools
+                try:
+                    tool_name, args = yield None
+                    while True:
+                        if tool_name in [tool.name for tool in tools]:
+                            response = await session.call_tool(tool_name, args)
+                            tool_name, args = yield response.content[0].text
+                        else:
+                            tool_name, args = yield None
+                except GeneratorExit:
+                    pass
+
+    async def init_in_asyncio_event_loop(self):
+        self.session_iterators = [
+            self._main_loop_async_client_iter(url, index)
+            for index, url in enumerate(self.urls)
+        ]
+        for iterator in self.session_iterators:
+            await iterator.asend(None)
+
+    async def call_handler(self, task: MCPCallTask) -> TaskStatus:
+        tool_name = task.tool_name
+        tool_args = json.loads(task.args)
+        for index in range(len(self.urls)):
+            result = await self.session_iterators[index].asend(
+                (tool_name, tool_args))
+            if result is not None:
+                task.result_str = result
+                break
+
+        return TaskStatus.SUCCESS
+
+    # must shutdown in asyncio event loop
+    async def async_shutdown(self):
+        for iterator in self.session_iterators:
+            try:
+                await iterator.aclose()
+            except GeneratorExit:
+                pass
+
+    task_handlers = {MCPCallTask: call_handler}

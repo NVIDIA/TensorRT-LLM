@@ -1,7 +1,6 @@
-import copy
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Mapping, Optional, Union
 
 import torch
 
@@ -81,6 +80,7 @@ class GenerationTask(Task):
     # result field
     output_str: Optional[str] = None
     output_tokens: Optional[List[int]] = None
+    finish_reason: Optional[str] = None
     # TODO: support openai API format context logits
     context_logits: Optional[torch.Tensor] = None
     # TODO: don't not use TokenLogprobs for general support
@@ -120,7 +120,8 @@ class StreamGenerationTask(GenerationTask):
     def create_from_generation_task(task: GenerationTask,
                                     streaming_step) -> "StreamGenerationTask":
         stream_task = StreamGenerationTask()
-        stream_task.__dict__ = copy.deepcopy(task.__dict__)
+        for k, v in task.__dict__.items():
+            stream_task.__dict__[k] = v
         stream_task.streaming_step = streaming_step
         return stream_task
 
@@ -133,18 +134,136 @@ class RewardTask(Task):
 
 
 @dataclass
-class StreamGenerationTask(GenerationTask):
-    # input field
-    # if the flag is set to True, the worker will cancel the generation work
-    cancel_flag: Optional[bool] = field(default=False)
-    # the task will be returned to the controller with at least new streaming_step tokens
-    # if the streaming_step is set to 0,
-    # the task will be returned to the controller immediately with
-    # new tokens that have already been generated.
-    streaming_step: Optional[int] = field(default=1)
+class RoleMessage:
+    role: Optional[str] = field(default=None)
+    content: Optional[str] = field(default=None)
+
+    def __str__(self) -> str:
+        return f"{self.role}: {self.content}\n"
+
+    def __repr__(self) -> str:
+        return f"{self.role}: {self.content}\n"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"role": self.role, "content": self.content}
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]):
+        return cls(role=data["role"], content=data["content"])
+
+
+@dataclass
+class UserMessage(RoleMessage):
+
+    def __init__(self, content: str):
+        super().__init__(role="user", content=content)
+
+
+@dataclass
+class AssistantMessage(RoleMessage):
+    reasoning: Optional[str] = field(default=None)
+    reasoning_content: Optional[str] = field(default=None)
+    tool_calls: Optional[List[Any]] = field(default=None)
+
+    def __init__(self,
+                 content: str,
+                 reasoning: Optional[str] = None,
+                 reasoning_content: Optional[str] = None,
+                 tool_calls: Optional[List[Any]] = None):
+        super().__init__(role="assistant", content=content)
+        self.reasoning = reasoning
+        self.reasoning_content = reasoning_content
+        self.tool_calls = tool_calls
+
+
+@dataclass
+class SystemMessage(RoleMessage):
+
+    def __init__(self, content: str):
+        super().__init__(role="system", content=content)
+
+
+class ToolDescription:
+
+    def __init__(self, name: str, description: str, parameters: Dict[str, Any]):
+        self.name = name
+        self.description = description
+        self.parameters = parameters
+
+    def to_dict(self) -> Dict[str, Any]:
+        pass
+
+
+class OpenAIToolDescription(ToolDescription):
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": {
+                    "type": "object",
+                    "properties": self.parameters,
+                },
+            },
+        }
+
+
+@dataclass
+class ChatTask(StreamGenerationTask):
+    messages: list[RoleMessage] = field(default_factory=list)
+    tools: Any = field(default=None)
+
+    def messages_to_dict_content(self,
+                                 start_index: int = 0
+                                 ) -> list[Mapping[str, str]]:
+        ret = []
+        for message in self.messages[start_index:]:
+            if message.content is not None:
+                ret.append(message.to_dict())
+        return ret
+
+    def add_message(self, message: RoleMessage):
+        self.messages.append(message)
+
+    def add_messages(self, messages: list[RoleMessage]):
+        self.messages.extend(messages)
+
+    @staticmethod
+    def create_from_prompt(user_prompt: Optional[str],
+                           system_prompts: list[SystemMessage],
+                           tools: Optional[Any] = None) -> "ChatTask":
+        task = ChatTask()
+        task.messages = [prompt for prompt in system_prompts]
+        if user_prompt is not None:
+            task.add_message(UserMessage(user_prompt))
+        task.tools = tools
+        return task
+
+    @staticmethod
+    def create_from_messages(messages: list[RoleMessage],
+                             tools: Optional[Any] = None) -> "ChatTask":
+        task = ChatTask()
+        task.messages = messages
+        task.tools = tools
+        return task
+
+
+@dataclass
+class MCPCallTask(Task):
+    # mcp inputs
+    tool_name: Optional[str] = field(default=None)
+    args: Optional[dict] = field(default=None)
 
     #result field
-    # worker set this field and identify the same task by this field
-    request_handle: Any = field(default=None)
-    # worker set this field to True when the generation is finished
-    end_flag: bool = field(default=False)
+    result_str: Optional[str] = None
+
+    @staticmethod
+    def create_mcptask(tool_name: str, args: dict,
+                       worker_tag: str) -> "MCPCallTask":
+        task = MCPCallTask()
+        task.tool_name = tool_name
+        task.args = args
+        task.worker_tag = worker_tag
+        return task
