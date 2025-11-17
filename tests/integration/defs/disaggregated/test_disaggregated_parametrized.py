@@ -314,7 +314,7 @@ class DisaggregatedTestConfig:
 
     # Test specific settings
     skip_device_count: Optional[int] = None
-    skip_hopper: bool = False
+    skip_no_hopper: bool = False
     skip_arm_arch: bool = False
     env_vars: Optional[Dict[str, str]] = None
     prompt_file: str = "prompts.json"
@@ -352,7 +352,7 @@ class DisaggregatedTestConfig:
         ctx_config: Optional[dict] = None,
         gen_config: Optional[dict] = None,
         skip_device_count: Optional[int] = None,
-        skip_hopper: Optional[bool] = None,
+        skip_no_hopper: Optional[bool] = None,
         skip_arm_arch: Optional[bool] = None,
         env_vars: Optional[Dict[str, str]] = None,
         prompt_file: Optional[str] = None,
@@ -369,7 +369,7 @@ class DisaggregatedTestConfig:
             ctx_config: Dictionary to merge into base ctx_config
             gen_config: Dictionary to merge into base gen_config
             skip_device_count: Override skip_device_count (if None, uses base value)
-            skip_hopper: Override skip_hopper (if None, uses base value)
+            skip_no_hopper: Override skip_no_hopper (if None, uses base value)
             skip_arm_arch: Override skip_arm_arch (if None, uses base value)
             env_vars: Override or merge with base env_vars
             prompt_file: Override prompt_file (if None, uses base value)
@@ -415,7 +415,7 @@ class DisaggregatedTestConfig:
             skip_device_count=skip_device_count
             if skip_device_count is not None
             else base.skip_device_count,
-            skip_hopper=skip_hopper if skip_hopper is not None else base.skip_hopper,
+            skip_no_hopper=skip_no_hopper if skip_no_hopper is not None else base.skip_no_hopper,
             skip_arm_arch=skip_arm_arch if skip_arm_arch is not None else base.skip_arm_arch,
             env_vars=new_env_vars,
             prompt_file=prompt_file if prompt_file is not None else base.prompt_file,
@@ -560,7 +560,6 @@ _ds_v3_lite_tp1_cfg = DisaggregatedTestConfig(
     global_config={
         "backend": "pytorch",
         "free_gpu_memory_fraction": 0.1,
-        "moe_config": {"backend": "TRTLLM"},
     },
     ctx_config={
         "disable_overlap_scheduler": True,
@@ -568,7 +567,7 @@ _ds_v3_lite_tp1_cfg = DisaggregatedTestConfig(
     gen_config={
         "disable_overlap_scheduler": False,
     },
-    skip_hopper=True,
+    skip_no_hopper=True,
 )
 
 _ds_v3_lite_4_gpus_cfg = DisaggregatedTestConfig(
@@ -577,7 +576,6 @@ _ds_v3_lite_4_gpus_cfg = DisaggregatedTestConfig(
     global_config={
         "backend": "pytorch",
         "free_gpu_memory_fraction": 0.7,
-        "moe_config": {"backend": "TRTLLM"},
     },
     ctx_config={
         "tensor_parallel_size": 2,
@@ -588,7 +586,7 @@ _ds_v3_lite_4_gpus_cfg = DisaggregatedTestConfig(
         "disable_overlap_scheduler": False,
     },
     skip_device_count=4,
-    skip_hopper=True,
+    skip_no_hopper=True,
 )
 
 TEST_CONFIGS = [
@@ -943,7 +941,7 @@ TEST_CONFIGS = [
             "num_instances": 2,
             "router": {"type": "kv_cache_aware"},
         },
-        skip_hopper=True,
+        skip_no_hopper=True,
     ),
     DisaggregatedTestConfig.from_base(
         _ds_v3_lite_tp1_cfg,
@@ -1353,7 +1351,7 @@ def test_disagg(
 ):
     """Parametrized test for all disaggregated configurations."""
     # Apply skip conditions that can't be marks
-    if config.skip_hopper:
+    if config.skip_no_hopper:
         skip_no_hopper()
 
     if config.skip_arm_arch:
