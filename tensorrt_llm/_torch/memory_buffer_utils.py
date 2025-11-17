@@ -98,7 +98,7 @@ class Buffers:
         try:
             mem_pool = get_shared_pool()
             if mem_pool is not None:
-                with torch.cuda.memory.use_mem_pool():
+                with torch.cuda.memory.use_mem_pool(mem_pool):
                     new_buffer_tensor = _create_buffer()
             else:
                 new_buffer_tensor = _create_buffer()
