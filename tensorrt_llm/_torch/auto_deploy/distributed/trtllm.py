@@ -67,11 +67,13 @@ try:
             # 2. Add residual
             tensor_with_residual = tensor_reduced + residual
 
-            # 3. Apply RMSNorm
-            # RMSNorm formula: x * rsqrt(mean(x^2) + eps) * weight
-            variance = tensor_with_residual.pow(2).mean(-1, keepdim=True)
-            normalized = tensor_with_residual * torch.rsqrt(variance + eps)
-            norm_out = normalized * norm_weight
+            # 3. Apply RMSNorm using PyTorch's built-in function
+            norm_out = torch.nn.functional.rms_norm(
+                tensor_with_residual,
+                normalized_shape=(tensor_with_residual.size(-1),),
+                weight=norm_weight,
+                eps=eps,
+            )
 
             return norm_out, tensor_with_residual
 
