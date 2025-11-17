@@ -2292,6 +2292,8 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
 
     auto fn = [&]()
     {
+        // IMPORTANT: Keep the order of the activation functions in the same order as the ActivationType enum in
+        // common.h
         auto fn = [&](auto block_scaling_type)
         {
             auto fn_list = std::array{
@@ -2307,11 +2309,12 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                     decltype(block_scaling_type)::value>, // Geglu
                 &doActivationKernel<T, GemmOutputType, ScaleBiasType, SwigluBiasAdaptor,
                     decltype(block_scaling_type)::value>, // SwigluBias
-                &doActivationKernel<T, GemmOutputType, ScaleBiasType, IdentityAdaptor<cutlass::epilogue::thread::Relu2>,
-                    decltype(block_scaling_type)::value>, // Relu2
                 &doActivationKernel<T, GemmOutputType, ScaleBiasType,
                     IdentityAdaptor<cutlass::epilogue::thread::Identity>,
-                    decltype(block_scaling_type)::value> // Identity
+                    decltype(block_scaling_type)::value>, // Identity
+                &doActivationKernel<T, GemmOutputType, ScaleBiasType, IdentityAdaptor<cutlass::epilogue::thread::Relu2>,
+                    decltype(block_scaling_type)::value>  // Relu2
+
             };
             return fn_list[static_cast<int>(activation_type.activation_type)];
         };

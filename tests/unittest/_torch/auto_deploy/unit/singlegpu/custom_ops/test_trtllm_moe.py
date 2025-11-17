@@ -12,7 +12,7 @@ from torch.nn import functional as F
 from utils.util import skip_pre_hopper
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
-from tensorrt_llm._torch.custom_ops.torch_custom_ops import ActivationType
+from tensorrt_llm._torch.utils import ActivationType
 
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 FP8_DTYPE = torch.float8_e4m3fn

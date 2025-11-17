@@ -63,11 +63,12 @@ class TensorParallelMode(str, enum.Enum):
 
 
 def load_weight_shard(
-        weight,
-        tensor_parallel_size: int = 1,
-        tensor_parallel_rank: int = 0,
-        tensor_parallel_mode: Optional[TensorParallelMode] = None,
-        device: torch.device = torch.device('cpu'),
+    weight,
+    tensor_parallel_size: int = 1,
+    tensor_parallel_rank: int = 0,
+    tensor_parallel_mode: Optional[TensorParallelMode] = None,
+    device: torch.device = torch.device('cpu'),
+    return_slice_indices: bool = False,
 ) -> torch.Tensor:
     # Skip device transfers on integrated GPUs to conserve shared memory
     if weight.device.type != device.type and is_device_integrated():
@@ -82,12 +83,14 @@ def load_weight_shard(
         tensor_shape = weight.shape
 
         def maybe_convert_to_torch_tensor(tensor: torch.Tensor,
-                                          indices: slice = None):
+                                          indices: list[slice] | None = None):
             if indices is None:
                 # Avoid unnecessary copy
-                return tensor.to(device)
+                result = (tensor.to(device), [slice(d) for d in tensor.shape])
             else:
-                return tensor[indices].to(device)
+                result = (tensor[indices].to(device), indices)
+            return result if return_slice_indices else result[0]
+
     # WAR to check whether it is a safetensor slice since safetensor didn't register the type to the module
     # safetensors slice, supports lazy loading, type(weight) is `builtin.PySafeSlice`
     elif hasattr(weight, "get_shape"):
@@ -113,7 +116,7 @@ def load_weight_shard(
     slice_width = math.ceil(width / tensor_parallel_size)
     slice_start = tensor_parallel_rank * slice_width
     slice_end = min((tensor_parallel_rank + 1) * slice_width, width)
-    slice_obj = [slice(None)] * len(tensor_shape)
+    slice_obj = [slice(d) for d in tensor_shape]
     slice_obj[split_dim] = slice(slice_start, slice_end)
     return maybe_convert_to_torch_tensor(weight, tuple(slice_obj))
 
@@ -824,9 +827,9 @@ class NVFP4LinearMethod(LinearMethodBase):
                                                      act_sf,
                                                      module.weight_scale,
                                                      module.alpha, module.dtype)
-        # Take the dim of out_features if padded.
+        # Take the dim of out_features if padded. Make sure the output is contiguous
         if output.shape[-1] > module.out_features:
-            output = output[..., :module.out_features]
+            output = output[..., :module.out_features].contiguous()
 
         if bias is not None:
             output = output + bias
