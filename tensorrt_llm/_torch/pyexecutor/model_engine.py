@@ -364,7 +364,6 @@ class PyTorchModelEngine(ModelEngine):
         if self.use_mrope:
             self.mrope_position_ids_cuda = torch.empty(
                 (3, 1, self.max_num_tokens), dtype=torch.int, device='cuda')
-        self.iter_counter = 0
 
         # Pre-allocated buffers for draft model to avoid implicit synchronization
         # These are used to build index tensors without creating tensors from Python lists
@@ -961,6 +960,18 @@ class PyTorchModelEngine(ModelEngine):
                 self.attn_runtime_features.cache_reuse
                 or self.attn_runtime_features.chunked_prefill)
         cache_indirection = self.cache_indirection_attention if self.attn_backend.Metadata is TrtllmAttentionMetadata else None
+        num_attention_heads = getattr(self.model.model_config.pretrained_config,
+                                      'num_attention_heads', None)
+        if num_attention_heads is not None:
+            num_key_value_heads = getattr(
+                self.model.model_config.pretrained_config,
+                'num_key_value_heads', None)
+            if num_key_value_heads is not None:
+                num_heads_per_kv = num_attention_heads // num_key_value_heads
+            else:
+                num_heads_per_kv = 1
+        else:
+            num_heads_per_kv = 1
         if kv_cache_manager is None:
             return self.attn_backend.Metadata(
                 max_num_requests=self.batch_size,
@@ -973,7 +984,8 @@ class PyTorchModelEngine(ModelEngine):
                 enable_context_mla_with_cached_kv=
                 enable_context_mla_with_cached_kv,
                 cache_indirection=cache_indirection,
-                sparse_attention_config=self.sparse_attention_config)
+                sparse_attention_config=self.sparse_attention_config,
+                num_heads_per_kv=num_heads_per_kv)
 
         if self.attn_metadata is not None:
             # This assertion can be relaxed if needed: just create a new metadata
@@ -991,7 +1003,9 @@ class PyTorchModelEngine(ModelEngine):
             enable_flash_mla=self.model.model_config.enable_flash_mla,
             enable_context_mla_with_cached_kv=enable_context_mla_with_cached_kv,
             cache_indirection=cache_indirection,
-            sparse_attention_config=self.sparse_attention_config)
+            sparse_attention_config=self.sparse_attention_config,
+            num_heads_per_kv=num_heads_per_kv,
+        )
 
         return self.attn_metadata
 
@@ -2572,7 +2586,6 @@ class PyTorchModelEngine(ModelEngine):
 
             maybe_attn_metadata, maybe_spec_metadata, key = self.cuda_graph_runner.maybe_get_cuda_graph(
                 padded_requests,
-                iter_counter=self.iter_counter,
                 enable_spec_decode=self.enable_spec_decode,
                 attn_metadata=attn_metadata,
                 spec_metadata=spec_metadata,
@@ -2596,7 +2609,6 @@ class PyTorchModelEngine(ModelEngine):
                 new_tensors_device, cache_indirection_buffer,
                 num_accepted_tokens_device, req_id_to_old_request)
 
-            self.iter_counter += 1
             with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
                 if not can_run_graph:
                     # Fallback to eager execution if graph was not used
