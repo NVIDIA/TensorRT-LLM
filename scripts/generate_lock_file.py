@@ -9,7 +9,7 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 """
-Generates pyproject.toml and poetry.lock files from requirements.txt
+Generates pyproject.toml and poetry.lock files from requirements.txt.
 
 Black Duck requires poetry lock files to perform security scans. TensorRT uses requirements.txt to define
 Python dependencies.
