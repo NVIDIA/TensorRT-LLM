@@ -19,7 +19,6 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/opUtils.h"
-#include "tensorrt_llm/kernels/userbuffers/ub_allocator.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 #include <gtest/gtest.h>

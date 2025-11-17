@@ -95,6 +95,7 @@ add_library(
   selectiveScanOp.cpp
   userbuffersFinalizeOp.cpp
   userbuffersTensor.cpp
+  ncclWindowTensor.cpp
   virtualMemoryAllocator.cpp
   weightOnlyQuantGemm.cpp
   weightOnlyQuantOp.cpp

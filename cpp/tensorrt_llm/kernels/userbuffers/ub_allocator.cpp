@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 #include "ub_allocator.h"
-#include "tensorrt_llm/common/ncclUtils.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include <set>
 #include <stdexcept>
@@ -23,16 +22,8 @@ namespace tensorrt_llm::runtime::ub
 {
 UserBufferAllocator& UserBufferAllocator::Instance()
 {
-    if (use_nccl_symmetric)
-    {
-        static NCCLUserBufferAllocator _;
-        return _;
-    }
-    else
-    {
-        static UserBufferAllocator _;
-        return _;
-    }
+    static UserBufferAllocator _;
+    return _;
 }
 
 void UserBufferAllocator::initialize(tensorrt_llm::runtime::WorldConfig const& worldConfig)
@@ -83,43 +74,5 @@ communicator* UserBufferAllocator::comm()
     TLLM_CHECK(isInitialized());
     return mUbComm;
 }
-
-void NCCLUserBufferAllocator::initialize(tensorrt_llm::runtime::WorldConfig const& worldConfig)
-{
-    if (!isInitialized())
-    {
-        TLLM_LOG_INFO("Initializing NCCLUserBufferAllocator");
-        std::set<int> group;
-        for (int i = 0; i < worldConfig.getSize(); i++)
-        {
-            group.insert(i);
-        }
-        mComm = getComm(group);
-        mIsInitialized = true;
-    }
-}
-
-UBBuffer NCCLUserBufferAllocator::registerUBBuffer(size_t bytes)
-{
-    TLLM_CHECK(isInitialized());
-    UBBuffer ub_buffer;
-
-    auto& ncclHelper = tensorrt_llm::common::nccl_util::NCCLHelper::getInstance();
-    if (!ncclHelper.isLoaded())
-    {
-        TLLM_THROW("NCCL library could not be loaded for dynamic symbol access");
-    }
-
-    auto ncclMemAllocFunc = ncclHelper.getNCCLMemAlloc();
-    auto ncclCommWindowRegisterFunc = ncclHelper.getNCCLCommWindowRegister();
-
-    NCCLCHECK(ncclMemAllocFunc(&ub_buffer.addr, bytes));
-    NCCLCHECK(ncclCommWindowRegisterFunc((*mComm), ub_buffer.addr, bytes, &ub_buffer.window, NCCL_WIN_COLL_SYMMETRIC));
-    ub_buffer.handle = 5;
-    ub_buffer.size = bytes;
-    return ub_buffer;
-}
-
-bool UserBufferAllocator::use_nccl_symmetric = false;
 
 }; // namespace tensorrt_llm::runtime::ub
