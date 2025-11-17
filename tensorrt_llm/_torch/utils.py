@@ -34,15 +34,15 @@ EventType = Enum(
 # IMPORTANT: Keep the same order of activation functions in this enum and the enum in
 # cpp/tensorrt_llm/kernels/cutlass_kernels/include/common.h
 class ActivationType(IntEnum):
-    Gelu = 0
-    Relu = 1
-    Silu = 2
-    Swiglu = 3
-    Geglu = 4
-    SwigluBias = 5
-    Relu2 = 6
-    Identity = 7
-    InvalidType = 8
+    InvalidType = 0
+    Identity = 1
+    Gelu = 2
+    Relu = 3
+    Silu = 4
+    Swiglu = 5
+    Geglu = 6
+    SwigluBias = 7
+    Relu2 = 8
 
 
 def set_torch_compiling(enable: bool):
