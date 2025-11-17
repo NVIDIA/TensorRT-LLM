@@ -592,10 +592,11 @@ class HarmonyAdapter:
                             Role.ASSISTANT,
                             final_content).with_channel("final"))
         else:  # No tool_calls field = final content
-            if final_content.strip() or content.strip():
+            if (final_content
+                    and final_content.strip()) or (content and content.strip()):
                 # Use final content if available, otherwise use raw content
-                actual_content = final_content if final_content.strip(
-                ) else content
+                actual_content = final_content if (
+                    final_content and final_content.strip()) else content
                 messages.append(
                     Message.from_role_and_content(
                         Role.ASSISTANT, actual_content).with_channel("final"))
