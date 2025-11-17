@@ -761,11 +761,13 @@ class KVCacheManager(BaseResourceManager):
                 max_tokens = mpi_comm().allreduce(max_tokens, op=MPI.MIN)
 
         # get number of blocks
-        blocks_in_primary_pool = math.ceil(max_tokens / tokens_per_block)
+        blocks_in_primary_pool = int(max_tokens // tokens_per_block)
+
         host_cache_size = kv_cache_config.host_cache_size if kv_cache_config.host_cache_size else 0
-        max_tokens_secondary = host_cache_size / cache_size_bytes_per_token
-        blocks_in_secondary_pool = max(
-            0, int(max_tokens_secondary / tokens_per_block))
+        max_tokens_secondary = host_cache_size // self.get_cache_bytes_per_token(
+        )
+        blocks_in_secondary_pool = int(max_tokens_secondary // tokens_per_block)
+
         return blocks_in_primary_pool, blocks_in_secondary_pool
 
     def get_max_atten_window_upper_bound(self, blocks_in_primary_pool,
