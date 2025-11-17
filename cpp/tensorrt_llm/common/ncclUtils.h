@@ -36,9 +36,6 @@
 #include <utility>
 #include <vector>
 
-namespace tensorrt_llm::common::nccl_util
-{
-
 #if ENABLE_MULTI_DEVICE
 
 #ifdef _WIN32
@@ -46,6 +43,9 @@ namespace tensorrt_llm::common::nccl_util
 #else
 #include <dlfcn.h>
 #endif
+
+namespace tensorrt_llm::common::nccl_util
+{
 
 //==============================================================================
 // NCCL Helper - Dynamic Library Loading
@@ -385,6 +385,6 @@ inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
     return std::make_pair(tensor, buffer);
 }
 
-#endif // ENABLE_MULTI_DEVICE
-
 } // namespace tensorrt_llm::common::nccl_util
+
+#endif // ENABLE_MULTI_DEVICE

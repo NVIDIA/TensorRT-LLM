@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/customAllReduceUtils.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/mcastDevMemUtils.h"
+#include "tensorrt_llm/common/ncclUtils.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h"
@@ -437,36 +438,57 @@ private:
         torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& norm_weight,
         torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias)
     {
+        // Handle ProcessGroup path first - cannot extract NCCL comm for window registration
+        // Use ProcessGroup's allreduce directly and return early
+        if (mNcclComm.index() == 1)
+        {
+            auto torchPg = std::get<1>(mNcclComm);
+
+            torch::Tensor reduce_output = input.clone();
+            std::vector tensors{reduce_output};
+            PGCHECK_THROW(torchPg->allreduce(tensors, {c10d::ReduceOp::SUM}));
+
+            if (mOp == AllReduceFusionOp::NONE)
+            {
+                return {reduce_output};
+            }
+
+            // Treat any other patterns as fallback cases.
+            return fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, reduce_output);
+        }
+
+        // From here on, we have a raw NCCL comm - can proceed with window registration
+        auto rawComm = std::get<0>(mNcclComm);
+        ncclComm_t comm = *rawComm;
+        TLLM_CHECK_WITH_INFO(comm != nullptr, "NCCL communicator is null");
+        std::cout << "[runNCCLAllReduceSymmetric] Using raw NCCL comm path (not ProcessGroup)" << std::endl;
+
+        using tensorrt_llm::common::nccl_util::NCCLWindowAllocator;
+        using tensorrt_llm::common::nccl_util::createNCCLWindowTensor;
 
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
         int size = input.numel();
-        auto& ub_manager = tensorrt_llm::runtime::ub::UserBuffersManager::get_instance();
-        auto ub_tensor0 = input;
-        auto ub_buffer0 = ub_manager.search_buffer(input.data_ptr());
-        if (ub_buffer0.invalid())
+
+        // Search for existing buffer or create a new one
+        auto& allocator = NCCLWindowAllocator::getInstance();
+        auto window_buffer0 = allocator.searchBuffer(comm, input.data_ptr());
+
+        if (!window_buffer0.isValid())
         {
-            auto [symmetric_input, symmetric_ub_buffer0]
-                = torch_ext::create_userbuffers_tensor(input.sizes(), input.scalar_type());
-            cudaMemcpyAsync(symmetric_ub_buffer0.addr, input.data_ptr(), size * input.element_size(),
-                cudaMemcpyDeviceToDevice, stream);
-            ub_buffer0 = symmetric_ub_buffer0;
-            ub_tensor0 = symmetric_input;
+            // Buffer not found, create a new symmetric buffer and copy input
+            auto [symmetric_input, symmetric_buffer0]
+                = createNCCLWindowTensor(comm, input.sizes(), input.scalar_type());
+            TLLM_CUDA_CHECK(cudaMemcpyAsync(symmetric_buffer0.ptr, input.data_ptr(), size * input.element_size(),
+                cudaMemcpyDeviceToDevice, stream));
+            window_buffer0 = symmetric_buffer0;
         }
 
-        TLLM_CHECK(!ub_buffer0.invalid());
-        auto [norm_out, ub_buffer1] = torch_ext::create_userbuffers_tensor(input.sizes(), input.scalar_type());
+        TLLM_CHECK_WITH_INFO(window_buffer0.isValid(), "Failed to get or create NCCL window buffer");
+        auto [norm_out, window_buffer1] = createNCCLWindowTensor(comm, input.sizes(), input.scalar_type());
 
-        std::visit(overloaded{[&, norm_out_ = norm_out](std::shared_ptr<ncclComm_t>& rawComm)
-                       {
-                           NCCLCHECK_THROW(ncclAllReduce(ub_buffer0.addr, norm_out_.mutable_data_ptr(), size,
-                               (*getDtypeMap())[mType], ncclSum, *rawComm, stream));
-                       },
-                       [&, norm_out_ = norm_out](c10::intrusive_ptr<c10d::ProcessGroup>& torchPg)
-                       {
-                           PGCHECK_THROW(PgHelper{torchPg}.allreduce(ub_tensor0, {c10d::ReduceOp::SUM}));
-                           std::ignore = norm_out_.copy_(ub_tensor0, true);
-                       }},
-            mNcclComm);
+        // Perform allreduce using symmetric memory with window buffers
+        NCCLCHECK_THROW(ncclAllReduce(
+            window_buffer0.ptr, window_buffer1.ptr, size, (*getDtypeMap())[mType], ncclSum, comm, stream));
 
         if (mOp == AllReduceFusionOp::NONE)
         {
