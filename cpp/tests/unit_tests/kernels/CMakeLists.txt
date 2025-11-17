@@ -87,8 +87,10 @@ set(ROUTING_KERNEL_TEST_SRC
     routing/routingTest.cpp routing/routingLlama4Test.cpp
     routing/routingRenormalizeTest.cpp routing/routingDeepSeekTest.cpp)
 add_gtest(routingKernelsTest "${ROUTING_KERNEL_TEST_SRC}")
+target_link_libraries(routingKernelsTest PRIVATE Python3::Python)
 
 add_gtest(moeLoadBalanceKernelTest moeLoadBalanceKernelTest.cpp)
 
 add_gtest(eaglePackDataTest eaglePackDataTest.cpp)
 add_gtest(sparseKvCacheTest sparseKvCacheTest.cu)
+add_gtest(prepareCustomMaskTest prepareCustomMaskTest.cpp)
