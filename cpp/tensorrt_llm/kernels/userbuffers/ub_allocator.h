@@ -64,8 +64,6 @@ public:
     communicator* comm();
     virtual UBBuffer registerUBBuffer(size_t bytes);
 
-    static bool use_nccl_symmetric;
-
 private:
     communicator* mUbComm;
 
@@ -73,16 +71,6 @@ protected:
     std::vector<UBBuffer> mBuffers;
     bool mIsInitialized;
     tensorrt_llm::runtime::WorldConfig mWorldConfig;
-};
-
-class NCCLUserBufferAllocator : public UserBufferAllocator
-{
-public:
-    void initialize(tensorrt_llm::runtime::WorldConfig const& world_config) override;
-    UBBuffer registerUBBuffer(size_t bytes) override;
-
-private:
-    std::shared_ptr<ncclComm_t> mComm;
 };
 
 #else
