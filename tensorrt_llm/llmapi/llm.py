@@ -48,6 +48,7 @@ from .tokenizer import TokenizerBase, _xgrammar_tokenizer_info
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 from .utils import (append_docstring, exception_handler, get_device_count,
                     logger_debug, set_api_status)
+from ray.util.placement_group import PlacementGroup, placement_group
 
 
 class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
@@ -125,11 +126,16 @@ class BaseLLM:
                  dtype: str = "auto",
                  revision: Optional[str] = None,
                  tokenizer_revision: Optional[str] = None,
+                 placement_share: float = 1.0,
+                 placement_where: list[tuple[PlacementGroup, list[int]]] = None,
                  **kwargs: Any) -> None:
 
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
         self._orchestrator_type = kwargs.get("orchestrator_type", None)
         self._llm_id = None
+
+        self.placement_share = placement_share
+        self.placement_where = placement_where
 
         log_level = logger.level
         logger.set_level("info")  # force display the backend
@@ -808,12 +814,14 @@ class _TrtLLM(BaseLLM):
                  dtype: str = "auto",
                  revision: Optional[str] = None,
                  tokenizer_revision: Optional[str] = None,
+                 placement_share: float = 1.0,
+                 placement_where: list[tuple[PlacementGroup, list[int]]] = None,
                  **kwargs: Any) -> None:
         # TODO: deprecate backend in LLM kwargs
 
         super().__init__(model, tokenizer, tokenizer_mode, skip_tokenizer_init,
                          trust_remote_code, tensor_parallel_size, dtype,
-                         revision, tokenizer_revision, **kwargs)
+                         revision, tokenizer_revision, placement_share, placement_where, **kwargs)
 
     @property
     def workspace(self) -> Path:
@@ -971,7 +979,9 @@ class _TrtLLM(BaseLLM):
                 num_postprocess_workers=self.args.num_postprocess_workers,
                 postprocess_tokenizer_dir=self.args.postprocess_tokenizer_dir,
             ),
-            is_llm_executor=True)
+            is_llm_executor=True,
+            placement_share=self.placement_share,
+            placement_where=self.placement_where)
 
 
 @append_docstring(TORCH_LLM_DOCSTRING)
@@ -992,6 +1002,8 @@ class _TorchLLM(BaseLLM):
                  dtype: str = "auto",
                  revision: Optional[str] = None,
                  tokenizer_revision: Optional[str] = None,
+                 placement_share: float = 1.0,
+                 placement_where: list[tuple[PlacementGroup, list[int]]] = None,
                  **kwargs: Any) -> None:
 
         # TODO: deprecate backend in LLM kwargs
@@ -1010,6 +1022,8 @@ class _TorchLLM(BaseLLM):
                          revision,
                          tokenizer_revision,
                          backend=backend,
+                         placement_share=placement_share,
+                         placement_where=placement_where,
                          **kwargs)
 
     @set_api_status("prototype")
@@ -1077,7 +1091,9 @@ class _TorchLLM(BaseLLM):
             is_llm_executor=True,
             hf_model_dir=self._hf_model_dir,
             tokenizer=self.tokenizer,
-            llm_args=self.args)
+            llm_args=self.args,
+            placement_share=self.placement_share,
+            placement_where=self.placement_where)
 
     def _validate_args_for_torch_backend(self, kwargs: dict) -> None:
         """Validate that users don't pass TrtLlmArgs-specific arguments when using PyTorch backend.
@@ -1113,10 +1129,12 @@ class LLM(_TorchLLM):
                  dtype: str = "auto",
                  revision: Optional[str] = None,
                  tokenizer_revision: Optional[str] = None,
+                 placement_share: float = 1.0,
+                 placement_where: list[tuple[PlacementGroup, list[int]]] = None,
                  **kwargs: Any) -> None:
         super().__init__(model, tokenizer, tokenizer_mode, skip_tokenizer_init,
                          trust_remote_code, tensor_parallel_size, dtype,
-                         revision, tokenizer_revision, **kwargs)
+                         revision, tokenizer_revision, placement_share, placement_where, **kwargs)
 
 
 # sphinx will ignore the LLM's docstring if it is not explicitly set

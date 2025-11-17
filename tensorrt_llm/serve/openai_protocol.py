@@ -936,7 +936,7 @@ class MemoryUpdateRequest(OpenAIBaseModel):
 
 
 class UpdateWeightsRequest(OpenAIBaseModel):
-    weights: Dict[str, List[Tuple[str, str]]]
+    weights: Dict[str, str]
 
 
 def encode_opaque_state(opaque_state: Optional[bytes]) -> Optional[str]:
