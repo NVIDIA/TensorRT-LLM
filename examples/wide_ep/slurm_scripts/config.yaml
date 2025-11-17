@@ -21,11 +21,9 @@ benchmark:
   benchmark_ratio: 0.8  # Benchmark ratio
   streaming: true  # Enable streaming mode
   concurrency_list: "1024"
-
-# Sequence Configuration
-sequence:
   input_length: 8196  # Input sequence length
   output_length: 1024  # Output sequence length
+  dataset_file: "<dataset_file>"
 
 # Environment Configuration
 environment:
@@ -35,7 +33,6 @@ environment:
   trtllm_repo: "<trtllm_repo>"
   build_wheel: false  # Don't build the wheel when launching multiple jobs
   trtllm_wheel_path: ""  # Path to pre-built TensorRT-LLM wheel. If provided, install from this wheel instead
-  dataset_file: "<dataset_file>"
   work_dir: "<full_path_to_work_dir>"
 
 # Profiling Configuration

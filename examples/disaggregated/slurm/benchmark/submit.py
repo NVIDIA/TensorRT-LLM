@@ -93,8 +93,8 @@ def submit_job(config):
     total_tasks = total_nodes * hw_config['gpus_per_node']
 
     # Generate log directory path based on configuration
-    isl = config['sequence']['input_length']
-    osl = config['sequence']['output_length']
+    isl = config['benchmark']['input_length']
+    osl = config['benchmark']['output_length']
     gen_batch_size = config['worker_config']['gen']['max_batch_size']
     gen_enable_attention_dp = config['worker_config']['gen'][
         'enable_attention_dp']
@@ -153,8 +153,8 @@ def submit_job(config):
         config['benchmark']['concurrency_list'],
 
         # Sequence and benchmark parameters
-        str(config['sequence']['input_length']),
-        str(config['sequence']['output_length']),
+        str(config['benchmark']['input_length']),
+        str(config['benchmark']['output_length']),
         str(config['benchmark']['multi_round']),
         str(config['benchmark']['benchmark_ratio']),
         str(config['benchmark']['streaming']).lower(),
@@ -164,7 +164,7 @@ def submit_job(config):
             ['max_tokens_in_buffer']),
 
         # Environment and paths
-        env_config['dataset_file'],
+        config['benchmark']['dataset_file'],
         env_config['model_path'],
         env_config['trtllm_repo'],
         env_config['work_dir'],

@@ -218,7 +218,7 @@ for i in $(seq 0 $((num_ctx_servers - 1))); do
         &> ${full_logdir}/output_ctx_${i}.log &
 done
 
-# start the server
+# start the server (in background)
 echo "Starting server..."
 srun -l --container-name=${container_name} \
     --container-image=${container_image} \
@@ -226,6 +226,17 @@ srun -l --container-name=${container_name} \
     --mpi=pmix --overlap -N 1 -n 1 \
     bash ${work_dir}/start_server.sh ${num_ctx_servers} ${num_gen_servers} ${full_logdir} ${work_dir} \
     &> ${full_logdir}/output_server.log &
+
+# Wait for server to be ready (runs synchronously)
+echo "Waiting for server to be ready..."
+if ! srun -l --container-name=${container_name} \
+    --container-mounts=${container_mount} \
+    --mpi=pmix --overlap -N 1 -n 1 \
+    bash ${work_dir}/wait_server.sh ${full_logdir} \
+    &> ${full_logdir}/wait_server.log; then
+    cleanup_on_failure "Server failed to become ready. Check ${full_logdir}/wait_server.log for details"
+fi
+echo "Server is ready!"
 
 # Start benchmarking
 echo "Starting benchmark..."
