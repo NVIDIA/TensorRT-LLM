@@ -236,11 +236,12 @@ class MTPSampler(TorchSampler):
 
         seq_slots = args.max_num_sequences
         max_tokens = args.max_total_draft_tokens + 1
-        max_beam_width = args.max_beam_width
+        self.max_beam_width = args.max_beam_width
 
         self.store = self.Store(
-            new_tokens=int_tensor((max_tokens, seq_slots, max_beam_width)),
-            next_new_tokens=int_tensor((max_tokens, seq_slots, max_beam_width)),
+            new_tokens=int_tensor((max_tokens, seq_slots, self.max_beam_width)),
+            next_new_tokens=int_tensor(
+                (max_tokens, seq_slots, self.max_beam_width)),
             next_draft_tokens=int_tensor(
                 (seq_slots, args.max_total_draft_tokens)),
             new_tokens_lens=int_tensor((seq_slots, )),
@@ -271,10 +272,11 @@ class MTPSampler(TorchSampler):
         for req in state.scheduled_requests.context_requests:
             if req.state == LlmRequestState.GENERATION_COMPLETE or req.context_remaining_length != 0:
                 continue
-            new_token = add_token(req, new_tokens, beam=beam_idx)
+            new_token = add_token(req, new_tokens, beam_idx=beam_idx)
             TorchSampler._handle_stop_criteria(req,
                                                new_token,
-                                               max_seq_len=self.max_seq_len)
+                                               max_seq_len=self.max_seq_len,
+                                               beam_idx=beam_idx)
             self._request_common_handling(req, next_draft_tokens_list)
 
         for req in state.scheduled_requests.generation_requests:
@@ -282,9 +284,15 @@ class MTPSampler(TorchSampler):
                 continue
             num_new_tokens = new_tokens_lens_list[req.py_seq_slot]
             for i in range(num_new_tokens):
-                new_token = add_token(req, new_tokens, beam=beam_idx, step=i)
+                new_token = add_token(req,
+                                      new_tokens,
+                                      beam_idx=beam_idx,
+                                      step=i)
                 if TorchSampler._handle_stop_criteria(
-                        req, new_token, max_seq_len=self.max_seq_len):
+                        req,
+                        new_token,
+                        max_seq_len=self.max_seq_len,
+                        beam_idx=beam_idx):
                     break
             req.py_num_accepted_draft_tokens = num_new_tokens - 1
             req.py_rewind_len = self.draft_len - req.py_num_accepted_draft_tokens
