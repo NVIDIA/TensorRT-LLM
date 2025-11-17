@@ -37,6 +37,7 @@ from .postproc_worker import PostprocParams, PostprocWorkerConfig
 from .request import GenerationRequest, LoRARequest, PromptAdapterRequest
 from .result import GenerationResult, IterationResult
 from .utils import IntraProcessQueue, ProcessPoolExecutorSession, RequestError
+from ray.util.placement_group import PlacementGroup
 
 if TYPE_CHECKING:
     from .proxy import GenerationExecutorProxy
@@ -367,6 +368,8 @@ class GenerationExecutor(ABC):
         postproc_worker_config: PostprocWorkerConfig,
         is_llm_executor: bool,
         tp_size: int,
+        placement_share: float = 1.0,
+        placement_where: list[tuple[PlacementGroup, list[int]]] = None,
     ):
         logger.warning(f"Orchestrator is creating Ray executor")
         from .ray_executor import RayExecutor
@@ -375,7 +378,9 @@ class GenerationExecutor(ABC):
                            model_world_size=model_world_size,
                            postproc_worker_config=postproc_worker_config,
                            is_llm_executor=is_llm_executor,
-                           tp_size=tp_size)
+                           tp_size=tp_size,
+                           placement_share=placement_share,
+                           placement_where=placement_where)
 
     @staticmethod
     def _create_rpc_executor(
@@ -439,6 +444,8 @@ class GenerationExecutor(ABC):
         hf_model_dir: Optional[Path] = None,
         tokenizer: Optional[TokenizerBase] = None,
         llm_args: Optional[BaseLlmArgs] = None,
+        placement_share: float = 1.0,
+        placement_where: list[tuple[PlacementGroup, list[int]]] = None,
         **args,
     ) -> Union["GenerationExecutorProxy", "GenerationExecutorWorker"]:
         if world_size == 0:
@@ -478,7 +485,9 @@ class GenerationExecutor(ABC):
                 model_world_size,
                 postproc_worker_config,
                 is_llm_executor=is_llm_executor,
-                tp_size=args.get("tp_size", 1))
+                tp_size=args.get("tp_size", 1),
+                placement_share=placement_share,
+                placement_where=placement_where)
         elif orchestrator_type is not None and orchestrator_type != "rpc":
             raise ValueError(
                 f"Unsupported orchestrator_type: {orchestrator_type}")
