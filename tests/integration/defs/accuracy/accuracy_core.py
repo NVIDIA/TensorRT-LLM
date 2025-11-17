@@ -435,59 +435,25 @@ class PassKeyRetrieval128k(AccuracyTask):
 
 class LongBenchV2(AccuracyTask):
     DATASET = "longbench_v2"
+    DATASET_DIR = f"{llm_models_root()}/zai-org/LongBench-v2"
 
-    # Hypothesis testing parameters
-    # Using similar parameters as MMLU/GSM8K for consistency
     ALPHA = 0.05
     BETA = 0.2
     SIGMA = 50.0
     NUM_SAMPLES = 215
 
-    # Input and output sizes
     MAX_BATCH_SIZE = 32
     MAX_INPUT_LEN = 1280000
     MAX_OUTPUT_LEN = 32000
 
-    # Evaluator class
     EVALUATOR_CLS = tensorrt_llm.evaluate.LongBenchV2
-
-    def __init__(self,
-                 model_name: str,
-                 dataset_path: str = None,
-                 length: str = "medium",
-                 max_len: int = 1280000,
-                 max_input_length: int = 1280000,
-                 max_output_length: int = 32000):
-        """
-        Initialize LongBenchV2 task.
-
-        Args:
-            model_name: Name of the model being evaluated
-            dataset_path: Path to LongBench-v2 dataset
-            length: Length setting (short/medium/long)
-            max_len: Maximum sequence length for prompt truncation
-            max_input_length: Maximum input length for sampling params
-            max_output_length: Maximum output length for sampling params
-        """
-        super().__init__(model_name)
-        self.dataset_path = dataset_path or f"{llm_models_root()}/zai-org/LongBench-v2"
-        self.length = length
-        self.max_len = max_len
-        self.max_input_length = max_input_length
-        self.max_output_length = max_output_length
-
-        # Update evaluator kwargs with instance-specific parameters
-        self.EVALUATOR_KWARGS = dict(
-            dataset_path=self.dataset_path,
-            length=self.length,
-            max_len=self.max_len,
-            apply_chat_template=True,
-            random_seed=0,
-        )
-
-        # Override max input/output lengths
-        self.MAX_INPUT_LEN = max_input_length
-        self.MAX_OUTPUT_LEN = max_output_length
+    EVALUATOR_KWARGS = dict(
+        dataset_path=DATASET_DIR,
+        length="medium",
+        max_len=1280000,
+        apply_chat_template=True,
+        random_seed=0,
+    )
 
     @staticmethod
     def create_modified_model_dir(original_model_dir: str,

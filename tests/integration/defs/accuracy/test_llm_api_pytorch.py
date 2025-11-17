@@ -26,7 +26,6 @@ from tensorrt_llm.llmapi import (AutoDecodingConfig, CudaGraphConfig,
                                  EagleDecodingConfig, KvCacheConfig, MoeConfig,
                                  MTPDecodingConfig, NGramDecodingConfig,
                                  SamplingParams, TorchCompileConfig)
-from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (get_device_count, get_device_memory, llm_models_root,
@@ -4185,14 +4184,7 @@ class TestDeepSeekR1LongBenchV2(LlmapiAccuracyTestHarness):
                      max_batch_size=32,
                      **pytorch_config) as llm:
 
-                # Use LongBenchV2 task for evaluation
-                task = LongBenchV2(
-                    self.MODEL_NAME,
-                    dataset_path=f"{llm_models_root()}/zai-org/LongBench-v2",
-                    length="medium",
-                    max_len=1280000,
-                    max_input_length=1280000,
-                    max_output_length=32000)
+                task = LongBenchV2(self.MODEL_NAME)
 
                 sampling_params = SamplingParams(max_tokens=32000)
 
@@ -4203,7 +4195,6 @@ class TestDeepSeekR1LongBenchV2(LlmapiAccuracyTestHarness):
             if temp_dir and os.path.exists(temp_dir):
                 import shutil
                 shutil.rmtree(temp_dir, ignore_errors=True)
-                logger.info(f"Cleaned up temporary directory: {temp_dir}")
 
     @pytest.mark.skip_less_mpi_world_size(4)
     def test_nvfp4_4gpus(self):
@@ -4240,14 +4231,7 @@ class TestDeepSeekR1LongBenchV2(LlmapiAccuracyTestHarness):
 
                 assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
 
-                # Use LongBenchV2 task for evaluation
-                task = LongBenchV2(
-                    self.MODEL_NAME,
-                    dataset_path=f"{llm_models_root()}/zai-org/LongBench-v2",
-                    length="medium",
-                    max_len=1280000,
-                    max_input_length=1280000,
-                    max_output_length=32000)
+                task = LongBenchV2(self.MODEL_NAME)
 
                 sampling_params = SamplingParams(max_tokens=32000)
 
@@ -4258,4 +4242,3 @@ class TestDeepSeekR1LongBenchV2(LlmapiAccuracyTestHarness):
             if temp_dir and os.path.exists(temp_dir):
                 import shutil
                 shutil.rmtree(temp_dir, ignore_errors=True)
-                logger.info(f"Cleaned up temporary directory: {temp_dir}")
