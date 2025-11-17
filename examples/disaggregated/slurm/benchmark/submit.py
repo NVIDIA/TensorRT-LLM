@@ -68,6 +68,8 @@ def submit_job(config):
     env_config.setdefault('trtllm_repo', '')
     env_config.setdefault('build_wheel', False)
     env_config.setdefault('trtllm_wheel_path', '')
+    env_config.setdefault('worker_env_var', '')
+    env_config.setdefault('server_env_var', '')
 
     # Get number of servers from config
     ctx_num = hw_config['num_ctx_servers']
@@ -181,7 +183,13 @@ def submit_job(config):
         str(config['accuracy']['enable_accuracy_test']).lower(),
         config['accuracy']['model'],
         config['accuracy']['tasks'],
-        config['accuracy']['model_args_extra']
+        config['accuracy']['model_args_extra'],
+
+        # Worker environment variables
+        env_config['worker_env_var'],
+
+        # Server environment variables
+        env_config['server_env_var']
     ]
 
     # Submit the job
