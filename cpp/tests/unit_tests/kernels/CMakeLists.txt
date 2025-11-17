@@ -92,3 +92,4 @@ add_gtest(moeLoadBalanceKernelTest moeLoadBalanceKernelTest.cpp)
 
 add_gtest(eaglePackDataTest eaglePackDataTest.cpp)
 add_gtest(sparseKvCacheTest sparseKvCacheTest.cu)
+add_gtest(prepareCustomMaskTest prepareCustomMaskTest.cpp)

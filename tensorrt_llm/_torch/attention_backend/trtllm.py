@@ -78,6 +78,9 @@ class TrtllmAttentionWrapper:
     spec_decoding_position_offsets: Optional[torch.Tensor]
     spec_decoding_packed_mask: Optional[torch.Tensor]
     spec_decoding_generation_lengths: Optional[torch.Tensor]
+    spec_decoding_bl_tree_mask_offset: Optional[torch.Tensor]
+    spec_decoding_bl_tree_mask: Optional[torch.Tensor]
+    spec_bl_tree_first_sparse_mask_offset_kv: Optional[torch.Tensor]
     kwargs: dict
 
     def __init__(
@@ -191,6 +194,9 @@ class TrtllmAttentionWrapper:
         spec_decoding_position_offsets: Optional[torch.Tensor] = None,
         spec_decoding_packed_mask: Optional[torch.Tensor] = None,
         spec_decoding_generation_lengths: Optional[torch.Tensor] = None,
+        spec_decoding_bl_tree_mask_offset: Optional[torch.Tensor] = None,
+        spec_decoding_bl_tree_mask: Optional[torch.Tensor] = None,
+        spec_bl_tree_first_sparse_mask_offset_kv: Optional[torch.Tensor] = None,
         attention_sinks: Optional[torch.Tensor] = None,
         chunked_prefill_buffer_batch_size: int = 1,
         sparse_kv_indices: Optional[torch.Tensor] = None,
@@ -297,6 +303,9 @@ class TrtllmAttentionWrapper:
         self.spec_decoding_position_offsets = spec_decoding_position_offsets
         self.spec_decoding_packed_mask = spec_decoding_packed_mask
         self.spec_decoding_generation_lengths = spec_decoding_generation_lengths
+        self.spec_decoding_bl_tree_mask_offset = spec_decoding_bl_tree_mask_offset
+        self.spec_decoding_bl_tree_mask = spec_decoding_bl_tree_mask
+        self.spec_bl_tree_first_sparse_mask_offset_kv = spec_bl_tree_first_sparse_mask_offset_kv
         self.chunked_prefill_buffer_batch_size = chunked_prefill_buffer_batch_size
         self.kwargs.update(kwargs)
 
@@ -456,6 +465,12 @@ class TrtllmAttentionWrapper:
             self.spec_decoding_generation_lengths,
             self.spec_decoding_position_offsets, self.spec_decoding_packed_mask
         ]
+        if get_sm_version() >= 100:
+            spec_decoding_tensor_params.append(
+                self.spec_decoding_bl_tree_mask_offset)
+            spec_decoding_tensor_params.append(self.spec_decoding_bl_tree_mask)
+            spec_decoding_tensor_params.append(
+                self.spec_bl_tree_first_sparse_mask_offset_kv)
         mla_tensor_params = [self.helix_position_offsets]
 
         thop.attention(
@@ -611,6 +626,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     spec_decoding_position_offsets: Optional[torch.Tensor] = None
     spec_decoding_packed_mask: Optional[torch.Tensor] = None
     spec_decoding_generation_lengths: Optional[torch.Tensor] = None
+    spec_decoding_bl_tree_mask_offset: Optional[torch.Tensor] = None
+    spec_decoding_bl_tree_mask: Optional[torch.Tensor] = None
+    spec_bl_tree_first_sparse_mask_offset_kv: Optional[torch.Tensor] = None
 
     @property
     def max_seq_len(self) -> int:
@@ -1063,6 +1081,68 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.ctx_kv_indptr[:self.num_contexts + 1].copy_(
             self.host_ctx_kv_indptr[:self.num_contexts + 1], non_blocking=True)
 
+    def compute_max_num_custom_mask_tiles_kv_upper_bound(
+            self, max_seq_len_kv, min_first_sparse_mask_offset_kv,
+            tile_size_kv_per_cta) -> int:
+        """
+        Compute the conservative upper bound of numCustomMaskTilesKv.
+
+        Args:
+            max_seq_len_kv (int): The maximum seqLenKv in the batch
+            min_first_sparse_mask_offset_kv (int): The minimum firstSparseMaskOffsetKv in the batch
+            tile_size_kv_per_cta (int): tileSizeKvPerCta value
+        """
+        first_sparse_tile_offset = min_first_sparse_mask_offset_kv // tile_size_kv_per_cta
+        num_tiles_kv_total = math.ceil(max_seq_len_kv / tile_size_kv_per_cta)
+        max_num_custom_mask_tiles_kv = num_tiles_kv_total - first_sparse_tile_offset
+        return max_num_custom_mask_tiles_kv
+
+    def spec_decoding_param_prepare_for_blackwell(self) -> None:
+        """
+        Prepare the blackwell parameters for the speculative decoding (Medusa and Eagle) generation-phase attention kernels.
+        """
+        self.spec_decoding_bl_tree_mask_offset = torch.zeros(
+            [self.max_num_requests],
+            dtype=torch.int64,
+            device='cuda',
+        )
+        max_kv_len = self.kv_lens[:self.num_seqs].max()
+        assert self.kv_lens_cuda[:self.
+                                 num_seqs] >= self._seq_lens_cuda[:self.
+                                                                  num_seqs], "kv_lens should be greater than seq_lens,please run prepare() first"
+
+        # Only support seq_lens are equal in one batch
+        seq_lens_slice = self.seq_lens[:self.num_seqs]
+        assert seq_lens_slice.min() == seq_lens_slice.max(), \
+            f"All elements in seq_lens must be equal in one batch, but got min={seq_lens_slice.min()}, max={seq_lens_slice.max()}"
+
+        self.spec_bl_tree_first_sparse_mask_offset_kv = (
+            self.kv_lens_cuda[:self.num_seqs] -
+            self._seq_lens_cuda[:self.num_seqs]).to(torch.int32)
+        min_first_sparse_mask_offset_kv = self.spec_bl_tree_first_sparse_mask_offset_kv.min(
+        )
+        # tile_size_kv * tile_size_q * num_instances_q * num_instances_kv is the largest value that is used in the trtllm-gen kernels
+        tile_size_kv = 128
+        tile_size_q = 128
+        # num_instances_q * num_instances_kv <= 2
+        num_instances_q = 1
+        num_instances_kv = 2
+        tile_size_kv_per_cta = tile_size_kv * num_instances_kv
+        tile_size_q_per_cta = tile_size_q * num_instances_q
+        max_num_custom_mask_tiles_kv = self.compute_max_num_custom_mask_tiles_kv_upper_bound(
+            max_kv_len, min_first_sparse_mask_offset_kv, tile_size_kv_per_cta)
+        max_num_tiles_q = math.ceil(
+            (self.seq_lens[:self.num_seqs].max() * self.num_heads_per_kv) /
+            tile_size_q_per_cta)
+        mask_size = int(self.max_num_requests * max_num_tiles_q *
+                        max_num_custom_mask_tiles_kv * num_instances_q *
+                        num_instances_kv * tile_size_q * tile_size_kv / 32)
+        self.spec_decoding_bl_tree_mask = torch.zeros(
+            mask_size,
+            dtype=torch.uint32,
+            device='cuda',
+        )
+
     def update_spec_dec_param(
         self,
         is_spec_decoding_enabled,
@@ -1070,7 +1150,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         is_spec_dec_dynamic_tree,
         max_draft_tokens,
         spec_decoding_tensor: Optional['SpecDecodingTensor'] = None,
-    ):
+    ) -> None:
 
         if spec_decoding_tensor is not None:
             spec_decoding_position_offsets = spec_decoding_tensor.position_offsets
@@ -1080,14 +1160,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             spec_decoding_position_offsets = None
             spec_decoding_packed_mask = None
             spec_decoding_generation_lengths = None
-        # spec_dec mode should only be enabled for non-sm100 machines and when there's a spec-dec tree.
-        self.is_spec_decoding_enabled = is_spec_decoding_enabled and (
-            get_sm_version() < 100 or get_sm_version() == 120)
 
-        if get_sm_version() >= 100:
-            if is_spec_dec_tree or is_spec_dec_dynamic_tree:
-                assert not is_spec_dec_tree, "Spec-dec tree is not supported on this machine. Please use a pre-Blackwell machine for a spec-dec tree."
-                assert not is_spec_dec_dynamic_tree, "Spec-dec dynamic tree is not supported on this machine. Please use a pre-Blackwell machine for a spec-dec dynamic tree."
+        self.is_spec_decoding_enabled = is_spec_decoding_enabled
+        if get_sm_version(
+        ) >= 100 and not is_spec_dec_tree and not is_spec_dec_dynamic_tree:
+            self.is_spec_decoding_enabled = False
 
         # use_spec_decoding is default to true by default, change in runtime by layers / requests
         self.use_spec_decoding = self.is_spec_decoding_enabled
@@ -1117,10 +1194,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 dtype=torch.int,
                 device='cuda',
             )
+            if get_sm_version() >= 100:
+                self.spec_decoding_param_prepare_for_blackwell()
+            else:
+                self.spec_decoding_bl_tree_mask_offset = None
+                self.spec_decoding_bl_tree_mask = None
+                self.spec_bl_tree_first_sparse_mask_offset_kv = None
 
             if self.is_spec_dec_dynamic_tree:
-                assert spec_decoding_position_offsets is not None, "spec_decoding_position_offsets is required for dynamic tree"
-                assert spec_decoding_packed_mask is not None, "spec_decoding_packed_mask is required for dynamic tree"
                 self.spec_decoding_position_offsets.copy_(
                     spec_decoding_position_offsets, non_blocking=True)
                 self.spec_decoding_packed_mask.copy_(spec_decoding_packed_mask,
@@ -1367,6 +1448,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             spec_decoding_packed_mask=metadata.spec_decoding_packed_mask,
             spec_decoding_generation_lengths=metadata.
             spec_decoding_generation_lengths,
+            spec_decoding_bl_tree_mask_offset=metadata.
+            spec_decoding_bl_tree_mask_offset,
+            spec_decoding_bl_tree_mask=metadata.spec_decoding_bl_tree_mask,
+            spec_bl_tree_first_sparse_mask_offset_kv=metadata.
+            spec_bl_tree_first_sparse_mask_offset_kv,
             attention_sinks=attention_sinks,
             chunked_prefill_buffer_batch_size=chunked_prefill_buffer_batch_size,
             sparse_kv_indices=sparse_kv_indices,
