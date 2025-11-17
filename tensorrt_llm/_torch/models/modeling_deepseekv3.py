@@ -640,17 +640,17 @@ class Deepseekv3RoutingImpl():
     def get_scores(logits, e_score_correction_bias):
         scores = F.sigmoid(logits)
         scores_with_bias = scores + e_score_correction_bias
-        return scores, scores_with_bias
-
-    def noaux_tc(self, logits, e_score_correction_bias):
-        n_group = self.n_group
-
         if enable_llm_debug():
             has_nan = torch.isnan(scores_with_bias).any()
             if has_nan:
                 warnings.warn(
                     "Detected NAN in the tensor scores_with_bias. Please check if it matches the expectation."
                 )
+
+        return scores, scores_with_bias
+
+    def noaux_tc(self, logits, e_score_correction_bias):
+        n_group = self.n_group
 
         _, num_experts = logits.shape
         if self.n_group > 1:
@@ -672,6 +672,13 @@ class Deepseekv3RoutingImpl():
         if not self.is_fused:
             scores, scores_with_bias = Deepseekv3RoutingImpl.get_scores(
                 logits, e_score_correction_bias)
+            if enable_llm_debug():
+                has_nan = torch.isnan(scores_with_bias).any()
+                if has_nan:
+                    warnings.warn(
+                        "Detected NAN in the tensor scores_with_bias. Please check if it matches the expectation."
+                    )
+
             scores_shape = list(scores_with_bias.shape)
             group_scores = torch.sum(torch.topk(
                 scores_with_bias.view(scores_shape[:-1] +
