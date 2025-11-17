@@ -3,7 +3,8 @@ from typing import Dict, List
 
 import torch
 
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
+                                                        LlmRequestState)
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 
@@ -92,18 +93,19 @@ class HandleAdditionalOutputs:
                                          (1, beam_width, 1)))
 
         for llm_req in generation_requests:
-            additional_outputs = llm_req.py_additional_outputs
+            if llm_req.state != LlmRequestState.GENERATION_COMPLETE:
+                additional_outputs = llm_req.py_additional_outputs
 
-            for name in additional_outputs:
-                outputs_begin = (output_index_with_context
-                                 if gather_context[name] else
-                                 output_index_without_context)
-                outputs_end = outputs_begin + beam_width
+                for name in additional_outputs:
+                    outputs_begin = (output_index_with_context
+                                     if gather_context[name] else
+                                     output_index_without_context)
+                    outputs_end = outputs_begin + beam_width
 
-                output_device_view = outputs[name][
-                    outputs_begin:outputs_end].reshape(1, beam_width, -1)
-                llm_req.py_result.append_additional_generation_outputs(
-                    name, output_device_view)
+                    output_device_view = outputs[name][
+                        outputs_begin:outputs_end].reshape(1, beam_width, -1)
+                    llm_req.py_result.append_additional_generation_outputs(
+                        name, output_device_view)
 
             output_index_with_context += beam_width
             output_index_without_context += beam_width
