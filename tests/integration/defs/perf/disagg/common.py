@@ -13,7 +13,8 @@ GPU_RESOURCE_CONFIG = {
     # OCI GB200
     "GB200": {
         "gres_gpu": 4,  # srun --gres parameter (None = not required)
-        "lock_freq_graphics_mhz": 2062,  # GPU graphics clock lock frequency (MHz)
+        "lock_freq_graphics_mhz":
+        2062,  # GPU graphics clock lock frequency (MHz)
         "lock_freq_memory_mhz": 3996,  # GPU memory clock lock frequency (MHz)
     },
     # OCI GB300
@@ -84,11 +85,13 @@ class EnvManager:
 
     @staticmethod
     def get_model_dir() -> str:
-        return os.getenv("MODEL_DIR", "/lustre/fsw/portfolios/coreai/users/xqiao")
+        return os.getenv("MODEL_DIR",
+                         "/lustre/fsw/portfolios/coreai/users/xqiao")
 
     @staticmethod
     def get_output_path() -> str:
-        output_path = os.getenv("OUTPUT_PATH", "/home/fredricz/tensorrt-llm-bench")
+        output_path = os.getenv("OUTPUT_PATH",
+                                "/home/fredricz/tensorrt-llm-bench")
         os.makedirs(output_path, exist_ok=True)
         return output_path
 
@@ -134,9 +137,8 @@ def extract_config_fields(config_data: dict) -> dict:
     gen_tp_size = config_data["worker_config"]["gen"]["tensor_parallel_size"]
     gen_batch_size = config_data["worker_config"]["gen"]["max_batch_size"]
     gen_enable_dp = config_data["worker_config"]["gen"]["enable_attention_dp"]
-    cache_transceiver_backend = config_data["worker_config"]["gen"]["cache_transceiver_config"][
-        "backend"
-    ]
+    cache_transceiver_backend = config_data["worker_config"]["gen"][
+        "cache_transceiver_config"]["backend"]
 
     eplb_slots = (config_data['worker_config']['gen'].get('moe_config', {}).get(
         'load_balancer', {}).get('num_slots', 0))
@@ -145,15 +147,14 @@ def extract_config_fields(config_data: dict) -> dict:
     gen_config = config_data["worker_config"]["gen"]
     mtp_size = 0
     if "speculative_config" in gen_config:
-        mtp_size = gen_config["speculative_config"].get("num_nextn_predict_layers", 0)
+        mtp_size = gen_config["speculative_config"].get(
+            "num_nextn_predict_layers", 0)
 
     # Generate derived fields
     dep_flag = "dep" if gen_enable_dp else "tep"
     log_base = f"{isl}-{osl}"
-    context_dir = (
-        f"ctx{ctx_num}_gen{gen_num}_{dep_flag}{gen_tp_size}_"
-        f"batch{gen_batch_size}_eplb{eplb_slots}_mtp{mtp_size}"
-    )
+    context_dir = (f"ctx{ctx_num}_gen{gen_num}_{dep_flag}{gen_tp_size}_"
+                   f"batch{gen_batch_size}_eplb{eplb_slots}_mtp{mtp_size}")
 
     return {
         "isl": isl,

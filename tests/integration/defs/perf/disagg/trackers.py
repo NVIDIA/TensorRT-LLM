@@ -79,14 +79,17 @@ class SessionTracker:
         log_file = os.path.join(output_path, "session_collect.log")
 
         job_name = f"{EnvManager.get_slurm_job_name()}-session-collect"
-        run_result = run_job(SESSION_COLLECT_CMD_TYPE, job_name, log_file=log_file)
+        run_result = run_job(SESSION_COLLECT_CMD_TYPE,
+                             job_name,
+                             log_file=log_file)
 
         if run_result["status"]:
             # update timestamps in CSV
             self._update_csv_timestamps()
             print("📊 Session properties collected successfully")
         else:
-            print(f"❌ Failed to collect session properties: {run_result['msg']}")
+            print(
+                f"❌ Failed to collect session properties: {run_result['msg']}")
 
         return run_result["status"]
 
@@ -109,7 +112,8 @@ class SessionTracker:
 
             # Save back
             df.to_csv(csv_file, index=False)
-            print(f"   ✅ Timestamps updated: {self.start_time} - {self.end_time}")
+            print(
+                f"   ✅ Timestamps updated: {self.start_time} - {self.end_time}")
 
         except Exception as e:
             print(f"   ❌ Failed to update timestamps: {e}")

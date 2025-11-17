@@ -9,6 +9,7 @@ from common import GPU_RESOURCE_CONFIG, EnvManager
 
 
 class LogWriter(object):
+
     def __init__(self, log_path: str):
         self.log_path = log_path
 
@@ -16,7 +17,8 @@ class LogWriter(object):
         log_file_name = os.path.join(self.log_path, file_name)
         print(f"Log file: {log_file_name}")
         try:
-            with open(log_file_name, "r", encoding="utf-8", errors="replace") as log_file:
+            with open(log_file_name, "r", encoding="utf-8",
+                      errors="replace") as log_file:
                 for line in log_file:
                     print(line, end="")
         except FileNotFoundError:
@@ -28,7 +30,9 @@ class LogWriter(object):
 
 
 class LogParser(object):
-    def __init__(self, benchmark_type: str, config, metrics_config, result_dir: str):
+
+    def __init__(self, benchmark_type: str, config, metrics_config,
+                 result_dir: str):
         """Log parser with metrics config support.
 
         Args:
@@ -42,7 +46,8 @@ class LogParser(object):
         self.metrics_config = metrics_config  # 保存 metrics 配置
         self.result_dir = result_dir
 
-    def _extract_log(self, pattern: str, metric_names: List[str], log_content: str):
+    def _extract_log(self, pattern: str, metric_names: List[str],
+                     log_content: str):
         """Extract log according to pattern and metrics names."""
         compiled = re.compile(pattern, re.MULTILINE | re.VERBOSE)
         results = []
@@ -52,14 +57,17 @@ class LogParser(object):
             print(f"Number of groups: {len(match.groups())}")
 
             if len(match.groups()) < 3:
-                print(f"Warning: Expected 3 groups but got {len(match.groups())}")
+                print(
+                    f"Warning: Expected 3 groups but got {len(match.groups())}")
                 continue
 
             try:
                 values = [float(x) for x in match.groups()[:-1]]
-                concurrency = int(match.groups()[-1])  # Use groups()[-1] instead of group(-1)
+                concurrency = int(
+                    match.groups()[-1])  # Use groups()[-1] instead of group(-1)
                 item = dict(zip(metric_names, values))
-                item["concurrency"] = concurrency  # Concurrency used to make test names
+                item[
+                    "concurrency"] = concurrency  # Concurrency used to make test names
                 results.append(item)
                 print(
                     f"Successfully extracted: E2EL={values[0]}, TTFT={values[1]}, concurrency={concurrency}"
@@ -77,25 +85,28 @@ class LogParser(object):
     ):
         """Parse logs using configured metrics."""
         # Build log file path using metrics_config.log_file
-        log_file_name = os.path.join(self.result_dir, self.metrics_config.log_file)
+        log_file_name = os.path.join(self.result_dir,
+                                     self.metrics_config.log_file)
 
         if not os.path.exists(log_file_name):
             print(f"   ❌ Log file not found: {log_file_name}")
             return {"status": False, "df": None}
 
-        with open(log_file_name, "r", encoding="utf-8", errors="replace") as log_file:
+        with open(log_file_name, "r", encoding="utf-8",
+                  errors="replace") as log_file:
             log_content = log_file.read()
 
         # Use metrics_config for extraction
-        raw_results = self._extract_log(
-            self.metrics_config.extractor_pattern, self.metrics_config.metric_names, log_content
-        )
+        raw_results = self._extract_log(self.metrics_config.extractor_pattern,
+                                        self.metrics_config.metric_names,
+                                        log_content)
         if len(raw_results) == 0:
             print("   ⚠️  No metrics extracted from log file")
             return {"status": False, "df": None}
 
         # Convert to perf result format
-        df = self._convert_to_perf_result_format(raw_results, model_name, timestamps, test_name)
+        df = self._convert_to_perf_result_format(raw_results, model_name,
+                                                 timestamps, test_name)
 
         return {"status": True, "df": df}
 
@@ -121,9 +132,11 @@ class LogParser(object):
         # Use provided timestamps or fallback to current time
         if timestamps:
             start_time = timestamps.get(
-                "start_timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            )
-            end_time = timestamps.get("end_timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                "start_timestamp",
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            end_time = timestamps.get(
+                "end_timestamp",
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             total_time = timestamps.get("total_time__sec", np.nan)
         else:
             current_time = datetime.now()
@@ -138,7 +151,8 @@ class LogParser(object):
 
         # Get precision from YAML config metadata
         if isinstance(self.config, dict):
-            precision = self.config.get("metadata", {}).get("precision", "unknown")
+            precision = self.config.get("metadata",
+                                        {}).get("precision", "unknown")
         else:
             # Fallback if config is not a dict (should not happen in current system)
             precision = "unknown"
@@ -174,7 +188,8 @@ class LogParser(object):
                     "end_timestamp": end_time,
                     # State and configuration
                     "state": "valid",
-                    "command": f"disagg_benchmark --model={model_name} --{precision} --concurrency={concurrency}",
+                    "command":
+                    f"disagg_benchmark --model={model_name} --{precision} --concurrency={concurrency}",
                     # Threshold related fields
                     "threshold": np.nan,
                     "absolute_threshold": np.nan,
@@ -252,7 +267,8 @@ class ResultSaver(object):
         Ideal for unified format data where consistency is maintained across appends.
         """
         # Check if file exists and has content
-        file_exists = os.path.exists(self.output_path) and os.path.getsize(self.output_path) > 0
+        file_exists = os.path.exists(self.output_path) and os.path.getsize(
+            self.output_path) > 0
 
         if file_exists:
             # File exists, append data only (no header)

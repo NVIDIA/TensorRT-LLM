@@ -66,8 +66,8 @@ def pytest_collection_modifyitems(config, items):
         with open(test_list_file, "r", encoding="utf-8") as f:
             # Read non-empty lines and strip whitespace
             wanted_tests = set(
-                line.strip() for line in f if line.strip() and not line.strip().startswith("#")
-            )
+                line.strip() for line in f
+                if line.strip() and not line.strip().startswith("#"))
     except FileNotFoundError:
         pytest.exit(f"❌ Error: Test list file not found: {test_list_file}")
         return
@@ -108,6 +108,8 @@ def pytest_collection_modifyitems(config, items):
 
     if len(selected) == 0:
         print("\n⚠️  Warning: No tests matched the test list!")
-        print(f"   Please check that the test IDs in {test_list_file} are correct.")
+        print(
+            f"   Please check that the test IDs in {test_list_file} are correct."
+        )
 
     print(f"{'=' * 70}\n")

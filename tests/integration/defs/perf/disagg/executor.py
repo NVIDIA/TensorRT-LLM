@@ -7,11 +7,10 @@ import os
 import re
 import shutil
 import time
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from common import GPU_RESOURCE_CONFIG, SESSION_COLLECT_CMD_TYPE, EnvManager, \
-    extract_config_fields, DEBUG_MODE
+from common import (DEBUG_MODE, GPU_RESOURCE_CONFIG, SESSION_COLLECT_CMD_TYPE,
+                    EnvManager, extract_config_fields)
 from report import LogParser, LogWriter, ResultSaver
 from trt_test_alternative import call, check_output
 
@@ -36,8 +35,7 @@ class SlurmRunCommandBuilder:
         if not gpu_config:
             raise ValueError(
                 f"GPU resource configuration not found for {gpu_type}. "
-                f"Please add configuration in GPU_RESOURCE_CONFIG."
-            )
+                f"Please add configuration in GPU_RESOURCE_CONFIG.")
 
         # Common srun arguments
         srun_args = [
@@ -54,21 +52,19 @@ class SlurmRunCommandBuilder:
             srun_args.append(f"--gres=gpu:{gpu_config['gres_gpu']}")
 
         # Add common parameters
-        srun_args.extend(
-            [
-                f"--partition={EnvManager.get_slurm_partition()}",
-                f"--account={EnvManager.get_slurm_account()}",
-                f"--job-name={job_name}",
-                "--time=02:00:00",
-                "--mpi=pmix",
-                # Note: Removed --overlap to ensure GPU allocation for session_collect
-                # which runs after all test jobs have completed
-                "-N",
-                "1",
-                "-n",
-                "1",
-            ]
-        )
+        srun_args.extend([
+            f"--partition={EnvManager.get_slurm_partition()}",
+            f"--account={EnvManager.get_slurm_account()}",
+            f"--job-name={job_name}",
+            "--time=02:00:00",
+            "--mpi=pmix",
+            # Note: Removed --overlap to ensure GPU allocation for session_collect
+            # which runs after all test jobs have completed
+            "-N",
+            "1",
+            "-n",
+            "1",
+        ])
 
         return srun_args
 
@@ -129,12 +125,13 @@ class SlurmRunCommandBuilder:
             #         "bash", "-c",
             #         f"cd {work_dir} && python3 {work_dir}/metrics_collect.py --config {work_dir}/config.yaml"
             #     ]
-            raise ValueError(
-                f"Unsupported command type: {cmd_type}. "
-                f"Currently supported: {SESSION_COLLECT_CMD_TYPE}"
-            )
+            raise ValueError(f"Unsupported command type: {cmd_type}. "
+                             f"Currently supported: {SESSION_COLLECT_CMD_TYPE}")
 
-    def run_job(self, cmd_type: str, job_name: str, log_file: str = None) -> Dict[str, Any]:
+    def run_job(self,
+                cmd_type: str,
+                job_name: str,
+                log_file: str = None) -> Dict[str, Any]:
         """Execute srun job.
 
         Args:
@@ -158,17 +155,24 @@ class SlurmRunCommandBuilder:
                 import subprocess
 
                 with open(log_file, "w") as f:
-                    result = subprocess.run(
-                        full_command, stdout=f, stderr=subprocess.STDOUT, timeout=7200, text=True
-                    )
+                    result = subprocess.run(full_command,
+                                            stdout=f,
+                                            stderr=subprocess.STDOUT,
+                                            timeout=7200,
+                                            text=True)
                     if result.returncode != 0:
-                        raise subprocess.CalledProcessError(result.returncode, full_command)
+                        raise subprocess.CalledProcessError(
+                            result.returncode, full_command)
                 print(f"   ✅ Output saved to {log_file}")
                 output = ""  # Output is in file
             else:
                 output = check_output(full_command, timeout=7200)
 
-            return {"status": True, "msg": "Job executed successfully", "output": output}
+            return {
+                "status": True,
+                "msg": "Job executed successfully",
+                "output": output
+            }
         except Exception as e:
             print(f"Job execution failed: {e}")
             return {"status": False, "msg": str(e)}
@@ -199,7 +203,8 @@ class JobManager:
             import re
 
             # Call submit.py with the config file
-            submit_script = os.path.join(EnvManager.get_script_dir(), "submit.py")
+            submit_script = os.path.join(EnvManager.get_script_dir(),
+                                         "submit.py")
 
             cmd = ["python3", submit_script, "-c", test_config.config_path]
 
@@ -224,12 +229,14 @@ class JobManager:
             error_msg = str(e)
             # Extract stderr from CalledProcessError if available
             if hasattr(e, "stderr") and e.stderr:
-                error_msg = e.stderr.decode() if isinstance(e.stderr, bytes) else e.stderr
+                error_msg = e.stderr.decode() if isinstance(e.stderr,
+                                                            bytes) else e.stderr
             print(f"   ❌ Job submission exception: {error_msg}")
             return False, error_msg
 
     @staticmethod
-    def backup_logs(job_id: str, test_config, result_dir: str, is_passed: bool) -> Optional[str]:
+    def backup_logs(job_id: str, test_config, result_dir: str,
+                    is_passed: bool) -> Optional[str]:
         """Backup logs and config files to test_id directory.
 
         Args:
@@ -256,7 +263,9 @@ class JobManager:
 
                 # Remove old backup if it exists
                 if os.path.exists(backup_dir):
-                    print("   ⚠️  Warning: Backup directory already exists, removing old backup")
+                    print(
+                        "   ⚠️  Warning: Backup directory already exists, removing old backup"
+                    )
                     shutil.rmtree(backup_dir)
 
                 shutil.copytree(result_dir, backup_dir)
@@ -266,23 +275,32 @@ class JobManager:
                 slurm_out_file = os.path.join(work_dir, f"slurm-{job_id}.out")
                 if os.path.exists(slurm_out_file):
                     shutil.copy(slurm_out_file, backup_dir)
-                    print(f"   ✅ SLURM log copied successfully: {slurm_out_file}")
+                    print(
+                        f"   ✅ SLURM log copied successfully: {slurm_out_file}")
                 else:
-                    print(f"   ⚠️  Warning: SLURM log not found: {slurm_out_file}")
+                    print(
+                        f"   ⚠️  Warning: SLURM log not found: {slurm_out_file}"
+                    )
 
                 case_config_path = test_config.config_path
                 if os.path.exists(case_config_path):
                     shutil.copy(case_config_path, backup_dir)
-                    print(f"   ✅ Case config copied successfully: {case_config_path}")
+                    print(
+                        f"   ✅ Case config copied successfully: {case_config_path}"
+                    )
                 else:
-                    print(f"   ⚠️  Warning: Case config not found: {case_config_path}")
+                    print(
+                        f"   ⚠️  Warning: Case config not found: {case_config_path}"
+                    )
 
                 return backup_dir
             except Exception as e:
                 print(f"   ⚠️  Warning: Failed to create backup copy: {e}")
                 return None
         else:
-            print(f"   ⚠️  Warning: Result directory does not exist yet: {result_dir}")
+            print(
+                f"   ⚠️  Warning: Result directory does not exist yet: {result_dir}"
+            )
             return None
 
     @staticmethod
@@ -326,7 +344,8 @@ class JobManager:
         print(f"   📁 Log directory: {log_dir_name}")
         print(f"   📁 Context directory: {context_dir}")
 
-        result_dir = os.path.join(EnvManager.get_script_dir(), log_dir_name, context_dir)
+        result_dir = os.path.join(EnvManager.get_script_dir(), log_dir_name,
+                                  context_dir)
         return result_dir
 
     @staticmethod
@@ -357,7 +376,8 @@ class JobManager:
         # Call the internal implementation method
         check_result = JobManager._check_job_result(
             job_id=job_id,
-            test_category=test_config.test_category,  # Pass test category for routing
+            test_category=test_config.
+            test_category,  # Pass test category for routing
             benchmark_type=test_config.benchmark_type,
             config=config_data,
             metrics_config=test_config.metrics_config,
@@ -374,14 +394,17 @@ class JobManager:
 
         # Clean up result directory
         if DEBUG_MODE:
-            print(f"🐛 Debug mode: Skipping result directory cleanup: {result_dir}")
+            print(
+                f"🐛 Debug mode: Skipping result directory cleanup: {result_dir}"
+            )
         else:
             JobManager.cleanup_result_dir(result_dir)
 
         return check_result
 
     @staticmethod
-    def check_for_early_failure(job_id: str, test_config) -> tuple[bool, Optional[str]]:
+    def check_for_early_failure(job_id: str,
+                                test_config) -> tuple[bool, Optional[str]]:
         """Check logs for early failure indicators.
 
         Args:
@@ -412,10 +435,14 @@ class JobManager:
                     for filename in os.listdir(result_dir):
                         is_gen_log = filename.startswith("output_gen_")
                         is_ctx_log = filename.startswith("output_ctx_")
-                        if (is_gen_log or is_ctx_log) and filename.endswith(".log"):
+                        if (is_gen_log
+                                or is_ctx_log) and filename.endswith(".log"):
                             log_path = os.path.join(result_dir, filename)
                             try:
-                                with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+                                with open(log_path,
+                                          "r",
+                                          encoding="utf-8",
+                                          errors="ignore") as f:
                                     # Read last 100KB
                                     f.seek(0, 2)
                                     file_size = f.tell()
@@ -423,10 +450,13 @@ class JobManager:
                                     recent_content = f.read()
 
                                     for pattern, error_msg in error_patterns:
-                                        if re.search(pattern, recent_content, re.MULTILINE):
+                                        if re.search(pattern, recent_content,
+                                                     re.MULTILINE):
                                             return True, f"{error_msg} in {filename}"
                             except Exception as e:
-                                print(f"   ⚠️  Warning: Failed to check {filename}: {e}")
+                                print(
+                                    f"   ⚠️  Warning: Failed to check {filename}: {e}"
+                                )
             except Exception:
                 # result_dir might not exist yet, that's OK
                 pass
@@ -442,25 +472,29 @@ class JobManager:
         try:
             # Use sacct to get job status - works for both running and completed jobs
             sacct_output = check_output(
-                ["sacct", "-j", job_id, "--noheader", "--format=State", "-X"], timeout=30
-            )
+                ["sacct", "-j", job_id, "--noheader", "--format=State", "-X"],
+                timeout=30)
             if sacct_output.strip():
                 return sacct_output.strip()
             else:
                 # If sacct returns empty, job might be very new, wait a bit and try once more
                 time.sleep(3)
-                sacct_output = check_output(
-                    ["sacct", "-j", job_id, "--noheader", "--format=State", "-X"], timeout=30
-                )
-                return sacct_output.strip() if sacct_output.strip() else "UNKNOWN"
+                sacct_output = check_output([
+                    "sacct", "-j", job_id, "--noheader", "--format=State", "-X"
+                ],
+                                            timeout=30)
+                return sacct_output.strip() if sacct_output.strip(
+                ) else "UNKNOWN"
         except Exception as e:
             print(f"Error checking job status with sacct: {e}")
             return "ERROR"
 
     @staticmethod
     def wait_for_completion(
-        job_id: str, timeout: int = 3600, test_config=None, check_early_failure: bool = True
-    ) -> tuple[bool, Optional[str]]:
+            job_id: str,
+            timeout: int = 3600,
+            test_config=None,
+            check_early_failure: bool = True) -> tuple[bool, Optional[str]]:
         """Wait for job completion with optional early failure detection.
 
         Args:
@@ -495,14 +529,14 @@ class JobManager:
 
             # Check for terminal states - all mean the job is done
             if status in [
-                "COMPLETED",
-                "FAILED",
-                "CANCELLED",
-                "TIMEOUT",
-                "NODE_FAIL",
-                "OUT_OF_MEMORY",
-                "ERROR",
-                "CANCELLED+",
+                    "COMPLETED",
+                    "FAILED",
+                    "CANCELLED",
+                    "TIMEOUT",
+                    "NODE_FAIL",
+                    "OUT_OF_MEMORY",
+                    "ERROR",
+                    "CANCELLED+",
             ] or ("error" in status.lower() and status != "ERROR"):
                 if status == "COMPLETED":
                     print(f"   ✅ Job {job_id} completed successfully")
@@ -513,18 +547,18 @@ class JobManager:
 
             # For running states, don't print repeatedly - status change already printed above
             # Only log unexpected/unknown statuses
-            if status not in ["RUNNING", "PENDING", "CONFIGURING", "COMPLETING", "UNKNOWN"]:
+            if status not in [
+                    "RUNNING", "PENDING", "CONFIGURING", "COMPLETING", "UNKNOWN"
+            ]:
                 print(f"   🔍 Job {job_id} has unexpected status: {status}")
 
             # Check for early failures (only when job is running and test_config is provided)
             current_time = time.time()
-            if (
-                check_early_failure
-                and test_config
-                and status == "RUNNING"
-                and current_time - last_failure_check >= failure_check_interval
-            ):
-                has_error, error_msg = JobManager.check_for_early_failure(job_id, test_config)
+            if (check_early_failure and test_config and status == "RUNNING"
+                    and current_time - last_failure_check
+                    >= failure_check_interval):
+                has_error, error_msg = JobManager.check_for_early_failure(
+                    job_id, test_config)
                 if has_error:
                     print(f"   🚨 Early failure detected: {error_msg}")
                     print(f"   🛑 Stopping wait for job {job_id}")
@@ -564,9 +598,8 @@ class JobManager:
         files_to_print = []
         if os.path.exists(result_dir):
             for file in os.listdir(result_dir):
-                if (
-                    file.endswith(".log") or file.endswith(".yaml")
-                ) and file != "output_server.log":
+                if (file.endswith(".log") or
+                        file.endswith(".yaml")) and file != "output_server.log":
                     files_to_print.append(file)
 
         # Sort files for consistent output order
@@ -611,12 +644,14 @@ class JobManager:
         # Import and use AccuracyParser
         from accuracy_parser import AccuracyParser
 
-        accuracy_parser = AccuracyParser(metrics_config, accuracy_config, result_dir)
+        accuracy_parser = AccuracyParser(metrics_config, accuracy_config,
+                                         result_dir)
         validation_result = accuracy_parser.parse_and_validate()
 
         # Check if parsing succeeded
         if not validation_result["success"]:
-            result["error"] = validation_result.get("error", "Accuracy validation failed")
+            result["error"] = validation_result.get(
+                "error", "Accuracy validation failed")
             return result
 
         # Print validation results
@@ -628,22 +663,26 @@ class JobManager:
             run_name = run_validation.run_name
             run_passed = run_validation.all_passed
             run_icon = "✅" if run_passed else "❌"
-            
+
             print(f"   {run_icon} {run_name}:")
-            
+
             for ds_result in run_validation.results:
                 status_icon = "✅" if ds_result.passed else "❌"
                 dataset_name = ds_result.dataset
                 filter_type = ds_result.filter
                 threshold_type = ds_result.threshold_type
 
-                print(f"      {status_icon} {dataset_name} ({filter_type}) - {threshold_type}:")
+                print(
+                    f"      {status_icon} {dataset_name} ({filter_type}) - {threshold_type}:"
+                )
                 if ds_result.error:
                     print(f"         ⚠️  Error: {ds_result.error}")
                 else:
                     print(f"         Expected: {ds_result.expected:.4f}")
                     print(f"         Actual:   {ds_result.actual:.4f}")
-                    print(f"         Threshold: {ds_result.threshold} ({ds_result.threshold_type})")
+                    print(
+                        f"         Threshold: {ds_result.threshold} ({ds_result.threshold_type})"
+                    )
                     print(f"         {ds_result.message}")
 
         # Set result status
@@ -661,7 +700,7 @@ class JobManager:
         result["all_passed"] = validation_result["all_passed"]
         result["accuracy_runs"] = validation_result["runs"]
         result["raw_accuracy"] = validation_result.get("raw_results", [])
-        
+
         return result
 
     @staticmethod
@@ -693,8 +732,11 @@ class JobManager:
         result = {"job_id": job_id, "status": "UNKNOWN", "success": False}
 
         # Parse metrics and save to CSV
-        log_parser = LogParser(benchmark_type, config, metrics_config, result_dir)
-        parse_result = log_parser.parse(model_name, timestamps=timestamps, test_name=test_name)
+        log_parser = LogParser(benchmark_type, config, metrics_config,
+                               result_dir)
+        parse_result = log_parser.parse(model_name,
+                                        timestamps=timestamps,
+                                        test_name=test_name)
 
         if not parse_result["status"]:
             return result
@@ -712,7 +754,7 @@ class JobManager:
         output_csv = os.path.join(output_path, "perf_script_test_results.csv")
         result_saver = ResultSaver(output_csv)
         result_saver.append_a_df(result_df)
-        
+
         result["success"] = True
         result["status"] = "SUCCESS"
         return result
@@ -761,19 +803,16 @@ class JobManager:
                 job_id=job_id,
                 metrics_config=metrics_config,
                 accuracy_config=accuracy_config,
-                result_dir=result_dir
-            )
+                result_dir=result_dir)
         else:  # perf
-            return JobManager._check_perf_result(
-                job_id=job_id,
-                benchmark_type=benchmark_type,
-                config=config,
-                metrics_config=metrics_config,
-                model_name=model_name,
-                result_dir=result_dir,
-                timestamps=timestamps,
-                test_name=test_name
-            )
+            return JobManager._check_perf_result(job_id=job_id,
+                                                 benchmark_type=benchmark_type,
+                                                 config=config,
+                                                 metrics_config=metrics_config,
+                                                 model_name=model_name,
+                                                 result_dir=result_dir,
+                                                 timestamps=timestamps,
+                                                 test_name=test_name)
 
 
 # create executor function

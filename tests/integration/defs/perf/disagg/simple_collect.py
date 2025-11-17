@@ -28,7 +28,8 @@ def collect_system_info():
 
     data = {}
     # Try multiple ways to get username
-    username = os.getenv("USER") or os.getenv("USERNAME") or os.getenv("LOGNAME") or "unknown"
+    username = os.getenv("USER") or os.getenv("USERNAME") or os.getenv(
+        "LOGNAME") or "unknown"
     data["username"] = username
     data["start_timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     data["hostname"] = socket.gethostname()
@@ -54,24 +55,22 @@ def collect_system_info():
         lines = result.stdout.strip().split("\n")
         if lines and lines[0]:
             parts = lines[0].split(", ")
-            data["nvidia_driver_version"] = parts[0] if len(parts) > 0 else "unknown"
+            data["nvidia_driver_version"] = parts[0] if len(
+                parts) > 0 else "unknown"
             gpu_name = parts[1] if len(parts) > 1 else "unknown"
             pci_device_id = parts[2] if len(parts) > 2 else "unknown"
             data["nvidia_device_count"] = len(lines)
 
             # Convert PCI device ID to integer if possible
             try:
-                pci_device_id_int = (
-                    int(pci_device_id, 16) if pci_device_id != "unknown" else "unknown"
-                )
+                pci_device_id_int = (int(pci_device_id, 16) if pci_device_id
+                                     != "unknown" else "unknown")
             except Exception:
                 pci_device_id_int = "unknown"
 
             data["gpu_properties"] = str(
-                OrderedDict(
-                    [("device_product_name", gpu_name), ("pci_device_id", pci_device_id_int)]
-                )
-            )
+                OrderedDict([("device_product_name", gpu_name),
+                             ("pci_device_id", pci_device_id_int)]))
         else:
             raise Exception("No GPU data")
     except Exception as e:
@@ -82,15 +81,19 @@ def collect_system_info():
 
     # OS information
     data["os_properties"] = str(
-        OrderedDict([("name", platform.system()), ("version", platform.version())])
-    )
+        OrderedDict([("name", platform.system()),
+                     ("version", platform.version())]))
 
     # CPU information
     cpu_model = "unknown"
-    cpu_freq_info = OrderedDict([("current", "unknown"), ("min", "unknown"), ("max", "unknown")])
+    cpu_freq_info = OrderedDict([("current", "unknown"), ("min", "unknown"),
+                                 ("max", "unknown")])
 
     try:
-        result = subprocess.run(["lscpu"], capture_output=True, text=True, check=True)
+        result = subprocess.run(["lscpu"],
+                                capture_output=True,
+                                text=True,
+                                check=True)
         match = re.search(r"Model name:\s*(.+)", result.stdout)
         if match:
             cpu_model = match.group(1).strip()
@@ -103,9 +106,9 @@ def collect_system_info():
 
         cpu_freq = psutil.cpu_freq()
         if cpu_freq:
-            cpu_freq_info = OrderedDict(
-                [("current", cpu_freq.current), ("min", cpu_freq.min), ("max", cpu_freq.max)]
-            )
+            cpu_freq_info = OrderedDict([("current", cpu_freq.current),
+                                         ("min", cpu_freq.min),
+                                         ("max", cpu_freq.max)])
     except ImportError:
         # psutil not available, try to get from /proc/cpuinfo
         try:
@@ -122,19 +125,23 @@ def collect_system_info():
         pass
 
     data["cpu_properties"] = str(
-        OrderedDict(
-            [("cpu_count", os.cpu_count()), ("cpu_model", cpu_model), ("cpu_freq", cpu_freq_info)]
-        )
-    )
+        OrderedDict([("cpu_count", os.cpu_count()), ("cpu_model", cpu_model),
+                     ("cpu_freq", cpu_freq_info)]))
 
     # CUDA version
     try:
-        result = subprocess.run(["nvcc", "--version"], capture_output=True, text=True, check=True)
+        result = subprocess.run(["nvcc", "--version"],
+                                capture_output=True,
+                                text=True,
+                                check=True)
         match = re.search(r"release (\d+\.\d+)", result.stdout)
         data["cuda_version"] = match.group(1) if match else "unknown"
     except Exception:
         try:
-            result = subprocess.run(["nvidia-smi"], capture_output=True, text=True, check=True)
+            result = subprocess.run(["nvidia-smi"],
+                                    capture_output=True,
+                                    text=True,
+                                    check=True)
             match = re.search(r"CUDA Version: (\d+\.\d+)", result.stdout)
             data["cuda_version"] = match.group(1) if match else "unknown"
         except Exception:
@@ -205,7 +212,8 @@ class TextWriter:
             # Format: OrderedDict({'device_product_name': 'value', ...})
             match = re.search(r"'device_product_name':\s*'([^']+)'", gpu_props)
             if match:
-                gpu_name = match.group(1).replace("_", " ")  # Replace underscores with spaces
+                gpu_name = match.group(1).replace(
+                    "_", " ")  # Replace underscores with spaces
         except Exception:
             pass
 
@@ -256,7 +264,9 @@ class TextWriter:
                 version_info = result.stdout.strip()
             else:
                 # Print error for debugging
-                print(f"TensorRT-LLM import failed (returncode={result.returncode}):")
+                print(
+                    f"TensorRT-LLM import failed (returncode={result.returncode}):"
+                )
                 if result.stderr:
                     print(f"  stderr:\n{result.stderr}")
 
@@ -279,12 +289,15 @@ class TextWriter:
                     version_info = result.stdout.strip()
                     print("✅ TensorRT-LLM version retrieved on second attempt")
                 else:
-                    print(f"TensorRT-LLM import failed again (returncode={result.returncode}):")
+                    print(
+                        f"TensorRT-LLM import failed again (returncode={result.returncode}):"
+                    )
                     if result.stderr:
                         print(f"  stderr:\n{result.stderr}")
 
         except Exception as e:
-            print(f"Error getting TensorRT-LLM version: {e}")  # Keep default unknown version
+            print(f"Error getting TensorRT-LLM version: {e}"
+                  )  # Keep default unknown version
 
         trtllm_file = os.path.join(self.output_dir, "trtllm_version.txt")
         with open(trtllm_file, "w") as f:

@@ -8,15 +8,15 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 try:
-    from typing import TypedDict, NotRequired  # Python 3.11+
+    from typing import NotRequired, TypedDict  # Python 3.11+
 except ImportError:
-    from typing_extensions import TypedDict, NotRequired  # Python < 3.11
+    from typing_extensions import NotRequired, TypedDict  # Python < 3.11
 
 
 @dataclass
 class DatasetValidation:
     """Validation result for a single dataset (stable structure, suitable for dataclass).
-    
+
     Attributes:
         dataset: Dataset name (e.g., 'gsm8k', 'mmlu')
         filter: Filter type (e.g., 'flexible-extract', 'strict-match')
@@ -28,7 +28,7 @@ class DatasetValidation:
         message: Validation message
         error: Optional error message if validation failed
     """
-    
+
     dataset: str
     filter: str
     passed: bool
@@ -38,10 +38,10 @@ class DatasetValidation:
     threshold_type: str
     message: str
     error: Optional[str] = None
-    
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for backward compatibility.
-        
+
         Returns:
             Dictionary representation of the validation result
         """
@@ -63,22 +63,22 @@ class DatasetValidation:
 @dataclass
 class RunValidation:
     """Validation result for a single run (stable structure).
-    
+
     Attributes:
         run_id: Run identifier (e.g., 'run-1', 'run-2')
         run_name: Human-readable run name (e.g., 'Run 1', 'Run 2')
         all_passed: Whether all datasets passed for this run
         results: List of dataset validation results
     """
-    
+
     run_id: str
     run_name: str
     all_passed: bool
     results: List[DatasetValidation]
-    
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for backward compatibility.
-        
+
         Returns:
             Dictionary representation of the run validation
         """
@@ -92,14 +92,13 @@ class RunValidation:
 
 class AccuracyValidationResult(TypedDict):
     """Accuracy validation result (using TypedDict for flexibility with type hints).
-    
+
     TypedDict provides type hints while maintaining dict flexibility.
     This is ideal for results that may need dynamic fields in the future.
     """
-    
+
     success: bool
     all_passed: bool
     runs: List[RunValidation]
     raw_results: List[Dict[str, Dict[str, float]]]
     error: NotRequired[str]  # Optional: only present when success=False
-

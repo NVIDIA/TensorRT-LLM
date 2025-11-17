@@ -4,14 +4,16 @@ import os
 import re
 from typing import Dict, List
 
-from accuracy_types import AccuracyValidationResult, DatasetValidation, RunValidation
+from accuracy_types import (AccuracyValidationResult, DatasetValidation,
+                            RunValidation)
 from config_loader import AccuracyConfig, MetricsConfig
 
 
 class AccuracyParser:
     """Accuracy test parser (extracts results from accuracy_eval.log)."""
 
-    def __init__(self, metrics_config: MetricsConfig, accuracy_config: AccuracyConfig, result_dir: str):
+    def __init__(self, metrics_config: MetricsConfig,
+                 accuracy_config: AccuracyConfig, result_dir: str):
         """Initialize AccuracyParser.
 
         Args:
@@ -99,9 +101,9 @@ class AccuracyParser:
                             threshold=dataset_config.threshold,
                             threshold_type=dataset_config.threshold_type,
                             message="",
-                            error=f"Dataset {dataset_config.dataset_name} not found in {run_name}"
-                        )
-                    )
+                            error=
+                            f"Dataset {dataset_config.dataset_name} not found in {run_name}"
+                        ))
                     run_passed = False
                     continue
 
@@ -120,9 +122,9 @@ class AccuracyParser:
                             threshold=dataset_config.threshold,
                             threshold_type=dataset_config.threshold_type,
                             message="",
-                            error=f"Filter '{filter_type}' not found for dataset {dataset_config.dataset_name} in {run_name}"
-                        )
-                    )
+                            error=
+                            f"Filter '{filter_type}' not found for dataset {dataset_config.dataset_name} in {run_name}"
+                        ))
                     run_passed = False
                     continue
 
@@ -138,21 +140,16 @@ class AccuracyParser:
                         expected=dataset_config.expected_value,
                         threshold=dataset_config.threshold,
                         threshold_type=dataset_config.threshold_type,
-                        message=msg
-                    )
-                )
+                        message=msg))
 
                 if not passed:
                     run_passed = False
 
             runs_validation.append(
-                RunValidation(
-                    run_id=run_id,
-                    run_name=run_name,
-                    all_passed=run_passed,
-                    results=validation_results
-                )
-            )
+                RunValidation(run_id=run_id,
+                              run_name=run_name,
+                              all_passed=run_passed,
+                              results=validation_results))
 
             if not run_passed:
                 all_runs_passed = False
@@ -164,7 +161,8 @@ class AccuracyParser:
             "raw_results": all_runs_results
         }
 
-    def _extract_accuracy_values(self, log_content: str) -> List[Dict[str, Dict[str, float]]]:
+    def _extract_accuracy_values(
+            self, log_content: str) -> List[Dict[str, Dict[str, float]]]:
         """Extract accuracy values from log content for multiple runs.
 
         Parses markdown table format from lm_eval output.
@@ -197,10 +195,8 @@ class AccuracyParser:
 
         # Regex to match table rows
         # Format: |dataset|version|filter|n-shot|metric|arrow|value|±|stderr|
-        pattern = re.compile(
-            self.metrics_config.extractor_pattern,
-            re.IGNORECASE
-        )
+        pattern = re.compile(self.metrics_config.extractor_pattern,
+                             re.IGNORECASE)
 
         matches = pattern.findall(log_content)
 
@@ -218,7 +214,8 @@ class AccuracyParser:
                 continue
 
             # Check if this dataset already exists in current run
-            if dataset_name in current_run and filter_type in current_run[dataset_name]:
+            if dataset_name in current_run and filter_type in current_run[
+                    dataset_name]:
                 # This is a new run - save current run and start a new one
                 if current_run:  # Only save if current_run has data
                     all_runs.append(current_run)
@@ -235,4 +232,3 @@ class AccuracyParser:
             all_runs.append(current_run)
 
         return all_runs
-

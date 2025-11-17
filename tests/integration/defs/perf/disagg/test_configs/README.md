@@ -1,45 +1,45 @@
 # Test Configurations
 
-本目录包含基于 YAML 的测试配置文件，用于 disaggregated benchmark 测试。
+This directory contains YAML-based test configuration files for disaggregated benchmark testing.
 
-## 目录结构
+## Directory Structure
 
 ```
 test_configs/
-└── disagg/                    # Disaggregated 测试类型
-    ├── perf/                  # 性能测试配置
-    └── accuracy/              # 精度测试配置（待添加）
+└── disagg/                    # Disaggregated test type
+    ├── perf/                  # Performance test configurations
+    └── accuracy/              # Accuracy test configurations (to be added)
 ```
 
-## 配置文件命名规范
+## Configuration File Naming Convention
 
-文件名格式：`{model}_{benchmark_type}_{config_details}.yaml`
+File name format: `{model}_{benchmark_type}_{config_details}.yaml`
 
-- **model**: 模型名称（如 deepseek-r1-fp4, Qwen3-8B-FP8）
-- **benchmark_type**: 基准类型（如 1k1k, 8k1k）
-- **config_details**: 配置详情（如 tep8_bs32_mtp3_nixl）
+- **model**: Model name (e.g., deepseek-r1-fp4, Qwen3-8B-FP8)
+- **benchmark_type**: Benchmark type (e.g., 1k1k, 8k1k)
+- **config_details**: Configuration details (e.g., tep8_bs32_mtp3_nixl)
 
-### 配置详情说明
+### Configuration Details Explanation
 
-- **tep/dep**: Tensor Parallel (TEP) 或 Data Parallel with attention_dp (DEP)
-- **数字**: TP size (如 tep8 表示 TP=8, dep16 表示 TP=16+DP)
-- **bs**: Batch Size (如 bs32 表示 batch_size=32)
-- **mtp**: MTP layers (如 mtp3 表示 3 层 MTP，无 mtp 表示不使用）
-- **nixl/ucx**: Cache transceiver backend (NIXL 或 UCX)
+- **tep/dep**: Tensor Parallel (TEP) or Data Parallel with attention_dp (DEP)
+- **number**: TP size (e.g., tep8 means TP=8, dep16 means TP=16+DP)
+- **bs**: Batch Size (e.g., bs32 means batch_size=32)
+- **mtp**: MTP layers (e.g., mtp3 means 3 MTP layers, no mtp means not used)
+- **nixl/ucx**: Cache transceiver backend (NIXL or UCX)
 
-## 生成的配置文件列表
+## Generated Configuration File List
 
 ### DeepSeek R1 FP4 (1k1k)
 
 1. `deepseek-r1-fp4_1k1k_tep8_bs32_mtp3_nixl.yaml` - TEP8, BS32, MTP3, NIXL
-2. `deepseek-r1-fp4_1k1k_tep8_bs32_nixl.yaml` - TEP8, BS32, 无MTP, NIXL
-3. `deepseek-r1-fp4_1k1k_dep16_bs128_mtp3_nixl.yaml` - DEP16, BS128, MTP3, NIXL (高并发)
-4. `deepseek-r1-fp4_1k1k_dep32_bs32_nixl.yaml` - DEP32, BS32, 无MTP, NIXL (超高TP)
+2. `deepseek-r1-fp4_1k1k_tep8_bs32_nixl.yaml` - TEP8, BS32, no MTP, NIXL
+3. `deepseek-r1-fp4_1k1k_dep16_bs128_mtp3_nixl.yaml` - DEP16, BS128, MTP3, NIXL (high concurrency)
+4. `deepseek-r1-fp4_1k1k_dep32_bs32_nixl.yaml` - DEP32, BS32, no MTP, NIXL (very high TP)
 5. `deepseek-r1-fp4_1k1k_tep8_bs32_mtp3_ucx.yaml` - TEP8, BS32, MTP3, UCX backend
 
 ### DeepSeek R1 FP4 (8k1k)
 
-6. `deepseek-r1-fp4_8k1k_tep8_bs16_mtp3_nixl.yaml` - TEP8, BS16, MTP3, NIXL (长序列)
+6. `deepseek-r1-fp4_8k1k_tep8_bs16_mtp3_nixl.yaml` - TEP8, BS16, MTP3, NIXL (long sequence)
 
 ### Qwen3-235B-A22B FP4
 
@@ -47,126 +47,126 @@ test_configs/
 
 ### DeepSeek V3 Lite FP8
 
-8. `deepseek-v3-lite-fp8_1k1k_tep4_bs4_ucx.yaml` - TEP4, BS4, UCX (小模型)
+8. `deepseek-v3-lite-fp8_1k1k_tep4_bs4_ucx.yaml` - TEP4, BS4, UCX (small model)
 
 ### Qwen3-8B FP8
 
-9. `Qwen3-8B-FP8_1k1k_tep4_bs4_nixl.yaml` - TEP4, BS4, NIXL (小模型)
+9. `Qwen3-8B-FP8_1k1k_tep4_bs4_nixl.yaml` - TEP4, BS4, NIXL (small model)
 
-## 配置来源
+## Configuration Source
 
-所有配置均从 `disagg_config.py` 中的 `DisaggConfig.MODEL_CONFIGS` 转换而来。
+All configurations are converted from `DisaggConfig.MODEL_CONFIGS` in `disagg_config.py`.
 
-## Metadata 字段说明
+## Metadata Fields Explanation
 
-每个 YAML 配置文件都包含 `metadata` 节点，用于标识测试元数据：
+Each YAML configuration file contains a `metadata` node to identify test metadata:
 
 ```yaml
 metadata:
-  model_name: "deepseek-r1-fp4"     # 模型名称
-  precision: "fp4"                   # 精度类型（fp4, fp8等）
-  supported_gpus: ["GB200", "GB300"] # 支持的 GPU 类型列表
+  model_name: "deepseek-r1-fp4"     # Model name
+  precision: "fp4"                   # Precision type (fp4, fp8, etc.)
+  supported_gpus: ["GB200", "GB300"] # List of supported GPU types
 ```
 
-### benchmark_type 动态生成
+### Dynamic benchmark_type Generation
 
-`benchmark_type`（如 1k1k, 8k1k）不再从文件名解析，而是从 YAML 的 `sequence` 配置动态生成：
+`benchmark_type` (e.g., 1k1k, 8k1k) is no longer parsed from the filename, but dynamically generated from the YAML `sequence` configuration:
 
 - `input_length: 1024, output_length: 1024` → `1k1k`
 - `input_length: 8192, output_length: 1024` → `8k1k`
 - `input_length: 16384, output_length: 2048` → `16k2k`
 
-**优势**：
-- ✅ 配置文件是唯一真实来源（Single Source of Truth）
-- ✅ 避免文件名与实际配置不一致
-- ✅ 便于程序化修改配置而无需重命名文件
-- ✅ `metadata` 字段便于未来扩展其他元数据
+**Advantages**:
+- ✅ Configuration file is the single source of truth
+- ✅ Avoids inconsistency between filename and actual configuration
+- ✅ Easy to programmatically modify configuration without renaming files
+- ✅ `metadata` field facilitates future extension of other metadata
 
-### GPU 类型过滤
+### GPU Type Filtering
 
-系统会根据当前 GPU 类型（通过 `GPU_TYPE` 环境变量）自动过滤配置：
+The system automatically filters configurations based on the current GPU type (via the `GPU_TYPE` environment variable):
 
 ```bash
 export GPU_TYPE=GB200
-python list_configs.py  # 只显示支持 GB200 的配置
+python list_configs.py  # Only shows configurations supporting GB200
 
 export GPU_TYPE=H100
-python list_configs.py  # 只显示支持 H100 的配置
+python list_configs.py  # Only shows configurations supporting H100
 ```
 
-## 使用方法
+## Usage
 
-### 1. 使用 `list_configs.py` 查看配置
+### 1. View Configurations with `list_configs.py`
 
 ```bash
-# 列出所有配置
+# List all configurations
 python list_configs.py
 
-# 查看性能测试配置
+# View performance test configurations
 python list_configs.py --category perf -v
 
-# 查看特定模型配置
+# View specific model configurations
 python list_configs.py --model deepseek-r1-fp4 --show-metrics
 ```
 
-### 2. 使用 `submit.py` 提交单个作业
+### 2. Submit a Single Job with `submit.py`
 
 ```bash
 python disagg/slurm/benchmark/submit.py -c test_configs/disagg/perf/deepseek-r1-fp4_1k1k_tep8_bs32_mtp3_nixl.yaml
 ```
 
-### 3. 使用 `submit.py` 批量提交目录中的作业
+### 3. Batch Submit Jobs in a Directory with `submit.py`
 
 ```bash
 python disagg/slurm/benchmark/submit.py -d test_configs/disagg/perf/
 ```
 
-### 4. 使用 pytest 运行测试
+### 4. Run Tests with pytest
 
 ```bash
-# 运行所有测试
+# Run all tests
 pytest test_disagg_yaml.py -v
 
-# 只运行性能测试
+# Run only performance tests
 pytest test_disagg_yaml.py -k "perf" -v
 
-# 运行特定模型
+# Run specific model
 pytest test_disagg_yaml.py -k "deepseek-r1-fp4" -v
 
-# 查看详细输出
+# View detailed output
 pytest test_disagg_yaml.py -s -vv
 ```
 
-## Metrics 配置
+## Metrics Configuration
 
-所有性能测试配置默认使用以下 metrics：
+All performance test configurations use the following metrics by default:
 
 - **log_file**: `benchmark_result.log`
 - **metric_names**: `["DISAGG_SERVER_TTFT", "DISAGG_SERVER_E2EL"]`
-- **extractor_pattern**: 预定义的 TTFT/E2EL 提取模式
+- **extractor_pattern**: Predefined TTFT/E2EL extraction pattern
 
-如需自定义 metrics，可在 YAML 文件的 `benchmark` 节点下添加 `metrics` 配置。详见 `solution4.md`。
+To customize metrics, add a `metrics` configuration under the `benchmark` node in the YAML file. See `solution4.md` for details.
 
-## 注意事项
+## Notes
 
-1. **环境路径**: 所有路径（container_image, model_path, work_dir 等）均基于 Lustre 文件系统
-2. **GPU 类型**: 大部分配置针对 GB200 GPU，部分小模型配置支持 H100/B200/B300
-3. **并发列表**: `concurrency_list` 根据配置的吞吐量能力进行调整
-4. **默认配置**: 所有配置均使用默认的 perf metrics，无需在 YAML 中显式配置
+1. **Environment Paths**: All paths (container_image, model_path, work_dir, etc.) are based on the Lustre file system
+2. **GPU Type**: Most configurations are for GB200 GPU, some small model configurations support H100/B200/B300
+3. **Concurrency List**: `concurrency_list` is adjusted based on the configured throughput capability
+4. **Default Configuration**: All configurations use default perf metrics, no need to explicitly configure in YAML
 
-## 扩展配置
+## Extending Configurations
 
-要添加新的测试配置：
+To add new test configurations:
 
-1. 在对应的目录下创建新的 YAML 文件
-2. 遵循文件命名规范
-3. 参考现有配置文件的结构
-4. 根据需要覆盖默认 metrics 配置
+1. Create a new YAML file in the corresponding directory
+2. Follow the file naming convention
+3. Refer to the structure of existing configuration files
+4. Override default metrics configuration as needed
 
-## 配置映射
+## Configuration Mapping
 
-| 原 BenchmarkConfig 参数 | YAML 配置路径 |
-|-------------------------|---------------|
+| Original BenchmarkConfig Parameter | YAML Configuration Path |
+|-----------------------------------|------------------------|
 | `isl`, `osl` | `sequence.input_length`, `sequence.output_length` |
 | `cache_transceiver_max_num_tokens` | `worker_config.gen.cache_transceiver_config.max_tokens_in_buffer` |
 | `cache_transceiver_backend` | `worker_config.gen.cache_transceiver_config.backend` |
@@ -176,4 +176,4 @@ pytest test_disagg_yaml.py -s -vv
 | `gen_enable_attention_dp` | `worker_config.gen.enable_attention_dp` |
 | `gen_mtp_size` | `worker_config.gen.speculative_config.num_nextn_predict_layers` |
 | `concurrency_list` | `benchmark.concurrency_list` |
-| `extractor_pattern`, `metric_names` | `benchmark.metrics` (可选，默认使用 perf 配置) |
+| `extractor_pattern`, `metric_names` | `benchmark.metrics` (optional, uses perf config by default) |
