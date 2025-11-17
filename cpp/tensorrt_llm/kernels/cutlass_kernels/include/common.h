@@ -29,8 +29,8 @@ enum class ActivationType
     Swiglu,
     Geglu,
     SwigluBias,
-    Identity,
     Relu2,
+    Identity,
     InvalidType
 };
 
