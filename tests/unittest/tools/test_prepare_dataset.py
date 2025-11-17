@@ -48,12 +48,12 @@ class TestPrepareDatasetLora:
                 task_dir.mkdir(parents=True, exist_ok=True)
             yield str(lora_dir)
 
-    def _build_base_command(self, llm_root: Path) -> List[str]:
+    def _build_base_command(self, output_path: Path) -> List[str]:
         """
         Build the base command for running prepare_dataset.py.
 
         Args:
-            llm_root: Path to the TensorRT LLM root directory
+            output_path: Path to the output dataset file
 
         Returns:
             List[str]: Base command components
@@ -61,8 +61,7 @@ class TestPrepareDatasetLora:
         Raises:
             pytest.skip: If LLM_MODELS_ROOT is not available
         """
-        script_path = llm_root / _PREPARE_DATASET_SCRIPT_PATH
-        cmd = ["python3", str(script_path)]
+        cmd = ["trtllm-bench"]
 
         # Add required tokenizer argument
         model_cache = llm_models_root()
@@ -70,10 +69,10 @@ class TestPrepareDatasetLora:
             pytest.skip("LLM_MODELS_ROOT not available")
 
         tokenizer_dir = model_cache / _TOKENIZER_SUBPATH
-        cmd.extend(["--tokenizer", str(tokenizer_dir)])
+        cmd.extend(["--model", str(tokenizer_dir)])
 
         # Always add --stdout flag since we parse stdout output
-        cmd.extend(["--stdout"])
+        cmd.extend(["dataset", "--output", f"{output_path}"])
 
         return cmd
 
@@ -109,7 +108,7 @@ class TestPrepareDatasetLora:
             str(_DEFAULT_OUTPUT_STDEV)
         ])
 
-    def _run_prepare_dataset(self, llm_root: Path, **kwargs) -> str:
+    def _run_prepare_dataset(self, **kwargs) -> str:
         """
         Execute prepare_dataset.py with specified parameters and capture
         output.
@@ -124,13 +123,20 @@ class TestPrepareDatasetLora:
         Raises:
             subprocess.CalledProcessError: If the command execution fails
         """
-        cmd = self._build_base_command(llm_root)
-        self._add_lora_arguments(cmd, **kwargs)
-        self._add_synthetic_data_arguments(cmd)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "dataset.jsonl"
+            cmd = self._build_base_command(output_path)
+            self._add_lora_arguments(cmd, **kwargs)
+            self._add_synthetic_data_arguments(cmd)
 
-        # Execute command and capture output
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        return result.stdout
+            # Execute command and capture output
+            subprocess.run(cmd, check=True, cwd=temp_dir)
+
+            data = ""
+            with open(output_path, "r") as f:
+                data = f.read()
+
+            return data
 
     def _parse_json_output(self, output: str) -> List[Dict[str, Any]]:
         """
@@ -198,7 +204,7 @@ class TestPrepareDatasetLora:
             },
             id="random_task_id")
     ])
-    def test_lora_metadata_generation(self, llm_root: Path, temp_lora_dir: str,
+    def test_lora_metadata_generation(self, temp_lora_dir: str,
                                       test_params: Dict) -> None:
         """Test LoRA metadata generation with various configurations."""
         # Extract test parameters
@@ -213,7 +219,7 @@ class TestPrepareDatasetLora:
         if rand_task_id is not None:
             kwargs["rand_task_id"] = rand_task_id
 
-        output = self._run_prepare_dataset(llm_root, **kwargs)
+        output = self._run_prepare_dataset(**kwargs)
         json_data = self._parse_json_output(output)
 
         assert len(json_data) > 0, f"No JSON data generated for {description}"

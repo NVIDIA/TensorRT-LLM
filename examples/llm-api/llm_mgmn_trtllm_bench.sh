@@ -71,7 +71,6 @@
 #      not supported in Slurm mode, you need to download the model and put it in
 #      the LOCAL_MODEL directory.
 
-export prepare_dataset="$SOURCE_ROOT/benchmarks/cpp/prepare_dataset.py"
 export data_path="$WORKDIR/token-norm-dist.txt"
 
 echo "Preparing dataset..."
@@ -86,14 +85,14 @@ srun -l \
     --mpi=pmix \
     bash -c "
         $PROLOGUE
-        python3 $prepare_dataset \
-            --tokenizer=$LOCAL_MODEL \
-            --stdout token-norm-dist \
+        trtllm-bench --model=$LOCAL_MODEL dataset \
+            --output $data_path \
+            token-norm-dist \
             --num-requests=100 \
             --input-mean=128 \
             --output-mean=128 \
             --input-stdev=0 \
-            --output-stdev=0 > $data_path
+            --output-stdev=0
     "
 
 echo "Running benchmark..."
