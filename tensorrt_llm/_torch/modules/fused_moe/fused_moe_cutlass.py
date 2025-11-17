@@ -565,6 +565,7 @@ class CutlassFusedMoE(MoE):
             tune_max_num_tokens=self.tune_max_num_tokens,
             tuner_num_tokens=tuner_num_tokens,
             tuner_top_k=tuner_top_k,
+            activation_type=self.activation_type,
             unpadded_hidden_size=self.unpadded_hidden_size,
             out_tensor=moe_output,
         )
@@ -669,7 +670,7 @@ class CutlassFusedMoE(MoE):
                 all_rank_num_tokens_list = [[
                     val[idx_chunk] for val in all_rank_chunk_size_list
                 ] for idx_chunk in range(num_chunks)]
-                chunk_size_list = all_rank_chunk_size_list[self.rank]
+                chunk_size_list = all_rank_chunk_size_list[self.parallel_rank]
             else:
                 all_rank_num_tokens_list = [None] * num_chunks
                 chunk_size_list = self.split_chunk(x.shape[0], num_chunks)
@@ -735,7 +736,7 @@ class CutlassFusedMoE(MoE):
             outputs = torch.cat(outputs_list)
 
         if self.use_dp and self.parallel_size > 1:
-            rank = self.mapping.tp_rank
+            rank = self.parallel_rank
             outputs = outputs[:all_rank_num_tokens[rank]]
         self.repeat_idx = 0 if self.repeat_idx == self.repeat_count - 1 else self.repeat_idx + 1
         return outputs
@@ -765,7 +766,7 @@ class CutlassFusedMoE(MoE):
             is_nvfp4_input = isinstance(x, Fp4QuantizedTensor)
             data_type = output_dtype if is_nvfp4_input else x.dtype
             num_tokens = all_rank_num_tokens[
-                self.mapping.tp_rank] if all_rank_num_tokens else x.shape[0]
+                self.parallel_rank] if all_rank_num_tokens else x.shape[0]
             hidden_size = x.shape[1] * (2 if is_nvfp4_input else 1)
             top_k = self.routing_method.experts_per_token
             return x.new_empty((num_tokens, top_k, hidden_size),

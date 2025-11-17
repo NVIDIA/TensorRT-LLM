@@ -8,8 +8,8 @@ from torch import nn
 
 from ...distributed.ops import reducescatter
 from ...model_config import ModelConfig
-from ...utils import (AuxStreamType, Fp4QuantizedTensor, get_model_extra_attrs,
-                      is_torch_compiling)
+from ...utils import (ActivationType, AuxStreamType, Fp4QuantizedTensor,
+                      get_model_extra_attrs, is_torch_compiling)
 from .routing import BaseMoeRoutingMethod
 
 
@@ -144,6 +144,7 @@ class MoE(nn.Module):
         swiglu_beta: Optional[torch.Tensor] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
         layer_idx: Optional[int] = None,
+        activation_type: ActivationType = ActivationType.Swiglu,
     ):
         from ...distributed import AllReduce
 
@@ -161,6 +162,7 @@ class MoE(nn.Module):
         self.swiglu_limit = swiglu_limit
         self.layer_idx = layer_idx
         self.layer_idx_str = str(layer_idx) if layer_idx is not None else None
+        self.activation_type = int(activation_type)
 
         self._register_layer(model_config)
 
@@ -184,6 +186,7 @@ class MoE(nn.Module):
 
         # All ranks participate in allreduce regardless of EP/TP combination
         self.mapping = model_config.mapping
+        self.parallel_rank = self.mapping.tp_rank
         self.parallel_size = self.mapping.tp_size
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
 
