@@ -26,6 +26,7 @@
 #include "cute/tensor.hpp"
 #include "cutlass/arch/barrier.h"
 #include "cutlass/device_kernel.h" // cutlass::device_kernel
+#include <cutlass/arch/reg_reconfig.h>
 
 using namespace cute;
 using namespace cutlass;
@@ -49,7 +50,7 @@ struct SM120BlockScaledBuilder
     static constexpr int kTileM = TileM_;
     static constexpr int kTileN = TileN_;
     static constexpr int kSFVecSize = 128; // fixed for 1x128 quantization
-    static constexpr int kTileSF = 1;      // 1 sf block contains 4 e8m0 for each 512 k elements
+    static constexpr int kTileSF = 1;      // 1 sf block contains 4 e8m0 per 512 k elements
     static constexpr int kTileK = 128;
     using TileShape = Shape<Int<kTileM>, Int<kTileN>, Int<kTileK>>;
     using ScaleTileShape = Shape<Int<kTileM>, Int<kTileN>, Int<kTileSF>>;
@@ -111,11 +112,11 @@ struct SM120BlockScaledBuilder
 
         // Reorder the tensor for the TiledAtom
         auto permutation_mnk = TiledPerm{};
-        auto t_tile = make_tile(get<0>(permutation_mnk), get<2>(permutation_mnk));
+        auto t_tile = make_tile(get<0>(permutation_mnk), _1{});
         auto tiled_sfa = logical_divide(sfatensor, t_tile);
 
         using AtomShape_MNK = typename Atom::Shape_MNK;
-        auto atom_tile = make_tile(make_layout(size<0>(AtomShape_MNK{})), make_layout(size<2>(AtomShape_MNK{})));
+        auto atom_tile = make_tile(make_layout(size<0>(AtomShape_MNK{})), make_layout(_1{}));
         auto tiled_atom_sfa = zipped_divide(tiled_sfa, atom_tile); // ((AtomM,AtomK),(RestM,RestK))
         // Transform the Atom mode from (M,K) to (Thr,Val)
         using AtomLayoutSFA_TV = Layout<Shape<Shape<_2, _2, _8>, _1>,     // Effectively 16 threads due to the 2:0 mode
@@ -147,7 +148,7 @@ struct SM120BlockScaledBuilder
     CUTE_HOST_DEVICE static constexpr auto get_layoutSFA_TV(TiledMma& mma)
     {
         auto tile_shape_mnk = tile_shape(mma);
-        auto ref_A = make_layout(make_shape(size<0>(tile_shape_mnk), size<2>(tile_shape_mnk)));
+        auto ref_A = make_layout(make_shape(size<0>(tile_shape_mnk), _1{}));
         auto thr_tensor = thrfrg_SFA(ref_A, mma);
         auto thr_layout_vmnk = mma.get_thr_layout_vmnk(); // (_32,_4,_1,_1):(_1,_32,_0,_0)
         auto atile = make_tile(_,
@@ -167,11 +168,11 @@ struct SM120BlockScaledBuilder
 
         // Reorder the tensor for the TiledAtom
         auto permutation_mnk = TiledPerm{};
-        auto t_tile = make_tile(get<1>(permutation_mnk), get<2>(permutation_mnk));
+        auto t_tile = make_tile(get<1>(permutation_mnk), _1{});
         auto tiled_sfb = logical_divide(sfbtensor, t_tile);
 
         using AtomShape_MNK = typename Atom::Shape_MNK;
-        auto atom_tile = make_tile(make_layout(size<1>(AtomShape_MNK{})), make_layout(size<2>(AtomShape_MNK{})));
+        auto atom_tile = make_tile(make_layout(size<1>(AtomShape_MNK{})), make_layout(_1{}));
         auto tiled_atom_sfb = zipped_divide(tiled_sfb, atom_tile); // ((AtomM,AtomK),(RestM,RestK))
         // Transform the Atom mode from (M,K) to (Thr,Val)
         using AtomLayoutSFB_TV = Layout<Shape<Shape<_4, _8>, _1>,         // Effectively 8 threads due to the 4:0 mode
@@ -203,7 +204,7 @@ struct SM120BlockScaledBuilder
     CUTE_HOST_DEVICE static constexpr auto get_layoutSFB_TV(TiledMma& mma)
     {
         auto tile_shape_mnk = tile_shape(mma);
-        auto ref_B = make_layout(make_shape(size<1>(tile_shape_mnk), size<2>(tile_shape_mnk)));
+        auto ref_B = make_layout(make_shape(size<1>(tile_shape_mnk), _1{}));
         auto thr_tensor = thrfrg_SFB(ref_B, mma);
         auto thr_layout_vmnk = mma.get_thr_layout_vmnk(); // (_32,_4,_1,_1):(_1,_32,_0,_0)
         auto btile = make_tile(_,
@@ -224,8 +225,8 @@ struct SM120BlockScaledBuilder
         auto new_ptr = recast_ptr<ElementSFCompute>(old_ptr);
         auto old_layout = tensor.layout();
         auto num_mn = size<1>(shape(old_layout));
-        auto num_k = size<2>(shape(old_layout));
-        auto new_layout = make_layout(make_shape(_32{}, num_mn, _4{}, num_k), make_stride(_0{}, _4{}, _0{}, _1{}));
+        CUTE_STATIC_ASSERT_V(size<2>(shape(old_layout)) == Int<1>{});
+        auto new_layout = make_layout(make_shape(_32{}, num_mn, _4{}, _4{}), make_stride(_0{}, _4{}, _0{}, _1{}));
         auto new_tensor = make_tensor(new_ptr, new_layout);
         return new_tensor;
     }

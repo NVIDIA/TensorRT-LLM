@@ -372,7 +372,7 @@ struct SM120BlockScaledKernel
         auto tCrSFA_frg = KT::transform_fragment_for_qmma(tCrSFA);
 
         auto s2r_copy_SFB = make_tiled_copy_impl(
-            typename KT::SmemCopyAtomSF{}, KT::get_layoutSFB_TV(mma), select<1, 2>(tile_shape(mma)));
+            typename KT::SmemCopyAtomSF{}, KT::get_layoutSFB_TV(mma), make_shape(size<1>(tile_shape(mma)), _1{}));
         auto s2r_thr_copy_SFB = s2r_copy_SFB.get_thread_slice(thread_idx);
         auto tXsSFB = s2r_thr_copy_SFB.partition_S(sSFB);                        // (CPY,CPY_M,CPY_K,PIPE)
         auto tCrSFB = KT::partition_fragment_SFB(sSFB(_, _, Int<0>{}), thr_mma); // (MMA,MMA_N,MMA_K)
