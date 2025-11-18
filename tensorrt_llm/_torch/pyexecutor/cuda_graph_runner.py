@@ -288,6 +288,10 @@ class CUDAGraphRunner:
         # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
         # This also lets us initialize states in the attn_metadata.
         graph = torch.cuda.CUDAGraph()
+        if self.memory_pool_handle is None or self.memory_pool is None:
+            self.memory_pool = torch.cuda.MemPool()
+            self.memory_pool_handle = self.memory_pool.id
+
         with with_multi_stream(True), piecewise_cuda_graph(False):
             for _ in range(self.WARMUP_STEPS):
                 _setup_spec_decoding_and_forward(key, forward_fn,
@@ -428,6 +432,8 @@ class CUDAGraphRunner:
         self.graph_outputs.clear()
         self.graph_metadata.clear()
         self.padding_dummy_request = None
+        del self.memory_pool
+        self.memory_pool = None
         del self.memory_pool_handle
         self.memory_pool_handle = None
         torch.cuda.empty_cache()
