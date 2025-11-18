@@ -715,7 +715,7 @@ class Indexer(nn.Module):
             self.hidden_size,
             self.n_heads,
             bias=False,
-            dtype=dtype,
+            dtype=torch.float32,
             quant_config=None,
             skip_create_weights_in_init=skip_create_weights_in_init,
             use_custom_cublas_mm=True)
@@ -1235,18 +1235,15 @@ class Indexer(nn.Module):
         return topk_indices_buffer
 
     def weight_scale(self, hidden_states: torch.Tensor,
-                     indexer_weights: Optional[torch.Tensor],
                      q_scale: torch.Tensor) -> torch.Tensor:
-        weights = indexer_weights if indexer_weights is not None else self.weights_proj(
-            hidden_states)
+        weights = self.weights_proj(hidden_states.float())
         weights = _scale(weights, q_scale, self.weight_scale_factor)
         return weights
 
     @torch.inference_mode()
     def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
                 metadata: DSAtrtllmAttentionMetadata,
-                position_ids: torch.Tensor, indexer_k: Optional[torch.Tensor],
-                indexer_weights: Optional[torch.Tensor]):
+                position_ids: torch.Tensor, indexer_k: Optional[torch.Tensor]):
         quant_block_size = metadata.kv_cache_manager.quant_block_size
         assert quant_block_size == 128, "Only support quant_block_size = 128 for now"
 
@@ -1309,7 +1306,7 @@ class Indexer(nn.Module):
         q_scale = q_scale.view(-1, self.n_heads, 1)
 
         weights, _ = maybe_execute_in_parallel(
-            lambda: self.weight_scale(hidden_states, indexer_weights, q_scale),
+            lambda: self.weight_scale(hidden_states, q_scale),
             lambda: self._update_k_cache(
                 k_fp8, k_scale, metadata),  # store k_fp8 and k_scale in k cache
             self.ln_events[0],

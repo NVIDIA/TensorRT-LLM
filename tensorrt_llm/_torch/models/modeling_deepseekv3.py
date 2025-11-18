@@ -363,7 +363,7 @@ class DeepseekV3WeightLoader:
                                 [q_a_proj_scale, fused_a_scale], dim=0)
 
                         module.weight_scale.data.copy_(fused_a_scale)
-                    # For DeepseekV32 with fuse_a_indexer_k_weight=True: kv_a_proj_with_mqa is oversized
+                    # For DeepseekV32 with fuse_a_indexer_k=True: kv_a_proj_with_mqa is oversized
                     # to include indexer weights, which is filled in post_load_weights.
                     module.weight.data[0:fused_a.shape[0]].copy_(fused_a)
                 elif names[-1] in params_map:
@@ -559,9 +559,9 @@ class DeepseekV32Attention(MLA):
         # DSV3.2 nvfp4 ckpt has kv_a_proj_with_mqa module in bfloat16
         # TODO: check it more directly/robustly, e.g., indexer_weight_quant == fuseA_quant == indexer_quant
         if model_config.get_quant_config().quant_algo == QuantAlgo.NVFP4:
-            self.fuse_a_indexer_k_weight = True
+            self.fuse_a_indexer_k = True
         else:
-            self.fuse_a_indexer_k_weight = False
+            self.fuse_a_indexer_k = False
 
         super().__init__(hidden_size=config.hidden_size,
                          num_attention_heads=config.num_attention_heads,
@@ -586,13 +586,13 @@ class DeepseekV32Attention(MLA):
 
         self.indexer = self.mqa.indexer
 
-        if self.fuse_a_indexer_k_weight:
+        if self.fuse_a_indexer_k:
             # For DeepseekV32, the kv_a_proj_with_mqa includes:
             # q_a_proj + kv_a_proj_with_mqa + indexer.wk + indexer.weights_proj
             self.kv_a_proj_with_mqa = DeepseekV3Linear(
                 config.hidden_size,
                 self.kv_lora_rank + self.qk_rope_head_dim + self.q_lora_rank +
-                self.indexer.head_dim + self.indexer.n_heads,
+                self.indexer.head_dim,
                 bias=False,
                 dtype=config.torch_dtype,
                 quant_config=model_config.get_quant_config(),
@@ -601,21 +601,15 @@ class DeepseekV32Attention(MLA):
                 use_custom_cublas_mm=True)
 
     def post_load_weights(self):
-        if self.fuse_a_indexer_k_weight:
-            assert self.kv_a_proj_with_mqa.weight.data.dtype == self.indexer.wk.weight.data.dtype == self.indexer.weights_proj.weight.data.dtype, "all weights in kv_a_proj_with_mqa module must have matching dtype"
+        if self.fuse_a_indexer_k:
+            assert self.kv_a_proj_with_mqa.weight.data.dtype == self.indexer.wk.weight.data.dtype, "all weights in kv_a_proj_with_mqa module must have matching dtype"
             # Copy indexer weights into the fused kv_a_proj_with_mqa module
             indexer_wk_weight = self.indexer.wk.weight.data
             offset = self.kv_lora_rank + self.qk_rope_head_dim + self.q_lora_rank
             self.kv_a_proj_with_mqa.weight.data[offset:offset +
                                                 self.indexer.head_dim].copy_(
                                                     indexer_wk_weight)
-            offset += self.indexer.head_dim
-            indexer_weights_proj_weight = self.indexer.weights_proj.weight.data
-            self.kv_a_proj_with_mqa.weight.data[offset:offset +
-                                                self.indexer.n_heads].copy_(
-                                                    indexer_weights_proj_weight)
             self.indexer.wk = None
-            self.indexer.weights_proj = None
 
 
 class Deepseekv3RoutingImpl():

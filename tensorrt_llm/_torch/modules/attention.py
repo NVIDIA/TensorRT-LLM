@@ -1221,11 +1221,11 @@ class MLA(nn.Module):
         if position_ids is not None:
             position_ids = position_ids[..., :num_tokens]
 
-        if self.fuse_a_indexer_k_weight:
-            q, compressed_kv, k_pe, indexer_k, indexer_weights = self.kv_a_proj_with_mqa(
+        if self.fuse_a_indexer_k:
+            q, compressed_kv, k_pe, indexer_k = self.kv_a_proj_with_mqa(
                 hidden_states).split([
                     self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim,
-                    self.indexer.head_dim, self.indexer.n_heads
+                    self.indexer.head_dim
                 ], -1)
         else:
             q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(
@@ -1233,7 +1233,6 @@ class MLA(nn.Module):
                     self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim
                 ], -1)
             indexer_k = None
-            indexer_weights = None
 
         # TODO: possibly overlap/fuse q_a_rmsnorm + kv_a_rmsnorm + indexer.k_layernorm?
         q, compressed_kv = maybe_execute_in_parallel(
@@ -1255,7 +1254,6 @@ class MLA(nn.Module):
             attn_metadata,
             position_ids,
             indexer_k=indexer_k,  # indexer K proj
-            indexer_weights=indexer_weights,  # indexer weights proj
         )
 
         assert q.shape[
