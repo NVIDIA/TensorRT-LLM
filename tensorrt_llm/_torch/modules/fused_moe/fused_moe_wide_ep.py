@@ -949,11 +949,14 @@ class WideEPMoE(MoE):
 
         if not isinstance(self.quant_method, UnquantizedFusedMoEMethod):
             assert not allow_partial_loading, "Partial loading is not supported for quantized MoE now"
-        self.quant_method.load_weights(
-            self,
-            weights,
-            self.weight_loading_mode,
-            allow_partial_loading=allow_partial_loading)
+            self.quant_method.load_weights(self, weights,
+                                           self.weight_loading_mode)
+        else:
+            self.quant_method.load_weights(
+                self,
+                weights,
+                self.weight_loading_mode,
+                allow_partial_loading=allow_partial_loading)
 
     def post_load_weights(self):
         self.quant_method.post_load_weights(self)
