@@ -467,14 +467,7 @@ def test_nvfp4_grouped_gemm_finalize_blackwell(
         tile_tokens_dim=tile_size,
     )
 
-    # TODO: Remove this WAR.
     max_num_permuted_tokens = permuted_idx_to_expanded_idx.size(0)
-    permuted_idx_to_expanded_idx.masked_fill_(
-        torch.arange(max_num_permuted_tokens, device="cuda")
-        >= tile_idx_to_mn_limit.repeat_interleave(tile_size),
-        -1,
-    )
-
     a = torch.randint(
         -100, 100, (max_num_permuted_tokens, hidden_size // 2), dtype=torch.int32, device="cuda"
     )

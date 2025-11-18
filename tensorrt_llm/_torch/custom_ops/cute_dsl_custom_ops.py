@@ -340,6 +340,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.num_local_experts = num_local_experts
             self.local_expert_offset = local_expert_offset
             self.tile_size = tile_size
+            # Padding values should never be accessed.
+            # Intentionally use a large padding value to expose issues early.
+            self.pad_val = int(2e9)
 
         def get_max_num_tiles(self, num_tokens: int) -> int:
             num_expanded_tokens = num_tokens * self.top_k
@@ -432,8 +435,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         permuted_idx_to_expanded_idx.append(expanded_idx)
                         colmajor_expanded_idx += 1
                     else:
-                        # TODO: Remove this WAR.
-                        permuted_idx_to_expanded_idx.append(-1)
+                        permuted_idx_to_expanded_idx.append(self.pad_val)
             return permuted_idx_to_expanded_idx
 
         def inputs_pre_hook(self,
@@ -451,7 +453,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert num_padding_tiles_val >= 0
 
             tile_idx_to_group_idx = torch.tensor(
-                tile_idx_to_group_idx_list + [int(1e9)] * num_padding_tiles_val,
+                tile_idx_to_group_idx_list +
+                [self.pad_val] * num_padding_tiles_val,
                 dtype=tile_idx_to_group_idx.dtype,
                 device=tile_idx_to_group_idx.device)
             num_non_exiting_tiles = torch.tensor(
@@ -482,15 +485,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
                        ) == num_non_exiting_tiles_val * self.tile_size
 
             tile_idx_to_group_idx = torch.tensor(
-                tile_idx_to_group_idx_list + [int(1e9)] * num_padding_tiles_val,
+                tile_idx_to_group_idx_list +
+                [self.pad_val] * num_padding_tiles_val,
                 dtype=tile_idx_to_group_idx.dtype,
                 device=tile_idx_to_group_idx.device)
             tile_idx_to_mn_limit = torch.tensor(
-                tile_idx_to_mn_limit_list + [int(1e9)] * num_padding_tiles_val,
+                tile_idx_to_mn_limit_list +
+                [self.pad_val] * num_padding_tiles_val,
                 dtype=tile_idx_to_mn_limit.dtype,
                 device=tile_idx_to_mn_limit.device)
             permuted_idx_to_expanded_idx = torch.tensor(
-                permuted_idx_to_expanded_idx_list + [int(1e9)] *
+                permuted_idx_to_expanded_idx_list + [self.pad_val] *
                 (num_padding_tiles_val * self.tile_size),
                 dtype=permuted_idx_to_expanded_idx.dtype,
                 device=permuted_idx_to_expanded_idx.device)

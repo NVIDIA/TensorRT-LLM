@@ -412,13 +412,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             tile_tokens_dim=tile_size,
         )
 
-        # TODO: Remove this WAR.
-        max_num_permuted_tokens = permuted_idx_to_expanded_idx.size(0)
-        permuted_idx_to_expanded_idx.masked_fill_(
-            torch.arange(max_num_permuted_tokens, device='cuda')
-            >= tile_idx_to_mn_limit.repeat_interleave(tile_size), -1)
-        x_sf.masked_fill_(x_sf.view(torch.float8_e4m3fn).isnan(), 0)
-
         x = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_blackwell(
             input=x.view(torch.float4_e2m1fn_x2),
             weight=self.w2_weight.view(torch.float4_e2m1fn_x2),

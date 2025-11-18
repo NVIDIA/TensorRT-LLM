@@ -174,7 +174,7 @@ def vectorized_atomic_add_fp32x2(rOut_epi_packed, scatter_out_offset, loc=None, 
             rOut_epi_packed[0].ir_value(),
             rOut_epi_packed[1].ir_value(),
         ],
-        "red.global.v2.f32.add [$0], {$1, $1};",
+        "red.global.v2.f32.add [$0], {$1, $2};",
         "l,f,f",
         has_side_effects=True,
     )
@@ -190,7 +190,7 @@ def atomic_add_func(rOut_epi_packed, scatter_out_offset, loc=None, ip=None):
                 rOut_epi_packed.ir_value(),
             ],
             "red.global.add.f32 [$0], $1;",
-            "=l,f",
+            "l,f",
             has_side_effects=True,
             loc=loc,
             ip=ip,
@@ -498,6 +498,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         gemm_output_major: cutlass.Constexpr,
         tile_idx_to_expert_idx: cute.Tensor,
         num_non_exiting_tiles: cute.Tensor,
+        tile_idx_to_mn_limit: cute.Tensor,
         alpha: cute.Tensor,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
@@ -739,6 +740,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             out,
             tile_idx_to_expert_idx,
             num_non_exiting_tiles,
+            tile_idx_to_mn_limit,
             alpha,
             permuted_idx_to_expanded_idx,
             token_final_scales,
@@ -821,6 +823,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         out: cute.Tensor,
         tile_idx_to_expert_idx: cute.Tensor,
         num_non_exiting_tiles: cute.Tensor,
+        tile_idx_to_mn_limit: cute.Tensor,
         alpha: cute.Tensor,
         permuted_idx_to_expanded_idx: cute.Tensor,
         token_final_scales: cute.Tensor,
@@ -1612,7 +1615,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 token_scale = self.final_scale_dtype(0.0)
                 topK = token_final_scales.shape[1]
 
-                if expanded_idx >= 0:
+                tile_mn_limit = tile_idx_to_mn_limit[mma_tile_coord_mnl[0]]
+
+                if permuted_row < tile_mn_limit:
                     token_idx = expanded_idx // topK
                     topk_idx = expanded_idx % topK
                     token_scale = token_final_scales[(token_idx, topk_idx)]
@@ -1652,24 +1657,25 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
 
                     rOut_epi.store(acc_vec_finalized.to(self.out_dtype))
 
-                    coord_n = mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk[
-                        1
-                    ] + subtile_idx * cute.size(tTR_rAcc)
+                    if permuted_row < tile_mn_limit:
+                        coord_n = mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk[
+                            1
+                        ] + subtile_idx * cute.size(tTR_rAcc)
 
-                    for index in cutlass.range(loop_size):
-                        scatter_out_offset = cute.domain_offset((0, coord_n, 0), scatter_out)
-                        if cutlass.const_expr(self.out_dtype == cutlass.BFloat16):
-                            rOut_epi_packed = rOut_epi[index, None, None]
-                            vectorized_atomic_add_bf16x8(rOut_epi_packed, scatter_out_offset)
-                            coord_n += cute.size(rOut_epi_packed)
-                        elif cutlass.const_expr(self.out_dtype == cutlass.Float32):
-                            rOut_epi_packed = rOut_epi[index, None]
-                            vectorized_atomic_add_fp32x2(rOut_epi_packed, scatter_out_offset)
-                            coord_n += cute.size(rOut_epi_packed)
-                        else:
-                            rOut_epi_packed = rOut_epi[index]
-                            atomic_add_func(rOut_epi_packed, scatter_out_offset)
-                            coord_n += 1
+                        for index in cutlass.range(loop_size):
+                            scatter_out_offset = cute.domain_offset((0, coord_n, 0), scatter_out)
+                            if cutlass.const_expr(self.out_dtype == cutlass.BFloat16):
+                                rOut_epi_packed = rOut_epi[index, None, None]
+                                vectorized_atomic_add_bf16x8(rOut_epi_packed, scatter_out_offset)
+                                coord_n += cute.size(rOut_epi_packed)
+                            elif cutlass.const_expr(self.out_dtype == cutlass.Float32):
+                                rOut_epi_packed = rOut_epi[index, None]
+                                vectorized_atomic_add_fp32x2(rOut_epi_packed, scatter_out_offset)
+                                coord_n += cute.size(rOut_epi_packed)
+                            else:
+                                rOut_epi_packed = rOut_epi[index]
+                                atomic_add_func(rOut_epi_packed, scatter_out_offset)
+                                coord_n += 1
                     self.epilog_sync_barrier.arrive_and_wait()
                 #
                 # Async arrive accumulator buffer empty
@@ -1697,10 +1703,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             tmem.relinquish_alloc_permit()
             self.epilog_sync_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
-            #
-            # Wait for C store complete
-            #
-            # c_pipeline.producer_tail()
 
     def epilog_tmem_copy_and_partition(
         self,
@@ -1858,9 +1860,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         # Start with total smem per CTA (capacity / occupancy)
         # Subtract reserved bytes and initial C stages bytes
         # Divide remaining by bytes needed per A/B stage
-        # cute.printf("num_smem_capacity: {}, occupancy: {}, mbar_helpers_bytes: {}, c_bytes: {}", num_smem_capacity,
-        # occupancy, mbar_helpers_bytes, c_bytes)
-        # cute.printf("ab_bytes_per_stage: {}", ab_bytes_per_stage)
         num_ab_stage = (num_smem_capacity // occupancy - (mbar_helpers_bytes)) // ab_bytes_per_stage
 
         # Refine epilogue stages:
@@ -2282,9 +2281,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         tile_idx_to_group_idx = cute.make_tensor(
             tile_idx_to_group_idx_ptr, layout=cute.make_layout((num_tiles,))
         )
-        # tile_idx_to_mn_limit = cute.make_tensor(
-        #     tile_idx_to_mn_limit_ptr, layout=cute.make_layout((num_tiles,))
-        # )
+        tile_idx_to_mn_limit = cute.make_tensor(
+            tile_idx_to_mn_limit_ptr, layout=cute.make_layout((num_tiles,))
+        )
         permuted_idx_to_expanded_idx = cute.make_tensor(
             permuted_idx_to_expanded_idx_ptr, layout=cute.make_layout((m,))
         )
@@ -2305,6 +2304,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             "n",
             tile_idx_to_group_idx,
             num_non_exiting_tiles,
+            tile_idx_to_mn_limit,
             alpha,
             max_active_clusters=max_active_clusters,
             stream=stream,
