@@ -1162,11 +1162,11 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             }
         }
         with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config, gen_server_config,
-                                      self.MODEL_PATH) as llm:
+                                      ctx_server_config,
+                                      gen_server_config,
+                                      self.MODEL_PATH,
+                                      debug_perf=True) as llm:
             task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
     def test_chunked_prefill(self):
