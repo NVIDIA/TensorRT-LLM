@@ -460,6 +460,14 @@ TEST_F(NCCLWindowAllocatorTest, CleanupOnCommDestroy)
     EXPECT_TRUE(buffer1.isValid());
     EXPECT_TRUE(buffer2.isValid());
 
+    // Manually release buffers before cleanup to avoid warnings
+    allocator.releaseBuffer(*testComm, buffer1.ptr);
+    allocator.releaseBuffer(*testComm, buffer2.ptr);
+
+    // Verify buffers are released but still exist in pool
+    EXPECT_EQ(allocator.getBufferInUseCount(*testComm), 0);
+    EXPECT_EQ(allocator.getBufferCount(*testComm), 2); // Buffers still exist, just not in use
+
     // Destroy the communicator - buffers should be cleaned up automatically
     testComm.reset();
 
