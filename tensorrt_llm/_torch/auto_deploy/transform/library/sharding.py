@@ -669,7 +669,7 @@ def detect_sharding_from_config(
                             world_size=world_size,
                             dist_op=None,
                             min_local_shape=min_local_shape,
-                            layer_type=LayerType.MAMBA,
+                            layer_type=LayerType.MAMBA_FULL,
                         )
                     )
                     num_row_col_shards += 1
