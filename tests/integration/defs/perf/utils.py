@@ -559,7 +559,7 @@ class PerfMultiNodeDisaggScriptTestCmds(NamedTuple):
                 )
                 # Add hostname and port to benchmark command
                 benchmark_cmd = self.benchmark_cmds[cmd_idx] + [
-                    '--hostname', disagg_server_hostname, '--port',
+                    '--host', disagg_server_hostname, '--port',
                     disagg_server_port
                 ]
                 # Wait for server to be ready
