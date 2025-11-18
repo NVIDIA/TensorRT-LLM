@@ -235,7 +235,6 @@ class QuantConfig:
         bits = kv_scheme.get("num_bits")
         dynamic = bool(kv_scheme.get("dynamic", False))
 
-        # TODO (danielafrimi) needs to check all supported options...
         if kv_type == "float" and bits == 8 and not dynamic:
             return QuantAlgo.FP8
         if kv_type in ("int", "uint") and bits == 8:
@@ -384,8 +383,7 @@ class QuantConfig:
                     )
 
             # Merge extended info (if any) over base
-            merged_quant_configs = dict(
-                args)  # todo we pop up some args so it moght not a good idea...
+            merged_quant_configs = dict(args)
             merged_quant_configs.update(json_extended_quant_configs)
 
             # kv_cache_quant_algo is global regardless of MIXED_PRECISION
@@ -428,9 +426,7 @@ class QuantConfig:
                 self.group_size = 128
 
         if moe_backend == 'TRTLLM' and self.quant_algo == "FP8_BLOCK_SCALES" and self.exclude_modules is None:
-            self.exclude_modules = [
-                "*kv_b_proj*", "*k_b_proj*", "*eh_proj"
-            ]  # todo maybe merge or it ight be okay to override
+            self.exclude_modules = ["*kv_b_proj*", "*k_b_proj*", "*eh_proj"]
 
         return True, layer_quant_config
 
