@@ -220,7 +220,8 @@ class FusedMoEMethodBase(ABC):
         if module.bias:
             if w3_w1_bias_shape is None:
                 w3_w1_bias_shape = (module.expert_size_per_partition,
-                                    module.intermediate_size_per_partition * 2)
+                                    module.intermediate_size_per_partition *
+                                    module.intermediate_size_expand_ratio)
             if w2_bias_shape is None:
                 w2_bias_shape = (module.expert_size_per_partition,
                                  module.hidden_size)
@@ -515,7 +516,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
     def create_weights(self, module: torch.nn.Module):
         weight_dtype = module.dtype
         w3_w1_weight_shape = (module.expert_size_per_partition,
-                              module.intermediate_size_per_partition * 2,
+                              module.intermediate_size_per_partition *
+                              module.intermediate_size_expand_ratio,
                               module.hidden_size)
         w2_weight_shape = (
             module.expert_size_per_partition,
@@ -580,13 +582,11 @@ def requantize_expert_w3_w1_weight_fp8_qdq(module: torch.nn.Module,
     w3_weight_scale = w3_weight_scale[...].reshape([])
     max_w3_w1_weight_scale = max(w1_weight_scale, w3_weight_scale)
 
+    split_length = module.intermediate_size_per_partition * module.intermediate_size_expand_ratio // 2
     w3_weight = dst_w3_w1_weight.narrow(
-        dim=0, start=0,
-        length=module.intermediate_size_per_partition).to(dtype=module.dtype)
+        dim=0, start=0, length=split_length).to(dtype=module.dtype)
     w1_weight = dst_w3_w1_weight.narrow(
-        dim=0,
-        start=module.intermediate_size_per_partition,
-        length=module.intermediate_size_per_partition).to(dtype=module.dtype)
+        dim=0, start=split_length, length=split_length).to(dtype=module.dtype)
     dequant_w3_weight = w3_weight * w3_weight_scale
     dequant_w1_weight = w1_weight * w1_weight_scale
     requant_w3_weight = (dequant_w3_weight / max_w3_w1_weight_scale).to(
@@ -594,13 +594,10 @@ def requantize_expert_w3_w1_weight_fp8_qdq(module: torch.nn.Module,
     requant_w1_weight = (dequant_w1_weight / max_w3_w1_weight_scale).to(
         torch.float8_e4m3fn)
 
-    dst_w3_w1_weight.narrow(
-        dim=0, start=0,
-        length=module.intermediate_size_per_partition).copy_(requant_w3_weight)
-    dst_w3_w1_weight.narrow(
-        dim=0,
-        start=module.intermediate_size_per_partition,
-        length=module.intermediate_size_per_partition).copy_(requant_w1_weight)
+    dst_w3_w1_weight.narrow(dim=0, start=0,
+                            length=split_length).copy_(requant_w3_weight)
+    dst_w3_w1_weight.narrow(dim=0, start=split_length,
+                            length=split_length).copy_(requant_w1_weight)
 
 
 class FP8QDQFusedMoEMethod(FusedMoEMethodBase):
@@ -609,7 +606,8 @@ class FP8QDQFusedMoEMethod(FusedMoEMethodBase):
         weight_dtype = torch.float8_e4m3fn
 
         w3_w1_weight_shape = (module.expert_size_per_partition,
-                              module.intermediate_size_per_partition * 2,
+                              module.intermediate_size_per_partition *
+                              module.intermediate_size_expand_ratio,
                               module.hidden_size)
         w2_weight_shape = (
             module.expert_size_per_partition,
@@ -1669,7 +1667,8 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         module.scaling_vector_size = scaling_vector_size
         # Divide by 16 because we use int64 to pack 16 fp4 values
         w3_w1_weight_shape = (module.expert_size_per_partition,
-                              module.intermediate_size_per_partition * 2,
+                              module.intermediate_size_per_partition *
+                              module.intermediate_size_expand_ratio,
                               module.hidden_size // weight_vec_size)
         w2_weight_shape = (module.expert_size_per_partition, module.hidden_size,
                            module.intermediate_size_per_partition //
@@ -1679,7 +1678,8 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         # column parallel
         w3_w1_weight_scale = nn.Parameter(
             torch.ones(module.expert_size_per_partition,
-                       module.intermediate_size_per_partition * 2,
+                       module.intermediate_size_per_partition *
+                       module.intermediate_size_expand_ratio,
                        module.hidden_size // module.scaling_vector_size //
                        block_scales_vec_size,
                        dtype=block_scales_dtype),
@@ -1950,16 +1950,17 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
                                             device=device)
         # Keep weights in device buffer
         # w3
-        dst_w3_weight_scale = dst_w3_w1_weight_scale.narrow(
-            dim=0, start=0, length=module.intermediate_size_per_partition)
+        split_length = module.intermediate_size_per_partition * module.intermediate_size_expand_ratio // 2
+        dst_w3_weight_scale = dst_w3_w1_weight_scale.narrow(dim=0,
+                                                            start=0,
+                                                            length=split_length)
         dst_w3_weight_scale.copy_(
             w3_weight_scale.view(dst_w3_weight_scale.dtype))
 
         # w1
-        dst_w1_weight_scale = dst_w3_w1_weight_scale.narrow(
-            dim=0,
-            start=module.intermediate_size_per_partition,
-            length=module.intermediate_size_per_partition)
+        dst_w1_weight_scale = dst_w3_w1_weight_scale.narrow(dim=0,
+                                                            start=split_length,
+                                                            length=split_length)
         dst_w1_weight_scale.copy_(
             w1_weight_scale.view(dst_w1_weight_scale.dtype))
 

@@ -33,6 +33,8 @@ l0_h100:
   - unittest/_torch/modeling -k "modeling_nemotron"
   - unittest/_torch/modeling -k "modeling_gemma3"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
+  - unittest/_torch/modeling/test_modeling_nemotron_h.py::test_nemotron_h_correctness[Nemotron-Nano-3-30B-A3.5B-dev-1024-mamba_ssm_cache_dtype:float32]
+  - unittest/_torch/modeling/test_modeling_nemotron_h.py::test_nemotron_h_correctness[Nemotron-Nano-3-30B-A3.5B-dev-1024-mamba_ssm_cache_dtype:None]
   - unittest/disaggregated/test_disagg_utils.py
   - unittest/disaggregated/test_router.py
   - unittest/disaggregated/test_remoteDictionary.py
