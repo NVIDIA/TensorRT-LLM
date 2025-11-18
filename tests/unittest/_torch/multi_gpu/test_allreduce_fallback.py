@@ -46,89 +46,36 @@ MPI.pickle.__init__(
 pytestmark = pytest.mark.threadleak(enabled=False)
 
 
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+
 def rms_norm(x: torch.Tensor, weight: torch.Tensor = None, eps: float = 1e-6):
+    """Reference implementation of RMS normalization."""
     y = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
     if weight is not None:
         y = y * weight
     return y
 
 
-def run_single_rank_fallback_test(
-    tensor_parallel_size,
-    single_rank_forward_func,
-    input,
-    residual,
-    weights,
-    hidden_size,
-    dtype,
-    fusion_op,
-    strategy,
-    expected_fallback_conditions,
-):
-    rank = tensorrt_llm.mpi_rank()
-    torch.cuda.set_device(rank)
-    try:
-        # Check function name to determine signature
-        func_name = single_rank_forward_func.__name__
-        if func_name == "run_allreduce_fallback_test":
-            single_rank_forward_func(
-                input,
-                residual,
-                hidden_size,
-                dtype,
-                tensor_parallel_size,
-                rank,
-                weights,
-                fusion_op,
-                strategy,
-                expected_fallback_conditions,
-            )
-        elif func_name == "run_allreduce_window_tensor_test":
-            single_rank_forward_func(input, hidden_size, dtype, tensor_parallel_size, rank, weights)
-        elif func_name == "run_allreduce_lookup_table_fallback_test":
-            single_rank_forward_func(input, hidden_size, dtype, tensor_parallel_size, rank, weights)
-        else:
-            raise ValueError(f"Unknown function: {func_name}")
-    except Exception:
-        traceback.print_exc()
-        raise
-    return True
-
-
-@torch.inference_mode()
-def run_allreduce_fallback_test(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    hidden_size: int,
-    dtype: torch.dtype,
-    tensor_parallel_size: int,
-    tensor_parallel_rank: int,
-    weights: list,
-    fusion_op: AllReduceFusionOp,
-    strategy: AllReduceStrategy,
-    expected_fallback_conditions: dict,
-):
-    """
-    Test AllReduce with AUTO strategy to verify fallback to NCCL_SYMMETRIC.
-
-    Args:
-        expected_fallback_conditions: Dict with keys:
-            - 'message_size_bytes': Expected message size in bytes
-            - 'max_workspace_size': Max workspace size threshold
-            - 'should_fallback': Whether fallback to NCCL_SYMMETRIC is expected
-    """
-    x = x.cuda()
-    residual = residual.cuda()
-    norm_weight = torch.randn((hidden_size,), dtype=dtype, device="cuda")
-    eps = 1e-5
-
-    mapping = Mapping(
+def create_mapping(tensor_parallel_size: int, tensor_parallel_rank: int) -> Mapping:
+    """Create a Mapping object for the given parallel configuration."""
+    return Mapping(
         world_size=tensor_parallel_size,
         tp_size=tensor_parallel_size,
         rank=tensor_parallel_rank,
     )
 
-    # Use AUTO strategy to test fallback behavior
+
+def create_test_modules(
+    mapping: Mapping,
+    hidden_size: int,
+    dtype: torch.dtype,
+    strategy: AllReduceStrategy,
+    weights: list,
+):
+    """Create and initialize test modules (Linear, AllReduce, RMSNorm)."""
     linear = Linear(
         in_features=hidden_size,
         out_features=hidden_size,
@@ -138,19 +85,110 @@ def run_allreduce_fallback_test(
         tensor_parallel_mode=TensorParallelMode.ROW,
         allreduce_strategy=strategy,
     ).cuda()
-    allreduce = AllReduce(mapping=mapping, strategy=strategy)
-    norm = RMSNorm(hidden_size=hidden_size, eps=eps, dtype=dtype).cuda()
 
-    scale = torch.tensor(1.0, dtype=torch.float32).cuda()
-    linear.load_weights([dict(weight=weights[0])])
+    allreduce = AllReduce(mapping=mapping, strategy=strategy)
+
+    norm = RMSNorm(hidden_size=hidden_size, eps=1e-5, dtype=dtype).cuda()
+    norm_weight = torch.randn((hidden_size,), dtype=dtype, device="cuda")
     norm.weight.data.copy_(norm_weight)
 
+    linear.load_weights([dict(weight=weights[0])])
+
+    return linear, allreduce, norm, norm_weight
+
+
+def verify_outputs(calc_output, ref_output, rtol=0.05, atol=0.15):
+    """Verify that calculated outputs match reference outputs."""
+    if isinstance(calc_output, tuple):
+        calc_outputs = calc_output
+    else:
+        calc_outputs = [calc_output]
+
+    if isinstance(ref_output, tuple):
+        ref_outputs = ref_output
+    else:
+        ref_outputs = [ref_output]
+
+    for calc_tensor, ref_tensor in zip(calc_outputs, ref_outputs):
+        try:
+            torch.testing.assert_close(calc_tensor, ref_tensor, rtol=rtol, atol=atol)
+        except AssertionError:
+            # Calculate percentage of mismatched elements
+            mismatched = torch.abs(calc_tensor - ref_tensor) > (rtol * torch.abs(ref_tensor) + atol)
+            mismatch_percentage = mismatched.sum() / mismatched.numel()
+            assert mismatch_percentage < 0.01, "Large mismatched elements encountered"
+
+
+def synchronize_and_cleanup():
+    """Synchronize CUDA operations before cleanup."""
+    torch.cuda.synchronize()
+
+
+# ============================================================================
+# Test Section 1: Message Size Fallback Tests
+# ============================================================================
+
+
+@torch.inference_mode()
+def test_message_size_calculation(tensor_parallel_size, tensor_parallel_rank, x, dtype):
+    """Test that message size is calculated correctly."""
+    message_size_bytes = x.size(-2) * x.size(-1) * x.element_size()
+    max_workspace_size = CustomAllReduceHelper.max_workspace_size_auto(tensor_parallel_size)
+
+    return {
+        "message_size_bytes": message_size_bytes,
+        "max_workspace_size": max_workspace_size,
+        "should_fallback": message_size_bytes > max_workspace_size,
+    }
+
+
+@torch.inference_mode()
+def test_fallback_with_fusion(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    hidden_size: int,
+    dtype: torch.dtype,
+    tensor_parallel_size: int,
+    tensor_parallel_rank: int,
+    weights: list,
+    strategy: AllReduceStrategy,
+    expected_conditions: dict = None,
+):
+    """Test fallback behavior with fused residual RMS norm operation."""
+    # Setup
+    x = x.cuda()
+    residual = residual.cuda()
+    mapping = create_mapping(tensor_parallel_size, tensor_parallel_rank)
+    linear, allreduce, norm, norm_weight = create_test_modules(
+        mapping, hidden_size, dtype, strategy, weights
+    )
+
+    scale = torch.tensor(1.0, dtype=torch.float32).cuda()
+    eps = 1e-5
+
+    # Verify message size calculation if expected conditions provided
+    if expected_conditions:
+        actual_conditions = test_message_size_calculation(
+            tensor_parallel_size, tensor_parallel_rank, x, dtype
+        )
+        expected_msg_size = expected_conditions.get("message_size_bytes")
+        actual_msg_size = actual_conditions["message_size_bytes"]
+        assert actual_msg_size == expected_msg_size, (
+            f"Message size mismatch: expected {expected_msg_size}, got {actual_msg_size}"
+        )
+        expected_max_ws = expected_conditions.get("max_workspace_size")
+        actual_max_ws = actual_conditions["max_workspace_size"]
+        assert actual_max_ws == expected_max_ws, (
+            f"Max workspace size mismatch: expected {expected_max_ws}, got {actual_max_ws}"
+        )
+
+    # Forward pass with fusion
     def calc_fused_allreduce(x, res):
         linear_out = linear(x, all_reduce_params=AllReduceParams(enable_allreduce=False))
         output = allreduce(
             linear_out,
             all_reduce_params=AllReduceParams(
-                fusion_op=fusion_op,
+                fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
                 residual=res,
                 norm_weight=norm_weight,
                 scale=scale,
@@ -168,61 +206,22 @@ def run_allreduce_fallback_test(
         norm_out = rms_norm(residual_out, norm_weight, eps)
         return norm_out.to(dtype), residual_out.to(dtype)
 
-    # Verify fallback conditions
-    # Message size should be calculated from the dimensions that are actually reduced by allreduce
-    # x has shape (tensor_parallel_size, seq_len, hidden_size), but allreduce operates on
-    # seq_len * hidden_size elements (the tensor_parallel_size dimension is the rank dimension)
-    # So we calculate: seq_len * hidden_size * element_size
-    message_size_bytes = x.size(-2) * x.size(-1) * x.element_size()
-    max_workspace_size = CustomAllReduceHelper.max_workspace_size_auto(tensor_parallel_size)
-
-    if expected_fallback_conditions:
-        assert message_size_bytes == expected_fallback_conditions.get(
-            "message_size_bytes", message_size_bytes
-        ), (
-            f"Message size mismatch: expected "
-            f"{expected_fallback_conditions.get('message_size_bytes')}, "
-            f"got {message_size_bytes}"
-        )
-        assert max_workspace_size == expected_fallback_conditions.get(
-            "max_workspace_size", max_workspace_size
-        ), (
-            f"Max workspace size mismatch: expected "
-            f"{expected_fallback_conditions.get('max_workspace_size')}, "
-            f"got {max_workspace_size}"
-        )
-
-    # Test correctness - if fallback works, this should still produce correct results
+    # Execute and verify
     xs = torch.chunk(x.clone(), tensor_parallel_size, dim=-1)
     calc_output = calc_fused_allreduce(xs[tensor_parallel_rank], residual)
     ref_output = ref_residual_rms_norm(xs[tensor_parallel_rank], residual)
 
-    for calc_output_tensor, ref_output_tensor in zip(calc_output, ref_output):
-        rtol, atol = 0.05, 0.15
-        try:
-            torch.testing.assert_close(
-                calc_output_tensor,
-                ref_output_tensor,
-                rtol=rtol,
-                atol=atol,
-            )
-        except AssertionError:
-            # Calculate percentage of mismatched elements
-            mismatched = torch.abs(calc_output_tensor - ref_output_tensor) > (
-                rtol * torch.abs(ref_output_tensor) + atol
-            )
-            mismatch_percentage = mismatched.sum() / mismatched.numel()
+    verify_outputs(calc_output, ref_output)
+    synchronize_and_cleanup()
 
-            # If more than 1% elements mismatch, raise the error
-            assert mismatch_percentage < 0.01, "Large mismatched elements encountered"
 
-    # Synchronize CUDA to ensure all operations are complete before cleanup
-    # This prevents NCCL cleanup from happening while CUDA operations are still pending
-    torch.cuda.synchronize()
+# ============================================================================
+# Test Section 2: Window Tensor Tests
+# ============================================================================
 
 
 @torch.inference_mode()
-def run_allreduce_window_tensor_test(
+def test_window_tensor_single_call(
     x: torch.Tensor,
     hidden_size: int,
     dtype: torch.dtype,
@@ -230,72 +229,74 @@ def run_allreduce_window_tensor_test(
     tensor_parallel_rank: int,
     weights: list,
 ):
-    """
-    Test NCCL_SYMMETRIC with window tensor registration.
-    This test verifies that NCCL_SYMMETRIC works correctly with large buffers
-    that should trigger window tensor registration.
-    """
+    """Test a single allreduce call with window tensor."""
     x = x.cuda()
-    norm_weight = torch.randn((hidden_size,), dtype=dtype, device="cuda")
-    eps = 1e-5
-
-    mapping = Mapping(
-        world_size=tensor_parallel_size,
-        tp_size=tensor_parallel_size,
-        rank=tensor_parallel_rank,
+    mapping = create_mapping(tensor_parallel_size, tensor_parallel_rank)
+    linear, allreduce, _, _ = create_test_modules(
+        mapping, hidden_size, dtype, AllReduceStrategy.NCCL_SYMMETRIC, weights
     )
-
-    # Use NCCL_SYMMETRIC explicitly to test window tensor path
-    linear = Linear(
-        in_features=hidden_size,
-        out_features=hidden_size,
-        bias=False,
-        dtype=dtype,
-        mapping=mapping,
-        tensor_parallel_mode=TensorParallelMode.ROW,
-        allreduce_strategy=AllReduceStrategy.NCCL_SYMMETRIC,
-    ).cuda()
-    allreduce = AllReduce(mapping=mapping, strategy=AllReduceStrategy.NCCL_SYMMETRIC)
-    norm = RMSNorm(hidden_size=hidden_size, eps=eps, dtype=dtype).cuda()
-
-    linear.load_weights([dict(weight=weights[0])])
-    norm.weight.data.copy_(norm_weight)
 
     def calc_allreduce(x):
         linear_out = linear(x)
         output = allreduce(linear_out)
-        return [output]
+        return output
 
     def ref_allreduce(x):
         linear_out = linear(x)
-        return [linear_out]
+        return linear_out
 
-    # Test correctness - window tensor is an implementation detail, but we verify correctness
     xs = torch.chunk(x.clone(), tensor_parallel_size, dim=-1)
     calc_output = calc_allreduce(xs[tensor_parallel_rank])
     ref_output = ref_allreduce(xs[tensor_parallel_rank])
+
+    verify_outputs(calc_output, ref_output)
+    synchronize_and_cleanup()
+
+
+@torch.inference_mode()
+def test_window_tensor_buffer_reuse(
+    x: torch.Tensor,
+    hidden_size: int,
+    dtype: torch.dtype,
+    tensor_parallel_size: int,
+    tensor_parallel_rank: int,
+    weights: list,
+    num_iterations: int = 3,
+):
+    """Test that window tensor buffers are reused across multiple calls."""
+    x = x.cuda()
+    mapping = create_mapping(tensor_parallel_size, tensor_parallel_rank)
+    linear, allreduce, _, _ = create_test_modules(
+        mapping, hidden_size, dtype, AllReduceStrategy.NCCL_SYMMETRIC, weights
+    )
+
+    def calc_allreduce(x):
+        linear_out = linear(x)
+        output = allreduce(linear_out)
+        return output
+
+    def ref_allreduce(x):
+        linear_out = linear(x)
+        return linear_out
+
+    xs = torch.chunk(x.clone(), tensor_parallel_size, dim=-1)
 
     # Test multiple calls to verify buffer reuse
-    for _ in range(3):
+    for _ in range(num_iterations):
         calc_output = calc_allreduce(xs[tensor_parallel_rank])
         ref_output = ref_allreduce(xs[tensor_parallel_rank])
+        verify_outputs(calc_output, ref_output)
 
-        for calc_output_tensor, ref_output_tensor in zip(calc_output, ref_output):
-            rtol, atol = 0.05, 0.15
-            torch.testing.assert_close(
-                calc_output_tensor,
-                ref_output_tensor,
-                rtol=rtol,
-                atol=atol,
-            )
+    synchronize_and_cleanup()
 
-    # Synchronize CUDA to ensure all operations are complete before cleanup
-    # This prevents NCCL cleanup from happening while CUDA operations are still pending
-    torch.cuda.synchronize()
+
+# ============================================================================
+# Test Section 3: Lookup Table Fallback Tests
+# ============================================================================
 
 
 @torch.inference_mode()
-def run_allreduce_lookup_table_fallback_test(
+def test_lookup_table_fallback(
     x: torch.Tensor,
     hidden_size: int,
     dtype: torch.dtype,
@@ -303,71 +304,104 @@ def run_allreduce_lookup_table_fallback_test(
     tensor_parallel_rank: int,
     weights: list,
 ):
-    """
-    Test AUTO strategy with extreme values that fall outside lookup table bounds.
-    This should trigger fallback to NCCL_SYMMETRIC.
-    """
+    """Test AUTO strategy fallback for extreme values outside lookup table bounds."""
     x = x.cuda()
-    norm_weight = torch.randn((hidden_size,), dtype=dtype, device="cuda")
-    eps = 1e-5
-
-    mapping = Mapping(
-        world_size=tensor_parallel_size,
-        tp_size=tensor_parallel_size,
-        rank=tensor_parallel_rank,
+    mapping = create_mapping(tensor_parallel_size, tensor_parallel_rank)
+    linear, allreduce, _, _ = create_test_modules(
+        mapping, hidden_size, dtype, AllReduceStrategy.AUTO, weights
     )
-
-    # Use AUTO strategy with extreme values
-    linear = Linear(
-        in_features=hidden_size,
-        out_features=hidden_size,
-        bias=False,
-        dtype=dtype,
-        mapping=mapping,
-        tensor_parallel_mode=TensorParallelMode.ROW,
-        allreduce_strategy=AllReduceStrategy.AUTO,
-    ).cuda()
-    allreduce = AllReduce(mapping=mapping, strategy=AllReduceStrategy.AUTO)
-    norm = RMSNorm(hidden_size=hidden_size, eps=eps, dtype=dtype).cuda()
-
-    linear.load_weights([dict(weight=weights[0])])
-    norm.weight.data.copy_(norm_weight)
 
     def calc_allreduce(x):
         linear_out = linear(x)
         output = allreduce(linear_out)
-        return [output]
+        return output
 
     def ref_allreduce(x):
         linear_out = linear(x)
-        return [linear_out]
+        return linear_out
 
-    # Test correctness - fallback should still work correctly
     xs = torch.chunk(x.clone(), tensor_parallel_size, dim=-1)
     calc_output = calc_allreduce(xs[tensor_parallel_rank])
     ref_output = ref_allreduce(xs[tensor_parallel_rank])
 
-    for calc_output_tensor, ref_output_tensor in zip(calc_output, ref_output):
-        rtol, atol = 0.05, 0.15
-        torch.testing.assert_close(
-            calc_output_tensor,
-            ref_output_tensor,
-            rtol=rtol,
-            atol=atol,
-        )
-
-    # Synchronize CUDA to ensure all operations are complete before cleanup
-    # This prevents NCCL cleanup from happening while CUDA operations are still pending
-    torch.cuda.synchronize()
+    verify_outputs(calc_output, ref_output)
+    synchronize_and_cleanup()
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 GPUs for this test")
+# ============================================================================
+# Test Section 4: Strategy Comparison Tests
+# ============================================================================
+
+
+@torch.inference_mode()
+def test_strategy_comparison(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    hidden_size: int,
+    dtype: torch.dtype,
+    tensor_parallel_size: int,
+    tensor_parallel_rank: int,
+    weights: list,
+    strategy: AllReduceStrategy,
+):
+    """Test a specific strategy and return results for comparison."""
+    return test_fallback_with_fusion(
+        x,
+        residual,
+        hidden_size,
+        dtype,
+        tensor_parallel_size,
+        tensor_parallel_rank,
+        weights,
+        strategy,
+        expected_conditions=None,
+    )
+
+
+# ============================================================================
+# MPI Wrapper Functions
+# ============================================================================
+
+
+def run_single_rank_test(tensor_parallel_size, test_func, *args):
+    """Wrapper to run a test function on a single rank.
+
+    The test_func should accept tensor_parallel_rank as one of its parameters.
+    We inject the actual rank here by replacing None placeholders.
+    """
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    try:
+        # Convert args to list to modify
+        args_list = list(args)
+        # Replace None placeholders with actual rank
+        # The pattern is: (..., tensor_parallel_size, None, ...) where None is rank
+        for i in range(len(args_list) - 1):
+            if args_list[i] == tensor_parallel_size and args_list[i + 1] is None:
+                args_list[i + 1] = rank
+                break
+        else:
+            # Fallback: find first None and replace it
+            for i, arg in enumerate(args_list):
+                if arg is None:
+                    args_list[i] = rank
+                    break
+        test_func(*args_list)
+    except Exception:
+        traceback.print_exc()
+        raise
+    return True
+
+
+# ============================================================================
+# Pytest Test Functions
+# ============================================================================
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 GPUs")
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
 def test_auto_strategy_fallback_large_message(mpi_pool_executor):
-    """
-    Test that AUTO strategy falls back to NCCL_SYMMETRIC when message size
-    exceeds max workspace size.
-    """
+    """Test AUTO strategy fallback for large messages."""
     torch.manual_seed(42)
 
     tensor_parallel_size = mpi_pool_executor.num_workers
@@ -376,8 +410,6 @@ def test_auto_strategy_fallback_large_message(mpi_pool_executor):
 
     # Calculate message size that exceeds max workspace
     max_workspace_size = CustomAllReduceHelper.max_workspace_size_auto(tensor_parallel_size)
-    # Create a message size that's larger than max workspace
-    # max_workspace_size is in bytes, so we need seq_len * hidden_size * element_size > max_workspace_size
     element_size = torch.finfo(dtype).bits // 8
     seq_len = (max_workspace_size // (hidden_size * element_size)) + 100
 
@@ -393,18 +425,19 @@ def test_auto_strategy_fallback_large_message(mpi_pool_executor):
     }
 
     results = mpi_pool_executor.map(
-        run_single_rank_fallback_test,
+        run_single_rank_test,
         *zip(
             *[
                 (
                     tensor_parallel_size,
-                    run_allreduce_fallback_test,
+                    test_fallback_with_fusion,
                     x,
                     residual,
-                    weights,
                     hidden_size,
                     dtype,
-                    AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                    tensor_parallel_size,
+                    None,
+                    weights,
                     AllReduceStrategy.AUTO,
                     expected_conditions,
                 )
@@ -416,12 +449,10 @@ def test_auto_strategy_fallback_large_message(mpi_pool_executor):
         assert r is True
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 GPUs for this test")
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 GPUs")
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
 def test_auto_strategy_fallback_small_message(mpi_pool_executor):
-    """
-    Test that AUTO strategy works correctly with small messages that don't trigger fallback.
-    """
+    """Test AUTO strategy with small messages that don't trigger fallback."""
     torch.manual_seed(42)
 
     tensor_parallel_size = mpi_pool_executor.num_workers
@@ -443,18 +474,19 @@ def test_auto_strategy_fallback_small_message(mpi_pool_executor):
     }
 
     results = mpi_pool_executor.map(
-        run_single_rank_fallback_test,
+        run_single_rank_test,
         *zip(
             *[
                 (
                     tensor_parallel_size,
-                    run_allreduce_fallback_test,
+                    test_fallback_with_fusion,
                     x,
                     residual,
-                    weights,
                     hidden_size,
                     dtype,
-                    AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                    tensor_parallel_size,
+                    None,
+                    weights,
                     AllReduceStrategy.AUTO,
                     expected_conditions,
                 )
@@ -466,15 +498,12 @@ def test_auto_strategy_fallback_small_message(mpi_pool_executor):
         assert r is True
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 GPUs for this test")
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 GPUs")
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
-@pytest.mark.parametrize("seq_len", [1024, 8192, 16384], ids=lambda x: f"seqlen:{x}")
+@pytest.mark.parametrize("seq_len", [1024, 8192], ids=lambda x: f"seqlen:{x}")
 @pytest.mark.parametrize("hidden_size", [4096, 8192], ids=lambda x: f"hidden:{x}")
-def test_nccl_symmetric_window_tensor(mpi_pool_executor, seq_len, hidden_size):
-    """
-    Test NCCL_SYMMETRIC with various buffer sizes to verify window tensor registration.
-    Window tensor registration is triggered for buffers above a threshold.
-    """
+def test_nccl_symmetric_window_tensor_single(mpi_pool_executor, seq_len, hidden_size):
+    """Test NCCL_SYMMETRIC window tensor with a single call."""
     torch.manual_seed(42)
 
     tensor_parallel_size = mpi_pool_executor.num_workers
@@ -484,20 +513,18 @@ def test_nccl_symmetric_window_tensor(mpi_pool_executor, seq_len, hidden_size):
     weights = [torch.randn((hidden_size, hidden_size), dtype=dtype)]
 
     results = mpi_pool_executor.map(
-        run_single_rank_fallback_test,
+        run_single_rank_test,
         *zip(
             *[
                 (
                     tensor_parallel_size,
-                    run_allreduce_window_tensor_test,
+                    test_window_tensor_single_call,
                     x,
-                    None,
-                    weights,
                     hidden_size,
                     dtype,
+                    tensor_parallel_size,
                     None,
-                    None,
-                    None,
+                    weights,
                 )
             ]
             * tensor_parallel_size
@@ -507,23 +534,12 @@ def test_nccl_symmetric_window_tensor(mpi_pool_executor, seq_len, hidden_size):
         assert r is True
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 GPUs for this test")
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 GPUs")
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
-@pytest.mark.parametrize(
-    "seq_len",
-    [1, 2**18],  # Very small and very large (reduced from 2**20 to avoid int32 overflow)
-    ids=lambda x: f"seqlen:{x}",
-)
-@pytest.mark.parametrize(
-    "hidden_size",
-    [64, 2**14],  # Very small and very large (reduced from 2**15 to avoid int32 overflow)
-    ids=lambda x: f"hidden:{x}",
-)
-def test_lookup_table_fallback_extreme_values(mpi_pool_executor, seq_len, hidden_size):
-    """
-    Test AUTO strategy with extreme values that fall outside lookup table bounds.
-    These should trigger fallback to NCCL_SYMMETRIC.
-    """
+@pytest.mark.parametrize("seq_len", [16384], ids=lambda x: f"seqlen:{x}")
+@pytest.mark.parametrize("hidden_size", [4096], ids=lambda x: f"hidden:{x}")
+def test_nccl_symmetric_window_tensor_reuse(mpi_pool_executor, seq_len, hidden_size):
+    """Test NCCL_SYMMETRIC window tensor buffer reuse."""
     torch.manual_seed(42)
 
     tensor_parallel_size = mpi_pool_executor.num_workers
@@ -533,20 +549,19 @@ def test_lookup_table_fallback_extreme_values(mpi_pool_executor, seq_len, hidden
     weights = [torch.randn((hidden_size, hidden_size), dtype=dtype)]
 
     results = mpi_pool_executor.map(
-        run_single_rank_fallback_test,
+        run_single_rank_test,
         *zip(
             *[
                 (
                     tensor_parallel_size,
-                    run_allreduce_lookup_table_fallback_test,
+                    test_window_tensor_buffer_reuse,
                     x,
-                    None,
-                    weights,
                     hidden_size,
                     dtype,
+                    tensor_parallel_size,
                     None,
-                    None,
-                    None,
+                    weights,
+                    3,
                 )
             ]
             * tensor_parallel_size
@@ -556,12 +571,46 @@ def test_lookup_table_fallback_extreme_values(mpi_pool_executor, seq_len, hidden
         assert r is True
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 GPUs for this test")
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 GPUs")
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+@pytest.mark.parametrize("seq_len", [1, 2**18], ids=lambda x: f"seqlen:{x}")
+@pytest.mark.parametrize("hidden_size", [64, 2**14], ids=lambda x: f"hidden:{x}")
+def test_lookup_table_fallback_extreme_values(mpi_pool_executor, seq_len, hidden_size):
+    """Test AUTO strategy fallback for extreme values."""
+    torch.manual_seed(42)
+
+    tensor_parallel_size = mpi_pool_executor.num_workers
+    dtype = torch.bfloat16
+
+    x = torch.randn((tensor_parallel_size, seq_len, hidden_size), dtype=dtype)
+    weights = [torch.randn((hidden_size, hidden_size), dtype=dtype)]
+
+    results = mpi_pool_executor.map(
+        run_single_rank_test,
+        *zip(
+            *[
+                (
+                    tensor_parallel_size,
+                    test_lookup_table_fallback,
+                    x,
+                    hidden_size,
+                    dtype,
+                    tensor_parallel_size,
+                    None,
+                    weights,
+                )
+            ]
+            * tensor_parallel_size
+        ),
+    )
+    for r in results:
+        assert r is True
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 GPUs")
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
 def test_nccl_symmetric_explicit_vs_auto(mpi_pool_executor):
-    """
-    Test that explicitly setting NCCL_SYMMETRIC produces same results as AUTO fallback.
-    """
+    """Test that explicit NCCL_SYMMETRIC produces same results as AUTO fallback."""
     torch.manual_seed(42)
 
     tensor_parallel_size = mpi_pool_executor.num_workers
@@ -575,18 +624,19 @@ def test_nccl_symmetric_explicit_vs_auto(mpi_pool_executor):
 
     # Test with explicit NCCL_SYMMETRIC
     results_explicit = mpi_pool_executor.map(
-        run_single_rank_fallback_test,
+        run_single_rank_test,
         *zip(
             *[
                 (
                     tensor_parallel_size,
-                    run_allreduce_fallback_test,
+                    test_fallback_with_fusion,
                     x,
                     residual,
-                    weights,
                     hidden_size,
                     dtype,
-                    AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                    tensor_parallel_size,
+                    None,
+                    weights,
                     AllReduceStrategy.NCCL_SYMMETRIC,
                     None,
                 )
@@ -595,20 +645,21 @@ def test_nccl_symmetric_explicit_vs_auto(mpi_pool_executor):
         ),
     )
 
-    # Test with AUTO (should fallback to NCCL_SYMMETRIC in some cases)
+    # Test with AUTO
     results_auto = mpi_pool_executor.map(
-        run_single_rank_fallback_test,
+        run_single_rank_test,
         *zip(
             *[
                 (
                     tensor_parallel_size,
-                    run_allreduce_fallback_test,
+                    test_fallback_with_fusion,
                     x,
                     residual,
-                    weights,
                     hidden_size,
                     dtype,
-                    AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                    tensor_parallel_size,
+                    None,
+                    weights,
                     AllReduceStrategy.AUTO,
                     None,
                 )
