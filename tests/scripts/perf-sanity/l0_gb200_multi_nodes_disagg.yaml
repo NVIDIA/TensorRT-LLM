@@ -5,8 +5,8 @@ hardware:
   gpus_per_ctx_server: 4
   num_gen_servers: 1
   gpus_per_gen_server: 4
+numa_bind: true
 timeout: 7200
-
 # Disagg Configs
 disagg_configs:
   - name: "r1_fp4_v2_dep8_mtp1"

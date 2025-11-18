@@ -368,8 +368,8 @@ class PerfMultiNodeDisaggScriptTestCmds(NamedTuple):
 
     def _generate_disagg_server_config(self,
                                        cmd_idx: int,
-                                       worker_port: int = 8336,
-                                       server_port: int = 8333) -> str:
+                                       ctx_gen_port: int = 8336,
+                                       disagg_server_port: int = 8333) -> str:
         print_info(
             f"Generating disagg server config for command index {cmd_idx}")
         # Wait for all hostname files to be created
@@ -420,15 +420,15 @@ class PerfMultiNodeDisaggScriptTestCmds(NamedTuple):
         # Generate server config
         server_config = {
             'hostname': current_hostname,
-            'port': server_port,
+            'port': disagg_server_port,
             'backend': 'pytorch',
             'context_servers': {
                 'num_instances': self.num_ctx_servers,
-                'urls': [f'{host}:{worker_port}' for host in ctx_hostnames]
+                'urls': [f'{host}:{ctx_gen_port}' for host in ctx_hostnames]
             },
             'generation_servers': {
                 'num_instances': self.num_gen_servers,
-                'urls': [f'{host}:{worker_port}' for host in gen_hostnames]
+                'urls': [f'{host}:{ctx_gen_port}' for host in gen_hostnames]
             }
         }
 

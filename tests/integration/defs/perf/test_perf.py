@@ -591,9 +591,10 @@ class ServerConfig:
 
     def to_cmd(self,
                output_dir: str,
+               numa_bind: bool = False,
+               disagg_server_idx: str = "",
                hostname: str = "localhost",
-               port: int = 8000,
-               disagg_server_idx: str = "") -> List[str]:
+               port: int = 8000) -> List[str]:
         model_dir = get_model_dir(self.model_name)
         self.model_path = model_dir if os.path.exists(
             model_dir) else self.model_name
@@ -603,11 +604,14 @@ class ServerConfig:
         elif "GEN" in disagg_server_idx:
             config_filename = f"extra-llm-api-config.{self.name}.gen.yml"
         config_path = os.path.join(output_dir, config_filename)
-        return [
+        cmd = [
             "trtllm-serve", self.model_path, "--host", hostname, "--port",
             str(port), "--backend", "pytorch", "--extra_llm_api_options",
             config_path
         ]
+        if numa_bind:
+            cmd = ["numactl", "-m 0,1"] + cmd
+        return cmd
 
     def to_db_data(self) -> dict:
         """Convert ServerConfig to Database data"""
@@ -730,7 +734,6 @@ class ClientConfig:
         self.model_path = ""
 
     def to_cmd(self,
-               output_dir: str,
                hostname: str = "localhost",
                port: int = 8000) -> List[str]:
         model_dir = get_model_dir(self.model_name)
@@ -882,11 +885,6 @@ def parse_multi_node_disagg_config_file(config_file_path: str,
     disagg_server_idx = os.environ.get("DISAGG_SERVER_IDX", "DISAGG")
     # Get hostname
     hostname = socket.gethostname()
-    # Determine port based on disagg_server_idx
-    port = 8333
-    if "CTX" in disagg_server_idx and "GEN" in disagg_server_idx:
-        port = 8336
-
     # Parse selection pattern
     if select_pattern:
         execution_plan = parse_select_pattern(select_pattern)
@@ -900,6 +898,7 @@ def parse_multi_node_disagg_config_file(config_file_path: str,
     disagg_configs = []
     hardware = config.get('hardware', {})
     timeout = config.get('timeout', 7200)
+    numa_bind = config.get('numa_bind', False)
     # Parse disaggregated configurations
     for disagg_config_data in config.get('disagg_configs', []):
         config_name = disagg_config_data.get('name', '')
@@ -936,7 +935,7 @@ def parse_multi_node_disagg_config_file(config_file_path: str,
         disagg_config = {
             'disagg_server_idx': disagg_server_idx,
             'hostname': hostname,
-            'port': port,
+            'numa_bind': numa_bind,
             'timeout': timeout,
             'name': config_name,
             'model_name': model_name,
@@ -1698,7 +1697,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         for disagg_config in self._config.disagg_configs:
             disagg_server_idx = disagg_config['disagg_server_idx']
             hostname = disagg_config['hostname']
-            port = disagg_config['port']
+            numa_bind = disagg_config['numa_bind']
             ctx_server_cmd = None
             gen_server_cmd = None
             disagg_server_cmd = None
@@ -1714,8 +1713,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 is_ctx = "CTX" in disagg_server_idx
                 server_config = disagg_config[
                     'ctx_server'] if is_ctx else disagg_config['gen_server']
-                server_cmd = server_config.to_cmd(output_dir, hostname, port,
-                                                  disagg_server_idx)
+                server_cmd = server_config.to_cmd(output_dir, numa_bind,
+                                                  disagg_server_idx, hostname,
+                                                  8336)
                 if is_ctx:
                     ctx_server_cmd = server_cmd
                 else:
@@ -1735,8 +1735,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                     str(timeout), "-r",
                     str(timeout)
                 ]
-                benchmark_cmd = disagg_config['client'].to_cmd(
-                    output_dir, hostname, port)
+                benchmark_cmd = disagg_config['client'].to_cmd(hostname, 8333)
             ctx_server_cmds.append(ctx_server_cmd)
             gen_server_cmds.append(gen_server_cmd)
             disagg_server_cmds.append(disagg_server_cmd)
