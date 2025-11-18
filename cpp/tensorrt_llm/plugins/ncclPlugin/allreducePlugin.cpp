@@ -222,25 +222,26 @@ AllReduceStrategyType AllreducePlugin::selectImplementation(
     {
         if (!isAuto)
         {
-            TLLM_LOG_INFO("Since Peer to Peer not supported, fallback to AllReduceStrategy: NCCL");
+            TLLM_LOG_INFO("Since Peer to Peer not supported, fallback to AllReduceStrategy: NCCL_SYMMETRIC");
         }
         else if (forceDeterministic)
         {
             TLLM_LOG_WARNING(
-                "Since Peer to Peer not supported, fallback to AllReduceStrategy: NCCL. NCCL might produce "
+                "Since Peer to Peer not supported, fallback to AllReduceStrategy: NCCL_SYMMETRIC. NCCL_SYMMETRIC might "
+                "produce "
                 "non-deterministic results.");
         }
-        return AllReduceStrategyType::NCCL;
+        return AllReduceStrategyType::NCCL_SYMMETRIC;
     }
 
     if (isAuto && !mIsNVLINKSupported && !forceDeterministic)
     {
-        return AllReduceStrategyType::NCCL;
+        return AllReduceStrategyType::NCCL_SYMMETRIC;
     }
 
     auto const maxWorkspaceSize = utils::customAllReduceUtils::getMaxRequiredWorkspaceSize(worldSize);
 
-    AllReduceStrategyType strat = AllReduceStrategyType::NCCL;
+    AllReduceStrategyType strat = AllReduceStrategyType::NCCL_SYMMETRIC;
     auto const messageSizeBytes = messageSize * common::getDTypeSize(type);
 
     if (messageSizeBytes <= maxWorkspaceSize)
@@ -268,7 +269,7 @@ AllReduceStrategyType AllreducePlugin::selectImplementation(
             }
             else
             {
-                strat = AllReduceStrategyType::NCCL;
+                strat = AllReduceStrategyType::NCCL_SYMMETRIC;
             }
         }
         else
@@ -279,7 +280,7 @@ AllReduceStrategyType AllreducePlugin::selectImplementation(
             }
             else
             {
-                strat = AllReduceStrategyType::NCCL;
+                strat = AllReduceStrategyType::NCCL_SYMMETRIC;
             }
         }
 
@@ -287,30 +288,31 @@ AllReduceStrategyType AllreducePlugin::selectImplementation(
         {
             if (!isAuto)
             {
-                TLLM_LOG_WARNING("Since not aligned, fallback to AllReduceStrategy: NCCL");
+                TLLM_LOG_WARNING("Since not aligned, fallback to AllReduceStrategy: NCCL_SYMMETRIC");
             }
             else if (forceDeterministic)
             {
                 TLLM_LOG_WARNING(
-                    "Since not aligned, fallback to AllReduceStrategy: NCCL. NCCL might produce "
+                    "Since not aligned, fallback to AllReduceStrategy: NCCL_SYMMETRIC. NCCL_SYMMETRIC might produce "
                     "non-deterministic results.");
             }
-            strat = AllReduceStrategyType::NCCL;
+            strat = AllReduceStrategyType::NCCL_SYMMETRIC;
         }
     }
     else
     {
         if (!isAuto)
         {
-            TLLM_LOG_WARNING("Since messageSize > maxWorkspace, fallback to AllReduceStrategy: NCCL");
+            TLLM_LOG_WARNING("Since messageSize > maxWorkspace, fallback to AllReduceStrategy: NCCL_SYMMETRIC");
         }
         else if (forceDeterministic)
         {
             TLLM_LOG_WARNING(
-                "Since messageSize > maxWorkspace, fallback to AllReduceStrategy: NCCL. NCCL might produce "
+                "Since messageSize > maxWorkspace, fallback to AllReduceStrategy: NCCL_SYMMETRIC. NCCL_SYMMETRIC might "
+                "produce "
                 "non-deterministic results.");
         }
-        strat = AllReduceStrategyType::NCCL;
+        strat = AllReduceStrategyType::NCCL_SYMMETRIC;
     }
 
     return strat;
@@ -355,6 +357,11 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
         TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: NCCL", rank);
         break;
     }
+    case AllReduceStrategyType::NCCL_SYMMETRIC:
+    {
+        TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: NCCL_SYMMETRIC", rank);
+        break;
+    }
     case AllReduceStrategyType::ONESHOT:
     {
         TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: ONESHOT", rank);
@@ -373,14 +380,14 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
     default: break;
     }
 
-    if (runtimeStrategy == AllReduceStrategyType::NCCL)
+    if (runtimeStrategy == AllReduceStrategyType::NCCL || runtimeStrategy == AllReduceStrategyType::NCCL_SYMMETRIC)
     {
         if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM || mOp == AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM)
         {
             NCCLCHECK(ncclAllReduce(inputs[0], outputs[1], size, (*getDtypeMap())[mType], ncclSum, *mNcclComm, stream));
             tensorrt_llm::kernels::AllReduceParams params;
             int fusion_ptr_idx = 0;
-            if (mStrategy == AllReduceStrategyType::NCCL)
+            if (mStrategy == AllReduceStrategyType::NCCL || mStrategy == AllReduceStrategyType::NCCL_SYMMETRIC)
             {
                 fusion_ptr_idx = 1;
             }
