@@ -2686,9 +2686,10 @@ class TorchLlmArgs(BaseLlmArgs):
         self._extra_resource_managers = value
 
     @model_validator(mode="after")
-    def validate_model_format_misc(self):
-        # Store the model format in the values
+    def validate_misc(self):
         self._model_format = _ModelFormatKind.HF
+        if self.max_beam_width is None:
+            self.max_beam_width = 1
         return self
 
     @model_validator(mode="after")
