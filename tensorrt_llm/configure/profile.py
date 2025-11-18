@@ -27,7 +27,7 @@ class ProfileMetadata(BaseModel):
 class BaseProfile(ABC):
     """Base class for all profiles.
 
-    A profile defines a particular strategy used to find an optimized config for a given scenario
+    A profile defines a particular strategy used to find an optimized config for a given set of constraints
     (e.g. database lookup, heuristics, etc.)
 
     Each profile is compatible with a specific type of constraints.
