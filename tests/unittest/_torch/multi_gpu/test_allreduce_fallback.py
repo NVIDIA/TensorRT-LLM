@@ -216,6 +216,10 @@ def run_allreduce_fallback_test(
             # If more than 1% elements mismatch, raise the error
             assert mismatch_percentage < 0.01, "Large mismatched elements encountered"
 
+    # Synchronize CUDA to ensure all operations are complete before cleanup
+    # This prevents NCCL cleanup from happening while CUDA operations are still pending
+    torch.cuda.synchronize()
+
 
 @torch.inference_mode()
 def run_allreduce_window_tensor_test(
@@ -285,6 +289,10 @@ def run_allreduce_window_tensor_test(
                 atol=atol,
             )
 
+    # Synchronize CUDA to ensure all operations are complete before cleanup
+    # This prevents NCCL cleanup from happening while CUDA operations are still pending
+    torch.cuda.synchronize()
+
 
 @torch.inference_mode()
 def run_allreduce_lookup_table_fallback_test(
@@ -347,6 +355,10 @@ def run_allreduce_lookup_table_fallback_test(
             rtol=rtol,
             atol=atol,
         )
+
+    # Synchronize CUDA to ensure all operations are complete before cleanup
+    # This prevents NCCL cleanup from happening while CUDA operations are still pending
+    torch.cuda.synchronize()
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 GPUs for this test")
