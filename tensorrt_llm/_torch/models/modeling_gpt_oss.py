@@ -833,14 +833,12 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
                 if 'gate_up_proj_weight_scale' in module_weights:
                     gu_ws = module_weights['gate_up_proj_weight_scale']
                     moe_weights['gate_up_proj_weight_scale'] = [
-                        gu_ws[i, :, :].transpose(0, 1)
-                        for i in range(num_expert)
+                        gu_ws[i, :, :] for i in range(num_expert)
                     ]
                 if 'down_proj_weight_scale' in module_weights:
                     dp_ws = module_weights['down_proj_weight_scale']
                     moe_weights['down_proj_weight_scale'] = [
-                        dp_ws[i, :, :].transpose(0, 1)
-                        for i in range(num_expert)
+                        dp_ws[i, :, :] for i in range(num_expert)
                     ]
 
                 # Module-level globals for NVFP4 loaders
