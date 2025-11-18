@@ -4,7 +4,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from .constraints import BaseConstraints, BenchmarkConstraints
+from tensorrt_llm.configure.constraints import BaseConstraints, BenchmarkConstraints
 
 
 class ProfileMetadata(BaseModel):

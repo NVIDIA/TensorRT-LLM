@@ -6,8 +6,8 @@ import yaml
 from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, CliSubCommand, SettingsConfigDict, get_subcommand
 
-from .constraints import BaseConstraints, BenchmarkConstraints
-from .profile import PROFILE_REGISTRY
+from tensorrt_llm.configure.constraints import BaseConstraints, BenchmarkConstraints
+from tensorrt_llm.configure.profile import PROFILE_REGISTRY
 
 
 def generate_subcommand_description(constraints_cls: type[BaseConstraints]) -> str:
