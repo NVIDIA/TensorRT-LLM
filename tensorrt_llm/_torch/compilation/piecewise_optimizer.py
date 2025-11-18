@@ -14,7 +14,7 @@ from tensorrt_llm.llmapi.utils import enable_llm_debug
 from ..utils import (get_model_extra_attrs,
                      get_per_request_piecewise_cuda_graph_flag,
                      get_piecewise_cuda_graph_flag, make_weak_ref,
-                     set_piecewise_running)
+                     skip_maybe_compile)
 from .multi_stream.auto_multi_stream import multi_stream_schedule
 from .utils import get_capture_piecewise_cuda_graph_flag, is_call_function
 
@@ -171,68 +171,75 @@ class PiecewiseRunner(object):
                 or not get_per_request_piecewise_cuda_graph_flag()):
             return self.default_callable(*args)
 
-        if self.is_first_runner or self.is_last_runner:
-            if self.is_first_runner == self.is_last_runner:
-                set_piecewise_running(False)
-            else:
-                set_piecewise_running(self.is_first_runner)
+        # Determine if we should skip compilation in @maybe_compile decorated functions:
+        # - First runner only: skip compilation (to avoid overhead)
+        # - Last runner only: skip compilation (to avoid overhead)
+        # - Both first and last (single runner): allow compilation (normal mode)
+        # - Middle runner: allow compilation (normal mode)
+        should_skip = (self.is_first_runner or self.is_last_runner) and \
+                      not (self.is_first_runner and self.is_last_runner)
 
-        entry = self.entries[runtime_num_of_token]
+        # Use context manager to directly control @maybe_compile behavior
+        # This makes the relationship explicit: PiecewiseRunner → skip_maybe_compile → @maybe_compile
+        with skip_maybe_compile(should_skip):
+            entry = self.entries[runtime_num_of_token]
 
-        if entry.enable_inductor and not entry.compiled:
-            entry.callable = compile_fx(entry.callable, args)
-            entry.compiled = True
+            if entry.enable_inductor and not entry.compiled:
+                entry.callable = compile_fx(entry.callable, args)
+                entry.compiled = True
 
-        if entry.cuda_graph is None:
+            if entry.cuda_graph is None:
 
-            if not get_capture_piecewise_cuda_graph_flag():
-                return entry.callable(*args)
+                if not get_capture_piecewise_cuda_graph_flag():
+                    return entry.callable(*args)
 
-            if entry.warmup_count < 3:
-                entry.warmup_count += 1
-                return entry.callable(*args)
+                if entry.warmup_count < 3:
+                    entry.warmup_count += 1
+                    return entry.callable(*args)
 
-            entry.input_addresses = [
-                i.data_ptr() for i in args if isinstance(i, torch.Tensor)
-            ]
+                entry.input_addresses = [
+                    i.data_ptr() for i in args if isinstance(i, torch.Tensor)
+                ]
 
-            graph = torch.cuda.CUDAGraph()
+                graph = torch.cuda.CUDAGraph()
 
-            # Torch's cuda graph will call gc.collect() internally. This will slow down the performance.
-            # We patch it to do nothing.
-            with patch("gc.collect", lambda: None):
-                # TODO: consider to use `make_graphed_callables()` when
-                # it's ready rather than capture it ourselves
-                # Graph Capture would override the stream. We need to setup the stream correctly.
-                extra_attrs = get_model_extra_attrs()
-                with torch.cuda.graph(graph, pool=self.graph_pool_handle):
+                # Torch's cuda graph will call gc.collect() internally. This will slow down the performance.
+                # We patch it to do nothing.
+                with patch("gc.collect", lambda: None):
+                    # TODO: consider to use `make_graphed_callables()` when
+                    # it's ready rather than capture it ourselves
+                    # Graph Capture would override the stream. We need to setup the stream correctly.
+                    extra_attrs = get_model_extra_attrs()
+                    with torch.cuda.graph(graph, pool=self.graph_pool_handle):
+                        extra_attrs[
+                            "global_stream"] = torch.cuda.current_stream()
+                        output = entry.callable(*args)
                     extra_attrs["global_stream"] = torch.cuda.current_stream()
-                    output = entry.callable(*args)
-                extra_attrs["global_stream"] = torch.cuda.current_stream()
 
-            entry.cuda_graph = graph
-            # Mark weak ref here. The intermediate activation tensor should be freed properly.
-            # Here we don't use python native weakref since we still need the object to be alive when the graph is replayed.
-            entry.output = make_weak_ref(output)
-            entry.output_addresses = [
-                i.data_ptr() for i in output if isinstance(i, torch.Tensor)
-            ]
+                entry.cuda_graph = graph
+                # Mark weak ref here. The intermediate activation tensor should be freed properly.
+                # Here we don't use python native weakref since we still need the object to be alive when the graph is replayed.
+                entry.output = make_weak_ref(output)
+                entry.output_addresses = [
+                    i.data_ptr() for i in output if isinstance(i, torch.Tensor)
+                ]
+
+                entry.cuda_graph.replay()
+
+                return output
+
+            if enable_llm_debug():
+                runtime_input_addresses = [
+                    i.data_ptr() for i in args if isinstance(i, torch.Tensor)
+                ]
+
+                assert (
+                    entry.input_addresses == runtime_input_addresses
+                ), f"{entry.input_addresses} vs\n {runtime_input_addresses}"
 
             entry.cuda_graph.replay()
 
-            return output
-
-        if enable_llm_debug():
-            runtime_input_addresses = [
-                i.data_ptr() for i in args if isinstance(i, torch.Tensor)
-            ]
-
-            assert (entry.input_addresses == runtime_input_addresses
-                    ), f"{entry.input_addresses} vs\n {runtime_input_addresses}"
-
-        entry.cuda_graph.replay()
-
-        return entry.output
+            return entry.output
 
 
 def piecewise_optimizer(

@@ -11,8 +11,10 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import ceil_div, pad_up
 from tensorrt_llm.quantization.utils import fp4_utils
 
-is_torch_compiling_flag = False
-is_piecewise_running_flag = False
+_torch_compiling = threading.local()
+# Controls whether @maybe_compile decorator should skip compilation
+# Set directly by PiecewiseRunner to avoid compilation overhead
+_skip_maybe_compile = threading.local()
 
 aux_stream_name_list = [
     'Attention',
@@ -46,23 +48,42 @@ class ActivationType(IntEnum):
 
 
 def set_torch_compiling(enable: bool):
-    global is_torch_compiling_flag
-    is_torch_compiling_flag = enable
+    _torch_compiling.flag = enable
 
 
 def is_torch_compiling() -> bool:
-    global is_torch_compiling_flag
-    return is_torch_compiling_flag
+    return getattr(_torch_compiling, 'flag', False)
 
 
-def set_piecewise_running(enable: bool):
-    global is_piecewise_running_flag
-    is_piecewise_running_flag = enable
+@contextlib.contextmanager
+def skip_maybe_compile(skip: bool = True):
+    """
+    Context manager to directly control @maybe_compile decorator behavior.
+
+    When skip=True, functions decorated with @maybe_compile will skip torch.compile
+    to avoid compilation overhead. Used by PiecewiseRunner to control compilation.
+
+    This makes the relationship between PiecewiseRunner and @maybe_compile explicit.
+
+    Args:
+        skip: Whether to skip compilation in @maybe_compile decorated functions
+
+    Example:
+        with skip_maybe_compile(True):
+            # Functions with @maybe_compile will NOT be compiled
+            result = some_function()
+    """
+    old_state = getattr(_skip_maybe_compile, 'flag', False)
+    _skip_maybe_compile.flag = skip
+    try:
+        yield
+    finally:
+        _skip_maybe_compile.flag = old_state
 
 
-def is_piecewise_running() -> bool:
-    global is_piecewise_running_flag
-    return is_piecewise_running_flag
+def _should_skip_maybe_compile() -> bool:
+    """Check if @maybe_compile should skip compilation."""
+    return getattr(_skip_maybe_compile, 'flag', False)
 
 
 _global_attrs = threading.local()
@@ -344,19 +365,34 @@ def get_device_uuid(device_idx: int) -> str:
 def maybe_compile(func=None, **compile_kwargs):
     """
     Conditionally compile a function with torch.compile.
-    If is_piecewise_running() is True, the function will not be compiled to avoid host overhead in attention op.
+
+    Compilation is skipped when running within a skip_maybe_compile(True) context,
+    which is used by PiecewiseRunner to avoid compilation overhead.
+
     Args:
         func: The function to decorate (optional, for direct decoration).
         **compile_kwargs: Keyword arguments for torch.compile.
     Returns:
-        The conditionally compiled function..
+        The conditionally compiled function.
+
+    Example:
+        @maybe_compile
+        def my_function(x):
+            return x * 2
+
+        # Normal usage: function is compiled
+        result = my_function(tensor)
+
+        # With skip_maybe_compile: function runs uncompiled
+        with skip_maybe_compile(True):
+            result = my_function(tensor)  # Not compiled
     """
 
     def decorator(f):
         compiled_func = torch.compile(f, **compile_kwargs)
 
         def wrapper(*args, **kwargs):
-            if is_piecewise_running():
+            if _should_skip_maybe_compile():
                 return f(*args, **kwargs)
             return compiled_func(*args, **kwargs)
 
