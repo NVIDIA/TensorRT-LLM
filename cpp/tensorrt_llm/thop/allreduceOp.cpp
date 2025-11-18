@@ -1010,12 +1010,12 @@ private:
 
         if (ifFallbackToNCCL(seq_len, message_size_bytes, max_workspace_size))
         {
-            return AllReduceStrategyType::NCCL;
+            return AllReduceStrategyType::NCCL_SYMMETRIC;
         }
 
-        // This rule based heuristic only chooses between NCCL and MIN_LATENCY strategies.
-        // From this point, all fusion patterns are supported by all these strategies: NCCL, ONESHOT, TWOSHOT and
-        // MIN_LATENCY.
+        // This rule based heuristic only chooses between NCCL_SYMMETRIC and MIN_LATENCY strategies.
+        // From this point, all fusion patterns are supported by all these strategies: NCCL_SYMMETRIC, ONESHOT, TWOSHOT
+        // and MIN_LATENCY.
         if (mStrategy != AllReduceStrategyType::AUTO)
         {
             // Check TWOSHOT constraint: seq_len >= tp_size
@@ -1032,12 +1032,12 @@ private:
             return tensorrt_llm::utils::customAllReduceUtils::selectStrategyLookUpTable(
                 seq_len, hidden_size, mOp, mGroup.size());
         }
-        return AllReduceStrategyType::NCCL;
+        return AllReduceStrategyType::NCCL_SYMMETRIC;
     }
 
     bool ifFallbackToNCCL(size_t seq_len, size_t message_size_bytes, size_t max_workspace_size)
     {
-        // If messageSize is less than maxWorkspaceSize, use NCCL, regardless of the fusion type.
+        // If messageSize is less than maxWorkspaceSize, use NCCL_SYMMETRIC, regardless of the fusion type.
         if (message_size_bytes > max_workspace_size || !mIsP2PSupported || !mIsNVLINKSupported)
         {
             return true;
