@@ -119,6 +119,27 @@ def get_model_yaml_config(model_label: str,
                 'enable_chunked_prefill': True,
             }
         },
+        # Deepseek R1 model with CUTLASS backend
+        {
+            'patterns': [
+                'deepseek_r1_nvfp4-bench-pytorch-streaming-float4-maxbs:512-maxnt:5220-input_output_len:4000,2000',
+            ],
+            'config': {
+                'enable_attention_dp': True,
+                'moe_config': {
+                    'backend': 'CUTLASS',
+                    'max_num_tokens': 3072,
+                },
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'free_gpu_memory_fraction': 0.5,
+                },
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'batch_sizes': [1, 2, 4, 8, 16, 32, 64],
+                },
+            }
+        },
         # Deepseek_v3_lite_cases
         {
             'patterns':

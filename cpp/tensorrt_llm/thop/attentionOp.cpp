@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION &
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
  * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -86,10 +86,11 @@ public:
         c10::ArrayRef<std::optional<torch::Tensor>> spec_decoding_tensor_params,
         torch::optional<torch::Tensor> attention_sinks, torch::optional<torch::Tensor> sparse_kv_indices,
         torch::optional<torch::Tensor> sparse_kv_offsets, torch::optional<torch::Tensor> sparse_attn_indices,
-        torch::optional<torch::Tensor> sparse_attn_offsets, int32_t const sparse_mla_topk,
-        std::optional<torch::Tensor> cu_q_seqlens, std::optional<torch::Tensor> cu_kv_seqlens,
-        std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
-        std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer) const
+        torch::optional<torch::Tensor> sparse_attn_offsets, int64_t const sparse_attn_indices_block_size,
+        int32_t const sparse_mla_topk, std::optional<torch::Tensor> cu_q_seqlens,
+        std::optional<torch::Tensor> cu_kv_seqlens, std::optional<torch::Tensor> fmha_scheduler_counter,
+        std::optional<torch::Tensor> mla_bmm1_scale, std::optional<torch::Tensor> mla_bmm2_scale,
+        std::optional<torch::Tensor> quant_q_buffer) const
         = 0;
 };
 
@@ -146,10 +147,11 @@ public:
         c10::ArrayRef<std::optional<torch::Tensor>> spec_decoding_tensor_params,
         torch::optional<torch::Tensor> attention_sinks, torch::optional<torch::Tensor> sparse_kv_indices,
         torch::optional<torch::Tensor> sparse_kv_offsets, torch::optional<torch::Tensor> sparse_attn_indices,
-        torch::optional<torch::Tensor> sparse_attn_offsets, int32_t const sparse_mla_topk,
-        std::optional<torch::Tensor> cu_q_seqlens, std::optional<torch::Tensor> cu_kv_seqlens,
-        std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
-        std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer) const override
+        torch::optional<torch::Tensor> sparse_attn_offsets, int64_t const sparse_attn_indices_block_size,
+        int32_t const sparse_mla_topk, std::optional<torch::Tensor> cu_q_seqlens,
+        std::optional<torch::Tensor> cu_kv_seqlens, std::optional<torch::Tensor> fmha_scheduler_counter,
+        std::optional<torch::Tensor> mla_bmm1_scale, std::optional<torch::Tensor> mla_bmm2_scale,
+        std::optional<torch::Tensor> quant_q_buffer) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv_or_q.get_device());
         T* attention_input = static_cast<T*>(qkv_or_q.slice(0, token_offset).data_ptr());
@@ -395,6 +397,9 @@ public:
             = sparse_attn_indices.has_value() ? sparse_attn_indices.value().data_ptr<int32_t>() : nullptr;
         op.mRuntimeSparseAttentionParams.sparse_attn_offsets
             = sparse_attn_offsets.has_value() ? sparse_attn_offsets.value().data_ptr<int32_t>() : nullptr;
+        op.mRuntimeSparseAttentionParams.sparse_attn_indices_block_size = sparse_attn_indices_block_size;
+        op.mRuntimeSparseAttentionParams.sparse_attn_indices_stride
+            = sparse_attn_indices.has_value() ? sparse_attn_indices.value().size(-1) : 0;
         if (op.isMLAEnabled() && op.mUseSparseAttention)
         {
             op.mRuntimeSparseAttentionParams.sparse_mla_topk = sparse_mla_topk;
@@ -481,6 +486,7 @@ public:
 
             common_enqueue_params.input_seq_length = input_seq_length;
             AttentionOp::EnqueueGenerationParams<T> enqueue_params{common_enqueue_params};
+            enqueue_params.layer_idx = op.mLayerIdx;
             enqueue_params.beam_width = beam_width;
             enqueue_params.num_requests = num_requests;
             enqueue_params.cache_indir = beam_width == 1
@@ -496,16 +502,44 @@ public:
             }
             if (op.mIsSpecDecodingEnabled && op.mUseSpecDecoding)
             {
-                TORCH_CHECK(spec_decoding_tensor_params.size() == 3,
-                    "Expecting 3 tensors for spec-dec mode, spec_decoding_generation_lengths, "
-                    "spec_decoding_position_offsets and spec_decoding_packed_mask.");
-                TORCH_CHECK(spec_decoding_tensor_params[0].has_value(),
-                    "Expecting spec_decoding_generation_lengths spec-dec mode.");
-                TORCH_CHECK(spec_decoding_tensor_params[1].has_value(),
-                    "Expecting spec_decoding_position_offsets spec-dec mode.");
-                TORCH_CHECK(
-                    spec_decoding_tensor_params[2].has_value(), "Expecting spec_decoding_packed_mask spec-dec mode.");
-
+                bool useTllmGen = tensorrt_llm::common::isSM100Family();
+                if (useTllmGen)
+                {
+                    TORCH_CHECK(spec_decoding_tensor_params.size() == 6,
+                        "Expecting 6 tensors for spec-dec mode, spec_decoding_generation_lengths, "
+                        "spec_decoding_position_offsets, spec_decoding_packed_mask, spec_decoding_bl_tree_mask_offset, "
+                        "spec_decoding_bl_tree_mask and spec_bl_tree_first_sparse_mask_offset_kv.");
+                    TORCH_CHECK(spec_decoding_tensor_params[0].has_value(),
+                        "Expecting spec_decoding_generation_lengths spec-dec mode.");
+                    TORCH_CHECK(spec_decoding_tensor_params[1].has_value(),
+                        "Expecting spec_decoding_position_offsets spec-dec mode.");
+                    TORCH_CHECK(spec_decoding_tensor_params[2].has_value(),
+                        "Expecting spec_decoding_packed_mask spec-dec mode.");
+                    TORCH_CHECK(spec_decoding_tensor_params[3].has_value(),
+                        "Expecting spec_decoding_bl_tree_mask_offset spec-dec mode.");
+                    TORCH_CHECK(spec_decoding_tensor_params[4].has_value(),
+                        "Expecting spec_decoding_bl_tree_mask spec-dec mode.");
+                    TORCH_CHECK(spec_decoding_tensor_params[5].has_value(),
+                        "Expecting spec_bl_tree_first_sparse_mask_offset_kv spec-dec mode.");
+                    enqueue_params.spec_decoding_bl_tree_mask_offset
+                        = spec_decoding_tensor_params[3].value().data_ptr<int64_t>();
+                    enqueue_params.spec_decoding_bl_tree_mask
+                        = spec_decoding_tensor_params[4].value().data_ptr<uint32_t>();
+                    enqueue_params.spec_bl_tree_first_sparse_mask_offset_kv
+                        = spec_decoding_tensor_params[5].value().data_ptr<int32_t>();
+                }
+                else
+                {
+                    TORCH_CHECK(spec_decoding_tensor_params.size() == 3,
+                        "Expecting 3 tensors for spec-dec mode, spec_decoding_generation_lengths, "
+                        "spec_decoding_position_offsets and spec_decoding_packed_mask.");
+                    TORCH_CHECK(spec_decoding_tensor_params[0].has_value(),
+                        "Expecting spec_decoding_generation_lengths spec-dec mode.");
+                    TORCH_CHECK(spec_decoding_tensor_params[1].has_value(),
+                        "Expecting spec_decoding_position_offsets spec-dec mode.");
+                    TORCH_CHECK(spec_decoding_tensor_params[2].has_value(),
+                        "Expecting spec_decoding_packed_mask spec-dec mode.");
+                }
                 enqueue_params.spec_decoding_generation_lengths
                     = spec_decoding_tensor_params[0].value().data_ptr<int32_t>();
                 enqueue_params.spec_decoding_position_offsets
@@ -589,10 +623,10 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::vector<std::optional<torch::Tensor>> spec_decoding_tensor_params,
     std::optional<torch::Tensor> sparse_kv_indices, std::optional<torch::Tensor> sparse_kv_offsets,
     std::optional<torch::Tensor> sparse_attn_indices, std::optional<torch::Tensor> sparse_attn_offsets,
-    std::optional<int64_t> sparse_mla_topk, std::optional<torch::Tensor> cu_q_seqlens,
-    std::optional<torch::Tensor> cu_kv_seqlens, std::optional<torch::Tensor> fmha_scheduler_counter,
-    std::optional<torch::Tensor> mla_bmm1_scale, std::optional<torch::Tensor> mla_bmm2_scale,
-    std::optional<torch::Tensor> quant_q_buffer)
+    int64_t const sparse_attn_indices_block_size, std::optional<int64_t> sparse_mla_topk,
+    std::optional<torch::Tensor> cu_q_seqlens, std::optional<torch::Tensor> cu_kv_seqlens,
+    std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
+    std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -847,8 +881,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe, block_ids_per_seq, mrope_rotary_cos_sin,
             mrope_position_deltas, mla_tensor_params, softmax_stats_tensor, spec_decoding_tensor_params,
             attention_sinks, sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets,
-            sparse_mla_topk_value, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale,
-            quant_q_buffer);
+            sparse_attn_indices_block_size, sparse_mla_topk_value, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
+            mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -866,8 +900,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe, block_ids_per_seq, mrope_rotary_cos_sin,
             mrope_position_deltas, mla_tensor_params, softmax_stats_tensor, spec_decoding_tensor_params,
             attention_sinks, sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets,
-            sparse_mla_topk_value, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale,
-            quant_q_buffer);
+            sparse_attn_indices_block_size, sparse_mla_topk_value, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
+            mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", layer_idx);

@@ -954,6 +954,7 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::moeGemmBiasAct(
     case ActivationType::Identity: runGemm<cutlass_extensions::EpilogueOpDefault>(inputs, hopper_inputs); break;
     case ActivationType::Swiglu: runGemm<cutlass_extensions::EpilogueOpDefaultSilu>(inputs, hopper_inputs); break;
     case ActivationType::Geglu: runGemm<cutlass_extensions::EpilogueOpDefaultFtGelu>(inputs, hopper_inputs); break;
+    case ActivationType::Relu2: runGemm<cutlass_extensions::EpilogueOpDefaultRelu2>(inputs, hopper_inputs); break;
     case ActivationType::InvalidType: TLLM_THROW("Activation type for fpA_intB must be valid."); break;
     default: TLLM_THROW("Invalid activation type."); break;
     }

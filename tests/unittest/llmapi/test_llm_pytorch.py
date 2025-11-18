@@ -182,28 +182,30 @@ def test_llm_reward_model():
 
 @skip_ray
 def test_llm_perf_metrics():
-    llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
-    sampling_params = SamplingParams(max_tokens=10, return_perf_metrics=True)
-    outputs = llm.generate(prompts, sampling_params)
-    assert outputs[0].outputs[0].request_perf_metrics is not None
+    with LLM(model=llama_model_path,
+             kv_cache_config=global_kvcache_config) as llm:
+        sampling_params = SamplingParams(max_tokens=10,
+                                         return_perf_metrics=True)
+        outputs = llm.generate(prompts, sampling_params)
+        assert outputs[0].outputs[0].request_perf_metrics is not None
 
-    perf_metrics = outputs[0].outputs[0].request_perf_metrics
+        perf_metrics = outputs[0].outputs[0].request_perf_metrics
 
-    timing_metrics = perf_metrics.timing_metrics
-    assert timing_metrics.arrival_time < timing_metrics.first_scheduled_time
-    assert timing_metrics.first_scheduled_time < timing_metrics.first_token_time
-    assert timing_metrics.first_token_time < timing_metrics.last_token_time
+        timing_metrics = perf_metrics.timing_metrics
+        assert timing_metrics.arrival_time < timing_metrics.first_scheduled_time
+        assert timing_metrics.first_scheduled_time < timing_metrics.first_token_time
+        assert timing_metrics.first_token_time < timing_metrics.last_token_time
 
-    kv_cache_metrics = perf_metrics.kv_cache_metrics
-    assert kv_cache_metrics.num_total_allocated_blocks == 1
-    assert kv_cache_metrics.num_new_allocated_blocks == 1
-    assert kv_cache_metrics.num_reused_blocks == 0
-    assert kv_cache_metrics.num_missed_blocks == 1
-    assert kv_cache_metrics.kv_cache_hit_rate == 0
+        kv_cache_metrics = perf_metrics.kv_cache_metrics
+        assert kv_cache_metrics.num_total_allocated_blocks == 1
+        assert kv_cache_metrics.num_new_allocated_blocks == 1
+        assert kv_cache_metrics.num_reused_blocks == 0
+        assert kv_cache_metrics.num_missed_blocks == 1
+        assert kv_cache_metrics.kv_cache_hit_rate == 0
 
-    assert perf_metrics.first_iter is not None
-    assert perf_metrics.iter - perf_metrics.first_iter == sampling_params.max_tokens - 1
-    assert perf_metrics.last_iter == perf_metrics.iter
+        assert perf_metrics.first_iter is not None
+        assert perf_metrics.iter - perf_metrics.first_iter == sampling_params.max_tokens - 1
+        assert perf_metrics.last_iter == perf_metrics.iter
 
 
 @skip_ray
@@ -948,7 +950,6 @@ def test_llm_rpc():
 
 @skip_ray
 @pytest.mark.asyncio
-@pytest.mark.skip(reason="https://nvbugs/5594753")
 async def test_llm_rpc_streaming():
     # TODO: remove the with-statement when shutdown hang issue is fixed
     with LLM(model=llama_model_path,

@@ -27,11 +27,13 @@ python3 scripts/generate_lock_files.py --path <path>/requirements.txt
 """
 
 import argparse
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, os.getcwd())
@@ -74,6 +76,25 @@ def get_project_info(path: str):
     return {"name": name, "version": version}
 
 
+def generate_metadata_json():
+    try:
+        commit_hash = subprocess.check_output(["git", "rev-parse", "HEAD"],
+                                              text=True).strip()
+    except subprocess.CalledProcessError as e:
+        print(f"Error retrieving git commit hash: {e}")
+        raise
+
+    data = {
+        "commit_hash": commit_hash,
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    }
+    with open(f"{FOLDER_SECURITY_SCANNING}/metadata.json",
+              "w",
+              encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Lock files generator",
@@ -93,6 +114,7 @@ if __name__ == "__main__":
     if os.path.exists(FOLDER_SECURITY_SCANNING):
         shutil.rmtree(FOLDER_SECURITY_SCANNING)
     os.mkdir(FOLDER_SECURITY_SCANNING)
+    generate_metadata_json()
 
     # generate pyproject.toml and poetry.lock files in the same location
     for path in paths:

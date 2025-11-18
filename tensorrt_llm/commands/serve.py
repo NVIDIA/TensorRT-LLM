@@ -16,7 +16,6 @@ from torch.cuda import device_count
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._tensorrt_engine import LLM
-from tensorrt_llm._torch.auto_deploy.llm import LLM as AutoDeployLLM
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.executor.utils import LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
@@ -162,6 +161,8 @@ def launch_server(
     if backend == 'pytorch':
         llm = PyTorchLLM(**llm_args)
     elif backend == '_autodeploy':
+        from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
+
         # AutoDeploy does not support build_config
         llm_args.pop("build_config", None)
         llm = AutoDeployLLM(**llm_args)
