@@ -2690,6 +2690,8 @@ class TorchLlmArgs(BaseLlmArgs):
         self._model_format = _ModelFormatKind.HF
         if self.max_beam_width is None:
             self.max_beam_width = 1
+        if self.max_batch_size is None:
+            self.max_batch_size = 2048
         return self
 
     @model_validator(mode="after")
