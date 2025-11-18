@@ -4154,6 +4154,8 @@ class TestDeepSeekR1LongBenchV2(LlmapiAccuracyTestHarness):
         temp_dir = None
         try:
             # Create modified model directory using LongBenchV2 static method
+            # This is a WAR for the fact that the model config is not modified to support long context.
+            # TODO: remove this once the model config is modified to support long context.
             temp_dir = LongBenchV2.create_modified_model_dir(original_model_dir)
 
             # Configure model settings
