@@ -11,7 +11,8 @@ from tensorrt_llm.logger import logger
 from ...distributed import allgather
 from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
-from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor, ceil_div
+from ...utils import (ActivationType, AuxStreamType, EventType,
+                      Fp4QuantizedTensor, ceil_div)
 from .interface import AlltoallMethodType, MoE
 
 # isort: off
@@ -73,6 +74,7 @@ class CutlassFusedMoE(MoE):
         swiglu_alpha: Optional[torch.Tensor] = None,
         swiglu_beta: Optional[torch.Tensor] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
+        activation_type: ActivationType = ActivationType.Swiglu,
     ):
 
         super().__init__(
@@ -89,6 +91,7 @@ class CutlassFusedMoE(MoE):
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
             layer_idx=layer_idx,
+            activation_type=activation_type,
         )
 
         # Store original hidden size before any potential padding
