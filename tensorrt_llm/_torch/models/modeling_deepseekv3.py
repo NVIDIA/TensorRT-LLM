@@ -362,7 +362,8 @@ class DeepseekV3WeightLoader:
                             fused_a_scale = torch.cat(
                                 [q_a_proj_scale, fused_a_scale], dim=0)
 
-                        module.weight_scale.data.copy_(fused_a_scale)
+                        module.weight_scale.data[0:fused_a_scale.
+                                                 shape[0]].copy_(fused_a_scale)
                     # For DeepseekV32 with fuse_a_indexer_k=True: kv_a_proj_with_mqa is oversized
                     # to include indexer weights, which is filled in post_load_weights.
                     module.weight.data[0:fused_a.shape[0]].copy_(fused_a)
@@ -604,6 +605,22 @@ class DeepseekV32Attention(MLA):
             self.kv_a_proj_with_mqa.weight.data[offset:offset +
                                                 self.indexer.head_dim].copy_(
                                                     indexer_wk_weight)
+
+            # Copy indexer scale data if it exists
+            if hasattr(self.indexer.wk, 'weight_scale'
+                       ) and self.indexer.wk.weight_scale is not None:
+                indexer_wk_scale = self.indexer.wk.weight_scale.data
+                assert self.kv_a_proj_with_mqa.weight_scale.dim(
+                ) == 2, "weight_scale must be a 2D tensor"
+                group_size = self.kv_a_proj_with_mqa.weight.shape[
+                    0] // self.kv_a_proj_with_mqa.weight_scale.shape[0]
+                scale_offset = offset // group_size
+                scale_size = indexer_wk_scale.shape[0]
+                # Copy indexer scale to the corresponding position in the fused module
+                self.kv_a_proj_with_mqa.weight_scale.data[
+                    scale_offset:scale_offset +
+                    scale_size].copy_(indexer_wk_scale)
+
             self.indexer.wk = None
 
 
