@@ -15,6 +15,7 @@
  */
 
 #include "reduceAddKernel.h"
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 
 #include <cuda_bf16.h>
@@ -117,10 +118,10 @@ __device__ __forceinline__ __nv_bfloat16 from_float_to_bfloat16(float val)
 }
 
 // Persistent kernel with loop over tokens
-// Uses 128-bit vectorized loads + FP32 accumulation for optimal performance and precision
-template <typename T, int VEC_SIZE = 8>
+// Uses compile-time topk for complete loop unrolling and optimization
+template <typename T, int TOPK, int VEC_SIZE = 8>
 __global__ void reduceAddKernel(T const* __restrict__ input, T const* __restrict__ residual, T* __restrict__ output,
-    int32_t num_tokens, int32_t topk, int32_t hidden_size)
+    int32_t num_tokens, int32_t hidden_size)
 {
     int32_t const tid = threadIdx.x;
     int32_t const threads_per_block = blockDim.x;
@@ -133,6 +134,12 @@ __global__ void reduceAddKernel(T const* __restrict__ input, T const* __restrict
     // Persistent kernel: each block processes multiple tokens
     for (int32_t token_idx = blockIdx.x; token_idx < num_tokens; token_idx += num_blocks)
     {
+        // Pre-calculate base pointers to reduce address calculation overhead
+        // TOPK is compile-time constant, so topk * hidden_size becomes a simple shift/add
+        T const* input_token_base = input + token_idx * TOPK * hidden_size;
+        T const* residual_token_base = residual + token_idx * hidden_size;
+        T* output_token_base = output + token_idx * hidden_size;
+
         // Vectorized processing: 128-bit loads (8 elements) + FP32 accumulation
         for (int32_t vec_idx = tid; vec_idx < num_vec_elements; vec_idx += threads_per_block)
         {
@@ -146,26 +153,32 @@ __global__ void reduceAddKernel(T const* __restrict__ input, T const* __restrict
                 acc[i] = 0.0f;
             }
 
-// Reduce across topk dimension: vectorized load + FP32 accumulation
-#pragma unroll 4
-            for (int32_t k = 0; k < topk; ++k)
+            // Reduce across TOPK: compile-time constant allows complete unrolling
+            // Compiler can optimize away all multiplications and generate optimal code
+            T const* input_ptr_base = input_token_base + h_offset;
+
+#pragma unroll
+            for (int32_t k = 0; k < TOPK; ++k)
             {
-                int32_t const input_idx = token_idx * topk * hidden_size + k * hidden_size + h_offset;
-                // 128-bit vectorized load
-                VecType const input_vec = *reinterpret_cast<VecType const*>(input + input_idx);
+                // With TOPK as template parameter, compiler generates:
+                // load from (base + 0), (base + H), (base + 2*H), ... (base + (TOPK-1)*H)
+                // All offsets known at compile time!
+                VecType const input_vec = *reinterpret_cast<VecType const*>(input_ptr_base);
                 T const* input_ptr = reinterpret_cast<T const*>(&input_vec);
 
-// Convert to FP32 and accumulate
+                // Convert to FP32 and accumulate
 #pragma unroll
                 for (int i = 0; i < VEC_SIZE; ++i)
                 {
                     acc[i] += to_float(input_ptr[i]);
                 }
+
+                // Increment by hidden_size (compiler knows this at compile time for unrolled loop)
+                input_ptr_base += hidden_size;
             }
 
-            // Vectorized load residual and add
-            int32_t const residual_idx = token_idx * hidden_size + h_offset;
-            VecType const residual_vec = *reinterpret_cast<VecType const*>(residual + residual_idx);
+            // Vectorized load residual (simple offset)
+            VecType const residual_vec = *reinterpret_cast<VecType const*>(residual_token_base + h_offset);
             T const* residual_ptr = reinterpret_cast<T const*>(&residual_vec);
 
             // Prepare output vector
@@ -187,9 +200,8 @@ __global__ void reduceAddKernel(T const* __restrict__ input, T const* __restrict
                 }
             }
 
-            // 128-bit vectorized store
-            int32_t const output_idx = token_idx * hidden_size + h_offset;
-            *reinterpret_cast<VecType*>(output + output_idx) = output_vec;
+            // 128-bit vectorized store (simple offset)
+            *reinterpret_cast<VecType*>(output_token_base + h_offset) = output_vec;
         }
 
         // Handle remaining elements (if hidden_size is not multiple of VEC_SIZE)
@@ -197,23 +209,22 @@ __global__ void reduceAddKernel(T const* __restrict__ input, T const* __restrict
         {
             float sum_val = 0.0f;
 
-            for (int32_t k = 0; k < topk; ++k)
+            // TOPK is compile-time constant, loop will be completely unrolled
+#pragma unroll
+            for (int32_t k = 0; k < TOPK; ++k)
             {
-                int32_t const input_idx = token_idx * topk * hidden_size + k * hidden_size + h;
-                sum_val += to_float(input[input_idx]);
+                sum_val += to_float(input_token_base[k * hidden_size + h]);
             }
 
-            int32_t const residual_idx = token_idx * hidden_size + h;
-            sum_val += to_float(residual[residual_idx]);
+            sum_val += to_float(residual_token_base[h]);
 
-            int32_t const output_idx = token_idx * hidden_size + h;
             if constexpr (std::is_same_v<T, half>)
             {
-                output[output_idx] = from_float_to_half(sum_val);
+                output_token_base[h] = from_float_to_half(sum_val);
             }
             else if constexpr (std::is_same_v<T, __nv_bfloat16>)
             {
-                output[output_idx] = from_float_to_bfloat16(sum_val);
+                output_token_base[h] = from_float_to_bfloat16(sum_val);
             }
         }
     }
@@ -253,32 +264,46 @@ inline int32_t getOptimalGridSize(int32_t num_tokens)
     return std::min(num_tokens, max_blocks);
 }
 
+// Helper to dispatch based on runtime topk value to compile-time template
+template <typename T>
+void launchReduceAddKernel(T const* input, T const* residual, T* output, int32_t num_tokens, int32_t topk,
+    int32_t hidden_size, cudaStream_t stream)
+{
+    constexpr int threads_per_block = 256;
+    int32_t const grid_size = getOptimalGridSize(num_tokens);
+    dim3 grid(grid_size);
+    dim3 block(threads_per_block);
+
+    // Dispatch to template specialization based on topk value
+    // Supported topk values: 2, 4, 6, 8, 16
+    switch (topk)
+    {
+    case 2: reduceAddKernel<T, 2><<<grid, block, 0, stream>>>(input, residual, output, num_tokens, hidden_size); break;
+    case 4: reduceAddKernel<T, 4><<<grid, block, 0, stream>>>(input, residual, output, num_tokens, hidden_size); break;
+    case 6: reduceAddKernel<T, 6><<<grid, block, 0, stream>>>(input, residual, output, num_tokens, hidden_size); break;
+    case 8: reduceAddKernel<T, 8><<<grid, block, 0, stream>>>(input, residual, output, num_tokens, hidden_size); break;
+    case 16:
+        reduceAddKernel<T, 16><<<grid, block, 0, stream>>>(input, residual, output, num_tokens, hidden_size);
+        break;
+    default:
+        // Throw error for unsupported topk values
+        TLLM_CHECK_WITH_INFO(false, "Unsupported topk value: %d. Supported values are: 2, 4, 6, 8, 16", topk);
+    }
+}
+
 // Template specializations for invokeReduceAdd
 template <>
 void invokeReduceAdd<half>(half const* input, half const* residual, half* output, int32_t num_tokens, int32_t topk,
     int32_t hidden_size, cudaStream_t stream)
 {
-    constexpr int threads_per_block = 256;
-    int32_t const grid_size = getOptimalGridSize(num_tokens);
-
-    dim3 grid(grid_size);
-    dim3 block(threads_per_block);
-
-    reduceAddKernel<half, 8><<<grid, block, 0, stream>>>(input, residual, output, num_tokens, topk, hidden_size);
+    launchReduceAddKernel<half>(input, residual, output, num_tokens, topk, hidden_size, stream);
 }
 
 template <>
 void invokeReduceAdd<__nv_bfloat16>(__nv_bfloat16 const* input, __nv_bfloat16 const* residual, __nv_bfloat16* output,
     int32_t num_tokens, int32_t topk, int32_t hidden_size, cudaStream_t stream)
 {
-    constexpr int threads_per_block = 256;
-    int32_t const grid_size = getOptimalGridSize(num_tokens);
-
-    dim3 grid(grid_size);
-    dim3 block(threads_per_block);
-
-    reduceAddKernel<__nv_bfloat16, 8>
-        <<<grid, block, 0, stream>>>(input, residual, output, num_tokens, topk, hidden_size);
+    launchReduceAddKernel<__nv_bfloat16>(input, residual, output, num_tokens, topk, hidden_size, stream);
 }
 
 } // namespace kernels

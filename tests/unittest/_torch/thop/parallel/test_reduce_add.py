@@ -8,6 +8,8 @@ This script tests the custom CUDA kernel implementation against a naive PyTorch 
 import pytest
 import torch
 
+import tensorrt_llm
+
 
 @pytest.mark.parametrize(
     "num_tokens,topk,hidden_size",
@@ -31,6 +33,8 @@ def test_reduce_add_correctness(num_tokens, topk, hidden_size, dtype):
     """
     device = "cuda"
 
+    tensorrt_llm.logger.set_level("error")
+
     # Create input tensors
     input_tensor = torch.randn(num_tokens, topk, hidden_size, dtype=dtype, device=device)
     residual = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device)
@@ -48,13 +52,6 @@ def test_reduce_add_correctness(num_tokens, topk, hidden_size, dtype):
     else:  # bfloat16
         # BF16: looser tolerance due to lower precision
         torch.testing.assert_close(output, expected, rtol=5e-2, atol=5e-2)
-
-    # Print statistics for information
-    max_diff = (output - expected).abs().max().item()
-    mean_diff = (output - expected).abs().mean().item()
-    print(
-        f"\n  [{dtype}, {num_tokens}x{topk}x{hidden_size}] Max diff: {max_diff:.6e}, Mean diff: {mean_diff:.6e}"
-    )
 
 
 @pytest.mark.benchmark
