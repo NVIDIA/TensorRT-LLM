@@ -146,3 +146,10 @@ class Mamba2Metadata:
             else:
                 self.chunk_indices = None
                 self.chunk_offsets = None
+        else:
+            self.query_start_loc = None
+            self.query_start_loc_long = torch.arange(
+                0,
+                batch_size + 1,
+                dtype=torch.long,
+                device=self.cu_seqlens.device)

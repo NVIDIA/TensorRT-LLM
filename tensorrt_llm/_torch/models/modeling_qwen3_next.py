@@ -827,16 +827,13 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         conv_states,
         ssm_states,
         num_decodes,
+        query_start_loc_long,
         **kwargs,
     ):
         mixed_qkv = kwargs["mixed_qkv"]
         a = kwargs["a"]
         b = kwargs["b"]
         cache_indices = kwargs["cache_indices"]
-        query_start_loc = torch.arange(0,
-                                       num_decodes + 1,
-                                       dtype=torch.long,
-                                       device=mixed_qkv.device)
 
         mixed_qkv = causal_conv1d_update(
             mixed_qkv,
@@ -870,7 +867,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             b=b,
             initial_state_source=ssm_states,
             initial_state_indices=cache_indices,
-            cu_seqlens=query_start_loc,
+            cu_seqlens=query_start_loc_long,
             use_qk_l2norm_in_kernel=True,
             softplus_beta=1.0,
             softplus_threshold=20.0,
