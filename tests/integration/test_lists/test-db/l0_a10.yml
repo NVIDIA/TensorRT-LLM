@@ -76,6 +76,9 @@ l0_a10:
   - unittest/llmapi/apps/test_chat_utils.py
   - unittest/llmapi/apps/test_tool_parsers.py
   - unittest/llmapi/apps/test_harmony_channel_validation.py
+  # third-party policy checks CPU-only
+  - 3rdparty/test_cmake_third_party.py
+  - 3rdparty/test_git_modules.py
 - condition:
     ranges:
       system_gpu_count:
