@@ -3470,3 +3470,90 @@ def test_llmapi_generation_logits(llm_venv, model_path,
     # Run the async test
     loop = asyncio.get_event_loop()
     loop.run_until_complete(async_generation_test())
+
+
+@pytest.mark.skip_less_device(4)
+@pytest.mark.skip_less_device_memory(80000)
+@skip_pre_hopper
+@pytest.mark.parametrize("model_dir,draft_model_dir", [
+    ("modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8",
+     "EAGLE3-LLaMA3.3-Instruct-70B"),
+    ("Qwen3/Qwen3-30B-A3B", "Qwen3/Qwen3-30B-eagle3"),
+    pytest.param("Qwen3/saved_models_Qwen3-235B-A22B_fp8_hf",
+                 "Qwen3/qwen3-235B-eagle3",
+                 marks=pytest.mark.skip_less_device_memory(90000)),
+    pytest.param("llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8",
+                 "Llama-4-Maverick-17B-128E-Eagle3",
+                 marks=pytest.mark.skip_less_device_memory(140000)),
+    pytest.param("Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",
+                 "Qwen3/qwen3-235B-eagle3",
+                 marks=skip_pre_blackwell),
+])
+def test_eagle3_output_consistency_4gpus(model_dir: str, draft_model_dir: str):
+    """
+    RCCA: https://nvbugspro.nvidia.com/bug/5575211
+    """
+    from tensorrt_llm import LLM, SamplingParams
+    from tensorrt_llm.llmapi import (CudaGraphConfig, EagleDecodingConfig,
+                                     KvCacheConfig)
+
+    models_path = llm_models_root()
+    target_model_dir = f"{models_path}/{model_dir}"
+    eagle_model_dir = f"{models_path}/{draft_model_dir}"
+
+    # Common configuration matching the bug report
+    llm_common_config = {
+        "model":
+        target_model_dir,
+        "tensor_parallel_size":
+        4,
+        "moe_expert_parallel_size":
+        4,
+        "max_seq_len":
+        4096,
+        "max_batch_size":
+        8,
+        "max_num_tokens":
+        2048,
+        "disable_overlap_scheduler":
+        True,
+        "kv_cache_config":
+        KvCacheConfig(
+            free_gpu_memory_fraction=0.2,
+            enable_block_reuse=False,
+        ),
+        "cuda_graph_config":
+        CudaGraphConfig(),
+    }
+
+    # Test prompt
+    prompt = "Who are you?"
+    sampling_params = SamplingParams(max_tokens=1024, temperature=0)
+
+    # Run with Eagle3
+    spec_config = EagleDecodingConfig(
+        max_draft_len=3,
+        speculative_model_dir=eagle_model_dir,
+        eagle3_one_model=True,
+    )
+    with LLM(**llm_common_config, speculative_config=spec_config) as llm_spec:
+        results_spec = llm_spec.generate([prompt], sampling_params)
+        output_spec = results_spec[0].outputs[0].text
+
+    # Run without Eagle3 (baseline)
+    with LLM(**llm_common_config) as llm_ref:
+        results_ref = llm_ref.generate([prompt], sampling_params)
+        output_ref = results_ref[0].outputs[0].text
+
+    length_ratio = min(len(output_spec), len(output_ref)) / max(
+        len(output_spec), len(output_ref))
+    assert length_ratio > 0.5, (
+        f"Output lengths differ too much! "
+        f"Eagle3: {len(output_spec)} chars, Baseline: {len(output_ref)} chars")
+
+    repetitive_pattern = re.compile(
+        r'(.)\1{10,}')  # Check for 10+ repeated chars
+    assert not repetitive_pattern.search(output_spec), (
+        f"Eagle3 output contains repetitive characters: {output_spec[:500]}")
+    assert not repetitive_pattern.search(output_ref), (
+        f"Baseline output contains repetitive characters: {output_ref[:500]}")
