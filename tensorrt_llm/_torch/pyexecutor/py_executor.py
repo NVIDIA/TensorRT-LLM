@@ -1514,6 +1514,17 @@ class PyExecutor:
             self.kv_connector_manager.worker.start_load_kv(
                 torch.cuda.current_stream())
 
+    def _kv_connector_refresh_unfinished_tasks(self):
+        if not self.use_flexkv:
+            return
+        if len(self.active_requests) == 0:
+            return
+        if not self.kv_connector_manager:
+            return
+        logger.warning(f"No scheduled requests, but flexkv have pending put requests")
+        self.kv_connector_manager.handle_metadata()
+        time.sleep(0.01)
+
     def _kv_connector_terminate_requests(self):
         if self.kv_connector_manager:
             reqs_to_terminate = self.kv_connector_manager.get_finished()
@@ -1544,6 +1555,9 @@ class PyExecutor:
 
                 if scheduled_batch is None:
                     break
+                
+                if scheduled_batch.batch_size == 0:
+                    self._kv_connector_refresh_unfinished_tasks()
 
                 self._terminate_requests(scheduled_batch.paused_requests)
                 self._pause_requests(scheduled_batch.paused_requests)
@@ -1766,6 +1780,8 @@ class PyExecutor:
                             can_forward = True
 
                 self._terminate_requests(scheduled_batch.paused_requests)
+                if scheduled_batch.batch_size == 0:
+                    self._kv_connector_refresh_unfinished_tasks()
 
                 can_queue, can_queue_this_rank = self._can_queue(
                     scheduled_batch)
@@ -3019,6 +3035,8 @@ class PyExecutor:
                 else:
                     if not request.is_disagg_context_transmission_state:
                         requests_to_terminate.append(request)
+                if self.use_flexkv and (request.is_finished or request.state == LlmRequestState.GENERATION_COMPLETE):
+                    self.resource_manager.free_slot_only(request)
             else:
                 new_active_requests.append(request)
 

@@ -2251,6 +2251,14 @@ class ResourceManager:
         for resource_manager in resource_manager_list:
             self.resource_managers.move_to_end(resource_manager)
 
+    def free_slot_only(self, request: LlmRequest):
+        """Only free the slot for the request, without freeing other resources.
+        This is used to release the slot early when decode finishes, before
+        the put task completes.
+        """
+        seq_slot_manager = self.get_resource_manager(ResourceManagerType.SEQ_SLOT_MANAGER)
+        if seq_slot_manager is not None:
+            seq_slot_manager.free_resources(request)
 
 class PeftCacheManager(BaseResourceManager):
 
