@@ -557,6 +557,7 @@ class ShardingTransformInfo(BaseModel, ABC):
 class LayerType(Enum):
     ATTENTION = "attention"
     MAMBA = "mamba"
+    MAMBA_FULL = "mamba_full"
     MLP = "mlp"
     MOE = "moe"
 
@@ -612,7 +613,7 @@ class WeightShardingInfo(ShardingTransformInfo):
 
     def apply(self, gm: GraphModule, node: Node) -> None:
         """Apply TP sharding transformation to the graph module."""
-        if self.layer_type == LayerType.MAMBA:
+        if self.layer_type == LayerType.MAMBA_FULL:
             _insert_sharded_mamba(
                 gm=gm,
                 entry_node=node,
