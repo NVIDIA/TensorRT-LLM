@@ -22,12 +22,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
     import cutlass
     import cutlass.cute as cute
 
+    from ..cute_dsl_kernels.blackwell.blockscaled_contiguous_grouped_gemm import \
+        Sm100BlockScaledContiguousGroupedGemmKernel
+    from ..cute_dsl_kernels.blackwell.blockscaled_contiguous_grouped_gemm_finalize_fusion import \
+        Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel
     from ..cute_dsl_kernels.blackwell.dense_blockscaled_gemm_persistent import \
         Sm100BlockScaledPersistentDenseGemmKernel
-    from ..cute_dsl_kernels.blackwell.grouped_blockscaled_gemm_finalize_fusion import \
-        Sm100BlockScaledPersistentGroupedGemmFinalizeFusionKernel
-    from ..cute_dsl_kernels.blackwell.grouped_blockscaled_gemm_persistent import \
-        Sm100BlockScaledPersistentGroupedGemmKernel
     from ..cute_dsl_kernels.blackwell.utils import make_ptr
 
     class CuteDSLNVFP4BlackwellRunner(TunableRunner):
@@ -500,8 +500,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 device=num_non_exiting_tiles.device)
             return a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales
 
-    class Sm100BlockScaledPersistentGroupedGemmRunner(TunableRunner):
-        kernel_class = Sm100BlockScaledPersistentGroupedGemmKernel
+    class Sm100BlockScaledContiguousGroupedGemmRunner(TunableRunner):
+        kernel_class = Sm100BlockScaledContiguousGroupedGemmKernel
         kernel_cache = dict()
         tuning_config_cache = dict()
 
@@ -731,7 +731,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     ) -> torch.Tensor:
         tuner = AutoTuner.get()
 
-        runner = Sm100BlockScaledPersistentGroupedGemmRunner(
+        runner = Sm100BlockScaledContiguousGroupedGemmRunner(
             num_experts, top_k, num_local_experts, local_expert_offset,
             tile_size, output_dtype, scaling_vector_size)
         inputs = [
@@ -770,9 +770,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         n = weight.size(1)
         return torch.empty(m, n, dtype=output_dtype, device=input.device)
 
-    class Sm100BlockScaledPersistentGroupedGemmFinalizeFusionRunner(
+    class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner(
             TunableRunner):
-        kernel_class = Sm100BlockScaledPersistentGroupedGemmFinalizeFusionKernel
+        kernel_class = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel
         kernel_cache = dict()
         tuning_config_cache = dict()
 
@@ -1039,7 +1039,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     ) -> torch.Tensor:
         tuner = AutoTuner.get()
 
-        runner = Sm100BlockScaledPersistentGroupedGemmFinalizeFusionRunner(
+        runner = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner(
             num_experts, top_k, num_local_experts, local_expert_offset,
             tile_size, output_dtype, scaling_vector_size)
         inputs = [

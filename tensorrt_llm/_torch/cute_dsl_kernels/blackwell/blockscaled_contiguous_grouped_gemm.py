@@ -53,7 +53,7 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
 
-class Sm100BlockScaledPersistentGroupedGemmKernel:
+class Sm100BlockScaledContiguousGroupedGemmKernel:
     """This class implements batched matrix multiplication (C = A x SFA x B x SFB) with support for various data types
     and architectural features specific to Blackwell GPUs with persistent tile scheduling and warp specialization.
 
@@ -88,7 +88,7 @@ class Sm100BlockScaledPersistentGroupedGemmKernel:
         - Also, Cluster shape M/N must be <= 4 for scale factor multicasts due to limited size of scale factors
 
     Example:
-        >>> gemm = Sm100BlockScaledPersistentGroupedGemmKernel(
+        >>> gemm = Sm100BlockScaledContiguousGroupedGemmKernel(
         ...     sf_vec_size=16, mma_tiler_mn=(256, 128), cluster_shape_mn=(2, 1)
         ... )
         >>> gemm(a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_tensor, max_active_clusters, stream)
@@ -2138,8 +2138,9 @@ class Sm100BlockScaledPersistentGroupedGemmKernel:
             is_valid = False
         return is_valid
 
-    @staticmethod
+    @classmethod
     def can_implement(
+        cls,
         ab_dtype: Type[cutlass.Numeric],
         sf_dtype: Type[cutlass.Numeric],
         sf_vec_size: int,
@@ -2198,24 +2199,22 @@ class Sm100BlockScaledPersistentGroupedGemmKernel:
         """
         can_implement = True
         # Skip unsupported types
-        if not Sm100BlockScaledPersistentGroupedGemmKernel.is_valid_dtypes_and_scale_factor_vec_size(
+        if not cls.is_valid_dtypes_and_scale_factor_vec_size(
             ab_dtype, sf_dtype, sf_vec_size, acc_dtype, c_dtype
         ):
             can_implement = False
 
         # Skip unsupported layouts
-        if not Sm100BlockScaledPersistentGroupedGemmKernel.is_valid_layouts(
-            ab_dtype, c_dtype, a_major, b_major, c_major
-        ):
+        if not cls.is_valid_layouts(ab_dtype, c_dtype, a_major, b_major, c_major):
             can_implement = False
 
         # Skip invalid mma tile shape and cluster shape
-        if not Sm100BlockScaledPersistentGroupedGemmKernel.is_valid_mma_tiler_and_cluster_shape(
+        if not cls.is_valid_mma_tiler_and_cluster_shape(
             use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, m_aligned
         ):
             can_implement = False
         # Skip illegal problem shape for load/store alignment
-        if not Sm100BlockScaledPersistentGroupedGemmKernel.is_valid_tensor_alignment(
+        if not cls.is_valid_tensor_alignment(
             m, n, k, l, ab_dtype, c_dtype, a_major, b_major, c_major
         ):
             can_implement = False
