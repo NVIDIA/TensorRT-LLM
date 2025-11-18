@@ -129,9 +129,8 @@ def synchronize_and_cleanup():
 # ============================================================================
 
 
-@torch.inference_mode()
-def test_message_size_calculation(tensor_parallel_size, tensor_parallel_rank, x, dtype):
-    """Test that message size is calculated correctly."""
+def calculate_message_size_conditions(tensor_parallel_size, tensor_parallel_rank, x, dtype):
+    """Calculate message size conditions for fallback testing."""
     message_size_bytes = x.size(-2) * x.size(-1) * x.element_size()
     max_workspace_size = CustomAllReduceHelper.max_workspace_size_auto(tensor_parallel_size)
 
@@ -143,7 +142,7 @@ def test_message_size_calculation(tensor_parallel_size, tensor_parallel_rank, x,
 
 
 @torch.inference_mode()
-def test_fallback_with_fusion(
+def run_fallback_with_fusion_test(
     x: torch.Tensor,
     residual: torch.Tensor,
     hidden_size: int,
@@ -168,7 +167,7 @@ def test_fallback_with_fusion(
 
     # Verify message size calculation if expected conditions provided
     if expected_conditions:
-        actual_conditions = test_message_size_calculation(
+        actual_conditions = calculate_message_size_conditions(
             tensor_parallel_size, tensor_parallel_rank, x, dtype
         )
         expected_msg_size = expected_conditions.get("message_size_bytes")
@@ -221,7 +220,7 @@ def test_fallback_with_fusion(
 
 
 @torch.inference_mode()
-def test_window_tensor_single_call(
+def run_window_tensor_single_call_test(
     x: torch.Tensor,
     hidden_size: int,
     dtype: torch.dtype,
@@ -254,7 +253,7 @@ def test_window_tensor_single_call(
 
 
 @torch.inference_mode()
-def test_window_tensor_buffer_reuse(
+def run_window_tensor_buffer_reuse_test(
     x: torch.Tensor,
     hidden_size: int,
     dtype: torch.dtype,
@@ -296,7 +295,7 @@ def test_window_tensor_buffer_reuse(
 
 
 @torch.inference_mode()
-def test_lookup_table_fallback(
+def run_lookup_table_fallback_test(
     x: torch.Tensor,
     hidden_size: int,
     dtype: torch.dtype,
@@ -334,7 +333,7 @@ def test_lookup_table_fallback(
 
 
 @torch.inference_mode()
-def test_strategy_comparison(
+def run_strategy_comparison_test(
     x: torch.Tensor,
     residual: torch.Tensor,
     hidden_size: int,
@@ -345,7 +344,7 @@ def test_strategy_comparison(
     strategy: AllReduceStrategy,
 ):
     """Test a specific strategy and return results for comparison."""
-    return test_fallback_with_fusion(
+    return run_fallback_with_fusion_test(
         x,
         residual,
         hidden_size,
@@ -430,7 +429,7 @@ def test_auto_strategy_fallback_large_message(mpi_pool_executor):
             *[
                 (
                     tensor_parallel_size,
-                    test_fallback_with_fusion,
+                    run_fallback_with_fusion_test,
                     x,
                     residual,
                     hidden_size,
@@ -479,7 +478,7 @@ def test_auto_strategy_fallback_small_message(mpi_pool_executor):
             *[
                 (
                     tensor_parallel_size,
-                    test_fallback_with_fusion,
+                    run_fallback_with_fusion_test,
                     x,
                     residual,
                     hidden_size,
@@ -518,7 +517,7 @@ def test_nccl_symmetric_window_tensor_single(mpi_pool_executor, seq_len, hidden_
             *[
                 (
                     tensor_parallel_size,
-                    test_window_tensor_single_call,
+                    run_window_tensor_single_call_test,
                     x,
                     hidden_size,
                     dtype,
@@ -554,7 +553,7 @@ def test_nccl_symmetric_window_tensor_reuse(mpi_pool_executor, seq_len, hidden_s
             *[
                 (
                     tensor_parallel_size,
-                    test_window_tensor_buffer_reuse,
+                    run_window_tensor_buffer_reuse_test,
                     x,
                     hidden_size,
                     dtype,
@@ -591,7 +590,7 @@ def test_lookup_table_fallback_extreme_values(mpi_pool_executor, seq_len, hidden
             *[
                 (
                     tensor_parallel_size,
-                    test_lookup_table_fallback,
+                    run_lookup_table_fallback_test,
                     x,
                     hidden_size,
                     dtype,
@@ -629,7 +628,7 @@ def test_nccl_symmetric_explicit_vs_auto(mpi_pool_executor):
             *[
                 (
                     tensor_parallel_size,
-                    test_fallback_with_fusion,
+                    run_fallback_with_fusion_test,
                     x,
                     residual,
                     hidden_size,
@@ -652,7 +651,7 @@ def test_nccl_symmetric_explicit_vs_auto(mpi_pool_executor):
             *[
                 (
                     tensor_parallel_size,
-                    test_fallback_with_fusion,
+                    run_fallback_with_fusion_test,
                     x,
                     residual,
                     hidden_size,
