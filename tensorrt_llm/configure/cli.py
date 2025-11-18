@@ -70,7 +70,6 @@ def create_subcommand(constraints_cls: type[BaseConstraints]) -> CliSubCommand:
                 profile for profile in profiles if profile._get_metadata().cli_name == self.profile
             )
             config = profile_cls().get_config(self)
-            config["test"] = {"test2": 2}
             print(f"Found optimized config: \n\n{yaml.safe_dump(config)}")
 
             if self.output is None:
