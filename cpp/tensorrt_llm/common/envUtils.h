@@ -91,6 +91,8 @@ std::string getEnvUCXInterface();
 
 std::string getEnvNixlInterface();
 
+std::string getEnvNixlBackend();
+
 std::string getEnvMooncakeInterface();
 
 bool getEnvDisaggLayerwise();
