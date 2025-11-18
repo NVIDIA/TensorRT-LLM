@@ -893,7 +893,7 @@ class MLA(nn.Module):
         mscale_all_dim = pos_embd_params.rope.mscale_all_dim
         scaling_factor = pos_embd_params.rope.scale
         mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
-        self.q_scaling = 1.0 / (mscale * mscale)
+        q_scaling = 1.0 / (mscale * mscale)
 
         if not self.is_dsa:
             self.mha = create_attention(
@@ -926,7 +926,7 @@ class MLA(nn.Module):
             num_kv_heads=1,
             pos_embd_params=pos_embd_params,
             quant_config=quant_config,
-            q_scaling=self.q_scaling,
+            q_scaling=q_scaling,
             is_mla_enable=True,
             q_lora_rank=self.q_lora_rank,
             kv_lora_rank=self.kv_lora_rank,
@@ -1199,9 +1199,9 @@ class MLA(nn.Module):
                 q_gen,
                 compressed_kv_gen,
                 k_pe_gen,
+                position_ids,
                 attn_metadata,
                 output[num_ctx_tokens:num_tokens, :],
-                position_ids=position_ids,
                 latent_cache=latent_cache_gen,
             )
 
@@ -1382,6 +1382,7 @@ class MLA(nn.Module):
         q: torch.Tensor,
         compressed_kv: torch.Tensor,
         k_pe: torch.Tensor,
+        position_ids: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
         latent_cache: Optional[torch.Tensor] = None,
@@ -1391,6 +1392,7 @@ class MLA(nn.Module):
             return self.forward_absorption_generation(q,
                                                       compressed_kv,
                                                       k_pe,
+                                                      position_ids,
                                                       attn_metadata,
                                                       output,
                                                       latent_cache=latent_cache,

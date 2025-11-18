@@ -723,7 +723,8 @@ class ExecutorRequestQueue:
             elif cp_type == CpType.HELIX:
                 return self._merge_helix_requests(
                     new_requests,
-                    tokens_per_block=cp_config['tokens_per_block'])
+                    tokens_per_block=32)
+                    # tokens_per_block=cp_config['tokens_per_block'])
             else:
                 raise NotImplementedError(
                     f'Unsupported cp type {cp_type.name}.')

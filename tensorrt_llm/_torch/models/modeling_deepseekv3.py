@@ -1610,7 +1610,6 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                 tp_size=original_tp_size * original_cp_size,
                 pp_size=model_config.mapping.pp_size,
                 moe_ep_size=model_config.mapping.moe_ep_size,
-                auto_parallel=model_config.mapping.auto_parallel,
                 enable_attention_dp=model_config.mapping.enable_attention_dp)
             model_config._frozen = True
         ###############################################################################

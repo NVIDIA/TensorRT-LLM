@@ -359,7 +359,6 @@ class MPIDist(Distributed):
                 tp_size=self.mapping.tp_size * self.mapping.cp_size,
                 pp_size=self.mapping.pp_size,
                 moe_ep_size=self.mapping.moe_ep_size,
-                auto_parallel=False,
                 enable_attention_dp=self.mapping.enable_attention_dp)
             self.mapping = mapping_without_helix
         self.create_tp_comm()

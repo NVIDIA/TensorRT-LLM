@@ -138,7 +138,7 @@ def get_llm_args(
         "tensor_parallel_size": tensor_parallel_size,
         "pipeline_parallel_size": pipeline_parallel_size,
         "context_parallel_size": context_parallel_size,
-        "cp_config": cp_config,
+        "cp_config": cp_config if cp_config is not None else {},
         "moe_expert_parallel_size": moe_expert_parallel_size,
         "gpus_per_node": gpus_per_node,
         "trust_remote_code": trust_remote_code,
@@ -200,12 +200,6 @@ def launch_server(
     # Optionally disable GC (default: not disabled)
     if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
         gc.disable()
-
-    # Optionally disable GC (default: not disabled)
-    if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
-        gc.disable()
-    else:
-        assert False, "TRTLLM_SERVER_DISABLE_GC must be set to 1."
 
     asyncio.run(server(host, port))
 
