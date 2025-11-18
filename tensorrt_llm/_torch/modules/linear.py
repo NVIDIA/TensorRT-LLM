@@ -2220,11 +2220,13 @@ class Linear(nn.Module):
         weight_mode = self.weights_loading_config.weight_mode
         if not isinstance(self.quant_method, UnquantizedLinearMethod):
             assert allow_partial_loading is False, "allow_partial_loading is only supported for non-unquantized linear methods now"
-        self.quant_method.load_weights(
-            self,
-            weights,
-            weight_mode,
-            allow_partial_loading=allow_partial_loading)
+            self.quant_method.load_weights(self, weights, weight_mode)
+        else:
+            self.quant_method.load_weights(
+                self,
+                weights,
+                weight_mode,
+                allow_partial_loading=allow_partial_loading)
 
     def post_load_weights(self):
         self.quant_method.post_load_weights(self)
