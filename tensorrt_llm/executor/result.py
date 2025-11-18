@@ -953,7 +953,7 @@ class IterationResult:
     Runtime results for all available iterations.
     """
 
-    def __init__(self, maxsize=0):
+    def __init__(self, maxsize: int = 0):
         self._done = False
         self._timeout = 2
 
