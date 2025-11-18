@@ -235,11 +235,11 @@ class QuantConfig:
         bits = kv_scheme.get("num_bits")
         dynamic = bool(kv_scheme.get("dynamic", False))
 
-        # todo add here all options...
+        # TODO (danielafrimi) needs to check all supported options...
         if kv_type == "float" and bits == 8 and not dynamic:
-            return QuantAlgo("FP8_BLOCK_SCALES")
+            return QuantAlgo.FP8
         if kv_type in ("int", "uint") and bits == 8:
-            return QuantAlgo("INT8")
+            return QuantAlgo.INT8
         return None
 
     def _map_new_to_legacy_args(self, hf_quant_config: dict) -> dict:
@@ -261,8 +261,7 @@ class QuantConfig:
                 hf_quant_config.get("ignore") or [])
 
         kv_scheme = hf_quant_config.get("kv_cache_scheme") or {}
-        kv_algo = QuantConfig._infer_kv_cache_quant_algo_from_scheme(
-            kv_scheme)  # todo check it
+        kv_algo = QuantConfig._infer_kv_cache_quant_algo_from_scheme(kv_scheme)
         if kv_algo is not None:
             qunatization_dict["kv_cache_quant_algo"] = kv_algo
 
@@ -273,7 +272,6 @@ class QuantConfig:
         if "symmetric" in hf_quant_config:
             qunatization_dict["zero_point"] = hf_quant_config["symmetric"]
 
-        # todo add here pre qunat scale and other keys....
         return qunatization_dict
 
     def _update_from_quant_config_json(self, path, moe_backend: str,

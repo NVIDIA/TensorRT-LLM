@@ -25,6 +25,7 @@ from ..llmapi.llm_args import TrtLlmArgs
 from ..logger import logger
 from ..mapping import Mapping
 from ..models.automodel import MODEL_MAP, AutoConfig, AutoModelForCausalLM
+from ..models.modeling_utils import QuantAlgo  # noqa: F401
 from ..models.modeling_utils import PretrainedConfig, QuantConfig
 from ..module import Module
 from .build_cache import (BuildCache, BuildCacheConfig, CachedStage,
