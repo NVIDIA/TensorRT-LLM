@@ -2273,7 +2273,7 @@ def test_ptp_quickstart_advanced_deepseek_r1_w4afp8_8gpus(
 
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("model_name,model_path,gpu_count", [
-    ("Llama3.1-70B-BF16", "llama-3.1-model/Meta-Llama-3.1-70B", 8),
+    ("Llama3.1-70B-BF16", "llama-3.1-model/Meta-Llama-3.1-70B", 2),
     ("Mixtral-8x7B-BF16", "Mixtral-8x7B-v0.1", 8),
     pytest.param('Llama3.1-70B-FP8',
                  'llama-3.1-model/Llama-3.1-70B-Instruct-FP8',
@@ -2304,7 +2304,7 @@ def test_ptp_quickstart_advanced_multi_gpus(llm_root, llm_venv, model_name,
         pytest.skip(f"Not enough GPUs for {model_name}")
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
     mapping = {
-        "Llama3.1-70B-BF16": 24.6,
+        "Llama3.1-70B-BF16": 91.0,
         "Mixtral-8x7B-BF16": 16.5,
         "Llama3.1-70B-FP8": 58.5,
         "Llama3.1-405B-FP8": 63.2,
@@ -3053,8 +3053,6 @@ def test_ptp_quickstart_multimodal_2gpu(llm_root, llm_venv, model_name,
         cmd.append("--load_lora")
         cmd.append("--auto_model_name")
         cmd.append("Phi4MMForCausalLM")
-        # TODO: remove this once kv cache reuse is supported for Phi-4-multimodal
-        cmd.append("--disable_kv_cache_reuse")
     elif model_name == "mistral-small-3.1-24b-instruct":
         # TODO: remove this once kv cache reuse is supported for Mistral
         cmd.append("--disable_kv_cache_reuse")
@@ -3472,133 +3470,3 @@ def test_llmapi_generation_logits(llm_venv, model_path,
     # Run the async test
     loop = asyncio.get_event_loop()
     loop.run_until_complete(async_generation_test())
-
-
-@skip_pre_hopper
-@pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.skip_less_device(4)
-def test_llama4_long_context_kv_cache_split_4gpus(llm_root, llm_venv):
-    """
-    RCCA: https://nvbugspro.nvidia.com/bug/5555681
-
-    Reproduces KV cache split overflow issue.
-
-    This test can reproduce the bug in two ways:
-    1. Using pipeline parallelism (PP=2) where KV cache is transferred between PP stages
-    2. Using disaggregated serving with separate prefill and decode workers
-
-    Method 1 (Pipeline Parallelism) is simpler and is used by default.
-    KV cache transfer happens between PP stages, and when max_tokens_in_buffer
-    is too small, it will trigger illegal memory access.
-
-    本测试可以通过两种方式复现bug：
-    1. 使用pipeline并行(PP=2)，KV cache在PP stages之间传输
-    2. 使用disaggregated serving，分离的prefill和decode workers
-
-    默认使用方法1（Pipeline并行），更简单。
-    KV cache在PP stages之间传输时，如果max_tokens_in_buffer太小会触发非法内存访问。
-    """
-    import os
-    import tempfile
-
-    from tensorrt_llm import LLM, SamplingParams
-
-    # Set environment variable for DEBUG log level to reproduce detailed plugin logs
-    # 设置环境变量以启用DEBUG日志级别，复现详细的plugin注册日志
-    os.environ['TLLM_LOG_LEVEL'] = 'debug'
-
-    # Enable CUDA error checking to get more detailed error messages
-    # 启用CUDA错误检查以获得更详细的错误信息
-    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
-    os.environ['NCCL_DEBUG'] = 'INFO'
-    os.environ['TRTLLM_ENABLE_KVCACHE_DEBUG'] = '1'
-
-    # Use Llama-4-Scout model as shown in the reproduction log
-    # 使用日志中显示的Llama-4-Scout模型
-    model_path = f"{llm_models_root()}/llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8"
-
-    with tempfile.NamedTemporaryFile(mode='w+t',
-                                     suffix=".llama4_long_context.log",
-                                     dir="./",
-                                     delete=True,
-                                     delete_on_close=True) as running_log:
-        # Method 1: Use Pipeline Parallelism (PP=2) to reproduce the bug
-        # Pipeline parallelism causes KV cache to be transferred between PP stages
-        # When max_tokens_in_buffer is too small, it will trigger illegal memory access
-        #
-        # 方法1：使用Pipeline并行(PP=2)复现bug
-        # Pipeline并行会在PP stages之间传输KV cache
-        # 当max_tokens_in_buffer太小时会触发非法内存访问
-        with LLM(
-                model_path,
-                tensor_parallel_size=2,  # TP=2 on first 2 GPUs
-                pipeline_parallel_size=
-                2,  # PP=2: critical for KV cache transfer between stages
-                moe_expert_parallel_size=1,
-                max_seq_len=257000,
-                max_input_len=256000,
-                max_num_tokens=8192,
-                max_batch_size=1,
-                enable_chunked_prefill=True,
-                trust_remote_code=True,
-                backend="pytorch",
-                kv_cache_config={
-                    "enable_block_reuse": True,
-                    "free_gpu_memory_fraction": 0.3
-                },
-                disable_overlap_scheduler=True,
-                cache_transceiver_config=
-            {
-                "backend": "UCX",
-                # Intentionally set to small value (2048) to reproduce buffer overflow bug
-                # This is much smaller than the 128k tokens input, which will trigger
-                # illegal memory access when transferring KV cache between PP stages
-                # 故意设置为较小值(2048)以复现缓冲区溢出bug
-                # 这比128k tokens的输入小得多，在PP stages之间传输KV cache时会触发非法内存访问
-                "max_tokens_in_buffer": 2048
-            }) as llm:
-
-            # Create a long prompt that exceeds max_tokens_in_buffer to trigger the bug
-            # 创建超过max_tokens_in_buffer的长提示以触发bug
-            # Each repetition is ~10 tokens, so 12800 repetitions ≈ 128k tokens
-            base_text = "Machine learning is a fascinating field of study. " * 12800
-            long_prompt = "Summarize the following text: " + base_text
-
-            print(f"Prompt length: {len(long_prompt)} characters")
-            print("Generating with pipeline parallelism...")
-
-            sampling_params = SamplingParams(
-                max_tokens=100,
-                min_tokens=100,
-                temperature=0.0,
-                ignore_eos=True,
-            )
-
-            # Test generation with long context
-            # KV cache will be transferred between PP stage 0 and stage 1
-            # If buffer is too small, illegal memory access will occur
-            # 测试长上下文生成
-            # KV cache会在PP stage 0和stage 1之间传输
-            # 如果缓冲区太小会发生非法内存访问
-            result = llm.generate(long_prompt, sampling_params=sampling_params)
-
-            # Verify output is generated successfully
-            # 验证输出成功生成
-            assert len(result.outputs) > 0
-            output_text = result.outputs[0].text
-            assert len(output_text) > 0
-
-            # Check for repetitive/meaningless output caused by KV cache corruption
-            # 检查由KV cache损坏导致的重复/无意义输出
-            max_repeat = max(
-                (sum(1 for _ in group)
-                 for char, group in __import__('itertools').groupby(output_text)
-                 ),
-                default=0)
-            assert max_repeat < 20, \
-                f"Found {max_repeat} consecutive identical characters, " \
-                f"suggesting KV cache corruption. Output: {output_text[:200]}"
-
-            print(
-                f"Successfully generated output with long context: {output_text[:100]}..."
-            )

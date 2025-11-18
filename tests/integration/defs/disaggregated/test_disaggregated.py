@@ -18,7 +18,6 @@ import os
 import re
 import subprocess
 import tempfile
-import time
 from typing import Callable
 
 import pytest
@@ -196,8 +195,6 @@ def get_test_config(test_desc, example_dir, test_root):
         (8, f"{test_configs_root}/disagg_config_ctxpp4_genpp4.yaml"),
         "ctxpp4_gentp4":
         (8, f"{test_configs_root}/disagg_config_ctxpp4_gentp4.yaml"),
-        "llama4_kv_cache_overflow":
-        (8, f"{test_configs_root}/disagg_config_llama4_kv_cache_overflow.yaml"),
         "deepseek_v3_lite_fp8_mpi":
         (4,
          f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_mpi.yaml"
@@ -1731,35 +1728,13 @@ def run_disaggregated_genai_perf(config_file,
                     cwd=cwd) as server_proc):
 
             # Wait for server to be ready
-            server_url = "http://localhost:8000"
-            start_wait = time.time()
-            server_ready = False
-
-            logger.info(
-                f"Waiting for server to be ready (timeout: {server_start_timeout}s)..."
-            )
-            while time.time() - start_wait < server_start_timeout:
-                try:
-                    response = requests.get(f"{server_url}/health", timeout=5)
-                    if response.status_code == 200:
-                        logger.info("✓ Server is ready!")
-                        server_ready = True
-                        break
-                except Exception as e:
-                    logger.debug(f"Server not ready yet: {e}")
-                time.sleep(5)
-
-            if not server_ready:
+            if not wait_for_server(
+                    "localhost", 8000, timeout_seconds=server_start_timeout):
                 raise RuntimeError(
-                    f"Server did not become ready within {server_start_timeout} seconds"
+                    f"Disaggregated server did not become ready within {server_start_timeout} seconds"
                 )
 
-            logger.info("Waiting 10 seconds for full initialization...")
-            time.sleep(10)
-
             # Run genai-perf
-            logger.info(
-                f"Running genai-perf with {input_tokens} input tokens...")
             genai_perf_cmd = [
                 'genai-perf', 'profile', '--model', model_path, '--tokenizer',
                 model_path, '--endpoint-type', 'chat', '--endpoint',
@@ -1909,6 +1884,15 @@ def test_llama4_long_context_kv_cache_overflow(disaggregated_test_root,
     """
     models_root = llm_models_root()
     llama4_model_root = os.path.join(models_root, model_path)
+
+    # Create symlink to match config file path
+    src_dst_dict = {
+        llama4_model_root: f"{llm_venv.get_working_directory()}/{model_path}",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
 
     num_ranks, config_file = get_test_config("llama4_kv_cache_overflow",
                                              disaggregated_example_root,
