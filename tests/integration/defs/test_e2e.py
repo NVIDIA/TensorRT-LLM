@@ -19,7 +19,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 from typing import Any, Optional, Tuple, Union
 
@@ -1597,8 +1596,6 @@ def test_openai_completions_example(llm_root, llm_venv, backend: str):
 
 @pytest.mark.parametrize("backend", ["pytorch", "trt"])
 def test_openai_chat_example(llm_root, llm_venv, backend: str):
-    time.sleep(610)
-    pytest.fail("Emma test")
     test_root = unittest_path() / "llmapi" / "apps"
     filter_expr = f"{backend} and not sampler"
     llm_venv.run_cmd([
@@ -1676,8 +1673,6 @@ def test_openai_lora(llm_root, llm_venv):
 
 
 def test_openai_chat_multimodal_example(llm_root, llm_venv):
-    time.sleep(310)
-    pytest.fail("Emma test")
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd(
         ["-m", "pytest",
