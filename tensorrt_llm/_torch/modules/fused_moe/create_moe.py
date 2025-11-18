@@ -6,7 +6,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ...model_config import ModelConfig
-from ...utils import AuxStreamType
+from ...utils import ActivationType, AuxStreamType
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepGemmFusedMoE
@@ -74,6 +74,7 @@ def create_moe(
     swiglu_alpha: Optional[torch.Tensor] = None,
     swiglu_beta: Optional[torch.Tensor] = None,
     swiglu_limit: Optional[torch.Tensor] = None,
+    activation_type: ActivationType = ActivationType.Swiglu,
 ) -> MoE:
     moe_cls = get_moe_cls(model_config, override_quant_config)
 
@@ -133,6 +134,7 @@ def create_moe(
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
+            activation_type=activation_type,
         )
     elif moe_cls == WideEPMoE:
         return moe_cls(
@@ -161,6 +163,8 @@ def create_moe(
             model_config=model_config,
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
+            layer_idx=layer_idx,
+            activation_type=activation_type,
         )
     elif moe_cls == CuteDslFusedMoE:
         return moe_cls(
