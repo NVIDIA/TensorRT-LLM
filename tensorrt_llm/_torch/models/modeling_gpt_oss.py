@@ -805,15 +805,20 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
                     except Exception:
                         pass
 
+                # Only fp32 bias is supported for NVFP4 MoE.
+                if gate_up_bias.dtype != torch.float32:
+                    gate_up_bias = gate_up_bias.to(torch.float32)
+                if down_bias.dtype != torch.float32:
+                    down_bias = down_bias.to(torch.float32)
+
                 moe_weights = {}
                 if gate_up is not None:
                     moe_weights['gate_up_proj'] = [
-                        gate_up[i, :, :].transpose(0, 1)
-                        for i in range(num_expert)
+                        gate_up[i, :, :] for i in range(num_expert)
                     ]
                 if down is not None:
                     moe_weights['down_proj'] = [
-                        down[i, :, :].transpose(0, 1) for i in range(num_expert)
+                        down[i, :, :] for i in range(num_expert)
                     ]
                 if gate_up_bias is not None:
                     moe_weights['gate_up_proj.bias'] = [
