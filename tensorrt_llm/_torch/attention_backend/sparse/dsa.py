@@ -1059,13 +1059,6 @@ class Indexer(nn.Module):
         weights: torch.Tensor,
         use_custom_topk: bool = True,
     ) -> torch.Tensor:
-        use_custom_topk = use_custom_topk and self.index_topk == 2048
-        if self.index_topk != 2048:
-            logger.warning_once(
-                f"Using custom topk indexer with index_topk={self.index_topk} is not supported. "
-                f"Please use index_topk=2048 instead.",
-                key="indexer_topk_not_2048_warning")
-
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
         num_ctx_tokens = metadata.num_ctx_tokens
