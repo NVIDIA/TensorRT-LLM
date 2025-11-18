@@ -1,0 +1,23 @@
+scenario:
+  model: openai/gpt-oss-120b
+  gpu: H200_SXM
+  num_gpus: 1
+  target_isl: 1024
+  target_osl: 8192
+  target_concurrency: 32
+env:
+  TRTLLM_ENABLE_PDL: 1
+config:
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 32
+  enable_attention_dp: false
+  kv_cache_config:
+    dtype: auto
+    enable_block_reuse: false
+    free_gpu_memory_fraction: 0.85
+  moe_config:
+    backend: TRITON
+  num_postprocess_workers: 4
+  print_iter_log: true
+  stream_interval: 20
