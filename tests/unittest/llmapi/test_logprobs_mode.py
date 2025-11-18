@@ -12,18 +12,9 @@ print(f"tensorrt_llm.__file__: {tensorrt_llm.__file__}")
 MODEL_PATH = llm_models_root() / "DeepSeek-V3-Lite/bf16"
 
 
-@pytest.mark.parametrize(
-    "logprobs_mode",
-    [
-        "raw_logits",
-        "raw_logprobs",
-        "processed_logits",
-        "processed_logprobs",
-    ],
-)
 @pytest.mark.parametrize("temperature", [0.0, 0.8])
 @pytest.mark.parametrize("top_k", [None, 50])
-def test_logprobs_mode_basic(logprobs_mode, temperature, top_k):
+def test_logprobs_mode_basic(temperature, top_k):
     llm = LLM(
         MODEL_PATH,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.7),
@@ -34,9 +25,10 @@ def test_logprobs_mode_basic(logprobs_mode, temperature, top_k):
         logprobs=3,
         temperature=temperature,
         top_k=top_k,
-        logprobs_mode=logprobs_mode,
+        logprobs_mode="processed_logprobs",
         return_context_logits=True,
         return_generation_logits=True,
+        seed=42,
     )
 
     prompts = ["The future of AI is"]
@@ -59,22 +51,15 @@ def test_logprobs_mode_basic(logprobs_mode, temperature, top_k):
             all_logprob_values.append(logprob_obj.logprob)
 
     print(f"all_logprob_values: {all_logprob_values}")
-    # Validate based on mode
-    if "logprobs" in logprobs_mode:
-        for val in all_logprob_values:
-            assert val <= 0.0, (
-                f"Logprobs mode {logprobs_mode} should have non-positive values, got {val}"
-            )
-
-    if "logits" in logprobs_mode:
-        has_positive = any(val > 0 for val in all_logprob_values)
-        assert has_positive, f"Logits mode {logprobs_mode} should have some positive values"
+    # Validate that processed_logprobs returns non-positive values (log probabilities)
+    for val in all_logprob_values:
+        assert val <= 0.0, f"processed_logprobs mode should have non-positive values, got {val}"
 
     del llm
 
 
-@pytest.mark.parametrize("temperature", [0.5, 1.0])
-def test_raw_vs_processed_logprobs_difference(temperature):
+@pytest.mark.parametrize("temperature", [0.5, 1.0, 1.5])
+def test_processed_logprobs_with_temperature(temperature):
     llm = LLM(
         MODEL_PATH,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.7),
@@ -82,45 +67,25 @@ def test_raw_vs_processed_logprobs_difference(temperature):
 
     prompt = ["The capital of France is"]
 
-    # Get raw logprobs
-    raw_params = SamplingParams(
-        max_tokens=3,
-        logprobs=5,
-        temperature=temperature,
-        top_k=20,
-        logprobs_mode="raw_logprobs",
-        seed=42,  # Fix seed for reproducibility
-    )
-    raw_outputs = llm.generate(prompt, sampling_params=raw_params)
-
-    # Get processed logprobs
-    processed_params = SamplingParams(
+    # Get processed logprobs (after temperature/top-k/top-p modifications)
+    params = SamplingParams(
         max_tokens=3,
         logprobs=5,
         temperature=temperature,
         top_k=20,
         logprobs_mode="processed_logprobs",
-        seed=42,  # Same seed
+        seed=42,
     )
-    processed_outputs = llm.generate(prompt, sampling_params=processed_params)
+    outputs = llm.generate(prompt, sampling_params=params)
 
     # Extract logprobs from first token
-    raw_first_token_logprobs = raw_outputs[0].outputs[0].logprobs[0]
-    processed_first_token_logprobs = processed_outputs[0].outputs[0].logprobs[0]
+    first_token_logprobs = outputs[0].outputs[0].logprobs[0]
+    assert len(first_token_logprobs) > 0, "Should have logprobs returned"
 
-    # Get a common token ID
-    common_token_ids = set(raw_first_token_logprobs.keys()) & set(
-        processed_first_token_logprobs.keys()
-    )
-    assert len(common_token_ids) > 0, "Should have some common token IDs"
-
-    token_id = list(common_token_ids)[0]
-    raw_val = raw_first_token_logprobs[token_id].logprob
-    processed_val = processed_first_token_logprobs[token_id].logprob
-
-    if temperature != 1.0:
-        assert raw_val != processed_val, (
-            f"Raw and processed logprobs should differ with temperature={temperature}"
+    # Validate that all values are non-positive (log probabilities)
+    for token_id, logprob_obj in first_token_logprobs.items():
+        assert logprob_obj.logprob <= 0.0, (
+            f"processed_logprobs should have non-positive values, got {logprob_obj.logprob}"
         )
 
     del llm
@@ -134,35 +99,28 @@ def test_logprobs_mode_with_greedy_sampling():
 
     prompt = ["Once upon a time"]
 
-    for mode in ["raw_logprobs", "processed_logprobs", "raw_logits", "processed_logits"]:
-        sampling_params = SamplingParams(
-            max_tokens=4,
-            logprobs=3,
-            temperature=0.0,  # Greedy sampling
-            logprobs_mode=mode,
-        )
+    sampling_params = SamplingParams(
+        max_tokens=4,
+        logprobs=3,
+        temperature=0.0,  # Greedy sampling
+        logprobs_mode="processed_logprobs",
+    )
 
-        outputs = llm.generate(prompt, sampling_params=sampling_params)
+    outputs = llm.generate(prompt, sampling_params=sampling_params)
 
-        assert len(outputs) == 1
-        assert len(outputs[0].outputs[0].logprobs) > 0, (
-            f"Mode {mode} should return logprobs even with greedy sampling"
-        )
+    assert len(outputs) == 1
+    assert len(outputs[0].outputs[0].logprobs) > 0, (
+        "processed_logprobs should return logprobs even with greedy sampling"
+    )
 
-        # Check value ranges
-        logprob_vals = [
-            logprob_obj.logprob
-            for token_logprobs in outputs[0].outputs[0].logprobs
-            for logprob_obj in token_logprobs.values()
-        ]
+    # Check value ranges - all should be non-positive (log probabilities)
+    logprob_vals = [
+        logprob_obj.logprob
+        for token_logprobs in outputs[0].outputs[0].logprobs
+        for logprob_obj in token_logprobs.values()
+    ]
 
-        if "logprobs" in mode:
-            assert all(v <= 0.0 for v in logprob_vals), (
-                f"Mode {mode} should have non-positive values"
-            )
-
-        if "logits" in mode:
-            assert any(v > 0 for v in logprob_vals), f"Mode {mode} should have some positive values"
+    assert all(v <= 0.0 for v in logprob_vals), "processed_logprobs should have non-positive values"
 
     del llm
 
@@ -175,17 +133,17 @@ def test_backward_compatibility():
 
     prompt = ["Hello world"]
 
-    # Test with explicit raw_logprobs
+    # Test with explicit processed_logprobs
     explicit_params = SamplingParams(
         max_tokens=3,
         logprobs=2,
         temperature=0.8,
-        logprobs_mode="raw_logprobs",
+        logprobs_mode="processed_logprobs",
         seed=123,
     )
     explicit_outputs = llm.generate(prompt, sampling_params=explicit_params)
 
-    # Test with default (should be raw_logprobs)
+    # Test with default (should be processed_logprobs)
     default_params = SamplingParams(
         max_tokens=3,
         logprobs=2,
@@ -199,14 +157,13 @@ def test_backward_compatibility():
     default_tokens = default_outputs[0].outputs[0].token_ids
 
     assert explicit_tokens == default_tokens, (
-        "Default mode should produce same results as explicit raw_logprobs"
+        "Default mode should produce same results as explicit processed_logprobs"
     )
 
     del llm
 
 
 def test_logprobs_mode_with_top_p():
-    """Test that processed modes correctly capture the effect of top-p sampling."""
     llm = LLM(
         MODEL_PATH,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
@@ -214,28 +171,35 @@ def test_logprobs_mode_with_top_p():
 
     prompt = ["The weather today is"]
 
+    # Test processed_logprobs mode (should have -inf for masked tokens after log_softmax)
     params = SamplingParams(
         max_tokens=2,
         logprobs=10,  # Request many logprobs to see the effect
         temperature=1.0,
         top_p=0.5,  # Restrict to top 50% probability mass
-        logprobs_mode="processed_logits",
+        logprobs_mode="processed_logprobs",
     )
 
     outputs = llm.generate(prompt, sampling_params=params)
 
-    # Check that some logits are -inf (masked by top-p)
+    # Check that some logprobs are -inf (masked by top-p)
     first_token_logprobs = outputs[0].outputs[0].logprobs[0]
     logprob_values = [obj.logprob for obj in first_token_logprobs.values()]
-    print(f"logprob_values: {logprob_values}")
-    assert any(val == float("-inf") for val in logprob_values)
+    print(f"processed_logprobs values: {logprob_values}")
+    assert any(val == float("-inf") for val in logprob_values), (
+        "processed_logprobs should have -inf values for tokens masked by top-p"
+    )
+    # All non-inf values should be non-positive (log probabilities)
+    non_inf_values = [v for v in logprob_values if v != float("-inf")]
+    if non_inf_values:
+        assert all(v <= 0.0 for v in non_inf_values), (
+            "processed_logprobs non-inf values should be non-positive"
+        )
 
     del llm
 
 
-@pytest.mark.parametrize("mode", ["raw_logprobs", "processed_logprobs"])
-def test_prompt_logprobs_with_modes(mode):
-    """Test that logprobs modes also work for prompt logprobs."""
+def test_prompt_logprobs_with_processed_logprobs():
     llm = LLM(
         MODEL_PATH,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
@@ -247,7 +211,7 @@ def test_prompt_logprobs_with_modes(mode):
         max_tokens=2,
         logprobs=3,
         prompt_logprobs=3,  # Request prompt logprobs
-        logprobs_mode=mode,
+        logprobs_mode="processed_logprobs",
         temperature=0.8,
     )
 
@@ -258,21 +222,61 @@ def test_prompt_logprobs_with_modes(mode):
     assert prompt_logprobs is not None
     assert len(prompt_logprobs) > 0
 
-    # Validate values based on mode
+    # Validate values - processed_logprobs should be non-positive
     for token_logprobs in prompt_logprobs:
         if token_logprobs:  # Can be None for first token
             for logprob_obj in token_logprobs.values():
-                if "logprobs" in mode:
-                    assert logprob_obj.logprob <= 0.0, (
-                        f"Prompt logprobs in mode {mode} should be non-positive"
-                    )
+                assert logprob_obj.logprob <= 0.0, (
+                    "Prompt logprobs in processed_logprobs mode should be non-positive"
+                )
+
+    del llm
+
+
+def test_processed_logprobs_with_top_k():
+    llm = LLM(
+        MODEL_PATH,
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+    )
+
+    prompt = ["The future of technology"]
+
+    # Test with small top_k to ensure filtering is applied
+    params = SamplingParams(
+        max_tokens=2,
+        logprobs=20,  # Request more logprobs than top_k to see filtering
+        temperature=1.0,
+        top_k=5,  # Only keep top 5 tokens
+        logprobs_mode="processed_logprobs",
+    )
+
+    outputs = llm.generate(prompt, sampling_params=params)
+
+    # Check that we have logprobs returned
+    first_token_logprobs = outputs[0].outputs[0].logprobs[0]
+    assert len(first_token_logprobs) > 0, "Should have logprobs returned"
+
+    # With top_k=5, we should get at most 5 non-inf logprobs (plus potentially the sampled token)
+    logprob_values = [obj.logprob for obj in first_token_logprobs.values()]
+    non_inf_count = sum(1 for v in logprob_values if v != float("-inf"))
+
+    # Should have at most top_k + 1 (top_k + sampled token if not in top_k)
+    assert non_inf_count <= 6, (
+        f"With top_k=5, should have at most 6 non-inf logprobs, got {non_inf_count}"
+    )
+
+    # All values should be non-positive (log probabilities)
+    non_inf_values = [v for v in logprob_values if v != float("-inf")]
+    if non_inf_values:
+        assert all(v <= 0.0 for v in non_inf_values), (
+            "processed_logprobs values should be non-positive"
+        )
 
     del llm
 
 
 if __name__ == "__main__":
     # Run a quick smoke test
-    print("Running smoke test for logprobs modes...")
-    test_logprobs_mode_basic("raw_logprobs", 0.8, None)
-    test_logprobs_mode_basic("processed_logprobs", 0.8, None)
-    print("Smoke test passed!")
+    print("Running test for processed_logprobs mode...")
+    test_logprobs_mode_basic(0.8, None)
+    print("logprobs mode test passed!")

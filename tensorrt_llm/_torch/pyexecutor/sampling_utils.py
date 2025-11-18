@@ -95,8 +95,7 @@ def top_k_sampling_batch(
     top_k: int,
     temperature: float,
     generator: Optional[torch.Generator] = None,
-    return_processed_logits: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     # NB: To be replaced by a more efficient implementation.
     return top_k_top_p_sampling_batch(
         logits,
@@ -104,7 +103,6 @@ def top_k_sampling_batch(
         temperature=temperature,
         generator=generator,
         top_p=1,
-        return_processed_logits=return_processed_logits,
     )
 
 
@@ -114,7 +112,6 @@ def top_p_sampling_batch(
     top_p: float,
     temperature: float,
     generator: Optional[torch.Generator] = None,
-    return_processed_logits: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     # NB: To be replaced by a more efficient implementation.
     return top_k_top_p_sampling_batch(
@@ -123,7 +120,6 @@ def top_p_sampling_batch(
         top_k=logits.size(1),
         temperature=temperature,
         generator=generator,
-        return_processed_logits=return_processed_logits,
     )
 
 
@@ -132,7 +128,6 @@ def temperature_sampling_batch(
     *,
     temperature: float,
     generator: Optional[torch.Generator] = None,
-    return_processed_logits: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     # NB: To be replaced by a more efficient implementation.
     return top_k_top_p_sampling_batch(
@@ -141,7 +136,6 @@ def temperature_sampling_batch(
         top_k=logits.size(1),
         temperature=temperature,
         generator=generator,
-        return_processed_logits=return_processed_logits,
     )
 
 
@@ -152,7 +146,6 @@ def top_k_top_p_sampling_batch(
     top_p: float,
     temperature: float,
     generator: Optional[torch.Generator] = None,
-    return_processed_logits: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """
     Perform top-k and top-p sampling.
@@ -163,17 +156,13 @@ def top_k_top_p_sampling_batch(
         top_p: Top-p (nucleus sampling) value
         temperature: Temperature for sampling
         generator: Optional torch random generator
-        return_processed_logits: If True, return processed logits after temperature/top-k/top-p
 
     Returns:
-        Tuple of (sampled_tokens, softmax_probs, processed_logits)
-        processed_logits is None if return_processed_logits is False
+        Tuple of (sampled_tokens, softmax_probs)
     """
     logits_dim = logits.dim()
     assert logits_dim == 2, "logits should be 2D: [batch_size, vocab_size]"
     assert temperature > 0, "non-greedy sampling requires valid temperature"
-    # Store processed logits if requested (clone before in-place modifications)
-    processed_logits_to_return = logits.clone() if return_processed_logits else None
     logits = logits / max(temperature, 1e-5)
     batch_size, vocab_size = logits.size()
 
@@ -210,51 +199,34 @@ def top_k_top_p_sampling_batch(
         )
         logits = logits.masked_fill(indices_to_remove, float("-inf"))
 
-    # Update processed logits if requested (apply same temperature/top-k/top-p)
-    if return_processed_logits:
-        processed_logits_to_return = processed_logits_to_return / max(temperature, 1e-5)
-        if need_top_k:
-            processed_logits_to_return = torch.where(
-                processed_logits_to_return < min_values,
-                torch.full_like(processed_logits_to_return, float("-inf")),
-                processed_logits_to_return,
-            )
-        if need_top_p:
-            processed_logits_to_return = processed_logits_to_return.masked_fill(
-                indices_to_remove, float("-inf")
-            )
-
     # compute probability distribution
     softmax = torch.softmax(logits, dim=-1)
 
     # sample from the distribution and generate result of [batch_size, 1]
     next_tokens = torch.multinomial(softmax, num_samples=1, generator=generator).squeeze(-1)
-    return next_tokens, softmax, processed_logits_to_return
+    return next_tokens, softmax
 
 
 def greedy_search_sampling_batch(
     logits,
     *,
     return_probs: bool = True,
-    return_processed_logits: bool = False,
-) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """
     Perform greedy sampling.
 
     Args:
         logits: Input logits tensor
         return_probs: If True, return softmax probabilities
-        return_processed_logits: If True, return processed logits
 
     Returns:
-        Tuple of (sampled_tokens, softmax_probs, processed_logits)
+        Tuple of (sampled_tokens, softmax_probs)
     """
     next_tokens = torch.argmax(logits, dim=-1)
     softmax: Optional[torch.Tensor] = None
     if return_probs:
         softmax = torch.softmax(logits, dim=-1)
-    processed_logits = logits.clone() if return_processed_logits else None
-    return next_tokens, softmax, processed_logits
+    return next_tokens, softmax
 
 
 def get_rejected_indices(
@@ -299,13 +271,77 @@ def sample_rejected(
     return cast(int, new_token.item())
 
 
+def process_logits(
+    strategy: Strategy,
+    logits: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Process logits according to the specified strategy (temperature, top-k, top-p)
+    without sampling. Returns processed logits ready for log_softmax.
+
+    Args:
+        strategy: Sampling strategy tuple (strategy_name, *params)
+        logits: Input logits tensor [batch_size, vocab_size]
+
+    Returns:
+        Processed logits tensor [batch_size, vocab_size]
+    """
+    logits = logits.clone()
+    match strategy:
+        case ("top_k", top_k, temperature):
+            logits = logits / max(temperature, 1e-5)
+            batch_size, vocab_size = logits.size()
+            if top_k < vocab_size:
+                values, _ = torch.topk(logits, top_k, dim=-1)
+                min_values = values[:, -1].unsqueeze(-1).expand(batch_size, vocab_size)
+                logits = torch.where(
+                    logits < min_values, torch.full_like(logits, float("-inf")), logits
+                )
+        case ("top_p", top_p, temperature):
+            logits = logits / max(temperature, 1e-5)
+            if top_p < 1:
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+                cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+                sorted_indices_to_remove[:, 0] = 0
+                indices_to_remove = sorted_indices_to_remove.scatter(
+                    1, sorted_indices, sorted_indices_to_remove
+                )
+                logits = logits.masked_fill(indices_to_remove, float("-inf"))
+        case ("top_k_top_p", top_k, top_p, temperature):
+            logits = logits / max(temperature, 1e-5)
+            batch_size, vocab_size = logits.size()
+            if top_k < vocab_size:
+                values, _ = torch.topk(logits, top_k, dim=-1)
+                min_values = values[:, -1].unsqueeze(-1).expand(batch_size, vocab_size)
+                logits = torch.where(
+                    logits < min_values, torch.full_like(logits, float("-inf")), logits
+                )
+            if top_p < 1:
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+                cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+                sorted_indices_to_remove[:, 0] = 0
+                indices_to_remove = sorted_indices_to_remove.scatter(
+                    1, sorted_indices, sorted_indices_to_remove
+                )
+                logits = logits.masked_fill(indices_to_remove, float("-inf"))
+        case ("temperature", temperature):
+            logits = logits / max(temperature, 1e-5)
+        case ("greedy", None):
+            # No processing needed for greedy
+            pass
+    return logits
+
+
 def sample(
     strategy: Strategy,
     logits: torch.Tensor,
     *,
     generator: Optional[torch.Generator] = None,
     return_probs: bool = True,
-    return_processed_logits: bool = False,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
     Sample from logits using the specified strategy.
@@ -315,10 +351,9 @@ def sample(
         logits: Input logits tensor
         generator: Optional random generator
         return_probs: If True, return softmax probabilities
-        return_processed_logits: If True, return processed logits after temperature/penalties/top-k/top-p
 
     Returns:
-        Tuple of (sampled_tokens, softmax_probs, processed_logits)
+        Tuple of (sampled_tokens, softmax_probs)
     """
     match strategy:
         case ("top_k", top_k, temperature):
@@ -329,34 +364,29 @@ def sample(
                 generator=generator,
             )
         case ("top_p", top_p, temperature):
-            tokens, softmax, processed_logits = top_p_sampling_batch(
+            tokens, softmax = top_p_sampling_batch(
                 logits,
                 top_p=top_p,
                 generator=generator,
                 temperature=temperature,
-                return_processed_logits=return_processed_logits,
             )
         case ("top_k_top_p", top_k, top_p, temperature):
-            tokens, softmax, processed_logits = top_k_top_p_sampling_batch(
+            tokens, softmax = top_k_top_p_sampling_batch(
                 logits,
                 top_k=top_k,
                 top_p=top_p,
                 temperature=temperature,
                 generator=generator,
-                return_processed_logits=return_processed_logits,
             )
         case ("temperature", temperature):
-            tokens, softmax, processed_logits = temperature_sampling_batch(
+            tokens, softmax = temperature_sampling_batch(
                 logits,
                 temperature=temperature,
                 generator=generator,
-                return_processed_logits=return_processed_logits,
             )
         case ("greedy", None):
-            tokens, softmax, processed_logits = greedy_search_sampling_batch(
-                logits, return_probs=return_probs, return_processed_logits=return_processed_logits
-            )
-    return tokens, softmax, processed_logits
+            tokens, softmax = greedy_search_sampling_batch(logits, return_probs=return_probs)
+    return tokens, softmax
 
 
 GenericStrategyKeyType = TypeVar("GenericStrategyKeyType")
@@ -400,8 +430,7 @@ class SimpleGroupedStrategySampler(GroupedStrategySampler[Strategy]):
         group_logit_indices: Optional[torch.Tensor] = None,
         generator: Optional[torch.Generator] = None,
         return_probs: bool,
-        return_processed_logits: bool = False,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         if group_logit_indices is None:
             assert logits.size(0) == len(strategies)
         else:
@@ -414,7 +443,6 @@ class SimpleGroupedStrategySampler(GroupedStrategySampler[Strategy]):
             logits,
             generator=generator,
             return_probs=return_probs,
-            return_processed_logits=return_processed_logits,
         )
 
 

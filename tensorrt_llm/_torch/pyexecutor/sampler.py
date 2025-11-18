@@ -68,6 +68,7 @@ from .sampling_utils import (
     Strategy,
     UtilsSamplingParams,
     get_rejected_indices,
+    process_logits,
     resolve_sampling_strategy,
     sample,
     sample_rejected,
@@ -320,8 +321,6 @@ class _BatchedSamplingResult:
     batch_req_indices: torch.Tensor
     # Next tokens for all requests:
     batch_next_tokens_cuda_int: torch.Tensor
-    # Processed logits after temperature/penalties/top-k/top-p (for processed logprobs modes):
-    processed_logits_cuda: Optional[torch.Tensor] = None
 
 
 # Helper class for _PackedStepIndexer and _UnpackedStepIndexer, facilitating the
@@ -1286,7 +1285,6 @@ class TorchSampler(Sampler):
         req_num_steps: torch.Tensor,
         req_offsets: torch.Tensor,
         token_dtype: torch.dtype,
-        return_processed_logits: bool = False,
     ) -> _BatchedSamplingResult:
         grouped_requests = _group_requests_by_strategy_key(
             requests,
@@ -1310,8 +1308,6 @@ class TorchSampler(Sampler):
         batch_next_tokens_cuda_int = torch.empty(
             (logits_cuda.size(0),), device=cuda_device, dtype=token_dtype
         )
-        # For processed logprobs: collect processed logits after temperature/top-k/top-p
-        processed_logits_list = [] if return_processed_logits else None
         batch_req_idx_offset_start = 0
         batch_next_tokens_offset_start = 0
         for (strategy_key, speculation_needs_probs), (
@@ -1358,7 +1354,6 @@ class TorchSampler(Sampler):
                     generator=generator_cuda,
                     return_probs=speculation_needs_probs,
                     group_logit_indices=logit_indices_for_sampler,
-                    return_processed_logits=return_processed_logits,
                 )
             )
             batch_next_tokens_offset_end = (
@@ -1367,10 +1362,6 @@ class TorchSampler(Sampler):
             batch_next_tokens_cuda_int[
                 batch_next_tokens_offset_start:batch_next_tokens_offset_end
             ].copy_(group_next_tokens_cuda, non_blocking=True)
-
-            # Collect processed logits if requested
-            if return_processed_logits and group_processed_logits_cuda is not None:
-                processed_logits_list.append(group_processed_logits_cuda)
 
             # Set LlmRequest.py_target_probs
             if speculation_needs_probs:
@@ -1397,15 +1388,9 @@ class TorchSampler(Sampler):
         if needs_d2t:
             self._apply_d2t(batch_next_tokens_cuda_int, model_outputs)
 
-        # Concatenate processed logits if collected
-        processed_logits_cuda = None
-        if return_processed_logits and processed_logits_list:
-            processed_logits_cuda = torch.cat(processed_logits_list, dim=0)
-
         return _BatchedSamplingResult(
             batch_req_indices=batch_req_indices,
             batch_next_tokens_cuda_int=batch_next_tokens_cuda_int,
-            processed_logits_cuda=processed_logits_cuda,
         )
 
     def _unbatch_sampling_results(
@@ -1720,69 +1705,6 @@ class TorchSampler(Sampler):
                 per_step[step][request_idx] = True
         return per_step
 
-    def _compute_processed_logprobs(
-        self,
-        batched_sampling_result: _BatchedSamplingResult,
-        requests: list[LlmRequest],
-        logits_cuda_indexer: _PackedStepIndexer,
-        req_num_steps: torch.Tensor,
-        logprobs_mode: str,
-        cuda_device: torch.device,
-    ) -> None:
-        """
-        Compute processed logprobs from logits after temperature/penalties/top-k/top-p.
-        Updates request objects with the computed logprobs.
-        """
-        processed_logits_cuda = batched_sampling_result.processed_logits_cuda
-        if processed_logits_cuda is None:
-            return
-
-        # Get requests that need logprobs
-        logprobs_req_indices = [
-            req_id for req_id, req in enumerate(requests) if req.py_num_logprobs
-        ]
-        logprobs_logit_indices = logits_cuda_indexer[logprobs_req_indices]
-        logprobs_logit_indices_cuda = logprobs_logit_indices.to(
-            device=cuda_device, non_blocking=True
-        )
-
-        # Apply log_softmax if mode is processed_logprobs
-        if logprobs_mode == "processed_logprobs":
-            processed_logprobs_cuda = F.log_softmax(
-                processed_logits_cuda[logprobs_logit_indices_cuda].to(
-                    dtype=torch.float32, non_blocking=True
-                ),
-                dim=-1,
-            )
-        elif logprobs_mode == "processed_logits":
-            processed_logprobs_cuda = processed_logits_cuda[logprobs_logit_indices_cuda].to(
-                dtype=torch.float32, non_blocking=True
-            )
-
-        # Compute top-k
-        topk_vals_cuda, topk_indices_cuda = torch.topk(
-            processed_logprobs_cuda, k=max(req.py_num_logprobs for req in requests), dim=-1
-        )
-
-        # Transfer to CPU
-        topk_vals = torch.empty_like(topk_vals_cuda, device="cpu", pin_memory=True)
-        topk_indices = torch.empty_like(topk_indices_cuda, device="cpu", pin_memory=True)
-        topk_vals.copy_(topk_vals_cuda, non_blocking=True)
-        topk_indices.copy_(topk_indices_cuda, non_blocking=True)
-
-        # Store in request objects
-        current_offset = 0
-        for req_id, steps in zip(
-            logprobs_req_indices, req_num_steps[logprobs_req_indices].tolist()
-        ):
-            req = requests[req_id]
-            next_offset = current_offset + steps
-            req.py_topk_logprobs_vals = topk_vals[current_offset:next_offset, : req.py_num_logprobs]
-            req.py_topk_logprobs_indices = topk_indices[
-                current_offset:next_offset, : req.py_num_logprobs
-            ]
-            current_offset = next_offset
-
     @nvtx_range("_process_requests")
     def _process_requests(
         self,
@@ -1855,9 +1777,9 @@ class TorchSampler(Sampler):
         # Handle top-k logprobs. This is done outside the sampling loop,
         # because the returned logprobs are specified to not reflect temperature scaling,
         # top-k/top-p masking, etc.
-        # Determine logprobs mode from first request that needs logprobs
-        logprobs_mode = "raw_logprobs"  # default
+
         if return_log_probs:
+            logprobs_mode = None
             for req in requests:
                 if req.py_num_logprobs:
                     logprob_params = getattr(req, "_logprob_params", None)
@@ -1865,9 +1787,6 @@ class TorchSampler(Sampler):
                         logprobs_mode = logprob_params.logprobs_mode
                     break
 
-        # Handle raw logprobs modes: compute BEFORE sampling (temperature/penalties/top-k/top-p)
-        # Raw modes return logprobs/logits before any sampling modifications
-        if return_log_probs and logprobs_mode.startswith("raw"):
             assert logits_cuda.dim() == 2, "logits should be 2D"
             logprobs_req_indices = [
                 req_id for req_id, req in enumerate(requests) if req.py_num_logprobs
@@ -1877,23 +1796,34 @@ class TorchSampler(Sampler):
                 device=logits_cuda.device, non_blocking=True
             )
 
-            # Compute raw logprobs or logits based on mode
-            if logprobs_mode == "raw_logprobs":
-                logits_cuda = raw_logits_cuda[:sum_steps]
+            # Compute logprobs based on mode
+            if logprobs_mode == "processed_logprobs":
+                # Process logits with the same transformations as sampling (temperature, top-k, top-p)
+                # but without actually sampling
+                processed_logits_list = []
+                for req_id in logprobs_req_indices:
+                    req = requests[req_id]
+                    strategy = _request_strategy(req, vocab_size=logits_cuda.size(1))
+                    req_logits_indices = logits_cuda_indexer[req_id]
+                    req_logits = logits_cuda[req_logits_indices].to(
+                        dtype=torch.float32, non_blocking=True
+                    )
+                    # Apply the same processing as sampling would apply
+                    processed_req_logits = process_logits(strategy, req_logits)
+                    processed_logits_list.append(processed_req_logits)
+                # Concatenate all processed logits
+                processed_logits_cuda = torch.cat(processed_logits_list, dim=0)
+                # Apply log_softmax to get log probabilities
+                logprobs_cuda = F.log_softmax(processed_logits_cuda, dim=-1)
+            else:
+                # For raw_logprobs and other modes, use raw logits (before sampling modifications)
+                raw_logits_for_logprobs = raw_logits_cuda[:sum_steps]
                 logprobs_cuda = F.log_softmax(
-                    logits_cuda[logprobs_logit_indices_cuda].to(
+                    raw_logits_for_logprobs[logprobs_logit_indices_cuda].to(
                         dtype=torch.float32, non_blocking=True
                     ),
                     dim=-1,
                 )
-            elif logprobs_mode == "raw_logits":
-                # Return unnormalized logits
-                logits_cuda = raw_logits_cuda[:sum_steps]
-                logprobs_cuda = logits_cuda[logprobs_logit_indices_cuda].to(
-                    dtype=torch.float32, non_blocking=True
-                )
-                print(f"DEBUG: this is should be raw logits: {logprobs_cuda}")
-                print(f"DEBUG: logprobs_cuda.shape: {logprobs_cuda.shape}")
 
             topk_vals_cuda, topk_indices_cuda = torch.topk(
                 logprobs_cuda, k=max(req.py_num_logprobs for req in requests), dim=-1
@@ -1919,10 +1849,6 @@ class TorchSampler(Sampler):
                 current_offset = next_offset
 
         # Perform sampling in batches
-        # For processed modes, we need to capture logits after temperature/penalties/top-k/top-p
-        return_processed_logits_for_logprobs = return_log_probs and logprobs_mode.startswith(
-            "processed"
-        )
 
         batched_sampling_result = self._sample_batched_by_strategy(
             logits_cuda,
@@ -1933,20 +1859,7 @@ class TorchSampler(Sampler):
             req_offsets=req_offsets,
             req_num_steps=req_num_steps,
             token_dtype=new_tokens_cuda.dtype,
-            return_processed_logits=return_processed_logits_for_logprobs,
         )
-
-        # Handle processed logprobs modes: compute AFTER sampling (temperature/penalties/top-k/top-p)
-        # Processed modes return logprobs/logits after all sampling modifications
-        if return_processed_logits_for_logprobs:
-            self._compute_processed_logprobs(
-                batched_sampling_result,
-                requests,
-                logits_cuda_indexer,
-                req_num_steps,
-                logprobs_mode,
-                cuda_device,
-            )
 
         # Fill results into output buffers
         new_tokens_host = self._unbatch_sampling_results(
