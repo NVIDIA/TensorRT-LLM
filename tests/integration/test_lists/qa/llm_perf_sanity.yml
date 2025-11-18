@@ -176,7 +176,7 @@ llm_perf_sanity:
     # gpt_oss_20b_fp4
   - perf/test_perf.py::test_perf[gpt_oss_20b_fp4-bench-pytorch-float4-input_output_len:512,512]
 
-# gpu_arch > Hopper, exculde GB20X, RTX 6000 for not supported
+# gpu_arch > Hopper, exclude GB20X, RTX 6000 for not supported
 - condition:
     ranges:
       system_gpu_count:
