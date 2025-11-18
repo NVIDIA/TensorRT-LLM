@@ -13,7 +13,7 @@ from ray.util.placement_group import (PlacementGroup,
                                       placement_group)
 
 from tensorrt_llm._ray_utils import unwrap_ray_errors
-from tensorrt_llm._utils import get_free_port, nvtx_range_debug, ray_use_rpc
+from tensorrt_llm._utils import get_free_port, nvtx_range_debug
 from tensorrt_llm.logger import logger
 
 from ..llmapi.utils import logger_debug
@@ -21,7 +21,7 @@ from .executor import GenerationExecutor
 from .postproc_worker import PostprocWorkerConfig
 from .ray_gpu_worker import RayGPUWorker, RayWorkerWrapper
 from .request import GenerationRequest
-from .result import GenerationResult, RayAsyncQueue, RaySyncQueue
+from .result import GenerationResult
 from .rpc_proxy_mixin import RpcExecutorMixin
 
 __all__ = [
@@ -76,38 +76,18 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             self.tp_size = tp_size
             self.master_address = ray.util.get_node_ip_address()
             self.master_port = get_free_port()
-            self.use_rpc = ray_use_rpc()
 
             worker_kwargs = dict(**worker_kwargs,
                                  postproc_worker_config=postproc_worker_config,
                                  is_llm_executor=is_llm_executor)
 
-            if self.use_rpc:
-                self.init_rpc_executor()
-                worker_kwargs['rpc_addr'] = self.rpc_addr
-                self.create_workers(RayGPUWorker, worker_kwargs)
-                self.setup_engine_remote()
-                self.setup_mainloop(tasks=[self._fetch_responses_loop_async],
-                                    thread_name="ray_executor_main_loop")
-                logger.info(f"Connecting to RPC server at {self.rpc_addr}")
-            else:
-                self.response_queue = RayAsyncQueue.options(runtime_env={
-                    "env_vars": {
-                        "TLLM_DISABLE_MPI": "1"
-                    }
-                }).remote()
-                self.response_sync_queue = RaySyncQueue.options(runtime_env={
-                    "env_vars": {
-                        "TLLM_DISABLE_MPI": "1"
-                    }
-                }).remote()
-                self.async_response_queue_weakref = self.create_actor_weak_ref(
-                    self.response_queue)
-                self.sync_response_queue_weakref = self.create_actor_weak_ref(
-                    self.response_sync_queue)
-                self.response_queue.warmup.remote()
-                self.response_sync_queue.warmup.remote()
-                self.create_workers(RayGPUWorker, worker_kwargs)
+            self.init_rpc_executor()
+            worker_kwargs['rpc_addr'] = self.rpc_addr
+            self.create_workers(RayGPUWorker, worker_kwargs)
+            self.setup_engine_remote()
+            self.setup_mainloop(tasks=[self._fetch_responses_loop_async],
+                                thread_name="ray_executor_main_loop")
+            logger.info(f"Connecting to RPC server at {self.rpc_addr}")
 
         except Exception as e:
             self.shutdown()
@@ -192,37 +172,21 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
     def submit(self, request: "GenerationRequest") -> "GenerationResult":
         """
         Low-level API to the executor. Return a "future" GenerationResult
-        which can be waited.
-        Forwards the request to the workers through RPC or Ray queues depending on mode.
+        which can be waited. Forwards the request to the workers through RPC.
         """
         request.set_id(self._get_next_client_id())
         logprob_params = self._get_logprob_params(request)
 
-        if self.use_rpc:
-            with nvtx_range_debug("rpc_submit"):
-                self.rpc_client.submit(request).remote(need_response=False)
+        with nvtx_range_debug("rpc_submit"):
+            self.rpc_client.submit(request).remote(need_response=False)
 
-            result = GenerationResult(
-                request,
-                background_error_handler=self._handle_background_error,
-                executor=self,
-                disaggregated_params=request.disaggregated_params,
-                logprob_params=logprob_params)
-            self._results[request.id] = result
-        else:
-            result = GenerationResult(
-                request,
-                background_error_handler=self._handle_background_error,
-                executor=self,
-                disaggregated_params=request.disaggregated_params,
-                logprob_params=logprob_params)
-
-            with nvtx_range_debug("request_queue.put"):
-                self.call_all_ray_workers("enqueue_request",
-                                          leader_only=True,
-                                          request=request,
-                                          async_call=True,
-                                          result_wait_queue=result.queue)
+        result = GenerationResult(
+            request,
+            background_error_handler=self._handle_background_error,
+            executor=self,
+            disaggregated_params=request.disaggregated_params,
+            logprob_params=logprob_params)
+        self._results[request.id] = result
 
         return result
 
@@ -238,9 +202,6 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
                                             async_call=False)
         return sorted(gpu_ids)
 
-    def use_ray_queue(self) -> bool:
-        return not self.use_rpc
-
     def abort_request(self, request_id: int) -> None:
         self.call_all_ray_workers("abort_request",
                                   leader_only=True,
@@ -253,54 +214,40 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         if hasattr(self, '_shutdown_event'):
             self._shutdown_event.set()
 
-        mode_str = "RPC mode" if self.use_rpc else "Ray queue mode"
-        logger_debug(f"Shutting down RayExecutor ({mode_str})", color="yellow")
+        logger_debug(f"Shutting down RayExecutor", color="yellow")
 
-        if self.use_rpc:
-            if hasattr(self, 'main_loop') and self.main_loop and hasattr(
-                    self, 'main_loop_task_obj') and self.main_loop_task_obj:
-                logger_debug("Cancelling main loop task.", color="yellow")
-                try:
-                    self.main_loop.call_soon_threadsafe(
-                        self.main_loop_task_obj.cancel)
-                except Exception as e:
-                    logger_debug(f"Error cancelling main loop task: {e}",
-                                 color="yellow")
+        if hasattr(self, 'main_loop') and self.main_loop and hasattr(
+                self, 'main_loop_task_obj') and self.main_loop_task_obj:
+            logger_debug("Cancelling main loop task.", color="yellow")
+            try:
+                self.main_loop.call_soon_threadsafe(
+                    self.main_loop_task_obj.cancel)
+            except Exception as e:
+                logger_debug(f"Error cancelling main loop task: {e}",
+                             color="yellow")
 
-                if hasattr(self, 'main_loop_thread'):
-                    self.main_loop_thread.join()
+            if hasattr(self, 'main_loop_thread'):
+                self.main_loop_thread.join()
 
-            # Then, shutdown the workers
-            if hasattr(self, 'workers') and self.workers is not None:
-                try:
-                    logger_debug("Shutting down RPC remote", color="yellow")
-                    shutdown_refs = [
-                        worker.shutdown.remote() for worker in self.workers
-                    ]
-                    # Add timeout to prevent indefinite hanging
-                    ray.get(shutdown_refs, timeout=30.0)
-                except ray.exceptions.GetTimeoutError:
-                    logger.warning(
-                        "Timeout waiting for workers to shutdown after 30 seconds"
-                    )
-                except Exception as e:
-                    logger.warning(f"Error shutting down RPC remote: {e}")
+        # Then, shutdown the workers
+        if hasattr(self, 'workers') and self.workers is not None:
+            try:
+                shutdown_refs = [
+                    worker.shutdown.remote() for worker in self.workers
+                ]
+                # Add timeout to prevent indefinite hanging
+                ray.get(shutdown_refs, timeout=30.0)
+            except ray.exceptions.GetTimeoutError:
+                logger.warning(
+                    "Timeout waiting for workers to shutdown after 30 seconds")
+            except Exception as e:
+                logger.warning(f"Error shutting down: {e}")
 
-            if hasattr(self, 'rpc_client') and self.rpc_client is not None:
-                try:
-                    self.rpc_client.close()
-                except Exception as e:
-                    # Suppress errors during RPC client shutdown
-                    # These can occur if the client is already closed or if there are
-                    # pending operations that get cancelled during cleanup
-                    logger_debug(
-                        f"Suppressed error during RPC client close: {e}")
-        else:
-            # Release actors
-            self.response_queue = None
-            self.response_sync_queue = None
-            self.async_response_queue_weakref = None
-            self.sync_response_queue_weakref = None
+        if hasattr(self, 'rpc_client') and self.rpc_client is not None:
+            try:
+                self.rpc_client.close()
+            except Exception as e:
+                logger_debug(f"Suppressed error during RPC client close: {e}")
 
         self.workers = None
         if hasattr(self,
@@ -387,9 +334,3 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         ret = super().enable_postprocess_parallel
         assert ret == False, "Postprocess parallel is not supported in RayExecutor"
         return ret
-
-    @staticmethod
-    def create_actor_weak_ref(actor_handle: ray.actor.ActorHandle):
-        state, _, _ = actor_handle._serialization_helper()
-        return ray.actor.ActorHandle._deserialization_helper(state,
-                                                             weak_ref=True)

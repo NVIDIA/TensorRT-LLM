@@ -103,9 +103,6 @@ class GenerationExecutor(ABC):
         self._iter_kv_events_result: IterationResult | None = None
         self._iter_stats_result: IterationResult | None = None
 
-    def use_ray_queue(self) -> bool:
-        return False
-
     @abstractmethod
     def submit(self, request: GenerationRequest) -> GenerationResult:
         pass
