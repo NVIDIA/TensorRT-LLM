@@ -2160,7 +2160,6 @@ def reusePassedTestResults(llmSrc, stageName, testDBList, waivesTxt) {
                 "${test} SKIP (Reused from previous pipeline)"
             }.join('\n')
 
-            // Use heredoc to append content directly without intermediate files
             sh """
                 cat >> ${waivesTxt} << 'REUSED_TESTS_EOF'
     ${reusedTestsContent}
