@@ -2686,6 +2686,12 @@ class TorchLlmArgs(BaseLlmArgs):
         self._extra_resource_managers = value
 
     @model_validator(mode="after")
+    def validate_model_format_misc(self):
+        # Store the model format in the values
+        self._model_format = _ModelFormatKind.HF
+        return self
+
+    @model_validator(mode="after")
     def validate_speculative_config(self):
         if self.speculative_config:
             if not self.speculative_config.supports_backend(self.backend):
