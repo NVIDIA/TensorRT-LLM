@@ -317,15 +317,15 @@ class LinearMethodBase(ABC):
         """
         Load weights from the checkpoint.
         """
+        kargs = {}
+        if isinstance(self, UnquantizedLinearMethod):
+            kargs['allow_partial_loading'] = allow_partial_loading
         if weight_mode == WeightMode.VANILLA:
-            self.load_weights_vanilla(
-                module, weights, allow_partial_loading=allow_partial_loading)
+            self.load_weights_vanilla(module, weights, **kargs)
         elif weight_mode == WeightMode.FUSED_QKV_LINEAR:
-            self.load_weights_fused_qkv_linear(
-                module, weights, allow_partial_loading=allow_partial_loading)
+            self.load_weights_fused_qkv_linear(module, weights, **kargs)
         elif weight_mode == WeightMode.FUSED_GATE_UP_LINEAR:
-            self.load_weights_fused_gate_up_linear(
-                module, weights, allow_partial_loading=allow_partial_loading)
+            self.load_weights_fused_gate_up_linear(module, weights, **kargs)
         else:
             raise ValueError(f'unsupported weight mode: {weight_mode}')
 
@@ -2220,13 +2220,11 @@ class Linear(nn.Module):
         weight_mode = self.weights_loading_config.weight_mode
         if not isinstance(self.quant_method, UnquantizedLinearMethod):
             assert allow_partial_loading is False, "allow_partial_loading is only supported for non-unquantized linear methods now"
-            self.quant_method.load_weights(self, weights, weight_mode)
-        else:
-            self.quant_method.load_weights(
-                self,
-                weights,
-                weight_mode,
-                allow_partial_loading=allow_partial_loading)
+        self.quant_method.load_weights(
+            self,
+            weights,
+            weight_mode,
+            allow_partial_loading=allow_partial_loading)
 
     def post_load_weights(self):
         self.quant_method.post_load_weights(self)
