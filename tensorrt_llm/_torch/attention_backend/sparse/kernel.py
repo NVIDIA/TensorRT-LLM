@@ -891,7 +891,7 @@ def rocket_update_kt_cache_ctx_kernel(
     num_heads,
     num_kv_heads,
     head_dim,
-    kt_page_size,
+    kt_page_size: tl.constexpr,
     tokens_per_block,
     max_kt_blocks_per_seq,
     total_sparse_tokens,
@@ -903,9 +903,7 @@ def rocket_update_kt_cache_ctx_kernel(
     """
     batch_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
-
-    if batch_idx >= batch_size or kv_head_idx >= num_kv_heads:
-        return
+    kt_block_idx = tl.program_id(2)
 
     context_start = tl.load(context_cumsum_ptr + batch_idx)
 
@@ -916,100 +914,71 @@ def rocket_update_kt_cache_ctx_kernel(
     if num_sparse_tokens <= 0:
         return
 
-    # Calculate number of kt_tokens for this batch
-    num_kt_tokens = (num_sparse_tokens + kt_page_size - 1) // kt_page_size
-
     q_hidden_size = num_heads * head_dim
     kv_hidden_size = num_kv_heads * head_dim
     k_dim_base = q_hidden_size + kv_head_idx * head_dim
 
-    # Process kt_tokens and dimensions in blocks
-    for kt_block_start in tl.range(0, num_kt_tokens, BLOCK_SIZE_KT):
-        # Get kt_token indices for this block [BLOCK_SIZE_KT]
-        kt_offsets = kt_block_start + tl.arange(0, BLOCK_SIZE_KT)
-        kt_mask = kt_offsets < num_kt_tokens
+    BLOCK_SIZE_KV: tl.constexpr = kt_page_size * BLOCK_SIZE_KT
 
-        # Calculate page boundaries for all kt_tokens in this block
-        page_starts = sparse_start + kt_offsets * kt_page_size
-        page_ends = tl.minimum(page_starts + kt_page_size, sparse_end)
+    total_kt_tokens = (num_sparse_tokens + kt_page_size - 1) // kt_page_size
+    kt_offsets = kt_block_idx * BLOCK_SIZE_KT + tl.arange(0, BLOCK_SIZE_KT)
+    kt_mask = kt_offsets < total_kt_tokens
 
-        for dim_block_start in tl.range(0, head_dim, BLOCK_SIZE_DIM):
-            dim_offsets = tl.arange(0, BLOCK_SIZE_DIM)
-            dim_indices = dim_block_start + dim_offsets
-            dim_mask = dim_indices < head_dim
+    kv_start = kt_block_idx * BLOCK_SIZE_KT * kt_page_size
+    kv_offsets = kv_start + tl.arange(0, BLOCK_SIZE_KV)
+    kv_mask = kv_offsets < num_sparse_tokens
+    kv_indices = kv_head_idx * total_sparse_tokens + sparse_start + kv_offsets
 
-            k_min = tl.full((BLOCK_SIZE_KT, BLOCK_SIZE_DIM),
-                            float('inf'),
-                            dtype=tl.float32)
-            k_max = tl.full((BLOCK_SIZE_KT, BLOCK_SIZE_DIM),
-                            float('-inf'),
-                            dtype=tl.float32)
+    for dim_block_start in tl.range(0, head_dim, BLOCK_SIZE_DIM):
+        dim_offsets = tl.arange(0, BLOCK_SIZE_DIM)
+        dim_indices = dim_block_start + dim_offsets
+        dim_mask = dim_indices < head_dim
 
-            # Iterate through all tokens in the page
-            for page_offset in range(kt_page_size):
-                # Calculate token indices within sparse range [BLOCK_SIZE_KT]
-                token_indices = page_starts + page_offset
-                token_mask = (token_indices < page_ends) & kt_mask
+        kv_token_indices = tl.load(sparse_kv_indices_ptr + kv_indices,
+                                   mask=kv_mask,
+                                   other=0)
+        # Calculate indices for loading keys [BLOCK_SIZE_DIM, BLOCK_SIZE_KV]
+        k_base_indices = (kv_token_indices[None, :] + context_start) * (
+            q_hidden_size + 2 * kv_hidden_size) + k_dim_base
+        k_indices = k_base_indices + dim_indices[:, None]
 
-                # Load sparse indices for all valid tokens [BLOCK_SIZE_KT]
-                sparse_idx_offsets = kv_head_idx * total_sparse_tokens + token_indices
-                kv_token_indices = tl.load(sparse_kv_indices_ptr +
-                                           sparse_idx_offsets,
-                                           mask=token_mask,
-                                           other=0)
+        combined_mask = kv_mask[None, :] & dim_mask[:, None]
 
-                # Broadcast for 2D operations [BLOCK_SIZE_KT, BLOCK_SIZE_DIM]
-                valid_mask_2d = token_mask[:, None] & dim_mask[None, :]
+        # Load key values [BLOCK_SIZE_DIM, BLOCK_SIZE_KV]
+        k_values = tl.load(k_ptr + k_indices, mask=combined_mask, other=0.0)
 
-                # Calculate indices for loading keys [BLOCK_SIZE_KT, BLOCK_SIZE_DIM]
-                k_base_indices = (kv_token_indices[:, None] + context_start) * (
-                    q_hidden_size + 2 * kv_hidden_size) + k_dim_base
-                k_indices = k_base_indices + dim_indices[None, :]
+        k_values = tl.reshape(k_values,
+                              (BLOCK_SIZE_DIM, BLOCK_SIZE_KT, kt_page_size))
 
-                # Load key values [BLOCK_SIZE_KT, BLOCK_SIZE_DIM]
-                k_values = tl.load(k_ptr + k_indices,
-                                   mask=valid_mask_2d,
-                                   other=0.0)
+        k_min = tl.min(k_values,
+                       axis=-1).to(kt_cache_tensor_ptr.dtype.element_ty)
+        k_max = tl.max(k_values,
+                       axis=-1).to(kt_cache_tensor_ptr.dtype.element_ty)
 
-                k_min = tl.where(valid_mask_2d, tl.minimum(k_min, k_values),
-                                 k_min)
-                k_max = tl.where(valid_mask_2d, tl.maximum(k_max, k_values),
-                                 k_max)
+        # Calculate cache locations [BLOCK_SIZE_KT]
+        block_offsets_in_seq = kt_offsets // tokens_per_block
+        valid_block_mask = (block_offsets_in_seq
+                            < max_kt_blocks_per_seq) & kt_mask
 
-            k_min = k_min.to(kt_cache_tensor_ptr.dtype.element_ty)
-            k_max = k_max.to(kt_cache_tensor_ptr.dtype.element_ty)
+        # Load block indices [BLOCK_SIZE_KT]
+        block_offset_addrs = batch_idx * max_kt_blocks_per_seq + block_offsets_in_seq
+        block_indices = tl.load(kt_cache_block_offsets_ptr + block_offset_addrs,
+                                mask=valid_block_mask,
+                                other=0)
 
-            # Calculate cache locations [BLOCK_SIZE_KT]
-            block_offsets_in_seq = kt_offsets // tokens_per_block
-            valid_block_mask = (block_offsets_in_seq
-                                < max_kt_blocks_per_seq) & kt_mask
+        tokens_in_block = kt_offsets % tokens_per_block
 
-            # Load block indices [BLOCK_SIZE_KT]
-            block_offset_addrs = batch_idx * max_kt_blocks_per_seq + block_offsets_in_seq
-            block_indices = tl.load(kt_cache_block_offsets_ptr +
-                                    block_offset_addrs,
-                                    mask=valid_block_mask,
-                                    other=0)
+        # Calculate cache base addresses [BLOCK_SIZE_KT]
+        cache_bases = ((block_indices * tokens_per_block + tokens_in_block) *
+                       num_kv_heads * 2 * head_dim + kv_head_idx * 2 * head_dim)
 
-            tokens_in_block = kt_offsets % tokens_per_block
+        cache_min_addrs = cache_bases[None, :] + dim_indices[:, None]
+        cache_max_addrs = cache_min_addrs + head_dim
 
-            # Calculate cache base addresses [BLOCK_SIZE_KT]
-            cache_bases = (
-                (block_indices * tokens_per_block + tokens_in_block) *
-                num_kv_heads * 2 * head_dim + kv_head_idx * 2 * head_dim)
+        store_mask = valid_block_mask[None, :] & dim_mask[:, None]
 
-            cache_min_addrs = cache_bases[:, None] + dim_indices[None, :]
-            cache_max_addrs = cache_bases[:, None] + head_dim + dim_indices[
-                None, :]
-
-            store_mask = valid_block_mask[:, None] & dim_mask[None, :]
-
-            tl.store(kt_cache_tensor_ptr + cache_min_addrs,
-                     k_min,
-                     mask=store_mask)
-            tl.store(kt_cache_tensor_ptr + cache_max_addrs,
-                     k_max,
-                     mask=store_mask)
+        tl.store(kt_cache_tensor_ptr + cache_min_addrs, k_min, mask=store_mask)
+        tl.store(kt_cache_tensor_ptr + cache_max_addrs, k_max, mask=store_mask)
 
 
 def triton_rocket_update_kt_cache_ctx(
@@ -1023,6 +992,7 @@ def triton_rocket_update_kt_cache_ctx(
     num_kv_heads: int,
     head_dim: int,
     kt_page_size: int,
+    prompt_budget: int,
     tokens_per_block: int,
     max_kt_blocks_per_seq: int,
 ):
@@ -1039,16 +1009,20 @@ def triton_rocket_update_kt_cache_ctx(
         num_kv_heads: Number of KV heads
         head_dim: Head dimension
         kt_page_size: Page size for KT tokens
+        prompt_budget: Prompt budget
         tokens_per_block: Tokens per cache block
         max_kt_blocks_per_seq: Maximum KT blocks per sequence
     """
     batch_size = sparse_kv_offsets.size(0) - 1
     total_sparse_tokens = sparse_kv_indices.size(1)
 
-    BLOCK_SIZE_KT = 128
-    BLOCK_SIZE_DIM = 128
+    total_kt_tokens = (prompt_budget + kt_page_size - 1) // kt_page_size
 
-    grid = (batch_size, num_kv_heads)
+    BLOCK_SIZE_KT = 8
+    BLOCK_SIZE_DIM = head_dim
+
+    grid = (batch_size, num_kv_heads,
+            (total_kt_tokens + BLOCK_SIZE_KT - 1) // BLOCK_SIZE_KT)
 
     rocket_update_kt_cache_ctx_kernel[grid](
         qkv_input,

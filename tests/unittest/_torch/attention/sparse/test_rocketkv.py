@@ -167,7 +167,7 @@ def test_sparse_kv_predict(batch_size, num_contexts):
         window_size=32,
         kernel_size=3,
         prompt_budget=256,
-        page_size=3,
+        page_size=4,
     )
 
     # Create sequence lengths - mix short and long sequences in context phase
@@ -370,7 +370,7 @@ def test_sparse_attn_predict(batch_size, num_contexts):
         window_size=32,
         kernel_size=3,
         prompt_budget=256,
-        page_size=3,
+        page_size=2,
         topk=128,
         topr=96,
     )
@@ -378,8 +378,8 @@ def test_sparse_attn_predict(batch_size, num_contexts):
         window_size=32,
         kernel_size=3,
         prompt_budget=256,
-        page_size=3,
-        topk=43,
+        page_size=2,
+        topk=64,
         topr=96,
         kt_cache_dtype=torch.float8_e5m2,
     )
