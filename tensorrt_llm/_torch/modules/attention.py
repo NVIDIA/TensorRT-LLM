@@ -8,7 +8,7 @@ from torch import nn
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f, nvtx_range,
                                  nvtx_range_debug)
 from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.mapping import CpType, Mapping
 
 from ..attention_backend import (AttentionInputType, AttentionMetadata,
                                  FlashInferAttentionMetadata, TrtllmAttention,
@@ -676,6 +676,7 @@ class MLA(nn.Module):
         dense_bias: Optional[bool] = None,
         config: Optional[ModelConfig] = None,
         enable_unit_test: bool = False,
+        mapping_with_cp: Optional[Mapping] = None,
     ):
         """
         Initialize the MLA module.
@@ -708,7 +709,7 @@ class MLA(nn.Module):
         self.hidden_size = hidden_size
         self.num_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        assert self.num_heads == self.num_key_value_heads, "num_heads must be equal to num_key_value_heads"
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
         self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
@@ -747,7 +748,11 @@ class MLA(nn.Module):
 
         # tensor parallel
         config = config or ModelConfig()
-        self.mapping = config.mapping
+        if mapping_with_cp is not None:
+            print("[MLA::__init__] OVERRIDING MAPPING WITH CP DETECTED.")
+            self.mapping = mapping_with_cp
+        else:
+            self.mapping = config.mapping
         tp_size = self.mapping.tp_size
         pp_size = self.mapping.pp_size
         cp_size = self.mapping.cp_size
@@ -755,6 +760,8 @@ class MLA(nn.Module):
             tp_size = 1
         if self.mapping.has_cp_ulysses():
             raise NotImplementedError("MLA doesn't support CP Ulyssees yet")
+        if self.mapping.cp_size > 1:
+            assert self.mapping.cp_config['cp_type'] == CpType.HELIX
 
         mapping = Mapping(
             world_size=tp_size * pp_size * cp_size,
@@ -886,7 +893,7 @@ class MLA(nn.Module):
         mscale_all_dim = pos_embd_params.rope.mscale_all_dim
         scaling_factor = pos_embd_params.rope.scale
         mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
-        q_scaling = 1.0 / (mscale * mscale)
+        self.q_scaling = 1.0 / (mscale * mscale)
 
         if not self.is_dsa:
             self.mha = create_attention(
@@ -919,7 +926,7 @@ class MLA(nn.Module):
             num_kv_heads=1,
             pos_embd_params=pos_embd_params,
             quant_config=quant_config,
-            q_scaling=q_scaling,
+            q_scaling=self.q_scaling,
             is_mla_enable=True,
             q_lora_rank=self.q_lora_rank,
             kv_lora_rank=self.kv_lora_rank,
@@ -1086,6 +1093,9 @@ class MLA(nn.Module):
 
     def create_output(self, hidden_states: torch.Tensor, num_contexts: int):
         num_tokens = hidden_states.shape[0]
+        # note: for testing Helix parallelism, we ensure that the output is
+        # large enough for the context phase, but we then cut it again in
+        # `forward_context`
         hidden_size = self.o_proj.in_features
         if self.enable_unit_test and num_contexts > 0:
             # note: for testing Helix parallelism, we ensure that the output is
@@ -1286,6 +1296,7 @@ class MLA(nn.Module):
                 q_gen,
                 compressed_kv_gen,
                 k_pe_gen,
+                position_ids,
                 attn_metadata,
                 output[num_ctx_tokens:num_tokens, :],
                 latent_cache_gen,
@@ -1320,6 +1331,10 @@ class MLA(nn.Module):
                                                        self.qk_rope_head_dim)
         k = k.view(-1, self.num_heads_tp * self.qk_head_dim)
 
+        helix_position_offsets = position_ids if self.mapping.cp_size > 1 else None
+
+        # helix_position_offsets = position_ids if self.mapping.has_cp_helix(
+        #     ) else None
         helix_position_offsets = position_ids if self.mapping.cp_size > 1 else None
 
         attn_output = self.mha.forward(
@@ -1649,6 +1664,7 @@ class MLA(nn.Module):
         q: torch.Tensor,
         compressed_kv: torch.Tensor,
         k_pe: torch.Tensor,
+        position_ids: torch.Tensor,
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
         position_ids: Optional[torch.Tensor] = None,
@@ -2077,7 +2093,6 @@ class MLA(nn.Module):
         else:
             raise NotImplementedError(
                 f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")
-
         return output
 
     def forward(
