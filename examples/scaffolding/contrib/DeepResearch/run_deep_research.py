@@ -9,8 +9,6 @@ from tensorrt_llm.scaffolding.contrib.DeepResearch import create_open_deep_resea
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--max_research_iter", type=int, default=10)
-    parser.add_argument("--max_concurrent_research_units", type=int, default=10)
     parser.add_argument("--openai_api_key", type=str, default="tensorrt_llm")
     parser.add_argument("--base_url", type=str, default="http://localhost:8000/v1")
     parser.add_argument("--model", type=str, default="gpt-oss-20b")
@@ -26,9 +24,7 @@ async def main():
     mcp_worker = MCPWorker.init_with_urls(["http://0.0.0.0:8082/sse"])
     await mcp_worker.init_in_asyncio_event_loop()
 
-    llm = create_open_deep_research_scaffolding_llm(
-        generation_worker, mcp_worker, args.max_research_iter, args.max_concurrent_research_units
-    )
+    llm = create_open_deep_research_scaffolding_llm(generation_worker, mcp_worker)
 
     prompt = """
         From 2020 to 2050, how many elderly people will there be in Japan? What is their consumption \
