@@ -3,8 +3,14 @@ from dataclasses import dataclass, field
 from typing import List
 
 from tensorrt_llm.scaffolding import ChatTask, Controller, SystemMessage, Task, UserMessage
+from tensorrt_llm.scaffolding.task_collection import drop_kv_cache_scope, sub_request_node
 
-from .prompts import compress_research_simple_human_message, research_system_prompt
+from .prompts import (
+    compress_research_simple_human_prompt,
+    compress_research_simple_human_prompt_prefix,
+    research_system_prompt,
+    research_system_prompt_prefix,
+)
 from .tools import reflection_tool, tavily_search_tool
 from .utils import get_today_str
 
@@ -47,7 +53,12 @@ class Compressor(Controller):
         )
         compress_task = ChatTask.create_from_prompt(None, self.system_prompts)
         compress_task.add_messages(tasks[0].messages)
-        compress_task.add_message(UserMessage(compress_research_simple_human_message))
+        compress_task.add_message(
+            UserMessage(
+                compress_research_simple_human_prompt,
+                prefix=compress_research_simple_human_prompt_prefix,
+            )
+        )
 
         for i in range(self.max_iterations):
             yield from self.generation_controller.process([compress_task])
@@ -60,6 +71,8 @@ class Compressor(Controller):
         return
 
 
+@sub_request_node("Researcher")
+@drop_kv_cache_scope()
 class Researcher(Controller):
     tools = [tavily_search_tool, reflection_tool]
 
@@ -77,7 +90,12 @@ class Researcher(Controller):
     def process(self, research_tasks: List[ResearchTask], **kwargs):
         chat_task = ChatTask.create_from_prompt(
             research_tasks[0].research_topic,
-            [SystemMessage(research_system_prompt.format(date=get_today_str()))],
+            [
+                SystemMessage(
+                    research_system_prompt.format(date=get_today_str()),
+                    prefix=research_system_prompt_prefix,
+                )
+            ],
         )
 
         yield from self.chat_with_tools_controller.process([chat_task])

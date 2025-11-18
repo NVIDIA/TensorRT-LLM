@@ -35,6 +35,12 @@ Guidelines:
 - If the query is in a specific language, prioritize sources published in that language.
 """
 
+generate_research_brief_prompt_prefix = """You will be given a set of messages that have been exchanged so far between yourself and the user.
+Your job is to translate these messages into a more detailed and concrete research question that will be used to guide the research.
+
+The messages that have been exchanged so far between yourself and the user are:
+"""
+
 supervisor_system_prompt = """You are a research supervisor. Your job is to conduct research by calling the "conduct_research" tool. For context, today's date is {date}.
 
 <Task>
@@ -103,6 +109,8 @@ After each conduct_research tool call, use think_tool to analyze the results:
 - Do NOT use acronyms or abbreviations in your research questions, be very clear and specific
 </Scaling Rules>"""
 
+supervisor_system_prompt_prefix = supervisor_system_prompt
+
 research_system_prompt = """You are a research assistant conducting research on the user's input topic. For context, today's date is {date}.
 
 <Task>
@@ -149,6 +157,8 @@ After each search tool call, use reflection to analyze the results:
 </Show Your Thinking>
 """
 
+research_system_prompt_prefix = research_system_prompt
+
 compress_system_prompt = """You are a research assistant that has conducted research on a topic by calling several tools and web searches. Your job is now to clean up the findings, but preserve all of the relevant statements and information that the researcher has gathered. For context, today's date is {date}.
 
 <Task>
@@ -187,9 +197,13 @@ The report should be structured like this:
 Critical Reminder: It is extremely important that any information that is even remotely relevant to the user's research topic is preserved verbatim (e.g. don't rewrite it, don't summarize it, don't paraphrase it).
 """
 
-compress_research_simple_human_message = """All above messages are about research conducted by an AI Researcher. Please clean up these findings.
+compress_system_prompt_prefix = compress_system_prompt
+
+compress_research_simple_human_prompt = """All above messages are about research conducted by an AI Researcher. Please clean up these findings.
 
 DO NOT summarize the information. I want the raw information returned, just in a cleaner format. Make sure all relevant information is preserved - you can rewrite findings verbatim."""
+
+compress_research_simple_human_prompt_prefix = compress_research_simple_human_prompt
 
 final_report_generation_prompt = """Based on all the research conducted, create a comprehensive, well-structured answer to the overall research brief:
 <Research Brief>
@@ -271,4 +285,7 @@ Format the report in clear markdown with proper structure and include source ref
   [2] Source Title: URL
 - Citations are extremely important. Make sure to include these, and pay a lot of attention to getting these right. Users will often use these citations to look into more information.
 </Citation Rules>
+"""
+
+final_report_generation_prompt_prefix = """Based on all the research conducted, create a comprehensive, well-structured answer to the overall research brief:
 """

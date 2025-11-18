@@ -137,6 +137,7 @@ class RewardTask(Task):
 class RoleMessage:
     role: Optional[str] = field(default=None)
     content: Optional[str] = field(default=None)
+    prefix: Optional[str] = field(default=None)
 
     def __str__(self) -> str:
         return f"{self.role}: {self.content}\n"
@@ -155,8 +156,8 @@ class RoleMessage:
 @dataclass
 class UserMessage(RoleMessage):
 
-    def __init__(self, content: str):
-        super().__init__(role="user", content=content)
+    def __init__(self, content: str, prefix: Optional[str] = None):
+        super().__init__(role="user", content=content, prefix=prefix)
 
 
 @dataclass
@@ -179,8 +180,8 @@ class AssistantMessage(RoleMessage):
 @dataclass
 class SystemMessage(RoleMessage):
 
-    def __init__(self, content: str):
-        super().__init__(role="system", content=content)
+    def __init__(self, content: str, prefix: Optional[str] = None):
+        super().__init__(role="system", content=content, prefix=prefix)
 
 
 class ToolDescription:
@@ -214,6 +215,10 @@ class OpenAIToolDescription(ToolDescription):
 class ChatTask(StreamGenerationTask):
     messages: list[RoleMessage] = field(default_factory=list)
     tools: Any = field(default=None)
+
+    # for sub request marker
+    sub_request_markers: list[tuple[str, int]] = field(default_factory=list)
+    unique_id: Optional[int] = field(default=None)
 
     def messages_to_dict_content(self,
                                  start_index: int = 0
@@ -267,3 +272,24 @@ class MCPCallTask(Task):
         task.args = args
         task.worker_tag = worker_tag
         return task
+
+
+@dataclass
+class DropKVCacheTask(Task):
+    # input field
+    prefix: Optional[str] = field(default=None)
+    messages: list[RoleMessage] = field(default_factory=list)
+
+    def __init__(self, chat_task: ChatTask, worker_tag: str):
+        self.worker_tag = worker_tag
+        self.messages = chat_task.messages
+        self.prefix = ""
+        for message in self.messages:
+            if message.role == "system" or message.role == "user":
+                if message.prefix is not None:
+                    self.prefix += message.prefix
+                if message.prefix is None or len(message.prefix) < len(
+                        message.content):
+                    break
+            else:  # assistant message
+                break

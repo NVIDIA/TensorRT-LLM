@@ -12,8 +12,8 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig, SchedulerConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
 from .result import ScaffoldingOutput
-from .task import (AssistantMessage, ChatTask, GenerationTask, MCPCallTask,
-                   StreamGenerationTask, Task, TaskStatus)
+from .task import (AssistantMessage, ChatTask, DropKVCacheTask, GenerationTask,
+                   MCPCallTask, StreamGenerationTask, Task, TaskStatus)
 
 ExecutorCls = GenerationExecutor
 
@@ -149,7 +149,15 @@ class OpenaiWorker(Worker):
             print('Openai chat client get exception: ' + str(e))
             return TaskStatus.WORKER_EXECEPTION
 
-    task_handlers = {GenerationTask: generation_handler, ChatTask: chat_handler}
+    async def drop_kv_cache_handler(self, task: DropKVCacheTask) -> TaskStatus:
+        # TODO: implement the logic to drop the kv cache
+        return TaskStatus.SUCCESS
+
+    task_handlers = {
+        GenerationTask: generation_handler,
+        ChatTask: chat_handler,
+        DropKVCacheTask: drop_kv_cache_handler
+    }
 
 
 # worker inherit from OpenaiWorker
