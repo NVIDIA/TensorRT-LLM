@@ -429,3 +429,118 @@ def test_nvfp4_grouped_gemm_blackwell(num_tokens: int, top_k: int, ep_size: int,
     torch.testing.assert_close(
         c[: num_valid_tiles * tile_size], c_ref[: num_valid_tiles * tile_size]
     )
+
+
+@pytest.mark.skipif(get_sm_version() != 100, reason="This test is only supported on SM 100 GPUs")
+@pytest.mark.parametrize("tile_size", [128])
+@pytest.mark.parametrize("ep_size", [1, 8, 32])
+@pytest.mark.parametrize("top_k", [1, 2, 8])
+@pytest.mark.parametrize("num_tokens", [128, 515, 1024, 8192])
+def test_nvfp4_grouped_gemm_finalize_blackwell(
+    num_tokens: int, top_k: int, ep_size: int, tile_size: int
+):
+    sf_vec_size = 16
+    hidden_size = 4096
+    inter_size = 8192
+    num_experts = 256
+    num_local_experts = num_experts // ep_size
+
+    routing_logits = torch.randn(num_tokens, num_experts, device="cuda")
+    token_final_scales, token_selected_experts = routing_logits.topk(top_k, dim=-1)
+    token_selected_experts = token_selected_experts.to(torch.int32)
+    token_final_scales = token_final_scales.softmax(dim=-1).to(torch.float32)
+
+    (
+        tile_idx_to_group_idx,
+        tile_idx_to_mn_limit,
+        expanded_idx_to_permuted_idx,
+        permuted_idx_to_expanded_idx,
+        total_num_padded_tokens,
+        num_non_exiting_tiles,
+    ) = torch.ops.trtllm.moe_sort(
+        token_selected_experts=token_selected_experts,
+        token_final_scales=token_final_scales,
+        num_experts=num_experts,
+        top_k=top_k,
+        local_expert_offset=0,
+        local_num_experts=num_local_experts,
+        tile_tokens_dim=tile_size,
+    )
+
+    # TODO: Remove this WAR.
+    max_num_permuted_tokens = permuted_idx_to_expanded_idx.size(0)
+    permuted_idx_to_expanded_idx.masked_fill_(
+        torch.arange(max_num_permuted_tokens, device="cuda")
+        >= tile_idx_to_mn_limit.repeat_interleave(tile_size),
+        -1,
+    )
+
+    a = torch.randint(
+        -100, 100, (max_num_permuted_tokens, hidden_size // 2), dtype=torch.int32, device="cuda"
+    )
+    a = a.to(torch.int8).view(torch.float4_e2m1fn_x2)
+    a_sf = torch.randint(
+        -100,
+        100,
+        (max_num_permuted_tokens, hidden_size // sf_vec_size),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    a_sf = a_sf.to(torch.float8_e4m3fn).view(torch.uint8).flatten()
+    b = torch.randint(
+        -100,
+        100,
+        (num_local_experts, inter_size, hidden_size // 2),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    b = b.to(torch.int8).view(torch.float4_e2m1fn_x2)
+    b_sf = torch.randint(
+        -100,
+        100,
+        (num_local_experts, inter_size, hidden_size // sf_vec_size),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    b_sf = b_sf.to(torch.float8_e4m3fn).view(torch.uint8)
+    alpha = torch.ones(num_local_experts, dtype=torch.float32, device="cuda")
+
+    c = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_blackwell(
+        a,
+        b,
+        a_sf,
+        b_sf,
+        alpha,
+        tile_idx_to_group_idx,
+        tile_idx_to_mn_limit,
+        permuted_idx_to_expanded_idx,
+        num_non_exiting_tiles,
+        token_final_scales,
+        num_experts=num_experts,
+        top_k=top_k,
+        num_local_experts=num_local_experts,
+        local_expert_offset=0,
+        tile_size=tile_size,
+        output_dtype=torch.bfloat16,
+        scaling_vector_size=sf_vec_size,
+    )
+
+    c_ref = cute_dsl_nvfp4_grouped_gemm_ref(
+        a,
+        b,
+        a_sf,
+        b_sf,
+        alpha,
+        tile_idx_to_group_idx,
+        num_non_exiting_tiles,
+        tile_size=tile_size,
+        output_dtype=torch.bfloat16,
+        scaling_vector_size=sf_vec_size,
+    )
+    c_ref = torch.ops.trtllm.moe_unpermute(
+        permuted_input=c_ref,
+        expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+        topk_scales=token_final_scales,
+    )
+    match_ratio = torch.isclose(c, c_ref, rtol=1.6e-2, atol=1e-5).sum().item() / c.numel()
+    assert match_ratio > 0.99

@@ -411,25 +411,31 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             num_non_exiting_tiles=num_non_exiting_tiles,
             tile_tokens_dim=tile_size,
         )
-        x = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_blackwell(
+
+        # TODO: Remove this WAR.
+        max_num_permuted_tokens = permuted_idx_to_expanded_idx.size(0)
+        permuted_idx_to_expanded_idx.masked_fill_(
+            torch.arange(max_num_permuted_tokens, device='cuda')
+            >= tile_idx_to_mn_limit.repeat_interleave(tile_size), -1)
+        x_sf.masked_fill_(x_sf.view(torch.float8_e4m3fn).isnan(), 0)
+
+        x = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_blackwell(
             input=x.view(torch.float4_e2m1fn_x2),
             weight=self.w2_weight.view(torch.float4_e2m1fn_x2),
             input_scale=x_sf.view(torch.uint8),
             weight_scale=self.quant_scales.fc2_weight_block.view(torch.uint8),
             alpha=self.quant_scales.fc2_global,
             tile_idx_to_group_idx=tile_idx_to_expert_idx,
+            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
             num_non_exiting_tiles=num_non_exiting_tiles,
+            token_final_scales=token_final_scales,
             num_experts=self.num_slots,
             top_k=self.routing_method.experts_per_token,
             num_local_experts=self.expert_size_per_partition,
             local_expert_offset=self.slot_start,
             tile_size=tile_size,
             output_dtype=output_dtype,
-        )
-        x = torch.ops.trtllm.moe_unpermute(
-            permuted_input=x,
-            expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
-            topk_scales=token_final_scales,
         )
         return x
 
