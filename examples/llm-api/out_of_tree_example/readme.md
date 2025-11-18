@@ -45,8 +45,11 @@ Prepare the dataset:
 python ./benchmarks/cpp/prepare_dataset.py --tokenizer ./model_ckpt --stdout dataset --dataset-name lmms-lab/MMMU --dataset-split test --dataset-image-key image --dataset-prompt-key "question" --num-requests 100 --output-len-dist 128,5 > mm_data.jsonl
 ```
 
-
 Run the benchmark:
 ```
 trtllm-bench --model ./model_ckpt --model_path ./model_ckpt throughput --dataset mm_data.jsonl --backend pytorch --num_requests 100 --max_batch_size 4 --modality image --streaming --custom_module_dirs ../modeling_custom_phi
 ```
+
+### Serving
+
+Similar to `trtllm-bench` above, `trtllm-serve` also supports the `--custom_module_dirs` option.
