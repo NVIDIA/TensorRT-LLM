@@ -159,6 +159,7 @@ def launch_server(
     backend = llm_args["backend"]
     model = llm_args["model"]
     if backend == 'pytorch':
+        llm_args.pop("build_config", None)
         llm = PyTorchLLM(**llm_args)
     elif backend == '_autodeploy':
         from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
