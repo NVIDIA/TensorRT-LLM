@@ -188,6 +188,21 @@ def _process_simple_shard(
     return num_simple_shards
 
 
+class ShardingTransformConfig(TransformConfig):
+    """Configuration for sharding transformations."""
+
+    simple_shard_only: bool = Field(default=False)
+    sharding_source: List[ShardingSource] = Field(
+        default_factory=lambda: [ShardingSource.HEURISTIC]
+    )
+    support_partial_config: bool = Field(default=False)
+    # Which sharding dimensions to run: any subset of {"tp", "ep", "bmm"}
+    sharding_dims: List[ShardingDim] = Field(
+        default_factory=lambda: [ShardingDim.SSM, ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
+    )
+    process_grid: Dict[ShardingDim, int] = Field(default_factory=dict)
+
+
 @TransformRegistry.register("detect_sharding")
 class Sharding(BaseTransform):
     """A transformation to apply sharding to the model following tensor parallelism.
@@ -1047,6 +1062,15 @@ def detect_ep_shard(
         ad_logger.info("Skipping EP sharding for single device")
         return TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
 
+    if len(sharding_config.process_grid) > 0:
+        ad_logger.info(f"EP + TP sharding process grid: {sharding_config.process_grid}")
+        if torch.tensor(list(sharding_config.process_grid.values())).prod() != world_size:
+            ad_logger.warning(
+                f"EP + TP sharding process grid {sharding_config.process_grid} "
+                f"does not match world size {world_size}. "
+                f"Skipping 2D sharding, applying only 1D EP sharding."
+            )
+            sharding_config.process_grid = {}
     assert isinstance(gm, GraphModule), "Expecting GraphModule"
     num_moe_patterns = 0
     for node in list(gm.graph.nodes):
@@ -1057,6 +1081,7 @@ def detect_ep_shard(
                 node,
                 rank=rank,
                 world_size=world_size,
+                process_grid=sharding_config.process_grid,
             )
         ):
             num_moe_patterns += 1
