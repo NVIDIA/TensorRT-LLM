@@ -27,6 +27,7 @@ from .modeling_qwen2vl import Qwen2_5_VLModel, Qwen2VLModel
 from .modeling_qwen3 import Qwen3ForCausalLM
 from .modeling_qwen3_moe import Qwen3MoeForCausalLM
 from .modeling_qwen3_next import Qwen3NextForCausalLM
+from .modeling_qwen3vl import Qwen3VLModelTRT
 from .modeling_qwen_moe import Qwen2MoeForCausalLM
 from .modeling_seedoss import SeedOssForCausalLM
 from .modeling_siglip import SiglipVisionModel
@@ -35,41 +36,18 @@ from .modeling_vila import VilaModel
 
 # Note: for better readiblity, this should have same order as imports above
 __all__ = [
-    "AutoModelForCausalLM",
-    "BertForSequenceClassification",
-    "CLIPVisionModel",
-    "DeepseekV3ForCausalLM",
-    "Exaone4ForCausalLM",
-    "Gemma3ForCausalLM",
-    "Gemma3VLM",
-    "HCXVisionForCausalLM",
-    "HunYuanDenseV1ForCausalLM",
-    "HunYuanMoEV1ForCausalLM",
-    "LlamaForCausalLM",
-    "LlavaNextModel",
-    "Mistral3VLM",
-    "MistralForCausalLM",
-    "MixtralForCausalLM",
-    "NemotronH_Nano_VL_V2",
-    "NemotronForCausalLM",
-    "NemotronHForCausalLM",
-    "NemotronNASForCausalLM",
-    "Phi3ForCausalLM",
-    "Phi4MMForCausalLM",
-    "Qwen2ForCausalLM",
-    "Qwen2ForProcessRewardModel",
-    "Qwen2ForRewardModel",
-    "Qwen2MoeForCausalLM",
-    "SiglipVisionModel",
-    "get_model_architecture",
-    "VilaModel",
-    "Qwen2VLModel",
-    "Qwen2_5_VLModel",
-    "Qwen3ForCausalLM",
-    "Qwen3MoeForCausalLM",
-    "Qwen3NextForCausalLM",
-    "GptOssForCausalLM",
-    "SeedOssForCausalLM",
+    "AutoModelForCausalLM", "BertForSequenceClassification", "CLIPVisionModel",
+    "DeepseekV3ForCausalLM", "Exaone4ForCausalLM", "Gemma3ForCausalLM",
+    "Gemma3VLM", "HCXVisionForCausalLM", "HunYuanDenseV1ForCausalLM",
+    "HunYuanMoEV1ForCausalLM", "LlamaForCausalLM", "LlavaNextModel",
+    "Mistral3VLM", "MistralForCausalLM", "MixtralForCausalLM",
+    "NemotronH_Nano_VL_V2", "NemotronForCausalLM", "NemotronHForCausalLM",
+    "NemotronNASForCausalLM", "Phi3ForCausalLM", "Phi4MMForCausalLM",
+    "Qwen2ForCausalLM", "Qwen2ForProcessRewardModel", "Qwen2ForRewardModel",
+    "Qwen2MoeForCausalLM", "SiglipVisionModel", "get_model_architecture",
+    "VilaModel", "Qwen2VLModel", "Qwen2_5_VLModel", "Qwen3ForCausalLM",
+    "Qwen3MoeForCausalLM", "Qwen3NextForCausalLM", "GptOssForCausalLM",
+    "SeedOssForCausalLM", "Qwen3VLModelTRT"
 ]
 
 if transformers.__version__ >= "4.45.1":
