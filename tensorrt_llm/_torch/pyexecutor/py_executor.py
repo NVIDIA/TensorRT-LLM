@@ -275,6 +275,7 @@ class PyExecutor:
         self.worker_started = False
         self.worker_lock = threading.Lock()
 
+        self.use_flexkv = os.getenv("TENSORRT_LLM_USE_FLEXKV", "0") == "1"
         self.kv_connector_manager = kv_connector_manager
 
         self._maybe_init_kv_connector_manager()
@@ -282,7 +283,6 @@ class PyExecutor:
         if start_worker:
             self.start_worker()
 
-        self._wait_for_flexkv_manager()
 
     def _maybe_init_kv_connector_manager(self):
         if self.kv_connector_manager is not None:
@@ -311,6 +311,9 @@ class PyExecutor:
                         self.kv_connector_manager.layer_pre_hook)
                     module.register_forward_hook(
                         self.kv_connector_manager.layer_post_hook)
+            
+            if self.use_flexkv:
+                self._wait_for_flexkv_manager()
     
     def _wait_for_flexkv_manager(self):
         if self.kv_connector_manager is not None and self.dist.rank == 0:
