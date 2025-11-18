@@ -718,6 +718,7 @@ inline bool checkAndUpdateGemmOptions(
         TLLM_CHECK_ERROR(false, "E2m1 x E4m3 is not supported for JIT compile. Use cubins instead.");
     }
 #endif // TLLM_PUBLIC_RELEASE
+
     // Check that the A cast is supported.
     // Currently, we only support {MxFp4, NvFp4} -> Bf16.
     TLLM_CHECK_ERROR((options.mDtypeA == options.mDtypeMmaA)
@@ -761,6 +762,7 @@ inline bool checkAndUpdateGemmOptions(
         TLLM_CHECK_ERROR(options.mDtypeMmaB == tg::Dtype::E4m3 || options.mDtypeMmaB == tg::Dtype::E2m1,
             "For dtypeMmaA = E4m3/E2m1 A, dtypeMmaB must also be E4m3/E2m1.");
     }
+
     // kind::mxf8f6f4
     if (options.mDtypeMmaA == tg::Dtype::MxE4m3 || options.mDtypeMmaA == tg::Dtype::MxE2m1)
     {
@@ -772,6 +774,7 @@ inline bool checkAndUpdateGemmOptions(
         TLLM_CHECK_ERROR(options.mDtypeMmaA == tg::Dtype::MxE4m3 || options.mDtypeMmaA == tg::Dtype::MxE2m1,
             "For dtypeMmaB = MxE4m3 or MxE2m1, dtypeMmaA must also be MxE4m3 or MxE2m1.");
     }
+
     // kind::f16
     if (options.mDtypeMmaA == tg::Dtype::Fp16 || options.mDtypeMmaA == tg::Dtype::Bfloat16)
     {
@@ -849,6 +852,7 @@ inline bool checkAndUpdateGemmOptions(
             "Hopper does not use TMEM. The register layout corresponds to 16dp256bit. Got ", options.mEpilogueLdtmDps,
             "dp", options.mEpilogueLdtmBits, "bit.");
     }
+
     // Constraints for NvFp4 and MxFp8.
     if ((options.mMmaKind == tg::MmaKind::MxFp4NvFp4 || options.mMmaKind == tg::MmaKind::MxFp8Fp6Fp4
             || options.mDtypeC == tg::Dtype::MxE4m3)
