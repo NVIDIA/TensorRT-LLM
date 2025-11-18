@@ -1,1 +1,1 @@
-genai-perf
+aiperf
