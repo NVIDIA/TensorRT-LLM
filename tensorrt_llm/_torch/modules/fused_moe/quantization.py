@@ -1,3 +1,4 @@
+import inspect
 import math
 from abc import ABC, abstractmethod
 from typing import Dict, List, NamedTuple, Optional, Union
@@ -247,6 +248,14 @@ class FusedMoEMethodBase(ABC):
             dst_w3_w1_bias_tensor: Optional[torch.Tensor],
             dst_w2_bias_tensor: Optional[torch.Tensor],
             allow_partial_loading: bool = False):
+        w3_w1_kargs = {}
+        w2_kargs = {}
+        w3_w1_args = inspect.getfullargspec(self.load_expert_w3_w1_weight).args
+        w2_args = inspect.getfullargspec(self.load_expert_w2_weight).args
+        if "allow_partial_loading" in w3_w1_args:
+            w3_w1_kargs["allow_partial_loading"] = allow_partial_loading
+        if "allow_partial_loading" in w2_args:
+            w2_kargs["allow_partial_loading"] = allow_partial_loading
         # Multithread weight load is superseded by prefetch_files() in model_engine.py
         # Also, threading adds overhead in order to protect shuffle index cache with critical section.
         for local_slot_id, expert_id in enumerate(load_expert_ids):
@@ -290,18 +299,13 @@ class FusedMoEMethodBase(ABC):
                     f"Unknown weight loading mode in MoE: {weight_loading_mode}"
                 )
 
-            self.load_expert_w3_w1_weight(
-                module,
-                w1_weight,
-                w3_weight,
-                dst_w3_w1_weights_tensor[expert_idx],
-                allow_partial_loading=allow_partial_loading)
+            self.load_expert_w3_w1_weight(module, w1_weight, w3_weight,
+                                          dst_w3_w1_weights_tensor[expert_idx],
+                                          **w3_w1_kargs)
 
-            self.load_expert_w2_weight(
-                module,
-                w2_weight,
-                dst_w2_weights_tensor[expert_idx],
-                allow_partial_loading=allow_partial_loading)
+            self.load_expert_w2_weight(module, w2_weight,
+                                       dst_w2_weights_tensor[expert_idx],
+                                       **w2_kargs)
             unmap_weights = [
                 weight for weight in [w1_weight, w3_weight, w2_weight]
                 if weight is not None
@@ -310,17 +314,12 @@ class FusedMoEMethodBase(ABC):
 
             if module.bias:
                 self.load_expert_w3_w1_weight(
-                    module,
-                    w1_bias,
-                    w3_bias,
-                    dst_w3_w1_bias_tensor.data[expert_idx],
-                    allow_partial_loading=allow_partial_loading)
+                    module, w1_bias, w3_bias,
+                    dst_w3_w1_bias_tensor.data[expert_idx], **w3_w1_kargs)
 
-                self.load_expert_w2_weight(
-                    module,
-                    w2_bias,
-                    dst_w2_bias_tensor.data[expert_idx],
-                    allow_partial_loading=allow_partial_loading)
+                self.load_expert_w2_weight(module, w2_bias,
+                                           dst_w2_bias_tensor.data[expert_idx],
+                                           **w2_kargs)
                 unmap_weights = [
                     weight for weight in [w1_bias, w3_bias, w2_bias]
                     if weight is not None
