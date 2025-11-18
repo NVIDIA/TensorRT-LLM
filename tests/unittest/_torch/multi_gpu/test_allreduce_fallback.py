@@ -375,10 +375,14 @@ def run_single_rank_test(tensor_parallel_size, test_func, *args):
         args_list = list(args)
         # Replace None placeholders with actual rank
         # The pattern is: (..., tensor_parallel_size, None, ...) where None is rank
+        # We need to check for None first to avoid comparing tensors to integers
         for i in range(len(args_list) - 1):
-            if args_list[i] == tensor_parallel_size and args_list[i + 1] is None:
-                args_list[i + 1] = rank
-                break
+            # Check if next arg is None first (safe check)
+            if args_list[i + 1] is None:
+                # Check if current arg is tensor_parallel_size (using isinstance to avoid tensor comparison)
+                if isinstance(args_list[i], int) and args_list[i] == tensor_parallel_size:
+                    args_list[i + 1] = rank
+                    break
         else:
             # Fallback: find first None and replace it
             for i, arg in enumerate(args_list):
