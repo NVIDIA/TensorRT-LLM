@@ -110,8 +110,10 @@ class BatchStatePP(BatchState):
 
 class AsyncTransferManager:
 
-    def __init__(self, kv_cache_manager: "KvCacheManager"):
-        self.kv_cache_manager = kv_cache_manager
+    def __init__(self, resource_manager: "ResourceManager"):
+        self.resource_manager = resource_manager
+        self.kv_cache_manager = resource_manager.resource_managers.get(
+            ResourceManagerType.KV_CACHE_MANAGER)
         self.requests: dict[int, (LlmRequest, int, int)] = dict()
 
     def requests_in_transfer(self) -> dict[int, LlmRequest]:
@@ -119,6 +121,14 @@ class AsyncTransferManager:
 
     def start_transfer(self, request: LlmRequest):
         if request.py_request_id not in self.requests:
+            for resource_mgr_type in (
+                    ResourceManagerType.SEQ_SLOT_MANAGER,
+                    ResourceManagerType.SPEC_RESOURCE_MANAGER):
+                if resource_mgr_type in self.resource_manager.resource_managers and self.resource_manager.resource_managers[
+                        resource_mgr_type] is not None:
+                    self.resource_manager.resource_managers[
+                        resource_mgr_type].free_resources(request)
+
             block_id = self.kv_cache_manager.store_blocks_for_reuse(
                 request, True)
             self.requests[request.py_request_id] = (request, block_id, 1)
@@ -246,7 +256,7 @@ class PyExecutor:
         self.active_requests: List[LlmRequest] = []
         self.expected_num_active_requests = 0
         self.async_transfer_manager = AsyncTransferManager(
-            self.kv_cache_manager)
+            self.resource_manager)
         self.previous_batch: Optional[BatchState] = None
         self.has_previous_draft_tokens = False
         self.num_scheduled_requests: int = 0
@@ -1444,9 +1454,8 @@ class PyExecutor:
 
                     self._update_request_states(scheduled_batch)
 
-                    ctx_transmission_reqs = self._send_kv_async(
-                        scheduled_batch.context_requests +
-                        scheduled_batch.generation_requests)
+                ctx_transmission_reqs = self._send_kv_async(
+                    scheduled_batch.all_requests())
 
                 if self.previous_batch is not None:
                     self._process_previous_batch()
@@ -1909,36 +1918,34 @@ class PyExecutor:
 
     @nvtx_range("_send_kv_async")
     def _send_kv_async(self, scheduled_requests: List[LlmRequest]):
-        if (scheduled_requests is None or len(scheduled_requests) == 0):
-            return []
+
+        def kv_connector_request_finished(req: LlmRequest):
+            try:
+                cache_block_ids = self.kv_cache_manager.get_cache_indices(req)
+            except Exception as e:
+                logger.warning(
+                    f"Unable to get cache blocks for request {req.py_request_id}. Skipping asynchronous saving: {e}"
+                )
+            else:
+                if self.kv_connector_manager.request_finished(
+                        req, cache_block_ids):
+                    self.async_transfer_manager.start_transfer(req)
+
         for req in scheduled_requests:
             if self.kv_cache_transceiver and req.is_context_only_request and (
                     req.is_context_finished or req.is_finished_due_to_length):
                 self.kv_cache_transceiver.respond_and_send_async(req)
                 self.async_transfer_manager.start_transfer(req)
 
-            if self.kv_connector_manager and req.is_finished:
-                try:
-                    cache_block_ids = self.kv_cache_manager.get_cache_indices(
-                        req)
-                except Exception as e:
-                    logger.error(
-                        f"Error in request_finished for request {req.py_request_id}: {e}"
-                    )
-                else:
-                    if self.kv_connector_manager.request_finished(
-                            req, cache_block_ids):
-                        self.async_transfer_manager.start_transfer(req)
-
-            if req.py_request_id in self.async_transfer_manager.requests_in_transfer(
-            ).keys():
-                for resource_mgr_type in (
-                        ResourceManagerType.SEQ_SLOT_MANAGER,
-                        ResourceManagerType.SPEC_RESOURCE_MANAGER):
-                    if resource_mgr_type in self.resource_manager.resource_managers and self.resource_manager.resource_managers[
-                            resource_mgr_type] is not None:
-                        self.resource_manager.resource_managers[
-                            resource_mgr_type].free_resources(req)
+        if self.kv_connector_manager:
+            if not self.disable_overlap_scheduler:
+                requests = self.previous_batch.sample_state.scheduled_requests.all_requests(
+                ) if self.previous_batch is not None else []
+            else:
+                requests = scheduled_requests
+            for req in requests:
+                if req.is_finished:
+                    kv_connector_request_finished(req)
 
         if self.kv_cache_transceiver:
             self._check_disagg_ctx_cache_transfer_status(0)
