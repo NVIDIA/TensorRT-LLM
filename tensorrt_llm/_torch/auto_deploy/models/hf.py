@@ -49,17 +49,25 @@ from .quant_config_reader import QuantConfigReader, autodetect_quant_config_read
 
 @contextmanager
 def hf_load_state_dict_with_device(device: DeviceLikeType):
-    """Patch HF load_state_dict to use provided device.
+    """Patch HF loading utilities according to our needs.
 
-    NOTE (lucaslie): this function is called by ``load_checkpoint_in_model``. We provide the device
-    map here as a patch instead of going through ``load_checkpoint_in_model``. This is because
-    otherwise ``load_checkpoint_in_model`` will execute its own state_dict loading logic instead of
-    calling ``nn.Module.load_state_dict``. However, we rely on the state dict loading hooks in
-    ``nn.Module.load_state_dict`` to correctly load the weights. By providing the device map here,
-    we can ensure that ``load_checkpoint_in_model`` will call ``nn.Module.load_state_dict``.
+    Following patches are applied:
+        1. load_state_dict to use provided device. NOTE (lucaslie): this function is called by
+           ``load_checkpoint_in_model``. We provide the device map here as a patch instead of going
+           through ``load_checkpoint_in_model``. This is because otherwise
+           ``load_checkpoint_in_model`` will execute its own state_dict loading logic instead of
+           calling ``nn.Module.load_state_dict``. However, we rely on the state dict loading hooks
+           in ``nn.Module.load_state_dict`` to correctly load the weights. By providing the device
+           map here, we can ensure that ``load_checkpoint_in_model`` will call
+           ``nn.Module.load_state_dict``.
+        2. change logging level of logger to ERROR to avoid logging warnings from HF state_dict
+           loading for missing/unexpected keys (happens for MoE expert-sharded layers for example).
     """
     # save the original load_state_dict method
     original_load_state_dict = modeling.load_state_dict
+
+    # save the original logger level
+    original_logger_level = modeling.logger.level
 
     # Define and apply the patched version
     def load_state_dict_with_device(checkpoint_file, device_map=None):
@@ -68,11 +76,16 @@ def hf_load_state_dict_with_device(device: DeviceLikeType):
     # Apply the patch
     modeling.load_state_dict = load_state_dict_with_device
 
+    # Change the logger level to ERROR
+    modeling.logger.setLevel("ERROR")
+
     try:
         yield
     finally:
         # Restore the original method, even if an exception occurred
         modeling.load_state_dict = original_load_state_dict
+        # Restore the original logger level
+        modeling.logger.setLevel(original_logger_level)
 
 
 # TODO (lucaslie): continue working on the base class
@@ -123,6 +136,13 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
     def vocab_size_padded(self) -> Optional[int]:
         model_config, _ = self._get_model_config()
         return getattr(model_config, "vocab_size", None)
+
+    @property
+    def chunk_size(self) -> Optional[int]:
+        """Returns the chunk size for this model."""
+        model_config, _ = self._get_model_config()
+        # chunk_size is an input to a custom op, so it can not be none. We set it to a default value of 128.
+        return getattr(model_config, "chunk_size", 128)
 
     def _recursive_update_config(
         self, config: PretrainedConfig, update_dict: Dict[str, Any]

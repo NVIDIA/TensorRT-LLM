@@ -145,6 +145,8 @@ class AttentionMetadata:
     _saved_tensors: Dict[str, torch.Tensor] = field(init=False,
                                                     default_factory=dict)
     sparse_attention_config: Optional["SparseAttentionConfig"] = None
+    # The number of heads per kv head.
+    num_heads_per_kv: Optional[int] = 1
 
     def __post_init__(self) -> None:
         if self.is_cross:

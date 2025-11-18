@@ -2,8 +2,7 @@
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
 ARG TRITON_IMAGE=nvcr.io/nvidia/tritonserver
 ARG BASE_TAG=25.10-py3
-# [TODO] Update to NVIDIA Triton 25.10 when it's available
-ARG TRITON_BASE_TAG=25.09-py3
+ARG TRITON_BASE_TAG=25.10-py3
 ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE}:${BASE_TAG} AS base
@@ -44,6 +43,7 @@ COPY docker/common/install.sh \
      docker/common/install_ucx.sh \
      docker/common/install_nixl.sh \
      docker/common/install_etcd.sh \
+     docker/common/install_mooncake.sh \
      ./
 
 RUN GITHUB_MIRROR=${GITHUB_MIRROR} \
@@ -102,6 +102,13 @@ COPY docker/common/install_triton.sh \
      ./
 
 RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install_triton.sh && rm install_triton.sh
+
+# Install Mooncake, after triton handles boost requirement
+RUN if [ -f /etc/redhat-release ]; then \
+        echo "Rocky8 detected, skipping mooncake installation"; \
+    else \
+        bash ./install_mooncake.sh; \
+    fi && rm install_mooncake.sh
 
 FROM ${DEVEL_IMAGE} AS wheel
 WORKDIR /src/tensorrt_llm

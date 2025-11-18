@@ -1,7 +1,7 @@
 import contextlib
 import threading
 from dataclasses import dataclass
-from enum import Enum
+from enum import Enum, IntEnum
 from typing import Dict, List
 
 import torch
@@ -29,6 +29,20 @@ EventType = Enum(
     ['Main', *aux_stream_name_list],
     start=0,
 )
+
+
+# IMPORTANT: Keep the same order of activation functions in this enum and the enum in
+# cpp/tensorrt_llm/kernels/cutlass_kernels/include/common.h
+class ActivationType(IntEnum):
+    Gelu = 0
+    Relu = 1
+    Silu = 2
+    Swiglu = 3
+    Geglu = 4
+    SwigluBias = 5
+    Identity = 6
+    Relu2 = 7
+    InvalidType = 8
 
 
 def set_torch_compiling(enable: bool):
@@ -325,3 +339,27 @@ def get_device_uuid(device_idx: int) -> str:
     property = torch.cuda.get_device_properties(device_idx)
     uuid = "GPU-" + str(property.uuid)
     return uuid
+
+
+def maybe_compile(func=None, **compile_kwargs):
+    """
+    Conditionally compile a function with torch.compile.
+    If is_piecewise_running() is True, the function will not be compiled to avoid host overhead in attention op.
+    Args:
+        func: The function to decorate (optional, for direct decoration).
+        **compile_kwargs: Keyword arguments for torch.compile.
+    Returns:
+        The conditionally compiled function..
+    """
+
+    def decorator(f):
+        compiled_func = torch.compile(f, **compile_kwargs)
+
+        def wrapper(*args, **kwargs):
+            if is_piecewise_running():
+                return f(*args, **kwargs)
+            return compiled_func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator(func) if func else decorator

@@ -114,7 +114,7 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
                 },
             },
         ),
-        pytest.param(
+        (
             "meta-llama/Llama-4-Scout-17B-16E-Instruct",
             {
                 "transforms": {
@@ -122,7 +122,6 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
                     "compile_model": {"backend": "torch-opt"},
                 },
             },
-            marks=pytest.mark.skip(reason="https://nvbugs/5625972"),
         ),
         (
             "meta-llama/Llama-4-Scout-17B-16E-Instruct",

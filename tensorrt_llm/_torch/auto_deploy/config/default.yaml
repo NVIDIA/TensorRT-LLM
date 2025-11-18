@@ -123,15 +123,11 @@ transforms:
   fuse_allreduce_residual_rmsnorm:
     stage: post_load_fusion
   # TODO (lucaslie): add backend selection as part of configurable inference optimizers
-  # check if we can fuse rmsnorm
   fuse_rmsnorm:
-    # TODO (lucaslie): add backend selection as part of configurable inference optimizers
-    # check if we can fuse rmsnorm
     stage: post_load_fusion
-    backend: triton
+    rmsnorm_backend: triton
+    gated_rmsnorm_backend: triton
     requires_shape_prop: true
-  fuse_gated_rmsnorm:
-    stage: post_load_fusion
 
   ############################################################################################
   # VISUALIZE GRAPH
@@ -166,6 +162,8 @@ transforms:
   ############################################################################################
   # COMPILE MODEL
   ############################################################################################
+  fuse_causal_conv_activation:
+    stage: compile
   compile_model:
     stage: compile
     run_per_gm: false

@@ -61,6 +61,7 @@ def cuda_causal_conv_prepare_metadata(
     pages_per_seq: torch.Tensor,
     slot_idx: torch.Tensor,
     page_size: int,
+    chunk_size: int,
 ) -> List[torch.Tensor]:
     """Prepare metadata for cached causal conv (CUDA backend).
 
@@ -75,13 +76,13 @@ def cuda_causal_conv_prepare_metadata(
 
     slot_idx_sanitized = slot_idx[:num_seq].clone().to(torch.long)
     # This is only used during prefill to determine if we should use the initial states from the cache.
-    use_initial_states = input_pos > 0
+    use_initial_states = input_pos[:num_seq] > 0
     return (seq_len_sanitized, seq_start, slot_idx_sanitized, use_initial_states)
 
 
 @cuda_causal_conv_prepare_metadata.register_fake
 def cuda_causal_conv_prepare_metadata_fake(
-    position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size
+    position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size, chunk_size
 ):
     seq_len_sanitized = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
     num_seq = len(seq_len_sanitized)
@@ -112,6 +113,7 @@ def _cuda_cached_causal_conv1d(
     dilation: int,
     groups: int,
     padding_mode: str,
+    activation: Optional[str],
 ) -> torch.Tensor:
     """Flattened cached causal conv that respects slot-indexed state caches (CUDA backend).
 
@@ -175,26 +177,26 @@ def _cuda_cached_causal_conv1d(
             cache_indices=cache_indices,
             has_initial_state=has_initial_state,
             conv_states=conv_state_cache,
-            activation=None,
+            activation=activation,
             pad_slot_id=PAD_SLOT_ID,
         )  # (dim, total_prefill_tokens)
 
         # Scatter outputs back to y
         y_prefill = y_varlen.transpose(0, 1)  # [total_prefill_tokens, C_out]
-        y_flat[:total_prefill_tokens].copy_(y_prefill.to(y_flat.dtype))
+        y_flat[:total_prefill_tokens].copy_(y_prefill)
 
     # DECODE: batch update for single-token sequences
     if num_decode > 0:
-        # Use true start offsets for decode tokens (tail after prefills)
-        decode_idx = seq_start[num_prefill:].to(torch.long)
-        x_decode = inp_flat.index_select(0, decode_idx)  # [num_decode, C_in]
+        x_decode = inp_flat[
+            total_prefill_tokens : total_prefill_tokens + num_decode
+        ]  # [num_decode, C_in]
 
         y_dec = causal_conv1d_update(
             x_decode,  # [batch, dim]
             conv_state_cache,
             w2d,
             bias,
-            activation=None,
+            activation=activation,
             cache_seqlens=None,
             conv_state_indices=slot_idx[num_prefill:].to(torch.int32),
             pad_slot_id=PAD_SLOT_ID,
@@ -202,10 +204,12 @@ def _cuda_cached_causal_conv1d(
 
         if y_dec.dim() == 3:
             y_dec = y_dec.squeeze(-1)
-        y_flat.index_copy_(0, decode_idx, y_dec.to(y_flat.dtype))
+        y_flat[total_prefill_tokens : total_prefill_tokens + num_decode].copy_(
+            y_dec.to(y_flat.dtype)
+        )
 
     # Custom op must not return an alias of any input; return a fresh tensor
-    return y.contiguous().clone()
+    return y
 
 
 @_cuda_cached_causal_conv1d.register_fake
@@ -227,6 +231,7 @@ def _cuda_cached_causal_conv1d_fake(
     dilation: int,
     groups: int,
     padding_mode: str,
+    activation: Optional[str],
 ):
     return torch.empty(
         input.shape[0], input.shape[1], weight.shape[0], device=input.device, dtype=input.dtype
@@ -279,7 +284,7 @@ class CudaBackendCausalConv(AttentionDescriptor):
                 in_channels,
                 max(1, kernel_size - 1),
                 device=si.device,
-                dtype=cache_config.dtype or inp_fake.dtype,
+                dtype=inp_fake.dtype,
             )
 
         return {"conv_state_cache": _get_conv_cache}
@@ -293,4 +298,5 @@ class CudaBackendCausalConv(AttentionDescriptor):
         stride, padding, dilation, groups, padding_mode = extract_op_args(
             source_attn_node, "stride", "padding", "dilation", "groups", "padding_mode"
         )
-        return [stride, padding, dilation, groups, padding_mode]
+        # None is for activation parameter, which may not exist in the source node (added by fusion later)
+        return [stride, padding, dilation, groups, padding_mode, None]

@@ -823,7 +823,8 @@ def create_py_executor_instance(
 def create_torch_sampler_args(mapping: Mapping, *, max_seq_len: int,
                               max_batch_size: int,
                               speculative_config: SpeculativeConfig,
-                              max_beam_width: int):
+                              max_beam_width: int,
+                              disable_flash_infer_sampling: bool):
     max_num_sequences = max_batch_size * mapping.pp_size
     max_draft_len = (0 if speculative_config is None else
                      speculative_config.max_draft_len)
@@ -836,20 +837,32 @@ def create_torch_sampler_args(mapping: Mapping, *, max_seq_len: int,
         max_total_draft_tokens=max_total_draft_tokens,
         max_num_sequences=max_num_sequences,
         max_beam_width=max_beam_width,
+        disable_flash_infer_sampling=disable_flash_infer_sampling,
     )
 
 
 def instantiate_sampler(
-        engine: PyTorchModelEngine, llm_args: TorchLlmArgs, mapping: Mapping,
-        max_batch_size: int, max_beam_width: int, max_seq_len: int,
-        mm_encoder_only: bool, speculative_config: SpeculativeConfig,
-        decoding_config: trtllm.DecodingConfig, kv_cache_config: KvCacheConfig):
+    engine: PyTorchModelEngine,
+    llm_args: TorchLlmArgs,
+    mapping: Mapping,
+    *,
+    max_batch_size: int,
+    max_beam_width: int,
+    max_seq_len: int,
+    mm_encoder_only: bool,
+    speculative_config: SpeculativeConfig,
+    decoding_config: trtllm.DecodingConfig,
+    kv_cache_config: KvCacheConfig,
+    disable_flash_infer_sampling: bool,
+):
     sampler_args = create_torch_sampler_args(
         mapping,
         max_seq_len=engine.max_seq_len,
         max_batch_size=max_batch_size,
         speculative_config=speculative_config,
-        max_beam_width=max_beam_width)
+        max_beam_width=max_beam_width,
+        disable_flash_infer_sampling=disable_flash_infer_sampling,
+    )
     decoding_mode = get_decoding_mode(decoding_config=decoding_config,
                                       max_beam_width=max_beam_width)
     if mapping.cp_config.get('cp_type') == CpType.STAR:

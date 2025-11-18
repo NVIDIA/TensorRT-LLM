@@ -727,10 +727,10 @@ class AutoTuner:
         new_tuning_failure_occured = False
 
         for p in profiles:
-            tensors = self._prepare_input_tensors(p, inputs)
             is_cache_hit, *_ = self.profiling_cache.search_cache(
                 custom_op, runners, p.get_opt_shapes(), tuning_config)
             if not is_cache_hit:
+                tensors = self._prepare_input_tensors(p, inputs)
                 # Initialize runner and tactic as None in case of no valid tactic or runners are found
                 best_runner_id, best_tactic, min_time, has_tuning_failure_occured = self._profile_runners(
                     custom_op, runners, tensors, p, tuning_config, **kwargs)
@@ -1044,13 +1044,25 @@ class AutoTuner:
         dtype = origin_tensor.dtype
         device = origin_tensor.device
         shapes = []
-        for d in dims:
+        for i, d in enumerate(dims):
             if isinstance(d, StaticDim):
+                assert d.val == origin_tensor.shape[i]
                 shapes.append(d.val)
             else:
                 # TODO: how to make sure the created Tensor has the min/max info
                 assert isinstance(d, DynamicDim)
                 shapes.append(d.opt)
+
+        if len(dims) == 2 and isinstance(dims[0], DynamicDim) and isinstance(
+                dims[1], StaticDim) and (dtype == torch.int32
+                                         or dtype == torch.int64):
+            # We should be carefully about int values, since they might be index like topk_index.
+            # We want to keep them legal, so just repeating input tensor.
+            repeat_times = (shapes[0] + origin_tensor.shape[0] -
+                            1) // origin_tensor.shape[0]
+            dup_tensor = origin_tensor.repeat(repeat_times, 1)[:shapes[0]]
+            return dup_tensor
+
         # TODO: FIXME, sometimes the content of the tensor can affect the performance, like MOE
         # One solution is to manituplate the tensor content to make it more like the real data
         # during the tuning process. This can by controlled in the preparation phase by the runner.

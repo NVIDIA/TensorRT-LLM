@@ -215,6 +215,9 @@ class BaseSparseAttentionConfig(StrictBaseModel):
         """
         return True
 
+    def get_indices_block_size(self) -> int:
+        return 1
+
 
 class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
     """
@@ -238,6 +241,9 @@ class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
 
+    def get_indices_block_size(self) -> int:
+        return self.page_size
+
 
 class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
     """
@@ -259,6 +265,109 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
+
+
+class MoeLoadBalancerConfig(StrictBaseModel):
+    """
+    Pydantic configuration model for the Mixture of Experts (MoE) load balancer.
+
+    This model holds configuration data (`num_slots`, etc.) as well as
+    runtime state (`_ep_rank`, `_ep_size`) which must be set via the
+    `setup()` method before use.
+    """
+
+    num_slots: Optional[int] = None
+    initial_global_assignments: Optional[Dict[int, List[int]]] = Field(
+        default=None,
+        repr=False  # Exclude this large dict from model representation
+    )
+    layer_updates_per_iter: int = 0
+    _ep_rank: Optional[int] = PrivateAttr(default=None)
+    _ep_size: Optional[int] = PrivateAttr(default=None)
+
+    # --- Methods ---
+
+    def setup(self, ep_rank: int, ep_size: int) -> None:
+        """
+        Initializes the runtime state of the configuration.
+        This must be called before accessing properties like `num_local_slots`.
+        """
+        self._ep_rank = ep_rank
+        self._ep_size = ep_size
+
+        # This assertion was in the original and is critical.
+        if self.num_slots is None:
+            raise ValueError("`num_slots` cannot be None when calling setup().")
+
+        if self.num_slots % ep_size != 0:
+            raise ValueError(
+                f"`num_slots` ({self.num_slots}) must be divisible by `ep_size` ({ep_size})."
+            )
+
+    # --- Computed Properties ---
+    # These properties depend on the runtime state set by setup()
+
+    @property
+    def ep_rank(self) -> int:
+        """Public accessor for the private expert parallel rank."""
+        if self._ep_rank is None:
+            raise AttributeError("ep_rank is not set. Call setup() first.")
+        return self._ep_rank
+
+    @property
+    def ep_size(self) -> int:
+        """Public accessor for the private expert parallel size."""
+        if self._ep_size is None:
+            raise AttributeError("ep_size is not set. Call setup() first.")
+        return self._ep_size
+
+    @property
+    def num_local_slots(self) -> int:
+        """Calculates the number of slots local to this rank."""
+        if self.num_slots is None or self._ep_size is None:
+            raise ValueError(
+                "Cannot calculate `num_local_slots`. "
+                "`num_slots` must be set and setup() must be called.")
+        return self.num_slots // self._ep_size
+
+    @property
+    def slot_start(self) -> int:
+        """Calculates the starting global slot index for this rank."""
+        if self._ep_rank is None:
+            raise ValueError(
+                "Cannot calculate `slot_start`. Call setup() first.")
+        return self._ep_rank * self.num_local_slots
+
+    @property
+    def slot_end(self) -> int:
+        """Calculates the ending global slot index (exclusive) for this rank."""
+        return self.slot_start + self.num_local_slots
+
+    def get_layer_initial_global_assignments(
+            self, layer_idx: int) -> Optional[List[int]]:
+        """
+        Retrieves the initial global assignments for a specific layer.
+        """
+        if self.initial_global_assignments is None:
+            return None
+
+        if layer_idx not in self.initial_global_assignments:
+            raise KeyError(
+                f"layer_idx {layer_idx} not found in `initial_global_assignments`."
+            )
+
+        assignments = self.initial_global_assignments[layer_idx]
+
+        if self.num_slots is None:
+            raise ValueError(
+                "`num_slots` is not set, cannot verify assignment length.")
+
+        if len(assignments) != self.num_slots:
+            raise ValueError(
+                f"Assignment length ({len(assignments)}) for layer {layer_idx} "
+                f"does not match `num_slots` ({self.num_slots}).")
+
+        return assignments
 
 
 class MoeConfig(StrictBaseModel):
@@ -326,6 +435,7 @@ class _ParallelConfig(StrictBaseModel):
     moe_tp_size: int = -1
     moe_ep_size: int = -1
     cp_config: dict = Field(default_factory=dict)
+    pp_partition: Optional[List[int]] = Field(default=None)
     enable_attention_dp: bool = False
     enable_lm_head_tp_in_adp: bool = False
 
@@ -372,6 +482,7 @@ class _ParallelConfig(StrictBaseModel):
                        gpus_per_node=self.gpus_per_node,
                        tp_size=self.tp_size,
                        pp_size=self.pp_size,
+                       pp_partition=self.pp_partition,
                        cp_size=self.cp_size,
                        cp_config=self.cp_config,
                        enable_attention_dp=self.enable_attention_dp,
@@ -449,6 +560,16 @@ class DecodingBaseConfig(StrictBaseModel):
     # this value. Otherwise, speculation will always be on.
     max_concurrency: Optional[int] = None
 
+    # Developer interface: dynamically adjust draft length based on active batch size in runtime.
+    # Maps batch size to draft lengths. For example:
+    # {1: 4, 4: 2, 8: 0} means:
+    # - batch_size >= 1: use draft_len=4
+    # - batch_size >= 4: use draft_len=2
+    # - batch_size >= 8: use draft_len=0 (disable speculation)
+    # draft_len_schedule is enforced to contain batch_size=1 and its according draft_len equals max_draft_len for consistency
+    # for example, if max_draft_len=4, the schedule must contain {1: 4}
+    draft_len_schedule: Optional[dict[int, int]] = None
+
     load_format: Optional[str] = None
     # PyTorch only.
     # Rolling average window size (N) for acceptance length across completed requests.
@@ -485,6 +606,51 @@ class DecodingBaseConfig(StrictBaseModel):
     _allow_chain_drafter: bool = PrivateAttr(True)
     # If set, drafting uses greedy sampling, irrespective of sampling parameters.
     _allow_greedy_draft_tokens: bool = PrivateAttr(True)
+
+    @field_validator('draft_len_schedule')
+    @classmethod
+    def validate_draft_len_schedule_and_sort(cls, v, info):
+        """Validate and sort draft_len_schedule by batch size thresholds."""
+        if v is not None:
+            # Validate values
+            for batch_size, draft_len in v.items():
+                if batch_size < 1:
+                    raise ValueError(
+                        f"draft_len_schedule: batch size threshold must be >= 1, got {batch_size}"
+                    )
+                if draft_len < 0:
+                    raise ValueError(
+                        f"draft_len_schedule: draft length must be >= 0, got {draft_len}"
+                    )
+
+            # Require batch_size=1 in schedule
+            if 1 not in v:
+                raise ValueError(
+                    "draft_len_schedule must include batch_size=1. "
+                    "All systems can have batch_size=1. Add {1: <max_draft_len>} to your schedule."
+                )
+
+            # Enforce schedule[1] == max_draft_len for consistency
+            max_draft_len = info.data.get('max_draft_len')
+            if max_draft_len is not None and v[1] != max_draft_len:
+                raise ValueError(
+                    f"draft_len_schedule[1] must equal max_draft_len for consistency. "
+                    f"Got schedule[1]={v[1]}, but max_draft_len={max_draft_len}. "
+                    f"batch_size=1 should use maximum draft length.")
+
+            # Enforce all draft lengths <= max_draft_len
+            if max_draft_len is not None:
+                for batch_size, draft_len in v.items():
+                    if draft_len > max_draft_len:
+                        raise ValueError(
+                            f"draft_len_schedule: all draft lengths must be <= max_draft_len. "
+                            f"Got draft_len={draft_len} for batch_size={batch_size}, "
+                            f"but max_draft_len={max_draft_len}.")
+
+            # Return sorted dict (by batch size thresholds)
+            # This ensures efficient lookup
+            return dict(sorted(v.items(), key=lambda x: x[0]))
+        return v
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -817,12 +983,11 @@ class MTPDecodingConfig(DecodingBaseConfig):
     # Now we need a flag when MTPDecodingConfig is updated by PyTorchModelEngine.
     num_nextn_predict_layers_from_model_config: int = 1
 
-    # TODO: Hard code for DeepSeek R1
     # When encounter <think>, start thinking phase.
     # When encounter </think>, end thinking phase.
     # <think> [thinking phase] </think> [real output]
-    BEGIN_THINKING_PHASE_TOKEN: int = 128798
-    END_THINKING_PHASE_TOKEN: int = 128799
+    begin_thinking_phase_token: int = 128798
+    end_thinking_phase_token: int = 128799
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -1587,6 +1752,12 @@ class BaseLlmArgs(StrictBaseModel):
         description="Enable LM head TP in attention dp.",
         status="prototype")
 
+    pp_partition: Optional[List[int]] = Field(
+        default=None,
+        description=
+        "Pipeline parallel partition, a list of each rank's layer number.",
+        status="prototype")
+
     cp_config: Optional[dict] = Field(default_factory=dict,
                                       description="Context parallel config.",
                                       status="prototype")
@@ -1843,6 +2014,7 @@ class BaseLlmArgs(StrictBaseModel):
             moe_ep_size=self.moe_expert_parallel_size,
             enable_attention_dp=self.enable_attention_dp,
             enable_lm_head_tp_in_adp=self.enable_lm_head_tp_in_adp,
+            pp_partition=self.pp_partition,
             cp_config=self.cp_config)
         return self
 
@@ -2593,6 +2765,9 @@ class TorchLlmArgs(BaseLlmArgs):
     # PrivateVars
     _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
 
+    _disable_flash_infer_sampling: bool = PrivateAttr(default=True)
+    """Unless this is set to False, FlashInfer.sampling is not used, even if available."""
+
     @property
     def quant_config(self) -> QuantConfig:
         if self._quant_config is None:
@@ -2661,7 +2836,6 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_load_balancer(self) -> 'TorchLlmArgs':
-        from .._torch import MoeLoadBalancerConfig
         if isinstance(self.moe_config.load_balancer, str):
             if not os.path.exists(self.moe_config.load_balancer):
                 raise FileNotFoundError(

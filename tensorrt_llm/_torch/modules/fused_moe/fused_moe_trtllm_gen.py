@@ -13,8 +13,9 @@ from tensorrt_llm.logger import logger
 from ...custom_ops.trtllm_gen_custom_ops import \
     fp4_block_scale_fake_output_without_finalize
 from ...distributed import allgather
+from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
-from ...utils import Fp4QuantizedTensor, ceil_div
+from ...utils import AuxStreamType, Fp4QuantizedTensor, ceil_div
 from .interface import AlltoallMethodType, MoE, MoEWeightLoadingMode
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
                            NVFP4TRTLLMGenFusedMoEMethod,
@@ -37,6 +38,7 @@ class TRTLLMGenFusedMoE(MoE):
         dtype (Optional[torch.dtype]): Data type for the weights.
         reduce_results (bool): Whether to reduce the results across devices.
         model_config (ModelConfig): Configuration object for the model.
+        aux_stream_dict (Optional[Dict[AuxStreamType, torch.cuda.Stream]]): Auxiliary CUDA streams for overlapping.
 
     MoE torch custom op:
         Only support min-latency mode now (SM100 Blackwell only).
@@ -66,6 +68,8 @@ class TRTLLMGenFusedMoE(MoE):
         dtype: Optional[torch.dtype] = None,
         reduce_results: bool = False,
         model_config: ModelConfig = ModelConfig(),
+        aux_stream_dict: Optional[Dict[AuxStreamType,
+                                       torch.cuda.Stream]] = None,
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
         VANILLA,
         layer_idx: Optional[int] = None,
@@ -82,6 +86,7 @@ class TRTLLMGenFusedMoE(MoE):
             dtype=dtype,
             reduce_results=reduce_results,
             model_config=model_config,
+            aux_stream_dict=aux_stream_dict,
             weight_loading_mode=weight_loading_mode,
             bias=bias,
             swiglu_alpha=swiglu_alpha,
@@ -97,19 +102,11 @@ class TRTLLMGenFusedMoE(MoE):
 
         assert not self.smart_router, "Smart router is not supported in TRTLLMGenFusedMoE."
 
-        self.num_slots = self.num_experts
-        self.expert_size_per_partition = self.num_experts // self.ep_size
-        self.initial_global_assignments = [
-            (ep_rank * self.num_experts // self.ep_size + local_slot_id) %
-            self.num_experts for ep_rank in range(self.ep_size)
-            for local_slot_id in range(self.expert_size_per_partition)
-        ]
-        self.slot_start = self.ep_rank * self.expert_size_per_partition
-        self.slot_end = self.slot_start + self.expert_size_per_partition
-        self.initial_local_expert_ids = self.initial_global_assignments[
-            self.slot_start:self.slot_end]
-        assert len(
-            self.initial_local_expert_ids) == self.expert_size_per_partition
+        # Note: Load balancer initialization is handled by base class _init_load_balancer()
+        # If no load balancer is available, the base class will set:
+        # - self.num_slots = self.num_experts
+        # - self.expert_size_per_partition = self.num_experts // self.ep_size
+        # - self.initial_global_assignments, self.slot_start, self.slot_end, etc.
 
         # TODO: AlltoAll code is largely duplicated with WideEPMoE. Consider refactor and reuse in the future.
         self.alltoall_method_type = self.select_alltoall_method_type()
@@ -136,7 +133,7 @@ class TRTLLMGenFusedMoE(MoE):
                         mapping=self.mapping,
                         max_num_tokens=model_config.max_num_tokens,
                         top_k=self.routing_method.experts_per_token,
-                        num_experts=self.num_experts,
+                        num_experts=self.num_slots,
                         workspace_size_per_rank=workspace_mb * 1024 * 1024,
                     )
                 else:
@@ -182,6 +179,10 @@ class TRTLLMGenFusedMoE(MoE):
             return AlltoallMethodType.NotEnabled
 
         return AlltoallMethodType.MNNVL
+
+    def _supports_load_balancer(self) -> bool:
+        """TRTLLMGenFusedMoE supports load balancer."""
+        return True
 
     @cached_property
     def enable_alltoall(self):
@@ -285,7 +286,7 @@ class TRTLLMGenFusedMoE(MoE):
                     False)
         elif self.has_w4a8_mxfp4_mxfp8:
             x, x_sf = torch.ops.trtllm.mxfp8_quantize(
-                x, False, alignment=self.quant_method.weight_alignment)
+                x, False, alignment=self.quant_method.input_hidden_alignment)
             x_row, x_col = x.shape[0], x.shape[1]
         elif self.has_deepseek_fp8_block_scales:
             # No change required before communication
@@ -340,13 +341,38 @@ class TRTLLMGenFusedMoE(MoE):
         x_col = x.shape[1]
         token_count = x.shape[0]
         alltoall_info = None
+        # Determine if this is first/last call (TRTLLMGenFusedMoE doesn't use chunking)
+        is_first_call = self.repeat_idx == 0
+        is_last_call = self.repeat_idx == self.repeat_count - 1
 
         if post_quant_comm:
+            # Start GPU stage for first call
+            self._load_balancer_start_wait_gpu_stage(is_first_call)
             token_selected_experts, token_final_scales = self.routing_method.apply(
                 router_logits)
             token_selected_experts = token_selected_experts.to(torch.int32)
             if token_final_scales is not None:
                 token_final_scales = token_final_scales.to(torch.bfloat16)
+
+            self._load_balancer_done_wait_gpu_stage(is_first_call)
+
+            ignore_allreduce = self.enable_alltoall and self.alltoall_method_type == AlltoallMethodType.MNNVL and self.moe_alltoall_backend == "mnnvllatency"
+            self._load_balancer_update_statistic(
+                token_selected_experts,
+                is_first_call,
+                is_last_call,
+                ignore_allreduce=ignore_allreduce)
+
+            # Route tokens to slots
+            token_selected_slots = self._load_balancer_route(
+                token_selected_experts, self.use_dp)
+
+            # Update expert statistics
+            ExpertStatistic.set_layer(self.layer_idx)
+            ExpertStatistic.maybe_add_info(self.num_slots, token_selected_slots)
+
+            # Use routed slots for subsequent processing
+            token_selected_experts = token_selected_slots
 
             x, x_sf, x_row, x_col = self._quantize_for_post_quant_comm(x)
 
@@ -364,9 +390,14 @@ class TRTLLMGenFusedMoE(MoE):
 
             if self.moe_alltoall_backend == "mnnvllatency":
                 assert self.alltoall_prepare_workspace is not None, "alltoall_prepare_workspace should be initialized"
-                alltoall_info, _ = MnnvlMoe.mnnvl_moe_alltoallv_prepare_without_allgather(
+                if is_last_call:
+                    loadbalancer_local_statistic_info = self._load_balancer_get_local_statistic_tensor(
+                    )
+                else:
+                    loadbalancer_local_statistic_info = None
+                alltoall_info, gathered_loadbalancer_local_statistic_info = MnnvlMoe.mnnvl_moe_alltoallv_prepare_without_allgather(
                     token_selected_experts,
-                    None,
+                    loadbalancer_local_statistic_info,
                     self.alltoall_prepare_workspace,
                     runtime_max_tokens_per_rank,
                     self.ep_rank,
@@ -375,6 +406,11 @@ class TRTLLMGenFusedMoE(MoE):
                     self.num_slots,
                     top_k,
                 )
+                if gathered_loadbalancer_local_statistic_info is not None:
+                    gathered_loadbalancer_local_statistic_info = gathered_loadbalancer_local_statistic_info.view(
+                        (self.mapping.moe_ep_size, self.num_experts))
+                    self._load_balancer_update_statistic_with_gathered_statistic(
+                        gathered_loadbalancer_local_statistic_info)
 
                 if x_sf is not None:
                     x_sf = x_sf.view(x_row,
@@ -576,6 +612,9 @@ class TRTLLMGenFusedMoE(MoE):
                 n_group,
                 topk_group,
                 intermediate_size_per_partition_padded,
+                self.hidden_size,  # valid_hidden_size
+                self.quant_method.
+                intermediate_size_per_partition_lean,  # valid_intermediate_size
                 self.
                 slot_start,  # local_expert_start;  use ep_rank if stride!=1
                 self.expert_size_per_partition,  # local_expert_size
@@ -659,6 +698,9 @@ class TRTLLMGenFusedMoE(MoE):
                 n_group,
                 topk_group,
                 intermediate_size_per_partition_padded,
+                self.hidden_size,  # valid_hidden_size_per_partition
+                self.quant_method.
+                intermediate_size_per_partition_lean,  # valid_intermediate_size_per_partition
                 self.
                 slot_start,  # local_expert_start;  use ep_rank if stride!=1
                 self.expert_size_per_partition,  # local_expert_size
@@ -674,7 +716,9 @@ class TRTLLMGenFusedMoE(MoE):
             if not post_quant_comm:
                 # TRTLLM-Gen uses linear SF layout for the mxfp8 input.
                 mxfp8_x, sf = torch.ops.trtllm.mxfp8_quantize(
-                    x, False, alignment=self.quant_method.weight_alignment)
+                    x,
+                    False,
+                    alignment=self.quant_method.input_hidden_alignment)
             else:
                 mxfp8_x, sf = x, x_sf
 
@@ -700,7 +744,9 @@ class TRTLLMGenFusedMoE(MoE):
                 n_group,
                 topk_group,
                 intermediate_size_per_partition_padded,
-                self.hidden_size,
+                self.hidden_size,  # valid_hidden_size
+                self.quant_method.
+                intermediate_size_per_partition_lean,  # valid_intermediate_size
                 self.
                 slot_start,  # local_expert_start;  use ep_rank if stride!=1
                 self.expert_size_per_partition,  # local_expert_size
@@ -715,6 +761,9 @@ class TRTLLMGenFusedMoE(MoE):
             raise NotImplementedError(
                 "TRTLLMGenFusedMoE only supports fp8_block_scaling, nvfp4, w4a16_mxfp4, w4a8_mxfp4_mxfp8 and w4a8_mxfp4_fp8 dtypes."
             )
+
+        # Handle load balancer CPU stage if needed
+        self._load_balancer_start_set_cpu_stage(is_last_call)
 
         # Combine results if using alltoall
         if self.enable_alltoall:
@@ -763,10 +812,17 @@ class TRTLLMGenFusedMoE(MoE):
             use_dp_padding=use_dp_padding,
         )
 
+        self._load_balancer_done_set_cpu_stage(is_last_call)
+
         if use_dp_padding:
-            rank = self.mapping.tp_rank
+            rank = self.parallel_rank
             final_hidden_states = final_hidden_states[:
                                                       all_rank_num_tokens[rank]]
+
+        # Update repeat index for load balancer
+        if self.layer_load_balancer:
+            self.repeat_idx = 0 if self.repeat_idx == self.repeat_count - 1 else self.repeat_idx + 1
+
         return final_hidden_states
 
     def forward_fake(

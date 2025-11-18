@@ -4,6 +4,7 @@ Build moe_align CUDA extension eagerly with a persistent build directory
 """
 
 import os
+import tempfile
 
 import torch
 from torch.utils.cpp_extension import load
@@ -12,21 +13,10 @@ from torch.utils.cpp_extension import load
 os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.0;8.6;8.9;9.0")
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-CACHE_ROOT = os.environ.get("AD_CACHE_DIR") or os.path.join(
-    os.environ.get("XDG_CACHE_HOME", os.path.join(os.path.expanduser("~"), ".cache")),
-    "ad_cache",
-)
-BUILD_DIR = os.path.join(CACHE_ROOT, "auto_deploy", "fused_moe", "moe_align")
-try:
-    os.makedirs(BUILD_DIR, exist_ok=True)
-except PermissionError:
-    import tempfile
 
-    # Fallback to the system temp dir while maintaining a stable subfolder layout
-    BUILD_DIR = os.path.join(
-        tempfile.gettempdir(), "ad_cache", "auto_deploy", "fused_moe", "moe_align"
-    )
-    os.makedirs(BUILD_DIR, exist_ok=True)
+# Use system temp directory to avoid environment variable dependency
+BUILD_DIR = os.path.join(tempfile.gettempdir(), "ad_cache", "auto_deploy", "fused_moe", "moe_align")
+os.makedirs(BUILD_DIR, exist_ok=True)
 
 moe_align_ext = load(
     name="moe_align_ext",

@@ -331,7 +331,8 @@ class StarAttention(AttentionBackend[StarAttentionMetadata]):
         num_ctx_tokens = metadata.num_ctx_tokens
         num_qry_tokens = metadata.num_qry_tokens
 
-        kv_cache = metadata.kv_cache_manager.get_buffers(self.layer_idx)
+        kv_cache = metadata.kv_cache_manager.get_buffers(
+            self.layer_idx, kv_layout=metadata.kv_layout)
         if self.quant_config and self.quant_config.layer_quant_mode.has_any_quant(
         ):
             qc = self.quant_config

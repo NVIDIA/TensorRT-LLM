@@ -120,6 +120,7 @@ def _torch_ssm_prepare_metadata(
     pages_per_seq: torch.Tensor,
     slot_idx: torch.Tensor,
     page_size: int,
+    chunk_size: int,
 ) -> List[torch.Tensor]:
     """Prepare metadata for cached SSM transform.
 
@@ -143,7 +144,7 @@ def _torch_ssm_prepare_metadata(
 
 @_torch_ssm_prepare_metadata.register_fake
 def _torch_ssm_prepare_metadata_fake(
-    position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size
+    position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size, chunk_size
 ):
     # Use the same sanitization logic to determine sizes in fake mode
     seq_len_sanitized = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
@@ -347,6 +348,9 @@ class TorchBackendSSM(AttentionDescriptor):
             # Fallback: assume last dim is n_groups * state_size and choose a minimal positive size
             ssm_state_size = max(1, B_fake.shape[-1])
 
+        # extract ssm_state_dtype from cache_config or hs_fake
+        ssm_state_dtype = cache_config.mamba_dtype or hs_fake.dtype
+
         def _get_ssm_cache(si: SequenceInfo):
             return torch.empty(
                 si.max_batch_size,
@@ -354,7 +358,7 @@ class TorchBackendSSM(AttentionDescriptor):
                 head_dim,
                 ssm_state_size,
                 device=si.device,
-                dtype=cache_config.dtype or hs_fake.dtype,
+                dtype=ssm_state_dtype,
             )
 
         return {"ssm_state_cache": _get_ssm_cache}
