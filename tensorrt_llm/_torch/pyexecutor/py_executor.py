@@ -1767,19 +1767,32 @@ class PyExecutor:
         # Remove cancel request in the waiting queue
         self.executor_request_queue.update_waiting_queue()
 
+        # Create set from list of canceled request ids to speed up canceled test
+        canceled_req_ids = set(self.executor_request_queue.get_canceled_req_ids())
+
+        still_pending_canceled_ids = []
         for request in self.active_requests:
             req_id = request.py_request_id if not request.is_child else request.parent_request_id
-            if req_id in self.executor_request_queue.get_canceled_req_ids():
+            if req_id not in canceled_req_ids:
+                continue
+
+            is_cancelled = self._try_cancel_request(request)
+            if is_cancelled:
                 # Mark requests as finished, then, we reuse all existing code
                 # to clean up the KV cache resources.
                 request.finish_by_reason(FinishReason.CANCELLED)
                 request.decoding_iter = request.py_decoding_iter
+            else:
+                still_pending_canceled_ids.append(req_id)
 
         if self.enable_attention_dp:
             # TODO: revisit the cancel logic of attention dp
             # When enable attention dp, each rank does not have full copy of requests
             # so we need to remove the cancel requests not in the local rank
             self.executor_request_queue.clear_canceled_req_ids()
+        else:
+            # Only keep active requests that did not cancel in canceled req ids list
+            self.executor_request_queue.canceled_req_ids = still_pending_canceled_ids
 
     @nvtx_range("_enqueue_responses")
     def _enqueue_responses(self, responses: Iterable[Tuple[int, LlmResponse]]):
