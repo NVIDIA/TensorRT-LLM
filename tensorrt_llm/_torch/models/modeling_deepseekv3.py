@@ -556,13 +556,8 @@ class DeepseekV32Attention(MLA):
         config = model_config.pretrained_config
         predicted_tokens_per_seq = model_config.spec_config.max_total_draft_tokens + 1 if model_config.spec_config is not None else 1
 
-        # DSV3.2 nvfp4 ckpt has kv_a_proj_with_mqa module in bfloat16
-        # TODO: check it more directly/robustly, e.g., indexer_weight_quant == fuseA_quant == indexer_quant
-        if model_config.get_quant_config().quant_algo == QuantAlgo.NVFP4:
-            self.fuse_a_indexer_k = True
-        else:
-            self.fuse_a_indexer_k = False
-
+        # DSV3.2 can fuse indexer k projection into kv_a_proj_with_mqa GEMM
+        self.fuse_a_indexer_k = True
         super().__init__(hidden_size=config.hidden_size,
                          num_attention_heads=config.num_attention_heads,
                          num_key_value_heads=config.num_key_value_heads,
