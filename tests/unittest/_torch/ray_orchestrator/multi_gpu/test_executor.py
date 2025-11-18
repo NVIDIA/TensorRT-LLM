@@ -31,7 +31,6 @@ def test_bundle_indices(monkeypatch):
     """Placement via bundle indices"""
 
     monkeypatch.setenv("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", "1")
-    monkeypatch.setenv("TLLM_RAY_USE_RPC", "1")
 
     pg = None
     try:
