@@ -19,6 +19,7 @@
 #if ENABLE_MULTI_DEVICE
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include <limits>
 #include <stdexcept>
@@ -463,6 +464,16 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
     if (!comm)
     {
         return;
+    }
+
+    // Synchronize CUDA to ensure all operations using these buffers are complete
+    // before we deregister windows and free memory
+    cudaError_t cudaErr = cudaDeviceSynchronize();
+    if (cudaErr != cudaSuccess)
+    {
+        TLLM_LOG_WARNING("[NCCLUtil] cudaDeviceSynchronize failed with error: %d before cleanup for comm %p", cudaErr,
+            static_cast<void*>(comm));
+        // Continue anyway - the sync failure might be from a previous error
     }
 
     std::lock_guard<std::mutex> lock(mMutex);
