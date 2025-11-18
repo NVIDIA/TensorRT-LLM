@@ -674,6 +674,11 @@ def _scale(weights: torch.Tensor, q_scale: torch.Tensor,
     return weights * q_scale.squeeze(-1) * s
 
 
+@maybe_compile(dynamic=True)
+def _to_float(hidden_states: torch.Tensor) -> torch.Tensor:
+    return hidden_states.float()
+
+
 class Indexer(nn.Module):
 
     def __init__(self,
@@ -1234,18 +1239,36 @@ class Indexer(nn.Module):
                                         dtype=torch.int32)
         return topk_indices_buffer
 
-    @maybe_compile(dynamic=True)
-    def _scale_v2(self, hidden_states: torch.Tensor, q_scale: torch.Tensor,
-                  s: float) -> torch.Tensor:
-        weights = self.weights_proj(hidden_states.float())
-        return weights * q_scale.squeeze(-1) * s
-
-    def weight_scale(self, hidden_states: torch.Tensor,
-                     q_scale: torch.Tensor) -> torch.Tensor:
-        #weights = self.weights_proj(hidden_states.float())
-        weights = self._scale_v2(hidden_states, q_scale,
-                                 self.weight_scale_factor)
+    def _weight_scale(self, weights: torch.Tensor,
+                      q_scale: torch.Tensor) -> torch.Tensor:
+        weights = _scale(weights, q_scale, self.weight_scale_factor)
         return weights
+
+    def _qk_projection_and_rope(self, qr: torch.Tensor,
+                                hidden_states: torch.Tensor,
+                                indexer_k: Optional[torch.Tensor],
+                                position_ids: torch.Tensor):
+        """Project Q/K and apply RoPE"""
+        q = self.wq_b(qr)
+        k = indexer_k if indexer_k is not None else self.wk(hidden_states)
+        k = self.k_norm(k)
+        q = q.view(-1, self.n_heads, self.head_dim)
+        q_pe, q_nope = q.split([self.rope_dim, self.head_dim - self.rope_dim],
+                               dim=-1)
+        k_pe, k_nope = k.split([self.rope_dim, self.head_dim - self.rope_dim],
+                               dim=-1)
+        q_pe, k_pe = self.rotary_emb(position_ids, [q_pe, k_pe.unsqueeze(1)])
+        k_pe = k_pe[:, 0, :]
+        return q_pe, q_nope, k_pe, k_nope
+
+    def _prep_q_or_k(self, qk_pe: torch.Tensor, qk_nope: torch.Tensor):
+        """Concatenate, rotate, and FP8 quantize for Q or K"""
+        q_or_k = torch.cat([qk_pe, qk_nope], dim=-1)
+        q_or_k = rotate_activation(q_or_k)
+        q_or_k = q_or_k.view(-1, self.head_dim)
+        q_or_k = fp8_utils.fp8_quantize_1x128_sf_transpose(
+            q_or_k, use_ue8m0=self.scale_fmt == "ue8m0")
+        return q_or_k
 
     @torch.inference_mode()
     def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
@@ -1254,66 +1277,29 @@ class Indexer(nn.Module):
         quant_block_size = metadata.kv_cache_manager.quant_block_size
         assert quant_block_size == 128, "Only support quant_block_size = 128 for now"
 
-        if indexer_k is not None:
-            q, k = maybe_execute_in_parallel(
-                lambda: self.wq_b(
-                    qr),  # TODO: fuse wq_b and move this outside of the indexer
-                lambda: self.k_norm(indexer_k),
-                self.ln_events[0],
-                self.ln_events[1],
-                self.aux_stream,
-            )
-        else:
-            q, k = maybe_execute_in_parallel(
-                lambda: self.wq_b(qr),
-                lambda: self.k_norm(self.wk(hidden_states)),
-                self.ln_events[0],
-                self.ln_events[1],
-                self.aux_stream,
-            )
-
-        # q/k rope + possible fast_hadamard_transform
-        q = q.view(-1, self.n_heads, self.head_dim)
-
-        q, k = maybe_execute_in_parallel(
-            lambda: torch.split(
-                q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1),
-            lambda: torch.split(
-                k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1),
+        q_and_k, weights = maybe_execute_in_parallel(
+            lambda: self._qk_projection_and_rope(qr, hidden_states, indexer_k,
+                                                 position_ids),
+            lambda: self.weights_proj(_to_float(hidden_states)),
             self.ln_events[0],
             self.ln_events[1],
             self.aux_stream,
         )
-
-        q_pe, q_nope = q
-        k_pe, k_nope = k
-        q_pe, k_pe = self.rotary_emb(position_ids, [q_pe, k_pe.unsqueeze(1)])
-
-        k_pe = k_pe[:, 0, :]
-
-        def _prep_q_or_k(qk_pe, qk_nope):
-            q_or_k = torch.cat([qk_pe, qk_nope], dim=-1)
-            q_or_k = rotate_activation(q_or_k)
-            q_or_k = q_or_k.view(-1, self.head_dim)
-            q_or_k = fp8_utils.fp8_quantize_1x128_sf_transpose(
-                q_or_k, use_ue8m0=self.scale_fmt == "ue8m0")
-            return q_or_k
-
+        q_pe, q_nope, k_pe, k_nope = q_and_k
         q, k = maybe_execute_in_parallel(
-            lambda: _prep_q_or_k(q_pe, q_nope),
-            lambda: _prep_q_or_k(k_pe, k_nope),
+            lambda: self._prep_q_or_k(q_pe, q_nope),
+            lambda: self._prep_q_or_k(k_pe, k_nope),
             self.ln_events[0],
             self.ln_events[1],
             self.aux_stream,
         )
-
         q_fp8, q_scale = q
         k_fp8, k_scale = k
         q_fp8 = q_fp8.view(-1, self.n_heads, self.head_dim)
         q_scale = q_scale.view(-1, self.n_heads, 1)
 
         weights, _ = maybe_execute_in_parallel(
-            lambda: self.weight_scale(hidden_states, q_scale),
+            lambda: self._weight_scale(weights, q_scale),
             lambda: self._update_k_cache(
                 k_fp8, k_scale, metadata),  # store k_fp8 and k_scale in k cache
             self.ln_events[0],
