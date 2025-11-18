@@ -242,10 +242,10 @@ To serve the model using `trtllm-serve`:
 cat >./extra-llm-api-config.yml <<EOF
 cuda_graph_config:
     enable_padding: true
-    enable_block_reuse: false
     max_batch_size: 1024
 enable_attention_dp: false
 kv_cache_config:
+    enable_block_reuse: false
     dtype: fp8
 stream_interval: 10
 EOF
@@ -256,9 +256,9 @@ EOF
 cat >./extra-llm-api-config.yml <<EOF
 cuda_graph_config:
   enable_padding: true
-  enable_block_reuse: false
   max_batch_size: 2048
 kv_cache_config:
+  enable_block_reuse: false
   dtype: fp8
 stream_interval: 10
 enable_attention_dp: true
@@ -270,10 +270,10 @@ EOF
 cat >./extra-llm-api-config.yml <<EOF
 cuda_graph_config:
     enable_padding: true
-    enable_block_reuse: false
     max_batch_size: 1024
 enable_attention_dp: false
 kv_cache_config:
+    enable_block_reuse: false
     dtype: fp8
     free_gpu_memory_fraction: 0.8
 stream_interval: 10
@@ -288,10 +288,10 @@ EOF
 cat >./extra-llm-api-config.yml <<EOF
 cuda_graph_config:
     enable_padding: true
-    enable_block_reuse: false
     max_batch_size: 512
 enable_attention_dp: true
 kv_cache_config:
+    enable_block_reuse: false
     dtype: fp8
     free_gpu_memory_fraction: 0.8
 stream_interval: 10
