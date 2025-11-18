@@ -61,6 +61,31 @@ def validate_allreduce_strategy(v):
     if isinstance(v, int):
         return AllReduceStrategy(v)
     return v  # Let Pydantic handle other types
+class ShardingSource(Enum):
+    """Enum for sharding source."""
+
+    HEURISTIC = "heuristic"
+    FACTORY = "factory"
+
+
+class ShardingDim(Enum):
+    """Enum for sharding dimension."""
+
+    SSM = "ssm"
+    TP = "tp"
+    EP = "ep"
+    BMM = "bmm"
+
+
+class SplitDimension(IntEnum):
+    """Enum for tensor split dimensions in sharding."""
+
+    # NOTE: The names COLUMN/ROW reflect the hugging face
+    # base_tp_plan sharding notation, but since we assume Y = W @ X^T,
+    # when splitting weight matrix W^T across columns, the actual split
+    # is over dimension 0
+    COLUMN = 0
+    ROW = 1
 
 
 def _load_hook(
@@ -562,17 +587,6 @@ def _update_node_args(node: Node, args: tuple) -> None:
     )
 
 
-class SplitDimension(IntEnum):
-    """Enum for tensor split dimensions in sharding."""
-
-    # NOTE: The names COLUMN/ROW reflect the hugging face
-    # base_tp_plan sharding notation, but since we assume Y = W @ X^T,
-    # when splitting weight matrix W^T across columns, the actual split
-    # is over dimension 0
-    COLUMN = 0
-    ROW = 1
-
-
 class ShardingTransformInfo(BaseModel, ABC):
     """Abstract base class for transformation configurations."""
 
@@ -996,6 +1010,7 @@ def _insert_sharded_moe(
     world_size: int,
     allreduce_strategy: AllReduceStrategy,
     scale_names: Sequence[str] = (),
+    process_grid: Dict[ShardingDim, int] = {},
 ):
     """Update the torch_moe node with sharded weight lists,
     sharded `selected_experts` and `final_scales(router_logics)`.
@@ -1014,7 +1029,24 @@ def _insert_sharded_moe(
     selected_experts = args[1]
     final_scales = args[2]
 
-    experts_per_rank = num_experts // world_size
+    if len(process_grid) > 0:
+        ep_size = process_grid[ShardingDim.EP]
+        tp_size = process_grid[ShardingDim.TP]
+        # the order of the keys (ep,tp) vs (tp,ep) determines how ranks
+        # are mapped to the 2D process grid
+        if list(process_grid.keys())[-1] == ShardingDim.TP:
+            tp_rank = rank % tp_size
+            ep_rank = rank // tp_size
+        else:
+            tp_rank = rank // ep_size
+            ep_rank = rank % ep_size
+    else:
+        ep_size = world_size
+        tp_size = 1
+        ep_rank = rank
+        tp_rank = 0
+
+    experts_per_rank = num_experts // ep_size
 
     with gm.graph.inserting_before(node):
         lower = experts_per_rank * rank
@@ -1032,7 +1064,7 @@ def _insert_sharded_moe(
         div_node = gm.graph.create_node(
             "call_function", operator.floordiv, args=(selected_experts, experts_per_rank), kwargs={}
         )
-        comp_op = torch.ge if rank == world_size - 1 else torch.eq
+        comp_op = torch.ge if ep_rank == ep_size - 1 else torch.eq
         rank_mask = gm.graph.create_node("call_function", comp_op, args=(div_node, rank), kwargs={})
 
         # final_scales_local = final_scales * rank_mask
@@ -1041,20 +1073,20 @@ def _insert_sharded_moe(
         )
 
     # -- Shard expert weights --
-    def get_partition(lst, world_size, rank):
+    def get_partition(lst, ep_size, ep_rank):
         num_experts = len(lst)
-        expert_size_per_partition = num_experts // world_size
-        expert_start = rank * expert_size_per_partition
+        expert_size_per_partition = num_experts // ep_size
+        expert_start = ep_rank * expert_size_per_partition
         # For num_experts % world_size != 0 case,
         # assign the last (num_experts % world_size) experts to the last rank
         expert_end = (
-            num_experts if (rank == world_size - 1) else expert_start + expert_size_per_partition
+            num_experts if (ep_rank == ep_size - 1) else expert_start + expert_size_per_partition
         )
         return lst[expert_start:expert_end]
 
-    w1_list_sharded = get_partition(args[3], world_size, rank)
-    w2_list_sharded = get_partition(args[4], world_size, rank)
-    w3_list_sharded = get_partition(args[5], world_size, rank)
+    w1_list_sharded = get_partition(args[3], ep_size, ep_rank)
+    w2_list_sharded = get_partition(args[4], ep_size, ep_rank)
+    w3_list_sharded = get_partition(args[5], ep_size, ep_rank)
 
     # -- Update args --
     args[1] = selected_experts_local
@@ -1065,11 +1097,12 @@ def _insert_sharded_moe(
 
     # Shard scales for quantized ops
     for i in range(len(scale_names) * 3):  # 3 layers (w1, w2, w3) × #scale_names per layer
-        args[6 + i] = get_partition(args[6 + i], world_size, rank)
+        args[6 + i] = get_partition(args[6 + i], ep_size, ep_rank)
 
     ad_logger.debug(
         f"Updated node {node}: replaced original arguments {node.args} with sharded arguments {args}."
     )
+    ad_logger.debug(f"TP rank: {tp_rank}, EP rank: {ep_rank}")
     node.args = tuple(args)
 
     # -- add an all_reduce node --
@@ -1163,12 +1196,10 @@ def _insert_sharded_mxfp4_mlp_ep(
 
 class EPShardingInfo(ShardingTransformInfo):
     """Configuration for EP sharding transformations.
-
-    NOTE: allreduce_strategy will be automatically injected by ShardingConfig.add()
-    if not provided at creation time. The strategy comes from the parent ShardingConfig.
     """
-
-    allreduce_strategy: Optional[AllReduceStrategy] = None  # Set by ShardingConfig.add() if None
+    rank: int
+    world_size: int
+    process_grid: Dict[ShardingDim, int]
 
     @classmethod
     def from_node(cls, node: Node, **kwargs) -> "EPShardingInfo":
@@ -1187,7 +1218,7 @@ class EPShardingInfo(ShardingTransformInfo):
 
     def apply(self, gm: GraphModule, node: Node) -> None:
         """Apply EP sharding transformation to the graph module."""
-        _insert_sharded_moe(gm, node, self.rank, self.world_size, self.allreduce_strategy, [])
+        _insert_sharded_moe(gm, node, self.rank, self.world_size,self.allreduce_strategy, process_grid=self.process_grid)
 
 
 class MXFP4EPShardingInfo(EPShardingInfo):
@@ -1218,7 +1249,12 @@ class FP8EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
 
     def apply(self, gm: GraphModule, node: Node) -> None:
         _insert_sharded_moe(
-            gm, node, self.rank, self.world_size, self.allreduce_strategy, self.scale_names()
+            gm,
+            node,
+            self.rank,
+            self.world_size,
+            scale_names=self.scale_names(),
+            process_grid=self.process_grid,
         )
 
 
@@ -1259,23 +1295,6 @@ def _resolve_ep_cls_from_node(node: Node) -> type[EPShardingInfo]:
     return EPShardingInfo
 
 
-class ShardingSource(Enum):
-    """Enum for sharding source."""
-
-    HEURISTIC = "heuristic"
-    FACTORY = "factory"
-    MANUAL = "manual"
-
-
-class ShardingDim(Enum):
-    """Enum for sharding dimension."""
-
-    SSM = "ssm"
-    TP = "tp"
-    EP = "ep"
-    BMM = "bmm"
-
-
 class ShardingTransformContainer(BaseModel):
     """Configuration for sharding the model."""
 
@@ -1297,6 +1316,7 @@ class ShardingTransformContainer(BaseModel):
         description="AllReduce strategy for distributed operations. "
         "Options: AUTO, NCCL, ONESHOT, TWOSHOT, MIN_LATENCY, LOWPRECISION, UB, MNNVL, NCCL_SYMMETRIC, SYMM_MEM",
     )
+    process_grid: Dict[ShardingDim, int] = Field(default_factory=dict)
     weight_sharding_transforms: List[WeightShardingInfo] = Field(default_factory=list)
     parameter_update_transforms: List[ParameterUpdateInfo] = Field(default_factory=list)
     bmm_transforms: List[BMMShardingInfo] = Field(default_factory=list)
