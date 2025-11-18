@@ -106,6 +106,7 @@ def parse_arguments():
     # KV cache
     parser.add_argument('--kv_cache_dtype', type=str, default='auto')
     parser.add_argument("--kv_cache_fraction", type=float, default=0.7)
+    parser.add_argument('--tokens_per_block', type=int, default=64)
     parser.add_argument('--num_samples', type=int, default=10)
 
     # Runtime
@@ -139,6 +140,7 @@ def run_llm(args, sparse_attention_config):
         enable_block_reuse=
         False,  # sparse attention does not support kv cache reuse now
         free_gpu_memory_fraction=args.kv_cache_fraction,
+        tokens_per_block=args.tokens_per_block,
         dtype=args.kv_cache_dtype,
         tokens_per_block=64,
     )

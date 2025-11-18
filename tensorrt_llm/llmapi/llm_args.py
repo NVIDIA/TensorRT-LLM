@@ -232,7 +232,7 @@ class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
     topk: Optional[int] = Field(default=128, description="Top-k")
     prompt_budget: Optional[int] = Field(default=1266,
                                          description="Prompt budget")
-    page_size: Optional[int] = Field(default=3, description="Page size")
+    page_size: Optional[int] = Field(default=4, description="Page size")
     kt_cache_dtype: Optional[Any] = Field(default=torch.bfloat16,
                                           description="KT cache dtype")
 

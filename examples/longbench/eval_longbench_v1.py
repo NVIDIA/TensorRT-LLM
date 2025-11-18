@@ -160,6 +160,7 @@ def parse_arguments() -> argparse.Namespace:
                         type=str,
                         default='auto',
                         help='KV cache data type')
+    parser.add_argument('--tokens_per_block', type=int, default=64)
     parser.add_argument('--kv_cache_fraction',
                         type=float,
                         default=0.7,
@@ -320,6 +321,7 @@ def initialize_llm(args: argparse.Namespace) -> Tuple[LLM, AutoTokenizer]:
             # sparse attention doesn't support KV cache reuse
             enable_block_reuse=False,
             free_gpu_memory_fraction=args.kv_cache_fraction,
+            tokens_per_block=args.tokens_per_block,
         )
 
         # Configure CUDA graph

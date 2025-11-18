@@ -45,6 +45,9 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.page_size = self.sparse_attention_config.page_size
         self.topk = self.sparse_attention_config.topk
 
+        assert self.page_size == next_power_of_2(
+            self.page_size), "Page size must be a power of 2"
+
         capture_graph = torch.cuda.is_current_stream_capturing()
 
         # Cumulative valid sequence lengths for query and key
@@ -430,6 +433,7 @@ class RocketTrtllmAttention(TrtllmAttention):
             self.num_kv_heads,
             self.head_dim,
             self.page_size,
+            self.prompt_budget,
             metadata.kt_tokens_per_block,
             metadata.kv_cache_manager.max_kt_blocks_per_seq,
         )
