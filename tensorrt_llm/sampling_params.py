@@ -10,12 +10,10 @@ from pydantic import BaseModel
 from tensorrt_llm.bindings import executor as tllme
 from tensorrt_llm.logger import logger
 
-# Logprobs mode type definition (similar to vLLM)
-# - "raw_logits": return raw unnormalized logits before temperature/penalties/top-k/top-p
-# - "raw_logprobs": return log-softmax of raw logits
-# - "processed_logits": return unnormalized logits after temperature/penalties/top-k/top-p
-# - "processed_logprobs": return log-softmax of processed logits
-LogprobsMode = Literal["raw_logits", "raw_logprobs", "processed_logits", "processed_logprobs"]
+# Logprobs mode:
+# - "processed_logprobs": return log-softmax of greedy sampled logits
+# TODO: add "return_raw_context_logits" and "return_raw_generation_logits" later
+LogprobsMode = Literal["processed_logprobs"]
 
 
 @dataclass(slots=True, kw_only=True)
@@ -52,7 +50,7 @@ class LogprobParams(NamedTuple):
     # Drop the geneation_logits once the logprobs are computed
     drop_generation_logits: bool = False
     # Logprobs mode: controls whether to return logprobs before or after sampling modifications
-    logprobs_mode: LogprobsMode = "raw_logprobs"
+    logprobs_mode: LogprobsMode = "processed_logprobs"
 
 
 class LogitsProcessor(ABC):
@@ -183,11 +181,8 @@ class SamplingParams:
 
         logprobs (int, optional): Number of log probabilities to return per output token. Defaults to None.
         prompt_logprobs (int, optional): Number of log probabilities to return per prompt token. Defaults to None.
-        logprobs_mode (str): Controls whether to return logprobs before or after sampling modifications. Defaults to "raw_logprobs".
+        logprobs_mode (str): Controls return logprobs after sampling modifications. Defaults to "processed_logprobs".
             Options:
-            - "raw_logits": Return raw unnormalized logits before temperature/penalties/top-k/top-p
-            - "raw_logprobs": Return log-softmax of raw logits
-            - "processed_logits": Return unnormalized logits after temperature/penalties/top-k/top-p
             - "processed_logprobs": Return log-softmax of processed logits
         return_context_logits (bool): Controls if Result should contain the context logits. Defaults to False.
         return_generation_logits (bool): Controls if Result should contain the generation logits. Defaults to False.
@@ -266,7 +261,7 @@ class SamplingParams:
     additional_model_outputs: Optional[List[str]] = None
 
     # Logprobs mode: controls whether to return logprobs before or after sampling modifications
-    logprobs_mode: LogprobsMode = "raw_logprobs"
+    logprobs_mode: LogprobsMode = "processed_logprobs"
 
     # Used in logprobs calculation in TRT flow to drop logits early if user did not explicitly request them.
     # Can be deprecated after migration to PyTorch backend.

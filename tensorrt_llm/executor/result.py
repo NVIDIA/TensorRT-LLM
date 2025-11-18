@@ -1007,7 +1007,6 @@ def compute_logprobs(
     context_logits: Optional[torch.Tensor],
     generation_logits: Optional[torch.Tensor],
     output_token_ids: Optional[list[int]],
-    apply_log_softmax: bool = True,
 ) -> LogProbsResult:
     """
     Compute top-K logprobs from logits when engine doesn't provide them directly.
@@ -1023,7 +1022,6 @@ def compute_logprobs(
         context_logits: Logits for context/prompt tokens
         generation_logits: Logits for generated tokens
         output_token_ids: Token IDs of generated outputs
-        apply_log_softmax: If True, apply log_softmax to logits. If False, logits are already log_softmax'ed or are raw unnormalized values (depending on logprobs_mode)
 
     Returns:
         LogProbsResult, a NamedTuple containing:
@@ -1031,10 +1029,8 @@ def compute_logprobs(
             - generation: Optional[List[Dict[token_id, Logprob]]] logprobs for generated tokens.
     """
 
-    def _topk_logprobs(logits: torch.Tensor,
-                       top_k: int,
-                       tokens: Optional[list[int]],
-                       apply_softmax: bool = True) -> TokenLogprobs:
+    def _topk_logprobs(logits: torch.Tensor, top_k: int,
+                       tokens: Optional[list[int]]) -> TokenLogprobs:
         if logits.dim() == 3:
             # reshape from [1, T, V] to [T, V]
             logits = logits.squeeze(0)
@@ -1044,13 +1040,7 @@ def compute_logprobs(
             # than output tokens.
             logits = logits[:len(tokens)]
 
-        # Apply log_softmax only if requested (for logprobs modes)
-        # For logits modes, skip log_softmax to return raw unnormalized values
-        if apply_softmax:
-            logprobs = F.log_softmax(logits.to("cuda", dtype=torch.float32),
-                                     dim=-1)
-        else:
-            logprobs = logits.to("cuda", dtype=torch.float32)
+        logprobs = F.log_softmax(logits.to("cuda", dtype=torch.float32), dim=-1)
 
         topk_vals, topk_indices = torch.topk(logprobs, k=top_k, dim=-1)
 
@@ -1076,16 +1066,10 @@ def compute_logprobs(
         return results
 
     prompt_logprobs = _topk_logprobs(
-        context_logits,
-        k_prompt_logprobs,
-        None,
-        apply_softmax=apply_log_softmax
-    ) if k_prompt_logprobs and context_logits is not None else None
+        context_logits, k_prompt_logprobs,
+        None) if k_prompt_logprobs and context_logits is not None else None
     generation_logprobs = _topk_logprobs(
-        generation_logits,
-        k_logprobs,
-        output_token_ids,
-        apply_softmax=apply_log_softmax
+        generation_logits, k_logprobs, output_token_ids
     ) if k_logprobs and generation_logits is not None else None
 
     return LogProbsResult(prompt=prompt_logprobs,
