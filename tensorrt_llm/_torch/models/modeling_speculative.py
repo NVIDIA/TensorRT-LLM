@@ -54,6 +54,11 @@ class Eagle3Attention(Attention):
             tp_size = 1
         # Override the QKV projection. The number of input features
         # is twice as big for EAGLE3 draft models.
+        qkv_shard_indices_mapping = {
+            "q": (0, self.q_size),
+            "k": (self.q_size, self.kv_size),
+            "v": (self.q_size + self.kv_size, self.kv_size),
+        }
         if not self._next_layer_regular:
             self.qkv_proj = Linear(
                 2 * self.hidden_size,
@@ -67,6 +72,7 @@ class Eagle3Attention(Attention):
                 quant_config=model_config.get_quant_config(),
                 skip_create_weights_in_init=model_config.
                 skip_create_weights_in_init,
+            fused_weight_shard_indices_mapping=qkv_shard_indices_mapping,
             )
 
 
@@ -642,10 +648,12 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
 
     def load_weights(self,
                      weights: Dict,
-                     weight_mapper: Optional[BaseWeightMapper] = None):
+                     weight_mapper: Optional[BaseWeightMapper] = None,
+                     allow_partial_loading: bool = False):
         super().load_weights(weights=weights,
                              weight_mapper=weight_mapper,
-                             skip_modules=["draft_model"])
+                             skip_modules=["draft_model"],
+                             allow_partial_loading=allow_partial_loading)
 
     def load_draft_weights(self,
                            weights: Dict,

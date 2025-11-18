@@ -187,7 +187,8 @@ class PyTorchModelEngine(ModelEngine):
         if model is None:
             lora_config: Optional[
                 LoraConfig] = None if is_draft_model else llm_args.lora_config
-            loader = ModelLoader(
+            # Keep the model_loader to support reloading the model weights later
+            self.model_loader = ModelLoader(
                 llm_args=llm_args,
                 mapping=self.mapping,
                 spec_config=self.spec_config,
@@ -196,7 +197,7 @@ class PyTorchModelEngine(ModelEngine):
                 max_seq_len=self.max_seq_len,
                 lora_config=lora_config,
             )
-            self.model, moe_load_balancer = loader.load(
+            self.model, moe_load_balancer = self.model_loader.load(
                 checkpoint_dir=model_path, checkpoint_loader=checkpoint_loader)
             if isinstance(moe_load_balancer, MoeLoadBalancer):
                 setattr(self, "moe_load_balancer", moe_load_balancer)

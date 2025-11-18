@@ -1,5 +1,6 @@
-from typing import List
+from typing import Callable, List, Optional
 
+import pytest
 import torch
 from torch.multiprocessing.reductions import reduce_tensor
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -44,18 +45,35 @@ class HFModel:
                     cur_weights.append((n, p.to("cuda:" + str(i))))
                 self.all_weights[i] = cur_weights
 
-    def get_weight_ipc_handles(self, cuda_device: int = None):
+    def get_weight_ipc_handles(
+        self,
+        cuda_device: Optional[List[int]] = None,
+        weight_filter: Optional[Callable[[str], bool]] = None,
+    ):
+        """
+        Get IPC handles for model weights with flexible filtering.
+
+        Args:
+            cuda_device: List of CUDA device indices to get weights from
+            weight_filter: Optional function that takes weight name and returns True if weight should be included
+
+        Returns:
+            ret: Dictionary containing weight handles
+        """
         ret = {}
-        device_list = (
-            list(range(torch.cuda.device_count())) if cuda_device is None else [cuda_device]
-        )
+        device_list = list(range(torch.cuda.device_count())) if cuda_device is None else cuda_device
+
         for device in device_list:
             all_handles = []
             for item in self.all_weights[device]:
                 name, p = item
+                # Apply filter if provided
+                if weight_filter is not None and not weight_filter(name):
+                    continue
                 handle = reduce_tensor(p)
                 all_handles.append((name, handle))
             ret[self.device_uuid[device]] = all_handles
+
         return ret
 
     def generate_batch_incremental(
@@ -81,6 +99,7 @@ class HFModel:
                 ret = self.model.generate(
                     input_ids=cur_token_ids.unsqueeze(0).cuda(),
                     max_new_tokens=1,
+                    do_sample=False,
                     return_dict_in_generate=True,
                     output_scores=True,
                 )
@@ -106,7 +125,7 @@ def compare_logits(
     logits_list: List[torch.Tensor],
     ref_logits_list: List[torch.Tensor],
     topk: int = 20,
-    threshold: float = 0.85,
+    threshold: float = 0.9,
 ):
     assert len(logits_list) == len(ref_logits_list)
 
@@ -139,14 +158,17 @@ def run_generate(llm, hf_model, prompts, sampling_params):
     return llm_logits, ref_logits
 
 
-def test_llm_update_weights():
-    llama_model_path = str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+@pytest.mark.parametrize(
+    "model_dir", ["Qwen3/Qwen3-8B", "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"]
+)
+def test_llm_update_weights(model_dir):
+    model_dir = str(llm_models_root() / model_dir)
     kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
 
-    hf_model = HFModel(llama_model_path)
+    hf_model = HFModel(model_dir)
 
     llm = LLM(
-        model=llama_model_path,
+        model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
         tensor_parallel_size=1,
         pipeline_parallel_size=1,
@@ -170,13 +192,46 @@ def test_llm_update_weights():
     llm_logits, ref_logits = results[0]
     compare_logits(llm_logits, ref_logits)
 
-    # Stage 2: Test update with flipped weights
+    # Stage 2: Test update weights with full weights
     hf_model.flip_weights()
-    ipc_handles = hf_model.get_weight_ipc_handles()
+    ipc_handles = hf_model.get_weight_ipc_handles([0])
 
     llm._collective_rpc("update_weights", (ipc_handles,))
+    # Finalize the update weights
+    llm._collective_rpc("update_weights", (None,))
+
     results.append(run_generate(llm, hf_model, prompts, sampling_params))
     llm_logits, ref_logits = results[1]
+    compare_logits(llm_logits, ref_logits)
 
-    # Compare the logits for this phase since output should be random
+    # Stage 3: Test update weights with partial weights
+    hf_model.flip_weights()
+
+    def common_filter(filter_name: str) -> Callable[[str], bool]:
+        def filter_fn(name: str) -> bool:
+            return filter_name in name
+
+        return filter_fn
+
+    filter_list = [
+        "q_proj.weight",
+        "k_proj.weight",
+        "v_proj.weight",
+        "o_proj.weight",
+        "gate_proj.weight",
+        "up_proj.weight",
+        "down_proj.weight",
+        "norm.weight",
+        "embed_tokens.weight",
+        "lm_head.weight",
+    ]
+    for filter_name in filter_list:
+        weight_filter = common_filter(filter_name=filter_name)
+        ipc_handles = hf_model.get_weight_ipc_handles([0], weight_filter=weight_filter)
+        llm._collective_rpc("update_weights", (ipc_handles,), non_block=True)
+    # Finalize the update weights
+    llm._collective_rpc("update_weights", (None,))
+
+    results.append(run_generate(llm, hf_model, prompts, sampling_params))
+    llm_logits, ref_logits = results[2]
     compare_logits(llm_logits, ref_logits)
