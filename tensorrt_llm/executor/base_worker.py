@@ -86,6 +86,7 @@ class BaseWorker(GenerationExecutor):
         super().__init__(
             num_postprocess_workers=postproc_config.num_postprocess_workers,
             postprocess_tokenizer_dir=postproc_config.postprocess_tokenizer_dir,
+            max_iteration_result_size=postproc_config.max_iteration_result_size,
             is_llm_executor=is_llm_executor,
         )
 
