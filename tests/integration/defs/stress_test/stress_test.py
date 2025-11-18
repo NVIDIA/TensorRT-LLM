@@ -14,7 +14,7 @@
 # limitations under the License.
 """
 Stress test script for inference of model using TensorRT LLM with PyTorch/TRT backend.
-This script is used for stress testing inference performance using trtllm-serve and genai-perf.
+This script is used for stress testing inference performance using trtllm-serve and aiperf.
 
 The script supports three test modes:
 1. "stress-test": Runs performance test followed by stress test
@@ -48,9 +48,9 @@ from defs.conftest import get_device_count, get_device_memory, llm_models_root
 from defs.trt_test_alternative import (Popen, cleanup_process_tree, print_info,
                                        print_warning)
 
-# Install genai-perf in requirements-dev.txt will affect triton and pytorch version mismatch
-# def genai_perf_install():
-#     """Ensures genai-perf is installed without affecting the global environment"""
+# Install aiperf in requirements-dev.txt will affect triton and pytorch version mismatch
+# def aiperf_install():
+#     """Ensures aiperf is installed without affecting the global environment"""
 
 #     import os
 #     import subprocess
@@ -62,7 +62,7 @@ from defs.trt_test_alternative import (Popen, cleanup_process_tree, print_info,
 
 #     if not os.path.exists(requirements_file):
 #         with open(requirements_file, "w") as f:
-#             f.write("genai-perf\n")
+#             f.write("aiperf\n")
 
 #     subprocess.check_call(
 #         [sys.executable, "-m", "pip", "install", "-r", requirements_file])
@@ -108,7 +108,7 @@ class ModelConfig:
 
     @property
     def model_name(self) -> str:
-        """Extract model name from model_dir for genai-perf"""
+        """Extract model name from model_dir for aiperf"""
         return os.path.basename(self.model_dir)
 
 
@@ -149,14 +149,14 @@ class StressTestConfig:
     @property
     def request_count_stress_test(self) -> int:
         """Calculate request count for stress test"""
-        # Cannot set exact stress time in genai-perf test, WR is set the stress_time as customized value to get request count
+        # Cannot set exact stress time in aiperf test, WR is set the stress_time as customized value to get request count
         stress_request_count = self.customized_stress_request_rate * self.customized_stress_time
         return stress_request_count
 
 
 @dataclass(frozen=True)
 class PerformanceParams:
-    """Dataclass to store test parameters for genai-perf"""
+    """Dataclass to store test parameters for aiperf"""
     input_len_mean: int = 64  # customized for tinyllama and llama-v3-8b-instruct-hf
     input_len_std: int = 16
     output_len_mean: int = 128  # customized for tinyllama and llama-v3-8b-instruct-hf
@@ -409,7 +409,7 @@ def stress_test(config,
                 server_config=None,
                 stress_time=None,
                 stress_timeout=None):
-    """Test LLM model performance using trtllm-serve and genai-perf.
+    """Test LLM model performance using trtllm-serve and aiperf.
 
     This function supports multiple testing modes controlled by the --test-mode option:
     - "stress-test": Runs the measure capacity stage first, then the stress stage,
@@ -426,10 +426,10 @@ def stress_test(config,
         stress_time: Optional stress time in seconds, overrides the default in StressTestConfig
         stress_timeout: Optional stress timeout in seconds, overrides the default in StressTestConfig
     """
-    # Ensure genai-perf is installed
-    # genai_perf_install()
-    # Import genai-perf - needed after installation to make sure it's available
-    # import genai_perf  # noqa: F401
+    # Ensure aiperf is installed
+    # aiperf_install()
+    # Import aiperf - needed after installation to make sure it's available
+    # import aiperf  # noqa: F401
 
     # Test mode handling - determine which tests to run
     if test_mode == "stress-test":
@@ -754,7 +754,7 @@ def stress_test(config,
             os.unlink(extra_llm_options_path)
 
 
-def create_genai_perf_command(model_name,
+def create_aiperf_command(model_name,
                               model_path,
                               request_count,
                               concurrency,
@@ -764,7 +764,7 @@ def create_genai_perf_command(model_name,
                               output_len_std=PerformanceParams.output_len_std,
                               warmup_request_count=10):
     """
-    Create a command list for genai-perf with standardized parameters.
+    Create a command list for aiperf with standardized parameters.
 
     Args:
         model_name: Name of the model
@@ -778,10 +778,10 @@ def create_genai_perf_command(model_name,
         warmup_request_count: Number of warmup requests
 
     Returns:
-        List of command-line arguments for genai-perf
+        List of command-line arguments for aiperf
     """
     return [
-        "genai-perf",
+        "aiperf",
         "profile",
         "-m",
         model_name,
@@ -809,16 +809,16 @@ def create_genai_perf_command(model_name,
     ]
 
 
-def run_genai_perf_process(cmd,
+def run_aiperf_process(cmd,
                            test_start_time,
                            test_timeout,
                            server_config,
                            request_counter=None):
     """
-    Run a genai-perf process and monitor both the process and server health.
+    Run a aiperf process and monitor both the process and server health.
 
     Args:
-        cmd: Command list to execute genai-perf
+        cmd: Command list to execute aiperf
         test_start_time: Start time of the test
         test_timeout: Timeout for the test in seconds
         server_config: Server configuration object
@@ -827,7 +827,7 @@ def run_genai_perf_process(cmd,
     Returns:
         Boolean indicating whether the process completed successfully
     """
-    # Start genai-perf process with our context manager
+    # Start aiperf process with our context manager
     with launch_process(cmd,
                         start_new_session=True,
                         filter_pattern=None,
@@ -836,16 +836,16 @@ def run_genai_perf_process(cmd,
         last_health_check = time.time()
         process_completed = False
 
-        # Monitor both the server and genai-perf process
+        # Monitor both the server and aiperf process
         while process.poll() is None:
             current_time = time.time()
 
-            # Check if genai-perf is still running but exceeded timeout
+            # Check if aiperf is still running but exceeded timeout
             elapsed_time = current_time - test_start_time
             if elapsed_time > test_timeout:
                 cleanup_process_tree(process, has_session=True)
                 raise RuntimeError(
-                    f"genai-perf test timed out after {test_timeout} seconds")
+                    f"aiperf test timed out after {test_timeout} seconds")
 
             # Check server health periodically
             if current_time - last_health_check > server_config.health_check_timeout:
@@ -869,20 +869,20 @@ def run_genai_perf_process(cmd,
 
             time.sleep(0.5)
 
-        # Check final status of genai-perf process
+        # Check final status of aiperf process
         retcode = process.poll()
         if retcode is not None:
             if retcode != 0:
                 cleanup_process_tree(process, has_session=True)
                 raise RuntimeError(
-                    f"genai-perf exited with non-zero code: {retcode}")
+                    f"aiperf exited with non-zero code: {retcode}")
             else:
-                print_info("genai-perf completed successfully")
+                print_info("aiperf completed successfully")
                 process_completed = True
         else:
             cleanup_process_tree(process, has_session=True)
             raise RuntimeError(
-                "genai-perf did not complete normally, will terminate")
+                "aiperf did not complete normally, will terminate")
 
     return process_completed
 
@@ -921,8 +921,8 @@ def measure_capacity_stage(model_name,
             f"Running test {test_index+1}/{total_tests}: concurrency={concurrency}, request_count={request_count}"
         )
 
-        # Prepare genai-perf command
-        cmd = create_genai_perf_command(
+        # Prepare aiperf command
+        cmd = create_aiperf_command(
             model_name=model_name,
             model_path=model_path,
             request_count=request_count,
@@ -933,8 +933,8 @@ def measure_capacity_stage(model_name,
             output_len_std=performance_params.output_len_std,
             warmup_request_count=10)
 
-        # Run genai-perf process
-        process_completed = run_genai_perf_process(
+        # Run aiperf process
+        process_completed = run_aiperf_process(
             cmd, test_start_time, performance_params.test_timeout,
             server_config, request_counter)
 
@@ -1016,8 +1016,8 @@ def stress_stage(model_name,
     if request_counter:
         request_counter.reset()
 
-    # Prepare genai-perf command
-    cmd = create_genai_perf_command(
+    # Prepare aiperf command
+    cmd = create_aiperf_command(
         model_name=model_name,
         model_path=model_path,
         request_count=request_count,
@@ -1028,8 +1028,8 @@ def stress_stage(model_name,
         output_len_std=PerformanceParams.output_len_std,
         warmup_request_count=10)
 
-    # Start genai-perf process
-    process_completed = run_genai_perf_process(cmd, test_start_time,
+    # Start aiperf process
+    process_completed = run_aiperf_process(cmd, test_start_time,
                                                test_timeout, server_config,
                                                request_counter)
 
@@ -1183,14 +1183,14 @@ def extract_stress_test_metrics(artifacts_dir="./artifacts",
         artifacts_dir (str): Path to the artifacts directory
         current_model (str, optional): If provided, only analyze artifacts for this model
     """
-    # Find all profile_export_genai_perf.json files in the artifacts directory
+    # Find all profile_export_aiperf.json files in the artifacts directory
     json_files = glob(os.path.join(artifacts_dir,
-                                   "**/profile_export_genai_perf.json"),
+                                   "**/profile_export_aiperf.json"),
                       recursive=True)
 
     if not json_files:
         raise RuntimeError(
-            "No profile_export_genai_perf.json files found in the artifacts directory"
+            "No profile_export_aiperf.json files found in the artifacts directory"
         )
 
     # Get a list of directory names in the artifacts directory
@@ -1308,7 +1308,7 @@ def extract_stress_test_metrics(artifacts_dir="./artifacts",
         range_val = max_val - min_val
         if range_val == 0:
             raise ValueError(
-                "Please check OutputTokenThroughput from genai-perf")
+                "Please check OutputTokenThroughput from aiperf")
         else:
             normalized_df.loc[
                 normalized_df["Model"] == model_name,
