@@ -427,14 +427,6 @@ class TestStarcoder2(unittest.TestCase):
     def test_starcoder2_generated_tokens_match_hf(self, scenario: Scenario) -> None:
         """
         Compare generated tokens from TRT-LLM PyTorch backend to HuggingFace.
-
-        This is the PyTorch backend equivalent of test_engine_allclose_to_hf in
-        test_starcoder2_engine.py. Both tests use the same full pretrained models
-        from HuggingFace and compare token-level generation output.
-
-        The difference is:
-        - This test uses the PyTorch execution backend (TRTLLM attention)
-        - The engine test uses the compiled TensorRT engine
         """
         backend = scenario.backend
         config_name = scenario.config_name
@@ -467,7 +459,6 @@ class TestStarcoder2(unittest.TestCase):
             starcoder2 = Starcoder2ForCausalLM(model_config).to(dtype).to(device)
             starcoder2.load_weights(hf_starcoder2.state_dict())
 
-        # Test prompt - same as engine test
         test_prompt = "def fibonacci(n):"
         tokenizer = AutoTokenizer.from_pretrained(model_name)
 
@@ -583,7 +574,6 @@ class TestStarcoder2(unittest.TestCase):
 
         hf_output_ids = hf_output[0, len(input_ids) :].cpu().tolist()
 
-        # Decode for debugging
         trt_text = tokenizer.decode(trt_output_ids)
         hf_text = tokenizer.decode(hf_output_ids)
 
@@ -597,15 +587,11 @@ class TestStarcoder2(unittest.TestCase):
         print(f"{config_name}/{backend} HF output:  {hf_text}")
         print(f"Match ratio: {match_ratio:.2%} ({matches}/{min_len} tokens)")
 
-        # Should match at least 80% of tokens
+        # Should match at least 90% of tokens
         self.assertGreater(
             match_ratio,
-            0.8,
+            0.9,
             f"TRT-LLM and HF token outputs differ significantly: {match_ratio:.2%} match",
         )
 
         kv_cache_manager.shutdown()
-
-
-if __name__ == "__main__":
-    unittest.main()
