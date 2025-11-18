@@ -2031,11 +2031,6 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
         # w3
         dst_w3_weight_scale = dst_w3_w1_weight_scale_gpu.narrow(
             dim=0, start=0, length=module.intermediate_size_per_partition)
-        print("trying to load w3 scale")
-        print("the dtype expected by MOE module is", dst_w3_weight_scale.dtype)
-        print("the shape expected by MOE module is", dst_w3_weight_scale.shape)
-        print("the dtype of actual w3 shard is", w3_weight_scale.dtype)
-        print("the shape of actual w3 shard is", w3_weight_scale.shape)
         dst_w3_weight_scale.copy_(
             w3_weight_scale.view(dst_w3_weight_scale.dtype))
 
