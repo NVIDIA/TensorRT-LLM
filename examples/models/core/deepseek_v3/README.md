@@ -262,6 +262,10 @@ kv_cache_config:
   dtype: fp8
 stream_interval: 10
 enable_attention_dp: true
+attention_dp_config:
+  batching_wait_iters: 0
+  enable_balance: true
+  timeout_iters: 60
 EOF
 ```
 
@@ -290,6 +294,10 @@ cuda_graph_config:
     enable_padding: true
     max_batch_size: 512
 enable_attention_dp: true
+attention_dp_config:
+  batching_wait_iters: 0
+  enable_balance: true
+  timeout_iters: 60
 kv_cache_config:
     enable_block_reuse: false
     dtype: fp8
