@@ -423,8 +423,6 @@ class QuantConfig:
                     layer_quant_config[layer] = cfg
 
         for arg, val in args.items():
-            if not hasattr(self, arg):
-                raise ValueError(f"{arg} can't be found in quant config")
             setattr(self, arg, val)
 
         if self.quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
