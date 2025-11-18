@@ -1667,7 +1667,6 @@ class MLA(nn.Module):
         position_ids: torch.Tensor,
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
-        position_ids: Optional[torch.Tensor] = None,
         latent_cache: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
