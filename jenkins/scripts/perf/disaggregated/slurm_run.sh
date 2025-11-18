@@ -71,7 +71,7 @@ echo "Full Command: $pytestCommand"
     done
  fi
 
-if [ "$DISAGG_SERVER_IDX" = "DISAGG" ]; then
+if [ "$DISAGG_SERVER_IDX" = "DISAGG_SERVER" ] || [ "$DISAGG_SERVER_IDX" = "BENCHMARK" ]; then
     eval $pytestWithoutLLMAPILaunchCommand
 else
     eval $pytestCommand

@@ -28,7 +28,7 @@ nodes_per_gen_server=${23}
 total_nodes=${24}
 total_gpus=${25}
 
-echo "Starting job \$SLURM_JOB_ID on \$SLURM_NODELIST"
+echo "Starting job $SLURM_JOB_ID on $SLURM_NODELIST"
 
 # Function to cleanup on failure
 cleanup_on_failure() {
@@ -51,13 +51,10 @@ export coverageConfigFile="$coverageConfigFile"
 export NVIDIA_IMEX_CHANNELS=0
 export NVIDIA_VISIBLE_DEVICES=$(seq -s, 0 $(($(nvidia-smi --query-gpu=count -i 0 --format=noheader)-1)))
 
-# Get slurm job id
-echo "SLURM_JOB_ID: \$SLURM_JOB_ID"
-
 # Setup srun arguments
 srunArgs=(
     "--container-image=$container"
-    "--container-name=disagg-test-\$SLURM_JOB_ID"
+    "--container-name=disagg-test-$SLURM_JOB_ID"
     "--container-workdir=/home/svc_tensorrt/bloom/scripts"
     "--container-mounts=$mounts"
     "--container-env=NVIDIA_IMEX_CHANNELS"
@@ -74,7 +71,7 @@ fi
 # Install tensorrt-llm on each node
 echo "Installing TensorRT-LLM..."
 chmod +x $scriptInstallNode
-if ! srun "${srunArgs[@]}" --kill-on-bad-exit=1 --overlap -N \$SLURM_NNODES --ntasks-per-node=1 --ntasks=\$SLURM_NNODES $scriptInstallNode &> $jobWorkspace/install.log; then
+if ! srun "${srunArgs[@]}" --kill-on-bad-exit=1 --overlap -N $SLURM_NNODES --ntasks-per-node=1 --ntasks=$SLURM_NNODES $scriptInstallNode &> $jobWorkspace/install.log; then
     cleanup_on_failure "TensorRT-LLM installation failed. Check $jobWorkspace/install.log for details"
 fi
 echo "TensorRT-LLM installation completed successfully"
@@ -103,7 +100,7 @@ echo "  total_gen_nodes: $total_gen_nodes"
 # echo "enable_pdl: $enable_pdl"
 
 # Get node lists from SLURM_NODELIST
-all_nodes=($(scontrol show hostname \$SLURM_NODELIST | sort))
+all_nodes=($(scontrol show hostname $SLURM_NODELIST | sort))
 total_nodes_num=${#all_nodes[@]}
 echo "all_nodes: ${all_nodes[@]}, total_nodes_num: $total_nodes_num"
 
@@ -144,18 +141,28 @@ for i in $(seq 0 $((num_ctx_servers - 1))); do
     echo "Started ctx server $i"
 done
 
-# Start disagg server (this will run both disagg server and benchmark)
+# Start disagg server
 echo "Starting disagg server..."
-export DISAGG_SERVER_IDX="DISAGG"
-export USE_LLMAPI_LAUNCH="false"
-if ! srun "${srunArgs[@]}" --kill-on-bad-exit=1 --overlap \
+export DISAGG_SERVER_IDX="DISAGG_SERVER"
+srun "${srunArgs[@]}" --kill-on-bad-exit=1 --overlap -l \
     -N 1 \
     --ntasks=1 \
     --ntasks-per-node=1 \
     -w ${gen_node_list[0]} \
     --container-env=DISAGG_SERVER_IDX \
-    $scriptRunNode &> $jobWorkspace/disagg_server_benchmark.log; then
-    cleanup_on_failure "Disagg server or benchmark failed. Check logs in $jobWorkspace for details"
+    $scriptRunNode &> $jobWorkspace/disagg_server.log &
+
+# Start benchmark
+echo "Starting benchmark..."
+export DISAGG_SERVER_IDX="BENCHMARK"
+if ! srun "${srunArgs[@]}" --kill-on-bad-exit=1 --overlap -l \
+    -N 1 \
+    --ntasks=1 \
+    --ntasks-per-node=1 \
+    -w ${gen_node_list[0]} \
+    --container-env=DISAGG_SERVER_IDX \
+    $scriptRunNode &> $jobWorkspace/benchmark.log; then
+    cleanup_on_failure "Benchmark failed. Check logs in ${jobWorkspace} for details"
 fi
 
 echo "Disagg server and benchmark completed successfully"
