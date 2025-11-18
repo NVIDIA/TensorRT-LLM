@@ -92,6 +92,7 @@ def generate_metadata_json():
               "w",
               encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+        f.write("\n")
 
 
 if __name__ == "__main__":
