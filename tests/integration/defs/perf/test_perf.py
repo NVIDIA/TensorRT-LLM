@@ -883,8 +883,6 @@ def parse_multi_node_disagg_config_file(config_file_path: str,
                                         select_pattern: str = None):
     # Get disagg_server_idx from environment variable
     disagg_server_idx = os.environ.get("DISAGG_SERVER_IDX", "DISAGG")
-    # Get hostname
-    hostname = socket.gethostname()
     # Parse selection pattern
     if select_pattern:
         execution_plan = parse_select_pattern(select_pattern)
@@ -934,7 +932,7 @@ def parse_multi_node_disagg_config_file(config_file_path: str,
         # Create disagg_config dict
         disagg_config = {
             'disagg_server_idx': disagg_server_idx,
-            'hostname': hostname,
+            'hostname': socket.gethostname(),
             'numa_bind': numa_bind,
             'timeout': timeout,
             'name': config_name,
@@ -2045,6 +2043,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 disagg_server_cmds=disagg_server_cmds,
                 benchmark_cmds=benchmark_cmds,
                 timeout=self._config.disagg_configs[0]['timeout'],
+                hostname=self._config.disagg_configs[0]['hostname'],
                 disagg_server_idx=self._config.disagg_configs[0]
                 ['disagg_server_idx'],
                 num_ctx_servers=self._config.disagg_configs[0]['hardware']

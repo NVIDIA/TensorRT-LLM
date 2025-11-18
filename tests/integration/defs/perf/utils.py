@@ -18,7 +18,6 @@ import copy
 import io
 import os
 import re
-import socket
 import subprocess
 import time
 from datetime import datetime
@@ -361,6 +360,7 @@ class PerfMultiNodeDisaggScriptTestCmds(NamedTuple):
     disagg_server_cmds: List[List[str]]
     benchmark_cmds: List[List[str]]
     timeout: int
+    hostname: str
     disagg_server_idx: str
     num_ctx_servers: int
     num_gen_servers: int
@@ -413,13 +413,9 @@ class PerfMultiNodeDisaggScriptTestCmds(NamedTuple):
         print_info(f"ctx_hostnames: {ctx_hostnames}")
         print_info(f"gen_hostnames: {gen_hostnames}")
 
-        # Get current hostname
-        current_hostname = socket.gethostname()
-        print_info(f"Current hostname: {current_hostname}")
-
         # Generate server config
         server_config = {
-            'hostname': current_hostname,
+            'hostname': self.hostname,
             'port': disagg_server_port,
             'backend': 'pytorch',
             'context_servers': {
@@ -528,7 +524,8 @@ class PerfMultiNodeDisaggScriptTestCmds(NamedTuple):
                         env=envs,
                     )
                 # Wait for server to be ready
-                self.wait_for_endpoint_ready(f"http://localhost:8333/health")
+                self.wait_for_endpoint_ready(
+                    f"http://{self.hostname}:8333/health")
                 try:
                     # Run benchmark
                     print_info("Running benchmark")
