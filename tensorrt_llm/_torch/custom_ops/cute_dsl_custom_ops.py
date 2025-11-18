@@ -715,6 +715,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 m,
                 n,
                 k,
+                l,
                 stream=stream,
             )
             return c

@@ -2238,7 +2238,7 @@ class Sm100BlockScaledPersistentGroupedGemmKernel:
         m: int,
         n: int,
         k: int,
-        l: cutlass.Constexpr,  # noqa: E741
+        l: int,  # noqa: E741
         tile_size: cutlass.Constexpr,
         scaling_vector_size: cutlass.Constexpr,
         max_active_clusters: cutlass.Constexpr,
@@ -2266,7 +2266,6 @@ class Sm100BlockScaledPersistentGroupedGemmKernel:
         tile_idx_to_group_idx = cute.make_tensor(
             tile_idx_to_group_idx_ptr, layout=cute.make_layout((num_tiles,))
         )
-        tile_idx_to_group_idx.mark_layout_dynamic()
         num_non_exiting_tiles = cute.make_tensor(
             num_non_exiting_tiles_ptr, layout=cute.make_layout((1,))
         )
