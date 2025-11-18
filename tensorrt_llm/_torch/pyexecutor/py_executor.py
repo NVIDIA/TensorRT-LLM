@@ -976,6 +976,17 @@ class PyExecutor:
             self.kv_connector_manager.worker.start_load_kv(
                 torch.cuda.current_stream())
 
+    def _kv_connector_refresh_unfinished_tasks(self):
+        if not self.use_flexkv:
+            return
+        if len(self.active_requests) == 0:
+            return
+        if not self.kv_connector_manager:
+            return
+        logger.warning(f"No scheduled requests, but flexkv have pending put requests")
+        self.kv_connector_manager.handle_metadata()
+        time.sleep(0.01)
+
     def _kv_connector_terminate_requests(self):
         if self.kv_connector_manager:
             reqs_to_terminate = self.kv_connector_manager.get_finished()
@@ -1003,6 +1014,9 @@ class PyExecutor:
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
                 if scheduled_batch is None:
                     break
+                
+                if scheduled_batch.batch_size == 0:
+                    self._kv_connector_refresh_unfinished_tasks()
 
                 self._pause_requests(scheduled_batch.paused_requests)
 
@@ -1135,6 +1149,9 @@ class PyExecutor:
                     break
 
                 self._pause_requests(scheduled_batch.paused_requests)
+                
+                if scheduled_batch.batch_size == 0:
+                    self._kv_connector_refresh_unfinished_tasks()
 
                 if scheduled_batch.batch_size > 0:
                     if self.kv_cache_transceiver:
@@ -1783,6 +1800,13 @@ class PyExecutor:
                     new_responses.append((req_id, response))
 
             if request_done:
+                # Release slot immediately when decode finishes, before put task completes
+                # This allows new requests to be scheduled earlier.
+                # Note: request_done is True when request.is_finished is True, which happens
+                # after the request state is set to GENERATION_COMPLETE in update_requests().
+                # We check both to be safe.
+                if self.use_flexkv and (request.is_finished or request.state == LlmRequestState.GENERATION_COMPLETE):
+                    self.resource_manager.free_slot_only(request)
                 if request.is_disagg_context_transmission_state:
                     self.ctx_in_transmission_requests.append(request)
                 else:

@@ -1033,6 +1033,15 @@ class ResourceManager:
             if hasattr(resource_manager, "free_resources"):
                 resource_manager.free_resources(request)
 
+    def free_slot_only(self, request: LlmRequest):
+        """Only free the slot for the request, without freeing other resources.
+        This is used to release the slot early when decode finishes, before
+        the put task completes.
+        """
+        seq_slot_manager = self.get_resource_manager(ResourceManagerType.SEQ_SLOT_MANAGER)
+        if seq_slot_manager is not None:
+            seq_slot_manager.free_resources(request)
+
     def reorder_pipeline(self, resource_manager_list: list[str]):
         assert set(resource_manager_list) == set(self.resource_managers.keys())
         for resource_manager in resource_manager_list:
