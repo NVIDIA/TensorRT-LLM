@@ -242,36 +242,36 @@ class QuantConfig:
         return None
 
     def _map_new_to_legacy_args(self, hf_quant_config: dict) -> dict:
-        qunatization_dict = {}
+        quantization_dict = {}
         quant_algo = hf_quant_config.get("quant_algo")
         if quant_algo == "fp8_pb_wo":
             quant_algo = "FP8_BLOCK_SCALES"
         if quant_algo is not None:
-            qunatization_dict["quant_algo"] = quant_algo
+            quantization_dict["quant_algo"] = quant_algo
 
             if quant_algo == QuantAlgo.W4A16_AWQ or quant_algo == QuantAlgo.W4A8_AWQ:
-                qunatization_dict["pre_quant_scale"] = True
+                quantization_dict["pre_quant_scale"] = True
 
         if "group_size" in hf_quant_config:
-            qunatization_dict["group_size"] = hf_quant_config["group_size"]
+            quantization_dict["group_size"] = hf_quant_config["group_size"]
 
         if "ignore" in hf_quant_config:
-            qunatization_dict["exclude_modules"] = list(
+            quantization_dict["exclude_modules"] = list(
                 hf_quant_config.get("ignore") or [])
 
         kv_scheme = hf_quant_config.get("kv_cache_scheme") or {}
         kv_algo = QuantConfig._infer_kv_cache_quant_algo_from_scheme(kv_scheme)
         if kv_algo is not None:
-            qunatization_dict["kv_cache_quant_algo"] = kv_algo
+            quantization_dict["kv_cache_quant_algo"] = kv_algo
 
         if "quantized_layers" in hf_quant_config:
-            qunatization_dict["quantized_layers"] = hf_quant_config[
+            quantization_dict["quantized_layers"] = hf_quant_config[
                 "quantized_layers"]
 
         if "symmetric" in hf_quant_config:
-            qunatization_dict["zero_point"] = hf_quant_config["symmetric"]
+            quantization_dict["zero_point"] = hf_quant_config["symmetric"]
 
-        return qunatization_dict
+        return quantization_dict
 
     def _update_from_quant_config_json(self, path, moe_backend: str,
                                        model_ckpt_path) -> bool:
@@ -321,8 +321,7 @@ class QuantConfig:
                 return True, None
         return False, None
 
-    def _update_from_legacy_args(self, args, moe_backend: str,
-                                 checkpoint_dir) -> bool:
+    def _update_from_legacy_args(self, args, moe_backend, checkpoint_dir):
         hf_quant_algo = args.pop("quant_algo", None)
         layer_quant_config = None
 
@@ -363,7 +362,7 @@ class QuantConfig:
                 None, QuantAlgo.FP8, QuantAlgo.NVFP4
         ]:
             raise ValueError(
-                f"Only kv_cache_quant_algo={QuantAlgo.FP8} or {QuantAlgo.NVFP4} is allowed for pre-quantized checkpoint, got {quant_config.kv_cache_quant_algo}."
+                f"Only kv_cache_quant_algo={QuantAlgo.FP8} or {QuantAlgo.NVFP4} is allowed for pre-quantized checkpoint, got {self.kv_cache_quant_algo}."
             )
 
         if self.quant_algo == QuantAlgo.MIXED_PRECISION:
@@ -430,16 +429,15 @@ class QuantConfig:
 
         return True, layer_quant_config
 
-    def _update_from_legacy_quant_config_json(self, path, moe_backend: str,
-                                              checkpoint_dir: Path):
+    def _update_from_legacy_quant_config_json(self, path, moe_backend,
+                                              checkpoint_dir):
         with open(path, "r") as f:
             hf_quant_config = json.load(f)
             hf_quant_config = hf_quant_config["quantization"]
         return self._update_from_legacy_args(hf_quant_config, moe_backend,
                                              checkpoint_dir)
 
-    def load_quant_config_from_dtypes_json(self, dtypes_json_file,
-                                           moe_backend: str):
+    def load_quant_config_from_dtypes_json(self, dtypes_json_file, moe_backend):
         layer_quant_config = None
 
         exclude_modules = set()
@@ -493,8 +491,8 @@ class QuantConfig:
             logger.info(
                 f"Found {quant_config_dtypes}, pre-quantized checkpoint is used."
             )
-            self.load_quant_config_from_dtypes_json(quant_config_dtypes,
-                                                    moe_backend)
+            return self.load_quant_config_from_dtypes_json(
+                quant_config_dtypes, moe_backend)
 
         logger.warning(f"No quant config found in {model_ckpt_path}")
         return False, None
