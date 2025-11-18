@@ -10,18 +10,33 @@ from tensorrt_llm.scaffolding.controller import (
     ParallelProcess,
 )
 from tensorrt_llm.scaffolding.scaffolding_llm import ScaffoldingLlm
-from tensorrt_llm.scaffolding.task import ChatTask, Task
+from tensorrt_llm.scaffolding.task import (
+    AssistantMessage,
+    ChatTask,
+    SystemMessage,
+    Task,
+    UserMessage,
+)
+from tensorrt_llm.scaffolding.task_collection import (
+    DropKVCacheWorkerTag,
+    drop_kv_cache_scope,
+    sub_request_node,
+)
 from tensorrt_llm.scaffolding.worker import Worker
 
 from .prompts import (
     compress_system_prompt,
+    compress_system_prompt_prefix,
     final_report_generation_prompt,
+    final_report_generation_prompt_prefix,
     generate_research_brief_prompt,
+    generate_research_brief_prompt_prefix,
     supervisor_system_prompt,
+    supervisor_system_prompt_prefix,
 )
 from .researcher import Compressor, Researcher, ResearchTask
 from .tools import complete_research_tool, conduct_research_tool, think_tool
-from .utils import AssistantMessage, SystemMessage, UserMessage, get_today_str
+from .utils import get_today_str
 
 
 @dataclass
@@ -39,8 +54,12 @@ class SupervisorTask(Task):
         return task
 
 
+@sub_request_node("OpenDeepResearch", is_top_level=True)
+@drop_kv_cache_scope()
 class Supervisor(Controller):
     tools = [conduct_research_tool, complete_research_tool, think_tool]
+    max_research_iter = 3
+    max_concurrent_research_units = 5
 
     def __init__(
         self,
@@ -48,16 +67,12 @@ class Supervisor(Controller):
         research_planning_controller: Controller,
         research_with_tools_controller: Controller,
         final_report_controller: Controller,
-        max_research_iter: int = 3,
-        max_concurrent_research_units: int = 5,
     ):
         super().__init__()
         self.brief_controller = brief_controller
         self.research_planning_controller = research_planning_controller
         self.research_with_tools_controller = research_with_tools_controller
         self.final_report_controller = final_report_controller
-        self.max_research_iter = max_research_iter
-        self.max_concurrent_research_units = max_concurrent_research_units
 
     def clone(self):
         return Supervisor(
@@ -65,8 +80,6 @@ class Supervisor(Controller):
             research_planning_controller=self.research_planning_controller.clone(),
             research_with_tools_controller=self.research_with_tools_controller.clone(),
             final_report_controller=self.final_report_controller.clone(),
-            max_research_iter=self.max_research_iter,
-            max_concurrent_research_units=self.max_concurrent_research_units,
         )
 
     def process(self, tasks: List[Task], **kwargs):
@@ -76,9 +89,10 @@ class Supervisor(Controller):
 
         research_brief_messages = [
             UserMessage(
-                generate_research_brief_prompt.format(
+                content=generate_research_brief_prompt.format(
                     date=get_today_str(), messages=str(user_topic)
-                )
+                ),
+                prefix=generate_research_brief_prompt_prefix,
             )
         ]
 
@@ -92,11 +106,12 @@ class Supervisor(Controller):
             research_brief,
             [
                 SystemMessage(
-                    supervisor_system_prompt.format(
+                    content=supervisor_system_prompt.format(
                         date=get_today_str(),
                         max_researcher_iterations=self.max_research_iter,
                         max_concurrent_research_units=self.max_concurrent_research_units,
-                    )
+                    ),
+                    prefix=supervisor_system_prompt_prefix,
                 )
             ],
             tools=self.tools,
@@ -156,7 +171,8 @@ class Supervisor(Controller):
                         messages=research_planning_task.messages_to_dict_content(),
                         findings=research_planning_task.messages_to_dict_content(prompt_index + 1),
                         date=get_today_str(),
-                    )
+                    ),
+                    prefix=final_report_generation_prompt_prefix,
                 ),
             ],
         )
@@ -170,10 +186,7 @@ class Supervisor(Controller):
 
 
 def create_open_deep_research_scaffolding_llm(
-    generation_worker: Worker,
-    mcp_worker: Worker,
-    max_research_iter: int = 3,
-    max_concurrent_research_units: int = 5,
+    generation_worker: Worker, mcp_worker: Worker
 ) -> ScaffoldingLlm:
     gerneration_controller = NativeGenerationController(
         sampling_params={
@@ -185,7 +198,12 @@ def create_open_deep_research_scaffolding_llm(
     research_chat_with_tools_controller = ChatWithMCPController(gerneration_controller)
     research_compress_controller = Compressor(
         gerneration_controller,
-        system_prompts=[SystemMessage(compress_system_prompt.format(date=get_today_str()))],
+        system_prompts=[
+            SystemMessage(
+                compress_system_prompt.format(date=get_today_str()),
+                prefix=compress_system_prompt_prefix,
+            )
+        ],
     )
 
     research_controller = Researcher(
@@ -197,18 +215,14 @@ def create_open_deep_research_scaffolding_llm(
     final_report_controller = gerneration_controller
 
     supervisor_controller = Supervisor(
-        brief_controller,
-        research_planning_controller,
-        research_controller,
-        final_report_controller,
-        max_research_iter,
-        max_concurrent_research_units,
+        brief_controller, research_planning_controller, research_controller, final_report_controller
     )
     scaffolding_llm = ScaffoldingLlm(
         supervisor_controller,
         {
             NativeGenerationController.WorkerTag.GENERATION: generation_worker,
             ChatWithMCPController.WorkerTag.TOOLCALL: mcp_worker,
+            DropKVCacheWorkerTag.DROP_KV_CACHE: generation_worker,
         },
     )
 
