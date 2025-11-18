@@ -839,10 +839,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.prepare_flash_mla()
         # number of tokens needed in the kv cache for each sequence after the next pass
         kv_lens = cached_token_lens + self.seq_lens_kv if cached_token_lens is not None else self.seq_lens_kv
-        # Store actual KV length (without extra tokens) for use in kv_lens_runtime.
-        # num_extra_kv_tokens are for internal cache management but should not be reported
-        # as actual past KV length in host_past_key_value_lengths.
-        self.kv_lens_actual = kv_lens.clone()
         # self.kv_lens is the valid kv cache length, while the self.kv_lens_cuda is
         # the sequence length including the cached tokens and the input tokens.
         self.kv_lens[:self.num_seqs].copy_(
@@ -885,9 +881,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             ) <= self.kv_cache_manager.max_seq_len, error_message
 
         self.kv_lens_cuda_runtime = self.kv_lens_cuda[:self.num_seqs]
+        # Don't use self.kv_lens here because it includes extra tokens.
         # Use actual KV length (without extra tokens) for kv_lens_runtime,
         # which becomes host_past_key_value_lengths and eventually mMaxSeqLenKv.
-        self.kv_lens_runtime = self.kv_lens_actual[:self.num_seqs]
+        self.kv_lens_runtime = kv_lens[:self.num_seqs]
         self.prompt_lens_cuda_runtime = self.prompt_lens_cuda[:self.num_seqs]
         self.prompt_lens_cpu_runtime = self.prompt_lens_cpu[:self.num_seqs]
         self.host_request_types_runtime = self.host_request_types[:self.
