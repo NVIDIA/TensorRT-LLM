@@ -707,7 +707,8 @@ def create_py_executor(
 
     _adjust_torch_mem_fraction()
 
-    logger.info(f"{llm_args}")
+    if mapping.rank == 0:
+        logger.info(f"LLM Args:\n{llm_args}")
 
     py_executor.start_worker()
     return py_executor

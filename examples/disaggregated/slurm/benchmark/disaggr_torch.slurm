@@ -47,6 +47,12 @@ accuracy_model=${31}
 accuracy_tasks=${32}
 model_args_extra=${33}
 
+# Worker environment variables
+worker_env_var=${34}
+
+# Server environment variables
+server_env_var=${35}
+
 # Print all parsed arguments
 echo "Parsed arguments:"
 echo "Hardware Configuration:"
@@ -90,6 +96,12 @@ echo "  enable_accuracy_test: ${enable_accuracy_test}"
 echo "  accuracy_model: ${accuracy_model}"
 echo "  accuracy_tasks: ${accuracy_tasks}"
 echo "  model_args_extra: ${model_args_extra}"
+echo
+echo "Worker Environment Variables:"
+echo "  worker_env_var: ${worker_env_var}"
+echo
+echo "Server Environment Variables:"
+echo "  server_env_var: ${server_env_var}"
 
 container_name="disaggr-test"
 
@@ -199,7 +211,7 @@ for i in $(seq 0 $((num_gen_servers - 1))); do
         --container-mounts=${container_mount} \
         --mpi=pmix \
         bash ${work_dir}/start_worker.sh \
-        "GEN" ${i} ${model_path} "8336" "${benchmark_mode}" "${concurrency_list}" "${enable_pdl}" "${numa_bind}" "${full_logdir}" "${nsys_on}" "${gen_config_path}" \
+        "GEN" ${i} ${model_path} "8336" "${benchmark_mode}" "${concurrency_list}" "${enable_pdl}" "${numa_bind}" "${full_logdir}" "${nsys_on}" "${gen_config_path}" "${worker_env_var}" \
         &> ${full_logdir}/output_gen_${i}.log &
 done
 
@@ -214,18 +226,29 @@ for i in $(seq 0 $((num_ctx_servers - 1))); do
         --container-mounts=${container_mount} \
         --mpi=pmix \
         bash ${work_dir}/start_worker.sh \
-        "CTX" ${i} ${model_path} "8336" "${benchmark_mode}" "${concurrency_list}" "${enable_pdl}" "${numa_bind}" "${full_logdir}" "${nsys_on}" "${ctx_config_path}" \
+        "CTX" ${i} ${model_path} "8336" "${benchmark_mode}" "${concurrency_list}" "${enable_pdl}" "${numa_bind}" "${full_logdir}" "${nsys_on}" "${ctx_config_path}" "${worker_env_var}" \
         &> ${full_logdir}/output_ctx_${i}.log &
 done
 
-# start the server
+# start the server (in background)
 echo "Starting server..."
 srun -l --container-name=${container_name} \
     --container-image=${container_image} \
     --container-mounts=${container_mount} \
     --mpi=pmix --overlap -N 1 -n 1 \
-    bash ${work_dir}/start_server.sh ${num_ctx_servers} ${num_gen_servers} ${full_logdir} ${work_dir} \
+    bash ${work_dir}/start_server.sh ${num_ctx_servers} ${num_gen_servers} ${full_logdir} ${work_dir} "${server_env_var}" \
     &> ${full_logdir}/output_server.log &
+
+# Wait for server to be ready (runs synchronously)
+echo "Waiting for server to be ready..."
+if ! srun -l --container-name=${container_name} \
+    --container-mounts=${container_mount} \
+    --mpi=pmix --overlap -N 1 -n 1 \
+    bash ${work_dir}/wait_server.sh ${full_logdir} \
+    &> ${full_logdir}/wait_server.log; then
+    cleanup_on_failure "Server failed to become ready. Check ${full_logdir}/wait_server.log for details"
+fi
+echo "Server is ready!"
 
 # Start benchmarking
 echo "Starting benchmark..."
