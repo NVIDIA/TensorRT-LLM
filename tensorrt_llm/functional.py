@@ -4094,7 +4094,7 @@ def allreduce(
     workspace = None
     if all_reduce_params.strategy != AllReduceStrategy.NCCL and all_reduce_params.strategy != AllReduceStrategy.UB:
         if current_all_reduce_helper().workspace is None:
-            all_reduce_params.strategy = AllReduceStrategy.NCCL
+            all_reduce_params.strategy = AllReduceStrategy.NCCL_SYMMETRIC
         else:
             workspace = current_all_reduce_helper().workspace.trt_tensor
     if all_reduce_params.strategy == AllReduceStrategy.UB:
