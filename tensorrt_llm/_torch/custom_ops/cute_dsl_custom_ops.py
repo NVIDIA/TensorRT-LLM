@@ -22,18 +22,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
     import cutlass
     import cutlass.cute as cute
 
-    from ..cute_dsl_kernels.blackwell.dense_blockscaled_gemm_persistent import (
-        Sm100BlockScaledPersistentDenseGemmKernel,
-        Sm100BlockScaledPersistentDenseGemmKernelWrapper)
+    from ..cute_dsl_kernels.blackwell.dense_blockscaled_gemm_persistent import \
+        Sm100BlockScaledPersistentDenseGemmKernel
     from ..cute_dsl_kernels.blackwell.grouped_blockscaled_gemm_finalize_fusion import \
         Sm100BlockScaledPersistentGroupedGemmFinalizeFusionKernel
     from ..cute_dsl_kernels.blackwell.grouped_blockscaled_gemm_persistent import \
         Sm100BlockScaledPersistentGroupedGemmKernel
     from ..cute_dsl_kernels.blackwell.utils import make_ptr
 
-    class CuteDSLNVFP4BlackwellLinear(TunableRunner):
-        kernel_dict = dict()
-
+    class CuteDSLNVFP4BlackwellRunner(TunableRunner):
+        kernel_class = Sm100BlockScaledPersistentDenseGemmKernel
+        kernel_cache = dict()
         tuning_config = TuningConfig(
             dynamic_tensor_specs=(DynamicTensorSpec(
                 0, 0, get_last_power_of_2_num_tokens_buckets,
@@ -58,7 +57,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return hash((self.output_dtype, ))
 
         def __eq__(self, other):
-            if not isinstance(other, CuteDSLNVFP4BlackwellLinear):
+            if not isinstance(other, self.__class__):
                 return False
             return self.output_dtype == other.output_dtype
 
@@ -118,7 +117,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             kernel_m = m
                             kernel_n = n
 
-                        if Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
+                        if self.__class__.kernel_class.can_implement(
                                 cutlass.Float4E2M1FN,  # ab_dtype,
                                 cutlass.Float8E4M3FN,  # sf_dtype
                                 sf_vec_size,  # sf_vec_size,
@@ -213,12 +212,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             torch_stream = torch.cuda.current_stream()
             stream = cuda.CUstream(torch_stream.cuda_stream)
 
-            CACHE_KEY = (
-                sf_vec_size,
-                mma_tiler_mn,
-                cluster_shape_mn,
-                swap_ab,
-            )
+            cache_key = (sf_vec_size, mma_tiler_mn, cluster_shape_mn, swap_ab)
             if swap_ab:
                 kernel_a_ptr = b_ptr
                 kernel_a_sf_ptr = b_sf_ptr
@@ -238,8 +232,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 kernel_sf_m = sf_m
                 kernel_sf_n = sf_n
 
-            if CACHE_KEY not in CuteDSLNVFP4BlackwellLinear.kernel_dict:
-                gemm = Sm100BlockScaledPersistentDenseGemmKernelWrapper(
+            if cache_key not in self.__class__.kernel_cache:
+                gemm = self.__class__.kernel_class(
                     sf_vec_size,
                     mma_tiler_mn,
                     cluster_shape_mn,
@@ -250,7 +244,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     cluster_shape_mn[0] * cluster_shape_mn[1])
 
                 compiled_gemm = cute.compile(
-                    gemm,
+                    gemm.wrapper,
                     kernel_m,
                     kernel_n,
                     real_k,
@@ -269,11 +263,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     swap_ab,
                 )
 
-                CuteDSLNVFP4BlackwellLinear.kernel_dict[
-                    CACHE_KEY] = compiled_gemm
+                self.__class__.kernel_cache[cache_key] = compiled_gemm
             else:
-                compiled_gemm = CuteDSLNVFP4BlackwellLinear.kernel_dict[
-                    CACHE_KEY]
+                compiled_gemm = self.__class__.kernel_cache[cache_key]
 
             # launch gemm kernel
             compiled_gemm(
@@ -311,18 +303,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         tuner = AutoTuner.get()
 
-        cute_dsl_nvfp4_gemm_blackwell_runner = CuteDSLNVFP4BlackwellLinear(
-            alpha, output_dtype)
+        runner = CuteDSLNVFP4BlackwellRunner(alpha, output_dtype)
+        inputs = [input, weight, input_scale, weight_scale]
         _, best_tactic = tuner.choose_one(
             "trtllm::cute_dsl_nvfp4_gemm_blackwell",
-            [cute_dsl_nvfp4_gemm_blackwell_runner],
-            CuteDSLNVFP4BlackwellLinear.tuning_config,
-            [input, weight, input_scale, weight_scale],
+            [runner],
+            runner.__class__.tuning_config,
+            inputs,
         )
-        return cute_dsl_nvfp4_gemm_blackwell_runner(
-            inputs=[input, weight, input_scale, weight_scale],
-            tactic=best_tactic,
-        )
+        output = runner(inputs, tactic=best_tactic)
+        return output
 
     @torch.library.register_fake("trtllm::cute_dsl_nvfp4_gemm_blackwell")
     def _(
