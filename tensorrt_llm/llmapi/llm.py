@@ -1141,6 +1141,7 @@ class _TorchLLM(BaseLLM):
             postproc_worker_config=PostprocWorkerConfig(
                 num_postprocess_workers=self.args.num_postprocess_workers,
                 postprocess_tokenizer_dir=self.args.postprocess_tokenizer_dir,
+                max_iteration_result_size=self.args.max_iteration_result_size,
             ),
             is_llm_executor=True,
             hf_model_dir=self._hf_model_dir,

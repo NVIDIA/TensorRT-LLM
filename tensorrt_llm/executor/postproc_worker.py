@@ -43,6 +43,7 @@ class PostprocWorkerConfig:
     ''' The config for the postprocess worker. '''
     num_postprocess_workers: int = 0
     postprocess_tokenizer_dir: Optional[str] = None
+    max_iteration_result_size: int = 0
 
     @property
     def enabled(self) -> bool:

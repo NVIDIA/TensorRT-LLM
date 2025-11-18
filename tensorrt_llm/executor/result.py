@@ -854,15 +854,15 @@ class IterationResult:
     Runtime results for all available iterations.
     """
 
-    def __init__(self):
+    def __init__(self, maxsize=0):
         self._done = False
         self._timeout = 2
 
         if has_event_loop():
-            self.aqueue = AsyncQueue()
+            self.aqueue = AsyncQueue(maxsize if maxsize > 0 else None)
             self.queue = self.aqueue.sync_q
         else:
-            self.queue = Queue()
+            self.queue = Queue(maxsize)
             self.aqueue = None
 
     def set_timeout(self, timeout: float):

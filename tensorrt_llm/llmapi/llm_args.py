@@ -2107,6 +2107,12 @@ class BaseLlmArgs(StrictBaseModel):
         description="The path to the tokenizer directory for postprocessing.",
         status="prototype")
 
+    max_iteration_result_size: int = Field(
+        default=16384,
+        description="Maximum size of the iteration result queue. "
+        "When the queue is full, the oldest result will be removed.",
+        status="prototype")
+
     reasoning_parser: Optional[str] = Field(
         default=None,
         description="The parser to separate reasoning content from output.",
