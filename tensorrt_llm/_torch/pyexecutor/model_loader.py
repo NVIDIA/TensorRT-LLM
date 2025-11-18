@@ -20,7 +20,8 @@ from ...llmapi.llm_args import LoadFormat
 from ..model_config import ModelConfig
 from ..models import AutoModelForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
-from ..models.modeling_utils import MetaInitMode, timing
+from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
+                                     timing)
 from ..modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, maybe_create_moe_load_balancer)
 
@@ -268,19 +269,21 @@ class ModelLoader:
                 else:
                     weights = checkpoint_loader.load_weights(checkpoint_dir)
 
-                weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
+                self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
                     model, config)
                 self._call_load_weights(model.load_weights, weights,
-                                        weight_mapper)
+                                        self.weight_mapper)
 
                 if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
                 ):
                     weights = checkpoint_loader.load_weights(
                         self.spec_config.speculative_model_dir)
                     self._call_load_weights(model.load_draft_weights, weights,
-                                            weight_mapper)
+                                            self.weight_mapper)
 
             elif load_format == LoadFormat.DUMMY:
+                self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
+                    model, config)
                 initialize_dummy_weights(model)
                 if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
                 ):
@@ -310,6 +313,16 @@ class ModelLoader:
             torch.cuda.current_stream().synchronize()
 
         return model, moe_load_balancer
+
+    def reload(self,
+               model: DecoderModelForCausalLM,
+               weights: dict,
+               allow_partial_loading: bool = False):
+        self._call_load_weights(model.load_weights,
+                                weights,
+                                self.weight_mapper,
+                                allow_partial_loading=allow_partial_loading)
+        torch.cuda.current_stream().synchronize()
 
     def _load_and_validate_config(
             self, checkpoint_dir: str,
@@ -354,10 +367,18 @@ class ModelLoader:
                             sub_config).num_hidden_layers = num_layers_override
         return config
 
-    def _call_load_weights(self, load_method: Callable, weights, weight_mapper):
+    def _call_load_weights(self,
+                           load_method: Callable,
+                           weights,
+                           weight_mapper,
+                           allow_partial_loading: bool = False):
         """Calls the model's weight loading method with the correct arguments."""
         args = inspect.getfullargspec(load_method).args
+        kargs = {}
         if "weight_mapper" in args:
-            load_method(weights, weight_mapper=weight_mapper)
+            kargs["weight_mapper"] = weight_mapper
+        if "allow_partial_loading" in args:
+            kargs["allow_partial_loading"] = allow_partial_loading
         else:
-            load_method(weights)
+            assert allow_partial_loading is False, "allow_partial_loading is only supported for this model"
+        load_method(weights, **kargs)
