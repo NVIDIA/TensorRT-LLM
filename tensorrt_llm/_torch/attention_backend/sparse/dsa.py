@@ -718,7 +718,7 @@ class Indexer(nn.Module):
             dtype=torch.float32,
             quant_config=None,
             skip_create_weights_in_init=skip_create_weights_in_init,
-            use_custom_cublas_mm=True)
+            use_custom_cublas_mm=False)
 
         self.rotary_emb = RotaryEmbedding(
             pos_embd_params.rope,
@@ -1234,10 +1234,17 @@ class Indexer(nn.Module):
                                         dtype=torch.int32)
         return topk_indices_buffer
 
+    @maybe_compile(dynamic=True)
+    def _scale_v2(self, hidden_states: torch.Tensor, q_scale: torch.Tensor,
+                  s: float) -> torch.Tensor:
+        weights = self.weights_proj(hidden_states.float())
+        return weights * q_scale.squeeze(-1) * s
+
     def weight_scale(self, hidden_states: torch.Tensor,
                      q_scale: torch.Tensor) -> torch.Tensor:
-        weights = self.weights_proj(hidden_states.float())
-        weights = _scale(weights, q_scale, self.weight_scale_factor)
+        #weights = self.weights_proj(hidden_states.float())
+        weights = self._scale_v2(hidden_states, q_scale,
+                                 self.weight_scale_factor)
         return weights
 
     @torch.inference_mode()
