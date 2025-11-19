@@ -535,14 +535,15 @@ class KVCacheManager(BaseResourceManager):
                          scheduled_batch: ScheduledRequests,
                          attn_metadata: "AttentionMetadata" = None,
                          kv_cache_dtype_byte_size: float = None):
-        self.update_kv_cache_draft_token_location(scheduled_batch,
-                                                  attn_metadata,
-                                                  kv_cache_dtype_byte_size)
-        # rewind kv cache
-        for request in scheduled_batch.generation_requests:
-            if request.state != LlmRequestState.GENERATION_COMPLETE:
-                if request.py_rewind_len > 0:
-                    self.rewind_kv_cache(request, request.py_rewind_len)
+        if not self.is_draft:
+            self.update_kv_cache_draft_token_location(scheduled_batch,
+                                                      attn_metadata,
+                                                      kv_cache_dtype_byte_size)
+            # rewind kv cache
+            for request in scheduled_batch.generation_requests:
+                if request.state != LlmRequestState.GENERATION_COMPLETE:
+                    if request.py_rewind_len > 0:
+                        self.rewind_kv_cache(request, request.py_rewind_len)
 
         # For context requests, we store the blocks for reuse.
         for request in scheduled_batch.context_requests:

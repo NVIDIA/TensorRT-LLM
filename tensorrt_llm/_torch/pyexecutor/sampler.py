@@ -879,9 +879,9 @@ class TorchSampler(Sampler):
 
         assert num_accepted_draft_tokens <= longest_accepted_len
 
-        request.py_num_accepted_draft_tokens_indices = eagle_paths[longest_match_path_idx][
-            1:num_accepted_draft_tokens
-        ].tolist()  # exclude the root node
+        tree_node_indices = eagle_paths[longest_match_path_idx][1:num_accepted_draft_tokens]
+        request.py_num_accepted_draft_tokens_indices = (tree_node_indices - 1).tolist()
+
         return num_accepted_draft_tokens - 1
 
     @torch.inference_mode()

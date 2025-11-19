@@ -202,7 +202,11 @@ class Eagle3SpecMetadata(SpecMetadata):
             elif is_first_draft and spec_tree_manager is not None:
                 assert req_id in self.request_accepted_path.keys(
                 ), f"Request {req_id} not found in request_accepted_path"
-                accepted_path = self.request_accepted_path[req_id]
+                # 'node_idx + 1' is because we '-1' in sampler.py for kv cache rewind. Now we add it back.
+                accepted_path = [
+                    node_idx + 1
+                    for node_idx in self.request_accepted_path[req_id]
+                ]
 
                 if accepted_path == []:
                     # Case 1: This is a context request, We need to read all the hidden states.
@@ -218,7 +222,6 @@ class Eagle3SpecMetadata(SpecMetadata):
                     assert len(accepted_path_pad) == seq_len
                     hidden_states_read_indices.extend([
                         start_idx + accepted_draft_token_offset
-                        # for accepted_draft_token_offset in accepted_path
                         for accepted_draft_token_offset in accepted_path_pad
                     ])
 
