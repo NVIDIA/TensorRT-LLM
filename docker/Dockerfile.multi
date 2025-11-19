@@ -30,11 +30,6 @@ FROM base AS devel
 # NB: PyTorch requires this to be < 1.0
 ENV PYTORCH_CUDA_ALLOC_CONF="garbage_collection_threshold:0.99999"
 
-# Set CUDA include path and Triton PTXAS path for Triton runtime compilation
-# Required for Triton to find CUDA headers when compiling cuda_utils.c on remote MPI nodes
-ENV CPATH=/usr/local/cuda/include
-ENV TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
-
 # Copy all installation scripts at once to reduce layers
 COPY docker/common/install.sh \
      docker/common/install_base.sh \
