@@ -5,7 +5,7 @@ constraints:
   target_isl: 1024
   target_osl: 1024
   target_concurrency: 4
-env:
+env_overrides:
   TRTLLM_ENABLE_PDL: 1
   NCCL_GRAPH_REGISTER: 0
 config:

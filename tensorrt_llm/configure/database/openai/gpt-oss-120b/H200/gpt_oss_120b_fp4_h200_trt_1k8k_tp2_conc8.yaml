@@ -5,7 +5,7 @@ constraints:
   target_isl: 1024
   target_osl: 8192
   target_concurrency: 8
-env:
+env_overrides:
   TRTLLM_ENABLE_PDL: 1
 config:
   cuda_graph_config:
