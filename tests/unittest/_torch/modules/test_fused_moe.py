@@ -1346,13 +1346,15 @@ def test_fused_moe_fp8_blockwise_cute_dsl_multi_gpu(ep_size, routing_method,
 
 @skip_pre_blackwell
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize(
-    "moe_backend",
-    [pytest.param("TRTLLM", marks=skip_blackwell_geforce), "CUTLASS"])
+@pytest.mark.parametrize("moe_backend", [
+    pytest.param("TRTLLM", marks=skip_blackwell_geforce), "CUTLASS", "CUTEDSL"
+])
 def test_fused_moe_nvfp4(dtype, moe_backend):
 
     if moe_backend == "TRTLLM" and dtype == torch.float16:
         pytest.skip("TRTLLM NVFP4 MoE backend does not support float16 yet")
+    if moe_backend == "CUTEDSL" and dtype == torch.float16:
+        pytest.skip("CUTEDSL NVFP4 MoE backend does not support float16 yet")
 
     test_all_kernels = True
     if get_sm_version() == 120:
@@ -1450,6 +1452,7 @@ def test_fused_moe_nvfp4(dtype, moe_backend):
                                      moe_backend=moe_backend),
         )
         fused_moe.load_weights([weights])
+        fused_moe.post_load_weights()
         fused_moe.cuda()
 
         # Evaluate the outputs on a variant sequence length to cover all possible keys in Autotuner cache
