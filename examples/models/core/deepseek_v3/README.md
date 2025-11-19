@@ -256,7 +256,26 @@ EOF
 cat >./extra-llm-api-config.yml <<EOF
 cuda_graph_config:
   enable_padding: true
-  max_batch_size: 2048
+  batch_sizes:
+  - 2048
+  - 1024
+  - 896
+  - 512
+  - 384
+  - 256
+  - 192
+  - 160
+  - 128
+  - 96
+  - 64
+  - 48
+  - 32
+  - 24
+  - 16
+  - 8
+  - 4
+  - 2
+  - 1
 kv_cache_config:
   enable_block_reuse: false
   dtype: fp8
