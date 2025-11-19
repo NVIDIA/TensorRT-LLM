@@ -1337,10 +1337,9 @@ class ShardingTransformContainer(BaseModel):
         # Extract factory_source from factory_config if present
         self.factory_source = self.factory_config.get("source", ShardingConfigSource.UNKNOWN)
         self.allreduce_strategy = other.allreduce_strategy
-        self.validate_config(ShardingSource.MANUAL)
-        self.validate_config(ShardingSource.FACTORY)
 
-    def add(self, transform: ShardingTransformInfo) -> bool:
+        # Extract factory_source from factory_config if present
+        self.factory_source = self.factory_config.get("source", ShardingConfigSource.UNKNOWN)
         """Append a transform only if that node was
         not sharded before. Do not overwrite existing transforms.
 
@@ -1419,5 +1418,4 @@ class ShardingTransformContainer(BaseModel):
             config.clear()
             return False
         return True
-
 
