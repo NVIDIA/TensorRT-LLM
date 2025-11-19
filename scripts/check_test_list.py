@@ -271,7 +271,7 @@ def main():
               flush=True)
 
     # Check for duplicates in waives.txt if requested
-    if args.check_duplicates:
+    if args.check_duplicate_waives:
         print("-----------Checking for duplicates in waives.txt...-----------",
               flush=True)
         check_waive_duplicates(llm_src)
