@@ -3,6 +3,7 @@ import pytest
 import torch
 
 os.environ['TRTLLM_ENABLE_KVCACHE_PRECISION_CONVERSION'] = '1'
+os.environ['TRTLLM_KVCACHE_ENABLE_PRECISION_CONVERSION'] = '1'
 
 import tensorrt_llm
 import tensorrt_llm.bindings
@@ -19,6 +20,24 @@ from tensorrt_llm.sampling_params import SamplingParams
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
 DataType = tensorrt_llm.bindings.DataType
+
+COMBO_CONFIGS = {
+    "ctx_fp8_gen_fp8_xfer_fp8": (DataType.FP8, DataType.FP8, "FP8"),
+    "ctx_fp16_gen_fp8_xfer_fp8": (DataType.HALF, DataType.FP8, "FP8"),
+    "ctx_fp16_gen_fp8_xfer_fp16": (DataType.HALF, DataType.FP8, "FP16"),
+    "ctx_fp8_gen_fp16_xfer_fp8": (DataType.FP8, DataType.HALF, "FP8"),
+    "ctx_fp16_gen_fp16_xfer_fp16": (DataType.HALF, DataType.HALF, "FP16"),
+    # "ctx_fp32_gen_fp32_xfer_fp32": (DataType.FLOAT, DataType.FLOAT, "FP32"),
+    # "ctx_fp32_gen_fp16_xfer_fp16": (DataType.FLOAT, DataType.HALF, "FP16"),
+    # "ctx_fp16_gen_fp32_xfer_fp16": (DataType.HALF, DataType.FLOAT, "FP16"),
+    # "ctx_fp32_gen_fp32_xfer_fp16": (DataType.FLOAT, DataType.FLOAT, "FP16"),
+    # "ctx_fp32_gen_fp8_xfer_fp8": (DataType.FLOAT, DataType.FP8, "FP8"),
+    # "ctx_fp8_gen_fp32_xfer_fp8": (DataType.FP8, DataType.FLOAT, "FP8"),
+    # "ctx_fp32_gen_fp32_xfer_fp8": (DataType.FLOAT, DataType.FLOAT, "FP8"),
+    "ctx_fp16_gen_fp8_xfer_nvfp4": (DataType.HALF, DataType.FP8, "NVFP4"),
+    "ctx_fp8_gen_fp16_xfer_nvfp4": (DataType.FP8, DataType.HALF, "NVFP4"),
+    "ctx_fp16_gen_fp16_xfer_nvfp4": (DataType.HALF, DataType.HALF, "NVFP4"),
+}
 
 
 def create_kv_cache_manager(mapping, dtype):
@@ -49,45 +68,39 @@ def fill_kv_cache_buffer(kv_cache_manager):
 
 
 @pytest.fixture(scope="function")
-def ctx_gen_kv_cache_dtype(request):
-    print(f"FIXTURE CALLED with param: {request.param}", flush=True)
-    if request.param == "ctx_fp8_gen_fp8": 
-        result = DataType.FP8, DataType.FP8
-    elif request.param == "ctx_bf16_gen_fp8": 
-        result = DataType.BF16, DataType.FP8
-    elif request.param == "ctx_fp16_gen_fp8":
-        result = DataType.HALF, DataType.FP8
-    else:
-        raise ValueError(f"Invalid config: {request.param}")
-    print(f"FIXTURE RETURNING: {result}", flush=True)
-    return result
+def ctx_gen_transfer_dtype(request):
+    if request.param not in COMBO_CONFIGS:
+        raise ValueError(f"Invalid ctx/gen/transfer combo: {request.param}")
+    combo = COMBO_CONFIGS[request.param]
+    print(f"CTX/GEN/TRANSFER combo {request.param}: {combo}", flush=True)
+    return combo
 
 
 # TODO: Test MLA TODO: Test MLA TODO: Test MLA 
 
 @pytest.mark.parametrize(
-    "ctx_gen_kv_cache_dtype",
-    ["ctx_fp8_gen_fp8", "ctx_fp16_gen_fp8"],  # BF16->FP8 not supported yet
-    ids=["ctx_fp8_gen_fp8", "ctx_fp16_gen_fp8"],
+    "ctx_gen_transfer_dtype",
+    list(COMBO_CONFIGS.keys()),
+    ids=list(COMBO_CONFIGS.keys()),
     indirect=True)
 @pytest.mark.parametrize("attention_type",
                          [AttentionTypeCpp.DEFAULT],
                          ids=["mha"])
-def test_kv_cache_transceiver_single_process(ctx_gen_kv_cache_dtype,
+def test_kv_cache_transceiver_single_process(ctx_gen_transfer_dtype,
                                              attention_type):
-    print(f"TEST FUNCTION ENTERED with ctx_gen={ctx_gen_kv_cache_dtype}, attention={attention_type}", flush=True)
+    print(f"TEST FUNCTION ENTERED with ctx/gen/transfer={ctx_gen_transfer_dtype}, attention={attention_type}", flush=True)
     # Init kv_cache manager and cache transceiver
     print("A", flush=True)
     
     mapping = Mapping(world_size=1, rank=0)
-    ctx_kv_cache_dtype, gen_kv_cache_dtype = ctx_gen_kv_cache_dtype
+    ctx_kv_cache_dtype, gen_kv_cache_dtype, transfer_dtype = ctx_gen_transfer_dtype
     kv_cache_manager_ctx = create_kv_cache_manager(mapping, ctx_kv_cache_dtype)
     kv_cache_manager_gen = create_kv_cache_manager(mapping, gen_kv_cache_dtype)
 
     cache_transceiver_config = CacheTransceiverConfig(
         backend="DEFAULT",
         max_tokens_in_buffer=256,
-        transfer_dtype="FP16")
+        transfer_dtype=transfer_dtype)
 
     print("C", flush=True)
     
