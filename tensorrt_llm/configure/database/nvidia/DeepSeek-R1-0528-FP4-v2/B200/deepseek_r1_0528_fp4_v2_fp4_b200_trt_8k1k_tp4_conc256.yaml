@@ -5,7 +5,7 @@ constraints:
   target_isl: 8192
   target_osl: 1024
   target_concurrency: 256
-env:
+env_overrides:
 
 config:
   cuda_graph_config:
