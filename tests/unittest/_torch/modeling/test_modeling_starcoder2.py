@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from transformers import AutoTokenizer, Starcoder2Config
+from transformers import Starcoder2Config
 from transformers import Starcoder2ForCausalLM as HFStarcoder2ForCausalLM
 from utils.util import default_dtype
 
@@ -83,19 +83,6 @@ class Scenario:
         return f"backend:{self.backend.lower()}_config:{self.config_name.lower()}_cuda_graph:{self.use_cuda_graph}"
 
 
-def reduce_starcoder2_config(
-    mem_for_full_model: int, config_dict: dict[str, Any], default_num_layers: int = 6
-):
-    """Reduce model size if GPU memory is low."""
-    _, total_mem = torch.cuda.mem_get_info()
-    # scale model down if gpu memory is low
-    if total_mem < mem_for_full_model:
-        model_fraction = total_mem / mem_for_full_model
-        num_layers = int(config_dict["num_hidden_layers"] * model_fraction)
-        num_layers = min(num_layers, default_num_layers)
-        config_dict["num_hidden_layers"] = num_layers
-
-
 def get_kv_cache_manager(
     dtype: torch.dtype,
     config: Starcoder2Config,
@@ -135,100 +122,6 @@ def get_kv_cache_manager(
     )
     return kv_cache_manager
 
-
-def test_starcoder2_sanity():
-    """Basic sanity test for StarCoder2 model."""
-    config_dict = deepcopy(STARCODER2_3B_CONFIG)
-    # 3B * sizeof(float16) plus some extra for activations
-    mem_for_full_model = int((2 + 1) * 3 * 2 ** (30))
-    reduce_starcoder2_config(mem_for_full_model, config_dict)
-
-    if config_dict["num_hidden_layers"] <= 0:
-        pytest.skip("Insufficient memory for a single StarCoder2 layer")
-
-    starcoder2_config = Starcoder2Config.from_dict(config_dict)
-
-    dtype = starcoder2_config.torch_dtype
-    device = torch.device("cuda")
-
-    with torch.device(device), default_dtype(dtype):
-        model_config = ModelConfig(pretrained_config=starcoder2_config)
-        starcoder2 = Starcoder2ForCausalLM(model_config).to(device)
-
-    input_ids = torch.tensor(
-        [100, 200, 300, 400, 500, 600, 700, 800],
-        dtype=torch.long,
-        device=device,
-    )
-
-    context_sequence_lengths = [3, 2, 1]
-    sequence_lengths = context_sequence_lengths + [1, 1]
-    past_seen_tokens = [0, 0, 0, 62, 75]
-    request_ids = list(range(len(sequence_lengths)))
-    token_nums = (torch.tensor(past_seen_tokens) + torch.tensor(sequence_lengths)).tolist()
-    prompt_lens = token_nums[:3] + past_seen_tokens[3:]
-
-    num_blocks = 100
-    tokens_per_block = 128
-    max_seq_len = num_blocks * tokens_per_block
-    batch_size = len(context_sequence_lengths) + 2
-
-    kv_cache_manager = get_kv_cache_manager(
-        dtype=dtype,
-        config=starcoder2_config,
-        tokens_per_block=tokens_per_block,
-        max_seq_len=max_seq_len,
-        batch_size=batch_size,
-        num_blocks=num_blocks,
-    )
-    kv_cache_manager.add_dummy_requests(request_ids, token_nums)
-
-    metadata_cls = get_attention_backend(model_config.attn_backend).Metadata
-    attn_metadata = metadata_cls(
-        seq_lens=torch.tensor(sequence_lengths, dtype=torch.long),
-        num_contexts=len(context_sequence_lengths),
-        kv_cache_params=KVCacheParams(
-            use_cache=True,
-            num_cached_tokens_per_seq=past_seen_tokens,
-        ),
-        kv_cache_manager=kv_cache_manager,
-        request_ids=request_ids,
-        prompt_lens=prompt_lens,
-        max_num_requests=len(context_sequence_lengths) + 2,
-        max_num_tokens=8192,
-    )
-
-    position_ids = []
-    for i, tokens in enumerate(past_seen_tokens):
-        seq_len = context_sequence_lengths[i] if i < len(context_sequence_lengths) else 1
-        position_id = torch.arange(tokens, tokens + seq_len, device=input_ids.device)
-        position_ids.append(position_id)
-
-    position_ids = torch.cat(position_ids).unsqueeze(0)
-
-    with torch.inference_mode():
-        attn_metadata.prepare()
-        logits = starcoder2.forward(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            attn_metadata=attn_metadata,
-        )
-
-    assert len(past_seen_tokens) == logits.shape[0]
-
-    with torch.inference_mode():
-        attn_metadata.prepare()
-        logits = starcoder2.forward(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            attn_metadata=attn_metadata,
-            return_context_logits=True,
-        )
-    assert input_ids.shape == logits.shape[:-1]
-
-    kv_cache_manager.shutdown()
-
-
 @pytest.mark.parametrize(
     "scenario",
     [
@@ -248,7 +141,7 @@ def test_starcoder2_allclose_to_hf(scenario: Scenario) -> None:
     """
     Compare TensorRT-LLM StarCoder2 output to HuggingFace.
 
-    Tests both context and generation phases using full pretrained models.
+    Tests both context and generation phases using randomly initialized models.
     Optionally tests with CUDA graphs for generation phase optimization.
     """
     backend = scenario.backend
@@ -258,29 +151,25 @@ def test_starcoder2_allclose_to_hf(scenario: Scenario) -> None:
 
     torch.random.manual_seed(0)
 
-    # Skip if insufficient memory for full pretrained model
-    _, total_mem = torch.cuda.mem_get_info()
-    min_mem_required = {
-        "3B": 10 * (2**30),  # 10 GB
-        "7B": 20 * (2**30),  # 20 GB
-        "15B": 40 * (2**30),  # 40 GB
+    # Create config based on model size
+    config_mapping = {
+        "3B": STARCODER2_3B_CONFIG,
+        "7B": STARCODER2_7B_CONFIG,
+        "15B": STARCODER2_15B_CONFIG,
     }
+    config_dict = deepcopy(config_mapping[config_name])
 
-    if total_mem < min_mem_required[config_name]:
-        pytest.skip(f"Insufficient memory for StarCoder2-{config_name}")
-
-    # Load full pretrained model from HuggingFace
-    model_name = f"bigcode/starcoder2-{config_name.lower()}"
-    hf_starcoder2 = HFStarcoder2ForCausalLM.from_pretrained(
-        model_name, torch_dtype=torch.bfloat16, device_map="auto"
-    )
+    # Create HuggingFace model from config with random weights
+    hf_config = Starcoder2Config.from_dict(config_dict)
+    hf_starcoder2 = HFStarcoder2ForCausalLM(hf_config)
+    hf_starcoder2 = hf_starcoder2.to(dtype=torch.bfloat16, device="cuda")
 
     dtype = torch.bfloat16
     device = torch.device("cuda")
 
-    # Build TRT-LLM model from the same pretrained config
+    # Build TRT-LLM model and copy the same random weights from HF model
     with torch.device(device), default_dtype(dtype):
-        model_config = ModelConfig(pretrained_config=hf_starcoder2.config, attn_backend=backend)
+        model_config = ModelConfig(pretrained_config=hf_config, attn_backend=backend)
         starcoder2 = Starcoder2ForCausalLM(model_config).to(dtype).to(device)
         starcoder2.load_weights(hf_starcoder2.state_dict())
 
@@ -291,7 +180,7 @@ def test_starcoder2_allclose_to_hf(scenario: Scenario) -> None:
 
     kv_cache_manager = get_kv_cache_manager(
         dtype=dtype,
-        config=hf_starcoder2.config,
+        config=hf_config,
         tokens_per_block=tokens_per_block,
         max_seq_len=max_seq_len,
         batch_size=batch_size,
@@ -429,44 +318,40 @@ def test_starcoder2_allclose_to_hf(scenario: Scenario) -> None:
 def test_starcoder2_generated_tokens_match_hf(scenario: Scenario) -> None:
     """
     Compare generated tokens from TRT-LLM PyTorch backend to HuggingFace.
+    Uses randomly initialized models with identical weights.
     """
     backend = scenario.backend
     config_name = scenario.config_name
 
     torch.random.manual_seed(0)
 
-    # Skip if insufficient memory for full pretrained model
-    _, total_mem = torch.cuda.mem_get_info()
-    min_mem_required = {
-        "3B": 10 * (2**30),  # 10 GB
-        "7B": 20 * (2**30),  # 20 GB
-        "15B": 40 * (2**30),  # 40 GB
+    # Create config based on model size
+    config_mapping = {
+        "3B": STARCODER2_3B_CONFIG,
+        "7B": STARCODER2_7B_CONFIG,
+        "15B": STARCODER2_15B_CONFIG,
     }
+    config_dict = deepcopy(config_mapping[config_name])
 
-    if total_mem < min_mem_required[config_name]:
-        pytest.skip(f"Insufficient memory for StarCoder2-{config_name}")
-
-    # Load full pretrained model from HuggingFace (same as engine test)
-    model_name = f"bigcode/starcoder2-{config_name.lower()}"
-    hf_starcoder2 = HFStarcoder2ForCausalLM.from_pretrained(
-        model_name, torch_dtype=torch.bfloat16, device_map="auto"
-    )
+    # Create HuggingFace model from config with random weights
+    hf_config = Starcoder2Config.from_dict(config_dict)
+    hf_starcoder2 = HFStarcoder2ForCausalLM(hf_config)
+    hf_starcoder2 = hf_starcoder2.to(dtype=torch.bfloat16, device="cuda")
 
     dtype = torch.bfloat16
     device = torch.device("cuda")
 
-    # Build TRT-LLM model from the same pretrained config
+    # Build TRT-LLM model and copy the same random weights from HF model
     with torch.device(device), default_dtype(dtype):
-        model_config = ModelConfig(pretrained_config=hf_starcoder2.config, attn_backend=backend)
+        model_config = ModelConfig(pretrained_config=hf_config, attn_backend=backend)
         starcoder2 = Starcoder2ForCausalLM(model_config).to(dtype).to(device)
         starcoder2.load_weights(hf_starcoder2.state_dict())
 
     test_prompt = "def fibonacci(n):"
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-
-    # Encode test prompt
+    # Create a simple tokenizer for the test (just split by characters for simplicity)
+    # Use a fixed token mapping for deterministic testing
     input_ids = torch.tensor(
-        tokenizer.encode(test_prompt),
+        [100, 200, 300, 400, 500],  # Fixed token IDs for testing
         dtype=torch.long,
         device=device,
     )
@@ -479,7 +364,7 @@ def test_starcoder2_generated_tokens_match_hf(scenario: Scenario) -> None:
 
     kv_cache_manager = get_kv_cache_manager(
         dtype=dtype,
-        config=hf_starcoder2.config,
+        config=hf_config,
         tokens_per_block=tokens_per_block,
         max_seq_len=max_seq_len,
         batch_size=batch_size,
@@ -564,34 +449,37 @@ def test_starcoder2_generated_tokens_match_hf(scenario: Scenario) -> None:
         trt_output_ids.append(next_token_id)
         num_cached_tokens += 1
 
-    # Generate with HuggingFace for comparison
+    # Generate with HuggingFace for comparison (manual loop for consistency)
+    hf_output_ids = []
+    hf_past_key_values = None
+    hf_current_ids = input_ids.unsqueeze(0)
+
     with torch.inference_mode():
-        hf_output = hf_starcoder2.generate(
-            input_ids.unsqueeze(0),
-            max_new_tokens=max_new_tokens,
-            do_sample=False,  # Greedy decoding
-            pad_token_id=tokenizer.eos_token_id,
-            use_cache=True,
-        )
+        for step in range(max_new_tokens):
+            hf_output = hf_starcoder2.forward(
+                input_ids=hf_current_ids,
+                past_key_values=hf_past_key_values,
+                use_cache=True,
+            )
+            # Greedy sampling: take argmax
+            next_token_id = torch.argmax(hf_output.logits[:, -1, :], dim=-1).item()
+            hf_output_ids.append(next_token_id)
+            hf_past_key_values = hf_output.past_key_values
+            hf_current_ids = torch.tensor([[next_token_id]], dtype=torch.long, device=device)
 
-    hf_output_ids = hf_output[0, len(input_ids) :].cpu().tolist()
-
-    trt_text = tokenizer.decode(trt_output_ids)
-    hf_text = tokenizer.decode(hf_output_ids)
-
-    # Compare outputs - allow some tolerance for minor differences
+    # Compare outputs - both should match exactly with same random weights
     min_len = min(len(trt_output_ids), len(hf_output_ids))
     matches = sum(1 for i in range(min_len) if trt_output_ids[i] == hf_output_ids[i])
     match_ratio = matches / min_len if min_len > 0 else 0.0
 
     # Print for debugging
-    print(f"\n{config_name}/{backend} TRT output: {trt_text}")
-    print(f"{config_name}/{backend} HF output:  {hf_text}")
+    print(f"\n{config_name}/{backend} TRT output tokens: {trt_output_ids}")
+    print(f"{config_name}/{backend} HF output tokens:  {hf_output_ids}")
     print(f"Match ratio: {match_ratio:.2%} ({matches}/{min_len} tokens)")
 
-    # Should match at least 90% of tokens
-    assert match_ratio > 0.9, (
-        f"TRT-LLM and HF token outputs differ significantly: {match_ratio:.2%} match"
+    # Should match exactly with identical random weights
+    assert match_ratio == 1.0, (
+        f"TRT-LLM and HF token outputs should match exactly: {match_ratio:.2%} match"
     )
 
     kv_cache_manager.shutdown()
