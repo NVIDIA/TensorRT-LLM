@@ -278,11 +278,14 @@ def _group_requests_by_strategy_key(
     group_dict: dict[tuple[GenericStrategyKeyType, bool], tuple[list[int], list[Strategy]]] = (
         defaultdict(lambda: ([], []))
     )
+
     for req_index, req in enumerate(requests):
         strategy = _request_strategy(req, vocab_size=vocab_size)
-        # In the overlap path, py_draft_logits is not updated yet,
-        # so we use get_draft_token_length() for the checking.
-        speculation_needs_probs = get_draft_token_length(req) > 0 and strategy is not GREEDY
+        speculation_needs_probs = (
+            # NB: This criterion needs to be consistent with the gating of rejection sampling in
+            #     process_draft_tokens.
+            TorchSampler._speculation_could_use_rejection_sampling(req, strategy)
+        )
         strategy_key = strategy_to_key(strategy, speculation_needs_probs)
         group_dict_entry = group_dict[(strategy_key, speculation_needs_probs)]
         group_dict_entry[0].append(req_index)
@@ -1026,6 +1029,17 @@ class TorchSampler(Sampler):
 
         return num_accepted
 
+    @staticmethod
+    def _speculation_could_use_rejection_sampling(
+        request: LlmRequest, strategy: Optional[Strategy] = None
+    ) -> bool:
+        if strategy is None:
+            strategy = _request_strategy(
+                request,
+                vocab_size=2**31,  # vocab_size does not affect greediness
+            )
+        return get_draft_token_length(request) > 0 and strategy != GREEDY
+
     def process_draft_tokens(
         self,
         request: LlmRequest,
@@ -1034,9 +1048,17 @@ class TorchSampler(Sampler):
         finish_reasons: FinishReasonsList,
         resource_manager: Optional[ResourceManager] = None,
     ) -> int:
-        if (
-            _request_strategy(request, vocab_size=2**31) == GREEDY
-            or request.py_draft_logits is None
+        if not (
+            self._speculation_could_use_rejection_sampling(request)
+            # NB: '_speculation_could_use_rejection_sampling' is called in sample_async, which precludes
+            #     inspection of .py_draft_logits, because it is not set yet when the overlap path
+            #     is used.
+            #
+            #     OTOH, some drafters (e.g. NGram) do not provide draft logits, precluding rejection
+            #     sampling. The current solution accepts that .py_target_probs may sometimes be
+            #     computed, even though .py_draft_logits may never be set and the target probs
+            #     may ultimately not be required.
+            and request.py_draft_logits is not None
         ):
             spec_tree_manager = self.get_spec_tree_manager(resource_manager)
             if spec_tree_manager is not None:

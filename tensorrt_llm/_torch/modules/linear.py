@@ -23,9 +23,10 @@ from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.quantization.utils.fp8_utils import (
-    resmooth_to_fp8_e8m0, transform_sf_into_required_layout)
+    per_token_quant_and_transform, resmooth_to_fp8_e8m0,
+    transform_sf_into_required_layout)
 
-from ..._utils import is_sm_100f
+from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
 from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
@@ -75,9 +76,9 @@ def load_weight_shard(
         # For integrated GPU systems (e.g., DGX Spark), CPU and GPU share limited physical memory.
         # Avoiding device transfers reduces memory consumption and unnecessary data copies,
         # enabling support for larger models on memory-constrained systems.
-        logger.warning(
-            f"[load_weight_shard] Skipping device transfer from {weight.device} to {device} on integrated GPU to conserve shared memory."
-        )
+        logger.warning_once(
+            f"[load_weight_shard] Skipping device transfer from {weight.device} to {device} on integrated GPU to conserve shared memory.",
+            key="load_weight_shard_skip_device_transfer_with_integrated_gpu")
         device = weight.device
     if isinstance(weight, torch.Tensor):
         tensor_shape = weight.shape
@@ -645,6 +646,10 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
                     module.weight_scale,
                     disable_ue8m0_cast=True,
                 )
+        elif get_sm_version() == 120:
+            act_input_fp8, act_input_sf = per_token_quant_and_transform(input)
+            output = torch.ops.trtllm.fp8_block_scaling_gemm(
+                act_input_fp8, module.weight, act_input_sf, module.weight_scale)
         else:
             act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
                 input)
@@ -730,8 +735,9 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
 
     def post_load_weights(self, module: Linear):
         super().post_load_weights(module)
-        if is_sm_100f() and not (module.use_cute_dsl_blockscaling_mm
-                                 or module.disable_deep_gemm):
+        if (is_sm_100f() and not (module.use_cute_dsl_blockscaling_mm
+                                 or module.disable_deep_gemm)) or \
+           get_sm_version() == 120:
             weight, weight_scale = resmooth_to_fp8_e8m0(module.weight,
                                                         module.weight_scale)
             transfromed_scale = transform_sf_into_required_layout(

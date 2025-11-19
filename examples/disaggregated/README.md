@@ -19,6 +19,8 @@ cache_transceiver_config:
   # KV cache transfer timeout in milliseconds
   # For requests, if they do not send/receive the KV cache in time they are cancelled and cleaned up
   kv_transfer_timeout_ms: <int>
+  # Timeout in milliseconds to wait for the sender future to be ready when scheduled batch size is 0. This allows the request to be eventually cancelled by the user or because of kv_transfer_timeout_ms
+  kv_transfer_sender_future_timeout_ms: <int>
 ```
 
 The following is an example, consisting of the `ctx_extra-llm-api-config.yaml` and `gen_extra-llm-api-config.yaml` files needed in the sections below.

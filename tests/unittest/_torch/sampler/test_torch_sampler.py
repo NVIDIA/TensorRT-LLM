@@ -945,15 +945,11 @@ class TestBatchedSampling:
     def mock_requests(
         self,
         sampling_params_list: list[SamplingParams],
-        with_draft_logits: bool,
-        vocab_size: int,
         seq_slot_assignment: tuple[list[int], int],
         draft_lens: list[int],
     ) -> ScheduledRequests:
         return self._build_mock_requests(
             sampling_params_list=sampling_params_list,
-            with_draft_logits=with_draft_logits,
-            vocab_size=vocab_size,
             seq_slot_assignment=seq_slot_assignment,
             draft_lens=draft_lens,
         )
@@ -962,8 +958,6 @@ class TestBatchedSampling:
         self,
         sampling_params_list: list[SamplingParams],
         *,
-        with_draft_logits: bool,
-        vocab_size: int,
         seq_slot_assignment: tuple[list[int], int],
         draft_lens: list[int],
     ) -> ScheduledRequests:
@@ -975,21 +969,9 @@ class TestBatchedSampling:
                 self,
                 sampling_params_list: list[SamplingParams],
                 *,
-                with_draft_logits: bool,
                 draft_lens: list[int],
             ):
                 self._sampling_params_list = sampling_params_list
-                self._with_draft_logits = with_draft_logits
-
-                def _attach_draft_logits(req: LlmRequest) -> LlmRequest:
-                    draft_len = len(req.py_draft_tokens)
-                    if draft_len and with_draft_logits:
-                        req.py_draft_logits = torch.testing.make_tensor(  # type: ignore
-                            (draft_len, vocab_size),
-                            dtype=torch.float32,
-                            device="cuda",
-                        )
-                    return req
 
                 # NB:
                 #   -  stop words are tested in test_write_finish_reasons
@@ -999,24 +981,22 @@ class TestBatchedSampling:
                 #   -  py_return_log_probs is tested elsewhere
                 #   -  code paths gated by py_return_context_logits tested in test_select_generated_logits
                 self._gen_requests = [
-                    _attach_draft_logits(
-                        LlmRequest(
-                            request_id=seq_slot,
-                            max_new_tokens=(2 * draft_len),  # not used by tested code
-                            input_tokens=[12],  # not used by tested code
-                            sampling_config=SamplingConfig(sampling_params._get_sampling_config()),
-                            seq_slot=seq_slot,
-                            is_streaming=False,  # not relevant for tested code
-                            draft_tokens=(  # 'len(.py_draft_tokens)' is inspected by get_draft_token_length
-                                torch.testing.make_tensor(
-                                    (draft_len,),
-                                    dtype=torch.int32,
-                                    device="cpu",
-                                ).tolist()
-                                if draft_len
-                                else None
-                            ),
-                        )
+                    LlmRequest(
+                        request_id=seq_slot,
+                        max_new_tokens=(2 * draft_len),  # not used by tested code
+                        input_tokens=[12],  # not used by tested code
+                        sampling_config=SamplingConfig(sampling_params._get_sampling_config()),
+                        seq_slot=seq_slot,
+                        is_streaming=False,  # not relevant for tested code
+                        draft_tokens=(  # 'len(.py_draft_tokens)' is inspected by get_draft_token_length
+                            torch.testing.make_tensor(
+                                (draft_len,),
+                                dtype=torch.int32,
+                                device="cpu",
+                            ).tolist()
+                            if draft_len
+                            else None
+                        ),
                     )
                     for sampling_params, seq_slot, draft_len in zip(
                         sampling_params_list, seq_slots, draft_lens
@@ -1040,9 +1020,7 @@ class TestBatchedSampling:
         with torch.inference_mode(True):
             return cast(
                 ScheduledRequests,
-                ScheduledRequestsMock(
-                    sampling_params_list, with_draft_logits=with_draft_logits, draft_lens=draft_lens
-                ),
+                ScheduledRequestsMock(sampling_params_list, draft_lens=draft_lens),
             )
 
     @pytest.fixture(scope="function")
@@ -1184,20 +1162,17 @@ class TestBatchedSampling:
             "max_draft_len",
             "draft_lens",
             "sampling_params_list",
-            "with_draft_logits",
             "params_label",
             "allow_zero_draft_len",
             "vocab_size",
         ),
         [
-            # NB: with_draft_logits=True and non-zero draft len ensures that
-            #     LlmRequest.py_target_probs is set.
+            # NB: non-zero draft len ensures that LlmRequest.py_target_probs is set.
             pytest.param(
                 use_flashinfer,
                 3,
                 [3] * len(sampling_params_list),
                 sampling_params_list,
-                True,
                 params_label,
                 False,
                 vocab_size,
@@ -1225,7 +1200,6 @@ class TestBatchedSampling:
         allow_zero_draft_len: bool,  # used by fixtures
         sampling_params_list: list[SamplingParams],
         seq_slot_assignment: tuple[list[int], int],
-        with_draft_logits: bool,
     ):
         """Validate probabilities returned by sample_async.
 
@@ -1255,9 +1229,7 @@ class TestBatchedSampling:
                 # requests.
                 uut_mock_requests = self._build_mock_requests(
                     sampling_params_list=sampling_params_list,
-                    vocab_size=vocab_size,
                     seq_slot_assignment=seq_slot_assignment,
-                    with_draft_logits=with_draft_logits,
                     draft_lens=draft_lens,
                 )
             else:
@@ -1427,11 +1399,8 @@ class TestBatchedSampling:
         )
         mock_requests_with_probs = self._build_mock_requests(
             sampling_params_list=sampling_params_list,
-            vocab_size=vocab_size,
             seq_slot_assignment=seq_slot_assignment,
-            # NB: with_draft_logits=True and non-zero draft len ensures that
-            #     LlmRequest.py_target_probs is set.
-            with_draft_logits=True,
+            # NB: non-zero draft len ensures that LlmRequest.py_target_probs is set.
             draft_lens=([draft_len_with_probs] * len(sampling_params_list)),
         )
         # zero-pad logits to draft_len_with_probs
@@ -1818,6 +1787,12 @@ class TestBatchedSampling:
 
         # Perform G-test (asymptotically approximated by Pearson's chi-square test) to
         # check that sampled tokens are consistent with the expected probs.
+        #
+        # NB: Need to use FP64 to avoid negative test statistic values.
+        test_token_counts_ma = test_token_counts_ma.astype(np.float64)
+        test_expected_counts_ma = test_expected_counts_ma.astype(np.float64)
+        test_expected_counts_ma /= test_expected_counts_ma.sum(axis=-1, keepdims=True)
+        test_expected_counts_ma *= num_samples
         test_result = power_divergence(
             f_obs=test_token_counts_ma,
             f_exp=test_expected_counts_ma,
@@ -1847,7 +1822,6 @@ class TestBatchedSampling:
             "use_flashinfer",
             "max_draft_len",
             "sampling_params_list",
-            "with_draft_logits",
             "allow_zero_draft_len",
             "bypass_sampling",
             "vocab_size",
@@ -1857,7 +1831,6 @@ class TestBatchedSampling:
                 use_flashinfer,
                 max_draft_len,
                 sampling_params_list,
-                with_draft_logits,
                 allow_zero_draft_len,
                 # Run full sampling test only for uniform batches, with/without probs, but skip
                 # sampling statistics when varying draft lens etc. to validate batch handling:
@@ -1868,14 +1841,13 @@ class TestBatchedSampling:
                 id=(
                     f"{'FlashInfer' if use_flashinfer else 'Torch'}"
                     f"-draft_len={0 if allow_zero_draft_len else 1}..{max_draft_len}"
-                    f"-return_probs={with_draft_logits}-{params_label}"
+                    f"-{params_label}"
                 ),
             )
             # https://stackoverflow.com/a/75421799, does not work with nested loops
             for (
                 use_flashinfer,
                 is_mixed,
-                with_draft_logits,
                 max_draft_len,
                 allow_zero_draft_len,
                 _build_test_cases,
@@ -1883,7 +1855,6 @@ class TestBatchedSampling:
             ) in product(
                 [False, True],
                 [False, True],
-                [True, False],
                 [0, 3],
                 [False, True],
                 [_build_test_cases],
@@ -1895,8 +1866,7 @@ class TestBatchedSampling:
                 include_uniform=(not is_mixed),
                 include_mixed=is_mixed,
             )
-            if (allow_zero_draft_len or max_draft_len > 0)
-            and (not with_draft_logits or max_draft_len > 0)
+            if allow_zero_draft_len or max_draft_len > 0
         ],
     )
     def test_samples(
@@ -1908,7 +1878,6 @@ class TestBatchedSampling:
         vocab_size: int,
         sampling_params_list: list[SamplingParams],
         seq_slot_assignment: tuple[list[int], int],
-        with_draft_logits: bool,
         max_draft_len: int,
         use_flashinfer: bool,
         allow_zero_draft_len: bool,  # used by fixtures
@@ -2038,7 +2007,7 @@ class TestBatchedSampling:
                 probs = probs[: (draft_len + 1)]
 
                 # check probs are returned only when needed
-                should_return_probs = draft_len and with_draft_logits
+                should_return_probs = bool(draft_len)
                 assert (
                     hasattr(req, "py_target_probs") and req.py_target_probs is not None
                 ) == should_return_probs

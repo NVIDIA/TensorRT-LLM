@@ -145,7 +145,6 @@ def launch_disaggregated_llm(
 
     for i, port in enumerate(ctx_ports):
         env_ctx = os.environ.copy()
-        env_ctx["TRTLLM_USE_UCX_KVCACHE"] = "1"
         gpu_range = range(current_gpu_offset,
                           current_gpu_offset + ctx_total_gpus)
         env_ctx["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_range))
@@ -166,7 +165,6 @@ def launch_disaggregated_llm(
 
     for i, port in enumerate(gen_ports):
         env_gen = os.environ.copy()
-        env_gen["TRTLLM_USE_UCX_KVCACHE"] = "1"
         gpu_range = range(current_gpu_offset,
                           current_gpu_offset + gen_total_gpus)
         env_gen["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_range))

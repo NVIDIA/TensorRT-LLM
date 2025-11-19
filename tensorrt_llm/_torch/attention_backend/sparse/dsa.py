@@ -1060,7 +1060,6 @@ class Indexer(nn.Module):
         weights: torch.Tensor,
         use_custom_topk: bool = True,
     ) -> torch.Tensor:
-        use_custom_topk = use_custom_topk and self.index_topk == 2048  #@TODO: Do we need to add a warning?
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
         num_ctx_tokens = metadata.num_ctx_tokens
@@ -1092,7 +1091,7 @@ class Indexer(nn.Module):
                         chunk.cu_seqlen_ke,
                     )
                     if use_custom_topk:
-                        torch.ops.trtllm.indexer_topk_prefill_op(
+                        torch.ops.trtllm.indexer_topk_prefill(
                             logits, chunk.cu_seqlen_ks, chunk.cu_seqlen_ke,
                             topk_indices_buffer[
                                 chunk.token_start:chunk.token_end, :])
@@ -1128,7 +1127,7 @@ class Indexer(nn.Module):
                     cu_seqlen_ke,
                 )
                 if use_custom_topk:
-                    torch.ops.trtllm.indexer_topk_prefill_op(
+                    torch.ops.trtllm.indexer_topk_prefill(
                         logits, cu_seqlen_ks, cu_seqlen_ke,
                         topk_indices_buffer[:num_ctx_tokens, :])
                 else:
@@ -1196,7 +1195,7 @@ class Indexer(nn.Module):
                 # This is because rowEnd = seq_len - next_n + offset + 1
                 gen_kv_lens_cuda = metadata.kv_lens_cuda_runtime[
                     num_contexts:num_contexts + num_generations]
-                torch.ops.trtllm.indexer_topk_decode_op(
+                torch.ops.trtllm.indexer_topk_decode(
                     logits_decode, gen_kv_lens_cuda,
                     topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
                                         num_gen_tokens, :], next_n)
