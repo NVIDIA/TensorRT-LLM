@@ -114,7 +114,7 @@ transforms:
   fuse_moe:
     stage: post_load_fusion
     enabled: true
-    backend: trtllm
+    backend: auto
   fuse_fp8_moe:
     stage: post_load_fusion
     enabled: true

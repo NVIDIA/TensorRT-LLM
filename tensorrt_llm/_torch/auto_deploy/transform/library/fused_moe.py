@@ -1,5 +1,5 @@
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple, Type
+from typing import Dict, List, Literal, Optional, Tuple, Type
 
 import torch
 from pydantic import Field
@@ -18,15 +18,13 @@ from ..interface import (
 )
 
 
-def _insert_fused_moe_ops(gm: GraphModule, backend: str) -> int:
+def _insert_fused_moe_ops(gm: GraphModule, backend: Literal["auto", "trtllm", "triton"]) -> int:
     fused_key_counter = 0
     graph = gm.graph
     backend = backend.lower()
 
-    assert backend in ["trtllm", "triton"], (
-        f"Invalid backend: {backend}. Must be 'trtllm' or 'triton'."
-    )
     replacement_op = {
+        "auto": torch.ops.auto_deploy.trtllm_moe_fused,
         "trtllm": torch.ops.auto_deploy.trtllm_moe_fused,
         "triton": torch.ops.auto_deploy.triton_moe_fused,
     }[backend]
