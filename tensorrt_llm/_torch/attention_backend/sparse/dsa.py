@@ -1248,8 +1248,7 @@ class Indexer(nn.Module):
                                 position_ids: torch.Tensor):
         """Project Q/K and apply RoPE"""
         q = self.wq_b(qr)
-        k = indexer_k
-        k = self.k_norm(k)
+        k = self.k_norm(indexer_k)
         q = q.view(-1, self.n_heads, self.head_dim)
         q_pe, q_nope = q.split([self.rope_dim, self.head_dim - self.rope_dim],
                                dim=-1)
