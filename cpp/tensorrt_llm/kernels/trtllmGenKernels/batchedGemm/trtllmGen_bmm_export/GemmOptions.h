@@ -1623,8 +1623,8 @@ inline CUresult loadCubinData(CUmodule* module, Config const& config)
     // Trtllm links the cubin into the executable while Flashinfer loads the cubin from storage.
 #ifdef TLLM_GEN_EXPORT_FLASHINFER
 #ifdef TLLM_GEN_GEMM_CUBIN_PATH
-    static const std::string tllm_gen_gemm_cubin_path = std::string(TLLM_GEN_GEMM_CUBIN_PATH);
-    const std::string sha256 = config.mHash ? config.mHash : "";
+    static std::string const tllm_gen_gemm_cubin_path = std::string(TLLM_GEN_GEMM_CUBIN_PATH);
+    std::string const sha256 = config.mHash ? config.mHash : "";
     std::string fileName = config.mFunctionName;
     if (!fileName.empty())
     {

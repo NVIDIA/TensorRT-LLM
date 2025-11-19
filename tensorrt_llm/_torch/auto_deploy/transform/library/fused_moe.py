@@ -19,7 +19,7 @@ def _insert_fused_moe_ops(gm: GraphModule) -> int:
         if not is_op(node, torch.ops.auto_deploy.torch_moe):
             continue
 
-        (mlp_style_val, act_fn_val) = extract_op_args(node, "mlp_style", "act_fn")
+        (mlp_style_val,) = extract_op_args(node, "mlp_style")
 
         hidden_states, selected_experts, routing_weights, w1_list, w2_list, w3_list = (
             extract_op_args(
@@ -50,7 +50,7 @@ def _insert_fused_moe_ops(gm: GraphModule) -> int:
             fused_w_up_experts = torch.stack([gm.get_parameter(n.target) for n in w1_list], dim=0)
             new_key_w_up = f"fused_moe_w1_stacked_{fused_key_counter}"
             # Triton fused MoE op supports mlp only.
-            replacement_op = torch.ops.auto_deploy.trtllm_moe_fused
+            replacement_op = torch.ops.auto_deploy.triton_moe_fused
 
         else:
             raise ValueError(f"Unknown mlp_style: {mlp_style_val}")
@@ -75,10 +75,6 @@ def _insert_fused_moe_ops(gm: GraphModule) -> int:
                     graph.get_attr(new_key_w_up),
                     graph.get_attr(new_key_w_down),
                 ),
-                kwargs={
-                    "mlp_style": mlp_style_val,
-                    "act_fn": act_fn_val,
-                },
             )
 
         node.replace_all_uses_with(new_node)

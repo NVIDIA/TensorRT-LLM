@@ -400,7 +400,6 @@ class WideEPMoE(MoE):
         all_rank_max_num_tokens = max(all_rank_num_tokens)
         if isinstance(x, Fp4QuantizedTensor):
             assert output_dtype is not None
-            output_dtype = output_dtype
         else:
             output_dtype = x.dtype
 
