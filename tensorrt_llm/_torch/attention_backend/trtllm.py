@@ -465,7 +465,7 @@ class TrtllmAttentionWrapper:
             self.spec_decoding_generation_lengths,
             self.spec_decoding_position_offsets, self.spec_decoding_packed_mask
         ]
-        if get_sm_version() >= 100:
+        if get_sm_version() >= 100 and get_sm_version() != 120:
             spec_decoding_tensor_params.append(
                 self.spec_decoding_bl_tree_mask_offset)
             spec_decoding_tensor_params.append(self.spec_decoding_bl_tree_mask)
@@ -1158,8 +1158,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             spec_decoding_generation_lengths = None
 
         self.is_spec_decoding_enabled = is_spec_decoding_enabled
-        if get_sm_version(
-        ) >= 100 and not is_spec_dec_tree and not is_spec_dec_dynamic_tree:
+        if (get_sm_version() >= 100 and get_sm_version() != 120
+            ) and not is_spec_dec_tree and not is_spec_dec_dynamic_tree:
             self.is_spec_decoding_enabled = False
 
         # use_spec_decoding is default to true by default, change in runtime by layers / requests
@@ -1190,7 +1190,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 dtype=torch.int,
                 device='cuda',
             )
-            if get_sm_version() >= 100:
+            if get_sm_version() >= 100 and get_sm_version() != 120:
                 self.spec_decoding_param_prepare_for_blackwell()
             else:
                 self.spec_decoding_bl_tree_mask_offset = None
