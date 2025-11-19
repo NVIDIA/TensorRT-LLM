@@ -762,8 +762,8 @@ class FuseMoeConfig(TransformConfig):
     """Configuration for MoE fusion transform."""
 
     backend: str = Field(
-        default="trtllm",
-        description="Backend to use for MoE computation ('trtllm' or 'triton'. default: 'trtllm').",
+        default="auto",
+        description="Backend to use for MoE computation ('auto', 'trtllm' or 'triton'. default: 'auto').",
     )
 
 
@@ -801,8 +801,8 @@ class FuseFP8MoeConfig(TransformConfig):
     """Configuration for FP8 MoE fusion transform."""
 
     backend: str = Field(
-        default="trtllm",
-        description="Backend to use for FP8 MoE computation ('trtllm' or 'triton'. default: 'trtllm').",
+        default="auto",
+        description="Backend to use for FP8 MoE computation ('auto', 'trtllm' or 'triton'. default: 'auto').",
     )
 
 
