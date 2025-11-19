@@ -225,12 +225,12 @@ class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
     """
     algorithm: ClassVar[str] = "rocket"
     window_size: Optional[int] = Field(
-        default=None, description="The window size for snap KV.")
+        default=32, description="The window size for snap KV.")
     kernel_size: Optional[int] = Field(
-        default=None, description="The kernel size for snap KV.")
-    topr: Optional[Union[int, float]] = Field(default=76, description="Top-r")
-    topk: Optional[int] = Field(default=128, description="Top-k")
-    prompt_budget: Optional[int] = Field(default=1266,
+        default=63, description="The kernel size for snap KV.")
+    topr: Optional[Union[int, float]] = Field(default=128, description="Top-r")
+    topk: Optional[int] = Field(default=64, description="Top-k")
+    prompt_budget: Optional[int] = Field(default=2048,
                                          description="Prompt budget")
     page_size: Optional[int] = Field(default=4, description="Page size")
     kt_cache_dtype: Optional[Any] = Field(default=torch.bfloat16,
