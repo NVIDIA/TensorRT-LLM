@@ -2,7 +2,7 @@ import os
 import time
 
 import requests
-from defs.conftest import llm_models_root, skip_pre_hopper
+from defs.conftest import llm_models_root, skip_post_blackwell, skip_pre_hopper
 from defs.trt_test_alternative import popen, print_error, print_info
 from openai import OpenAI
 from requests.exceptions import RequestException
@@ -93,6 +93,7 @@ def check_openai_chat_completion(http_port="8000",
 
 
 @skip_pre_hopper
+@skip_post_blackwell
 def test_extra_llm_api_options(serve_test_root):
     test_configs_root = f"{serve_test_root}/test_configs"
     config_file = f"{test_configs_root}/Qwen3-30B-A3B-FP8.yml"

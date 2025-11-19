@@ -224,7 +224,7 @@ static auto makeTmaShapeStrideAbc(GemmOptions const& options, int sizeM, int siz
 
 // Create the TMA shape/stride for A/B block scaling factors.
 static auto makeTmaShapeStrideSfAb(int mM, int mN, int mK, MatrixType matrixType, int tileM, int tileN, int tileK,
-    tg::SfLayout layout, int sfReshapeFactor, const int32_t numEltsPerSf)
+    tg::SfLayout layout, int sfReshapeFactor, int32_t const numEltsPerSf)
 {
 
     // The outer dimension.

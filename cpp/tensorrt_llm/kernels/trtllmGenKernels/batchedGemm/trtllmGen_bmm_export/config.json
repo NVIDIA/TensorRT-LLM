@@ -39,7 +39,8 @@
             "dtypeA": "e2m1",
             "dtypeC": "e2m1",
             "mmaK": 64,
-            "tileK": 512
+            "tileK": 512,
+            "biasType": "m"
         },
         "BatchedGemmFp4LowLatency": {
             "_template": "BatchedGemmFp4Base",
@@ -53,8 +54,7 @@
             "mmaM": 256,
             "clusterDimX": 2,
             "sfLayoutB": "128x4",
-            "sfLayoutC": "128x4",
-            "biasType": "m"
+            "sfLayoutC": "128x4"
         },
 
         "BatchedGemmPerTensorScalingFp8Base": {
@@ -156,7 +156,6 @@
             "dtypeB": "e4m3",
             "dtypeMmaA": "e4m3",
             "sfBlockSizeA": 32,
-            "biasType": "m",
             "act": "swiglu"
         }
     },
