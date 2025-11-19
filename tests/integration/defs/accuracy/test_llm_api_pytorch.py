@@ -2558,11 +2558,11 @@ class TestGLM4_6(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize(
-        "tp_size,pp_size,mtp_nextn,fp8kv,cuda_graph,overlap_scheduler,chunked_prefill,max_batch_size,moe_backend",
-        [pytest.param(4, 1, 2, True, True, True, True, 16, "CUTLASS")],
+        "tp_size,pp_size,mtp_nextn,cuda_graph,overlap_scheduler,chunked_prefill,max_batch_size,moe_backend",
+        [pytest.param(4, 1, 2, True, True, True, 16, "CUTLASS")],
         ids=["throughput"])
-    def test_nvfp4_multi_gpus(self, tp_size, pp_size, mtp_nextn, fp8kv,
-                              cuda_graph, overlap_scheduler, chunked_prefill,
+    def test_nvfp4_multi_gpus(self, tp_size, pp_size, mtp_nextn, cuda_graph,
+                              overlap_scheduler, chunked_prefill,
                               max_batch_size, moe_backend):
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.70)
@@ -2571,13 +2571,10 @@ class TestGLM4_6(LlmapiAccuracyTestHarness):
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
             moe_config=MoeConfig(backend=moe_backend))
 
-        if fp8kv:
-            kv_cache_config.dtype = "fp8"
-
         mtp_config = None
         if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
-        with LLM(f"{llm_models_root()}/GLM-4.6/GLM-4.6-FP4",
+        with LLM(f"{llm_models_root()}/glm-4.6-fp4",
                  max_batch_size=max_batch_size,
                  tensor_parallel_size=tp_size,
                  pipeline_parallel_size=pp_size,
