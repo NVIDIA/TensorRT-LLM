@@ -30,12 +30,15 @@ torch::Tensor create_nccl_window_tensor(
         groupSet.insert(static_cast<int>(rank));
     }
 
+    // Guard against empty group to avoid undefined behavior
+    TORCH_CHECK(!groupSet.empty(), "Group cannot be empty for NCCL window tensor creation");
+
     // Get NCCL communicator for the group
     auto comm = getComm(groupSet);
 
     // Create NCCL window tensor
     using tensorrt_llm::common::nccl_util::createNCCLWindowTensor;
-    auto [tensor, buffer] = createNCCLWindowTensor(*comm, shape, dtype);
+    auto tensor = std::get<0>(createNCCLWindowTensor(*comm, shape, dtype));
 
     // Return just the tensor (Python doesn't need the buffer object)
     return tensor;

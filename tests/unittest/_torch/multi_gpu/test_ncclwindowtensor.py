@@ -158,25 +158,53 @@ def run_window_tensor_multiple_test(
 
     # Create multiple window tensors
     tensors = []
+    data_ptrs = []
     for i in range(num_tensors):
         tensor = _create_nccl_window_tensor(group, shape, dtype)
         assert tensor.shape == shape
         assert tensor.dtype == dtype
         assert tensor.is_cuda
         tensors.append(tensor)
+        # Record data pointer immediately after creation
+        data_ptrs.append(tensor.data_ptr())
 
     # Verify all tensors are independent (different memory addresses)
-    for i in range(len(tensors)):
-        for j in range(i + 1, len(tensors)):
-            assert not torch.equal(tensors[i], tensors[j]) or torch.allclose(
-                tensors[i], tensors[j]
-            ), "Tensors should be independent"
+    # Check that all data pointers are distinct
+    for i in range(len(data_ptrs)):
+        for j in range(i + 1, len(data_ptrs)):
+            assert data_ptrs[i] != data_ptrs[j], (
+                f"Tensors {i} and {j} share the same data pointer "
+                f"({hex(data_ptrs[i])}), indicating aliasing/storage-sharing bug"
+            )
 
     # Test writing different data to each tensor
+    expected_data = []
     for i, tensor in enumerate(tensors):
         test_data = torch.randn(shape, dtype=dtype, device="cuda") * (i + 1)
         tensor.copy_(test_data)
-        assert torch.allclose(tensor, test_data, rtol=1e-5, atol=1e-5)
+        expected_data.append(test_data)
+
+    # Synchronize to ensure all writes are complete
+    torch.cuda.synchronize()
+
+    # Re-check that each tensor contains its expected values
+    for i, tensor in enumerate(tensors):
+        assert torch.allclose(tensor, expected_data[i], rtol=1e-5, atol=1e-5), (
+            f"Tensor {i} does not contain expected data after write"
+        )
+
+    # Verify pointers remain distinct after writes
+    for i in range(len(tensors)):
+        current_ptr = tensors[i].data_ptr()
+        assert current_ptr == data_ptrs[i], (
+            f"Tensor {i} data pointer changed from {hex(data_ptrs[i])} "
+            f"to {hex(current_ptr)} after write"
+        )
+        for j in range(i + 1, len(tensors)):
+            assert current_ptr != tensors[j].data_ptr(), (
+                f"Tensors {i} and {j} share the same data pointer "
+                f"({hex(current_ptr)}) after writes, indicating aliasing bug"
+            )
 
     # Synchronize CUDA to ensure all operations are complete before cleanup
     torch.cuda.synchronize()

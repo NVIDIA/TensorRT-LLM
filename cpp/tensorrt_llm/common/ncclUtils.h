@@ -30,6 +30,8 @@
 #include <memory>
 #include <mutex>
 #include <numeric>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -180,8 +182,8 @@ public:
 
     NcclCommResource(NcclCommResource const&) = delete;
     NcclCommResource& operator=(NcclCommResource const&) = delete;
-    NcclCommResource(NcclCommResource&&) = default;
-    NcclCommResource& operator=(NcclCommResource&&) = default;
+    NcclCommResource(NcclCommResource&&) = delete;
+    NcclCommResource& operator=(NcclCommResource&&) = delete;
 
 private:
     ncclComm_t mComm;
@@ -371,6 +373,15 @@ inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
     // Request buffer from allocator
     auto& allocator = NCCLWindowAllocator::getInstance();
     auto buffer = allocator.requestBuffer(comm, buffer_size);
+
+    // Defensive validation: ensure buffer is valid before proceeding
+    if (!buffer.isValid())
+    {
+        std::ostringstream oss;
+        oss << "Failed to allocate NCCL window buffer: invalid buffer returned from requestBuffer "
+            << "(comm=" << static_cast<void*>(comm) << ", buffer_size=" << buffer_size << ")";
+        throw std::runtime_error(oss.str());
+    }
 
     // Create custom deleter that releases the buffer
     auto deleter = [comm, ptr = buffer.ptr](void*) { NCCLWindowAllocator::getInstance().releaseBuffer(comm, ptr); };
