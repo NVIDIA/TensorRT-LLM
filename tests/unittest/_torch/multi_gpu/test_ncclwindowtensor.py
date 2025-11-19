@@ -101,7 +101,7 @@ def run_window_tensor_creation_test(
     shape: tuple,
     dtype_str: str,
     tensor_parallel_size: int,
-    tensor_parallel_rank: int,
+    _tensor_parallel_rank: int,
 ):
     """Test creating NCCL window tensors."""
     # Convert dtype string back to torch.dtype
@@ -142,7 +142,7 @@ def run_window_tensor_multiple_test(
     shape: tuple,
     dtype_str: str,
     tensor_parallel_size: int,
-    tensor_parallel_rank: int,
+    _tensor_parallel_rank: int,
     num_tensors: int,
 ):
     """Test creating multiple NCCL window tensors."""
@@ -187,7 +187,7 @@ def run_window_tensor_different_shapes_test(
     shapes: list,
     dtype_str: str,
     tensor_parallel_size: int,
-    tensor_parallel_rank: int,
+    _tensor_parallel_rank: int,
 ):
     """Test creating NCCL window tensors with different shapes."""
     # Convert dtype string back to torch.dtype
@@ -223,7 +223,7 @@ def run_window_tensor_operations_test(
     shape: tuple,
     dtype_str: str,
     tensor_parallel_size: int,
-    tensor_parallel_rank: int,
+    _tensor_parallel_rank: int,
 ):
     """Test NCCL window tensors with basic PyTorch operations."""
     # Convert dtype string back to torch.dtype
@@ -383,7 +383,8 @@ def test_create_window_tensor(mpi_pool_executor, shape, dtype_str):
                     None,
                 )
             ]
-            * tensor_parallel_size
+            * tensor_parallel_size,
+            strict=True,
         ),
     )
     for r in results:
@@ -415,7 +416,8 @@ def test_create_multiple_window_tensors(mpi_pool_executor, shape, dtype_str, num
                     num_tensors,
                 )
             ]
-            * tensor_parallel_size
+            * tensor_parallel_size,
+            strict=True,
         ),
     )
     for r in results:
@@ -445,7 +447,8 @@ def test_window_tensor_operations(mpi_pool_executor, shape, dtype_str):
                     None,
                 )
             ]
-            * tensor_parallel_size
+            * tensor_parallel_size,
+            strict=True,
         ),
     )
     for r in results:
@@ -475,7 +478,8 @@ def test_window_tensor_allreduce(mpi_pool_executor, shape, dtype_str):
                     None,
                 )
             ]
-            * tensor_parallel_size
+            * tensor_parallel_size,
+            strict=True,
         ),
     )
     for r in results:
@@ -505,7 +509,8 @@ def test_create_window_tensors_different_shapes(mpi_pool_executor, dtype_str):
                     None,
                 )
             ]
-            * tensor_parallel_size
+            * tensor_parallel_size,
+            strict=True,
         ),
     )
     for r in results:
