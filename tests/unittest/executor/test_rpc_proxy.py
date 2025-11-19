@@ -3,10 +3,9 @@ import sys
 import time
 
 import pytest
-from test_base_worker import create_fake_executor_config
 
 from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, TorchLlmArgs
 from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.sampling_params import SamplingParams
@@ -23,9 +22,12 @@ model_path = llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 class TestRpcProxy:
 
     def create_proxy(self, tp_size: int):
-        # Create executor config with the correct tp_size
-        llm_args, executor_config = create_fake_executor_config(model_path,
-                                                                tp_size=tp_size)
+        llm_args = TorchLlmArgs(
+            model=model_path,
+            tensor_parallel_size=tp_size,
+            backend='pytorch',
+            enable_iter_perf_stats=True,
+        )
 
         # Enable KV cache events
         llm_args.kv_cache_config = KvCacheConfig(
