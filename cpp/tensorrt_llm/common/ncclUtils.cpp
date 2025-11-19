@@ -157,12 +157,12 @@ void NCCLHelper::loadNCCLLibrary()
         char const* libraryNames[] = {"libnccl.so"};
 #endif
 
-        for (int i = 0; libraryNames[i] != nullptr; ++i)
+        for (auto const* name : libraryNames)
         {
-            mLibraryHandle = loadLibraryHandle(libraryNames[i]);
+            mLibraryHandle = loadLibraryHandle(name);
             if (mLibraryHandle)
             {
-                TLLM_LOG_INFO("Successfully loaded NCCL library: %s", libraryNames[i]);
+                TLLM_LOG_INFO("Successfully loaded NCCL library: %s", name);
                 break;
             }
         }
@@ -184,13 +184,19 @@ void NCCLHelper::loadNCCLLibrary()
             TLLM_LOG_WARNING("Failed to load ncclCommWindowRegister symbol, NCCL symmetric will not be supported.");
         }
 
-        if (mNCCLMemAlloc)
+        if (mNCCLMemAlloc == nullptr)
+        {
+            TLLM_LOG_WARNING("Failed to load ncclMemAlloc symbol, NCCL symmetric will not be supported.");
+        }
+
+        if (mNCCLCommWindowRegister != nullptr && mNCCLMemAlloc != nullptr)
         {
             mIsLoaded = true;
         }
         else
         {
-            TLLM_LOG_WARNING("Failed to load required NCCL symbols");
+            TLLM_LOG_WARNING(
+                "Failed to load required NCCL symbols (both ncclCommWindowRegister and ncclMemAlloc are required)");
         }
     }
     catch (std::exception const& e)
@@ -401,6 +407,17 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm,
 
     auto ncclMemAllocFunc = ncclHelper.getNCCLMemAlloc();
     auto ncclCommWindowRegisterFunc = ncclHelper.getNCCLCommWindowRegister();
+
+    // Defensive checks: both function pointers must be non-null
+    if (ncclMemAllocFunc == nullptr)
+    {
+        TLLM_THROW("ncclMemAlloc function pointer is null, cannot allocate NCCL window buffer");
+    }
+
+    if (ncclCommWindowRegisterFunc == nullptr)
+    {
+        TLLM_THROW("ncclCommWindowRegister function pointer is null, cannot register NCCL window buffer");
+    }
 
     // Allocate device memory using ncclMemAlloc
     ncclResult_t allocResult = ncclMemAllocFunc(&buffer.ptr, size);

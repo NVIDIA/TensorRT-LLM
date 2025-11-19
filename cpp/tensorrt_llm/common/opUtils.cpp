@@ -113,21 +113,30 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
     std::shared_ptr<ncclComm_t> ncclComm(new ncclComm_t,
         [](ncclComm_t* comm)
         {
-            if (comm && *comm)
+            if (!comm)
             {
-                // STEP 1: Clean up all registered resources FIRST
+                return;
+            }
+
+            // STEP 1: Clean up resources and destroy NCCL communicator if it's valid
+            if (*comm)
+            {
+                // Clean up all registered resources FIRST
                 tensorrt_llm::common::nccl_util::NcclCommResourceManager::getInstance().cleanupResources(*comm);
 
-                // STEP 2: Now destroy the NCCL communicator
+                // Now destroy the NCCL communicator
                 ncclResult_t result = ncclCommDestroy(*comm);
                 if (result != ncclSuccess)
                 {
                     TLLM_LOG_WARNING("ncclCommDestroy failed with error: %d", result);
                 }
 
-                // STEP 3: Free the memory
-                delete comm;
+                // Clear the communicator value before freeing the pointer
+                *comm = nullptr;
             }
+
+            // STEP 2: Always free the pointer memory (regardless of whether *comm was valid)
+            delete comm;
         });
 #if defined(_WIN32)
     // Need static connection initialization for accurate KV cache size estimation
