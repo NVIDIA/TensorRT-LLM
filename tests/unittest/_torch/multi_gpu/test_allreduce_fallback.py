@@ -41,6 +41,20 @@ pytestmark = pytest.mark.threadleak(enabled=False)
 # ============================================================================
 
 
+def _create_nccl_window_tensor(group, shape, dtype):
+    """Wrapper to create NCCL window tensor - WAR for pickle error.
+
+    This wrapper function avoids pickling torch.ops by accessing it dynamically
+    inside the function rather than storing references.
+    """
+    # Import torch locally to avoid module-level references
+    import torch as _torch
+
+    # Access ops dynamically
+    func = getattr(getattr(_torch, "ops"), "trtllm").create_nccl_window_tensor
+    return func(group, shape, dtype)
+
+
 def run_single_rank_test(tensor_parallel_size, test_func, *args):
     """Wrapper to run a test function on a single rank.
 
@@ -99,8 +113,8 @@ def run_window_tensor_creation_test(
     # Create group list for window tensor creation
     group = list(range(tensor_parallel_size))
 
-    # Create window tensor
-    window_tensor = torch.ops.trtllm.create_nccl_window_tensor(group, shape, dtype)
+    # Create window tensor - use wrapper function to avoid pickling torch.ops
+    window_tensor = _create_nccl_window_tensor(group, shape, dtype)
 
     # Verify tensor properties
     assert window_tensor.shape == shape, f"Shape mismatch: {window_tensor.shape} vs {shape}"
