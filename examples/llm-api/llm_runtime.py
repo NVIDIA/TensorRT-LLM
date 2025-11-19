@@ -48,15 +48,29 @@ def example_cuda_graph_config():
 
 
 def example_kv_cache_config():
+    """
+    Example demonstrating KV cache configuration for memory management and performance.
+
+    KV cache configuration helps with:
+    - Controlling GPU memory allocation for key-value cache
+    - Enabling block reuse to optimize memory usage for shared prefixes
+    - Balancing memory usage between model weights and cache storage
+
+    Please refer to the api reference for more details.
+    """
+
     print("\n=== KV Cache Configuration Example ===")
     print("\n1. KV Cache Configuration:")
 
-    llm_advanced = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-                       max_batch_size=8,
-                       max_seq_len=1024,
-                       kv_cache_config=KvCacheConfig(
-                           free_gpu_memory_fraction=0.5,
-                           enable_block_reuse=True))
+    llm_advanced = LLM(
+        model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        max_batch_size=8,
+        max_seq_len=1024,
+        kv_cache_config=KvCacheConfig(
+            # free_gpu_memory_fraction: the fraction of free GPU memory to allocate to the KV cache
+            free_gpu_memory_fraction=0.5,
+            # enable_block_reuse: whether to enable block reuse
+            enable_block_reuse=True))
 
     prompts = [
         "Hello, my name is",
