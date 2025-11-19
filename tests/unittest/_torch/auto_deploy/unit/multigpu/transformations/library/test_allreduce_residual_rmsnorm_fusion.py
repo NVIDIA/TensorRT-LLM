@@ -5,8 +5,8 @@ import torch
 from _dist_test_utils import get_device_counts
 from torch.export import export
 
+from tensorrt_llm._torch.auto_deploy.custom_ops.trtllm_dist import is_trtllm_op_available
 from tensorrt_llm._torch.auto_deploy.distributed import common as dist
-from tensorrt_llm._torch.auto_deploy.distributed.trtllm import is_trtllm_op_available
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
@@ -94,7 +94,7 @@ def _test_allreduce_fusion(port: int, ModuleCls):
     # Check if fused node in the graph
     has_fused_node = False
     for node in gm_transformed.graph.nodes:
-        if is_op(node, torch.ops.dist.fused_allreduce_residual_rmsnorm):
+        if is_op(node, torch.ops.dist.trtllm_fused_allreduce_residual_rmsnorm):
             has_fused_node = True
     assert has_fused_node, "Fused node not found."
 

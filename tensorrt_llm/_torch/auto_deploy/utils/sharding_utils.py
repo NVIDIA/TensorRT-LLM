@@ -58,6 +58,47 @@ def validate_allreduce_strategy(v):
     if isinstance(v, int):
         return AllReduceStrategy(v)
     return v  # Let Pydantic handle other types
+def _get_dist_ops(backend: str):
+    """Get the appropriate distributed ops based on backend availability.
+
+    Args:
+        backend: The distributed backend to use. Can be 'auto', 'trtllm', or 'torch'.
+                 'auto' will automatically select based on availability.
+
+    Returns tuple of (all_gather_op, all_reduce_op) for the current backend.
+    """
+    from ..custom_ops.trtllm_dist import is_trtllm_op_available
+
+    # Handle DistBackend enum or string
+    if hasattr(backend, "value"):
+        backend = backend.value
+
+    if backend == "trtllm":
+        # Force TRT-LLM ops
+        return (
+            torch.ops.auto_deploy.trtllm_dist_all_gather.default,
+            torch.ops.auto_deploy.trtllm_dist_all_reduce.default,
+        )
+    elif backend == "torch":
+        # Force PyTorch distributed ops
+        return (
+            torch.ops.auto_deploy.torch_dist_all_gather.default,
+            torch.ops.auto_deploy.torch_dist_all_reduce.default,
+        )
+    else:  # auto
+        # Automatically select based on availability
+        if is_trtllm_op_available():
+            # Use TRT-LLM optimized ops in MPI mode
+            return (
+                torch.ops.auto_deploy.trtllm_dist_all_gather.default,
+                torch.ops.auto_deploy.trtllm_dist_all_reduce.default,
+            )
+        else:
+            # Use PyTorch distributed ops in demollm mode
+            return (
+                torch.ops.auto_deploy.torch_dist_all_gather.default,
+                torch.ops.auto_deploy.torch_dist_all_reduce.default,
+            )
 
 
 def _load_hook(
@@ -262,6 +303,7 @@ def _insert_sharded_mamba(
     rank: int,
     world_size: int,
     allreduce_strategy: AllReduceStrategy,
+    dist_backend: str,
     add_dist: bool = False,
     min_local_shape: int = 1,
     weights_to_shard: Optional[list[str]] = None,
@@ -376,6 +418,7 @@ def _insert_sharded_mamba(
         dim=SplitDimension.COLUMN,
         rank=rank,
         world_size=world_size,
+        dist_backend=dist_backend,
         add_dist=False,
         min_local_shape=min_local_shape,
         fused_weight_dims=entry_fused_dims,
@@ -441,6 +484,7 @@ def _shard_parameter_node(
     rank: int,
     world_size: int,
     allreduce_strategy: AllReduceStrategy,
+    dist_backend: str,
     add_dist: bool = False,
     min_local_shape: int = 1,
     fused_weight_dims: Optional[list] = None,
@@ -531,15 +575,13 @@ def _shard_parameter_node(
             )
         return
 
-    # figure out the right dist op
-    if dim == 0:
-        # Column split -> all_gather
-        fn_dist = torch.ops.auto_deploy.torch_dist_all_gather.default
-        dist_args = (node, -1)
-    else:
-        # Row split -> all_reduce with strategy
-        fn_dist = torch.ops.auto_deploy.torch_dist_all_reduce.default
-        dist_args = (node, allreduce_strategy.name)
+    # figure out the right dist op (backend-aware)
+    all_gather_op, all_reduce_op = _get_dist_ops(dist_backend)
+    dist_lookup = {
+        0: (all_gather_op, -1),
+        1: (all_reduce_op, allreduce_strategy.name),
+    }
+    fn_dist, *dist_args = dist_lookup[dim]
 
     # add reduction node
     with gm.graph.inserting_after(node):
@@ -627,6 +669,7 @@ class WeightShardingInfo(ShardingTransformInfo):
     # used for TP sharding of fused weights
     fused_weight_dims: Optional[list] = None
     allreduce_strategy: Optional[AllReduceStrategy] = None  # Set by ShardingConfig.add() if None
+    dist_backend: str = "auto"
 
     def quantization_cb(
         self,
@@ -676,6 +719,7 @@ class WeightShardingInfo(ShardingTransformInfo):
                 dim=self.split_dim.value,
                 rank=self.rank,
                 world_size=self.world_size,
+                dist_backend=self.dist_backend,
                 add_dist=self.dist_op is not None,
                 min_local_shape=self.min_local_shape,
                 fused_weight_dims=self.fused_weight_dims
@@ -691,6 +735,7 @@ class WeightShardingInfo(ShardingTransformInfo):
                 dim=self.split_dim.value,
                 rank=self.rank,
                 world_size=self.world_size,
+                dist_backend=self.dist_backend,
                 add_dist=self.dist_op is not None,
                 min_local_shape=self.min_local_shape,
                 fused_weight_dims=self.fused_weight_dims,
@@ -891,6 +936,7 @@ class BMMShardingInfo(ShardingTransformInfo):
     world_size: int
     start_idx: int
     end_idx: int
+    dist_backend: str = "auto"
 
     def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
         """Validate the transformation configuration."""
@@ -912,7 +958,8 @@ class BMMShardingInfo(ShardingTransformInfo):
         # Check if the distribution is balanced
         remainder = bmm_batch_size % self.world_size
 
-        # NOTE: our torch.ops.auto_deploy.torch_dist_all_gather doesn't support uneven splits at the moment.
+        # NOTE: our torch.ops.auto_deploy.torch_dist_all_gather/trtllm_dist_all_gather
+        #  doesn't support uneven splits at the moment.
         if remainder:
             ad_logger.warning(
                 f"BMM batch size {bmm_batch_size} is not divisible by world size {self.world_size}. "
@@ -977,9 +1024,10 @@ class BMMShardingInfo(ShardingTransformInfo):
         handle_tensor(node, rhs_tensor, 1, self.start_idx, self.end_idx)
 
         # Add all_gather node after BMM to collect results
+        all_gather_op, _ = _get_dist_ops(self.dist_backend)
         with gm.graph.inserting_after(node):
             gather_node = gm.graph.call_function(
-                torch.ops.auto_deploy.torch_dist_all_gather.default,
+                all_gather_op,
                 args=(node, 0),  # Gather along batch dimension (0)
             )
             node.replace_all_uses_with(gather_node)
@@ -992,6 +1040,7 @@ def _insert_sharded_moe(
     rank: int,
     world_size: int,
     allreduce_strategy: AllReduceStrategy,
+    dist_backend: str,
     scale_names: Sequence[str] = (),
 ):
     """Update the torch_moe node with sharded weight lists,
@@ -1070,11 +1119,9 @@ def _insert_sharded_moe(
     node.args = tuple(args)
 
     # -- add an all_reduce node --
+    _, all_reduce_op = _get_dist_ops(dist_backend)
     with gm.graph.inserting_after(node):
-        dist_node = gm.graph.call_function(
-            torch.ops.auto_deploy.torch_dist_all_reduce.default,
-            args=(node, allreduce_strategy.name),
-        )
+        dist_node = gm.graph.call_function(all_reduce_op, args=(node, allreduce_strategy.name))
         node.replace_all_uses_with(dist_node)
         dist_node.replace_input_with(dist_node, node)
 
@@ -1103,11 +1150,12 @@ def _insert_sharded_mxfp4_mlp_ep(
     rank: int,
     world_size: int,
     allreduce_strategy: AllReduceStrategy,
+    dist_backend: str,
 ):
     """Transform a call to auto_deploy::triton_mxfp4_moe into:
       - sharded expert parameters along dim 0 (this rank slice),
       - call to auto_deploy::triton_mxfp4_moe_ep(..., local_lo, local_hi),
-      - followed by torch_dist_all_reduce.
+      - followed by torch_dist_all_reduce/trtllm_dist_all_reduce.
 
     NOTE: allreduce_strategy is MANDATORY and must be explicitly provided.
 
@@ -1149,10 +1197,9 @@ def _insert_sharded_mxfp4_mlp_ep(
     node.args = args_ep
 
     # Add a dist all-reduce after the op (sum partial results across EP ranks)
+    _, all_reduce_op = _get_dist_ops(dist_backend)
     with gm.graph.inserting_after(node):
-        red = gm.graph.call_function(
-            torch.ops.auto_deploy.torch_dist_all_reduce, args=(node, allreduce_strategy.name)
-        )
+        red = gm.graph.call_function(all_reduce_op, args=(node, allreduce_strategy.name))
         node.replace_all_uses_with(red)
         # keep dataflow: red(input=node)
         red.replace_input_with(red, node)
@@ -1166,6 +1213,7 @@ class EPShardingInfo(ShardingTransformInfo):
     """
 
     allreduce_strategy: Optional[AllReduceStrategy] = None  # Set by ShardingConfig.add() if None
+    dist_backend: str = "auto"
 
     @classmethod
     def from_node(cls, node: Node, **kwargs) -> "EPShardingInfo":
@@ -1184,7 +1232,7 @@ class EPShardingInfo(ShardingTransformInfo):
 
     def apply(self, gm: GraphModule, node: Node) -> None:
         """Apply EP sharding transformation to the graph module."""
-        _insert_sharded_moe(gm, node, self.rank, self.world_size, self.allreduce_strategy, [])
+        _insert_sharded_moe(gm, node, self.rank, self.world_size, self.allreduce_strategy, self.dist_backend, [])
 
 
 class MXFP4EPShardingInfo(EPShardingInfo):
@@ -1198,7 +1246,7 @@ class MXFP4EPShardingInfo(EPShardingInfo):
         return True
 
     def apply(self, gm: GraphModule, node: Node) -> None:
-        _insert_sharded_mxfp4_mlp_ep(gm, node, self.rank, self.world_size, self.allreduce_strategy)
+        _insert_sharded_mxfp4_mlp_ep(gm, node, self.rank, self.world_size, self.allreduce_strategy, self.dist_backend)
 
 
 class FP8EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
@@ -1215,7 +1263,7 @@ class FP8EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
 
     def apply(self, gm: GraphModule, node: Node) -> None:
         _insert_sharded_moe(
-            gm, node, self.rank, self.world_size, self.allreduce_strategy, self.scale_names()
+            gm, node, self.rank, self.world_size, self.allreduce_strategy, self.dist_backend, self.scale_names()
         )
 
 
@@ -1233,7 +1281,7 @@ class NVFP4EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
 
     def apply(self, gm: GraphModule, node: Node) -> None:
         _insert_sharded_moe(
-            gm, node, self.rank, self.world_size, self.allreduce_strategy, self.scale_names()
+            gm, node, self.rank, self.world_size, self.allreduce_strategy, self.dist_backend, self.scale_names()
         )
 
 
@@ -1272,6 +1320,14 @@ class ShardingDim(Enum):
     BMM = "bmm"
 
 
+class DistBackend(Enum):
+    """Enum for distributed backend."""
+
+    AUTO = "auto"
+    TRTLLM = "trtllm"
+    TORCH = "torch"
+
+
 class ShardingConfig(BaseModel):
     """Configuration for sharding the model."""
 
@@ -1292,6 +1348,7 @@ class ShardingConfig(BaseModel):
         description="AllReduce strategy for distributed operations. "
         "Options: AUTO, NCCL, ONESHOT, TWOSHOT, MIN_LATENCY, LOWPRECISION, UB, MNNVL, NCCL_SYMMETRIC, SYMM_MEM",
     )
+    dist_backend: DistBackend = Field(default=DistBackend.AUTO)
     weight_sharding_transforms: List[WeightShardingInfo] = Field(default_factory=list)
     parameter_update_transforms: List[ParameterUpdateInfo] = Field(default_factory=list)
     bmm_transforms: List[BMMShardingInfo] = Field(default_factory=list)
