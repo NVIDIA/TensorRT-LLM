@@ -120,7 +120,7 @@ class Starcoder2DecoderLayer(DecoderLayer):
                 config=model_config,
             )
         else:
-            raise ValueError(f"Unsupported mlp_type: {config.mlp_type}")
+            raise ValueError(f"Unsupported mlp_type: {config.mlp_type}. Only default (linear) MLP is supported.")
 
         norm_eps = getattr(config, "norm_epsilon", 1e-5)
         self.input_layernorm = LayerNorm(
@@ -218,8 +218,7 @@ class Starcoder2Model(DecoderModel):
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
-                "You cannot specify both input_ids and inputs_embeds at the same time, "
-                "and must specify either one"
+                "You must specify exactly one of input_ids or inputs_embeds."
             )
 
         if inputs_embeds is None:
