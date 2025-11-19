@@ -17,11 +17,14 @@ from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
 from ...utils import AuxStreamType, Fp4QuantizedTensor, ceil_div
 from .interface import AlltoallMethodType, MoE, MoEWeightLoadingMode
+
+# isort: off
 from .quantization import (
     DeepSeekFP8BlockScalesFusedMoEMethod, NVFP4TRTLLMGenFusedMoEMethod,
     UnquantizedFusedMoEMethod, W4A8MXFP4FP8TRTLLMGenFusedMoEMethod,
     W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod, W4A8NVFP4FP8TRTLLMGenFusedMoEMethod,
     W4A16MXFP4TRTLLMGenFusedMoEMethod)
+# isort: on
 from .routing import BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod
 
 
