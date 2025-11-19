@@ -28,12 +28,12 @@ NP=4 ./mpi_launch.sh ./run_single.sh config_ctx.yaml --model deepseek-ai/DeepSee
 NP=4 ./mpi_launch.sh ./run_single.sh config_gen.yaml --model deepseek-ai/DeepSeek-V3.2-Exp --tokens-per-block 64 --max-seq-len $((32768 + 1024 + 4)) --moe-backend DEEPGEMM --seq-len-kv-cache 32769
 
 # Run with attention TP
-NP=4 ./mpi_launch.sh ./run_single.sh config_gen.yaml --no-enable-attention-dp
 NP=4 ./mpi_launch.sh ./run_single.sh config_ctx.yaml --no-enable-attention-dp
+NP=4 ./mpi_launch.sh ./run_single.sh config_gen.yaml --no-enable-attention-dp
 
 # Run with attention TP and TRTLLMGen
-NP=4 TRTLLM_ENABLE_PDL=1 ./mpi_launch.sh ./run_single.sh config_ctx.yaml --no-enable-attention-dp --moe-backend TRTLLM
-NP=4 TRTLLM_ENABLE_PDL=1 ./mpi_launch.sh ./run_single.sh config_gen.yaml --no-enable-attention-dp --moe-backend TRTLLM
+NP=4 ./mpi_launch.sh -x TRTLLM_ENABLE_PDL=1 ./run_single.sh config_ctx.yaml --no-enable-attention-dp --moe-backend TRTLLM
+NP=4 ./mpi_launch.sh -x TRTLLM_ENABLE_PDL=1 ./run_single.sh config_gen.yaml --no-enable-attention-dp --moe-backend TRTLLM
 
 # Run with MTP3
 NP=4 ./mpi_launch.sh ./run_single.sh config_gen.yaml --batch-size 32 --seq-len-q 4
@@ -49,17 +49,19 @@ NP=4 ./mpi_launch.sh ./run_single.sh config_gen.yaml --scaled-from 16 --moe-back
 NP=4 ./mpi_launch.sh ./run_single.sh config_gen.yaml --scaled-from 16 --no-enable-attention-dp
 
 # Run Qwen3-Next (balanced routing is not implemented)
-NP=2 TRTLLM_ENABLE_PDL=1 ./mpi_launch.sh ./run_single.sh config_ctx.yaml --model Qwen/Qwen3-Next-80B-A3B-Instruct --layer-indices 6,7 --no-enable-attention-dp --moe-backend TRTLLM --balance-method NotModified
-NP=2 TRTLLM_ENABLE_PDL=1 ./mpi_launch.sh ./run_single.sh config_gen.yaml --model Qwen/Qwen3-Next-80B-A3B-Instruct --layer-indices 6,7 --no-enable-attention-dp --moe-backend TRTLLM --balance-method NotModified
+NP=2 ./mpi_launch.sh -x TRTLLM_ENABLE_PDL=1 ./run_single.sh config_ctx.yaml --model Qwen/Qwen3-Next-80B-A3B-Instruct --layer-indices 6,7 --no-enable-attention-dp --moe-backend TRTLLM --batch-size 4 --balance-method NotModified
+NP=2 ./mpi_launch.sh -x TRTLLM_ENABLE_PDL=1 ./run_single.sh config_gen.yaml --model Qwen/Qwen3-Next-80B-A3B-Instruct --layer-indices 6,7 --no-enable-attention-dp --moe-backend TRTLLM --batch-size 512 --balance-method NotModified
 
 # Run with DeepEP A2A
-NP=4 TRTLLM_FORCE_ALLTOALL_METHOD=DeepEP ./mpi_launch.sh ./run_single.sh config_ctx.yaml --moe-backend WIDEEP
-NP=4 TRTLLM_FORCE_ALLTOALL_METHOD=DeepEP ./mpi_launch.sh ./run_single.sh config_gen.yaml --moe-backend WIDEEP
+NP=4 ./mpi_launch.sh -x TRTLLM_FORCE_ALLTOALL_METHOD=DeepEP ./run_single.sh config_ctx.yaml --moe-backend WIDEEP
+NP=4 ./mpi_launch.sh -x TRTLLM_FORCE_ALLTOALL_METHOD=DeepEP ./run_single.sh config_gen.yaml --moe-backend WIDEEP
 ```
 
 ### Run with Slurm
 
-> Tips: If you have a running job with environment installed, please skip step 1 and 2 and go straight to step 3. In this case, your job must be run with `--container-name aaa`, and if the container name is not "layer_wise_benchmarks" please `export CONTAINER_NAME=aaa`.
+> Tips:
+> 1. If you have a running Slurm job, please skip step 1 and go straight to step 2 and 3.
+> 2. Further, if you have installed `tensorrt_llm` in the Slurm job, you can also skip step 2 and run step 3 with `export CONTAINER_NAME=aaa` specified. If you don't know the container name, run `export CONTAINER_NAME=$(SLURM_JOB_ID=$SLURM_JOB_ID ./slurm_query_container_name.sh)` to get it.
 
 **Step 1:** On the controller node, allocate one or multiple nodes, and record the `SLURM_JOB_ID`:
 
@@ -76,6 +78,8 @@ SLURM_JOB_ID=$SLURM_JOB_ID ./slurm_init_containers.sh
 ```
 
 It uses the image recorded in `../../jenkins/current_image_tags.properties`. The image will be downloaded to `../../enroot/` for once.
+
+> Tips: If you want to change the image, no need to reallocate Slurm jobs. Just start another container by running step 2 with `export CONTAINER_NAME=aaa`, and step 3 will run in the container specified by the `CONTAINER_NAME` env.
 
 **Step 3:** Run benchmarks to generate profiles. Run the following command on the controller node, where `NODES` &le; the number of allocated nodes:
 
