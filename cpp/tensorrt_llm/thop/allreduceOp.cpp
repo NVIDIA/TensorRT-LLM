@@ -475,7 +475,7 @@ private:
         double const b = 156716.52177552;
         int nRanks;
         NCCLCHECK_THROW(ncclCommCount(comm, &nRanks));
-        size_t min_registration_threshold = (a * nRanks + b) * input.element_size();
+        size_t min_registration_threshold = static_cast<size_t>(std::max(0.0, a * nRanks + b)) * input.element_size();
         char const* env_threshold = std::getenv("TLLM_NCCL_MIN_REGISTRATION");
         if (env_threshold != nullptr)
         {
@@ -1032,12 +1032,11 @@ private:
             return tensorrt_llm::utils::customAllReduceUtils::selectStrategyLookUpTable(
                 seq_len, hidden_size, mOp, mGroup.size());
         }
-        return AllReduceStrategyType::NCCL_SYMMETRIC;
     }
 
     bool ifFallbackToNCCL(size_t seq_len, size_t message_size_bytes, size_t max_workspace_size)
     {
-        // If messageSize is less than maxWorkspaceSize, use NCCL_SYMMETRIC, regardless of the fusion type.
+        // If messageSize is greater than maxWorkspaceSize or topology is unsuitable, use NCCL_SYMMETRIC fallback.
         if (message_size_bytes > max_workspace_size || !mIsP2PSupported || !mIsNVLINKSupported)
         {
             return true;
