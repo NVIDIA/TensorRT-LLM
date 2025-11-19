@@ -1043,13 +1043,27 @@ class PyExecutor:
 
         if self.drafter is not None:
             # Honor permanent disable flag based on rolling acceptance first
-            if getattr(self, 'speculation_permanently_disabled', False):
+            if self.drafter.draft_len_schedule is not None:
+                batch_size_input = len(self.active_requests)
+
+                self.max_total_draft_tokens = self.drafter.get_draft_len_for_batch_size(
+                    batch_size_input)
+
+                self.drafter.update_max_total_draft_tokens(
+                    self.max_total_draft_tokens)
+
+            # Check if draft_len=0 → immediately disable
+            # self.max_total_draft_tokens==0 is only possible when draft_len_schedule is provided
+            # for example, draft_len_schedule = {1:4, 4:2, 8:0}, batch_size >= 8 will set self.max_draft_len = 0
+            if self.drafter.draft_len_schedule is not None and self.max_total_draft_tokens == 0:
+                self.use_spec_decode = False
+            elif getattr(self, 'speculation_permanently_disabled', False):
                 self.use_spec_decode = False
             else:
                 self.use_spec_decode = self.drafter.should_use_spec_decode(
                     self.active_requests, self.max_batch_size,
                     self.model_engine.max_num_tokens,
-                    self.model_engine.spec_config.max_total_draft_tokens)
+                    self.max_total_draft_tokens)
             logger.debug(f"Use spec decode: {self.use_spec_decode}")
             self.model_engine.enable_spec_decode = self.use_spec_decode
 
@@ -1059,10 +1073,9 @@ class PyExecutor:
                         LlmRequestState.GENERATION_IN_PROGRESS,
                         LlmRequestState.DISAGG_GENERATION_INIT):
                     continue
-                max_total_draft_tokens = self.model_engine.spec_config.max_total_draft_tokens
                 request.draft_tokens = [
                     0
-                ] * max_total_draft_tokens if max_total_draft_tokens > 0 else []
+                ] * self.max_total_draft_tokens if self.max_total_draft_tokens > 0 else []
 
             # If speculation is off, this function sets py_draft_tokens to []
             # for all active requests. If it's on, we initialize py_draft_tokens
@@ -1256,11 +1269,10 @@ class PyExecutor:
                     continue
 
                 req.py_last_draft_tokens = req.py_draft_tokens
-                max_total_draft_tokens = self.model_engine.spec_config.max_total_draft_tokens
 
-                if max_total_draft_tokens > 0 and self.use_spec_decode and not req.py_disable_speculative_decoding:
-                    req.py_draft_tokens = [0] * max_total_draft_tokens
-                    req.py_draft_pages_allocated = max_total_draft_tokens
+                if self.max_total_draft_tokens > 0 and self.use_spec_decode and not req.py_disable_speculative_decoding:
+                    req.py_draft_tokens = [0] * self.max_total_draft_tokens
+                    req.py_draft_pages_allocated = self.max_total_draft_tokens
                 else:
                     req.py_draft_tokens = []
                     req.py_draft_pages_allocated = 0

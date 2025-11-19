@@ -63,8 +63,6 @@ class ModelDrafter(Drafter):
         spec_resource_manager: Optional[BaseResourceManager] = None,
         guided_decoder: Optional[GuidedDecoder] = None,
     ):
-        super().__init__(spec_config.max_concurrency)
-
         # Validate required parameters
         if draft_model_engine is None:
             raise ValueError("draft_model_engine cannot be None")
@@ -74,6 +72,11 @@ class ModelDrafter(Drafter):
             raise ValueError("max_total_draft_tokens must be >= 0")
         assert max_draft_len <= max_total_draft_tokens
 
+        super().__init__(max_draft_len=max_draft_len,
+                         max_total_draft_tokens=max_total_draft_tokens,
+                         max_concurrency=spec_config.max_concurrency,
+                         draft_len_schedule=spec_config.draft_len_schedule)
+
         # Model and resource management
         self.draft_model_engine = draft_model_engine
         self.draft_seq_slot_manager = draft_seq_slot_manager
@@ -82,8 +85,7 @@ class ModelDrafter(Drafter):
 
         # Configuration
         self.spec_config = spec_config
-        self.max_draft_len = max_draft_len
-        self.max_total_draft_tokens = max_total_draft_tokens
+
         # Sampling
         self.sampler = sampler
         self.guided_decoder = guided_decoder
@@ -93,6 +95,7 @@ class ModelDrafter(Drafter):
             # TODO: enable sampling/guided decoding on static draft loop
             assert guided_decoder is None
             assert spec_config._allow_greedy_draft_tokens
+            assert spec_config.draft_len_schedule is None
 
         # Create accumulator for draft tokens in non-CDL mode
         self.draft_tokens_accumulator: Dict[int, List[int]] = {}

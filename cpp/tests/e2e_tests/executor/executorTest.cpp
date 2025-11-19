@@ -2459,6 +2459,7 @@ void doTokenComparisonChangeBeamWidth(bool enableReuse, SizeType32 maxWaitMs)
 
     for (SizeType32 beamWidth : {1, 2})
     {
+        TLLM_LOG_INFO("Running beam width: %d", beamWidth);
         BeamResult beamResult{beamWidth};
         auto const resultsPath
             = GPT_DATA_PATH / ((beamWidth == 1) ? "sampling" : "beam_search_" + std::to_string(beamWidth));
@@ -2466,8 +2467,10 @@ void doTokenComparisonChangeBeamWidth(bool enableReuse, SizeType32 maxWaitMs)
         beamResult.contextLogitsFile = resultsPath / PathUtil::FP16_PLUGIN_PACKED_PAGED_CONTEXT_LOGITS_FILE();
         beamResult.genLogitsFile = resultsPath / PathUtil::FP16_PLUGIN_PACKED_PAGED_GENERATION_LOGITS_FILE();
 
+        auto const numReturnSequences = beamWidth;
+
         runTest(executor, inputPath, modelIds, flakyTestInfo, streaming, vocabSizePadded, beamResult, outConfig,
-            isSpeculativeDecoding, maxWaitMs, false, 1, false, 1);
+            isSpeculativeDecoding, maxWaitMs, false, numReturnSequences, false, 1);
     }
 }
 

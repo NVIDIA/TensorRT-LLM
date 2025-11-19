@@ -49,7 +49,7 @@ export JAEGER_IP=$(docker inspect --format '{{ .NetworkSettings.IPAddress }}' ja
 export OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=grpc
 export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=grpc://$JAEGER_IP:4317
 export OTEL_EXPORTER_OTLP_TRACES_INSECURE=true
-export OTEL_SERVICE_NAME="trt-server"
+export OTEL_SERVICE_NAME="trtllm-server"
 ```
 
 Then run TensorRT-LLM with OpenTelemetry, and make sure to set `return_perf_metrics` to true in the model configuration:
@@ -61,7 +61,7 @@ trtllm-serve models/Qwen3-8B/ --otlp_traces_endpoint="$OTEL_EXPORTER_OTLP_TRACES
 ## Send requests and find traces in Jaeger
 
 You can send a request to the server and view the traces in [Jaeger UI](http://localhost:16686/).
-The traces should be visible under the service name "trt-server".
+The traces should be visible under the service name "trtllm-server".
 
 ## Configuration for Disaggregated Serving
 
