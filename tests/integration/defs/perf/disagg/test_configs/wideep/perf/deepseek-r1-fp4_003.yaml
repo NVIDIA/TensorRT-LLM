@@ -21,7 +21,7 @@ benchmark:
   use_nv_sa_benchmark: false
   multi_round: 8
   benchmark_ratio: 0.8
-  streaming: false
+  streaming: true
   concurrency_list: '1075'
 hardware:
   gpus_per_node: 4

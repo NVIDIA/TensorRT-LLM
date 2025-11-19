@@ -81,9 +81,6 @@ worker_config:
       backend: NIXL
     stream_interval: 20
     num_postprocess_workers: 4
-    speculative_config:
-      decoding_type: MTP
-      num_nextn_predict_layers: 3
     allreduce_strategy: MNNVL
   ctx:
     max_batch_size: 4
@@ -103,6 +100,3 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 4608
       backend: NIXL
-    speculative_config:
-      decoding_type: MTP
-      num_nextn_predict_layers: 3
