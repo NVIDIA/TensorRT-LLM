@@ -723,7 +723,8 @@ class Indexer(nn.Module):
         self.rotary_emb = RotaryEmbedding(
             pos_embd_params.rope,
             head_dim=self.rope_dim,
-            is_neox=pos_embd_params.is_neox,
+            # RoPE in indexer is not interleaved
+            is_neox=True,
         )
 
         self.softmax_scale = self.head_dim**-0.5
