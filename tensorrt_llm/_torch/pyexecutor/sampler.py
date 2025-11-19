@@ -1849,7 +1849,6 @@ class TorchSampler(Sampler):
                 current_offset = next_offset
 
         # Perform sampling in batches
-
         batched_sampling_result = self._sample_batched_by_strategy(
             logits_cuda,
             requests,
