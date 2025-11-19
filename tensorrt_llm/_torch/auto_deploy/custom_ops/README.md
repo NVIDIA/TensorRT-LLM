@@ -43,5 +43,4 @@ The table below lists the operators ordered by their backend.
 | `torch.ops.auto_deploy.trtllm_dist_all_reduce` | Distributed all-reduce operation (TRT-LLM backend, MPI mode) |
 | `torch.ops.auto_deploy.trtllm_dist_fused_linear_all_reduce` | Fused linear layer followed by all-reduce (TRT-LLM backend, MPI mode) |
 | `torch.ops.auto_deploy.trtllm_dist_fused_fp8_linear_all_reduce` | Fused FP8 linear layer followed by all-reduce (TRT-LLM backend, MPI mode) |
-| `torch.ops.dist.torch_fused_allreduce_residual_rmsnorm` | Fused all-reduce + residual add + RMSNorm (PyTorch backend, demollm mode) |
 | `torch.ops.dist.trtllm_fused_allreduce_residual_rmsnorm` | Fused all-reduce + residual add + RMSNorm (TRT-LLM backend, MPI mode) |

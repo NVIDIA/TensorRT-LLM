@@ -78,45 +78,6 @@ except ImportError:
     TRTLLM_OP_AVAILABLE = False
 
 
-# PyTorch fallback fused op (atomic - always uses torch.distributed)
-# This is defined outside try-except so it's always available
-@torch.library.custom_op(
-    "dist::torch_fused_allreduce_residual_rmsnorm", mutates_args=(), device_types="cuda"
-)
-def torch_fused_allreduce_residual_rmsnorm(
-    tensor: torch.Tensor, residual: torch.Tensor, norm_weight: torch.Tensor, eps: float
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused allreduce + residual + rmsnorm using PyTorch operations (unfused).
-
-    This op uses separate PyTorch operations and is used in demollm mode.
-    """
-    from .common import all_reduce as torch_all_reduce
-
-    # 1. All-reduce the tensor
-    tensor_reduced = tensor.clone()
-    torch_all_reduce(tensor_reduced, op=ReduceOp.SUM)
-
-    # 2. Add residual
-    tensor_with_residual = tensor_reduced + residual
-
-    # 3. Apply RMSNorm using PyTorch's built-in function
-    norm_out = torch.nn.functional.rms_norm(
-        tensor_with_residual,
-        normalized_shape=(tensor_with_residual.size(-1),),
-        weight=norm_weight,
-        eps=eps,
-    )
-
-    return norm_out, tensor_with_residual
-
-
-@torch_fused_allreduce_residual_rmsnorm.register_fake
-def torch_fused_allreduce_residual_rmsnorm_fake(
-    tensor: torch.Tensor, residual: torch.Tensor, norm_weight: torch.Tensor, eps: float
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return torch.empty_like(tensor), torch.empty_like(tensor)
-
-
 def is_trtllm_op_available():
     """Check if TRT-LLM ops are available and running with MPI."""
     return TRTLLM_OP_AVAILABLE and is_ompi()
