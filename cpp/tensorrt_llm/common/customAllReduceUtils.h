@@ -81,7 +81,6 @@ inline AllReduceStrategyType SelectStrategyLP(size_t seq_len, size_t hidden_size
     {
         return AllReduceStrategyType::ONESHOT;
     }
-    return AllReduceStrategyType::NCCL_SYMMETRIC;
 }
 
 // use 1D vector to store the best strategy instead of a map for each sm version

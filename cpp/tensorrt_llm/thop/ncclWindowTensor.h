@@ -15,7 +15,6 @@
  */
 #pragma once
 
-#include "tensorrt_llm/common/ncclUtils.h"
 #include <torch/extension.h>
 #include <vector>
 
