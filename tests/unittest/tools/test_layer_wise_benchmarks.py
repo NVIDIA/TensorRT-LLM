@@ -14,7 +14,7 @@ def test_deepseek_r1_ctx_dep(llm_root, world_size):
     check_call(
         [
             "./mpi_launch.sh",
-            "./run_single.sh",
+            "./run.sh",
             "config_ctx.yaml",
             "--model",
             model_root / "DeepSeek-R1" / "DeepSeek-R1-0528-FP4-v2",
@@ -35,7 +35,7 @@ def test_deepseek_r1_ctx_tep(llm_root, world_size):
     check_call(
         [
             "./mpi_launch.sh",
-            "./run_single.sh",
+            "./run.sh",
             "config_ctx.yaml",
             "--model",
             model_root / "DeepSeek-R1" / "DeepSeek-R1-0528-FP4-v2",
@@ -59,7 +59,7 @@ def test_deepseek_v32_ctx_dep(llm_root, world_size):
     check_call(
         [
             "./mpi_launch.sh",
-            "./run_single.sh",
+            "./run.sh",
             "config_ctx.yaml",
             "--model",
             model_root / "DeepSeek-V3.2-Exp-hf",
@@ -82,7 +82,7 @@ def test_deepseek_r1_gen_scaled_from_16_dep(llm_root, world_size):
     check_call(
         [
             "./mpi_launch.sh",
-            "./run_single.sh",
+            "./run.sh",
             "config_gen.yaml",
             "--model",
             model_root / "DeepSeek-R1" / "DeepSeek-R1-0528-FP4-v2",
@@ -106,7 +106,7 @@ def test_qwen3_next_gen_tep(llm_root, world_size):
     check_call(
         [
             "./mpi_launch.sh",
-            "./run_single.sh",
+            "./run.sh",
             "config_gen.yaml",
             "--model",
             model_root / "Qwen3" / "Qwen3-Next-80B-A3B-Instruct",

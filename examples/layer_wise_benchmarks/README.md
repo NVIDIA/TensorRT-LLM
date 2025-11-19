@@ -2,7 +2,7 @@
 
 ## Generate profiles
 
-### Run with MPI
+### Run with OpenMPI
 
 **Step 1:** Start a container using Docker, Enroot or others. Please refer to `../../jenkins/current_image_tags.properties` for the Docker image URI.
 
@@ -16,45 +16,45 @@ pip install -e ../..
 
 ```bash
 # Run DeepSeek-R1 NVFP4
-NP=4 ./mpi_launch.sh ./run_single.sh config_ctx.yaml
-NP=4 ./mpi_launch.sh ./run_single.sh config_gen.yaml
+NP=4 ./mpi_launch.sh ./run.sh config_ctx.yaml
+NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml
 
 # Run DeepSeek-V3.2-Exp
-NP=4 ./mpi_launch.sh ./run_single.sh config_ctx.yaml --model deepseek-ai/DeepSeek-V3.2-Exp --tokens-per-block 64 --moe-backend DEEPGEMM
-NP=4 ./mpi_launch.sh ./run_single.sh config_gen.yaml --model deepseek-ai/DeepSeek-V3.2-Exp --tokens-per-block 64 --moe-backend DEEPGEMM
+NP=4 ./mpi_launch.sh ./run.sh config_ctx.yaml --model deepseek-ai/DeepSeek-V3.2-Exp --tokens-per-block 64 --moe-backend DEEPGEMM
+NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --model deepseek-ai/DeepSeek-V3.2-Exp --tokens-per-block 64 --moe-backend DEEPGEMM
 
 # Run DeepSeek-V3.2-Exp with 32k context length
-NP=4 ./mpi_launch.sh ./run_single.sh config_ctx.yaml --model deepseek-ai/DeepSeek-V3.2-Exp --tokens-per-block 64 --max-seq-len $((32768 + 1024 + 4)) --moe-backend DEEPGEMM --batch-size 1 --seq-len-q 32769
-NP=4 ./mpi_launch.sh ./run_single.sh config_gen.yaml --model deepseek-ai/DeepSeek-V3.2-Exp --tokens-per-block 64 --max-seq-len $((32768 + 1024 + 4)) --moe-backend DEEPGEMM --seq-len-kv-cache 32769
+NP=4 ./mpi_launch.sh ./run.sh config_ctx.yaml --model deepseek-ai/DeepSeek-V3.2-Exp --tokens-per-block 64 --max-seq-len $((32768 + 1024 + 4)) --moe-backend DEEPGEMM --batch-size 1 --seq-len-q 32769
+NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --model deepseek-ai/DeepSeek-V3.2-Exp --tokens-per-block 64 --max-seq-len $((32768 + 1024 + 4)) --moe-backend DEEPGEMM --seq-len-kv-cache 32769
 
 # Run with attention TP
-NP=4 ./mpi_launch.sh ./run_single.sh config_ctx.yaml --no-enable-attention-dp
-NP=4 ./mpi_launch.sh ./run_single.sh config_gen.yaml --no-enable-attention-dp
+NP=4 ./mpi_launch.sh ./run.sh config_ctx.yaml --no-enable-attention-dp
+NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --no-enable-attention-dp
 
 # Run with attention TP and TRTLLMGen
-NP=4 ./mpi_launch.sh -x TRTLLM_ENABLE_PDL=1 ./run_single.sh config_ctx.yaml --no-enable-attention-dp --moe-backend TRTLLM
-NP=4 ./mpi_launch.sh -x TRTLLM_ENABLE_PDL=1 ./run_single.sh config_gen.yaml --no-enable-attention-dp --moe-backend TRTLLM
+NP=4 ./mpi_launch.sh -x TRTLLM_ENABLE_PDL=1 ./run.sh config_ctx.yaml --no-enable-attention-dp --moe-backend TRTLLM
+NP=4 ./mpi_launch.sh -x TRTLLM_ENABLE_PDL=1 ./run.sh config_gen.yaml --no-enable-attention-dp --moe-backend TRTLLM
 
 # Run with MTP3
-NP=4 ./mpi_launch.sh ./run_single.sh config_gen.yaml --batch-size 32 --seq-len-q 4
+NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --batch-size 32 --seq-len-q 4
 
 # Run 4 layers
-NP=4 ./mpi_launch.sh ./run_single.sh config_ctx.yaml --layer-indices 5,6,7,8
-NP=4 ./mpi_launch.sh ./run_single.sh config_gen.yaml --layer-indices 5,6,7,8
+NP=4 ./mpi_launch.sh ./run.sh config_ctx.yaml --layer-indices 5,6,7,8
+NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --layer-indices 5,6,7,8
 
 # Scale DEP=16 to 4 GPUs: reduce the number of experts, uses MNNVL A2A if applicable
-NP=4 ./mpi_launch.sh ./run_single.sh config_gen.yaml --scaled-from 16 --moe-backend WIDEEP
+NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --scaled-from 16 --moe-backend WIDEEP
 
 # Scale TEP=16 to 4 GPUs: reduce the number of attention heads and experts
-NP=4 ./mpi_launch.sh ./run_single.sh config_gen.yaml --scaled-from 16 --no-enable-attention-dp
+NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --scaled-from 16 --no-enable-attention-dp
 
 # Run Qwen3-Next (balanced routing is not implemented)
-NP=2 ./mpi_launch.sh -x TRTLLM_ENABLE_PDL=1 ./run_single.sh config_ctx.yaml --model Qwen/Qwen3-Next-80B-A3B-Instruct --layer-indices 6,7 --no-enable-attention-dp --moe-backend TRTLLM --batch-size 4 --balance-method NotModified
-NP=2 ./mpi_launch.sh -x TRTLLM_ENABLE_PDL=1 ./run_single.sh config_gen.yaml --model Qwen/Qwen3-Next-80B-A3B-Instruct --layer-indices 6,7 --no-enable-attention-dp --moe-backend TRTLLM --batch-size 512 --balance-method NotModified
+NP=2 ./mpi_launch.sh -x TRTLLM_ENABLE_PDL=1 ./run.sh config_ctx.yaml --model Qwen/Qwen3-Next-80B-A3B-Instruct --layer-indices 6,7 --no-enable-attention-dp --moe-backend TRTLLM --batch-size 4 --balance-method NotModified
+NP=2 ./mpi_launch.sh -x TRTLLM_ENABLE_PDL=1 ./run.sh config_gen.yaml --model Qwen/Qwen3-Next-80B-A3B-Instruct --layer-indices 6,7 --no-enable-attention-dp --moe-backend TRTLLM --batch-size 512 --balance-method NotModified
 
 # Run with DeepEP A2A
-NP=4 ./mpi_launch.sh -x TRTLLM_FORCE_ALLTOALL_METHOD=DeepEP ./run_single.sh config_ctx.yaml --moe-backend WIDEEP
-NP=4 ./mpi_launch.sh -x TRTLLM_FORCE_ALLTOALL_METHOD=DeepEP ./run_single.sh config_gen.yaml --moe-backend WIDEEP
+NP=4 ./mpi_launch.sh -x TRTLLM_FORCE_ALLTOALL_METHOD=DeepEP ./run.sh config_ctx.yaml --moe-backend WIDEEP
+NP=4 ./mpi_launch.sh -x TRTLLM_FORCE_ALLTOALL_METHOD=DeepEP ./run.sh config_gen.yaml --moe-backend WIDEEP
 ```
 
 ### Run with Slurm
@@ -85,17 +85,34 @@ It uses the image recorded in `../../jenkins/current_image_tags.properties`. The
 
 ```bash
 # Run DeepSeek-R1 NVFP4 with wide ep: uses MNNVL A2A if applicable
-SLURM_JOB_ID=$SLURM_JOB_ID NODES=4 NP=16 ./slurm_launch.sh ./run_single.sh config_gen.yaml --moe-backend WIDEEP
+SLURM_JOB_ID=$SLURM_JOB_ID NODES=4 NP=16 ./slurm_launch.sh ./run.sh config_gen.yaml --moe-backend WIDEEP
 
 # Run with attention TP and TRTLLMGen
-SLURM_JOB_ID=$SLURM_JOB_ID NODES=4 NP=16 TRTLLM_ENABLE_PDL=1 ./slurm_launch.sh ./run_single.sh config_gen.yaml --no-enable-attention-dp --moe-backend TRTLLM
+SLURM_JOB_ID=$SLURM_JOB_ID NODES=4 NP=16 TRTLLM_ENABLE_PDL=1 ./slurm_launch.sh ./run.sh config_gen.yaml --no-enable-attention-dp --moe-backend TRTLLM
 
 # Run with DeepEPLowLatency
-SLURM_JOB_ID=$SLURM_JOB_ID NODES=4 NP=16 TRTLLM_FORCE_ALLTOALL_METHOD=DeepEPLowLatency ./slurm_launch.sh ./run_single.sh config_gen.yaml --moe-backend WIDEEP
+SLURM_JOB_ID=$SLURM_JOB_ID NODES=4 NP=16 TRTLLM_FORCE_ALLTOALL_METHOD=DeepEPLowLatency ./slurm_launch.sh ./run.sh config_gen.yaml --moe-backend WIDEEP
 
 # You can run 4-GPU and 8-GPU tasks without reallocate the slurm job
-SLURM_JOB_ID=$SLURM_JOB_ID NODES=1 NP=4 ./slurm_launch.sh ./run_single.sh config_ctx.yaml
-SLURM_JOB_ID=$SLURM_JOB_ID NODES=2 NP=8 ./slurm_launch.sh ./run_single.sh config_ctx.yaml
+SLURM_JOB_ID=$SLURM_JOB_ID NODES=1 NP=4 ./slurm_launch.sh ./run.sh config_ctx.yaml
+SLURM_JOB_ID=$SLURM_JOB_ID NODES=2 NP=8 ./slurm_launch.sh ./run.sh config_gtx.yaml
+```
+
+### Batched run
+
+By specifying `--batch-size-list` on the command line (or `batch_size_list` in the YAML file), the script runs multiple configurations in a single process. This significantly reduces the total runtime because it avoids repeated library initialization and model initialization. When `--batch-size-list` is set, the value of `--batch-size` is ignored.
+
+Supported list arguments:
+- `--batch-size-list` (or `batch_size_list` in YAML)
+- `--seq-len-q-list` (or `seq_len_q_list` in YAML)
+- `--seq-len-kv-cache-list` (or `seq_len_kv_cache_list` in YAML)
+- `--balance-ratio-list` (or `balance_ratio_list` in YAML)
+
+Run with OpenMPI:
+
+```
+NP=4 ./mpi_launch.sh ./run.sh config_ctx.yaml --batch-size-list 1,2,4 --seq-len-q-list 1024,8192
+NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --scaled-from 16 --moe-backend WIDEEP --batch-size-list 32,64,128,256,512 --seq-len-q-list 1,2,3,4
 ```
 
 ## Parse profiles
