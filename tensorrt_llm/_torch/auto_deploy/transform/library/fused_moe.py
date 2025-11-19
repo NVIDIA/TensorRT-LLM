@@ -581,7 +581,7 @@ class MatchNVFP4MoePattern(MatchMoePattern):
         return ["input_scale", "weight_scale", "alpha"]
 
 
-def _stack_fp8_moe_weights(gm: GraphModule, backend: str) -> int:
+def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "triton"]) -> int:
     """
     Stack per-expert FP8 weights and scales by materializing stacked tensors as parameters.
     This is fast because we directly stack the tensor values (not graph nodes).
@@ -591,10 +591,8 @@ def _stack_fp8_moe_weights(gm: GraphModule, backend: str) -> int:
     graph = gm.graph
 
     backend = backend.lower()
-    assert backend in ["trtllm", "triton"], (
-        f"Invalid backend: {backend}. Must be 'trtllm' or 'triton'."
-    )
     replacement_op = {
+        "auto": torch.ops.auto_deploy.trtllm_quant_fp8_moe_fused,
         "trtllm": torch.ops.auto_deploy.trtllm_quant_fp8_moe_fused,
         "triton": torch.ops.auto_deploy.triton_quant_fp8_moe,
     }[backend]
