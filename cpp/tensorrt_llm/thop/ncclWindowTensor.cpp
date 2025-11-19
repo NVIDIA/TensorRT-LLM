@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 #include "ncclWindowTensor.h"
+#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/ncclUtils.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include <set>
 
@@ -30,18 +32,15 @@ torch::Tensor create_nccl_window_tensor(
         groupSet.insert(static_cast<int>(rank));
     }
 
-    // Guard against empty group to avoid undefined behavior
-    TORCH_CHECK(!groupSet.empty(), "Group cannot be empty for NCCL window tensor creation");
+    TLLM_CHECK(!groupSet.empty());
 
     // Get NCCL communicator for the group
     auto comm = getComm(groupSet);
 
     // Create NCCL window tensor
     using tensorrt_llm::common::nccl_util::createNCCLWindowTensor;
-    auto tensor = std::get<0>(createNCCLWindowTensor(*comm, shape, dtype));
-
     // Return just the tensor (Python doesn't need the buffer object)
-    return tensor;
+    return createNCCLWindowTensor(*comm, shape, dtype).first;
 }
 
 } // namespace torch_ext
