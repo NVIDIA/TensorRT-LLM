@@ -526,7 +526,7 @@ class AutoTuner:
     _CUDA_GRAPH_DELAY_MICRO_SECS = 100
     _instance = None
 
-    def __init__(self, warmup=3, repeat=30, stream_delay_micro_secs=1000):
+    def __init__(self, warmup=3, repeat=10, stream_delay_micro_secs=1000):
         self.repeat = repeat
         self.warmup = warmup
         self.stream_delay_micro_secs = stream_delay_micro_secs
