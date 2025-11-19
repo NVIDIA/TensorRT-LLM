@@ -1,6 +1,6 @@
 import math
 from abc import ABC, abstractmethod
-from typing import Dict, List, NamedTuple, Optional, Union
+from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -1892,6 +1892,37 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
         torch.cuda.synchronize()
 
         dst_w2_weight_scale.copy_(dst_w2_weight_scale_interleaved)
+
+
+def _fp4_quantize_pad_unpad(weight: torch.Tensor, alignment: Tuple[int, int]):
+    assert weight.dim() == 2, "Only 2D tensor is supported."
+    assert weight.device.type == 'cuda', "Only cuda tensor is supported."
+    assert weight.dtype == torch.bfloat16, "Only bfloat16 tensor is supported."
+
+    print("Original shape:", weight.shape)
+    padding_dim_0 = (alignment[0] -
+                     weight.shape[0] % alignment[0]) % alignment[0]
+    padding_dim_1 = (alignment[1] -
+                     weight.shape[1] % alignment[1]) % alignment[1]
+    print("Padding:", (padding_dim_0, padding_dim_1))
+    weight_padded = torch.nn.functional.pad(
+        weight, (0, padding_dim_1, 0, padding_dim_0))
+    print("Padded shape:", weight_padded.shape)
+
+    global_scale_factor = (448 * 6) / weight.abs().max().float()
+    print("Global scale factor:", global_scale_factor.item())
+
+    weight_nvfp4, block_scale_factor = torch.ops.trtllm.fp4_quantize(
+        weight,
+        global_scale_factor,
+        sfVecSize=16,
+        sfUseUE8M0=False,
+        isSfSwizzledLayout=False)
+    block_scale_factor = block_scale_factor.view(weight.shape[0], -1)
+    print("Weight nvfp4 shape:", weight_nvfp4.shape)
+    print("Block scale factor shape:", block_scale_factor.shape)
+
+    return weight_nvfp4, global_scale_factor, block_scale_factor
 
 
 class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):

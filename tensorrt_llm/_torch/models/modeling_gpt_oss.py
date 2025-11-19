@@ -830,26 +830,15 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
                     ]
 
                 # Per-expert block scales (transpose to expected layout)
-
-                # WAR due to checkpoint issue. The checkpoint fix is required for correct accuracy.
-                def w3_w1_scale_war(original):
-                    assert original.shape == (2880, 360)
-                    return original.reshape(180, 5760).contiguous()
-
-                def w2_scale_war(original):
-                    assert original.shape == (2880, 180)
-                    return original.reshape(180, 2880).contiguous()
-
                 if 'gate_up_proj_weight_scale' in module_weights:
                     gu_ws = module_weights['gate_up_proj_weight_scale']
                     moe_weights['gate_up_proj_weight_scale'] = [
-                        w3_w1_scale_war(gu_ws[i, :, :])
-                        for i in range(num_expert)
+                        gu_ws[i, :, :] for i in range(num_expert)
                     ]
                 if 'down_proj_weight_scale' in module_weights:
                     dp_ws = module_weights['down_proj_weight_scale']
                     moe_weights['down_proj_weight_scale'] = [
-                        w2_scale_war(dp_ws[i, :, :]) for i in range(num_expert)
+                        dp_ws[i, :, :] for i in range(num_expert)
                     ]
 
                 # Module-level globals for NVFP4 loaders
