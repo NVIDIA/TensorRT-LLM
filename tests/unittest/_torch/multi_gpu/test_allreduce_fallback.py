@@ -23,6 +23,8 @@ import torch
 from mpi4py import MPI
 
 import tensorrt_llm
+from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
+from tensorrt_llm.mapping import Mapping
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
@@ -281,6 +283,78 @@ def run_window_tensor_operations_test(
     torch.cuda.synchronize()
 
 
+@torch.inference_mode()
+def run_window_tensor_allreduce_test(
+    shape: tuple,
+    dtype_str: str,
+    tensor_parallel_size: int,
+    tensor_parallel_rank: int,
+):
+    """Test AllReduce with NCCL_SYMMETRIC on NCCL window tensors."""
+    # Convert dtype string back to torch.dtype
+    dtype_map = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    dtype = dtype_map[dtype_str]
+
+    group = list(range(tensor_parallel_size))
+
+    # Create window tensor
+    window_tensor = _create_nccl_window_tensor(group, shape, dtype)
+
+    # Initialize with deterministic data based on rank
+    # Each rank fills its tensor with (rank + 1), so we can predict the exact outcome
+    # After allreduce, each element should be sum(1, 2, ..., tensor_parallel_size)
+    rank_value = float(tensor_parallel_rank + 1)
+    data = torch.full(shape, rank_value, dtype=dtype, device="cuda")
+    window_tensor.copy_(data)
+
+    # Compute expected result: allreduce sums across all ranks
+    # Expected value per element = 1 + 2 + ... + tensor_parallel_size = n*(n+1)/2
+    expected_sum = tensor_parallel_size * (tensor_parallel_size + 1) / 2.0
+    expected_result = torch.full(shape, expected_sum, dtype=dtype, device="cuda")
+
+    # Create mapping and AllReduce with NCCL_SYMMETRIC strategy
+    mapping = Mapping(
+        world_size=tensor_parallel_size,
+        tp_size=tensor_parallel_size,
+        rank=tensor_parallel_rank,
+    )
+    allreduce = AllReduce(mapping=mapping, strategy=AllReduceStrategy.NCCL_SYMMETRIC)
+
+    # Perform allreduce on window tensor
+    result = allreduce(window_tensor)
+
+    # Verify result properties
+    assert result.shape == shape, f"Result shape mismatch: {result.shape} vs {shape}"
+    assert result.dtype == dtype, f"Result dtype mismatch: {result.dtype} vs {dtype}"
+    assert result.is_cuda, "Result should be on CUDA"
+
+    # Verify result is not NaN or Inf
+    assert not torch.isnan(result).any(), "Result contains NaN values"
+    assert not torch.isinf(result).any(), "Result contains Inf values"
+
+    # Verify exact correctness: result should match expected sum
+    # Use appropriate tolerance based on dtype
+    if dtype == torch.float32:
+        rtol, atol = 1e-5, 1e-5
+    elif dtype == torch.float16:
+        rtol, atol = 1e-3, 1e-3
+    else:  # bfloat16
+        rtol, atol = 1e-2, 1e-2
+
+    assert torch.allclose(result, expected_result, rtol=rtol, atol=atol), (
+        f"AllReduce result mismatch on rank {tensor_parallel_rank}. "
+        f"Expected all elements to be {expected_sum}, but got values in range "
+        f"[{result.min().item():.6f}, {result.max().item():.6f}]"
+    )
+
+    # Synchronize CUDA to ensure all operations are complete before cleanup
+    torch.cuda.synchronize()
+
+
 # ============================================================================
 # Pytest Test Functions
 # ============================================================================
@@ -365,6 +439,36 @@ def test_window_tensor_operations(mpi_pool_executor, shape, dtype_str):
                 (
                     tensor_parallel_size,
                     run_window_tensor_operations_test,
+                    shape,
+                    dtype_str,
+                    tensor_parallel_size,
+                    None,
+                )
+            ]
+            * tensor_parallel_size
+        ),
+    )
+    for r in results:
+        assert r is True
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 GPUs")
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+@pytest.mark.parametrize("shape", [(1024,), (1024, 2048)], ids=lambda x: f"shape:{x}")
+@pytest.mark.parametrize("dtype_str", ["float32", "bfloat16"], ids=lambda x: x)
+def test_window_tensor_allreduce(mpi_pool_executor, shape, dtype_str):
+    """Test AllReduce with NCCL_SYMMETRIC on NCCL window tensors."""
+    torch.manual_seed(42)
+
+    tensor_parallel_size = mpi_pool_executor.num_workers
+
+    results = mpi_pool_executor.map(
+        run_single_rank_test,
+        *zip(
+            *[
+                (
+                    tensor_parallel_size,
+                    run_window_tensor_allreduce_test,
                     shape,
                     dtype_str,
                     tensor_parallel_size,
