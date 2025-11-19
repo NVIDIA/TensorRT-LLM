@@ -433,6 +433,108 @@ class PassKeyRetrieval128k(AccuracyTask):
     MAX_OUTPUT_LEN = 50
 
 
+class LongBenchV2(AccuracyTask):
+    DATASET = "longbench_v2"
+    DATASET_DIR = f"{llm_models_root()}/zai-org/LongBench-v2"
+
+    ALPHA = 0.05
+    BETA = 0.2
+    SIGMA = 50.0
+    NUM_SAMPLES = 215
+
+    MAX_BATCH_SIZE = 32
+    MAX_INPUT_LEN = 1280000
+    MAX_OUTPUT_LEN = 32000
+
+    EVALUATOR_CLS = tensorrt_llm.evaluate.LongBenchV2
+    EVALUATOR_KWARGS = dict(
+        dataset_path=DATASET_DIR,
+        length="medium",
+        max_len=1280000,
+        apply_chat_template=True,
+        random_seed=0,
+    )
+
+    @staticmethod
+    def create_modified_model_dir(original_model_dir: str,
+                                  max_position_embeddings: int = 1280000,
+                                  model_max_length: int = 1280000) -> str:
+        """
+        Create temporary directory with modified config files for long context evaluation.
+
+        This method creates a temporary directory with symlinks to all model files except
+        config files, which are copied and modified to support longer context lengths.
+        This is useful for evaluating models on long context tasks that exceed the
+        original model's max_position_embeddings.
+
+        Args:
+            original_model_dir: Path to the original model directory
+            max_position_embeddings: New value for max_position_embeddings in config.json
+            model_max_length: New value for model_max_length in tokenizer_config.json
+
+        Returns:
+            Path to the temporary modified model directory
+
+        Note:
+            The caller is responsible for cleaning up the temporary directory after use.
+        """
+        import tempfile
+
+        # Create temporary model directory with symlinks
+        temp_dir = tempfile.mkdtemp(prefix="longbench_v2_modified_model_")
+        logger.info(f"Created temporary model directory: {temp_dir}")
+
+        # Create symlinks for all files except config files
+        for item in os.listdir(original_model_dir):
+            src = os.path.join(original_model_dir, item)
+            dst = os.path.join(temp_dir, item)
+
+            # Skip config files - will handle them separately
+            if item in ["config.json", "tokenizer_config.json"]:
+                continue
+
+            # Create symlink for other files/directories
+            os.symlink(src, dst)
+            logger.info(f"  Symlinked: {item}")
+
+        # Modify and copy config.json
+        config_src = os.path.join(original_model_dir, "config.json")
+        config_dst = os.path.join(temp_dir, "config.json")
+        if os.path.exists(config_src):
+            with open(config_src, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+
+            # Modify max_position_embeddings
+            original_max_pos = config.get('max_position_embeddings')
+            config['max_position_embeddings'] = max_position_embeddings
+            logger.info(
+                f"  Modified config.json: max_position_embeddings {original_max_pos} -> {max_position_embeddings}"
+            )
+
+            with open(config_dst, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+
+        # Modify and copy tokenizer_config.json
+        tokenizer_config_src = os.path.join(original_model_dir,
+                                            "tokenizer_config.json")
+        tokenizer_config_dst = os.path.join(temp_dir, "tokenizer_config.json")
+        if os.path.exists(tokenizer_config_src):
+            with open(tokenizer_config_src, 'r', encoding='utf-8') as f:
+                tokenizer_config = json.load(f)
+
+            # Modify model_max_length
+            original_max_len = tokenizer_config.get('model_max_length')
+            tokenizer_config['model_max_length'] = model_max_length
+            logger.info(
+                f"  Modified tokenizer_config.json: model_max_length {original_max_len} -> {model_max_length}"
+            )
+
+            with open(tokenizer_config_dst, 'w', encoding='utf-8') as f:
+                json.dump(tokenizer_config, f, indent=2, ensure_ascii=False)
+
+        return temp_dir
+
+
 class CliFlowAccuracyTestHarness:
     # Model
     MODEL_NAME = None

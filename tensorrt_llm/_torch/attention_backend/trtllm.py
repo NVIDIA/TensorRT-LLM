@@ -881,7 +881,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             ) <= self.kv_cache_manager.max_seq_len, error_message
 
         self.kv_lens_cuda_runtime = self.kv_lens_cuda[:self.num_seqs]
-        self.kv_lens_runtime = self.kv_lens[:self.num_seqs]
+        # Don't use self.kv_lens here because it includes extra tokens.
+        # Use actual KV length (without extra tokens) for kv_lens_runtime,
+        # which becomes host_past_key_value_lengths and eventually mMaxSeqLenKv.
+        self.kv_lens_runtime = kv_lens[:self.num_seqs]
         self.prompt_lens_cuda_runtime = self.prompt_lens_cuda[:self.num_seqs]
         self.prompt_lens_cpu_runtime = self.prompt_lens_cpu[:self.num_seqs]
         self.host_request_types_runtime = self.host_request_types[:self.
@@ -897,13 +900,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.block_ids_per_seq.fill_(0)
         self.block_ids_per_seq[:self.num_generations, :num_blocks].copy_(
             block_ids_per_seq[self.num_contexts:], non_blocking=True)
-
-        self.kv_lens_cuda_runtime = self.kv_lens_cuda[:self.num_seqs]
-        self.kv_lens_runtime = self.kv_lens[:self.num_seqs]
-        self.prompt_lens_cuda_runtime = self.prompt_lens_cuda[:self.num_seqs]
-        self.prompt_lens_cpu_runtime = self.prompt_lens_cpu[:self.num_seqs]
-        self.host_request_types_runtime = self.host_request_types[:self.
-                                                                  num_seqs]
 
     def pre_process_for_chunked_prefill(
         self,

@@ -34,6 +34,7 @@
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/nanobind/batch_manager/algorithms.h"
 #include "tensorrt_llm/nanobind/batch_manager/bindings.h"
+#include "tensorrt_llm/nanobind/batch_manager/buffers.h"
 #include "tensorrt_llm/nanobind/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheConnector.h"
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheManager.h"
@@ -490,6 +491,7 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .def_prop_ro("uvm", &tr::MemoryCounters::getUVM);
 
     tensorrt_llm::nanobind::process_group::initBindings(mInternalProcessGroup);
+    tpb::Buffers::initBindings(mInternalBatchManager);
     tensorrt_llm::nanobind::runtime::initBindings(mInternalRuntime);
     tensorrt_llm::nanobind::testing::initBindings(mInternalTesting);
     tpb::initBindings(mInternalBatchManager);

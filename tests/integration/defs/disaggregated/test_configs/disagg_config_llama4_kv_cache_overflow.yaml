@@ -1,0 +1,52 @@
+model: llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8
+hostname: localhost
+port: 8000
+backend: pytorch
+
+context_servers:
+  num_instances: 1
+  tensor_parallel_size: 4
+  pipeline_parallel_size: 1
+  moe_expert_parallel_size: 1
+  enable_attention_dp: false
+  max_num_tokens: 8192
+  max_seq_len: 257000
+  max_input_len: 256000
+  max_batch_size: 1
+  trust_remote_code: true
+  enable_chunked_prefill: true
+  kv_cache_config:
+    enable_block_reuse: false
+    free_gpu_memory_fraction: 0.3
+  disable_overlap_scheduler: true
+  cuda_graph_config: null
+  cache_transceiver_config:
+    backend: UCX
+    # Intentionally small to reproduce buffer overflow bug
+    max_tokens_in_buffer: 2048
+  urls:
+    - "localhost:8001"
+
+generation_servers:
+  num_instances: 1
+  tensor_parallel_size: 4
+  pipeline_parallel_size: 1
+  moe_expert_parallel_size: 1
+  enable_attention_dp: false
+  max_num_tokens: 8192
+  max_seq_len: 257000
+  max_input_len: 256000
+  max_batch_size: 1
+  trust_remote_code: true
+  enable_chunked_prefill: true
+  kv_cache_config:
+    enable_block_reuse: false
+    free_gpu_memory_fraction: 0.3
+  disable_overlap_scheduler: true
+  cuda_graph_config: null
+  cache_transceiver_config:
+    backend: UCX
+    # Intentionally small to reproduce buffer overflow bug
+    max_tokens_in_buffer: 2048
+  urls:
+    - "localhost:8002"

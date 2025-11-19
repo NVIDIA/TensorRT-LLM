@@ -290,11 +290,14 @@ def _group_requests_by_strategy_key(
     group_dict: dict[tuple[GenericStrategyKeyType, bool], tuple[list[int], list[Strategy]]] = (
         defaultdict(lambda: ([], []))
     )
+
     for req_index, req in enumerate(requests):
         strategy = _request_strategy(req, vocab_size=vocab_size)
-        # In the overlap path, py_draft_logits is not updated yet,
-        # so we use get_draft_token_length() for the checking.
-        speculation_needs_probs = get_draft_token_length(req) > 0 and strategy is not GREEDY
+        speculation_needs_probs = (
+            # NB: This criterion needs to be consistent with the gating of rejection sampling in
+            #     process_draft_tokens.
+            TorchSampler._speculation_could_use_rejection_sampling(req, strategy)
+        )
         strategy_key = strategy_to_key(strategy, speculation_needs_probs)
         group_dict_entry = group_dict[(strategy_key, speculation_needs_probs)]
         group_dict_entry[0].append(req_index)
@@ -1140,6 +1143,17 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
 
         return num_accepted
 
+    @staticmethod
+    def _speculation_could_use_rejection_sampling(
+        request: LlmRequest, strategy: Optional[Strategy] = None
+    ) -> bool:
+        if strategy is None:
+            strategy = _request_strategy(
+                request,
+                vocab_size=2**31,  # vocab_size does not affect greediness
+            )
+        return get_draft_token_length(request) > 0 and strategy != GREEDY
+
     def process_draft_tokens(
         self,
         request: LlmRequest,
@@ -1148,9 +1162,17 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         finish_reasons: FinishReasonsList,
         resource_manager: Optional[ResourceManager] = None,
     ) -> int:
-        if (
-            _request_strategy(request, vocab_size=2**31) == GREEDY
-            or request.py_draft_logits is None
+        if not (
+            self._speculation_could_use_rejection_sampling(request)
+            # NB: '_speculation_could_use_rejection_sampling' is called in sample_async, which precludes
+            #     inspection of .py_draft_logits, because it is not set yet when the overlap path
+            #     is used.
+            #
+            #     OTOH, some drafters (e.g. NGram) do not provide draft logits, precluding rejection
+            #     sampling. The current solution accepts that .py_target_probs may sometimes be
+            #     computed, even though .py_draft_logits may never be set and the target probs
+            #     may ultimately not be required.
+            and request.py_draft_logits is not None
         ):
             spec_tree_manager = self.get_spec_tree_manager(resource_manager)
             if spec_tree_manager is not None:
@@ -1211,7 +1233,8 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
             )
             if get_draft_token_length(req) > 0:
                 req.py_num_accepted_draft_tokens = num_accepted
-                req.py_rewind_len = req.py_draft_pages_allocated - num_accepted
+                actual_draft_len = get_draft_token_length(req)
+                req.py_rewind_len = actual_draft_len - num_accepted
             else:
                 req.py_num_accepted_draft_tokens = 0
                 req.py_rewind_len = 0
@@ -2057,7 +2080,6 @@ class TRTLLMSampler(Sampler, AsyncWorkerMixin):
                 dtype=torch.int,
             ),
             "decoder_state": DecoderState(),
-            "decoding_input": [None] * self.num_micro_batches,
         }
 
         self.store["decoder_state"].setup(
@@ -2166,19 +2188,20 @@ class TRTLLMSampler(Sampler, AsyncWorkerMixin):
         if beam_width > 1:
             self._update_cache_indirection_buffer(scheduled_requests)
 
-        self.store["decoding_input"][self.micro_batch_idx] = make_decoding_batch_input(
+        make_decoding_batch_input(
+            self.store["decoder_input_buffers"][self.micro_batch_idx],
+            self.store["decoder_state"],
             scheduled_requests.context_requests,
             scheduled_requests.generation_requests,
             model_outputs["logits"],
             beam_width,
             num_context_logits_prefix_sum,
-            self.store["decoder_input_buffers"][self.micro_batch_idx],
-            self.store["decoder_state"],
             self.store["buffer_manager"],
         )
 
         self.algs.decoder.forward_async(
-            self.store["decoder_state"], self.store["decoding_input"][self.micro_batch_idx]
+            self.store["decoder_state"],
+            self.store["decoder_input_buffers"][self.micro_batch_idx],
         )
 
         finalize_events = {}
