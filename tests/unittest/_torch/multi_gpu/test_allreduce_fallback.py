@@ -216,6 +216,71 @@ def run_window_tensor_different_shapes_test(
     torch.cuda.synchronize()
 
 
+@torch.inference_mode()
+def run_window_tensor_operations_test(
+    shape: tuple,
+    dtype_str: str,
+    tensor_parallel_size: int,
+    tensor_parallel_rank: int,
+):
+    """Test NCCL window tensors with basic PyTorch operations."""
+    # Convert dtype string back to torch.dtype
+    dtype_map = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    dtype = dtype_map[dtype_str]
+
+    group = list(range(tensor_parallel_size))
+
+    # Create two window tensors
+    tensor1 = _create_nccl_window_tensor(group, shape, dtype)
+    tensor2 = _create_nccl_window_tensor(group, shape, dtype)
+
+    # Initialize with test data
+    data1 = torch.randn(shape, dtype=dtype, device="cuda")
+    data2 = torch.randn(shape, dtype=dtype, device="cuda")
+    tensor1.copy_(data1)
+    tensor2.copy_(data2)
+
+    # Test addition: tensor1 + tensor2
+    result_add = tensor1 + tensor2
+    expected_add = data1 + data2
+    assert torch.allclose(result_add, expected_add, rtol=1e-5, atol=1e-5), "Addition failed"
+
+    # Test subtraction: tensor1 - tensor2
+    result_sub = tensor1 - tensor2
+    expected_sub = data1 - data2
+    assert torch.allclose(result_sub, expected_sub, rtol=1e-5, atol=1e-5), "Subtraction failed"
+
+    # Test multiplication by scalar: tensor1 * 2.5
+    scalar = 2.5
+    result_mul = tensor1 * scalar
+    expected_mul = data1 * scalar
+    assert torch.allclose(result_mul, expected_mul, rtol=1e-5, atol=1e-5), (
+        "Scalar multiplication failed"
+    )
+
+    # Test in-place operations
+    tensor1.add_(tensor2)  # tensor1 += tensor2
+    expected_inplace = data1 + data2
+    assert torch.allclose(tensor1, expected_inplace, rtol=1e-5, atol=1e-5), (
+        "In-place addition failed"
+    )
+
+    # Test element-wise multiplication: tensor1 * tensor2 (after in-place add)
+    tensor1.copy_(data1)  # Reset tensor1
+    result_elem_mul = tensor1 * tensor2
+    expected_elem_mul = data1 * data2
+    assert torch.allclose(result_elem_mul, expected_elem_mul, rtol=1e-5, atol=1e-5), (
+        "Element-wise multiplication failed"
+    )
+
+    # Synchronize CUDA to ensure all operations are complete before cleanup
+    torch.cuda.synchronize()
+
+
 # ============================================================================
 # Pytest Test Functions
 # ============================================================================
@@ -274,6 +339,36 @@ def test_create_multiple_window_tensors(mpi_pool_executor, shape, dtype_str, num
                     tensor_parallel_size,
                     None,
                     num_tensors,
+                )
+            ]
+            * tensor_parallel_size
+        ),
+    )
+    for r in results:
+        assert r is True
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 GPUs")
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+@pytest.mark.parametrize("shape", [(1024,), (1024, 2048)], ids=lambda x: f"shape:{x}")
+@pytest.mark.parametrize("dtype_str", ["float32", "bfloat16"], ids=lambda x: x)
+def test_window_tensor_operations(mpi_pool_executor, shape, dtype_str):
+    """Test NCCL window tensors with basic PyTorch operations (+, -, * scalar)."""
+    torch.manual_seed(42)
+
+    tensor_parallel_size = mpi_pool_executor.num_workers
+
+    results = mpi_pool_executor.map(
+        run_single_rank_test,
+        *zip(
+            *[
+                (
+                    tensor_parallel_size,
+                    run_window_tensor_operations_test,
+                    shape,
+                    dtype_str,
+                    tensor_parallel_size,
+                    None,
                 )
             ]
             * tensor_parallel_size
