@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@emma/add_spark_for_slurm', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -2760,6 +2760,7 @@ def launchTestJobs(pipeline, testFilter)
     SBSASlurmTestConfigs = [
         // Disable GB300 stages due to nodes will be offline temporarily.
         // "GB300-PyTorch-1": ["gb300-single", "l0_gb300", 1, 1],
+        "GB10-Tensorrt-Post-Merge-1": ["gb10x", "l0_gb10", 1, 1],
         "GB200-4_GPUs-PyTorch-1": ["gb200-trtllm", "l0_gb200_multi_gpus", 1, 1, 4],
         "GB200-4_GPUs-PyTorch-Post-Merge-1": ["gb200-x4-oci", "l0_gb200_multi_gpus", 1, 1, 4],
         // "GB300-4_GPUs-PyTorch-Post-Merge-1": ["gb300-trtllm", "l0_gb300_multi_gpus", 1, 1, 4],

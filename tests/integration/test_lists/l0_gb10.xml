@@ -1,0 +1,17 @@
+version: 0.0.1
+l0_gb10:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*gb10*'
+      linux_distribution_name: ubuntu*
+      cpu: aarch64
+    terms:
+      stage: post_merge
+      backend: tensorrt
+  tests:
+  - llmapi/test_llm_examples.py::test_llmapi_quickstart_atexit
