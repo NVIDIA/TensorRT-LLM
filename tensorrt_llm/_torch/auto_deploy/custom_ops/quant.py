@@ -240,26 +240,104 @@ def fp8_linear_fake(
     return torch.ops.aten.linear(input, weight_fp8.to(input.dtype), bias)
 
 
-@torch.library.custom_op("auto_deploy::torch_quant_fused_fp8_linear_all_reduce", mutates_args=())
+# ============================================================================
+# Fused FP8 Linear + AllReduce Ops (Atomic - Backend Specific)
+# ============================================================================
+
+
+@torch.library.custom_op("auto_deploy::torch_fused_fp8_linear_all_reduce", mutates_args=())
 @torch.compile(dynamic=True)
-def fused_fp8_linear_all_reduce(
+def torch_fused_fp8_linear_all_reduce(
     input: torch.Tensor,
     weight_fp8: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
     input_scale: Optional[torch.Tensor] = None,
     weight_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """Fused FP8 linear + all_reduce using PyTorch backend.
+
+    This op always uses torch.distributed and is used in demollm mode.
+    """
     out = torch.ops.auto_deploy.torch_quant_fp8_linear(
         input, weight_fp8, bias, input_scale, weight_scale
     )
-    if trtllm_dist.is_trtllm_op_available():
-        return trtllm_dist.trtllm_allreduce(out, op=dist.ReduceOp.SUM)
     dist.all_reduce(out, op=dist.ReduceOp.SUM)
     return out
 
 
-@fused_fp8_linear_all_reduce.register_fake
-def fused_fp8_linear_all_reduce_fake(
+@torch_fused_fp8_linear_all_reduce.register_fake
+def torch_fused_fp8_linear_all_reduce_fake(
+    input: torch.Tensor,
+    weight_fp8: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    input_scale: Optional[torch.Tensor] = None,
+    weight_scale: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    return torch.ops.auto_deploy.torch_quant_fp8_linear(
+        input, weight_fp8, bias, input_scale, weight_scale
+    )
+
+
+@torch.library.custom_op("auto_deploy::trtllm_fused_fp8_linear_all_reduce", mutates_args=())
+@torch.compile(dynamic=True)
+def trtllm_fused_fp8_linear_all_reduce(
+    input: torch.Tensor,
+    weight_fp8: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    input_scale: Optional[torch.Tensor] = None,
+    weight_scale: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Fused FP8 linear + all_reduce using TRT-LLM backend.
+
+    This op always uses TRT-LLM's optimized allreduce and is used in MPI mode.
+    """
+    out = torch.ops.auto_deploy.torch_quant_fp8_linear(
+        input, weight_fp8, bias, input_scale, weight_scale
+    )
+    return trtllm_dist.trtllm_allreduce(out, op=dist.ReduceOp.SUM)
+
+
+@trtllm_fused_fp8_linear_all_reduce.register_fake
+def trtllm_fused_fp8_linear_all_reduce_fake(
+    input: torch.Tensor,
+    weight_fp8: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    input_scale: Optional[torch.Tensor] = None,
+    weight_scale: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    return torch.ops.auto_deploy.torch_quant_fp8_linear(
+        input, weight_fp8, bias, input_scale, weight_scale
+    )
+
+
+# ============================================================================
+# Legacy op name for backward compatibility
+# ============================================================================
+
+
+@torch.library.custom_op("auto_deploy::torch_quant_fused_fp8_linear_all_reduce", mutates_args=())
+@torch.compile(dynamic=True)
+def torch_quant_fused_fp8_linear_all_reduce(
+    input: torch.Tensor,
+    weight_fp8: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    input_scale: Optional[torch.Tensor] = None,
+    weight_scale: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Legacy name for torch_fused_fp8_linear_all_reduce.
+
+    Kept for backward compatibility with existing code.
+    Defaults to torch backend (demollm mode).
+    """
+    out = torch.ops.auto_deploy.torch_quant_fp8_linear(
+        input, weight_fp8, bias, input_scale, weight_scale
+    )
+    dist.all_reduce(out, op=dist.ReduceOp.SUM)
+    return out
+
+
+@torch_quant_fused_fp8_linear_all_reduce.register_fake
+def torch_quant_fused_fp8_linear_all_reduce_fake(
     input: torch.Tensor,
     weight_fp8: torch.Tensor,
     bias: Optional[torch.Tensor] = None,

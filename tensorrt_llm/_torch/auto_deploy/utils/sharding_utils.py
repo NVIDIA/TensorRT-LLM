@@ -29,6 +29,27 @@ from .quantization_utils import (
 )
 
 
+def _get_dist_ops():
+    """Get the appropriate distributed ops based on backend availability.
+
+    Returns tuple of (all_gather_op, all_reduce_op) for the current backend.
+    """
+    from ..distributed.trtllm import is_trtllm_op_available
+
+    if is_trtllm_op_available():
+        # Use TRT-LLM optimized ops in MPI mode
+        return (
+            torch.ops.auto_deploy.trtllm_dist_all_gather.default,
+            torch.ops.auto_deploy.trtllm_dist_all_reduce.default,
+        )
+    else:
+        # Use PyTorch distributed ops in demollm mode
+        return (
+            torch.ops.auto_deploy.torch_dist_all_gather.default,
+            torch.ops.auto_deploy.torch_dist_all_reduce.default,
+        )
+
+
 def _load_hook(
     state_dict,
     prefix,
@@ -485,10 +506,11 @@ def _shard_parameter_node(
             )
         return
 
-    # figure out the right dist op
+    # figure out the right dist op (backend-aware)
+    all_gather_op, all_reduce_op = _get_dist_ops()
     dist_lookup = {
-        0: (torch.ops.auto_deploy.torch_dist_all_gather.default, -1),
-        1: (torch.ops.auto_deploy.torch_dist_all_reduce.default,),
+        0: (all_gather_op, -1),
+        1: (all_reduce_op,),
     }
     fn_dist, *dist_args = dist_lookup[dim]
 
@@ -924,9 +946,10 @@ class BMMShardingInfo(ShardingTransformInfo):
         handle_tensor(node, rhs_tensor, 1, self.start_idx, self.end_idx)
 
         # Add all_gather node after BMM to collect results
+        all_gather_op, _ = _get_dist_ops()
         with gm.graph.inserting_after(node):
             gather_node = gm.graph.call_function(
-                torch.ops.auto_deploy.torch_dist_all_gather.default,
+                all_gather_op,
                 args=(node, 0),  # Gather along batch dimension (0)
             )
             node.replace_all_uses_with(gather_node)
@@ -1012,10 +1035,9 @@ def _insert_sharded_moe(
     node.args = tuple(args)
 
     # -- add an all_reduce node --
+    _, all_reduce_op = _get_dist_ops()
     with gm.graph.inserting_after(node):
-        dist_node = gm.graph.call_function(
-            torch.ops.auto_deploy.torch_dist_all_reduce.default, args=(node,)
-        )
+        dist_node = gm.graph.call_function(all_reduce_op, args=(node,))
         node.replace_all_uses_with(dist_node)
         dist_node.replace_input_with(dist_node, node)
 
@@ -1084,8 +1106,9 @@ def _insert_sharded_mxfp4_mlp_ep(
     node.args = args_ep
 
     # Add a dist all-reduce after the op (sum partial results across EP ranks)
+    _, all_reduce_op = _get_dist_ops()
     with gm.graph.inserting_after(node):
-        red = gm.graph.call_function(torch.ops.auto_deploy.torch_dist_all_reduce, args=(node,))
+        red = gm.graph.call_function(all_reduce_op, args=(node,))
         node.replace_all_uses_with(red)
         # keep dataflow: red(input=node)
         red.replace_input_with(red, node)

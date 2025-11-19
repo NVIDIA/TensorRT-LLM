@@ -24,26 +24,73 @@ def simple(input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tenso
 @simple.register_fake
 def simple_fake(input, weight, bias):
     """Fake implementation of simple_linear."""
-    # return torch.empty(
-    # input.shape[:-1] + (weight.shape[-1],), dtype=input.dtype, device=input.device
-    # )
     return torch.ops.aten.linear(input, weight, bias)
+
+
+# ============================================================================
+# Fused Linear + AllReduce Ops (Atomic - Backend Specific)
+# ============================================================================
+
+
+@torch.library.custom_op(
+    "auto_deploy::torch_fused_linear_all_reduce", mutates_args=(), device_types="cuda"
+)
+def torch_fused_linear_all_reduce(
+    input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
+) -> torch.Tensor:
+    """Fused linear + all_reduce using PyTorch backend.
+
+    This op always uses torch.distributed and is used in demollm mode.
+    """
+    output = torch.ops.aten.linear(input, weight, bias)
+    dist.all_reduce(output, op=dist.ReduceOp.SUM)
+    return output
+
+
+@torch_fused_linear_all_reduce.register_fake
+def torch_fused_linear_all_reduce_fake(input, weight, bias):
+    return torch.ops.aten.linear(input, weight, bias)
+
+
+@torch.library.custom_op(
+    "auto_deploy::trtllm_fused_linear_all_reduce", mutates_args=(), device_types="cuda"
+)
+def trtllm_fused_linear_all_reduce(
+    input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
+) -> torch.Tensor:
+    """Fused linear + all_reduce using TRT-LLM backend.
+
+    This op always uses TRT-LLM's optimized allreduce and is used in MPI mode.
+    """
+    output = torch.ops.aten.linear(input, weight, bias)
+    return trtllm_dist.trtllm_allreduce(output, op=dist.ReduceOp.SUM)
+
+
+@trtllm_fused_linear_all_reduce.register_fake
+def trtllm_fused_linear_all_reduce_fake(input, weight, bias):
+    return torch.ops.aten.linear(input, weight, bias)
+
+
+# ============================================================================
+# Legacy op name for backward compatibility
+# ============================================================================
 
 
 @torch.library.custom_op(
     "auto_deploy::trtllm_dist_fused_linear_all_reduce", mutates_args=(), device_types="cuda"
 )
-def fused_linear_all_reduce(
+def trtllm_dist_fused_linear_all_reduce(
     input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
 ) -> torch.Tensor:
-    """Fused linear followed by all_reduce on the output."""
+    """Legacy name for trtllm_fused_linear_all_reduce.
+
+    Kept for backward compatibility with existing code.
+    This is an alias that directly implements the same logic.
+    """
     output = torch.ops.aten.linear(input, weight, bias)
-    if trtllm_dist.is_trtllm_op_available():
-        return trtllm_dist.trtllm_allreduce(output, op=dist.ReduceOp.SUM)
-    dist.all_reduce(output, op=dist.ReduceOp.SUM)
-    return output
+    return trtllm_dist.trtllm_allreduce(output, op=dist.ReduceOp.SUM)
 
 
-@fused_linear_all_reduce.register_fake
-def fused_linear_all_reduce_fake(input, weight, bias):
+@trtllm_dist_fused_linear_all_reduce.register_fake
+def trtllm_dist_fused_linear_all_reduce_fake(input, weight, bias):
     return torch.ops.aten.linear(input, weight, bias)
