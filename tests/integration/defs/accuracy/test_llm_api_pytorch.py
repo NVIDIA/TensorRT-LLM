@@ -1685,13 +1685,15 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                            (False, False, False, True),
                            (True, False, True, True), (True, True, True, True)])
     @parametrize_with_ids("mtp_nextn", [0, 2])
-    @parametrize_with_ids("moe_backend", ["CUTLASS", "TRTLLM"])
+    @parametrize_with_ids("moe_backend", ["CUTLASS", "TRTLLM", "CUTEDSL"])
     def test_nvfp4(self, fp8kv, attention_dp, cuda_graph, overlap_scheduler,
                    torch_compile, mtp_nextn, moe_backend):
         if moe_backend == "TRTLLM" and (get_sm_version() == 120
                                         or get_sm_version() == 121):
             pytest.skip(
                 "MOE TRTLLM backend does not support SM version 120 or 121")
+        if moe_backend == "CUTEDSL" and get_sm_version() != 100:
+            pytest.skip(f"{moe_backend} backend supports SM 100 only")
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         torch_compile_config = TorchCompileConfig(
@@ -1778,7 +1780,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                                          (2, 2, 1), (1, 4, 1)],
                              ids=["tp4", "ep4", "tp2pp2", "pp4"])
     @parametrize_with_ids("mtp_nextn", [0, 2])
-    @parametrize_with_ids("moe_backend", ["CUTLASS", "TRTLLM"])
+    @parametrize_with_ids("moe_backend", ["CUTLASS", "TRTLLM", "CUTEDSL"])
     def test_nvfp4_4gpus(self, fp8kv, attention_dp, cuda_graph,
                          overlap_scheduler, tp_size, pp_size, ep_size,
                          torch_compile, mtp_nextn, moe_backend):
@@ -1788,6 +1790,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                         or get_sm_version() == 121):
             pytest.skip(
                 "MOE TRTLLM backend does not support SM version 120 or 121")
+        if moe_backend == "CUTEDSL" and get_sm_version() != 100:
+            pytest.skip(f"{moe_backend} backend supports SM 100 only")
+
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         # Picewise Cuda Graph cannot be enabled for nvfp4 attention dp.
         torch_compile_config = TorchCompileConfig(
