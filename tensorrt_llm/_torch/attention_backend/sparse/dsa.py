@@ -723,7 +723,7 @@ class Indexer(nn.Module):
             dtype=torch.float32,
             quant_config=None,
             skip_create_weights_in_init=skip_create_weights_in_init,
-            use_custom_cublas_mm=False)
+            use_custom_cublas_mm=True)
 
         self.rotary_emb = RotaryEmbedding(
             pos_embd_params.rope,
