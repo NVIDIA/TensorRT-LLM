@@ -114,6 +114,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
         def remote = [
             ip           : randomLoginNode,
             host         : randomLoginNode,
+            port         : cluster.sshPort,
             user         : "${pipeline.USERNAME}",
             passwd       : "${pipeline.PASSWORD}",
             allowAnyHosts: true,
@@ -400,6 +401,7 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String jobUID){
         def remote = [
             ip           : randomLoginNode,
             host         : randomLoginNode,
+            port         : cluster.sshPort,
             user         : "${pipeline.USERNAME}",
             passwd       : "${pipeline.PASSWORD}",
             allowAnyHosts: true,
@@ -457,6 +459,7 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String nodeName, St
         def remote = [
             ip           : randomLoginNode,
             host         : randomLoginNode,
+            port         : cluster.sshPort,
             user         : "${pipeline.USERNAME}",
             passwd       : "${pipeline.PASSWORD}",
             allowAnyHosts: true,
@@ -522,6 +525,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
             def remote = [
                     ip           : randomLoginNode,
                     host         : randomLoginNode,
+                    port         : cluster.sshPort,
                     user         : "${pipeline.USERNAME}",
                     passwd       : "${pipeline.PASSWORD}",
                     allowAnyHosts: true,
@@ -590,6 +594,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                 def remote = [
                         ip           : randomLoginNode,
                         host         : randomLoginNode,
+                        port         : cluster.sshPort,
                         user         : "${pipeline.USERNAME}",
                         passwd       : "${pipeline.PASSWORD}",
                         allowAnyHosts: true,
@@ -812,6 +817,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def remote = [
                     ip           : randomLoginNode,
                     host         : randomLoginNode,
+                    port         : cluster.sshPort,
                     user         : "${pipeline.USERNAME}",
                     passwd       : "${pipeline.PASSWORD}",
                     allowAnyHosts: true,
