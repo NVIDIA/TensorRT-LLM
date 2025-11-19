@@ -601,14 +601,11 @@ def nvfp4_gemm_cublaslt(
 ) -> torch.Tensor:
     """cuBLASLt-based NVFP4 GEMM with heuristic-based auto-tuning.
 
-    .. deprecated::
-        Use :func:`nvfp4_gemm_unified` instead for automatic backend selection
-        among CUTLASS, cuBLASLt, and CuteDSL based on performance profiling.
+    Note:
+        This function is primarily used internally by nvfp4_gemm_unified.
+        Direct usage is discouraged. Consider using nvfp4_gemm_unified instead
+        for automatic backend selection with better performance.
     """
-    logger.warning_once(
-        "nvfp4_gemm_cublaslt is deprecated. Use nvfp4_gemm_unified instead "
-        "for automatic backend selection with better performance.",
-        key="nvfp4_gemm_cublaslt_deprecated")
     tuner = AutoTuner.get()
 
     # Use CublasLt runner with heuristic-based tuning
@@ -657,14 +654,11 @@ def nvfp4_gemm(
 ) -> torch.Tensor:
     """CUTLASS-based NVFP4 GEMM with auto-tuning.
 
-    .. deprecated::
-        Use :func:`nvfp4_gemm_unified` instead for automatic backend selection
-        among CUTLASS, cuBLASLt, and CuteDSL based on performance profiling.
+    Note:
+        This function is primarily used internally by nvfp4_gemm_unified.
+        Direct usage is discouraged. Consider using nvfp4_gemm_unified instead
+        for automatic backend selection with better performance.
     """
-    logger.warning_once(
-        "nvfp4_gemm is deprecated. Use nvfp4_gemm_unified instead "
-        "for automatic backend selection with better performance.",
-        key="nvfp4_gemm_deprecated")
     tuner = AutoTuner.get()
 
     # Use Cutlass runner with predefined configs
