@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 import pandas as pd
 import yaml
@@ -8,7 +8,9 @@ from pydantic import BaseModel, Field, RootModel
 DATABASE_LIST_PATH = Path(__file__).parent / "database" / "scenario_list.yaml"
 
 
-class RecipeRecord(BaseModel):
+class RecipeConstraints(BaseModel):
+    """Recipe record for scenario list."""
+
     model: str = Field(description="Model name")
     gpu: str = Field(description="GPU name")
     isl: int = Field(description="Input sequence length")
@@ -28,7 +30,15 @@ class RecipeRecord(BaseModel):
         return pd.Series(self.model_dump())
 
 
-class RecipeList(RootModel[List[RecipeRecord]]):
+class Recipe(BaseModel):
+    """Recipe that describes a single scenario."""
+
+    constraints: RecipeConstraints = Field(description="Recipe constraints")
+    env_overrides: Dict[str, Any] = Field(description="Environment overrides", default_factory=dict)
+    config: Dict[str, Any] = Field(description="Configuration overrides", default_factory=dict)
+
+
+class RecipeList(RootModel[List[RecipeConstraints]]):
     @classmethod
     def from_yaml(cls, yaml_path: Path) -> "RecipeList":
         """Load recipe list from YAML file and validate the data.
@@ -51,7 +61,7 @@ class RecipeList(RootModel[List[RecipeRecord]]):
         """
         return pd.DataFrame([record.to_pandas_row() for record in self.root])
 
-    def __iter__(self) -> Iterator[RecipeRecord]:
+    def __iter__(self) -> Iterator[RecipeConstraints]:
         """Iterate over the recipe list.
 
         Returns:
