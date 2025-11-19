@@ -281,6 +281,7 @@ class OpenSearchDB:
     @staticmethod
     def queryBuildIdFromOpenSearchDB(job_name, last_days=DEFAULT_LOOKBACK_DAYS):
         if DISABLE_OPEN_SEARCH_DB_FOR_LOCAL_TEST:
+            print("Disabled OpenSearchDB for local test")
             return []
         if job_name in OpenSearchDB.query_build_id_cache:
             return OpenSearchDB.query_build_id_cache[job_name]
@@ -319,6 +320,7 @@ class OpenSearchDB:
         Mirrors queryBuildIdFromOpenSearchDB for PR monitoring.
         """
         if DISABLE_OPEN_SEARCH_DB_FOR_LOCAL_TEST:
+            print("Disabled OpenSearchDB for local test")
             return []
 
         cache_key = f"pr_{repo_name}"
