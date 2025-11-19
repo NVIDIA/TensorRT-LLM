@@ -1344,12 +1344,28 @@ def test_fused_moe_fp8_blockwise_cute_dsl_multi_gpu(ep_size, routing_method,
             assert r is True
 
 
+def test_fp4_quantize_pad_unpad():
+    INTERMEDIATE_SIZE = 5760
+    HIDDEN_SIZE = 2880
+    weight = torch.randn(
+        (INTERMEDIATE_SIZE, HIDDEN_SIZE), dtype=torch.bfloat16,
+        device="cuda") * 0.05
+
+    from tensorrt_llm._torch.modules.fused_moe.quantization import \
+        _fp4_quantize_pad_unpad
+    weight_nvfp4, global_scale_factor, block_scale_factor = _fp4_quantize_pad_unpad(
+        weight, (1, 1))
+    # Current we don't check anything as this is just used for debugging purpose
+
+
 @skip_pre_blackwell
+@pytest.mark.parametrize("hidden_size, intermediate_size", [(512, 512),
+                                                            (2880, 2880)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
     "moe_backend",
     [pytest.param("TRTLLM", marks=skip_blackwell_geforce), "CUTLASS"])
-def test_fused_moe_nvfp4(dtype, moe_backend):
+def test_fused_moe_nvfp4(dtype, moe_backend, hidden_size, intermediate_size):
 
     if moe_backend == "TRTLLM" and dtype == torch.float16:
         pytest.skip("TRTLLM NVFP4 MoE backend does not support float16 yet")
@@ -1366,8 +1382,8 @@ def test_fused_moe_nvfp4(dtype, moe_backend):
         SCALING_VECTOR_SIZE = 16
 
         SEQ_LEN = 4
-        HIDDEN_SIZE = 512
-        INTERMEDIATE_SIZE = 512
+        HIDDEN_SIZE = hidden_size
+        INTERMEDIATE_SIZE = intermediate_size
         NUM_EXPERTS = 4
         TOP_K = 2
         routing_method = RenormalizeMoeRoutingMethod(top_k=TOP_K)
@@ -1400,20 +1416,20 @@ def test_fused_moe_nvfp4(dtype, moe_backend):
                 w1_sf_global,
                 w3_sf_global)  # w3 global and w1 global must be the same
 
-            w1_weight_nvfp4, w1_sf_block = torch.ops.trtllm.fp4_quantize(
-                w1_weight, w3_w1_global, SCALING_VECTOR_SIZE, False)
-            w1_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
-                w1_sf_block.cpu().view(INTERMEDIATE_SIZE, -1))
+            w1_weight_nvfp4, w1_sf_block_unswizzled = torch.ops.trtllm.fp4_quantize(
+                w1_weight, w3_w1_global, SCALING_VECTOR_SIZE, False, False)
+            w1_sf_block_unswizzled = w1_sf_block_unswizzled.view(
+                INTERMEDIATE_SIZE, -1)
 
-            w2_weight_nvfp4, w2_sf_block = torch.ops.trtllm.fp4_quantize(
-                w2_weight, w2_sf_global, SCALING_VECTOR_SIZE, False)
-            w2_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
-                w2_sf_block.cpu().view(HIDDEN_SIZE, -1))
+            w2_weight_nvfp4, w2_sf_block_unswizzled = torch.ops.trtllm.fp4_quantize(
+                w2_weight, w2_sf_global, SCALING_VECTOR_SIZE, False, False)
+            w2_sf_block_unswizzled = w2_sf_block_unswizzled.view(
+                HIDDEN_SIZE, -1)
 
-            w3_weight_nvfp4, w3_sf_block = torch.ops.trtllm.fp4_quantize(
-                w3_weight, w3_w1_global, SCALING_VECTOR_SIZE, False)
-            w3_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
-                w3_sf_block.cpu().view(INTERMEDIATE_SIZE, -1))
+            w3_weight_nvfp4, w3_sf_block_unswizzled = torch.ops.trtllm.fp4_quantize(
+                w3_weight, w3_w1_global, SCALING_VECTOR_SIZE, False, False)
+            w3_sf_block_unswizzled = w3_sf_block_unswizzled.view(
+                INTERMEDIATE_SIZE, -1)
 
             w1_input_scale = x_sf_global.cuda()
             w2_input_scale = x_sf_global.cuda()
@@ -1471,6 +1487,8 @@ def test_fused_moe_nvfp4(dtype, moe_backend):
             fused_moe.forward(x, router_logits)
 
         output = fused_moe.forward(x, router_logits)
+        print(output)
+        print(ref_output)
         torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.15)
 
         if not test_all_kernels:
