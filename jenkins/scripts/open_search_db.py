@@ -372,7 +372,7 @@ class OpenSearchDB:
             return []
 
 
-print(OpenSearchDB.queryPRIdsFromOpenSearchDB("LLM/main/L0_MergeRequest_PR"))
+print(OpenSearchDB.queryBuildIdFromOpenSearchDB("LLM/main/L0_MergeRequest_PR"))
 print("OPEN_SEARCH_DB_BASE_URL: ", OPEN_SEARCH_DB_BASE_URL)
 print("OPEN_SEARCH_DB_USERNAME: ", OPEN_SEARCH_DB_USERNAME)
 print("OPEN_SEARCH_DB_PASSWORD: ", OPEN_SEARCH_DB_PASSWORD)
