@@ -1244,13 +1244,11 @@ class Indexer(nn.Module):
         weights = _scale(weights, q_scale, self.weight_scale_factor)
         return weights
 
-    def _qk_projection_and_rope(self, qr: torch.Tensor,
-                                hidden_states: torch.Tensor,
-                                indexer_k: Optional[torch.Tensor],
+    def _qk_projection_and_rope(self, qr: torch.Tensor, indexer_k: torch.Tensor,
                                 position_ids: torch.Tensor):
         """Project Q/K and apply RoPE"""
         q = self.wq_b(qr)
-        k = indexer_k if indexer_k is not None else self.wk(hidden_states)
+        k = indexer_k
         k = self.k_norm(k)
         q = q.view(-1, self.n_heads, self.head_dim)
         q_pe, q_nope = q.split([self.rope_dim, self.head_dim - self.rope_dim],
@@ -1273,13 +1271,12 @@ class Indexer(nn.Module):
     @torch.inference_mode()
     def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
                 metadata: DSAtrtllmAttentionMetadata,
-                position_ids: torch.Tensor, indexer_k: Optional[torch.Tensor]):
+                position_ids: torch.Tensor, indexer_k: torch.Tensor):
         quant_block_size = metadata.kv_cache_manager.quant_block_size
         assert quant_block_size == 128, "Only support quant_block_size = 128 for now"
 
         q_and_k, weights = maybe_execute_in_parallel(
-            lambda: self._qk_projection_and_rope(qr, hidden_states, indexer_k,
-                                                 position_ids),
+            lambda: self._qk_projection_and_rope(qr, indexer_k, position_ids),
             lambda: self.weights_proj(_to_float(hidden_states)),
             self.ln_events[0],
             self.ln_events[1],
