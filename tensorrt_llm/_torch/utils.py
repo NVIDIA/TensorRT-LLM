@@ -1,4 +1,5 @@
 import contextlib
+import os
 import threading
 from dataclasses import dataclass
 from enum import Enum, IntEnum
@@ -317,9 +318,14 @@ def create_lm_head_tp_mapping(mapping: Mapping, token_count: int) -> Mapping:
     # Since token_count=256 will hit the boundary of math-bound problem
     # We use 256 // token_count to determine the lm_head_tp_size
     lm_head_tp_size_raw = 256 // token_count
-    lm_head_tp_size = nearest_in_buckets(lm_head_tp_size_raw,
-                                         [1, mapping.gpus_per_node])
-    assert mapping.tp_size % lm_head_tp_size == 0
+    # TODO: On platforms like GB200, setting lm_head_tp_size_upper_bound to world_size could be more efficient when world_size > gpus_per_node, we need to do further investigation.
+    lm_head_tp_size_upper_bound = min(mapping.world_size, mapping.gpus_per_node)
+    lm_head_tp_size = int(
+        os.getenv(
+            'LM_HEAD_TP_SIZE',
+            nearest_in_buckets(lm_head_tp_size_raw,
+                               [1, lm_head_tp_size_upper_bound])))
+    assert mapping.tp_size % lm_head_tp_size == 0, f"mapping.tp_size: {mapping.tp_size}, lm_head_tp_size: {lm_head_tp_size}"
     lm_head_pp_size = mapping.pp_size * mapping.tp_size // lm_head_tp_size
 
     return Mapping(
