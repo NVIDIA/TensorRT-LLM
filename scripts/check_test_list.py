@@ -129,16 +129,8 @@ def check_waive_duplicates(llm_src):
         if not line:
             continue
 
-        # Skip Perf tests due to they are dynamically generated
-        if "perf/test_perf.py" in line:
-            continue
-
         # Check for SKIP marker in waives.txt and split by the first occurrence
         line = line.split(" SKIP", 1)[0].strip()
-
-        # Skip unittests due to we don't need to have an entry in test-db yml
-        if line.startswith("unittest/"):
-            continue
 
         # Track all occurrences of each processed line
         if line in dedup_lines:
@@ -238,7 +230,7 @@ def main():
                         action="store_true",
                         help="Enable test list verification for waive file.")
     parser.add_argument(
-        "--check-duplicates",
+        "--check-duplicate-waives",
         action="store_true",
         help="Enable duplicate check in waives.txt (fails if duplicates found)."
     )

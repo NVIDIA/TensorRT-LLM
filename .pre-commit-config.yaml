@@ -1460,11 +1460,6 @@ repos:
         entry: ./scripts/format_test_list.py
         language: script
         files: tests/integration/test_lists/.*\.txt$
-    -   id: waive list check
-        name: Checks for duplicated test items in waives.txt
-        entry: ./scripts/check_test_list.py --check-duplicates
-        language: script
-        pass_filenames: false
     -   id: DCO check
         name: Checks the commit message for a developer certificate of origin signature
         entry: ./scripts/dco_check.py
