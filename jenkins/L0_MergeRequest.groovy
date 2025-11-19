@@ -155,6 +155,8 @@ def globalVars = [
 boolean enableUpdateGitlabStatus =
     !testFilter[ENABLE_SKIP_TEST] &&
     !testFilter[ONLY_MULTI_GPU_TEST] &&
+    !testFilter[(DISABLE_MULTI_GPU_TEST)] &&
+    !testFilter[(DEBUG_MODE)] &&
     testFilter[GPU_TYPE_LIST] == null &&
     testFilter[TEST_STAGE_LIST] == null &&
     testFilter[TEST_BACKEND] == null
