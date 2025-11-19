@@ -881,7 +881,8 @@ class BMMShardingInfo(ShardingTransformInfo):
         # Check if the distribution is balanced
         remainder = bmm_batch_size % self.world_size
 
-        # NOTE: our torch.ops.auto_deploy.torch_dist_all_gather doesn't support uneven splits at the moment.
+        # NOTE: our torch.ops.auto_deploy.torch_dist_all_gather/trtllm_dist_all_gather
+        #  doesn't support uneven splits at the moment.
         if remainder:
             ad_logger.warning(
                 f"BMM batch size {bmm_batch_size} is not divisible by world size {self.world_size}. "
@@ -1070,7 +1071,7 @@ def _insert_sharded_mxfp4_mlp_ep(
     Transform a call to auto_deploy::triton_mxfp4_moe into:
       - sharded expert parameters along dim 0 (this rank's slice),
       - call to auto_deploy::triton_mxfp4_moe_ep(..., local_lo, local_hi),
-      - followed by torch_dist_all_reduce.
+      - followed by torch_dist_all_reduce/trtllm_dist_all_reduce.
 
     Expects the original op signature:
       (hidden_states,

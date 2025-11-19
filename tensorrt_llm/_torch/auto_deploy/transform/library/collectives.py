@@ -92,17 +92,6 @@ def _make_allreduce_residual_rmsnorm_replacement(fused_op: Callable):
 # Instantiate Pattern and Replacement Functions
 # ============================================================================
 
-# Torch backend (demollm mode)
-_allreduce_residual_rmsnorm_pattern_torch = _make_allreduce_residual_rmsnorm_pattern(
-    torch.ops.auto_deploy.torch_dist_all_reduce, add_order="residual_first"
-)
-_allreduce_residual_rmsnorm_pattern2_torch = _make_allreduce_residual_rmsnorm_pattern(
-    torch.ops.auto_deploy.torch_dist_all_reduce, add_order="x_first"
-)
-_allreduce_residual_rmsnorm_repl_torch = _make_allreduce_residual_rmsnorm_replacement(
-    torch.ops.dist.torch_fused_allreduce_residual_rmsnorm
-)
-
 # TRT-LLM backend (MPI mode)
 _allreduce_residual_rmsnorm_pattern_trtllm = _make_allreduce_residual_rmsnorm_pattern(
     torch.ops.auto_deploy.trtllm_dist_all_reduce, add_order="residual_first"
@@ -149,29 +138,7 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
         op_ignore_types = {torch.ops.aten.to.dtype: (torch.dtype,)}
         scalar_workaround = {"eps": 0.1253}
 
-        # Register BOTH torch and trtllm patterns
-        # The pattern matcher will find whichever is present in the graph
-
-        # Torch backend patterns (residual + x)
-        register_ad_pattern(
-            search_fn=_allreduce_residual_rmsnorm_pattern_torch,
-            replace_fn=_allreduce_residual_rmsnorm_repl_torch,
-            patterns=patterns,
-            dummy_args=dummy_args,
-            op_ignore_types=op_ignore_types,
-            scalar_workaround=scalar_workaround,
-        )
-
-        # Torch backend patterns (x + residual)
-        register_ad_pattern(
-            search_fn=_allreduce_residual_rmsnorm_pattern2_torch,
-            replace_fn=_allreduce_residual_rmsnorm_repl_torch,
-            patterns=patterns,
-            dummy_args=dummy_args,
-            op_ignore_types=op_ignore_types,
-            scalar_workaround=scalar_workaround,
-        )
-
+        # Register only trtllm patterns
         # TRT-LLM backend patterns (residual + x)
         register_ad_pattern(
             search_fn=_allreduce_residual_rmsnorm_pattern_trtllm,
