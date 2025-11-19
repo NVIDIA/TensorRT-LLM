@@ -11,11 +11,13 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
 from tensorrt_llm.quantization.utils.fp4_utils import (
-    float4_sf_dtype, get_reorder_rows_for_gated_act_gemm_row_indices,
+    float4_e2m1x2, float4_sf_dtype,
+    get_reorder_rows_for_gated_act_gemm_row_indices,
     get_shuffle_matrix_a_row_indices, get_shuffle_matrix_sf_a_row_indices)
 from tensorrt_llm.quantization.utils.fp8_utils import (
     resmooth_to_fp8_e8m0, transform_sf_into_required_layout)
 
+from ...utils import swizzle_sf, unswizzle_sf
 from ..linear import TensorParallelMode, load_weight_shard
 from .interface import MoEWeightLoadingMode
 
@@ -148,6 +150,20 @@ def maybe_pad_for_mxfp4(weight: torch.Tensor,
     else:
         weight = F.pad(weight, (0, col_pad_size))
     return weight
+
+
+def interleave_linear_and_gate(x: torch.Tensor,
+                               group_size: int = 64,
+                               dim: int = -1) -> torch.Tensor:
+    sizes = x.size()
+    dim = dim % x.dim()
+    assert sizes[dim] % (group_size * 2) == 0
+    prev_sizes = sizes[:dim]
+    post_sizes = sizes[dim + 1:]
+    x = x.view(*prev_sizes, 2, sizes[dim] // (group_size * 2), group_size,
+               *post_sizes)
+    x = x.transpose(dim, dim + 1).contiguous().view(*sizes)
+    return x
 
 
 class FusedMoEMethodBase(ABC):
@@ -1811,6 +1827,35 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
             fc2_weight_block=module.w2_weight_scale,
             fc2_global=module.fc2_alpha,
         )
+
+    def post_load_weights(self, module: torch.nn.Module):
+        super().post_load_weights(module)
+        if module.moe_backend == "CUTEDSL":
+            # Interleave FC1 weight and scales for GEMM1 + SwiGLU fusion.
+            w3_w1_weight = module.w3_w1_weight.data.view(float4_e2m1x2)
+            m = w3_w1_weight.size(1)
+            n = w3_w1_weight.size(2) * 2
+            w3_w1_weight_interleaved = interleave_linear_and_gate(w3_w1_weight,
+                                                                  group_size=64,
+                                                                  dim=1)
+            w3_w1_weight_interleaved = w3_w1_weight_interleaved.view(
+                module.w3_w1_weight.data.dtype)
+            module.w3_w1_weight.data.copy_(w3_w1_weight_interleaved)
+
+            w3_w1_weight_scale = module.quant_scales.fc1_weight_block.data.view(
+                float4_sf_dtype)
+            w3_w1_weight_scale_unswizzled = unswizzle_sf(
+                w3_w1_weight_scale, m, n).view(-1, m,
+                                               n // module.scaling_vector_size)
+            w3_w1_weight_scale_unswizzled_interleaved = interleave_linear_and_gate(
+                w3_w1_weight_scale_unswizzled, group_size=64, dim=1)
+            w3_w1_weight_scale_interleaved = swizzle_sf(
+                w3_w1_weight_scale_unswizzled_interleaved, m,
+                n).view(-1, m, n // module.scaling_vector_size)
+            w3_w1_weight_scale_interleaved = w3_w1_weight_scale_interleaved.view(
+                module.quant_scales.fc1_weight_block.data.dtype)
+            module.quant_scales.fc1_weight_block.data.copy_(
+                w3_w1_weight_scale_interleaved)
 
 
 class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):

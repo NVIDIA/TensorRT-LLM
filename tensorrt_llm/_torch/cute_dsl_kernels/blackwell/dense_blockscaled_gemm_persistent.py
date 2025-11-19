@@ -58,8 +58,8 @@ import torch
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack
 
-from tensorrt_llm._torch.cute_dsl_kernels.blackwell.custom_pipeline import (
-    PipelineTmaUmma, PipelineUmmaAsync)
+from .custom_pipeline import PipelineTmaUmma, PipelineUmmaAsync
+from .utils import is_power_of_2
 
 
 class Sm100BlockScaledPersistentDenseGemmKernel:
@@ -1761,7 +1761,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         if cluster_shape_mn[0] % (2 if mma_tiler_mn[0] == 256 else 1) != 0:
             is_valid = False
         # Skip invalid cluster shape
-        is_power_of_2 = lambda x: x > 0 and (x & (x - 1)) == 0
         if (cluster_shape_mn[0] * cluster_shape_mn[1] > 16
                 or cluster_shape_mn[0] <= 0 or cluster_shape_mn[1] <= 0
                 # Special cluster shape check for scale factor multicasts.

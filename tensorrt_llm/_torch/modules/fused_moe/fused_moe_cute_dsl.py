@@ -379,7 +379,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             local_num_experts=self.expert_size_per_partition,
             tile_tokens_dim=tile_size,
         )
-
         x, x_sf = torch.ops.trtllm.moe_permute(
             input=x.view(torch.float4_e2m1fn_x2),
             input_sf=x_sf,
@@ -389,7 +388,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             tile_tokens_dim=tile_size,
             top_k=self.routing_method.experts_per_token,
         )
-        x = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_blackwell(
+        x, x_sf = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_swiglu_blackwell(
             input=x.view(torch.float4_e2m1fn_x2),
             weight=self.w3_w1_weight.view(torch.float4_e2m1fn_x2),
             input_scale=x_sf.view(torch.uint8),
@@ -397,21 +396,13 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             alpha=self.quant_scales.fc1_global,
             tile_idx_to_group_idx=tile_idx_to_expert_idx,
             num_non_exiting_tiles=num_non_exiting_tiles,
+            global_sf=self.fc2_input_scale,
             num_experts=self.num_slots,
             top_k=self.routing_method.experts_per_token,
             num_local_experts=self.expert_size_per_partition,
             local_expert_offset=self.slot_start,
             tile_size=tile_size,
-            output_dtype=output_dtype,
         )
-        x, x_sf = torch.ops.trtllm.moe_swiglu_nvfp4_quantize(
-            input=x,
-            global_sf=self.fc2_input_scale,
-            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
-            num_non_exiting_tiles=num_non_exiting_tiles,
-            tile_tokens_dim=tile_size,
-        )
-
         x = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_blackwell(
             input=x.view(torch.float4_e2m1fn_x2),
             weight=self.w2_weight.view(torch.float4_e2m1fn_x2),

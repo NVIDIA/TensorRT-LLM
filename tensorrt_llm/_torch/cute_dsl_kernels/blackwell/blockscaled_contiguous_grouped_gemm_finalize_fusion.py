@@ -39,6 +39,8 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from .utils import is_power_of_2
+
 """
 High-performance persistent blockscaled contiguous grouped dense GEMM (C = alpha * (SFA * A) * (SFB * B)) example for
 the NVIDIA Blackwell architecture using CUTE DSL.
@@ -2060,9 +2062,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             is_valid = False
 
         # Skip invalid cluster shape
-        def is_power_of_2(x: int) -> bool:
-            return x > 0 and (x & (x - 1)) == 0
-
         if (
             cluster_shape_mn[0] * cluster_shape_mn[1] > 16
             or cluster_shape_mn[0] <= 0
