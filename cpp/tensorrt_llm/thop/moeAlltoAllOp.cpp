@@ -31,7 +31,7 @@ namespace torch_ext
 namespace mnnvl_throughput
 {
 
-// TODO: Is Alignment necessary?obu guo
+// TODO: Is Alignment necessary?
 // Helper function to align offset to specified byte boundary
 inline size_t alignOffset(size_t offset, size_t alignment)
 {
