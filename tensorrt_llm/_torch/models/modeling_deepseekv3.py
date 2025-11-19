@@ -239,7 +239,53 @@ class DeepseekV3WeightLoader:
 
             return kv_b_proj, k_nope_weight_trans
 
-        def load_kv_b_proj_and_k_b_proj_nvfp4(module_name: str,
+        def load_kv_b_proj_and_k_b_proj_trans_for_fp8_per_tensor(
+                module_name: str) -> torch.Tensor:
+            """
+            Load kv_b_proj and k_b_proj_trans for FP8 per-tensor quantization.
+            Similar to load_kv_b_proj_and_k_b_proj_trans but for FP8 weights.
+            Returns:
+                kv_b_proj: concatenated weight for context phase
+                k_b_proj_trans: transposed k weight [num_heads, kv_lora_rank, qk_nope_head_dim]
+            """
+            weight_name = "weight"
+            local_qk_nope_head_dim = qk_nope_head_dim
+            local_v_head_dim = v_head_dim
+            local_kv_lora_rank = kv_lora_rank
+
+            kv_b_proj = weights[f"{module_name}.{weight_name}"][:].unflatten(
+                0,
+                [
+                    num_heads,
+                    local_qk_nope_head_dim + local_v_head_dim,
+                ],
+            )
+
+            if not self.model_config.mapping.enable_attention_dp:
+                kv_b_proj = split_matrix_tp(kv_b_proj, tp_size, tp_rank, 0)
+            k_nope_weight, v_weight = kv_b_proj.split(
+                [local_qk_nope_head_dim, local_v_head_dim],
+                dim=1,
+            )
+            weight_divisor = 1 if self.model_config.mapping.enable_attention_dp else tp_size
+            local_num_heads = num_heads // weight_divisor
+
+            # Transpose k_nope_weight: [num_heads, qk_nope_head_dim, kv_lora_rank] 
+            # -> [num_heads, kv_lora_rank, qk_nope_head_dim]
+            k_nope_weight_trans = k_nope_weight.transpose(2, 1).contiguous()
+
+            # Concatenate for context phase
+            kv_b_proj = torch.concat([
+                k_nope_weight.reshape(local_num_heads * local_qk_nope_head_dim,
+                                      local_kv_lora_rank),
+                v_weight.reshape(local_num_heads * local_v_head_dim,
+                                 local_kv_lora_rank)
+            ],
+                                     dim=0)
+
+            return kv_b_proj, k_nope_weight_trans
+
+        def load_kv_b_proj_and_k_b_proj_for_nvfp4(module_name: str,
                                               weight_name: str) -> torch.Tensor:
             if weight_name == "weight":
                 local_qk_nope_head_dim = qk_nope_head_dim
@@ -338,7 +384,7 @@ class DeepseekV3WeightLoader:
 
             return k_b_proj, v_b_proj
 
-        def split_kv_b_proj_nvfp4(kv_b_proj: torch.Tensor) -> torch.Tensor:
+        def split_kv_b_proj_for_nvfp4_or_fp8_per_tensor(kv_b_proj: torch.Tensor) -> torch.Tensor:
             local_qk_nope_head_dim = qk_nope_head_dim
             local_v_head_dim = v_head_dim
 
@@ -384,9 +430,21 @@ class DeepseekV3WeightLoader:
                                    self.config.num_hidden_layers)
                     name = '.'.join(names)
                 if names[-1] == "kv_b_proj":
-                    nvfp4_kv_b_proj = self.model_config.get_quant_config(
-                    ).layer_quant_mode.has_nvfp4() and weights[
-                        f"{name}.weight"].dtype == fp4_utils.float4_e2m1x2
+                    global_quant_config = self.model_config.get_quant_config()
+                    if global_quant_config.quant_algo == QuantAlgo.MIXED_PRECISION:
+                        # Check if this layer has a specific quant config
+                        if self.model_config.quant_config_dict and name in self.model_config.quant_config_dict:
+                            layer_quant_config = self.model_config.get_quant_config(name)
+                            layer_quant_mode = layer_quant_config.layer_quant_mode
+                        else:
+                            # Layer is not quantized, use global quant mode (will go to else branch)
+                            layer_quant_mode = global_quant_config.layer_quant_mode
+                    else:
+                        layer_quant_mode = global_quant_config.layer_quant_mode
+                    
+                    nvfp4_kv_b_proj = layer_quant_mode.has_nvfp4() and weights[f"{name}.weight"].dtype == fp4_utils.float4_e2m1x2
+                    fp8_per_tensor_kv_b_proj = layer_quant_mode.has_fp8_qdq() and weights[f"{name}.weight"].dtype == torch.float8_e4m3fn
+                    
 
                     if nvfp4_kv_b_proj:
                         ########### input_scale
@@ -405,18 +463,18 @@ class DeepseekV3WeightLoader:
                         ########### weights: kv_b_proj and k_b_proj and v_b_proj
                         # will transpose and copy k_b_proj later
                         # will copy v_b_proj later
-                        kv_b_proj, k_b_proj = load_kv_b_proj_and_k_b_proj_nvfp4(
+                        kv_b_proj, k_b_proj = load_kv_b_proj_and_k_b_proj_for_nvfp4(
                             name, "weight")
-                        _, v_b_proj = split_kv_b_proj_nvfp4(module.weight.data)
+                        _, v_b_proj = split_kv_b_proj_for_nvfp4_or_fp8_per_tensor(module.weight.data)
                         module.weight.data.copy_(
                             kv_b_proj.reshape(module.weight.shape))
 
                         ########### weight_scale: kv_b_proj_scale and k_b_proj_scale and v_b_proj_scale
                         # load and copy kv_b_proj_scale to module, because it is used in context phrase
-                        kv_b_proj_scale, k_b_proj_scale = load_kv_b_proj_and_k_b_proj_nvfp4(
+                        kv_b_proj_scale, k_b_proj_scale = load_kv_b_proj_and_k_b_proj_for_nvfp4(
                             name, "weight_scale")
 
-                        _, v_b_proj_scale = split_kv_b_proj_nvfp4(
+                        _, v_b_proj_scale = split_kv_b_proj_for_nvfp4_or_fp8_per_tensor(
                             kv_b_proj_scale)
                         kv_b_proj_scale = torch.ops.trtllm.block_scale_interleave(
                             kv_b_proj_scale.view(fp4_utils.float4_sf_dtype))
@@ -467,7 +525,39 @@ class DeepseekV3WeightLoader:
                                 attn_module.k_b_proj_trans.shape))
                         attn_module.v_b_proj = nn.Parameter(v_b_proj,
                                                             requires_grad=False)
+                    elif fp8_per_tensor_kv_b_proj:
+                        ##### for fp8 per tensor scaling
+                        # Load weights for kv_b_proj
+                        kv_b_proj, k_b_proj_trans = load_kv_b_proj_and_k_b_proj_trans_for_fp8_per_tensor(name)
+                        module.weight.data.copy_(
+                            kv_b_proj.reshape(module.weight.shape))
+
+                        # Load weights for k_b_proj_trans
+                        attn_module = all_named_modules[parent_module_name]
+                        attn_module.k_b_proj_trans.data.copy_(
+                            k_b_proj_trans.reshape(
+                                attn_module.k_b_proj_trans.shape))
+
+                        # Load weights for v_b_proj
+                        _, v_b_proj = split_kv_b_proj_for_nvfp4_or_fp8_per_tensor(module.weight.data)
+                        attn_module.v_b_proj = nn.Parameter(v_b_proj,
+                                                            requires_grad=False)
+
+                        # Load weight_scale for kv_b_proj, k_b_proj_trans and v_b_proj
+                        if f"{name}.weight_scale" in weights:
+                            weight_scale = weights[f"{name}.weight_scale"]
+                            module.weight_scale.data.copy_(weight_scale)
+                            attn_module.k_b_proj_trans_scale.data.copy_(module.weight_scale)
+                            attn_module.v_b_proj_scale.data.copy_(module.weight_scale)
+                        
+                        # Assume input_scale = 1.0 for kv_b_proj k_b_proj_trans and v_b_proj
+                        module.input_scale.data.fill_(1.0)
+                        module.inv_input_scale.data.fill_(1.0)
+                        attn_module.k_b_proj_trans_input_scale.data.fill_(1.0)
+                        attn_module.v_b_proj_input_scale.data.fill_(1.0)
+
                     else:
+                        ##### for fp8 block scaling
                         # TODO: remove weight_dequant after enabling fp8_bmm
                         dequant_kv_b_proj = self.model_config.quant_config.is_module_excluded_from_quantization(
                             names[-1])
@@ -526,10 +616,26 @@ class DeepseekV3WeightLoader:
                                 ).view(*attn_module.v_b_proj_dequant.shape).to(
                                     attn_module.v_b_proj_dequant.dtype))
                 elif names[-1] == "kv_a_proj_with_mqa":
-                    nvfp4_fused_a = self.model_config.get_quant_config(
-                    ).layer_quant_mode.has_nvfp4() and weights[
-                        f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight"].dtype == fp4_utils.float4_e2m1x2 and weights[
-                            f"{'.'.join(names[:-1])}.q_a_proj.weight"].dtype == fp4_utils.float4_e2m1x2
+                    global_quant_config = self.model_config.get_quant_config()
+                    if global_quant_config.quant_algo == QuantAlgo.MIXED_PRECISION:
+                        # Check if this layer has a specific quant config
+                        if self.model_config.quant_config_dict and name in self.model_config.quant_config_dict:
+                            layer_quant_config = self.model_config.get_quant_config(name)
+                            layer_quant_mode = layer_quant_config.layer_quant_mode
+                        else:
+                            # Layer is not quantized, use global quant mode (will go to else branch)
+                            layer_quant_mode = global_quant_config.layer_quant_mode
+                    else:
+                        layer_quant_mode = global_quant_config.layer_quant_mode
+                    
+                    # Check if both q_a_proj and kv_a_proj_with_mqa are NVFP4 (or only kv_a_proj_with_mqa for lite mode)
+                    kv_a_is_nvfp4 = weights[f"{name}.weight"].dtype == fp4_utils.float4_e2m1x2
+                    if not is_lite:
+                        q_a_is_nvfp4 = weights[f"{'.'.join(names[:-1])}.q_a_proj.weight"].dtype == fp4_utils.float4_e2m1x2
+                        nvfp4_fused_a = layer_quant_mode.has_nvfp4() and kv_a_is_nvfp4 and q_a_is_nvfp4
+                    else:
+                        nvfp4_fused_a = layer_quant_mode.has_nvfp4() and kv_a_is_nvfp4
+
                     if nvfp4_fused_a:
                         ########### input_scale
                         kv_a_proj_with_mqa_input_scale = weights[

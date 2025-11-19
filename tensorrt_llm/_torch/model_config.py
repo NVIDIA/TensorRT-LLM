@@ -194,11 +194,11 @@ class ModelConfig(Generic[TConfig]):
         return False
 
     def get_quant_config(self, name: Optional[str] = None) -> QuantConfig:
-        if name is None or self.per_layer_quant_configs is None:
+        if name is None or self.quant_config_dict is None:
             return self.quant_config
 
-        if name in self.per_layer_quant_configs:
-            return self.per_layer_quant_configs[name]
+        if name in self.quant_config_dict:
+            return self.quant_config_dict[name]
 
         raise ValueError(f'quant config of {name} is not found')
 
