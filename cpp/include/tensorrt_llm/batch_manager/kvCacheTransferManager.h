@@ -63,6 +63,25 @@ private:
         BlockPtr const& block, std::vector<KVCacheBlockPool> const& pools, size_t poolIdx);
 
     /*!
+     * \brief Synchronize pending onboard transfers for the given blocks.
+     *
+     * \details For the src block (offloadedBlock), we wait for any pending
+     *          writes before reading from it. For the dst block (block), we
+     *          wait for any pending reads and writes before overwriting it.
+     * \param offloadedBlock    Offloaded block (to be onboarded)
+     * \param block             Block (to be copied content onto)
+     */
+    void syncPendingOnboardTransfers(BlockPtr const& offloadedBlock, BlockPtr const& block);
+
+    /*!
+     * \brief Record pending onboard transfers for the given blocks.
+     *
+     * \param offloadedBlock    Offloaded block (to be onboarded)
+     * \param block             Block (to be copied content onto)
+     */
+    void recordPendingOnboardTransfers(BlockPtr const& offloadedBlock, BlockPtr const& block);
+
+    /*!
      * \brief The key method that copies the src block to the dst block.
      *
      * \param src             Source block
@@ -78,6 +97,15 @@ private:
     void copyBlock(BlockPtr const& src, BlockPtr const& dst, std::vector<KVCacheBlockPool> const& pools, bool isOffload,
         int numTokensToCopy = 0, executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM,
         std::string const& directory = "");
+
+    /*!
+     * \brief Directly copy a block from gpu to gpu.
+     *
+     * \param src             Source block
+     * \param dst             Destination block
+     * \param pools           Pools describing memory layout for KV blocks
+     */
+    void copyBlockGPUToGPU(BlockPtr const& src, BlockPtr const& dst, std::vector<KVCacheBlockPool> const& pools);
 
     runtime::BufferManager mBufferManager;
     runtime::BufferManager mOnboardManager;

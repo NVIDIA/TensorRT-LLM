@@ -97,6 +97,19 @@ tr::ITensor::SharedPtr KVCacheTransferManager::computeBlockPointer(
     return blockTensor;
 }
 
+// Directly copy a block from gpu to gpu without using the buffer manager.
+void KVCacheTransferManager::copyGPUtoGPU(
+    BlockPtr const& src, BlockPtr const& dst, std::vector<KVCacheBlockPool> const& pools)
+{
+    for (size_t poolIdx = 0; poolIdx < pools.size(); ++poolIdx)
+    {
+        auto srcPtr = computeBlockPointer(src, pools, poolIdx);
+        auto dstPtr = computeBlockPointer(dst, pools, poolIdx);
+        mBufferManager.copy(*srcPtr, *dstPtr);
+    }
+    TLLM_LOG_DEBUG("GPU-to-GPU copy for from block %d to block %d", src->getBlockId(), dst->getBlockId());
+}
+
 void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
     std::vector<KVCacheBlockPool> const& pools, bool isOffload, int numTokensToCopy, executor::KvCacheTransferMode mode,
     std::string const& directory)
@@ -241,9 +254,7 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
 // Failing to do so will lead to corrupted blocks eventually.
 //
 
-void KVCacheTransferManager::onboard(BlockPtr const& offloadedBlock, BlockPtr const& block,
-    std::vector<KVCacheBlockPool> const& pools, int numTokensToCopy, executor::KvCacheTransferMode mode,
-    std::string const& directory)
+void KVCacheTransferManager::syncPendingOnboardTransfers(BlockPtr const& offloadedBlock, BlockPtr const& block)
 {
     // Wait for any pending writes before reading from offloadedBlock
     auto offloadedBlockPendingWriteItr = mPendingWrites.find(offloadedBlock->getMemoryPoolBlockIndex());
@@ -266,15 +277,33 @@ void KVCacheTransferManager::onboard(BlockPtr const& offloadedBlock, BlockPtr co
         mOnboardManager.getStream().wait(blockPendingWriteItr->second);
         mPendingWrites.erase(blockPendingWriteItr);
     }
+}
 
-    copyBlock(offloadedBlock, block, pools, false, numTokensToCopy, mode, directory);
-
+void KVCacheTransferManager::recordPendingOnboardTransfers(BlockPtr const& offloadedBlock, BlockPtr const& block)
+{
     // Record new pending read from offloadedBlock
     mPendingReads[offloadedBlock->getMemoryPoolBlockIndex()] = tr::CudaEvent();
     mOnboardManager.getStream().record(mPendingReads[offloadedBlock->getMemoryPoolBlockIndex()]);
     // Record new pending write to block
     mPendingWrites[block->getMemoryPoolBlockIndex()] = tr::CudaEvent();
     mOnboardManager.getStream().record(mPendingWrites[block->getMemoryPoolBlockIndex()]);
+}
+
+void KVCacheTransferManager::onboard(BlockPtr const& offloadedBlock, BlockPtr const& block,
+    std::vector<KVCacheBlockPool> const& pools, int numTokensToCopy, executor::KvCacheTransferMode mode,
+    std::string const& directory)
+{
+    syncPendingOnboardTransfers(offloadedBlock, block);
+    copyBlock(offloadedBlock, block, pools, false, numTokensToCopy, mode, directory);
+    recordPendingOnboardTransfers(offloadedBlock, block);
+}
+
+void KVCacheTransferManager::copyBlockGPUToGPU(
+    BlockPtr const& offloadedBlock, BlockPtr const& block, std::vector<KVCacheBlockPool> const& pools)
+{
+    syncPendingOnboardTransfers(offloadedBlock, block);
+    copyGPUtoGPU(offloadedBlock, block, pools);
+    recordPendingOnboardTransfers(offloadedBlock, block);
 }
 
 void KVCacheTransferManager::offload(BlockPtr const& block, BlockPtr const& offloadBlock,

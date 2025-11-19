@@ -1133,10 +1133,6 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.skip(
-        reason=
-        "Currently failing due to accuracy drop, https://nvbugspro.nvidia.com/bug/5625990"
-    )
     def test_auto_dtype_vswa_reuse_low_memory_available_partial_reuse(self):
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(

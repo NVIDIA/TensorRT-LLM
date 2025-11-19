@@ -672,6 +672,8 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     , mReusedTokens{0.0}
     , mTotalInputTokens{0.0}
     , mEnablePartialReuse{enablePartialReuse}
+    , mCopiedReusedPartialBlocks{0}
+    , mDirectlyReusedPartialBlocks{0}
     , mCopyOnPartialReuse{copyOnPartialReuse}
     , mKvCacheConnectorManager{std::move(kvCacheConnectorManager)}
     , mEnableIndexerKCache{enableIndexerKCache}
@@ -765,6 +767,9 @@ WindowBlockManager::~WindowBlockManager()
     TLLM_LOG_DEBUG("%s - reused tokens:                       %.0f ", mLogPrefix.c_str(), mReusedTokens);
     TLLM_LOG_DEBUG("%s - reused tokens percentage (%%):        %.2f ", mLogPrefix.c_str(),
         100.0 * mReusedTokens / mTotalInputTokens);
+    TLLM_LOG_DEBUG("%s - copied reused partial blocks:          %lu  ", mLogPrefix.c_str(), mCopiedReusedPartialBlocks);
+    TLLM_LOG_DEBUG(
+        "%s - directly reused partial blocks:        %lu  ", mLogPrefix.c_str(), mDirectlyReusedPartialBlocks);
 }
 
 bool BlockManager::verifyQueueIntegrity(SizeType32 windowSize)
@@ -1246,7 +1251,7 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
                     // Somebody else is using block or it is not a leaf, copy reusable tokens
                     auto newBlock = getFreeBlock(
                         sequence, matchingBlock->getPriority(), matchingBlock->getDurationMs(), mode, directory);
-                    mTransferManager->onboard(matchingBlock, newBlock, mPools, numMatched, mode, directory);
+                    mTransferManager->copyBlockGPUToGPU(matchingBlock, newBlock, mPools);
                     // TODO: (optional) Send out event
                     matchingBlock = newBlock;
                     if (blockItr != blockKeys.end())
@@ -1257,6 +1262,7 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
                     matchingBlock->setHash();
                     TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Copied partially filled block %d", mLogPrefix.c_str(),
                         matchingBlockId);
+                    ++mCopiedReusedPartialBlocks;
                 }
                 else
                 {
@@ -1266,6 +1272,7 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
                         matchingBlock, perBlockRetentions[bi].retentionPriority, perBlockRetentions[bi].durationMs);
                     TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Reused partially filled block %d", mLogPrefix.c_str(),
                         matchingBlockId);
+                    ++mDirectlyReusedPartialBlocks;
                 }
                 searchRoot = nullptr; // no matching needed for following blocks
             }

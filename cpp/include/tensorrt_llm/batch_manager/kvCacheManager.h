@@ -995,6 +995,10 @@ private:
     double mTotalInputTokens;
     // Whether blocks that are partially matched should be reused.
     bool mEnablePartialReuse;
+    // Number of partial matched blocks reused through a copy
+    SizeType32 mCopiedReusedPartialBlocks;
+    // Number of partial matched blocks reused directly without a copy
+    SizeType32 mDirectlyReusedPartialBlocks;
     // Whether partially matched blocks that are already in use should be copied and reused.
     bool mCopyOnPartialReuse;
     // The kv cache connector manager
