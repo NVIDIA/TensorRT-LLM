@@ -441,7 +441,18 @@ class ModelDrafter(Drafter):
                     req.py_request_id] = [0] * self.max_total_draft_tokens
             self.draft_tokens_accumulator[req.py_request_id][
                 draft_position - 1] = req.get_last_tokens(0)
-            target_model_req.py_draft_logits = req.py_result.generation_logits  # forwards Nones
+
+            generation_logits = req.py_result.generation_logits  # forwards Nones
+            if generation_logits is not None:
+                # generation_logits returns [beam_width, seq_length, vocab_size]
+                beam_width = generation_logits.size(0)
+                assert beam_width == 1, f"expected beam_width=1, got {beam_width}"
+                generation_logits.squeeze_(0)
+                # Transfer to CUDA if needed (chunked LogitsStorage stores on CPU)
+                if generation_logits.device.type == 'cpu':
+                    generation_logits = generation_logits.to('cuda',
+                                                             non_blocking=True)
+            target_model_req.py_draft_logits = generation_logits
 
             if req.state != LlmRequestState.GENERATION_COMPLETE and draft_position < target_model_req.py_draft_pages_allocated:
                 new_requests.append(req)

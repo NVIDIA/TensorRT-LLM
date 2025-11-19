@@ -73,16 +73,14 @@ transforms:
     stage: pattern_matcher
   quantize_mxfp4_moe:
     stage: pattern_matcher
-  # TODO: Infer sharding parameters (tp_size, row/column sharding) from the model config.
   detect_sharding:
     stage: sharding
     simple_shard_only: false
-    sharding_source: ['heuristic']
+    sharding_source: ['factory','heuristic']
     support_partial_config: true
     sharding_dims: ['tp', 'ep', 'bmm']
     allreduce_strategy: 'AUTO'
     requires_shape_prop: true
-  # TODO: (hg) need to ensure run_shape_prop after sharding.
   sharding_transform_executor:
     stage: sharding
     run_shape_prop: true

@@ -236,8 +236,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "fp4_quantize(Tensor input, Tensor? globalScale, int sfVecSize, bool sfUseUE8M0=False, bool "
-        "isSfSwizzledLayout=True) "
-        "-> (Tensor, Tensor)");
+        "isSfSwizzledLayout=True) -> (Tensor, Tensor)");
     m.def("calculate_nvfp4_global_scale(Tensor input, Tensor? tokensPerBatch) -> Tensor");
 }
 
