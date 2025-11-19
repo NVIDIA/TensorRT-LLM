@@ -200,7 +200,6 @@ class ShardingTransformConfig(TransformConfig):
     sharding_dims: List[ShardingDim] = Field(
         default_factory=lambda: [ShardingDim.SSM, ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
     )
-    process_grid: Dict[ShardingDim, int] = Field(default_factory=dict)
 
 
 @TransformRegistry.register("detect_sharding")
@@ -1052,9 +1051,42 @@ def detect_dp_bmm_shard(
     )
 
 
-def detect_ep_shard(
-    gm: GraphModule, transform_container: ShardingTransformContainer
-) -> TransformInfo:
+def get_process_grid_from_config(
+    sharding_config: ShardingTransformContainer, rank: int, world_size: int
+) -> Tuple[int, int]:
+    if len(sharding_config.process_grid) > 0:
+        ad_logger.info(f"EP + TP sharding process grid: {sharding_config.process_grid}")
+        ep_size = sharding_config.process_grid[ShardingDim.EP]
+        tp_size = sharding_config.process_grid[ShardingDim.TP]
+        # the order of the keys (ep,tp) vs (tp,ep) determines how ranks
+        # are mapped to the 2D process grid
+        if list(sharding_config.process_grid.keys())[-1] == ShardingDim.TP:
+            tp_rank = rank % tp_size
+            ep_rank = rank // tp_size
+        else:
+            tp_rank = rank // ep_size
+            ep_rank = rank % ep_size
+
+        if ep_size * tp_size != world_size:
+            ad_logger.warning(
+                f"EP + TP sharding process grid {sharding_config.process_grid} "
+                f"does not match world size {world_size}. "
+                f"Skipping 2D sharding, applying only 1D EP sharding."
+            )
+            return None
+    else:
+        ep_size = world_size
+        tp_size = 1
+        ep_rank = rank
+        tp_rank = 0
+    process_grid = {
+        ShardingDim.EP: {"p": ep_rank, "w": ep_size},
+        ShardingDim.TP: {"p": tp_rank, "w": tp_size},
+    }
+    return process_grid
+
+
+def detect_ep_shard(gm: GraphModule, sharding_config: ShardingTransformContainer) -> TransformInfo:
     ad_logger.debug("Before sharding graph: " + str(gm))
 
     rank, world_size = transform_container.rank, transform_container.world_size
@@ -1062,15 +1094,6 @@ def detect_ep_shard(
         ad_logger.info("Skipping EP sharding for single device")
         return TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
 
-    if len(sharding_config.process_grid) > 0:
-        ad_logger.info(f"EP + TP sharding process grid: {sharding_config.process_grid}")
-        if torch.tensor(list(sharding_config.process_grid.values())).prod() != world_size:
-            ad_logger.warning(
-                f"EP + TP sharding process grid {sharding_config.process_grid} "
-                f"does not match world size {world_size}. "
-                f"Skipping 2D sharding, applying only 1D EP sharding."
-            )
-            sharding_config.process_grid = {}
     assert isinstance(gm, GraphModule), "Expecting GraphModule"
     num_moe_patterns = 0
     for node in list(gm.graph.nodes):
@@ -1081,7 +1104,6 @@ def detect_ep_shard(
                 node,
                 rank=rank,
                 world_size=world_size,
-                process_grid=sharding_config.process_grid,
             )
         ):
             num_moe_patterns += 1

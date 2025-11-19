@@ -688,8 +688,7 @@ class ShardingTransformInfo(BaseModel, ABC):
     model_config = ConfigDict(frozen=True)  # Makes the model immutable and hashable
 
     target_node: str
-    rank: int
-    world_size: int
+    config: ShardingConfig
 
     def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
         """
@@ -1095,7 +1094,6 @@ def _insert_sharded_moe(
     allreduce_strategy: AllReduceStrategy,
     dist_backend: str,
     scale_names: Sequence[str] = (),
-    process_grid: Dict[ShardingDim, int] = {},
 ):
     """Update the torch_moe node with sharded weight lists or stacked tensors,
     sharded `selected_experts` and `final_scales(router_logics)`.
@@ -1157,33 +1155,23 @@ def _insert_sharded_moe(
         num_experts = len(w1_weight_arg)
     else:
         raise ValueError(f"Unexpected w1_weight format in node {node.name}: {type(w1_weight_arg)}")
+    # get 2D EP+TP process grid and corresponding ranks
+    ep_rank = config.process_grid[ShardingDim.EP]["p"]
+    ep_size = config.process_grid[ShardingDim.EP]["w"]
+    tp_rank = config.process_grid[ShardingDim.TP]["p"]
+    tp_size = config.process_grid[ShardingDim.TP]["w"]
+    print(f"ep_rank: {ep_rank}, ep_size: {ep_size}, tp_rank: {tp_rank}, tp_size: {tp_size}")
+    num_experts = len(node.args[3])
     args = list(node.args)
 
     # -- Handle selected_experts and final_scales sharding --
     selected_experts = args[1]
     final_scales = args[2]
 
-    if len(process_grid) > 0:
-        ep_size = process_grid[ShardingDim.EP]
-        tp_size = process_grid[ShardingDim.TP]
-        # the order of the keys (ep,tp) vs (tp,ep) determines how ranks
-        # are mapped to the 2D process grid
-        if list(process_grid.keys())[-1] == ShardingDim.TP:
-            tp_rank = rank % tp_size
-            ep_rank = rank // tp_size
-        else:
-            tp_rank = rank // ep_size
-            ep_rank = rank % ep_size
-    else:
-        ep_size = world_size
-        tp_size = 1
-        ep_rank = rank
-        tp_rank = 0
-
     experts_per_rank = num_experts // ep_size
 
     with gm.graph.inserting_before(node):
-        lower = experts_per_rank * rank
+        lower = experts_per_rank * ep_rank
         # selected_experts_local = selected_experts - low
         selected_experts_local = gm.graph.create_node(
             "call_function", operator.sub, args=(selected_experts, lower), kwargs={}
@@ -1199,7 +1187,9 @@ def _insert_sharded_moe(
             "call_function", operator.floordiv, args=(selected_experts, experts_per_rank), kwargs={}
         )
         comp_op = torch.ge if ep_rank == ep_size - 1 else torch.eq
-        rank_mask = gm.graph.create_node("call_function", comp_op, args=(div_node, rank), kwargs={})
+        rank_mask = gm.graph.create_node(
+            "call_function", comp_op, args=(div_node, ep_rank), kwargs={}
+        )
 
         # final_scales_local = final_scales * rank_mask
         final_scales_local = gm.graph.create_node(
@@ -1207,20 +1197,33 @@ def _insert_sharded_moe(
         )
 
     # -- Shard expert weights --
-    def get_partition(lst, ep_size, ep_rank):
+    def get_partition(lst, world_size, rank):
         num_experts = len(lst)
-        expert_size_per_partition = num_experts // ep_size
-        expert_start = ep_rank * expert_size_per_partition
+        expert_size_per_partition = num_experts // world_size
+        expert_start = rank * expert_size_per_partition
         # For num_experts % world_size != 0 case,
         # assign the last (num_experts % world_size) experts to the last rank
         expert_end = (
-            num_experts if (ep_rank == ep_size - 1) else expert_start + expert_size_per_partition
+            num_experts if (rank == world_size - 1) else expert_start + expert_size_per_partition
         )
         return lst[expert_start:expert_end]
 
     w1_list_sharded = get_partition(args[3], ep_size, ep_rank)
     w2_list_sharded = get_partition(args[4], ep_size, ep_rank)
     w3_list_sharded = get_partition(args[5], ep_size, ep_rank)
+
+    # if tp_size > 1, we do 2D EP+TP sharding.
+    # we add TP sharding of all expert weights.
+    # for w1 in w1_list_sharded:
+    #     shard_weight_tensor(
+    #         gm=gm,
+    #         weight_tensor=w1,
+    #         param_key=weight_key,
+    #         dim=ShardingDimension.COLUMN,
+    #         rank=tp_rank,
+    #         world_size=tp_size,
+    #         min_local_shape=1,
+    #     )
 
     # -- Update args --
     args[1] = selected_experts_local
@@ -1236,7 +1239,6 @@ def _insert_sharded_moe(
     ad_logger.debug(
         f"Updated node {node}: replaced original arguments {node.args} with sharded arguments {args}."
     )
-    ad_logger.debug(f"TP rank: {tp_rank}, EP rank: {ep_rank}")
     node.args = tuple(args)
 
     # -- add an all_reduce node --
