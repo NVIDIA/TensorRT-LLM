@@ -30,27 +30,11 @@ from tensorrt_llm._torch.models.modeling_utils import (
 from tensorrt_llm._torch.modules.attention import Attention
 from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
 from tensorrt_llm._torch.modules.embedding import Embedding
+from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm.functional import PositionEmbeddingType
-
-
-class Starcoder2LayerNorm(nn.LayerNorm):
-    """
-    Custom LayerNorm that skips weight initialization to support meta tensor initialization.
-
-    StarCoder2ForCausalLM inherits from DecoderModelForCausalLM which uses the PostInitCaller
-    metaclass to enable meta tensor initialization (memory optimization). During model construction
-    with meta tensors, PyTorch's nn.LayerNorm.reset_parameters() tries to initialize weights with
-    ones_() which fails on meta tensors. This class skips that initialization step.
-
-    The weights will be properly initialized later when loaded from the HuggingFace checkpoint.
-    """
-
-    def reset_parameters(self) -> None:
-        # Skip initialization operations that conflict with meta tensor initialization
-        pass
 
 
 class Starcoder2Attention(Attention):
@@ -139,16 +123,18 @@ class Starcoder2DecoderLayer(DecoderLayer):
             raise ValueError(f"Unsupported mlp_type: {config.mlp_type}")
 
         norm_eps = getattr(config, "norm_epsilon", 1e-5)
-        self.input_layernorm = Starcoder2LayerNorm(
-            config.hidden_size,
+        self.input_layernorm = LayerNorm(
+            hidden_size=config.hidden_size,
             eps=norm_eps,
             dtype=config.torch_dtype,
+            has_bias=True,  # StarCoder2 uses bias in layer norm
         )
 
-        self.post_attention_layernorm = Starcoder2LayerNorm(
-            config.hidden_size,
+        self.post_attention_layernorm = LayerNorm(
+            hidden_size=config.hidden_size,
             eps=norm_eps,
             dtype=config.torch_dtype,
+            has_bias=True,  # StarCoder2 uses bias in layer norm
         )
 
     def forward(
@@ -164,10 +150,7 @@ class Starcoder2DecoderLayer(DecoderLayer):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = (
-                self.input_layernorm(hidden_states + residual),
-                hidden_states + residual,
-            )
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         # Self Attention
         hidden_states = self.self_attn(
@@ -178,9 +161,7 @@ class Starcoder2DecoderLayer(DecoderLayer):
         )
 
         # Fully Connected (MLP)
-        hidden_states = hidden_states + residual
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
 
         if spec_metadata is not None:
@@ -219,10 +200,11 @@ class Starcoder2Model(DecoderModel):
 
         # Use norm_epsilon (Starcoder2Config attribute name)
         norm_eps = getattr(config, "norm_epsilon", 1e-5)
-        self.norm = Starcoder2LayerNorm(
-            config.hidden_size,
+        self.norm = LayerNorm(
+            hidden_size=config.hidden_size,
             eps=norm_eps,
             dtype=config.torch_dtype,
+            has_bias=True,  # StarCoder2 uses bias in layer norm
         )
 
     def forward(
@@ -256,7 +238,8 @@ class Starcoder2Model(DecoderModel):
                 lora_params=lora_params,
             )
 
-        hidden_states = self.norm(hidden_states + residual)
+        # Use LayerNorm's built-in residual connection support
+        hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
