@@ -58,6 +58,9 @@ parser.add_argument("--batch-size-list", type=comma_separated_ints)
 parser.add_argument("--seq-len-q-list", type=comma_separated_ints)
 parser.add_argument("--seq-len-kv-cache-list", type=comma_separated_ints)
 parser.add_argument("--balance-ratio-list", type=comma_separated_floats)
+# Schedule
+parser.add_argument("--warmup-times", type=int, default=20)
+parser.add_argument("--run-times", type=int, default=100)
 args = parser.parse_args()
 # Load YAML file
 with open(args.config_path) as f:
@@ -147,6 +150,11 @@ for batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in itertools.product(
     torch.cuda.current_stream().wait_stream(capture_stream)
 torch.cuda.synchronize()
 
+events = [
+    torch.cuda.Event(enable_timing=True) for _ in range(args.warmup_times + args.run_times + 1)
+]
+[e.record() for e in events]  # Explicitly warmup events because torch is lazy
+
 torch.cuda.cudart().cudaProfilerStart()
 for batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in itertools.product(
     args.batch_size_list, args.seq_len_q_list, args.seq_len_kv_cache_list, args.balance_ratio_list
@@ -169,15 +177,13 @@ for batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in itertools.product(
             with torch.cuda.graph(g, stream=capture_stream, capture_error_mode="global"):
                 run_pack()
 
-    warmup_times = 20
-    run_times = 100
-    events = [torch.cuda.Event(enable_timing=True) for _ in range(warmup_times + run_times + 1)]
-    for i in range(warmup_times + run_times):
+    balance_ratio_str = "" if balance_ratio is None else f"  balance={balance_ratio:.2f}"
+    nvtx_message = (
+        f"b={batch_size} s={seq_len_q} past={seq_len_kv_cache}{balance_ratio_str} EP{world_size}"
+    )
+    for i in range(args.warmup_times + args.run_times):
         events[i].record()
-        balance_ratio_str = "" if balance_ratio is None else f"  balance={balance_ratio:.2f}"
-        with nvtx.annotate(
-            f"b={batch_size} s={seq_len_q} past={seq_len_kv_cache}{balance_ratio_str} EP{world_size}"
-        ):
+        with nvtx.annotate(nvtx_message):
             if args.use_cuda_graph:
                 g.replay()
             else:
@@ -188,7 +194,7 @@ for batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in itertools.product(
     # Print statistics
     #   Print before `cudaProfilerStop` to ensure messages are included in the profile
     time_list = [start.elapsed_time(stop) for start, stop in zip(events, events[1:])]
-    time_list = time_list[warmup_times:]
+    time_list = time_list[args.warmup_times :]
     print(
         f"[RANK {rank}]"
         f"  batch_size {batch_size}"
