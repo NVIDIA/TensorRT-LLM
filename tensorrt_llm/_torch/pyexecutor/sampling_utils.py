@@ -112,7 +112,7 @@ def top_p_sampling_batch(
     top_p: float,
     temperature: float,
     generator: Optional[torch.Generator] = None,
-) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     # NB: To be replaced by a more efficient implementation.
     return top_k_top_p_sampling_batch(
         logits,
@@ -128,7 +128,7 @@ def temperature_sampling_batch(
     *,
     temperature: float,
     generator: Optional[torch.Generator] = None,
-) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     # NB: To be replaced by a more efficient implementation.
     return top_k_top_p_sampling_batch(
         logits,
@@ -146,20 +146,7 @@ def top_k_top_p_sampling_batch(
     top_p: float,
     temperature: float,
     generator: Optional[torch.Generator] = None,
-) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """
-    Perform top-k and top-p sampling.
-
-    Args:
-        logits: Input logits tensor [batch_size, vocab_size]
-        top_k: Top-k value
-        top_p: Top-p (nucleus sampling) value
-        temperature: Temperature for sampling
-        generator: Optional torch random generator
-
-    Returns:
-        Tuple of (sampled_tokens, softmax_probs)
-    """
+) -> tuple[torch.Tensor, torch.Tensor]:
     logits_dim = logits.dim()
     assert logits_dim == 2, "logits should be 2D: [batch_size, vocab_size]"
     assert temperature > 0, "non-greedy sampling requires valid temperature"
@@ -212,16 +199,6 @@ def greedy_search_sampling_batch(
     *,
     return_probs: bool = True,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """
-    Perform greedy sampling.
-
-    Args:
-        logits: Input logits tensor
-        return_probs: If True, return softmax probabilities
-
-    Returns:
-        Tuple of (sampled_tokens, softmax_probs)
-    """
     next_tokens = torch.argmax(logits, dim=-1)
     softmax: Optional[torch.Tensor] = None
     if return_probs:
