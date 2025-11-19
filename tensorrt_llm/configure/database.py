@@ -29,6 +29,11 @@ class RecipeConstraints(BaseModel):
         """
         return pd.Series(self.model_dump())
 
+    def load_config(self) -> Dict[str, Any]:
+        """Load configuration from the configuration path."""
+        with open(self.config_path, "r") as f:
+            return Recipe(**yaml.load(f, Loader=yaml.FullLoader))
+
 
 class Recipe(BaseModel):
     """Recipe that describes a single scenario."""
