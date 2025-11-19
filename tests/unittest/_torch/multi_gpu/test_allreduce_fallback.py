@@ -157,7 +157,7 @@ def run_window_tensor_multiple_test(
     # Create multiple window tensors
     tensors = []
     for i in range(num_tensors):
-        tensor = torch.ops.trtllm.create_nccl_window_tensor(group, shape, dtype)
+        tensor = _create_nccl_window_tensor(group, shape, dtype)
         assert tensor.shape == shape
         assert tensor.dtype == dtype
         assert tensor.is_cuda
@@ -201,7 +201,7 @@ def run_window_tensor_different_shapes_test(
     # Create window tensors with different shapes
     tensors = []
     for shape in shapes:
-        tensor = torch.ops.trtllm.create_nccl_window_tensor(group, shape, dtype)
+        tensor = _create_nccl_window_tensor(group, shape, dtype)
         assert tensor.shape == shape, f"Shape mismatch: {tensor.shape} vs {shape}"
         assert tensor.dtype == dtype
         assert tensor.is_cuda
