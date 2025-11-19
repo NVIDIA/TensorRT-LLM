@@ -305,10 +305,14 @@ def is_bmm_op(node: Node) -> bool:
 
 
 def is_dist_op(node: Node) -> bool:
-    """Check if the node is a distributed op."""
+    """Check if the node is a distributed op (torch or trtllm backend)."""
     dist_ops = {
+        # PyTorch backend ops
         torch.ops.auto_deploy.torch_dist_all_gather,
         torch.ops.auto_deploy.torch_dist_all_reduce,
+        # TRT-LLM backend ops
+        torch.ops.auto_deploy.trtllm_dist_all_gather,
+        torch.ops.auto_deploy.trtllm_dist_all_reduce,
     }
     return is_op(node, dist_ops)
 

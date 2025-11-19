@@ -40,6 +40,7 @@ from ...utils.node_utils import (
 )
 from ...utils.sharding_utils import (
     BMMShardingInfo,
+    DistBackend,
     EPShardingInfo,
     LayerType,
     ParameterUpdateInfo,
@@ -136,6 +137,7 @@ def _process_simple_shard(
                         world_size=world_size,
                         dist_op="all_gather",
                         min_local_shape=1,
+                        dist_backend=sharding_config.dist_backend,
                     )
                 )
             )
@@ -166,6 +168,7 @@ class ShardingTransformConfig(TransformConfig):
     def _validate_allreduce_strategy(cls, v):
         """Convert string names like 'AUTO' to AllReduceStrategy enum."""
         return validate_allreduce_strategy(v)
+    dist_backend: DistBackend = Field(default=DistBackend.AUTO)
 
 
 @TransformRegistry.register("detect_sharding")
@@ -225,6 +228,7 @@ class Sharding(BaseTransform):
         sharding_config.support_partial_config = self.config.support_partial_config
         sharding_config.sharding_dims = self.config.sharding_dims
         sharding_config.sharding_source = self.config.sharding_source
+        sharding_config.dist_backend = self.config.dist_backend
 
         sharding_config.validate_config()
 
@@ -364,6 +368,7 @@ def _process_ssm_sharding(
             dist_op=None,
             min_local_shape=min_local_shape,
             fused_weight_dims=fused_weight_dims["in_proj"],
+            dist_backend=sharding_config.dist_backend,
         )
     )
 
@@ -402,6 +407,7 @@ def _process_ssm_sharding(
                 dist_op=None,
                 min_local_shape=min_local_shape,
                 fused_weight_dims=fused_dims,
+                dist_backend=sharding_config.dist_backend,
             )
         )
 
@@ -438,6 +444,7 @@ def _process_ssm_sharding(
             rank=rank,
             world_size=world_size,
             dist_op="all_reduce",
+            dist_backend=sharding_config.dist_backend,
         )
     )
     return 1
@@ -464,6 +471,7 @@ def _process_column_sharding(
                 world_size=world_size,
                 dist_op=None,  # for column sharding, no dist op is performed
                 min_local_shape=min_local_shape,
+                dist_backend=sharding_config.dist_backend,
             )
         )
 
@@ -597,6 +605,7 @@ def detect_sharding_from_factory_config(
                             world_size=world_size,
                             dist_op=None,
                             min_local_shape=min_local_shape,
+                            dist_backend=sharding_config.dist_backend,
                         )
                     ):
                         num_row_col_shards += 1
@@ -609,6 +618,7 @@ def detect_sharding_from_factory_config(
                             world_size=world_size,
                             dist_op="all_reduce",
                             min_local_shape=min_local_shape,
+                            dist_backend=sharding_config.dist_backend,
                         )
                     ):
                         num_row_col_shards += 1
@@ -622,6 +632,7 @@ def detect_sharding_from_factory_config(
                             dist_op=None,
                             min_local_shape=min_local_shape,
                             layer_type=LayerType.MAMBA,
+                            dist_backend=sharding_config.dist_backend,
                         )
                     )
                     num_row_col_shards += 1
@@ -642,6 +653,7 @@ def detect_sharding_from_factory_config(
                                     world_size=world_size,
                                     dist_op=None,
                                     min_local_shape=min_local_shape,
+                                    dist_backend=sharding_config.dist_backend,
                                 )
                             )
                         elif col_row_action == "rowwise":
@@ -653,6 +665,7 @@ def detect_sharding_from_factory_config(
                                     world_size=world_size,
                                     dist_op="all_reduce",
                                     min_local_shape=min_local_shape,
+                                    dist_backend=sharding_config.dist_backend,
                                 )
                             ):
                                 num_row_col_shards += 1
@@ -967,6 +980,7 @@ def detect_column_row_shard(
                 world_size=world_size,
                 dist_op="all_reduce",
                 min_local_shape=min_local_shape,
+                dist_backend=sharding_config.dist_backend,
             )
         ):
             num_row_col_shards += 1
@@ -1019,7 +1033,8 @@ def detect_dp_bmm_shard(gm: GraphModule, sharding_config: ShardingConfig) -> Tra
         base_size = bmm_batch_size // world_size
         remainder = bmm_batch_size % world_size
 
-        # NOTE: our torch.ops.auto_deploy.torch_dist_all_gather doesn't support uneven splits at the moment.
+        # NOTE: our torch.ops.auto_deploy.torch_dist_all_gather/trtllm_dist_all_gather
+        #  doesn't support uneven splits at the moment.
         if remainder:
             ad_logger.warning(
                 f"BMM batch size {bmm_batch_size} is not divisible by world size {world_size}. "
@@ -1042,6 +1057,7 @@ def detect_dp_bmm_shard(gm: GraphModule, sharding_config: ShardingConfig) -> Tra
                 world_size=world_size,
                 start_idx=start_idx,
                 end_idx=end_idx,
+                dist_backend=sharding_config.dist_backend,
             )
         )
         ad_logger.debug(
@@ -1084,6 +1100,7 @@ def detect_ep_shard(gm: GraphModule, sharding_config: ShardingConfig) -> Transfo
                 node,
                 rank=rank,
                 world_size=world_size,
+                dist_backend=sharding_config.dist_backend,
             )
         ):
             num_moe_patterns += 1
