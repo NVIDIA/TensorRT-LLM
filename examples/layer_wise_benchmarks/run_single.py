@@ -1,4 +1,5 @@
 import argparse
+import itertools
 
 import numpy as np
 import nvtx
@@ -13,6 +14,10 @@ from tensorrt_llm.tools.layer_wise_benchmarks import BalanceMethod, get_runner_c
 
 def comma_separated_ints(s):
     return [int(x) for x in s.split(",")]
+
+
+def comma_separated_floats(s):
+    return [float(x) for x in s.split(",")]
 
 
 # Parse cmdline
@@ -48,17 +53,37 @@ parser.add_argument("--seq-len-q", type=int)
 parser.add_argument("--seq-len-kv-cache", type=int)
 parser.add_argument("--balance-method", type=str)
 parser.add_argument("--balance-ratio", type=float)
+# Batched run args
+parser.add_argument("--batch-size-list", type=comma_separated_ints)
+parser.add_argument("--seq-len-q-list", type=comma_separated_ints)
+parser.add_argument("--seq-len-kv-cache-list", type=comma_separated_ints)
+parser.add_argument("--balance-ratio-list", type=comma_separated_floats)
 args = parser.parse_args()
+# Load YAML file
 with open(args.config_path) as f:
     config = yaml.safe_load(f)
 del args.config_path
 for k, v in vars(args).items():
     if v is None and k in config:
         setattr(args, k, config[k])
+# Set list arguments
+if args.batch_size_list is None:
+    args.batch_size_list = [args.batch_size]
+del args.batch_size
+if args.seq_len_q_list is None:
+    args.seq_len_q_list = [args.seq_len_q]
+del args.seq_len_q
+if args.seq_len_kv_cache_list is None:
+    args.seq_len_kv_cache_list = [args.seq_len_kv_cache]
+del args.seq_len_kv_cache
+if args.balance_ratio_list is None:
+    args.balance_ratio_list = [args.balance_ratio]
+del args.balance_ratio
+# Set default values
 if args.max_batch_size is None:
-    args.max_batch_size = args.batch_size
+    args.max_batch_size = max(args.batch_size_list)
 if args.max_num_tokens is None:
-    args.max_num_tokens = args.max_batch_size * args.seq_len_q
+    args.max_num_tokens = args.max_batch_size * max(args.seq_len_q_list)
 print(args)
 
 # MPI args
@@ -98,60 +123,83 @@ runner = Runner(
 )
 
 # Warm up
-assert args.batch_size <= args.max_batch_size
-assert args.seq_len_q + args.seq_len_kv_cache <= args.max_seq_len
-run_pack = runner.create_run_pack(
-    args.run_type,
-    batch_size=args.batch_size,
-    seq_len_q=args.seq_len_q,
-    seq_len_kv_cache=args.seq_len_kv_cache,
-    kv_cache_manager=kv_cache_manager,
-    attn_workspace=attn_workspace,
-)
-runner.replace_routing_method(
-    balance_method=BalanceMethod[args.balance_method], balance_ratio=args.balance_ratio
-)
-capture_stream.wait_stream(torch.cuda.current_stream())
-with torch.cuda.stream(capture_stream):
-    run_pack()
-    with autotune():
+for batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in itertools.product(
+    args.batch_size_list, args.seq_len_q_list, args.seq_len_kv_cache_list, args.balance_ratio_list
+):
+    assert batch_size <= args.max_batch_size
+    assert seq_len_q + seq_len_kv_cache <= args.max_seq_len
+    run_pack = runner.create_run_pack(
+        args.run_type,
+        batch_size=batch_size,
+        seq_len_q=seq_len_q,
+        seq_len_kv_cache=seq_len_kv_cache,
+        kv_cache_manager=kv_cache_manager,
+        attn_workspace=attn_workspace,
+    )
+    runner.replace_routing_method(
+        balance_method=BalanceMethod[args.balance_method], balance_ratio=balance_ratio
+    )
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream):
         run_pack()
-torch.cuda.current_stream().wait_stream(capture_stream)
+        with autotune():
+            run_pack()
+    torch.cuda.current_stream().wait_stream(capture_stream)
 torch.cuda.synchronize()
 
-# Profile: capture graph and replay it
 torch.cuda.cudart().cudaProfilerStart()
-if args.use_cuda_graph:
-    with with_multi_stream(True):
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g, stream=capture_stream, capture_error_mode="global"):
-            run_pack()
+for batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in itertools.product(
+    args.batch_size_list, args.seq_len_q_list, args.seq_len_kv_cache_list, args.balance_ratio_list
+):
+    # Profile: capture graph and replay it
+    run_pack = runner.create_run_pack(
+        args.run_type,
+        batch_size=batch_size,
+        seq_len_q=seq_len_q,
+        seq_len_kv_cache=seq_len_kv_cache,
+        kv_cache_manager=kv_cache_manager,
+        attn_workspace=attn_workspace,
+    )
+    runner.replace_routing_method(
+        balance_method=BalanceMethod[args.balance_method], balance_ratio=balance_ratio
+    )
+    if args.use_cuda_graph:
+        with with_multi_stream(True):
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, stream=capture_stream, capture_error_mode="global"):
+                run_pack()
 
-warmup_times = 20
-run_times = 100
-events = [torch.cuda.Event(enable_timing=True) for _ in range(warmup_times + run_times + 1)]
-for i in range(warmup_times + run_times):
-    events[i].record()
-    with nvtx.annotate(f"b={args.batch_size} s={args.seq_len_q} EP{world_size}"):
-        if args.use_cuda_graph:
-            g.replay()
-        else:
-            run_pack()
-events[-1].record()
-torch.cuda.synchronize()
+    warmup_times = 20
+    run_times = 100
+    events = [torch.cuda.Event(enable_timing=True) for _ in range(warmup_times + run_times + 1)]
+    for i in range(warmup_times + run_times):
+        events[i].record()
+        balance_ratio_str = "" if balance_ratio is None else f"  balance={balance_ratio:.2f}"
+        with nvtx.annotate(
+            f"b={batch_size} s={seq_len_q} past={seq_len_kv_cache}{balance_ratio_str} EP{world_size}"
+        ):
+            if args.use_cuda_graph:
+                g.replay()
+            else:
+                run_pack()
+    events[-1].record()
+    torch.cuda.synchronize()
 
-# Print statistics
-#   Print before `cudaProfilerStop` to ensure messages are included in the profile
-time_list = [start.elapsed_time(stop) for start, stop in zip(events, events[1:])]
-time_list = time_list[warmup_times:]
-print(
-    f"[RANK {rank}]"
-    f"  min {np.min(time_list) * 1000:.1f}"
-    f"  max {np.max(time_list) * 1000:.1f}"
-    f"  mean {np.mean(time_list) * 1000:.1f}"
-    f"  median {np.median(time_list) * 1000:.1f}"
-    f"  P90 {np.percentile(time_list, 90) * 1000:.1f}"
-    f"  (us)"
-)
-
+    # Print statistics
+    #   Print before `cudaProfilerStop` to ensure messages are included in the profile
+    time_list = [start.elapsed_time(stop) for start, stop in zip(events, events[1:])]
+    time_list = time_list[warmup_times:]
+    print(
+        f"[RANK {rank}]"
+        f"  batch_size {batch_size}"
+        f"  seq_len_q {seq_len_q}"
+        f"  seq_len_kv_cache {seq_len_kv_cache}"
+        + ("" if balance_ratio is None else f"  balance_ratio {balance_ratio:.2f}")
+        + f"  min {np.min(time_list) * 1000:.1f}"
+        f"  max {np.max(time_list) * 1000:.1f}"
+        f"  mean {np.mean(time_list) * 1000:.1f}"
+        f"  median {np.median(time_list) * 1000:.1f}"
+        f"  P90 {np.percentile(time_list, 90) * 1000:.1f}"
+        f"  (us)"
+    )
 torch.cuda.cudart().cudaProfilerStop()
