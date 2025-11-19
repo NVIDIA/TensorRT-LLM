@@ -362,7 +362,7 @@ def buildImage(config, imageKeyToTag)
                 if (buildWheelArgs.trim().isEmpty()) {
                     throw ex
                 }
-                echo "buildWheelArgs is empty, retry build without build wheel"
+                echo "Build failed with wheel arguments, retrying without them"
                 trtllm_utils.llmExecStepWithRetry(this, script: """
                 cd ${LLM_ROOT} && make -C docker ${target}_${action} \
                 BASE_IMAGE=${BASE_IMAGE} \
