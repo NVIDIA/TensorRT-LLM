@@ -358,7 +358,7 @@ def test_connector_disagg_prefill(enforce_single_worker, model_with_connector,
 
     model = model_fn(
         disable_overlap_scheduler=True,
-        cache_transceiver_config=CacheTransceiverConfig(backend="DEFAULT"))
+        cache_transceiver_config=CacheTransceiverConfig(backend="UCX"))
 
     sampling_params = SamplingParams(ignore_eos=True)
 
