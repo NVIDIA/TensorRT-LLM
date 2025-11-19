@@ -53,39 +53,14 @@ def torch_fused_linear_all_reduce_fake(input, weight, bias):
 
 
 @torch.library.custom_op(
-    "auto_deploy::trtllm_fused_linear_all_reduce", mutates_args=(), device_types="cuda"
-)
-def trtllm_fused_linear_all_reduce(
-    input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
-) -> torch.Tensor:
-    """Fused linear + all_reduce using TRT-LLM backend.
-
-    This op always uses TRT-LLM's optimized allreduce and is used in MPI mode.
-    """
-    output = torch.ops.aten.linear(input, weight, bias)
-    return trtllm_dist.trtllm_allreduce(output, op=dist.ReduceOp.SUM)
-
-
-@trtllm_fused_linear_all_reduce.register_fake
-def trtllm_fused_linear_all_reduce_fake(input, weight, bias):
-    return torch.ops.aten.linear(input, weight, bias)
-
-
-# ============================================================================
-# Legacy op name for backward compatibility
-# ============================================================================
-
-
-@torch.library.custom_op(
     "auto_deploy::trtllm_dist_fused_linear_all_reduce", mutates_args=(), device_types="cuda"
 )
 def trtllm_dist_fused_linear_all_reduce(
     input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
 ) -> torch.Tensor:
-    """Legacy name for trtllm_fused_linear_all_reduce.
+    """Fused linear + all_reduce using TRT-LLM backend.
 
-    Kept for backward compatibility with existing code.
-    This is an alias that directly implements the same logic.
+    This op always uses TRT-LLM's optimized allreduce and is used in MPI mode.
     """
     output = torch.ops.aten.linear(input, weight, bias)
     return trtllm_dist.trtllm_allreduce(output, op=dist.ReduceOp.SUM)

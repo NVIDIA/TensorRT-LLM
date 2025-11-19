@@ -245,9 +245,9 @@ def fp8_linear_fake(
 # ============================================================================
 
 
-@torch.library.custom_op("auto_deploy::torch_fused_fp8_linear_all_reduce", mutates_args=())
+@torch.library.custom_op("auto_deploy::torch_quant_fused_fp8_linear_all_reduce", mutates_args=())
 @torch.compile(dynamic=True)
-def torch_fused_fp8_linear_all_reduce(
+def torch_quant_fused_fp8_linear_all_reduce(
     input: torch.Tensor,
     weight_fp8: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
@@ -265,8 +265,8 @@ def torch_fused_fp8_linear_all_reduce(
     return out
 
 
-@torch_fused_fp8_linear_all_reduce.register_fake
-def torch_fused_fp8_linear_all_reduce_fake(
+@torch_quant_fused_fp8_linear_all_reduce.register_fake
+def torch_quant_fused_fp8_linear_all_reduce_fake(
     input: torch.Tensor,
     weight_fp8: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
@@ -278,9 +278,9 @@ def torch_fused_fp8_linear_all_reduce_fake(
     )
 
 
-@torch.library.custom_op("auto_deploy::trtllm_fused_fp8_linear_all_reduce", mutates_args=())
+@torch.library.custom_op("auto_deploy::trtllm_dist_fused_fp8_linear_all_reduce", mutates_args=())
 @torch.compile(dynamic=True)
-def trtllm_fused_fp8_linear_all_reduce(
+def trtllm_dist_fused_fp8_linear_all_reduce(
     input: torch.Tensor,
     weight_fp8: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
@@ -297,47 +297,8 @@ def trtllm_fused_fp8_linear_all_reduce(
     return trtllm_dist.trtllm_allreduce(out, op=dist.ReduceOp.SUM)
 
 
-@trtllm_fused_fp8_linear_all_reduce.register_fake
-def trtllm_fused_fp8_linear_all_reduce_fake(
-    input: torch.Tensor,
-    weight_fp8: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    input_scale: Optional[torch.Tensor] = None,
-    weight_scale: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    return torch.ops.auto_deploy.torch_quant_fp8_linear(
-        input, weight_fp8, bias, input_scale, weight_scale
-    )
-
-
-# ============================================================================
-# Legacy op name for backward compatibility
-# ============================================================================
-
-
-@torch.library.custom_op("auto_deploy::torch_quant_fused_fp8_linear_all_reduce", mutates_args=())
-@torch.compile(dynamic=True)
-def torch_quant_fused_fp8_linear_all_reduce(
-    input: torch.Tensor,
-    weight_fp8: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    input_scale: Optional[torch.Tensor] = None,
-    weight_scale: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Legacy name for torch_fused_fp8_linear_all_reduce.
-
-    Kept for backward compatibility with existing code.
-    Defaults to torch backend (demollm mode).
-    """
-    out = torch.ops.auto_deploy.torch_quant_fp8_linear(
-        input, weight_fp8, bias, input_scale, weight_scale
-    )
-    dist.all_reduce(out, op=dist.ReduceOp.SUM)
-    return out
-
-
-@torch_quant_fused_fp8_linear_all_reduce.register_fake
-def torch_quant_fused_fp8_linear_all_reduce_fake(
+@trtllm_dist_fused_fp8_linear_all_reduce.register_fake
+def trtllm_dist_fused_fp8_linear_all_reduce_fake(
     input: torch.Tensor,
     weight_fp8: torch.Tensor,
     bias: Optional[torch.Tensor] = None,

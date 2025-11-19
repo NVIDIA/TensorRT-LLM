@@ -20,12 +20,11 @@ The table below lists the operators ordered by their backend.
 | `torch.ops.auto_deploy.torch_dist_all_gather` | Distributed all-gather operation (PyTorch backend, demollm mode) |
 | `torch.ops.auto_deploy.torch_dist_all_reduce` | Distributed all-reduce operation (PyTorch backend, demollm mode) |
 | `torch.ops.auto_deploy.torch_fused_linear_all_reduce` | Fused linear layer followed by all-reduce (PyTorch backend, demollm mode) |
-| `torch.ops.auto_deploy.torch_fused_fp8_linear_all_reduce` | Fused FP8 linear layer followed by all-reduce (PyTorch backend, demollm mode) |
 | `torch.ops.auto_deploy.torch_linear_simple` | Simple linear layer implementation |
 | `torch.ops.auto_deploy.torch_moe` | Mixture of Experts implementation |
 | `torch.ops.auto_deploy.torch_moe_fused` | Fused Mixture of Experts implementation |
 | `torch.ops.auto_deploy.torch_quant_fn` | Generic quantization function that scales, rounds, and clamps input values |
-| `torch.ops.auto_deploy.torch_quant_fused_fp8_linear_all_reduce` | Legacy name for `torch_fused_fp8_linear_all_reduce` |
+| `torch.ops.auto_deploy.torch_quant_fused_fp8_linear_all_reduce` | Fused FP8 linear layer followed by all-reduce (PyTorch backend, demollm mode) |
 | `torch.ops.auto_deploy.torch_quant_nvfp4_linear` | FP4 quantized linear layer |
 | `torch.ops.auto_deploy.torch_quant_fp8_linear` | FP8 quantized linear layer |
 | `torch.ops.auto_deploy.torch_rope_with_complex_freqs` | RoPE with complex frequencies |
@@ -42,8 +41,7 @@ The table below lists the operators ordered by their backend.
 | `torch.ops.auto_deploy.trtllm_moe_fused` | TensorRT LLM fused MoE implementation |
 | `torch.ops.auto_deploy.trtllm_dist_all_gather` | Distributed all-gather operation (TRT-LLM backend, MPI mode) |
 | `torch.ops.auto_deploy.trtllm_dist_all_reduce` | Distributed all-reduce operation (TRT-LLM backend, MPI mode) |
-| `torch.ops.auto_deploy.trtllm_dist_fused_linear_all_reduce` | Legacy name for `trtllm_fused_linear_all_reduce` |
-| `torch.ops.auto_deploy.trtllm_fused_linear_all_reduce` | Fused linear layer followed by all-reduce (TRT-LLM backend, MPI mode) |
-| `torch.ops.auto_deploy.trtllm_fused_fp8_linear_all_reduce` | Fused FP8 linear layer followed by all-reduce (TRT-LLM backend, MPI mode) |
+| `torch.ops.auto_deploy.trtllm_dist_fused_linear_all_reduce` | Fused linear layer followed by all-reduce (TRT-LLM backend, MPI mode) |
+| `torch.ops.auto_deploy.trtllm_dist_fused_fp8_linear_all_reduce` | Fused FP8 linear layer followed by all-reduce (TRT-LLM backend, MPI mode) |
 | `torch.ops.dist.torch_fused_allreduce_residual_rmsnorm` | Fused all-reduce + residual add + RMSNorm (PyTorch backend, demollm mode) |
 | `torch.ops.dist.trtllm_fused_allreduce_residual_rmsnorm` | Fused all-reduce + residual add + RMSNorm (TRT-LLM backend, MPI mode) |
