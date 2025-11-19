@@ -1,6 +1,7 @@
 from .dsa import DSACacheManager, DSATrtllmAttention
-from .rocket import (RocketKVCacheManager, RocketTrtllmAttention,
-                     RocketVanillaAttention)
+from .rocket import (KVCacheManager, RocketKVCacheManager,
+                     RocketTrtllmAttention, RocketVanillaAttention,
+                     TrtllmAttention)
 
 
 def get_sparse_attn_kv_cache_manager(
@@ -9,6 +10,8 @@ def get_sparse_attn_kv_cache_manager(
         return RocketKVCacheManager
     elif sparse_attn_config.algorithm == "dsa":
         return DSACacheManager
+    elif sparse_attn_config.algorithm == "skip_softmax":
+        return KVCacheManager
     else:
         raise ValueError(
             f"Unsupported sparse attention algorithm: {sparse_attn_config.algorithm}"
@@ -31,6 +34,8 @@ def get_trtllm_sparse_attn_attention_backend(
         return RocketTrtllmAttention
     elif sparse_attn_config.algorithm == "dsa":
         return DSATrtllmAttention
+    elif sparse_attn_config.algorithm == "skip_softmax":
+        return TrtllmAttention
     else:
         raise ValueError(
             f"Unsupported sparse attention algorithm in trtllm attention backend: {sparse_attn_config.algorithm}"

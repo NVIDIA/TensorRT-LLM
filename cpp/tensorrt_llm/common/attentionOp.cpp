@@ -1313,6 +1313,8 @@ int AttentionOp::mlaGeneration(
             fmhaParams.sparse_params = mRuntimeSparseAttentionParams;
         }
 
+        // MLA does not support skip-softmax attention right now
+
         // Run the fmha kernel
         mDecoderFMHARunner->run(fmhaParams);
     }
@@ -1884,7 +1886,16 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         {
             fmhaParams.sparse_params = mRuntimeSparseAttentionParams;
         }
-
+        fmhaParams.skipSoftmaxThreshold = mSkipSoftmaxThreshold;
+#ifdef SKIP_SOFTMAX_STAT
+        fmhaParams.skipSoftmaxTotalBlocks = mSkipSoftmaxTotalBlocks;
+        fmhaParams.skipSoftmaxSkippedBlocks = mSkipSoftmaxSkippedBlocks;
+#else
+        if (tensorrt_llm::common::getEnvPrintSkipSoftmaxStat())
+        {
+            TLLM_THROW("To print skip softmax stat, please run build_wheel.py with -DSKIP_SOFTMAX_STAT");
+        }
+#endif
         if (mAttentionChunkSize)
         {
             fmhaParams.chunkedAttentionSize = *mAttentionChunkSize;

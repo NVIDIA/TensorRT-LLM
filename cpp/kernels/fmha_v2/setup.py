@@ -3060,14 +3060,16 @@ def get_kernel_traits_code(specs_names):
 
 
 # For now:
-# 1. Hopper head_size 128 kernel uses cubins for performance regressions.
+# 1. Hopper head_size 128 kernel uses cubins for performance regressions. (TODO: This is not true anymore, in order to deliver skip-softmax attention)
 # 2. Hopper sm89 with e4m3/e4m3_fp32 dtype uses cubins for accuracy regressions (will be fixed).
 # You should set the condition `use_cubin_header` to false if you have modified the source codes of those kernels that use cubins.
 # This ensures that the kernels will be recompiled using the updated source code rather than relying on precompiled cubins.
 def use_cubin_header(sm, head_size, dtype, output_dtype=None):
-    if 'e4m3' in dtype and output_dtype in ['bf16', 'fp16']:
-        return False
-    return (sm == 90 and head_size == 128) or (sm == 89 and 'e4m3' in dtype)
+    # To enable skip-softmax attention, we must not use cubins. TODO: tackle this messy.
+    return False
+    # if 'e4m3' in dtype and output_dtype in ['bf16', 'fp16']:
+    #     return False
+    # return (sm == 90 and head_size == 128) or (sm == 89 and 'e4m3' in dtype)
 
 
 def get_cubin_header(kernel_traits, specs_names):

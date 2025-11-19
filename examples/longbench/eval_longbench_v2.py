@@ -24,12 +24,14 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from datasets import load_dataset
+from tqdm import tqdm
 from transformers import AutoTokenizer
 
 # Add tensorrt_llm imports
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import (CudaGraphConfig, KvCacheConfig,
-                                 RocketSparseAttentionConfig)
+from tensorrt_llm.llmapi import (CudaGraphConfig, KvCacheConfig, MoeConfig,
+                                 RocketSparseAttentionConfig,
+                                 SkipSoftmaxAttentionConfig)
 from tensorrt_llm.logger import logger
 
 # Chat templates mapping
@@ -100,10 +102,27 @@ def parse_arguments() -> argparse.Namespace:
         type=int,
         default=133120,
         help='Maximum total tokens across all sequences in a batch')
+
+    parser.add_argument('--moe_max_num_tokens',
+                        type=int,
+                        default=None,
+                        help='Moe Max num tokens')
+
     parser.add_argument('--tensor_parallel_size',
                         type=int,
                         default=1,
                         help='Tensor parallel size')
+
+    parser.add_argument('--moe_ep_size',
+                        type=int,
+                        default=1,
+                        help='MoE expert parallel size')
+
+    # Skip softmax attention configuration
+    parser.add_argument('--skip_softmax_threshold',
+                        type=float,
+                        default=None,
+                        help='Skip softmax attention threshold')
 
     # RocketKV configuration
     parser.add_argument('--rocket_sparse',
@@ -223,25 +242,30 @@ def load_longbench_v2_config(longbench_path: str) -> Dict[str, Any]:
 
 
 def build_chat(tokenizer, prompt, chat_template):
-    """Build chat prompt following LongBench's approach."""
-    if chat_template == "vicuna" or chat_template == "longchat":
-        try:
-            from fastchat.model import get_conversation_template
-            conv = get_conversation_template("vicuna")
-            conv.append_message(conv.roles[0], prompt)
-            conv.append_message(conv.roles[1], None)
-            prompt = conv.get_prompt()
-        except ImportError:
-            # Fallback if fastchat is not available
-            prompt = f"A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions.\n\nUSER: {prompt}\nASSISTANT:"
-    elif chat_template == "llama2":
-        prompt = f"[INST]{prompt}[/INST]"
-    elif chat_template == "llama3":
-        prompt = f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-    elif chat_template == "mistral":
-        prompt = f"[INST] {prompt} [/INST]"
-    # For other templates or "none", return prompt as-is
-    return prompt
+    # """Build chat prompt following LongBench's approach."""
+    # if chat_template == "vicuna" or chat_template == "longchat":
+    #     try:
+    #         from fastchat.model import get_conversation_template
+    #         conv = get_conversation_template("vicuna")
+    #         conv.append_message(conv.roles[0], prompt)
+    #         conv.append_message(conv.roles[1], None)
+    #         prompt = conv.get_prompt()
+    #     except ImportError:
+    #         # Fallback if fastchat is not available
+    #         prompt = f"A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions.\n\nUSER: {prompt}\nASSISTANT:"
+    # elif chat_template == "llama2":
+    #     prompt = f"[INST]{prompt}[/INST]"
+    # elif chat_template == "llama3":
+    #     prompt = f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+    # elif chat_template == "mistral":
+    #     prompt = f"[INST] {prompt} [/INST]"
+    # # For other templates or "none", return prompt as-is
+    # return prompt
+    msg = [{"role": "user", "content": prompt}]
+    return tokenizer.apply_chat_template(msg,
+                                         tokenize=False,
+                                         thinking=False,
+                                         add_generation_prompt=True)
 
 
 def determine_chat_template(model_path: str, chat_template: str) -> str:
@@ -297,6 +321,9 @@ def post_process(pred: str, chat_template: str) -> str:
         pred = (pred.split("(Document")[0].split("\n\nQuestion")[0].split(
             "\n\nAnswer")[0].split("[INST]")[0].split("[/INST]")[0].split(
                 "(Passage")[0].strip())
+    elif "deepseek" in chat_template.lower():
+        if "</think>" in pred:
+            pred = pred.split("</think>", 1)[1].lstrip()
 
     return pred
 
@@ -353,6 +380,8 @@ def initialize_llm(args: argparse.Namespace) -> Tuple[LLM, AutoTokenizer]:
         # Configure KV cache
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=False,  # RocketKV doesn't support KV cache reuse
+            dtype=args.kv_cache_dtype,
+            free_gpu_memory_fraction=args.kv_cache_fraction,
         )
 
         if args.rocket_sparse:
@@ -365,6 +394,11 @@ def initialize_llm(args: argparse.Namespace) -> Tuple[LLM, AutoTokenizer]:
                 kt_cache_dtype=args.kt_cache_dtype,
             )
             logger.info(f"Using RocketKV sparse attention")
+        elif args.skip_softmax_threshold is not None:
+            # Configure skip softmax attention
+            sparse_attention_config = SkipSoftmaxAttentionConfig(
+                threshold=args.skip_softmax_threshold, )
+            logger.info(f"Using skip softmax attention")
         else:
             sparse_attention_config = None
             logger.info("Using standard attention")
@@ -373,17 +407,23 @@ def initialize_llm(args: argparse.Namespace) -> Tuple[LLM, AutoTokenizer]:
             max_batch_size=args.max_batch_size
         ) if args.attention_backend == "TRTLLM" else None
 
+        moe_config = MoeConfig(max_num_tokens=args.moe_max_num_tokens, )
+
         # Initialize LLM
         llm = LLM(
             model=args.model_path,
             backend=args.backend,
             kv_cache_config=kv_cache_config,
+            moe_config=moe_config,
             attn_backend=args.attention_backend,
             sparse_attention_config=sparse_attention_config,
             tensor_parallel_size=args.tensor_parallel_size,
+            moe_expert_parallel_size=args.tensor_parallel_size,
+            max_batch_size=args.max_batch_size,
             max_seq_len=args.max_seq_len,
             max_num_tokens=args.max_num_tokens,
             cuda_graph_config=cuda_graph_config,
+            enable_attention_dp=False,  # Use attention TP to lower TTFT
         )
 
         # Initialize tokenizer
@@ -461,8 +501,8 @@ def evaluate_longbench_v2(llm: LLM, tokenizer: AutoTokenizer,
     logger.info(f"Final dataset size: {len(filtered_data)} samples")
 
     # Determine chat template
-    chat_template = determine_chat_template(args.model_path, args.chat_template)
-    logger.info(f"Using chat template: {chat_template}")
+    # chat_template = determine_chat_template(args.model_path, args.chat_template)
+    # logger.info(f"Using chat template: {chat_template}")
 
     logger.info(f"Prepare and truncate prompts...")
     # Select appropriate template
@@ -479,26 +519,29 @@ def evaluate_longbench_v2(llm: LLM, tokenizer: AutoTokenizer,
     logger.info(f"Using template: {template_key}")
 
     # Set up extra end token ids
-    extra_end_token_ids = []
-    if chat_template == "llama3":
-        eot_id = tokenizer.encode("<|eot_id|>", add_special_tokens=False)[0]
-        extra_end_token_ids.append(eot_id)
-        logger.info(f"Added llama3 end token: {eot_id}")
+    # extra_end_token_ids = []
+    # if chat_template == "llama3":
+    #     eot_id = tokenizer.encode("<|eot_id|>", add_special_tokens=False)[0]
+    #     extra_end_token_ids.append(eot_id)
+    #     logger.info(f"Added llama3 end token: {eot_id}")
 
-    if chat_template == "qwen":
-        im_end_id = tokenizer.encode("<|im_end|>", add_special_tokens=False)[0]
-        extra_end_token_ids.append(im_end_id)
-        logger.info(f"Added qwen end token: {im_end_id}")
+    # if chat_template == "qwen":
+    #     im_end_id = tokenizer.encode("<|im_end|>", add_special_tokens=False)[0]
+    #     extra_end_token_ids.append(im_end_id)
+    #     logger.info(f"Added qwen end token: {im_end_id}")
+
+    # if chat_template == "deepseek":
 
     # Prepare prompts
     prompts = []
-    for sample in filtered_data:
+    for sample in tqdm(filtered_data, desc="Formatting prompts"):
         formatted_prompt = format_prompt(sample, template, args)
 
         # Apply chat formatting if needed
-        if chat_template != 'none':
-            formatted_prompt = build_chat(tokenizer, formatted_prompt,
-                                          chat_template)
+        # if chat_template != 'none':
+        formatted_prompt = build_chat(tokenizer,
+                                      formatted_prompt,
+                                      chat_template=None)
 
         # Apply truncation if prompt is too long
         formatted_prompt = truncate_prompt(formatted_prompt, tokenizer,
@@ -510,6 +553,15 @@ def evaluate_longbench_v2(llm: LLM, tokenizer: AutoTokenizer,
         logger.warning(f"No prompts to evaluate")
         return [], 0.0
 
+    # Dump prompts to a pickle file (one-liner)
+    # try:
+    #     prompts_pkl_path = os.path.join(args.output_dir, args.exp_name, "prompts.pkl")
+    #     with open(prompts_pkl_path, "wb") as f:
+    #         pickle.dump(prompts, f)
+    #     logger.info(f"Wrote prompts pickle to {prompts_pkl_path}")
+    # except Exception as e:
+    #     logger.warning(f"Failed to write prompts: {e}")
+
     # Run inference
     logger.info(f"Starting inference for {len(prompts)} samples...")
     start_time = time.time()
@@ -518,9 +570,9 @@ def evaluate_longbench_v2(llm: LLM, tokenizer: AutoTokenizer,
     max_new_tokens = 1024 if args.cot else 256
     sampling_params = SamplingParams(
         max_tokens=max_new_tokens,
-        temperature=0.1,
+        temperature=0.6,
         top_p=0.95,
-        stop_token_ids=extra_end_token_ids if extra_end_token_ids else None,
+        # stop_token_ids=extra_end_token_ids if extra_end_token_ids else None,
     )
 
     outputs = llm.generate(prompts, sampling_params)
@@ -534,7 +586,7 @@ def evaluate_longbench_v2(llm: LLM, tokenizer: AutoTokenizer,
     results = []
     for i, (sample, output) in enumerate(zip(filtered_data, outputs)):
         prediction = output.outputs[0].text.strip()
-        processed_prediction = post_process(prediction, chat_template)
+        processed_prediction = prediction  # post_process(prediction, chat_template)
 
         # Handle CoT mode
         if args.cot:
@@ -690,6 +742,7 @@ def save_results(results: List[Dict], args: argparse.Namespace,
             'attention_backend': args.attention_backend,
             'rocket_sparse': args.rocket_sparse,
             'token_budget': args.token_budget,
+            'skip_softmax_threshold': args.skip_softmax_threshold,
             'cot': args.cot,
             'no_context': args.no_context,
             'rag': args.rag,

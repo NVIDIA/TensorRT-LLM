@@ -384,6 +384,8 @@ struct Kernel_traits
     // Named barrier ids
     static constexpr int DMA_SYNC_BARRIER_ID = 0x1;
     static constexpr int MMA_SYNC_BARRIER_ID = 0x2;
+    // There are 2 warpgroups so 0x3 and 0x4 are used for skip-softmax
+    static constexpr int SKIP_SOFTMAX_BARRIER_ID = 0x3;
 
     // How many threads get involved in the dma group.
     enum
@@ -517,6 +519,10 @@ struct Kernel_traits
 
         // Mutex
         OrderedMutex compute_mutex;
+
+        // 4 warps in a warpgroup vote to an atomic variable in shared memory
+        // to decide whether to skip this STEP_KV. Double-buffered to avoid races between consecutive KV_STEPS.
+        uint32_t skip_softmax_votes[2][NUM_COMPUTE_GROUPS];
 
         inline __device__ void init(int tid0)
         {
@@ -692,6 +698,10 @@ struct Kernel_traits_Hopper_qgmma_e4m3_fp32
 
         // Mutex
         OrderedMutex compute_mutex;
+
+        // 4 warps in a warpgroup vote to an atomic variable in shared memory
+        // to decide whether to skip this STEP_KV. Double-buffered to avoid races between consecutive STEP_KVs.
+        uint32_t skip_softmax_votes[2][Base::NUM_COMPUTE_GROUPS];
 
         inline __device__ void init(int tid0)
         {

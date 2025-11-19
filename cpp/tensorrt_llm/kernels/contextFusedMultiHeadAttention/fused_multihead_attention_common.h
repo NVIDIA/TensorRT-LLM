@@ -312,6 +312,14 @@ struct MHARunnerParams
     int vMaxNBlock;
     // sparse attention parameters
     SparseAttentionParams sparse_params;
+
+    // Skip softmax when exp(local_max - global_max) < skipSoftmaxThreshold.
+    float skipSoftmaxThreshold = 0;
+#ifdef SKIP_SOFTMAX_STAT
+    // Statistics of skip-softmax, pointers of device memory for output
+    uint32_t* skipSoftmaxTotalBlocks;
+    uint32_t* skipSoftmaxSkippedBlocks;
+#endif
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -457,6 +465,16 @@ struct Fused_multihead_attention_params_v2
             float* scales;
         } q, k, v;
     } sage;
+
+    // Skip softmax when exp(local_max - global_max) < skip_softmax_threshold.
+    // A positive value means skip-softmax is enabled.
+    // Possibly, a value larger than 1 is allowed, which means we skip even if local_max > global_max.
+    float skip_softmax_threshold = 0;
+#ifdef SKIP_SOFTMAX_STAT
+    // Statistics of skip-softmax, pointers of device memory for output
+    uint32_t* skip_softmax_total_blocks;
+    uint32_t* skip_softmax_skipped_blocks;
+#endif
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

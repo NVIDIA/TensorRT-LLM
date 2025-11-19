@@ -194,12 +194,17 @@ class BaseSparseAttentionConfig(StrictBaseModel):
         "The sequence length threshold for separating short and long sequences."
     )
 
+    @property
+    def algorithm(self) -> str:
+        raise NotImplementedError("Algorithm must be implemented in subclasses")
+
     @classmethod
     def from_dict(cls, data: dict):
         # dispatch to the correct sparse attention config
         config_classes = {
             "rocket": RocketSparseAttentionConfig,
             "dsa": DeepSeekSparseAttentionConfig,
+            "skip_softmax": SkipSoftmaxAttentionConfig,
         }
 
         algorithm = data.get("algorithm", None)
@@ -262,6 +267,10 @@ class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
     def from_dict(cls, data: dict):
         return cls(**data)
 
+    @property
+    def algorithm(self) -> str:
+        return "rocket"
+
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
 
@@ -302,6 +311,25 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         """
         self.seq_len_threshold = self.index_topk
         return self.skip_indexer_for_short_seqs
+
+
+class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
+    """
+    Configuration for skip softmax attention.
+    """
+    threshold: Optional[float] = Field(
+        default=None, description="The threshold for skip softmax attention.")
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+    @property
+    def algorithm(self) -> str:
+        return "skip_softmax"
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "trtllm"
 
 
 class MoeLoadBalancerConfig(StrictBaseModel):
@@ -1551,6 +1579,7 @@ SpeculativeConfig: TypeAlias = Optional[Union[
 SparseAttentionConfig: TypeAlias = Union[
     RocketSparseAttentionConfig,
     DeepSeekSparseAttentionConfig,
+    SkipSoftmaxAttentionConfig,
 ]
 
 

@@ -494,6 +494,15 @@ public:
     // See [Chunked Attention] in _torch/modules/attention.py
     std::optional<int64_t> mAttentionChunkSize = std::nullopt;
 
+    // Skip softmax when exp(local_max - global_max) < mSkipSoftmaxThreshold.
+    // A positive value means skip-softmax is enabled.
+    // Possibly, a value larger than 1 is allowed, which means we skip even if local_max > global_max.
+    float mSkipSoftmaxThreshold = 0;
+#ifdef SKIP_SOFTMAX_STAT
+    uint32_t* mSkipSoftmaxTotalBlocks;
+    uint32_t* mSkipSoftmaxSkippedBlocks;
+#endif
+
     [[nodiscard]] auto data() const
     {
         return std::make_tuple(mLayerIdx, mNumHeads, mVisionStart, mVisionLength, mNumKVHeads, mHeadSize,
@@ -510,7 +519,7 @@ public:
             mMLAParams.data(), mCpSize, mCpRank, mCpGroup, mNumAttnHeads, mNumAttnKVHeads, mNumKVHeadsOrigin,
             mAttnTpSize, mAttnTpRank, mAttnCpSize, mAttnCpRank, mUlyssesMQABroadcast, mEnableContextFMHA,
             mFMHAForceFP32Acc, mMultiBlockMode, mEnableXQA, mUseKVCache, mSkipAttn, mFuseFp4Quant,
-            mNbMultiBlockSemaphores, mAttentionChunkSize.value_or(-1));
+            mNbMultiBlockSemaphores, mAttentionChunkSize.value_or(-1), mSkipSoftmaxThreshold);
     };
 
 private:

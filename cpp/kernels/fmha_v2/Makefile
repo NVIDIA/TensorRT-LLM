@@ -69,6 +69,9 @@ PREPROCESSOR_FLAGS += -DUSE_SAME_SUM_ORDER_IN_SOFTMAX_AS_REF_CODE
 # Do we want to use half accumulation for flash attention
 PREPROCESSOR_FLAGS += -DHALF_ACCUMULATION_FOR_FLASH_ATTENTION
 
+# Print the resulted sparsity given threshold in Skip-Softmax attention
+# PREPROCESSOR_FLAGS += -DSKIP_SOFTMAX_STAT
+
 # Add FLAGS when generating cubins.
 ifdef GENERATE_CUBIN
 	PREPROCESSOR_FLAGS += -DGENERATE_CUBIN
@@ -89,6 +92,18 @@ NVCC_FLAGS += $(PREPROCESSOR_FLAGS)
 
 # The include directories.
 INCLUDE_DIRS += -I./src -I./generated -I$(CUDA)/include
+
+ifndef ENABLE_SM70
+GENCODE_SM70 =
+else
+GENCODE_SM70 = -gencode=arch=compute_70,code="sm_70"
+endif
+
+ifndef ENABLE_SM72
+GENCODE_SM72 =
+else
+GENCODE_SM72 = -gencode=arch=compute_72,code="sm_72"
+endif
 
 GENCODE_SM80 = -gencode=arch=compute_80,code=\"sm_80\"
 GENCODE_SM86 = -gencode=arch=compute_86,code=\"sm_86\"
@@ -124,6 +139,8 @@ CUBIN_OBJ = $(patsubst %.cubin.cpp, %.cubin.o, $(CUBIN_CPP))
 
 GENCODES =
 
+GENCODES += $(GENCODE_SM70)
+GENCODES += $(GENCODE_SM72)
 GENCODES += $(GENCODE_SM80)
 GENCODES += $(GENCODE_SM86)
 GENCODES += $(GENCODE_SM89)

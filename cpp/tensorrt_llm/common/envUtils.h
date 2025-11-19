@@ -156,6 +156,8 @@ bool getEnvKVCacheTransferAllBlocksForWindow();
 
 bool getEnvEplbForceGdrcopy();
 
+bool getEnvPrintSkipSoftmaxStat();
+
 } // namespace common
 
 TRTLLM_NAMESPACE_END

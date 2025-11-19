@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
+from tensorrt_llm.llmapi import SkipSoftmaxAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -147,6 +148,12 @@ class TrtllmAttentionWrapper:
         self.rotary_embedding_original_max_positions = rope_params.original_max_positions
         self.kwargs = {}
         self.kwargs.update(kwargs)
+        self.skip_softmax_stat = torch.zeros(2,
+                                             dtype=torch.uint32,
+                                             device='cuda')
+        # Default disabled, but allow manual enabling through `TRTLLM_PRINT_SKIP_SOFTMAX_STAT=1`
+        self.print_skip_softmax_stat = os.environ.get(
+            "TRTLLM_PRINT_SKIP_SOFTMAX_STAT", "0") == "1"
 
     def update_quant_config(self, quant_config: Optional[QuantConfig] = None):
         quant_config = quant_config or QuantConfig()
@@ -206,6 +213,7 @@ class TrtllmAttentionWrapper:
         sparse_attn_offsets: Optional[torch.Tensor] = None,
         sparse_attn_indices_block_size: int = 1,
         sparse_mla_topk: int = 0,
+        skip_softmax_threshold: Optional[float] = None,
         helix_position_offsets: Optional[torch.Tensor] = None,
         helix_is_inactive_rank: Optional[torch.Tensor] = None,
         **kwargs,
@@ -317,6 +325,7 @@ class TrtllmAttentionWrapper:
         self.spec_decoding_bl_tree_mask = spec_decoding_bl_tree_mask
         self.spec_bl_tree_first_sparse_mask_offset_kv = spec_bl_tree_first_sparse_mask_offset_kv
         self.chunked_prefill_buffer_batch_size = chunked_prefill_buffer_batch_size
+        self.skip_softmax_threshold = skip_softmax_threshold
         self.kwargs.update(kwargs)
 
     def create_output(self, q: torch.Tensor, out_dtype: torch.dtype):
@@ -485,85 +494,51 @@ class TrtllmAttentionWrapper:
             self.helix_position_offsets, self.helix_is_inactive_rank
         ]
 
+        if self.print_skip_softmax_stat:
+            self.skip_softmax_stat.zero_()
+
         thop.attention(
-            q,
-            k,
-            v,
-            output,
-            output_sf,
-            out_dtype,
-            self.workspace,
-            self.sequence_length,
-            self.host_past_key_value_lengths,
-            self.host_total_kv_lens,
-            self.context_lengths,
-            self.host_context_lengths,
-            self.host_request_types,
-            self.kv_cache_block_offsets,
-            self.host_kv_cache_block_offsets,
-            self.host_kv_cache_pool_pointers,
-            self.host_kv_cache_pool_mapping,
-            self.cache_indirection,
-            self.kv_scale_orig_quant,
+            q, k, v, output, output_sf, out_dtype, self.workspace,
+            self.sequence_length, self.host_past_key_value_lengths,
+            self.host_total_kv_lens, self.context_lengths,
+            self.host_context_lengths, self.host_request_types,
+            self.kv_cache_block_offsets, self.host_kv_cache_block_offsets,
+            self.host_kv_cache_pool_pointers, self.host_kv_cache_pool_mapping,
+            self.cache_indirection, self.kv_scale_orig_quant,
             self.kv_scale_quant_orig,
             self.out_scale_sf if self.use_nvfp4_output else self.out_scale,
-            self.rotary_inv_freq,
-            self.rotary_cos_sin,
-            self.latent_cache,
-            self.q_pe,
-            self.block_ids_per_seq,
-            self.attention_sinks,
-            is_fused_qkv,
-            update_kv_cache,
-            self.predicted_tokens_per_seq,
-            self.layer_idx,
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_size,
-            self.tokens_per_block,
-            self.max_num_requests,
+            self.rotary_inv_freq, self.rotary_cos_sin, self.latent_cache,
+            self.q_pe, self.block_ids_per_seq, self.attention_sinks,
+            is_fused_qkv, update_kv_cache, self.predicted_tokens_per_seq,
+            self.layer_idx, self.num_heads, self.num_kv_heads, self.head_size,
+            self.tokens_per_block, self.max_num_requests,
             self.max_context_length,
-            self.attention_window_size,
-            self.sink_token_length,
-            self.beam_width,
-            int(mask_type),
-            self.quant_mode,
-            self.q_scaling,
-            self.position_embedding_type,
-            self.rotary_embedding_dim,
-            self.rotary_embedding_base,
-            self.rotary_embedding_scale_type,
-            rotary_embedding_scales,
-            rotary_embedding_max_position_info,
-            self.use_paged_context_fmha,
-            self.attention_input_type,
-            self.is_mla_enable,
-            self.chunked_prefill_buffer_batch_size,
-            self.q_lora_rank,
-            self.kv_lora_rank,
-            self.qk_nope_head_dim,
-            self.qk_rope_head_dim,
-            self.v_head_dim,
-            self.mrope_rotary_cos_sin,
-            self.mrope_position_deltas,
-            mla_tensor_params,
-            self.attention_chunk_size,
-            self.softmax_stats_tensor,
-            spec_decoding_bool_params,
-            spec_decoding_tensor_params,
-            self.sparse_kv_indices,
-            self.sparse_kv_offsets,
-            self.sparse_attn_indices,
-            self.sparse_attn_offsets,
-            self.sparse_attn_indices_block_size,
-            self.sparse_mla_topk,
-            cu_q_seqlens,
-            cu_kv_seqlens,
-            fmha_scheduler_counter,
-            mla_bmm1_scale,
-            mla_bmm2_scale,
-            quant_q_buffer,
-        )
+            self.attention_window_size, self.sink_token_length, self.beam_width,
+            int(mask_type), self.quant_mode, self.q_scaling,
+            self.position_embedding_type, self.rotary_embedding_dim,
+            self.rotary_embedding_base, self.rotary_embedding_scale_type,
+            rotary_embedding_scales, rotary_embedding_max_position_info,
+            self.use_paged_context_fmha, self.attention_input_type,
+            self.is_mla_enable, self.chunked_prefill_buffer_batch_size,
+            self.q_lora_rank, self.kv_lora_rank, self.qk_nope_head_dim,
+            self.qk_rope_head_dim, self.v_head_dim, self.mrope_rotary_cos_sin,
+            self.mrope_position_deltas, mla_tensor_params,
+            self.attention_chunk_size, self.softmax_stats_tensor,
+            spec_decoding_bool_params, spec_decoding_tensor_params,
+            self.sparse_kv_indices, self.sparse_kv_offsets,
+            self.sparse_attn_indices, self.sparse_attn_offsets,
+            self.sparse_attn_indices_block_size, self.sparse_mla_topk,
+            cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale,
+            mla_bmm2_scale, quant_q_buffer, self.skip_softmax_threshold,
+            self.skip_softmax_stat)
+
+        if self.print_skip_softmax_stat:
+            (total_blocks, skipped_blocks) = self.skip_softmax_stat
+            if total_blocks != 0:
+                print(
+                    f"SKIP_SOFTMAX_STAT: layer{self.layer_idx}: {skipped_blocks} / {total_blocks}"
+                    f" = {skipped_blocks / total_blocks * 100: .2f}%")
+
         # reset the planned states (especially tensors) to avoid memory leak
         self.plan()
         return output, output_sf
@@ -1497,6 +1472,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         mla_bmm1_scale: Optional[torch.Tensor] = None,
         mla_bmm2_scale: Optional[torch.Tensor] = None,
         quant_q_buffer: Optional[torch.Tensor] = None,
+        skip_softmax_threshold: Optional[float] = None,
         **kwargs,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
         assert isinstance(
@@ -1528,13 +1504,20 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets = None, None, None, None
         sparse_attn_indices_block_size = 1
+        skip_softmax_threshold = None
         if self.sparse_attention_config is not None:
-            sparse_kv_indices, sparse_kv_offsets = self.sparse_kv_predict(
-                q, k, metadata, **kwargs)
-            sparse_attn_indices, sparse_attn_offsets = self.sparse_attn_predict(
-                q, k, metadata, **kwargs)
-            sparse_attn_indices_block_size = self.sparse_attention_config.get_indices_block_size(
-            )
+            if isinstance(self.sparse_attention_config,
+                          SkipSoftmaxAttentionConfig):
+                skip_softmax_threshold = getattr(self.sparse_attention_config,
+                                                 'threshold', None)
+
+            else:
+                sparse_kv_indices, sparse_kv_offsets = self.sparse_kv_predict(
+                    q, k, metadata, **kwargs)
+                sparse_attn_indices, sparse_attn_offsets = self.sparse_attn_predict(
+                    q, k, metadata, **kwargs)
+                sparse_attn_indices_block_size = self.sparse_attention_config.get_indices_block_size(
+                )
 
         self.wrapper.plan(
             layer_idx=self.get_local_layer_idx(metadata),
@@ -1596,6 +1579,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             sparse_attn_indices_block_size=sparse_attn_indices_block_size,
             sparse_mla_topk=metadata.sparse_mla_topk if hasattr(
                 metadata, 'sparse_mla_topk') else 0,
+            skip_softmax_threshold=skip_softmax_threshold,
             helix_position_offsets=helix_position_offsets,
             helix_is_inactive_rank=metadata.helix_is_inactive_rank,
         )
