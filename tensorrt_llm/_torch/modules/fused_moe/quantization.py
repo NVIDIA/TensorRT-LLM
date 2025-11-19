@@ -424,7 +424,7 @@ class FusedMoEMethodBase(ABC):
                 delattr(module, 'local_shared_w3_w1_bias_tensors')
                 delattr(module, 'local_shared_w2_bias_tensors')
             module.register_all_parameter_slot_and_to_fix_weight_fns(weight_fns)
-            module.layer_load_balancer.host_tensor_sharer.host_tensor_sharer.finalize_layer_weights(
+            module.layer_load_balancer.host_tensor_sharer.finalize_layer_weights(
             )
         if hasattr(module,
                    "layer_load_balancer") and module.layer_load_balancer:
