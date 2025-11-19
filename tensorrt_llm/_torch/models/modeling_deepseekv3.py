@@ -640,17 +640,17 @@ class Deepseekv3RoutingImpl():
     def get_scores(logits, e_score_correction_bias):
         scores = F.sigmoid(logits)
         scores_with_bias = scores + e_score_correction_bias
-        return scores, scores_with_bias
-
-    def noaux_tc(self, logits, e_score_correction_bias):
-        n_group = self.n_group
-
         if enable_llm_debug():
             has_nan = torch.isnan(scores_with_bias).any()
             if has_nan:
                 warnings.warn(
                     "Detected NAN in the tensor scores_with_bias. Please check if it matches the expectation."
                 )
+
+        return scores, scores_with_bias
+
+    def noaux_tc(self, logits, e_score_correction_bias):
+        n_group = self.n_group
 
         _, num_experts = logits.shape
         if self.n_group > 1:
@@ -701,8 +701,7 @@ class Deepseekv3RoutingImpl():
             new_mask.scatter_(-1, topk_idx, 1)
             scores = scores * new_mask
             score_sum = torch.sum(scores, dim=-1, keepdim=True) + 1e-20
-            scores = scores / score_sum * \
-                self.routed_scaling_factor
+            scores = scores / score_sum * self.routed_scaling_factor
             topk_values, topk_indices = torch.topk(scores,
                                                    k=self.top_k,
                                                    dim=-1,

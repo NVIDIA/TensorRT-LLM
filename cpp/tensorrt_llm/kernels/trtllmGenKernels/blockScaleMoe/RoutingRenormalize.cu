@@ -276,8 +276,15 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts) routingIndicesBlo
             int const offsetForExpert = expertScanCounts;
             int const permutedIdx = isLocalExpert ? offsetForExpert + offsetWithinExpert : int32_t{-1};
 
-            params.mPtrExpandedIdxToPermutedIdx[expandedIdx] = permutedIdx;
-            if (isLocalExpert)
+            if (params.mPtrExpandedIdxToPermutedIdx != nullptr)
+            {
+                params.mPtrExpandedIdxToPermutedIdx[expandedIdx] = permutedIdx;
+            }
+            if (params.mPtrPermutedIdxToExpandedIdx != nullptr && isLocalExpert)
+            {
+                params.mPtrPermutedIdxToExpandedIdx[permutedIdx] = expandedIdx;
+            }
+            if (params.mPtrPermutedIdxToTokenIdx != nullptr && isLocalExpert)
             {
                 params.mPtrPermutedIdxToTokenIdx[permutedIdx] = tokenIdx;
             }

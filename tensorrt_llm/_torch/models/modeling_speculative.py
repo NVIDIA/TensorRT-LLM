@@ -351,7 +351,18 @@ class MTPForCausalLM(nn.Module):
     ):
         super().__init__()
         # Import here to avoid circular import
-        from .modeling_deepseekv3 import DeepseekV3MTP
+        model_type = model_config.pretrained_config.model_type
+        mtp_layer = None
+        match model_type:
+            case "glm4_moe":
+                from .modeling_glm import Glm4MTP
+                mtp_layer = Glm4MTP
+            case "deepseek_v3" | "deepseek_v32":
+                from .modeling_deepseekv3 import DeepseekV3MTP
+                mtp_layer = DeepseekV3MTP
+            case _:
+                raise ValueError(
+                    f"Model type {model_type} not supported for MTP")
 
         spec_dec_mode = model_config.spec_config.spec_dec_mode
         assert spec_dec_mode.is_mtp_one_model()
@@ -362,8 +373,8 @@ class MTPForCausalLM(nn.Module):
             model_config.spec_config.num_nextn_predict_layers // mtp_num_layers)
 
         self.mtp_layers = nn.ModuleList([
-            DeepseekV3MTP(model_config, layer_idx + start_layer_idx,
-                          model.aux_stream_dict)
+            mtp_layer(model_config, layer_idx + start_layer_idx,
+                      model.aux_stream_dict)
             for layer_idx in range(mtp_num_layers)
         ])
         self.lm_head = lm_head
