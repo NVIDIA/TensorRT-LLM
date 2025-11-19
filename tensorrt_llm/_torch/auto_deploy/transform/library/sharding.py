@@ -72,7 +72,11 @@ class ShardingTransformConfig(TransformConfig):
     simple_shard_only: bool = Field(default=False)
     support_partial_config: bool = False
     sharding_source: List[ShardingSource] = Field(
-        default_factory=lambda: [ShardingSource.HEURISTIC]
+        default_factory=lambda: [
+            ShardingSource.MANUAL,
+            ShardingSource.FACTORY,
+            ShardingSource.HEURISTIC,
+        ]
     )
     sharding_dims: List[ShardingDim] = Field(
         default_factory=lambda: [ShardingDim.SSM, ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
@@ -241,7 +245,7 @@ class Sharding(BaseTransform):
         for source in transform_container.sharding_source:
             if source == ShardingSource.FACTORY:
                 if len(transform_container.get_factory_config()) == 0:
-                    ad_logger.warning(
+                    ad_logger.debug(
                         "No factory config found. Skipping sharding from factory config"
                     )
                     continue
@@ -249,9 +253,7 @@ class Sharding(BaseTransform):
                 info += detect_sharding_from_config(gm, transform_container, ShardingSource.FACTORY)
             elif source == ShardingSource.MANUAL:
                 if len(transform_container.get_manual_config()) == 0:
-                    ad_logger.warning(
-                        "No manual config found. Skipping sharding from manual config"
-                    )
+                    ad_logger.debug("No manual config found. Skipping sharding from manual config")
                     continue
                 ad_logger.info("Applying sharding from manual config")
                 info += detect_sharding_from_config(gm, transform_container, ShardingSource.MANUAL)

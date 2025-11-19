@@ -6,11 +6,14 @@ import re
 from abc import ABC, abstractmethod
 from enum import Enum, IntEnum
 from functools import partial
-from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple
+
+if TYPE_CHECKING:
+    from ..transform.library.sharding import ShardingTransformConfig
 
 import torch
 import torch.nn as nn
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 from torch.fx import GraphModule, Node
 
 from ....functional import AllReduceStrategy
@@ -1279,8 +1282,8 @@ class ShardingTransformContainer(BaseModel):
     factory_source: ShardingConfigSource = Field(default=ShardingConfigSource.UNKNOWN)
     rank: int = Field(default=0)
     world_size: int = Field(default=1)
-    factory_config: Optional[Dict[str, Any]] = None
-    manual_config: Optional[Dict[str, Any]] = None
+    factory_config: Dict[str, Any] = Field(default_factory=dict)
+    manual_config: Dict[str, Any] = Field(default_factory=dict)
     simple_shard_only: bool = Field(default=False)
     support_partial_config: bool = False
     sharding_source: List[ShardingSource] = Field(
@@ -1314,12 +1317,11 @@ class ShardingTransformContainer(BaseModel):
             ParameterUpdateInfo: self.parameter_update_transforms,
         }
 
-    def init_params(self, other):
+    def init_params(self, other: "ShardingTransformConfig") -> None:
         """
         Copy parameters from ShardingTransformConfig. The class is not
         imported here to avoid circular imports.
         """
-        self.factory_source = other.factory_source
         self.rank = other.rank
         self.world_size = other.world_size
         self.factory_config = other.factory_config
@@ -1328,29 +1330,11 @@ class ShardingTransformContainer(BaseModel):
         self.support_partial_config = other.support_partial_config
         self.sharding_dims = other.sharding_dims
         self.sharding_source = other.sharding_source
-        self.factory_source = (
-            self.factory_config.get("source", ShardingConfigSource.UNKNOWN)
-            if self.factory_config
-            else ShardingConfigSource.UNKNOWN
-        )
+        # Extract factory_source from factory_config if present
+        self.factory_source = self.factory_config.get("source", ShardingConfigSource.UNKNOWN)
         self.allreduce_strategy = other.allreduce_strategy
         self.validate_config(ShardingSource.MANUAL)
         self.validate_config(ShardingSource.FACTORY)
-
-    @model_validator(mode="after")
-    def _validate_and_normalize(self):
-        # Normalize empty dict to None for "no config"
-        if isinstance(self.factory_config, dict) and not self.factory_config:
-            self.factory_config = None
-        # Validate only if provided
-        if self.factory_config is not None:
-            self.validate_config(ShardingSource.FACTORY)
-        # do the same for manual config
-        if isinstance(self.manual_config, dict) and not self.manual_config:
-            self.manual_config = None
-        if self.manual_config is not None:
-            self.validate_config(ShardingSource.MANUAL)
-        return self
 
     def add(self, transform: ShardingTransformInfo) -> bool:
         """Append a transform only if that node was
@@ -1389,34 +1373,25 @@ class ShardingTransformContainer(BaseModel):
             source == ShardingSource.FACTORY
             and self.factory_source != ShardingConfigSource.HUGGINGFACE
         ):
-            ad_logger.warning(
+            ad_logger.debug(
                 "Sharding config is currently only supported for HuggingFace. Skipping."
             )
             # invalidate the config
-            self.factory_config = {}
+            self.factory_config.clear()
             return False
 
-        if source == ShardingSource.MANUAL:
-            config = self.manual_config
-        else:
-            config = self.factory_config
-
-        if not isinstance(config, dict):
-            ad_logger.warning("Sharding config is not a dictionary. Skipping.")
-            # invalidate the config
-            config = {}
-            return False
+        config = self.manual_config if source == ShardingSource.MANUAL else self.factory_config
 
         if "head_dim" not in config:
-            ad_logger.warning("Sharding config does not contain head_dim. Skipping.")
+            ad_logger.debug("Sharding config does not contain head_dim. Skipping.")
             # invalidate the config
-            config = {}
+            config.clear()
             return False
 
         if "tp_plan" not in config or config["tp_plan"] is None:
-            ad_logger.warning("Sharding config does not contain tp_plan. Skipping.")
+            ad_logger.debug("Sharding config does not contain tp_plan. Skipping.")
             # invalidate the config
-            config = {}
+            config.clear()
             return False
         tp_plan = config["tp_plan"]
 
@@ -1435,18 +1410,14 @@ class ShardingTransformContainer(BaseModel):
             # "local",
         }
         if not self.support_partial_config and not values.issubset(supported_modes):
-            ad_logger.warning("Sharding config contains invalid values. Skipping.")
+            ad_logger.debug("Sharding config contains invalid values. Skipping.")
             # invalidate the config
-            config = {}
+            config.clear()
             return False
         return True
 
     def get_factory_config(self) -> Dict[str, Any]:
-        if self.factory_config is not None:
-            return self.factory_config
-        return {}
+        return self.factory_config
 
     def get_manual_config(self) -> Dict[str, Any]:
-        if self.manual_config is not None:
-            return self.manual_config
-        return {}
+        return self.manual_config
