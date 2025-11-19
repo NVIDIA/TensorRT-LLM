@@ -83,11 +83,19 @@ def run_single_rank_test(tensor_parallel_size, test_func, *args):
 @torch.inference_mode()
 def run_window_tensor_creation_test(
     shape: tuple,
-    dtype: torch.dtype,
+    dtype_str: str,
     tensor_parallel_size: int,
     tensor_parallel_rank: int,
 ):
     """Test creating NCCL window tensors."""
+    # Convert dtype string back to torch.dtype
+    dtype_map = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    dtype = dtype_map[dtype_str]
+
     # Create group list for window tensor creation
     group = list(range(tensor_parallel_size))
 
@@ -116,12 +124,20 @@ def run_window_tensor_creation_test(
 @torch.inference_mode()
 def run_window_tensor_multiple_test(
     shape: tuple,
-    dtype: torch.dtype,
+    dtype_str: str,
     tensor_parallel_size: int,
     tensor_parallel_rank: int,
     num_tensors: int,
 ):
     """Test creating multiple NCCL window tensors."""
+    # Convert dtype string back to torch.dtype
+    dtype_map = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    dtype = dtype_map[dtype_str]
+
     group = list(range(tensor_parallel_size))
 
     # Create multiple window tensors
@@ -153,11 +169,19 @@ def run_window_tensor_multiple_test(
 @torch.inference_mode()
 def run_window_tensor_different_shapes_test(
     shapes: list,
-    dtype: torch.dtype,
+    dtype_str: str,
     tensor_parallel_size: int,
     tensor_parallel_rank: int,
 ):
     """Test creating NCCL window tensors with different shapes."""
+    # Convert dtype string back to torch.dtype
+    dtype_map = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    dtype = dtype_map[dtype_str]
+
     group = list(range(tensor_parallel_size))
 
     # Create window tensors with different shapes
@@ -186,10 +210,8 @@ def run_window_tensor_different_shapes_test(
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 GPUs")
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
 @pytest.mark.parametrize("shape", [(1024,), (1024, 2048), (16, 32, 64)], ids=lambda x: f"shape:{x}")
-@pytest.mark.parametrize(
-    "dtype", [torch.float32, torch.float16, torch.bfloat16], ids=lambda x: str(x)
-)
-def test_create_window_tensor(mpi_pool_executor, shape, dtype):
+@pytest.mark.parametrize("dtype_str", ["float32", "float16", "bfloat16"], ids=lambda x: x)
+def test_create_window_tensor(mpi_pool_executor, shape, dtype_str):
     """Test creating a single NCCL window tensor."""
     torch.manual_seed(42)
 
@@ -203,7 +225,7 @@ def test_create_window_tensor(mpi_pool_executor, shape, dtype):
                     tensor_parallel_size,
                     run_window_tensor_creation_test,
                     shape,
-                    dtype,
+                    dtype_str,
                     tensor_parallel_size,
                     None,
                 )
@@ -218,9 +240,9 @@ def test_create_window_tensor(mpi_pool_executor, shape, dtype):
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 GPUs")
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
 @pytest.mark.parametrize("shape", [(1024, 2048)], ids=lambda x: f"shape:{x}")
-@pytest.mark.parametrize("dtype", [torch.bfloat16], ids=lambda x: str(x))
+@pytest.mark.parametrize("dtype_str", ["bfloat16"], ids=lambda x: x)
 @pytest.mark.parametrize("num_tensors", [2, 4, 8], ids=lambda x: f"num:{x}")
-def test_create_multiple_window_tensors(mpi_pool_executor, shape, dtype, num_tensors):
+def test_create_multiple_window_tensors(mpi_pool_executor, shape, dtype_str, num_tensors):
     """Test creating multiple NCCL window tensors."""
     torch.manual_seed(42)
 
@@ -234,7 +256,7 @@ def test_create_multiple_window_tensors(mpi_pool_executor, shape, dtype, num_ten
                     tensor_parallel_size,
                     run_window_tensor_multiple_test,
                     shape,
-                    dtype,
+                    dtype_str,
                     tensor_parallel_size,
                     None,
                     num_tensors,
@@ -249,8 +271,8 @@ def test_create_multiple_window_tensors(mpi_pool_executor, shape, dtype, num_ten
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 GPUs")
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
-@pytest.mark.parametrize("dtype", [torch.bfloat16], ids=lambda x: str(x))
-def test_create_window_tensors_different_shapes(mpi_pool_executor, dtype):
+@pytest.mark.parametrize("dtype_str", ["bfloat16"], ids=lambda x: x)
+def test_create_window_tensors_different_shapes(mpi_pool_executor, dtype_str):
     """Test creating NCCL window tensors with different shapes."""
     torch.manual_seed(42)
 
@@ -265,7 +287,7 @@ def test_create_window_tensors_different_shapes(mpi_pool_executor, dtype):
                     tensor_parallel_size,
                     run_window_tensor_different_shapes_test,
                     shapes,
-                    dtype,
+                    dtype_str,
                     tensor_parallel_size,
                     None,
                 )
