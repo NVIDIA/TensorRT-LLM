@@ -96,7 +96,7 @@ class OpenSearchDB:
                 OpenSearchDB.typeCheckForOpenSearchDB(item)
                 for item in json_data)
         if not isinstance(json_data, dict):
-            OpenSearchDB.logger.info(
+            print(
                 f"OpenSearchDB type check failed! Expected dict, got {type(json_data).__name__}"
             )
             return False
@@ -120,7 +120,7 @@ class OpenSearchDB:
             for prefix, expected_type in type_map.items():
                 if key.startswith(prefix):
                     if not isinstance(value, expected_type):
-                        OpenSearchDB.logger.info(
+                        print(
                             f"OpenSearchDB type check failed! key:{key}, value:{value} value_type:{type(value)}"
                         )
                         return False
@@ -128,7 +128,7 @@ class OpenSearchDB:
                     break
             if not matched:
                 if key not in allowed_keys:
-                    OpenSearchDB.logger.info(
+                    print(
                         f"Unknown key type! key:{key}, value_type:{type(value)}"
                     )
                     return False
@@ -173,27 +173,26 @@ class OpenSearchDB:
         """
         use_poc_db = "sandbox" in project
         if not OPEN_SEARCH_DB_BASE_URL:
-            OpenSearchDB.logger.info("OPEN_SEARCH_DB_BASE_URL is not set")
+            print("OPEN_SEARCH_DB_BASE_URL is not set")
             return False
         if not use_poc_db and (not OPEN_SEARCH_DB_USERNAME
                                or not OPEN_SEARCH_DB_PASSWORD):
-            OpenSearchDB.logger.info(
+            print(
                 "OPEN_SEARCH_DB_USERNAME or OPEN_SEARCH_DB_PASSWORD is not set")
             return False
         if not use_poc_db and project not in WRITE_ACCESS_PROJECT_NAME:
-            OpenSearchDB.logger.info(
+            print(
                 f"project {project} is not in write access project list: {json.dumps(WRITE_ACCESS_PROJECT_NAME)}"
             )
             return False
         if not OpenSearchDB.typeCheckForOpenSearchDB(json_data):
-            OpenSearchDB.logger.info(
-                f"OpenSearchDB type check failed! json_data:{json_data}")
+            print(f"OpenSearchDB type check failed! json_data:{json_data}")
             return False
 
         json_data_dump = json.dumps(json_data)
 
         if DISABLE_OPEN_SEARCH_DB_FOR_LOCAL_TEST:
-            OpenSearchDB.logger.info(
+            print(
                 f"OpenSearchDB is disabled for local test, skip posting to OpenSearchDB: {json_data_dump}"
             )
             return True
@@ -218,19 +217,19 @@ class OpenSearchDB:
                 res = requests.post(**args)
                 if res.status_code in (200, 201, 202):
                     if res.status_code != 200 and project == JOB_PROJECT_NAME:
-                        OpenSearchDB.logger.info(
+                        print(
                             f"OpenSearchDB post not 200, log:{res.status_code} {res.text}"
                         )
                     return True
                 else:
-                    OpenSearchDB.logger.info(
+                    print(
                         f"OpenSearchDB post failed, will retry, error:{res.status_code} {res.text}"
                     )
             except Exception as e:
-                OpenSearchDB.logger.info(
+                print(
                     f"OpenSearchDB post exception, attempt {attempt + 1} error: {e}"
                 )
-        OpenSearchDB.logger.info(
+        print(
             f"Fail to postToOpenSearchDB after {DEFAULT_RETRY_COUNT} tries: {url}, json: {json_data_dump}, last error: {getattr(res, 'text', 'N/A') if 'res' in locals() else ''}"
         )
         return False
@@ -246,10 +245,10 @@ class OpenSearchDB:
         """
         use_poc_db = "sandbox" in project
         if not OPEN_SEARCH_DB_BASE_URL:
-            OpenSearchDB.logger.info("OPEN_SEARCH_DB_BASE_URL is not set")
+            print("OPEN_SEARCH_DB_BASE_URL is not set")
             return None
         if not use_poc_db and project not in READ_ACCESS_PROJECT_NAME:
-            OpenSearchDB.logger.info(
+            print(
                 f"project {project} is not in read access project list: {json.dumps(READ_ACCESS_PROJECT_NAME)}"
             )
             return None
@@ -270,11 +269,11 @@ class OpenSearchDB:
                                timeout=QUERY_TIMEOUT_SECONDS)
             if res.status_code in [200, 201, 202]:
                 return res
-            OpenSearchDB.logger.info(
+            print(
                 f"OpenSearchDB query failed, will retry, error:{res.status_code} {res.text}"
             )
             retry_time -= 1
-        OpenSearchDB.logger.info(
+        print(
             f"Fail to queryFromOpenSearchDB after {retry_time} retry: {url}, json: {json_data_dump}, error: {res.text}"
         )
         return None
@@ -310,8 +309,7 @@ class OpenSearchDB:
             OpenSearchDB.query_build_id_cache[job_name] = build_ids
             return build_ids
         except Exception as e:
-            OpenSearchDB.logger.warning(
-                f"Failed to query build IDs from OpenSearchDB: {e}")
+            print(f"WARNING: Failed to query build IDs from OpenSearchDB: {e}")
             return []
 
     @staticmethod
@@ -368,9 +366,11 @@ class OpenSearchDB:
             OpenSearchDB.query_build_id_cache[cache_key] = pr_numbers
             return pr_numbers
         except Exception as e:
-            OpenSearchDB.logger.warning(
-                f"Failed to query PR IDs from OpenSearchDB: {e}")
+            print(f"WARNING: Failed to query PR IDs from OpenSearchDB: {e}")
             return []
 
 
 print(OpenSearchDB.queryPRIdsFromOpenSearchDB("LLM/main/L0_MergeRequest_PR"))
+print("OPEN_SEARCH_DB_BASE_URL: ", OPEN_SEARCH_DB_BASE_URL)
+print("OPEN_SEARCH_DB_USERNAME: ", OPEN_SEARCH_DB_USERNAME)
+print("OPEN_SEARCH_DB_PASSWORD: ", OPEN_SEARCH_DB_PASSWORD)
