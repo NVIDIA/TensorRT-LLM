@@ -40,16 +40,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
             use_cuda_graph=True,
         )
 
-        def __init__(self, alpha: float, output_dtype: torch.dtype):
+        def __init__(self, output_dtype: torch.dtype):
             super().__init__()
-            self.alpha = alpha
-            self.output_dtype = output_dtype
-            assert output_dtype == torch.bfloat16
 
+            # Validate output dtype (use proper exception instead of assert)
+            if output_dtype != torch.bfloat16:
+                raise ValueError(
+                    f"CuteDSL NVFP4 only supports bfloat16 output, got {output_dtype}"
+                )
+            self.output_dtype = output_dtype
+
+            # Validate SM version at initialization
             if get_sm_version() != 100:
                 raise ValueError(
-                    f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100"
-                )
+                    f"SM version {get_sm_version()} is not supported. "
+                    f"CuteDSL NVFP4 requires SM 100 (Blackwell).")
 
         # rewrite the hash function because the value of self.alpha doesn't affect the tactic.
         def __hash__(self):
@@ -149,6 +154,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self,
             inputs: List[torch.Tensor],
             tactic,
+            **kwargs,
         ) -> torch.Tensor:
             """
             Performs fp8 blockwise gemm operation using CuTe DSL.
@@ -160,7 +166,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     inputs[2]: Input scale tensor of shape (k//16, m), dtype: fp8.
                     inputs[3]: Weight scale tensor of shape (n, k//16), dtype: fp8.
                     inputs[4]: Alpha scaling factor. dtype: float32.
-                    inputs[5]: Output dtype, expected to be torch.bfloat16.
                 tactic: Tiling and cluster strategy, typically a tuple (mma_tiler_mn, cluster_shape_mn).
 
             Returns:
@@ -178,7 +183,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     False,
                 ]
 
-            a_tensor, b_tensor, a_sf_tensor, b_sf_tensor = inputs
+            a_tensor, b_tensor, a_sf_tensor, b_sf_tensor, alpha_tensor = inputs
             m, k, n = a_tensor.shape[0], a_tensor.shape[1], b_tensor.shape[0]
             c_tensor = torch.empty(*(m, n),
                                    dtype=self.output_dtype,
@@ -206,6 +211,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 b_sf_tensor, cutlass.Float8E4M3FN, 16)
             c_ptr = self.make_cute_dsl_global_pointer(c_tensor,
                                                       cutlass.BFloat16, 16)
+            # Create pointer to alpha on device
+            alpha_ptr = self.make_cute_dsl_global_pointer(
+                alpha_tensor, cutlass.Float32, 4)
 
             # get stream
             torch_stream = torch.cuda.current_stream()
@@ -261,7 +269,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     kernel_a_sf_ptr,
                     kernel_b_sf_ptr,
                     c_ptr,
-                    self.alpha,
+                    alpha_ptr,  # Pass alpha as device pointer
                     max_active_clusters,
                     stream,
                     swap_ab,
@@ -286,7 +294,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 kernel_a_sf_ptr,
                 kernel_b_sf_ptr,
                 c_ptr,
-                self.alpha,
+                alpha_ptr,  # Pass alpha as device pointer
                 stream,
             )
 
@@ -303,34 +311,29 @@ if IS_CUTLASS_DSL_AVAILABLE:
         weight: torch.Tensor,
         input_scale: torch.Tensor,
         weight_scale: torch.Tensor,
-        alpha: float,
+        alpha: torch.Tensor,
         output_dtype: torch.dtype,
     ) -> torch.Tensor:
         """CuteDSL-based NVFP4 GEMM optimized for Blackwell.
 
-        .. deprecated::
-            Use :func:`torch.ops.trtllm.nvfp4_gemm_unified` instead for automatic
-            backend selection among CUTLASS, cuBLASLt, and CuteDSL based on
-            performance profiling.
+        Note:
+            This function is primarily used internally by nvfp4_gemm_unified.
+            Direct usage is discouraged. Consider using nvfp4_gemm_unified instead
+            for automatic backend selection with better performance.
         """
-        from tensorrt_llm.logger import logger
-        logger.warning_once(
-            "cute_dsl_nvfp4_gemm_blackwell is deprecated. Use nvfp4_gemm_unified instead "
-            "for automatic backend selection with better performance.",
-            key="cute_dsl_nvfp4_gemm_blackwell_deprecated")
-
         tuner = AutoTuner.get()
 
-        cute_dsl_nvfp4_gemm_blackwell_runner = CuteDSLNVFP4BlackwellLinear(
-            alpha, output_dtype)
+        runner = CuteDSLNVFP4BlackwellLinear(output_dtype)
+
         _, best_tactic = tuner.choose_one(
             "trtllm::cute_dsl_nvfp4_gemm_blackwell",
-            [cute_dsl_nvfp4_gemm_blackwell_runner],
+            [runner],
             CuteDSLNVFP4BlackwellLinear.tuning_config,
             [input, weight, input_scale, weight_scale],
         )
-        return cute_dsl_nvfp4_gemm_blackwell_runner(
-            inputs=[input, weight, input_scale, weight_scale],
+
+        return runner(
+            inputs=[input, weight, input_scale, weight_scale, alpha],
             tactic=best_tactic,
         )
 
@@ -340,7 +343,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         mat_b: torch.Tensor,
         input_scale: torch.Tensor,
         weight_scale: torch.Tensor,
-        alpha: float,
+        alpha: torch.Tensor,  # Match custom op signature
         output_dtype: torch.dtype,
     ):
         # [m, k]
