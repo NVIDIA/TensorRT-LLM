@@ -91,7 +91,7 @@ class Buffers:
         new_buffer_tensor = None
         try:
             with torch.cuda.memory.use_mem_pool(get_shared_pool()):
-                new_buffer_tensor = torch.zeros((required_memory_size, ),
+                new_buffer_tensor = torch.empty((required_memory_size, ),
                                                 device='cuda',
                                                 dtype=torch.uint8)
         except Exception as ex:
@@ -101,7 +101,7 @@ class Buffers:
             )
             # if exception happens during allocating memory from shared pool, retry
             # to allocate from default pool
-            new_buffer_tensor = torch.zeros((required_memory_size, ),
+            new_buffer_tensor = torch.empty((required_memory_size, ),
                                             device='cuda',
                                             dtype=torch.uint8)
 
