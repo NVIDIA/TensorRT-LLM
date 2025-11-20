@@ -514,6 +514,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
 
     def slurmJobID = null
     def dockerArgs = null
+    def hasgdrdrv = false
 
     try {
         // Run ssh command to start node in desired cluster via SLURM
@@ -634,6 +635,9 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                             echo "--gpus ${gpuCount}"
                         fi
                     """, returnStdout: true).trim()
+                    if (fileExists('/dev/gdrdrv')) {
+                        hasgdrdrv = true
+                    }
                 }
 
                 dockerArgs = "${dockerArgs} " +
@@ -649,7 +653,9 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
 
                 if (partition.clusterName == "dlcluster") {
                     dockerArgs += " -e NVIDIA_IMEX_CHANNELS=0"
-                    dockerArgs += " --device=/dev/gdrdrv:/dev/gdrdrv"
+                    if (hasgdrdrv) {
+                        dockerArgs += " --device=/dev/gdrdrv:/dev/gdrdrv"
+                    }
                 }
                 echo "Final dockerArgs: ${dockerArgs}"
             } else {
