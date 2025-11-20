@@ -135,8 +135,8 @@ void MLARopeGeneration(torch::Tensor fused_q, // [tokens, num_heads, (nope_dim +
     TLLM_CHECK_WITH_INFO(
         head_size == kv_lora_rank + qk_rope_head_dim, "head_size must = kv_lora_rank + qk_rope_head_dim");
     TLLM_CHECK_WITH_INFO(num_kv_heads == 1, "num_kv_heads must = 1");
-    TORCH_CHECK(
-        mla_tensor_params.size() == 2, "Expecting 2 tensors for custom MLA tensor params: helix_position_offsets and helix_is_inactive_rank.");
+    TORCH_CHECK(mla_tensor_params.size() == 2,
+        "Expecting 2 tensors for custom MLA tensor params: helix_position_offsets and helix_is_inactive_rank.");
 
     auto stream = at::cuda::getCurrentCUDAStream(fused_q.get_device());
     auto const kv_cache_quant_mode = tc::QuantMode(uint32_t(quant_mode));
