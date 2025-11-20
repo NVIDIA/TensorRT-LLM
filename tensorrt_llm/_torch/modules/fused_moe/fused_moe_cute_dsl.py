@@ -404,24 +404,48 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             local_expert_offset=self.slot_start,
             tile_size=tile_size,
         )
-        x = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_blackwell(
-            input=x.view(torch.float4_e2m1fn_x2),
-            weight=self.w2_weight.view(torch.float4_e2m1fn_x2),
-            input_scale=x_sf.view(torch.uint8),
-            weight_scale=self.quant_scales.fc2_weight_block.view(torch.uint8),
-            alpha=self.quant_scales.fc2_global,
-            tile_idx_to_group_idx=tile_idx_to_expert_idx,
-            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
-            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
-            num_non_exiting_tiles=num_non_exiting_tiles,
-            token_final_scales=token_final_scales,
-            num_experts=self.num_slots,
-            top_k=self.routing_method.experts_per_token,
-            num_local_experts=self.expert_size_per_partition,
-            local_expert_offset=self.slot_start,
-            tile_size=tile_size,
-            output_dtype=output_dtype,
-        )
+        if self.use_fused_finalize:
+            x = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_blackwell(
+                input=x.view(torch.float4_e2m1fn_x2),
+                weight=self.w2_weight.view(torch.float4_e2m1fn_x2),
+                input_scale=x_sf.view(torch.uint8),
+                weight_scale=self.quant_scales.fc2_weight_block.view(
+                    torch.uint8),
+                alpha=self.quant_scales.fc2_global,
+                tile_idx_to_group_idx=tile_idx_to_expert_idx,
+                tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+                num_non_exiting_tiles=num_non_exiting_tiles,
+                token_final_scales=token_final_scales,
+                num_experts=self.num_slots,
+                top_k=self.routing_method.experts_per_token,
+                num_local_experts=self.expert_size_per_partition,
+                local_expert_offset=self.slot_start,
+                tile_size=tile_size,
+                output_dtype=output_dtype,
+            )
+        else:
+            x = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_blackwell(
+                input=x.view(torch.float4_e2m1fn_x2),
+                weight=self.w2_weight.view(torch.float4_e2m1fn_x2),
+                input_scale=x_sf.view(torch.uint8),
+                weight_scale=self.quant_scales.fc2_weight_block.view(
+                    torch.uint8),
+                alpha=self.quant_scales.fc2_global,
+                tile_idx_to_group_idx=tile_idx_to_expert_idx,
+                num_non_exiting_tiles=num_non_exiting_tiles,
+                num_experts=self.num_slots,
+                top_k=self.routing_method.experts_per_token,
+                num_local_experts=self.expert_size_per_partition,
+                local_expert_offset=self.slot_start,
+                tile_size=tile_size,
+                output_dtype=output_dtype,
+            )
+            x = torch.ops.trtllm.moe_unpermute(
+                permuted_input=x,
+                expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                topk_scales=token_final_scales,
+            )
         return x
 
     def forward_chunk(
