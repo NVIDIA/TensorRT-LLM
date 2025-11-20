@@ -10,7 +10,7 @@ from ...distributed import allgather
 from ...model_config import ModelConfig
 from ...utils import AuxStreamType, Fp4QuantizedTensor, ceil_div
 from .fused_moe_cutlass import CutlassFusedMoE
-from .quantization import MoEWeightLoadingMode
+from .quantization import MoEWeightLoadingMode, NVFP4CuteDslFusedMoEMethod
 from .routing import BaseMoeRoutingMethod
 
 
@@ -150,8 +150,7 @@ def cute_dsl_nvfp4_grouped_gemm_ref(
 
 
 class CuteDslFusedMoE(CutlassFusedMoE):
-    """
-    Python Flow of Fused Mixture of Experts (MoE) Layer.
+    """CuteDSL flow of fused mixture of experts (MoE) Layer.
 
     Args:
         num_experts (int): Number of experts in the MoE layer.
@@ -162,11 +161,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         dtype (Optional[torch.dtype]): Data type for the weights.
         reduce_results (bool): Whether to reduce the results across devices.
         model_config (ModelConfig): Configuration object for the model.
-
-    This backend is composed of multiple custom ops:
-    1. moe_permute_op: permute the input tensor and the expert selected tensor.
-    2. cute_dsl_fp8_group_blockwise_gemm_ref: a reference implementation of the cute_dsl_fp8_group_blockwise_gemm.
-    3. moe_finalize_scale_op: finalize the scale of the output tensor.
     """
 
     def __init__(
@@ -200,6 +194,13 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
         )
+
+    def _get_quant_method(self):
+        if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
+                exclude_kv_cache=True):
+            if self.quant_config.layer_quant_mode.has_nvfp4():
+                return NVFP4CuteDslFusedMoEMethod()
+        return super()._get_quant_method()
 
     def forward_chunk_unquantized(
             self,
