@@ -355,7 +355,7 @@ def buildImage(config, imageKeyToTag)
                 IMAGE_WITH_TAG=${imageWithTag} \
                 STAGE=${dockerfileStage} \
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
-                """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
+                """, sleepInSecs: randomSleep, numRetries: 1, shortCommondRunTimeMax: 7200)
             } catch (InterruptedException ex) {
                 throw ex
             } catch (Exception ex) {
