@@ -1,8 +1,7 @@
-import pytest
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any
 
+import pytest
 import torch
 from transformers import Starcoder2Config
 from transformers import Starcoder2ForCausalLM as HFStarcoder2ForCausalLM
@@ -123,6 +122,7 @@ def get_kv_cache_manager(
     )
     return kv_cache_manager
 
+
 @pytest.mark.parametrize(
     "scenario",
     [
@@ -173,13 +173,13 @@ def test_starcoder2_allclose_to_hf(scenario: Scenario) -> None:
         model_config = ModelConfig(pretrained_config=hf_config, attn_backend=backend)
         starcoder2 = Starcoder2ForCausalLM(model_config).to(dtype).to(device).eval()
         starcoder2.load_weights(hf_starcoder2.state_dict())
-    
+
     # Convert LayerNorm random weights to FP32 for numerical stability
     for name, module in starcoder2.named_modules():
         if isinstance(module, LayerNorm):
-            if hasattr(module, 'weight') and module.weight is not None:
+            if hasattr(module, "weight") and module.weight is not None:
                 module.weight.data = module.weight.data.to(torch.float32)
-            if hasattr(module, 'bias') and module.bias is not None:
+            if hasattr(module, "bias") and module.bias is not None:
                 module.bias.data = module.bias.data.to(torch.float32)
 
     num_blocks = 1

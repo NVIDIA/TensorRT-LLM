@@ -23,9 +23,9 @@ from tensorrt_llm._torch.attention_backend import AttentionMetadata
 from tensorrt_llm._torch.attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import (
-    _load_weights_impl,
     DecoderModel,
     DecoderModelForCausalLM,
+    _load_weights_impl,
     register_auto_model,
 )
 from tensorrt_llm._torch.modules.attention import Attention
@@ -36,7 +36,6 @@ from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm.functional import PositionEmbeddingType
-
 
 
 class Starcoder2Attention(Attention):
@@ -122,7 +121,9 @@ class Starcoder2DecoderLayer(DecoderLayer):
                 config=model_config,
             )
         else:
-            raise ValueError(f"Unsupported mlp_type: {config.mlp_type}. Only default (linear) MLP is supported.")
+            raise ValueError(
+                f"Unsupported mlp_type: {config.mlp_type}. Only default (linear) MLP is supported."
+            )
 
         norm_eps = getattr(config, "norm_epsilon", 1e-5)
         self.input_layernorm = LayerNorm(
@@ -219,9 +220,7 @@ class Starcoder2Model(DecoderModel):
         lora_params=None,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError(
-                "You must specify exactly one of input_ids or inputs_embeds."
-            )
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds.")
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
