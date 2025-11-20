@@ -14,16 +14,16 @@ if IS_CUDA_TILE_AVAILABLE:
     from ..cuda_tile_utils import next_power_of_2
 
 
-    @torch.library.custom_op("trtllm::cutile_rms_norm", mutates_args=())
-    def cutile_rms_norm(
+    @torch.library.custom_op("trtllm::cuda_tile_rms_norm", mutates_args=())
+    def cuda_tile_rms_norm(
         x: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
         static_persistent: bool,
         gather: bool,
     ) -> torch.Tensor:
-        x = x.clone().contiguous()
-        weight = weight.clone().contiguous()
+        x = x.contiguous()
+        weight = weight.contiguous()
 
         # Allocate output tensor
         y = torch.empty_like(x)
@@ -73,7 +73,7 @@ if IS_CUDA_TILE_AVAILABLE:
             ))
         return y.view(*x.shape)
 
-    @cutile_rms_norm.register_fake
+    @cuda_tile_rms_norm.register_fake
     def _(
         x: torch.Tensor,
         weight: torch.Tensor,

@@ -46,8 +46,6 @@ class RMSNorm(nn.Module):
             raise ValueError("has_weights must be True if use_gemma is True")
         if use_cuda_tile and not IS_CUDA_TILE_AVAILABLE:
             raise ValueError("cuda.tile is not available, please install it")
-        if use_cuda_tile and use_gemma:
-            raise ValueError("cuda_tile does support Gemma-style RMS norm yet")
 
         if has_weights:
             if not use_gemma:
@@ -79,17 +77,20 @@ class RMSNorm(nn.Module):
             residual = None
 
         if self.use_cuda_tile:
-            from ..custom_ops.cuda_tile_custom_ops import cutile_rms_norm
+            # TODO:
+            # 1. Fuse residual handling to kernels;
+            # 2. Fuse Gemma-style RMS norm to kernels.
+            from ..custom_ops.cuda_tile_custom_ops import cuda_tile_rms_norm
 
             if isinstance(residual, torch.Tensor):
-                # TODO: Fuse residual handing to cudatile_rms_norm.
-                residual = (hidden_states.float() + residual.float()).to(hidden_states.dtype)
-            hidden_states = cutile_rms_norm(
+                hidden_states = (hidden_states.float() + residual.float()).to(hidden_states.dtype)
+                residual = hidden_states
+            hidden_states = cuda_tile_rms_norm(
                 x=hidden_states,
-                weight=self.weight,
+                weight=(self.weight + 1) if self.use_gemma else self.weight,
                 eps=self.variance_epsilon,
                 static_persistent=False,
-                gather=True,
+                gather=True,  # gather=False cases subsequent device assertion failures.
             )
         elif IS_FLASHINFER_AVAILABLE:
             from ..custom_ops import (flashinfer_fused_add_rmsnorm,
