@@ -90,7 +90,7 @@ public:
         int32_t const sparse_mla_topk, std::optional<torch::Tensor> cu_q_seqlens,
         std::optional<torch::Tensor> cu_kv_seqlens, std::optional<torch::Tensor> fmha_scheduler_counter,
         std::optional<torch::Tensor> mla_bmm1_scale, std::optional<torch::Tensor> mla_bmm2_scale,
-        std::optional<torch::Tensor> quant_q_buffer, c10::ArrayRef<std::optional<torch::Tensor>> helix_tensor_params) const
+        std::optional<torch::Tensor> quant_q_buffer) const
         = 0;
 };
 
@@ -151,7 +151,7 @@ public:
         int32_t const sparse_mla_topk, std::optional<torch::Tensor> cu_q_seqlens,
         std::optional<torch::Tensor> cu_kv_seqlens, std::optional<torch::Tensor> fmha_scheduler_counter,
         std::optional<torch::Tensor> mla_bmm1_scale, std::optional<torch::Tensor> mla_bmm2_scale,
-        std::optional<torch::Tensor> quant_q_buffer, c10::ArrayRef<std::optional<torch::Tensor>> helix_tensor_params) const override
+        std::optional<torch::Tensor> quant_q_buffer) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv_or_q.get_device());
         T* attention_input = static_cast<T*>(qkv_or_q.slice(0, token_offset).data_ptr());
@@ -181,8 +181,8 @@ public:
         [[maybe_unused]] MlaParams<T> mla_params;
         if (op.isMLAEnabled())
         {
-            TORCH_CHECK(mla_tensor_params.size() == 1,
-                "Expecting 1 tensor for custom MLA tensor params: helix_position_offsets.");
+            TORCH_CHECK(mla_tensor_params.size() == 2,
+                "Expecting 2 tensors for custom MLA tensor params: helix_position_offsets and helix_is_inactive_rank.");
             if (is_context && op.mUseSparseAttention)
             {
                 if (latent_cache.has_value())
@@ -227,9 +227,14 @@ public:
 
                 // For generation, helix position is in ropeOp
                 auto& mla_helix_position_offsets = mla_tensor_params[0];
+                auto& mla_helix_is_inactive_rank = mla_tensor_params[1];
                 if (mla_helix_position_offsets.has_value())
                 {
                     mla_params.helix_position_offsets = mla_helix_position_offsets->data_ptr<int32_t>();
+                }
+                if (mla_helix_is_inactive_rank.has_value())
+                {
+                    mla_params.helix_is_inactive_rank = mla_helix_is_inactive_rank->const_data_ptr<bool>();
                 }
             }
             else
@@ -270,14 +275,6 @@ public:
             mla_params.meta = op.mMLAParams;
 
             mla_params.workspace = workspace_ptr;
-            if (helix_tensor_params[0].has_value())
-            {
-                mla_params.helix_position_offsets = helix_tensor_params[0].value().data_ptr<int32_t>();
-            }
-            if (helix_tensor_params[1].has_value())
-            {
-                mla_params.helix_is_inactive_rank = helix_tensor_params[1].value().const_data_ptr<bool>();
-            }
         }
 
         int const* context_lengths_ptr = context_lengths.slice(0, seq_offset).data_ptr<int>();
@@ -634,8 +631,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     int64_t const sparse_attn_indices_block_size, std::optional<int64_t> sparse_mla_topk,
     std::optional<torch::Tensor> cu_q_seqlens, std::optional<torch::Tensor> cu_kv_seqlens,
     std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
-    std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
-    std::vector<std::optional<torch::Tensor>> helix_tensor_params)
+    std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -891,7 +887,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             mrope_position_deltas, mla_tensor_params, softmax_stats_tensor, spec_decoding_tensor_params,
             attention_sinks, sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets,
             sparse_attn_indices_block_size, sparse_mla_topk_value, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
-            mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, helix_tensor_params);
+            mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -910,7 +906,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             mrope_position_deltas, mla_tensor_params, softmax_stats_tensor, spec_decoding_tensor_params,
             attention_sinks, sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets,
             sparse_attn_indices_block_size, sparse_mla_topk_value, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
-            mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, helix_tensor_params);
+            mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", layer_idx);

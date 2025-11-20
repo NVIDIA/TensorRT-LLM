@@ -478,10 +478,7 @@ class TrtllmAttentionWrapper:
             spec_decoding_tensor_params.append(self.spec_decoding_bl_tree_mask)
             spec_decoding_tensor_params.append(
                 self.spec_bl_tree_first_sparse_mask_offset_kv)
-        mla_tensor_params = [self.helix_position_offsets]
-        helix_tensor_params = [
-            self.helix_position_offsets, self.helix_is_inactive_rank
-        ]
+        mla_tensor_params = [self.helix_position_offsets, self.helix_is_inactive_rank]
 
         thop.attention(
             q,
@@ -561,7 +558,6 @@ class TrtllmAttentionWrapper:
             mla_bmm1_scale,
             mla_bmm2_scale,
             quant_q_buffer,
-            helix_tensor_params,
         )
         # reset the planned states (especially tensors) to avoid memory leak
         self.plan()
@@ -1752,6 +1748,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         mla_bmm2_scale: torch.Tensor,
         quant_q_buffer: torch.Tensor,
         helix_position_offsets: Optional[torch.Tensor] = None,
+        helix_is_inactive_rank: Optional[torch.Tensor] = None,
         out_scale: Optional[torch.Tensor] = None,
     ) -> None:
         """
@@ -1771,7 +1768,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         assert self.is_mla_enable and self.mla_params is not None
         assert metadata.kv_cache_manager is not None
         sink_token_length = 0
-        mla_tensor_params = [helix_position_offsets]
+        mla_tensor_params = [helix_position_offsets, helix_is_inactive_rank]
 
         torch.ops.trtllm.mla_rope_generation(
             fused_q,

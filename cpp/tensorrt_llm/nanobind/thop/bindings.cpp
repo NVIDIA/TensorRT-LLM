@@ -68,7 +68,7 @@ void initBindings(nb::module_& m)
         nb::arg("sparse_mla_topk") = std::nullopt, nb::arg("cu_q_seqlens") = std::nullopt,
         nb::arg("cu_kv_seqlens") = std::nullopt, nb::arg("fmha_scheduler_counter") = std::nullopt,
         nb::arg("mla_bmm1_scale") = std::nullopt, nb::arg("mla_bmm2_scale") = std::nullopt,
-        nb::arg("quant_q_buffer") = std::nullopt, nb::arg("helix_tensor_params"), "Multi-head attention operation",
+        nb::arg("quant_q_buffer") = std::nullopt, "Multi-head attention operation",
         nb::call_guard<nb::gil_scoped_release>());
 }
 } // namespace tensorrt_llm::nanobind::thop
