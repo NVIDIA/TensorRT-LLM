@@ -67,7 +67,7 @@ def trtllm_moe_fused_fake(
     return torch.empty_like(x)
 
 
-# Todo: refactor this repeating code block
+@torch.compile
 def _quantize_fp8(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """Quantize tensor to FP8 with clamping (matches torch_quant_fp8_linear)."""
     FP8_MIN = torch.finfo(torch.float8_e4m3fn).min
