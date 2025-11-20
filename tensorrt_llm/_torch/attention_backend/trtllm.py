@@ -478,7 +478,9 @@ class TrtllmAttentionWrapper:
             spec_decoding_tensor_params.append(self.spec_decoding_bl_tree_mask)
             spec_decoding_tensor_params.append(
                 self.spec_bl_tree_first_sparse_mask_offset_kv)
-        mla_tensor_params = [self.helix_position_offsets, self.helix_is_inactive_rank]
+        mla_tensor_params = [
+            self.helix_position_offsets, self.helix_is_inactive_rank
+        ]
 
         thop.attention(
             q,

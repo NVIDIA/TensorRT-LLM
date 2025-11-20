@@ -9,7 +9,6 @@ import weakref
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, List, Optional, Tuple
-from .llm_request import LlmRequest
 
 import torch
 import torch._dynamo.config
@@ -563,7 +562,8 @@ class PyTorchModelEngine(ModelEngine):
         if cp_type is not None:
             if cp_type in [CpType.ULYSSES, CpType.STAR]:
                 assert False, "cp_type must be HELIX for helix benchmarking."
-                print("[ModelEngine::warmup] EARLY RETURN since cp_type ", cp_type)
+                print("[ModelEngine::warmup] EARLY RETURN since cp_type ",
+                      cp_type)
                 return
 
         self._run_torch_compile_warmup(resource_manager)
@@ -1063,10 +1063,8 @@ class PyTorchModelEngine(ModelEngine):
                 f"Specified {self.max_seq_len=} is larger than what the model can support\n"
                 f"({inferred_max_seq_len}). NOT Setting max_seq_len to {inferred_max_seq_len}. "
                 f"ARE YOU SURE ABOUT THIS?\n"
-                f"*******************************************************\n"
-            )
+                f"*******************************************************\n")
             # self.max_seq_len = inferred_max_seq_len
-            pass
 
     def _infer_max_seq_len_from_config(self) -> int:
 
@@ -1622,7 +1620,8 @@ class PyTorchModelEngine(ModelEngine):
                 request.cached_tokens = num_cached_tokens_per_seq[-1]
                 prompt_lengths.append(request.py_prompt_len)
                 if self.mapping.has_cp_helix():
-                    helix_is_inactive_rank.append(request.py_helix_is_inactive_rank)
+                    helix_is_inactive_rank.append(
+                        request.py_helix_is_inactive_rank)
                 draft_lens.append(0)
                 sequence_lengths.append(1)
                 num_accepted_draft_tokens.append(0)
@@ -2134,8 +2133,7 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.padded_num_tokens = padded_num_tokens if padded_num_tokens != num_tokens else None
 
         if self.enable_attention_dp:
-            all_rank_num_tokens = self.dist.allgather(
-                attn_metadata.num_tokens)
+            all_rank_num_tokens = self.dist.allgather(attn_metadata.num_tokens)
             attn_metadata.all_rank_num_tokens = all_rank_num_tokens
 
         virtual_num_tokens = num_tokens
@@ -2195,9 +2193,7 @@ class PyTorchModelEngine(ModelEngine):
                 spec_all_rank_num_tokens = [
                     item[1] for item in all_rank_num_tokens
                 ]
-                all_rank_num_seqs = [
-                    item[2] for item in all_rank_num_tokens
-                ]
+                all_rank_num_seqs = [item[2] for item in all_rank_num_tokens]
                 attn_metadata.all_rank_num_tokens = attn_all_rank_num_tokens
                 spec_metadata.all_rank_num_tokens = spec_all_rank_num_tokens
                 spec_metadata.all_rank_num_seqs = all_rank_num_seqs
