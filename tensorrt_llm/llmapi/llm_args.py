@@ -233,8 +233,11 @@ class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
     prompt_budget: Optional[int] = Field(default=2048,
                                          description="Prompt budget")
     page_size: Optional[int] = Field(default=4, description="Page size")
-    kt_cache_dtype: Optional[Any] = Field(default=torch.bfloat16,
-                                          description="KT cache dtype")
+    kt_cache_dtype: Optional[str] = Field(
+        default='float8_e5m2',
+        choices=['bfloat16', 'float8_e5m2'],
+        description="KT cache dtype",
+    )
 
     @classmethod
     def from_dict(cls, data: dict):

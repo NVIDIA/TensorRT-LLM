@@ -27,13 +27,13 @@ def test_model(backend, model_name, attention_backend):
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                     enable_block_reuse=False)
 
-    dtype = torch.float8_e5m2 if attention_backend == "TRTLLM" else torch.bfloat16
+    kt_cache_dtype = 'float8_e5m2' if attention_backend == "TRTLLM" else 'bfloat16'
 
     sparse_attention_config = RocketSparseAttentionConfig(
         window_size=32,
         kernel_size=63,
         prompt_budget=2048,
-        kt_cache_dtype=dtype,
+        kt_cache_dtype=kt_cache_dtype,
     )
 
     cuda_graph_config = CudaGraphConfig(
@@ -168,6 +168,7 @@ def test_sparse_kv_predict(batch_size, num_contexts):
         kernel_size=3,
         prompt_budget=256,
         page_size=4,
+        kt_cache_dtype='bfloat16',
     )
 
     # Create sequence lengths - mix short and long sequences in context phase
@@ -373,6 +374,7 @@ def test_sparse_attn_predict(batch_size, num_contexts):
         page_size=2,
         topk=128,
         topr=96,
+        kt_cache_dtype='bfloat16',
     )
     sparse_attn_config_trtllm = RocketSparseAttentionConfig(
         window_size=32,
@@ -381,7 +383,7 @@ def test_sparse_attn_predict(batch_size, num_contexts):
         page_size=2,
         topk=64,
         topr=96,
-        kt_cache_dtype=torch.float8_e5m2,
+        kt_cache_dtype='bfloat16',
     )
 
     # Create sequence lengths

@@ -622,6 +622,7 @@ class RocketVanillaAttention(VanillaAttention):
         self.window_size = sparse_attention_config.window_size
         self.kernel_size = sparse_attention_config.kernel_size
         self.page_size = sparse_attention_config.page_size
+        assert sparse_attention_config.kt_cache_dtype == 'bfloat16', "Only bfloat16 kt cache is supported for Vanilla RocketKV"
 
     def _single_request_sparse_kv_predict(
             self, q: Optional[Tensor], k: Optional[Tensor], v: Optional[Tensor],
@@ -888,7 +889,7 @@ class RocketKVCacheManager(KVCacheManager):
         assert not kv_cache_config.enable_block_reuse, "RocketKV cache requires block reuse to be disabled in KV cache config"
         self.kt_tokens_per_block = next_power_of_2(
             math.ceil(tokens_per_block / sparse_attn_config.page_size))
-        self.kt_cache_dtype = sparse_attn_config.kt_cache_dtype
+        self.kt_cache_dtype = torch.bfloat16 if sparse_attn_config.kt_cache_dtype == 'bfloat16' else torch.float8_e5m2
 
         super().__init__(
             kv_cache_config,

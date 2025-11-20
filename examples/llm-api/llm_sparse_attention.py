@@ -65,6 +65,14 @@ def parse_arguments():
                         type=int,
                         default=2048,
                         help="The prompt budget for RocketKV.")
+    parser.add_argument('--topk',
+                        type=int,
+                        default=64,
+                        help='Top-k for RocketKV')
+    parser.add_argument('--kt_cache_dtype',
+                        type=str,
+                        default='float8_e5m2',
+                        choices=['bfloat16', 'float8_e5m2'])
     parser.add_argument('--index_max_chunk_size',
                         type=int,
                         default=32768,
@@ -193,6 +201,8 @@ def run_RocketKV(args):
         window_size=args.window_size,
         kernel_size=args.kernel_size,
         prompt_budget=args.prompt_budget,
+        topk=args.topk,
+        kt_cache_dtype=args.kt_cache_dtype,
     )
     run_llm(args, sparse_attention_config)
 
