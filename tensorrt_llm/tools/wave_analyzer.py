@@ -385,7 +385,7 @@ def main():
 
                             # Status Icons and Logic
                             icon = "✅"
-                            if "CRITICAL" in stats.recommendation: icon = "❌"
+                            if "CRITICAL" in stats.recommendation:icon = "❌"
                             elif "Tune" in stats.recommendation: icon = "⚠️"
                             elif "Split-K" in stats.recommendation: icon = "🛡️"
                             elif "Latency" in stats.recommendation or "Vocab" in stats.recommendation: icon = "🔹"
