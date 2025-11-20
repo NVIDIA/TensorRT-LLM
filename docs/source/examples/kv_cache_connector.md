@@ -33,15 +33,15 @@ These methods run on the leader process and drive the connector's behavior.
   * **Returns**: An arbitrary metadata object (picklable) that describes the tasks for the workers. This object is broadcasted to all workers.
 
 * **`get_num_new_matched_tokens(self, request: LlmRequest, num_computed_tokens: int) -> tuple[int, bool]`**
-  * **Description**: Called when a new request arrives. It checks the external cache to see if any part of the prompt has already been computed and cached.
+  * **Description**: Called when a new request arrives. It checks to see if any KV cache can be loaded from an external KV store.
   * **Returns**: A tuple `(num_tokens, is_async)`. `num_tokens` is the number of tokens found in the external cache. `is_async` indicates if the loading will happen asynchronously (background) or requires blocking.
 
 * **`request_finished(self, request: LlmRequest, cache_block_ids: list[int]) -> bool`**
   * **Description**: Called when a request completes generation.
-  * **Returns**: A boolean indicating if an asynchronous save operation has started. If `True`, the system waits for the operation to complete before deallocating the blocks.
+  * **Returns**: A boolean indicating if an asynchronous save operation is underway. If `True`, the system waits for the operation to complete before releasing the KV cache blocks.
 
 * **`update_state_after_alloc(self, request: LlmRequest, block_ids: list[int])`**
-  * **Description**: a callback to update internal state after new blocks have been allocated for a request.
+  * **Description**: a callback to update internal state after KV cache blocks have been allocated for the prefill.
 
 #### 2. Worker Interface (`KvCacheConnectorWorker`)
 
@@ -53,7 +53,7 @@ These methods run on all workers (GPU processes) and interact with the actual GP
 
 * **`start_load_kv(self, stream: torch.cuda.Stream)`**
   * **Description**: Initiates the loading of KV blocks from the external source into the GPU memory.
-  * **Arguments**: `stream` is the CUDA stream where copy operations should be enqueued.
+  * **Arguments**: `stream` is the CUDA stream where the forward pass is executed in.
 
 * **`wait_for_layer_load(self, layer_idx: int, stream: torch.cuda.Stream)`**
   * **Description**: A synchronization point. Ensures that the KV cache for a specific layer is fully loaded before the model attempts to perform the forward pass on that layer.
@@ -93,9 +93,8 @@ This example implements a file-system based KV cache.
 This example illustrates the API mechanics but has several limitations that make it unsuitable for high-performance production use without modification:
 
 1. **Blocking I/O**: The example uses `torch.load` and `torch.save` synchronously. In a real implementation, these should be offloaded to a background thread or asynchronous I/O handler to avoid stalling the GPU.
-2. **Simplified Block Matching**: The `get_num_new_matched_tokens` implementation in the example only matches full blocks aligned to the start of the sequence. It doesn't handle complex prefix matching or partial blocks efficiently.
-3. **No Chunked Prefill**: The example notes it "does not work with chunked prefill," meaning it assumes the entire prefill happens in one go.
-4. **FileSystem Latency**: Storing one file per block can create high filesystem overhead. Production systems typically aggregate blocks or use a key-value store database (like Redis) or object store.
+2. **Simplified Block Matching**: The `get_num_new_matched_tokens` implementation in the example only matches full blocks. It does not handle partial cache hits.
+3. **FileSystem Latency**: Storing one file per block can create high filesystem overhead.
 
 ### Usage
 
