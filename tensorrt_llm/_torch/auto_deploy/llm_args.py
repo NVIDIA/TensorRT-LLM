@@ -1,6 +1,6 @@
 from importlib.resources import files
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Type, Union
+from typing import Any, Dict, List, Literal, Optional, Set, Type, Union
 
 import torch
 from pydantic import Field, PrivateAttr, ValidationInfo, field_validator, model_validator
@@ -8,7 +8,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from ...llmapi.llm_args import BaseLlmArgs, BuildConfig, KvCacheConfig, SamplerType, _ParallelConfig
+from ...llmapi.llm_args import (
+    BaseLlmArgs,
+    BuildConfig,
+    EagleDecodingConfig,
+    KvCacheConfig,
+    SamplerType,
+    _ParallelConfig,
+)
 from .models import ModelFactory, ModelFactoryRegistry
 from .utils._config import DynamicYamlMixInForSettings
 from .utils.logger import ad_logger
@@ -36,6 +43,12 @@ def _check_for_default_value_only(
     if value != cls.model_fields[field_name].get_default(call_default_factory=True):
         raise ValueError(msg)
     return value
+
+
+def default_eagle3_layers_to_capture(num_hidden_layers: int) -> Set[int]:
+    if num_hidden_layers <= 5:
+        raise ValueError("Not enough hidden layers for default EAGLE3 capture")
+    return {1, num_hidden_layers // 2 - 1, num_hidden_layers - 4}
 
 
 _TRANSFORMS_SHORTCUT_LOOKUP = {
@@ -150,6 +163,11 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
 
     enable_chunked_prefill: bool = Field(default=False, description="Enable chunked prefill.")
 
+    draft_checkpoint_loader: Optional[object] = Field(
+        default=None,
+        description="The checkpoint loader to use for the draft model when using speculative decoding with two models.",
+    )
+
     ### INFERENCE OPTIMIZER CONFIG #################################################################
     mode: Literal["graph", "transformers"] = Field(
         default="graph",
@@ -188,11 +206,6 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
             " be used to determine the batch sizes.",
             "cuda_graph_batch_sizes",
         ),
-    )
-
-    draft_checkpoint_loader: Optional[object] = Field(
-        default=None,
-        description="The checkpoint loader to use for the draft model when using speculative decoding with two models.",
     )
 
     ### SEQUENCE INTERFACE CONFIG ##################################################################
@@ -419,6 +432,26 @@ class LlmArgs(AutoDeployConfig, BaseLlmArgs, BaseSettings):
     def ensure_no_custom_parallel_config(cls, value: Any, info: ValidationInfo) -> Any:
         msg = "AutoDeploy only supports parallelization via the `world_size` argument."
         return _check_for_default_value_only(cls, value, info, msg)
+
+    @model_validator(mode="after")
+    def default_eagle3_layers_to_capture(self):
+        if self.speculative_config is None or not isinstance(
+            self.speculative_config, EagleDecodingConfig
+        ):
+            return self
+
+        if self.speculative_config.eagle3_layers_to_capture is None:
+            num_hidden_layers = self.create_factory()._get_model_config()[0].num_hidden_layers
+            self.speculative_config.eagle3_layers_to_capture = default_eagle3_layers_to_capture(
+                num_hidden_layers
+            )
+
+        # insert the layers to capture into the transforms config.
+        self.transforms["detect_hidden_states_for_capture"]["eagle3_layers_to_capture"] = (
+            self.speculative_config.eagle3_layers_to_capture
+        )
+
+        return self
 
     @model_validator(mode="after")
     def validate_parallel_config(self):

@@ -1476,11 +1476,24 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
                 num_accepted = self._process_draft_tokens_greedy(
                     request, new_tokens=new_tokens_list, finish_reasons=finish_reasons
                 )
-            return num_accepted
         else:
-            return self._process_draft_tokens_rejection_sampling(
+            num_accepted = self._process_draft_tokens_rejection_sampling(
                 request, new_tokens_list=new_tokens_list, new_tokens_tensor=new_tokens_tensor
             )
+
+        # Print draft acceptance info each iteration (non-overlap scheduler path)
+        draft_len = get_draft_token_length(request)
+        print(
+            "[spec-decode] req=%s iter=%s draft_len=%d accepted=%d"
+            % (
+                getattr(request, "py_request_id", None),
+                getattr(request, "py_decoding_iter", None),
+                draft_len,
+                num_accepted,
+            )
+        )
+
+        return num_accepted
 
     def _get_logprobs_from_request(self, request: LlmRequest) -> tuple[torch.Tensor, torch.Tensor]:
         """Extract the logprobs from the request

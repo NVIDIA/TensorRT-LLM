@@ -13,10 +13,11 @@ import copy
 import types
 from collections import defaultdict
 from dataclasses import dataclass
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from strenum import StrEnum
 from torch._prims_common import DeviceLikeType
 
@@ -32,9 +33,11 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_draft_tok
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import get_guided_decoding_config
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._torch.speculative import get_spec_drafter
+from tensorrt_llm._torch.speculative.eagle3 import Eagle3ResourceManager
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.llmapi.llm_args import (
     ContextChunkingPolicy,
+    EagleDecodingConfig,
     LoadFormat,
     SamplerType,
     TorchLlmArgs,
@@ -57,6 +60,7 @@ from ...pyexecutor.sampler import TorchSampler, TRTLLMSampler
 from ...pyexecutor.scheduler import (
     BindCapacityScheduler,
     BindMicroBatchScheduler,
+    RequestList,
     ScheduledRequests,
     SimpleScheduler,
 )
@@ -111,6 +115,90 @@ class _CacheManagerWithFakePool(KVCacheManager):
         # implementation before over-optimizing the function here
         ad_logger.info("Using fake cache manager with head_dim=0 and num pages:", self.num_blocks)
         return self.num_blocks, 0
+
+
+class ADHiddenStateManager(Eagle3ResourceManager):
+    def __init__(
+        self,
+        cache_seq_interface: CachedSequenceInterface,
+        config: EagleDecodingConfig,
+        max_num_requests: int,
+        max_seq_len: int,
+        max_num_tokens: int,
+    ):
+        hidden_state_buffer = self._get_hidden_state_buffers(cache_seq_interface)[0]
+        dtype = hidden_state_buffer.dtype
+        hidden_size = hidden_state_buffer.shape[1]
+
+        super().__init__(config, dtype, hidden_size, max_num_requests, max_seq_len, max_num_tokens)
+
+        self.hidden_state_write_indices: torch.Tensor = torch.empty(
+            max_num_tokens, dtype=torch.long, device="cuda"
+        )
+
+    def _get_hidden_state_buffers(
+        self, cache_seq_interface: CachedSequenceInterface
+    ) -> List[torch.Tensor]:
+        hidden_state_buffers = []
+        for name, tensor in cache_seq_interface.named_args.items():
+            if "hidden_states_cache" in name:
+                hidden_state_buffers.append(tensor)
+
+        if not hidden_state_buffers:
+            raise ValueError(
+                "No hidden_state_buffers found in cache_seq_interface. Check if we are actually running Eagle3."
+            )
+        return hidden_state_buffers
+
+    def prepare_hidden_states_capture(
+        self, ordered_requests: RequestList, cache_seq_interface: CachedSequenceInterface
+    ) -> None:
+        """Prepare the hidden states for capture by establishing indices that the hidden states will be written to."""
+        seq_lens = cache_seq_interface.info.seq_len
+        num_tokens = sum(seq_lens)
+
+        start_idx = 0
+        hidden_states_write_indices = []
+        for request, seq_len in zip(ordered_requests, seq_lens):
+            request_id = request.request_id
+            slot_id = self.slot_manager.get_slot(request_id)
+            self.start_indices[slot_id] = start_idx
+            hidden_states_write_indices.extend(range(start_idx, start_idx + seq_len))
+            start_idx += max(seq_len, self.max_total_draft_tokens + 1)
+            assert start_idx < self.hidden_states.shape[0], (
+                f"start_idx {start_idx} exceeds hidden_states capacity {self.hidden_states.shape[0]}"
+            )
+
+        if len(hidden_states_write_indices) != num_tokens:
+            raise ValueError(
+                f"len(hidden_state_write_indices) ({len(hidden_states_write_indices)}) != num_tokens \
+                ({num_tokens}). Check whether ordered_requests matches up with seq_lens."
+            )
+
+        hidden_state_write_indices_host = torch.tensor(
+            hidden_states_write_indices, dtype=torch.long
+        )
+
+        self.hidden_state_write_indices[:num_tokens].copy_(
+            hidden_state_write_indices_host, non_blocking=True
+        )
+
+    def capture_hidden_states(self, cache_seq_interface: CachedSequenceInterface) -> None:
+        """Capture configured hidden states that have been written by the model,
+        in a format that can be used by the draft model.
+        """
+        full_hidden_states = self._get_hidden_state_buffers(cache_seq_interface)
+        if not full_hidden_states:
+            return
+
+        num_tokens = sum(cache_seq_interface.info.seq_len)
+
+        hidden_states = [hidden_state[:num_tokens] for hidden_state in full_hidden_states]
+        hidden_states = torch.cat(hidden_states, dim=1) if hidden_states else None
+        hidden_states = hidden_states.to(dtype=self.dtype)
+
+        token_idx = self.hidden_state_write_indices[:num_tokens]
+        self.hidden_states[:, : hidden_states.shape[1]].index_copy_(0, token_idx, hidden_states)
 
 
 def construct_draft_llm_args(
@@ -461,6 +549,10 @@ class ADEngine(ModelEngine):
         kv_cache_manager = resource_manager.get_resource_manager(
             ResourceManagerType.KV_CACHE_MANAGER
         )
+        # resource manager for hidden state capture
+        spec_resource_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.SPEC_RESOURCE_MANAGER
+        )
 
         # requests in order of context, generate
         context_requests = scheduled_requests.context_requests
@@ -471,6 +563,7 @@ class ADEngine(ModelEngine):
             r for r in scheduled_requests.generation_requests if get_draft_token_length(r) == 0
         ]
         gen_requests = extend_requests + generation_requests
+        ordered_requests = context_requests + gen_requests
         # info to be extracted
         input_ids: List[List[int]] = []
         position_ids: List[List[int]] = []
@@ -670,16 +763,31 @@ class ADEngine(ModelEngine):
 
         self.cache_seq_interface.info.run_host_prepare_for_attention_forward()
 
+        if spec_resource_manager is not None and isinstance(
+            spec_resource_manager, ADHiddenStateManager
+        ):
+            spec_resource_manager.prepare_hidden_states_capture(
+                ordered_requests, self.cache_seq_interface
+            )
+
         self.iter_states["num_ctx_requests"] = num_ctx_requests
         self.iter_states["num_ctx_tokens"] = num_ctx_tokens
         # TODO: handle extend requests and draft requests for specdec
         self.iter_states["num_generation_tokens"] = num_generation_tokens
 
     @nvtx_range("ad_compute_logits")
-    def _compute_logits(self) -> List[torch.Tensor]:
+    def _compute_logits(self, resource_manager: ResourceManager) -> List[torch.Tensor]:
         # run the model
         logits: torch.Tensor = self.model(**self.cache_seq_interface.named_args)[0]
         logits = self.cache_seq_interface.info.maybe_gather_and_squeeze_logits(logits)
+
+        spec_resource_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.SPEC_RESOURCE_MANAGER
+        )
+        if spec_resource_manager is not None and isinstance(
+            spec_resource_manager, ADHiddenStateManager
+        ):
+            spec_resource_manager.capture_hidden_states(self.cache_seq_interface)
 
         # TRTLLMSampler expects float32 logits. PyTorchModelEngine always casts to float32 regardless.
         return logits.float()
@@ -708,7 +816,7 @@ class ADEngine(ModelEngine):
         self.iter_counter += 1
 
         outputs = {
-            "logits": self._compute_logits(),
+            "logits": self._compute_logits(resource_manager),
         }
         if self.mapping is not None:
             self._execute_logit_post_processors(scheduled_requests, outputs)
@@ -716,8 +824,30 @@ class ADEngine(ModelEngine):
         return outputs
 
 
+def share_embedding_weights(
+    target_model_engine: "ADEngine", draft_model_engine: PyTorchModelEngine
+):
+    # This function is necessary for supporting Eagle and other speculative decoding methods that
+    # copy the embed_tokens submodule. It is not necessary for MTP and other speculative decoding methods that
+    # use the draft model engine directly.
+
+    submodule = target_model_engine.model.model.embed_tokens
+
+    world_size = mpi_world_size()
+    assert world_size <= 1, f"This code assumes tp<=1. World size: {world_size}"
+
+    # Note: This simple forward function implementation assumes tp=1.
+    # TODO(govind): Handle the tp>1 case.
+    def new_embedding_forward(self, input_ids):
+        return F.embedding(input_ids, self.weight)
+
+    submodule.forward = MethodType(new_embedding_forward, submodule)
+
+    draft_model_engine.load_weights_from_target_model(target_model_engine.model)
+
+
 def create_draft_model_engine_maybe(
-    ad_config: LlmArgs, engine, dist_mapping: Mapping, mpi_dist: MPIDist
+    ad_config: LlmArgs, target_engine: ADEngine, dist_mapping: Mapping, mpi_dist: MPIDist
 ) -> Optional[PyTorchModelEngine]:
     """Create a draft model engine for speculative decoding.
 
@@ -745,13 +875,17 @@ def create_draft_model_engine_maybe(
         chunked_prefill=ad_config.enable_chunked_prefill,
         cache_reuse=kv_cache_config.enable_block_reuse,
         has_speculative_draft_tokens=has_spec_drafter,
-        chunk_size=engine.llm_args.max_num_tokens,
+        chunk_size=target_engine.llm_args.max_num_tokens,
     )
 
     # Construct TorchLlmArgs for the draft model
     draft_llm_args = construct_draft_llm_args(
         ad_config=ad_config,
     )
+
+    # chain drafter is not supported currently for AutoDeploy.
+    # TODO(govind): Do this when we want to optimize 2-model spec dec performance.
+    drafting_loop_wrapper = None
 
     draft_model_engine = PyTorchModelEngine(
         model_path=draft_spec_config.speculative_model_dir,
@@ -761,7 +895,11 @@ def create_draft_model_engine_maybe(
         dist=mpi_dist,
         spec_config=draft_spec_config,
         is_draft_model=True,
-        drafting_loop_wrapper=None,
+        drafting_loop_wrapper=drafting_loop_wrapper,
+    )
+
+    share_embedding_weights(
+        target_model_engine=target_engine, draft_model_engine=draft_model_engine
     )
 
     draft_model_engine.kv_cache_manager_key = ResourceManagerType.DRAFT_KV_CACHE_MANAGER
@@ -855,9 +993,11 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     engine = ADEngine.build_from_config(ad_config=ad_config, mapping=dist_mapping)
 
     spec_config = ad_config.speculative_config
-    if spec_config is not None and not spec_config.spec_dec_mode.is_draft_target():
+    if spec_config is not None and not (
+        spec_config.spec_dec_mode.is_draft_target() or spec_config.spec_dec_mode.is_eagle3()
+    ):
         raise ValueError(
-            "Currently, AutoDeploy only supports speculative decoding in draft target mode."
+            "Currently, AutoDeploy only supports speculative decoding in draft target or eagle3 mode."
         )
 
     if spec_config is not None and ad_config.guided_decoding_backend is not None:
@@ -865,11 +1005,20 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
             "Guided decoding is not currently supported for speculative decoding in AutoDeploy."
         )
 
-    # Speculative resource manager not needed for DraftTargetDecoding.
-    spec_resource_manager = None
-
     draft_model_engine = create_draft_model_engine_maybe(
-        ad_config=ad_config, engine=engine, dist_mapping=dist_mapping, mpi_dist=mpi_dist
+        ad_config=ad_config, target_engine=engine, dist_mapping=dist_mapping, mpi_dist=mpi_dist
+    )
+
+    spec_resource_manager = (
+        ADHiddenStateManager(
+            cache_seq_interface=engine.cache_seq_interface,
+            config=spec_config,
+            max_num_requests=ad_config.max_batch_size,
+            max_seq_len=engine.llm_args.max_seq_len,
+            max_num_tokens=engine.llm_args.max_num_tokens,
+        )
+        if isinstance(spec_config, EagleDecodingConfig)
+        else None
     )
 
     # check kvcache config for partial block reuse

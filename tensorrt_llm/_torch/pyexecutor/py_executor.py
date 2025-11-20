@@ -1757,6 +1757,14 @@ class PyExecutor:
             batch_indices = torch.arange(batch_size, device=device)
             new_tokens[0, :, 0] = target_tokens[num_accepted_tokens,
                                                 batch_indices]
+
+            # Print speculative acceptance counts each iteration
+            accepted = num_accepted_tokens.detach().cpu().tolist()
+            print("[spec-decode] iter=%s batch=%d ctx=%d draft_len=%d "
+                  "accepted_draft_tokens=%s (draft+1 is the target token)" %
+                  (getattr(self, "iter_counter", None), batch_size,
+                   len(scheduled_batch.context_requests), max_draft_len,
+                   accepted))
         else:
             # No draft tokens to accept, just use the first (and only) sampled token
             batch_indices = torch.arange(batch_size, device=device)
