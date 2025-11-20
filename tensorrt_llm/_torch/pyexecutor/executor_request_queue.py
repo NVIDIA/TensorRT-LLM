@@ -14,7 +14,6 @@ from tensorrt_llm._utils import mpi_disabled, nvtx_range
 from tensorrt_llm.mapping import CpType
 
 from ..distributed import Distributed
-from ..utils import use_torch_printoptions
 from .llm_request import (ExecutorRequest, LlmRequest,
                           executor_request_to_llm_request)
 
@@ -686,16 +685,12 @@ class ExecutorRequestQueue:
                 input_ids_this_rank = input_ids_this_rank[:-padding_len]
                 position_ids_this_rank = position_ids_this_rank[:-padding_len]
 
-            with use_torch_printoptions(sci_mode=False,
-                                        threshold=16,
-                                        edgeitems=2,
-                                        linewidth=120):
-                print(
-                    f"[ExecutorRequestQueue::_merge_helix_requests][{curr_cp_rank}]: input_ids_this_rank: {torch.tensor(input_ids_this_rank)}"
-                )
-                print(
-                    f"[ExecutorRequestQueue::_merge_helix_requests][{curr_cp_rank}]: position_ids_this_rank: {torch.tensor(position_ids_this_rank)}"
-                )
+            print(
+                f"[ExecutorRequestQueue::_merge_helix_requests][{curr_cp_rank}]: input_ids_this_rank: {torch.tensor(input_ids_this_rank)}"
+            )
+            print(
+                f"[ExecutorRequestQueue::_merge_helix_requests][{curr_cp_rank}]: position_ids_this_rank: {torch.tensor(position_ids_this_rank)}"
+            )
             # TODO: Figure how to pass down position_ids_this_rank to LLMRequest.
             req = executor_request_to_llm_request(
                 req_id=req_item.id,

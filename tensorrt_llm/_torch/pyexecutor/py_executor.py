@@ -42,7 +42,6 @@ from ..modules.decoder_layer import DecoderLayer
 from ..speculative.drafter import Drafter
 from ..speculative.mtp import SampleStateTensorsMTP
 from ..speculative.speculation_gate import SpeculationGate
-from ..utils import use_torch_printoptions
 from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
 from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
@@ -1903,15 +1902,11 @@ class PyExecutor:
                 req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
                 beam_width = req.sampling_config.beam_width
 
-                with use_torch_printoptions(sci_mode=False,
-                                            threshold=16,
-                                            edgeitems=2,
-                                            linewidth=120):
-                    for beam in range(0, beam_width):
-                        print(
-                            f"[PyExecutor::_prepare_disagg_gen_transmission_complete]: Adding new token {torch.tensor(first_gen_tokens[beam])} for beam {beam}."
-                        )
-                        req.add_new_token(first_gen_tokens[beam], beam)
+                for beam in range(0, beam_width):
+                    print(
+                        f"[PyExecutor::_prepare_disagg_gen_transmission_complete]: Adding new token {torch.tensor(first_gen_tokens[beam])} for beam {beam}."
+                    )
+                    req.add_new_token(first_gen_tokens[beam], beam)
 
     @nvtx_range("_recv_disagg_gen_cache")
     def _recv_disagg_gen_cache(self, new_gen_reqs):
