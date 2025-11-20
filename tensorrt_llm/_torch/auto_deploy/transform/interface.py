@@ -24,7 +24,6 @@ from ..utils._graph import (
     run_shape_prop,
 )
 from ..utils.logger import ad_logger
-from ..utils.sharding_utils import ShardingTransformContainer
 
 
 class TransformError(Exception):
@@ -61,9 +60,13 @@ class Stages(Enum):
 class SharedConfig(BaseModel):
     """Global config shared between multiple transforms in the inference optimizer."""
 
-    sharding_transform_container: ShardingTransformContainer = Field(
-        default_factory=ShardingTransformContainer
-    )
+    # sharding_transform_container: ShardingTransformContainer = Field(
+    #     default_factory=ShardingTransformContainer
+    # )
+    model_config = {
+        # to provide an easy way to do config validation of child config classes with more fields
+        "extra": "allow",
+    }
     local_rank: int = Field(default=0)
     world_size: int = Field(default=1)
 

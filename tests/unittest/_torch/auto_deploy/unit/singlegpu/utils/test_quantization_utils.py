@@ -6,11 +6,11 @@ from tensorrt_llm._torch.auto_deploy.transform.interface import TransformConfig
 from tensorrt_llm._torch.auto_deploy.transform.library.quantization import (
     FP8LinearQuantizationFromConfig,
 )
+from tensorrt_llm._torch.auto_deploy.transform.library.sharding import _shard_fp4_weight_scale
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (
     fp4_global_scale,
     modelopt_fp4_scale_to_cutlass_fp4_scale,
 )
-from tensorrt_llm._torch.auto_deploy.utils.sharding_utils import _shard_fp4_weight_scale
 
 
 @pytest.mark.parametrize("dim", [0, 1])
