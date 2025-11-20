@@ -1487,8 +1487,6 @@ def test_fused_moe_nvfp4(dtype, moe_backend, hidden_size, intermediate_size):
             fused_moe.forward(x, router_logits)
 
         output = fused_moe.forward(x, router_logits)
-        print(output)
-        print(ref_output)
         torch.testing.assert_close(output, ref_output, rtol=0.1, atol=0.4)
 
         if not test_all_kernels:

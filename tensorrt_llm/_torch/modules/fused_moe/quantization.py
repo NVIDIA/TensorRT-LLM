@@ -1582,10 +1582,6 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                            intermediate_size_per_partition_padded //
                            weight_vec_size)
 
-        print("creating weights for NVFP4 fused MoE")
-        print("padded w3_w1_weight_shape:", w3_w1_weight_shape)
-        print("padded w2_weight_shape:", w2_weight_shape)
-
         # Divide by 4 because we use int32 to pack 4 fp8 values
         # column parallel
         w3_w1_weight_scale = nn.Parameter(
@@ -1596,10 +1592,6 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                        dtype=block_scales_dtype),
             requires_grad=False)
         module.register_parameter("w3_w1_weight_scale", w3_w1_weight_scale)
-        print("w3_w1_hidden_size_padded:", w3_w1_hidden_size_padded)
-        print("module.scaling_vector_size:", module.scaling_vector_size)
-        print("block_scales_vec_size:", block_scales_vec_size)
-        print("w3_w1_weight_scale shape:", w3_w1_weight_scale.shape)
 
         # row parallel
         w2_weight_scale = nn.Parameter(
@@ -1610,7 +1602,6 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                        dtype=block_scales_dtype),
             requires_grad=False)
         module.register_parameter("w2_weight_scale", w2_weight_scale)
-        print("w2_weight_scale shape:", w2_weight_scale.shape)
 
         fc31_input_scale = nn.Parameter(torch.tensor(1., dtype=torch.float32),
                                         requires_grad=False)
@@ -1922,18 +1913,14 @@ def _fp4_quantize_pad_unpad(weight: torch.Tensor, alignment: Tuple[int, int]):
     assert weight.device.type == 'cuda', "Only cuda tensor is supported."
     assert weight.dtype == torch.bfloat16, "Only bfloat16 tensor is supported."
 
-    print("Original shape:", weight.shape)
     padding_dim_0 = (alignment[0] -
                      weight.shape[0] % alignment[0]) % alignment[0]
     padding_dim_1 = (alignment[1] -
                      weight.shape[1] % alignment[1]) % alignment[1]
-    print("Padding:", (padding_dim_0, padding_dim_1))
     weight_padded = torch.nn.functional.pad(
         weight, (0, padding_dim_1, 0, padding_dim_0))
-    print("Padded shape:", weight_padded.shape)
 
     global_scale_factor = (448 * 6) / weight.abs().max().float()
-    print("Global scale factor:", global_scale_factor.item())
 
     weight_nvfp4, block_scale_factor = torch.ops.trtllm.fp4_quantize(
         weight,
@@ -1942,8 +1929,6 @@ def _fp4_quantize_pad_unpad(weight: torch.Tensor, alignment: Tuple[int, int]):
         sfUseUE8M0=False,
         isSfSwizzledLayout=False)
     block_scale_factor = block_scale_factor.view(weight.shape[0], -1)
-    print("Weight nvfp4 shape:", weight_nvfp4.shape)
-    print("Block scale factor shape:", block_scale_factor.shape)
     return weight_nvfp4, global_scale_factor, block_scale_factor
 
 
@@ -1993,10 +1978,6 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
         dst_w3_w1_weight_gpu = dst_w3_w1_weight if dst_on_gpu else dst_w3_w1_weight.cuda(
         )
 
-        print("w1 shape and dtype before pad:", w1_weight.shape,
-              w1_weight.dtype)
-        print("w3 shape and dtype before pad:", w3_weight.shape,
-              w3_weight.dtype)
         alignment = _get_weight_alignment(self.weight_alignment,
                                           module.scaling_vector_size,
                                           module.tp_size, w1_weight.shape[0])
@@ -2017,8 +1998,6 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
             assert len(w3_weight.shape) == 1
             w1_weight = maybe_pad_for_weights(w1_weight, alignment).float()
             w3_weight = maybe_pad_for_weights(w3_weight, alignment).float()
-        print("w1 shape and dtype after pad:", w1_weight.shape, w1_weight.dtype)
-        print("w3 shape and dtype after pad:", w3_weight.shape, w3_weight.dtype)
 
         w1_weight_shard = load_weight_shard(w1_weight,
                                             module.tp_size,
@@ -2063,8 +2042,6 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
         dst_w2_weight_gpu = dst_w2_weight if dst_on_gpu else dst_w2_weight.cuda(
         )
 
-        print("w2 shape and dtype before pad:", w2_weight.shape,
-              w2_weight.dtype)
         shard_w2_weight_dim = 2 * w2_weight.shape[1] if len(
             w2_weight.shape) == 2 else w2_weight.shape[0]
         alignment = _get_weight_alignment(self.weight_alignment,
@@ -2077,7 +2054,6 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
         else:
             assert len(w2_weight.shape) == 1
             w2_weight = maybe_pad_for_weights(w2_weight, self.weight_alignment)
-        print("w2 shape and dtype after pad:", w2_weight.shape, w2_weight.dtype)
 
         w2_weight_shard = load_weight_shard(w2_weight,
                                             module.tp_size,
@@ -2119,10 +2095,6 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
         dst_w3_w1_weight_scale_gpu = dst_w3_w1_weight_scale if dst_on_gpu else dst_w3_w1_weight_scale.cuda(
         )
 
-        print("w1 scale shape and dtype before pad:", w1_weight_scale.shape,
-              w1_weight_scale.dtype)
-        print("w3 scale shape and dtype before pad:", w3_weight_scale.shape,
-              w3_weight_scale.dtype)
         alignment = _get_weight_alignment(self.weight_alignment,
                                           module.scaling_vector_size,
                                           module.tp_size,
@@ -2135,10 +2107,6 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
             w3_weight_scale,
             self.input_hidden_alignment // module.scaling_vector_size,
             alignment)
-        print("w1 scale shape and dtype after pad:", w1_weight_scale.shape,
-              w1_weight_scale.dtype)
-        print("w3 scale shape and dtype after pad:", w3_weight_scale.shape,
-              w3_weight_scale.dtype)
 
         w1_weight_scale = load_weight_shard(w1_weight_scale,
                                             module.tp_size,
@@ -2197,8 +2165,6 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
         dst_w2_weight_scale_gpu = dst_w2_weight_scale if dst_on_gpu else dst_w2_weight_scale.cuda(
         )
 
-        print("w2 scale shape and dtype before pad:", w2_weight_scale.shape,
-              w2_weight_scale.dtype)
         alignment = _get_weight_alignment(self.weight_alignment,
                                           module.scaling_vector_size,
                                           module.tp_size,
@@ -2206,8 +2172,6 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
         w2_weight_scale = maybe_pad_for_weights(
             w2_weight_scale, alignment // module.scaling_vector_size,
             self.weight_alignment)
-        print("w2 scale shape and dtype after pad:", w2_weight_scale.shape,
-              w2_weight_scale.dtype)
 
         w2_weight_scale = load_weight_shard(w2_weight_scale,
                                             module.tp_size,
