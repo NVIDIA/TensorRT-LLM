@@ -34,7 +34,7 @@ def get_model_paths():
     models_root = llm_models_root()
     base_model = os.path.join(
         models_root,
-        "llama-models-v2/Llama-3.1-8B-Instruct",
+        "llama-3.1-model/Llama-3.1-8B-Instruct",
     )
     speculative_model = os.path.join(
         models_root,

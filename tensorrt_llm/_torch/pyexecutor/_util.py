@@ -439,9 +439,7 @@ class KvCacheCreator:
             sparse_attn_config=self._sparse_attention_config,
             max_num_tokens=self._max_num_tokens,
             max_beam_width=self._max_beam_width,
-            is_draft=model_engine.is_draft_model,
-            kv_connector_manager=self._kv_connector_manager
-            if not estimating_kv_cache else None,
+            kv_connector_manager=self._kv_connector_manager,
             estimating_kv_cache=estimating_kv_cache,
         )
 
@@ -501,18 +499,19 @@ def _create_kv_cache_manager(
         max_seq_len: int, max_batch_size: int,
         spec_config: Optional[SpeculativeConfig],
         sparse_attn_config: Optional[SparseAttentionConfig],
-        max_num_tokens: int, max_beam_width: int, is_draft: bool,
+        max_num_tokens: int, max_beam_width: int,
         kv_connector_manager: Optional[KvCacheConnectorManager],
         estimating_kv_cache: bool) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model_engine
     """
-    assert model_engine.model.model_config.is_generation, \
-        "Only construct KV cache for generation models."
+    assert model_engine.model.model_config.is_generation, "Only construct KV cache for generation models."
 
     config = model_engine.model.model_config.pretrained_config
     quant_config = model_engine.model.model_config.quant_config
+    spec_config = spec_config
+    sparse_attn_config = sparse_attn_config
 
     hidden_size = config.hidden_size
     num_attention_heads = config.num_attention_heads
@@ -547,7 +546,7 @@ def _create_kv_cache_manager(
             dtype=kv_cache_dtype,
             spec_config=spec_config,
             max_beam_width=max_beam_width,
-            is_draft=is_draft,
+            is_draft=model_engine.is_draft_model,
             kv_connector_manager=kv_connector_manager
             if not estimating_kv_cache else None,
             sparse_attn_config=sparse_attn_config,
@@ -562,6 +561,7 @@ def _create_kv_cache_manager(
                 "Connector manager is not supported for MambaHybridCacheManager."
             )
 
+        config = model_engine.model.model_config.pretrained_config
         num_layers = config.hybrid_override_pattern.count("*")
         layer_mask = [char == "*" for char in config.hybrid_override_pattern]
         mamba_num_layers = config.hybrid_override_pattern.count("M")
@@ -602,7 +602,7 @@ def _create_kv_cache_manager(
             raise NotImplementedError(
                 "Connector manager is not supported for MambaHybridCacheManager."
             )
-
+        config = model_engine.model.model_config.pretrained_config
         mamba_layer_mask = [
             True if i %
             config.full_attention_interval != config.full_attention_interval -
@@ -642,7 +642,7 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
         )
     else:
-        # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_from_cpp in KVCacheManager
+        # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_from_cpp in KVCahceManager
         is_vswa = kv_cache_config.max_attention_window is not None and len(
             set(kv_cache_config.max_attention_window)) > 1
         binding_model_config = model_engine.model.model_config.get_bindings_model_config(
@@ -663,12 +663,11 @@ def _create_kv_cache_manager(
             max_num_tokens=max_num_tokens,
             model_config=binding_model_config,
             max_beam_width=max_beam_width,
-            is_draft=is_draft,
+            is_draft=model_engine.is_draft_model,
             kv_connector_manager=kv_connector_manager
             if not estimating_kv_cache else None,
             sparse_attn_config=sparse_attn_config,
         )
-
     return kv_cache_manager
 
 
