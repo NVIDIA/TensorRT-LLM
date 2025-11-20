@@ -19,7 +19,7 @@ Our sharding algorithm for tensor parallelism (TP) is based on the following ste
 import operator
 import re
 from collections import defaultdict
-from typing import Any, DefaultDict, Dict, List, Optional, Set, Tuple, Type
+from typing import Any, DefaultDict, Dict, List, Set, Tuple, Type
 
 import torch
 from pydantic import Field
@@ -65,8 +65,8 @@ class ShardingTransformConfig(TransformConfig):
     factory_source: ShardingConfigSource = Field(default=ShardingConfigSource.UNKNOWN)
     rank: int = Field(default=0)
     world_size: int = Field(default=1)
-    factory_config: Optional[Dict[str, Any]] = None
-    manual_config: Optional[Dict[str, Any]] = None
+    factory_config: Dict[str, Any] = Field(default_factory=dict)
+    manual_config: Dict[str, Any] = Field(default_factory=dict)
     simple_shard_only: bool = Field(default=False)
     support_partial_config: bool = False
     sharding_source: List[ShardingSource] = Field(
@@ -933,7 +933,7 @@ def detect_column_row_shard(
         )
 
         # shard single row node
-        sharding_config.weight_sharding_transforms.append(
+        sharding_config.add(
             WeightShardingInfo.from_node(
                 nodes_to_row_shard[0],
                 split_dim=SplitDimension.ROW,
@@ -1012,7 +1012,7 @@ def detect_dp_bmm_shard(
             start_idx = remainder + rank * base_size
             end_idx = start_idx + base_size
 
-        sharding_config.bmm_transforms.append(
+        sharding_config.add(
             BMMShardingInfo(
                 target_node=node.name,
                 rank=rank,
@@ -1056,7 +1056,7 @@ def detect_ep_shard(gm: GraphModule, sharding_config: ShardingTransformContainer
             ),
         ):
             continue
-        sharding_config.ep_transforms.append(
+        sharding_config.add(
             EPShardingInfo.from_node(
                 node,
                 rank=rank,
