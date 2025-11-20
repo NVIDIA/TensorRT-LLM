@@ -27,7 +27,12 @@ from tensorrt_llm._torch.pyexecutor.py_executor_creator import get_guided_decodi
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._torch.speculative import get_spec_drafter
 from tensorrt_llm._utils import nvtx_range
-from tensorrt_llm.llmapi.llm_args import ContextChunkingPolicy, LoadFormat, TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import (
+    ContextChunkingPolicy,
+    LoadFormat,
+    SpeculativeConfig,
+    TorchLlmArgs,
+)
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase
 
 from ...._utils import mpi_rank, mpi_world_size
@@ -50,6 +55,14 @@ from ..llm_args import LlmArgs
 from ..transform.optimizer import InferenceOptimizer
 from ..utils.logger import ad_logger
 from .interface import CachedSequenceInterface, GetInferenceModel
+
+
+@dataclass
+class ReportingInfo:
+    print_log: bool = False
+    enable_iter_perf_stats: bool = False
+    enable_iter_req_stats: bool = False
+
 
 class _CacheManagerWithFakePool(KVCacheManager):
     """We use the default KVCacheManager but with a fake pool by setting head_dim=0.
@@ -225,6 +238,11 @@ class ADEngine(ModelEngine):
             vocab_size_padded=factory.vocab_size_padded,
             chunk_size=factory.chunk_size,
         )
+        reporting_info = ReportingInfo(
+            print_log=False,
+            enable_iter_perf_stats=ad_config.enable_iter_perf_stats,
+            enable_iter_req_stats=ad_config.enable_iter_req_stats,
+        )
         # TODO (lucaslie): consider how we move args around InferenceOptimizer.__init__,
         # ADEngine.__init__, and ADEngine.build_from_config. Seems a bit unnatural atm.
 
@@ -236,8 +254,10 @@ class ADEngine(ModelEngine):
             build_and_optimize,
             seq_info,
             device,
-            ad_config,
             max_beam_width,
+            ad_config.speculative_config,
+            ad_config.disable_overlap_scheduler,
+            reporting_info,
         )
 
     @torch.inference_mode()
@@ -246,16 +266,18 @@ class ADEngine(ModelEngine):
         get_inference_model: GetInferenceModel,
         seq_info: SequenceInfo,
         device: DeviceLikeType,
-        ad_config: LlmArgs,
         max_beam_width: int = 1,
+        spec_config: Optional[SpeculativeConfig] = None,
+        disable_overlap_scheduler: bool = False,
+        reporting_info: ReportingInfo = ReportingInfo(),
     ) -> None:
         """Initialize the engine with model and sequence information."""
         # NOTE (lucaslie): create a fake Namespace to satisfy PyExecutor requirements...
         # This is not correctly declared in the base ModelEngine class though...
         self.llm_args = SimpleNamespace()
-        self.llm_args.print_iter_log = False
-        self.llm_args.enable_iter_perf_stats = ad_config.enable_iter_perf_stats
-        self.llm_args.enable_iter_req_stats = ad_config.enable_iter_req_stats
+        self.llm_args.print_iter_log = reporting_info.print_log
+        self.llm_args.enable_iter_perf_stats = reporting_info.enable_iter_perf_stats
+        self.llm_args.enable_iter_req_stats = reporting_info.enable_iter_req_stats
         self.llm_args.stream_interval = 1
         self.llm_args.attention_dp_config = None
         self.llm_args.batch_wait_timeout_ms = 0
@@ -269,10 +291,9 @@ class ADEngine(ModelEngine):
         # NOTE (lucaslie): not a declared base member in the base class; required by PyExecutor...
         self.max_beam_width = max_beam_width
         self.enable_attention_dp = False
-        self._disable_overlap_scheduler = ad_config.disable_overlap_scheduler
+        self._disable_overlap_scheduler = disable_overlap_scheduler
 
-        self.ad_config = ad_config
-        self.spec_config = ad_config.speculative_config
+        self.spec_config = spec_config
 
         # TODO(govind): Enable overlap scheduler for speculation.
         assert self.spec_config is None or self._disable_overlap_scheduler, (
@@ -431,7 +452,7 @@ class ADEngine(ModelEngine):
             input_pos.append(num_tokens_seen)
             flat_gather_indices.extend(gather_indices_to_append)
 
-            num_generation_tokens += (1 + get_draft_token_length(request))
+            num_generation_tokens += 1 + get_draft_token_length(request)
             request.py_batch_idx = request.seq_slot
             slot_idx.append(request.seq_slot)
             last_logit_only.append(False)

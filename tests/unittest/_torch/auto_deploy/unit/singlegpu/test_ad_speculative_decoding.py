@@ -31,8 +31,6 @@ def test_ad_speculative_decoding_smoke():
         "model"
     ]
 
-    print(f"Experiment config: {experiment_config}")
-
     print(f"Speculative model path: {speculative_model_dir}")
     # Configure speculative decoding with a draft model
     spec_config = DraftTargetDecodingConfig(
@@ -48,9 +46,12 @@ def test_ad_speculative_decoding_smoke():
     experiment_config["args"]["world_size"] = 1
     experiment_config["args"]["speculative_config"] = spec_config
     experiment_config["args"]["kv_cache_config"] = kv_cache_config
+    experiment_config["args"]["disable_overlap_scheduler"] = True
 
     experiment_config["prompt"]["batch_size"] = 1
     experiment_config["prompt"]["queries"] = test_prompt
+
+    print(f"Experiment config: {experiment_config}")
 
     cfg = ExperimentConfig(**experiment_config)
 
