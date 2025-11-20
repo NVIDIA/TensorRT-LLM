@@ -317,6 +317,7 @@ def create_lm_head_tp_mapping(mapping: Mapping, token_count: int) -> Mapping:
     # We use heuristic to determine the lm_head_tp_size
     # Since token_count=256 will hit the boundary of math-bound problem
     # We use 256 // token_count to determine the lm_head_tp_size
+    # For more details, refer to the blog: https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.md#mtp-lm-head-tensor-parallelism
     lm_head_tp_size_raw = 256 // token_count
     # TODO: On platforms like GB200, setting lm_head_tp_size_upper_bound to world_size could be more efficient when world_size > gpus_per_node, we need to do further investigation.
     lm_head_tp_size_upper_bound = min(mapping.world_size, mapping.gpus_per_node)
