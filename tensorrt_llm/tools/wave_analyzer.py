@@ -29,7 +29,7 @@ import csv
 from pathlib import Path
 from typing import NamedTuple, Optional, Tuple, Set, Dict
 
-# --- Third Party Dependencies (Robustness Check) ---
+# --- Dependency Management (Defensive Imports) ---
 try:
     from safetensors import safe_open
 except ImportError:
@@ -39,13 +39,16 @@ try:
     # Use pynvml (or nvidia-ml-py) for robust, environment-independent GPU identification
     import pynvml
 except ImportError:
+    # Assign None so subsequent checks (if pynvml is not None) work cleanly
     pynvml = None
 
 # --- Logger Shim ---
 try:
+    # Attempt to use TRT-LLM's internal logger
     import tensorrt_llm.logger as trt_logger_mod
     logger = trt_logger_mod.logger
 except ImportError:
+    # Fallback to standard logging library
     import logging
     logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
     logger = logging.getLogger("trtllm-wave")
@@ -67,14 +70,14 @@ DEFAULT_MOE_EXPERTS = 8
 
 # --- Hardware Database (Profiles) ---
 class GPU(NamedTuple):
-    """Stores key physical characteristics of a target GPU."""
+    """Stores key physical characteristics of a target GPU for simulation."""
     name: str
     num_sms: int
     max_blocks_per_sm: int
     is_dual_die: bool = False
 
 HARDWARE_DB: Dict[str, GPU] = {
-    # Architecture profiles used for physics simulation
+    # Architecture profiles used for physics simulation (SM count, max occupancy blocks)
     "b200":    GPU("NVIDIA B200 (Blackwell)", 132, 4, is_dual_die=True),
     "gb200":   GPU("NVIDIA GB200 (NVL72)",    132, 4, is_dual_die=True),
     "h200":    GPU("NVIDIA H200 (HBM3e)", 132, 4),
@@ -85,9 +88,9 @@ HARDWARE_DB: Dict[str, GPU] = {
 }
 
 class LayerStats(NamedTuple):
-    """Holds the computed metrics for a single layer."""
+    """Holds the computed metrics for a single layer analysis."""
     name: str
-    shape: Tuple[int, int]  # Effective shape (M, N) after TP/MoE adjustments
+    shape: Tuple[int, int]
     waves: float
     occupancy: float
     tail_loss_percent: float
@@ -97,11 +100,13 @@ class LayerStats(NamedTuple):
 
 def get_gpu_from_env() -> Optional[GPU]:
     """
-    Attempts to auto-detect the GPU using pynvml for robust binding.
-    Returns matching GPU from HARDWARE_DB or None.
+    Attempts to auto-detect the GPU using pynvml.
+
+    Returns:
+        Optional[GPU]: The matching GPU profile from HARDWARE_DB or None if detection fails.
     """
     if pynvml is None:
-        logger.debug("pynvml not installed. Cannot perform environment-based GPU auto-detection.")
+        logger.debug("pynvml not installed. GPU auto-detection skipped.")
         return None
 
     try:
@@ -120,14 +125,17 @@ def get_gpu_from_env() -> Optional[GPU]:
         
         return None
     except pynvml.NVMLError as e:
-        logger.debug(f"pynvml initialization failed: {e}. Running on a non-CUDA device.")
+        logger.debug(f"pynvml initialization failed: {e}. Cannot query CUDA device.")
         return None
     except Exception as e:
         logger.debug(f"Unexpected error during pynvml check: {e}")
         return None
 
 def parse_custom_hardware(custom_str: str) -> GPU:
-    """Parses a custom hardware string in format 'Name;SMs;MaxBlocks'."""
+    """
+    Parses a custom hardware string into a GPU NamedTuple.
+    Expected format: 'Name;SMs;MaxBlocks' (e.g., 'CustomA100;108;4').
+    """
     try:
         parts = custom_str.split(';')
         if len(parts) < 3:
@@ -145,18 +153,20 @@ def parse_custom_hardware(custom_str: str) -> GPU:
 
 def get_tile_heuristic(name: str, dtype: str, tile_m: Optional[int], tile_n: Optional[int]) -> Tuple[int, int]:
     """
-    Estimates the GEMM CTA (Tile) Size. Honors user input, then applies heuristics.
-    Ensures user input takes precedence in partial overrides (v8.0 fix).
+    Determines the GEMM CTA (Tile) Size, honoring user overrides with precedence.
+
+    User-provided tile dimensions (\p tile_m, \p tile_n) take precedence over 
+    internal heuristics. If an input is None, the heuristic is applied.
     """
     # 1. Determine the heuristic base size
     base_size = DEFAULT_TILE_SIZE
     if dtype in ['fp4', 'nvfp4', 'int4']:
         base_size = FP4_TILE_SIZE
-    # Apply specialized heuristic for narrow KV heads
+    # Apply specialized heuristic for narrow KV heads (commonly 64 or 128)
     elif any(x in name.lower() for x in ['kv', 'key', 'value']):
         base_size = GQA_TILE_SIZE
     
-    # 2. Apply user override: If the user provided a value, use it. Otherwise, use the base heuristic size.
+    # 2. Apply user override: honor user input first, fall back to heuristic base size.
     final_m = tile_m if tile_m is not None else base_size
     final_n = tile_n if tile_n is not None else base_size
     
@@ -173,11 +183,17 @@ def analyze_layer(name: str,
                   num_experts: int,
                   tile_m: Optional[int],
                   tile_n: Optional[int]) -> Optional[LayerStats]:
-    """Calculates Wave Quantization Occupancy for a single layer."""
+    """
+    Calculates Wave Quantization Occupancy based on workload dimensions and GPU profile.
+
+    This models the potential for tail effects caused by limited thread blocks.
+
+    Returns:
+        Optional[LayerStats]: Computed metrics, or None if the layer is trivially small.
+    """
     n_dim_raw, k_dim_raw = shape[0], shape[1]
 
     # --- 1. Workload Characterization (Parallelism Adjustments) ---
-    is_col_parallel = any(x in name for x in ['gate', 'up', 'qkv', 'query', 'key', 'value'])
     effective_n = math.ceil(n_dim_raw / tp_size)
     
     if effective_n < TINY_LAYER_THRESHOLD and m_dim < TINY_LAYER_THRESHOLD:
@@ -186,7 +202,7 @@ def analyze_layer(name: str,
     is_moe = "expert" in name or "block_sparse_moe" in name
     effective_m = m_dim
     if is_moe:
-        # MoE layers spread the batch over experts for M dimension
+        # MoE layers distribute the batch M dimension across experts
         effective_m = math.ceil(m_dim / num_experts)
 
     # --- 2. Physics Simulation (Grid and Waves) ---
@@ -197,12 +213,13 @@ def analyze_layer(name: str,
     grid_n = math.ceil(effective_n / tile_n_size)
     total_blocks = grid_m * grid_n
 
+    # Total capacity of the GPU for thread blocks
     wave_capacity = gpu.num_sms * gpu.max_blocks_per_sm
     waves = total_blocks / wave_capacity
     
     if waves <= 0: return None
 
-    # Theoretical Occupancy calculation
+    # Theoretical Occupancy calculation (how much of the final wave is filled)
     full_waves = math.ceil(waves)
     occupancy = waves / full_waves
     tail_loss = (1.0 - occupancy) * 100
@@ -212,11 +229,12 @@ def analyze_layer(name: str,
     is_saturated = waves > SATURATION_THRESHOLD
 
     if seq_len == 1 or waves < 1.0:
+        # Low wave count or decoding workloads are often memory-bound
         rec = "Latency Bound (Mem)"
     elif is_saturated:
         rec = "Saturated (Optimal)"
     elif occupancy < 0.60:
-        # Check K dimension using the tunable CLI argument
+        # Check K dimension against tunable threshold for Split-K recommendation
         if k_dim_raw > split_k_thresh:
             rec = "Split-K Likely"
         elif "lm_head" in name or "embed" in name:
@@ -229,7 +247,11 @@ def analyze_layer(name: str,
     return LayerStats(name, (effective_m, effective_n), waves, occupancy, tail_loss, rec, total_blocks)
 
 def main():
-    parser = argparse.ArgumentParser(description="TRT-LLM Static Wave Analyzer")
+    # --- CLI Argument Setup ---
+    parser = argparse.ArgumentParser(
+        description="TRT-LLM Static Wave Analyzer",
+        formatter_class=argparse.RawTextHelpFormatter  # Allows for multi-line help text
+    )
     parser.add_argument('--model_dir', type=Path, required=True, help="Path to .safetensors directory")
     parser.add_argument('--batch_size', type=int, required=True, help="Target Runtime Batch Size")
     parser.add_argument('--seq_len', type=int, default=1, help="Sequence Length")
@@ -239,9 +261,12 @@ def main():
         choices=['fp16', 'bf16', 'fp8', 'fp4', 'nvfp4', 'int4'],
         help="Compute Precision.")
 
-    # Hardware Configuration
+    # Hardware Configuration - Explicitly documenting auto-detection failure fallback
     group = parser.add_mutually_exclusive_group()
-    group.add_argument('--gpu', type=str, choices=HARDWARE_DB.keys(), help="Force specific GPU profile (disables auto-detect)")
+    group.add_argument('--gpu', type=str, choices=HARDWARE_DB.keys(),
+                       help="Force specific GPU profile (e.g., h100). \n"
+                            "If omitted and auto-detection fails (requires pynvml), \n"
+                            "the tool defaults to H100.")
     group.add_argument('--custom_hardware', type=str, help="Define custom GPU: 'Name;SMs;MaxBlocks'")
 
     # Output Options
@@ -256,7 +281,7 @@ def main():
 
     args = parser.parse_args()
 
-    # Robust Dependency Check (Safetensors required for file reading)
+    # Robust Dependency Check
     if safe_open is None:
         parser.error("'safetensors' is required for this tool. Please install it (e.g. `pip install safetensors`).")
 
@@ -282,6 +307,7 @@ def main():
     elif args.gpu:
         gpu = HARDWARE_DB[args.gpu]
     else:
+        # If no GPU is specified, attempt auto-detection; otherwise, default to H100.
         gpu = get_gpu_from_env()
         if gpu:
             logger.info(f"Auto-detected Hardware: {gpu.name}")
@@ -294,7 +320,7 @@ def main():
     logger.info(f"Starting Analysis for {gpu.name}...")
     logger.info(f"Workload: M={m_dim} (BS={args.batch_size}, Seq={args.seq_len}) | TP={args.tp_size} | {args.dtype.upper()}")
 
-    # Output Assumptions and Overrides (v8.0 Fixes)
+    # Output Assumptions and Overrides
     print("\n[SCOPE] Analyzing Linear Layers (GEMMs) only. Attention kernels (MHA/FA) and Norms are excluded.")
     print("[ASSUMPTION] Metric is 'Theoretical Occupancy' (Shared Mem limited). Does not account for DRAM bandwidth.")
     print(f"[ASSUMPTION] MoE layers assume {args.moe_experts}-expert routing. For accuracy, check the model's config.json for 'num_local_experts'.")
@@ -308,6 +334,7 @@ def main():
         logger.error(f"No .safetensors files found in {args.model_dir}")
         sys.exit(1)
 
+    # Use signatures (name and shape) to prevent duplicate analysis across sharded files
     seen_sigs: Set[Tuple[str, Tuple[int, ...]]] = set()
     header = f"{'Layer Name (Truncated)':<50} | {'Grid(MxN)':<14} | {'Waves':<8} | {'Occ %':<6} | {'Loss %':<6} | {'Status'}"
     print(f"\n{header}")
@@ -326,15 +353,21 @@ def main():
         for path in files:
             with safe_open(path, framework="np", device="cpu") as f:
                 for key in f.keys():
+                    # Filter out non-GEMM layers (norms, biases, etc.)
                     if "weight" in key and "norm" not in key and "router" not in key:
-                        # Heuristic to parse generic layer name (Architectural Stability Fix)
+                        
+                        # --- Architecture Parsing (Defensive Logic) ---
                         parts = key.split(".")
+                        generic_name = key
                         try:
+                            # Heuristic: find the layer index (e.g., '0' in 'layers.0.mlp...')
                             layer_idx_loc = next(i for i, part in enumerate(parts) if part.isdigit())
+                            # Short name is everything after the index up to the 'weight' ending
                             generic_name = ".".join(parts[layer_idx_loc+1:-1])
                         except StopIteration:
-                            logger.debug(f"Skipping layer '{key}' - layer index not found. Likely non-Transformer architecture.")
-                            continue
+                            # Fallback: Used for flat checkpoints or simple keys (e.g., 'lm_head.weight').
+                            logger.debug(f"Layer name parsing failed for '{key}'. Using truncated key.")
+                            generic_name = key.split('.')[-2] if len(key.split('.')) > 1 else key
 
                         shape_list = f.get_slice(key).get_shape()
                         shape = tuple(shape_list)
@@ -376,6 +409,8 @@ def main():
         avg_occ = (total_weighted_occupancy / total_weight) * 100
         print(f"MODEL SUMMARY FOR {gpu.name}:")
         print(f"  Weighted Average Theoretical Occupancy: {avg_occ:.2f}%")
+        # Added comment to defend the summary metric
+        print("  (Weighting based on Total Thread Blocks, acting as a proxy for layer compute volume.)")
         if avg_occ < 75.0:
              print("  Recommendation: ⚠️  Low utilization detected. Consider increasing Batch Size or TP degree.")
         else:
