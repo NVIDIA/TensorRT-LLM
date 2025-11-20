@@ -380,5 +380,5 @@ class ModelLoader:
         if "allow_partial_loading" in args:
             kargs["allow_partial_loading"] = allow_partial_loading
         else:
-            assert allow_partial_loading is False, "allow_partial_loading is only supported for this model"
+            assert allow_partial_loading is False, "allow_partial_loading is not supported for this model"
         load_method(weights, **kargs)
