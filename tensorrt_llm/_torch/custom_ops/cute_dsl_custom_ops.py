@@ -676,6 +676,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
                 )
+                # Compute max active clusters on current device
+                hardware_info = cutlass.utils.HardwareInfo()
+                max_active_clusters = hardware_info.get_max_active_clusters(
+                    cluster_shape_mn[0] * cluster_shape_mn[1])
 
                 compiled_gemm = cute.compile(
                     gemm.wrapper,
@@ -693,7 +697,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     l,
                     tile_size=self.tile_size,
                     scaling_vector_size=self.scaling_vector_size,
-                    max_active_clusters=16,
+                    max_active_clusters=max_active_clusters,
                     stream=stream,
                 )
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
@@ -970,6 +974,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
                 )
+                # Compute max active clusters on current device
+                hardware_info = cutlass.utils.HardwareInfo()
+                max_active_clusters = hardware_info.get_max_active_clusters(
+                    cluster_shape_mn[0] * cluster_shape_mn[1])
 
                 compiled_gemm = cute.compile(
                     gemm.wrapper,
@@ -992,7 +1000,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     self.top_k,
                     tile_size=self.tile_size,
                     scaling_vector_size=self.scaling_vector_size,
-                    max_active_clusters=16,
+                    max_active_clusters=max_active_clusters,
                     stream=stream,
                 )
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
