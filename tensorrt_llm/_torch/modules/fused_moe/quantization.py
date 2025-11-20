@@ -1596,6 +1596,9 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                        dtype=block_scales_dtype),
             requires_grad=False)
         module.register_parameter("w3_w1_weight_scale", w3_w1_weight_scale)
+        print("w3_w1_hidden_size_padded:", w3_w1_hidden_size_padded)
+        print("module.scaling_vector_size:", module.scaling_vector_size)
+        print("block_scales_vec_size:", block_scales_vec_size)
         print("w3_w1_weight_scale shape:", w3_w1_weight_scale.shape)
 
         # row parallel
@@ -1960,14 +1963,16 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
         weight_vec_size = torch.iinfo(self.weight_dtype).bits // 4
         block_scales_vec_size = 1
 
-        super().create_weights(module,
-                               self.weight_dtype,
-                               weight_vec_size,
-                               self.block_scales_dtype,
-                               block_scales_vec_size,
-                               self.weight_alignment,
-                               self.input_hidden_alignment,
-                               bias_dtype=torch.float32)
+        super().create_weights(
+            module,
+            self.weight_dtype,
+            weight_vec_size,
+            self.block_scales_dtype,
+            block_scales_vec_size,
+            scaling_vector_size=16,
+            weight_alignment=self.weight_alignment,
+            input_hidden_alignment=self.input_hidden_alignment,
+            bias_dtype=torch.float32)
 
         fc31_scale_c = nn.Parameter(torch.ones(module.expert_size_per_partition,
                                                dtype=torch.float32),
@@ -2030,9 +2035,7 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
         epilogue_tile_m = 128
 
         # Keep weights in device buffer
-        dst_w3_weight, dst_w1_weight = dst_w3_w1_weight_gpu.split(
-            module.intermediate_size_per_partition, dim=0)
-
+        dst_w3_weight, dst_w1_weight = dst_w3_w1_weight.chunk(2, dim=0)
         dst_w3_weight.copy_(w3_weight_shard.view(dst_w3_weight.dtype))
         dst_w1_weight.copy_(w1_weight_shard.view(dst_w1_weight.dtype))
 
@@ -2148,17 +2151,10 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
                                             TensorParallelMode.COLUMN,
                                             device=device)
         # Keep weights in device buffer
-        # w3
-        dst_w3_weight_scale = dst_w3_w1_weight_scale_gpu.narrow(
-            dim=0, start=0, length=module.intermediate_size_per_partition)
+        dst_w3_weight_scale, dst_w1_weight_scale = dst_w3_w1_weight_scale_gpu.chunk(
+            2, dim=0)
         dst_w3_weight_scale.copy_(
             w3_weight_scale.view(dst_w3_weight_scale.dtype))
-
-        # w1
-        dst_w1_weight_scale = dst_w3_w1_weight_scale_gpu.narrow(
-            dim=0,
-            start=module.intermediate_size_per_partition,
-            length=module.intermediate_size_per_partition)
         dst_w1_weight_scale.copy_(
             w1_weight_scale.view(dst_w1_weight_scale.dtype))
 
