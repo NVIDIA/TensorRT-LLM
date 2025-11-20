@@ -21,6 +21,7 @@
 #include "tensorrt_llm/thop/thUtils.h"
 #include <ATen/cuda/EmptyTensor.h>
 #include <ATen/ops/index_select.h>
+#include <iostream>
 
 namespace torch_ext
 {
@@ -44,6 +45,78 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     bool const do_finalize, btg::Dtype const dtype, MoeRunnerType& moe_runner, int64_t const moeConfigIndex,
     torch::optional<torch::Tensor> const& topk_weights, torch::optional<torch::Tensor> const& topk_ids)
 {
+    std::cout << "Function: run_fp4_block_scale_moe_runner" << std::endl;
+
+    auto print_tensor = [](std::string name, torch::Tensor const& t)
+    {
+        std::cout << name << ": shape=[";
+        for (auto s : t.sizes())
+        {
+            std::cout << s << ",";
+        }
+        std::cout << "], dtype=" << t.scalar_type() << std::endl;
+    };
+
+    auto print_opt_tensor = [&](std::string name, auto const& t)
+    {
+        if (t.has_value())
+        {
+            print_tensor(name, t.value());
+        }
+        else
+        {
+            std::cout << name << ": None" << std::endl;
+        }
+    };
+
+    auto print_val = [](std::string name, auto const& v) { std::cout << name << ": " << v << std::endl; };
+
+    auto print_opt_val = [&](std::string name, auto const& v)
+    {
+        if (v.has_value())
+        {
+            std::cout << name << ": " << v.value() << std::endl;
+        }
+        else
+        {
+            std::cout << name << ": None" << std::endl;
+        }
+    };
+
+    print_opt_tensor("routing_logits", routing_logits);
+    print_opt_tensor("routing_bias", routing_bias);
+    print_tensor("hidden_states", hidden_states);
+    print_opt_tensor("hidden_states_scale", hidden_states_scale);
+    print_tensor("gemm1_weights", gemm1_weights);
+    print_tensor("gemm1_weights_scale", gemm1_weights_scale);
+    print_opt_tensor("gemm1_bias", gemm1_bias);
+    print_opt_tensor("gemm1_alpha", gemm1_alpha);
+    print_opt_tensor("gemm1_beta", gemm1_beta);
+    print_opt_tensor("gemm1_clamp_limit", gemm1_clamp_limit);
+    print_tensor("gemm2_weights", gemm2_weights);
+    print_tensor("gemm2_weights_scale", gemm2_weights_scale);
+    print_opt_tensor("gemm2_bias", gemm2_bias);
+    print_tensor("output1_scales_scalar", output1_scales_scalar);
+    print_tensor("output1_scales_gate_scalar", output1_scales_gate_scalar);
+    print_tensor("output2_scales_scalar", output2_scales_scalar);
+
+    print_val("num_experts", num_experts);
+    print_val("top_k", top_k);
+    print_opt_val("n_group", n_group);
+    print_opt_val("topk_group", topk_group);
+    print_val("intermediate_size", intermediate_size);
+    print_val("local_expert_offset", local_expert_offset);
+    print_val("local_num_experts", local_num_experts);
+    print_opt_val("routed_scaling_factor", routed_scaling_factor);
+    print_val("tile_tokens_dim", tile_tokens_dim);
+    print_val("routing_method_type", routing_method_type);
+    print_val("do_finalize", do_finalize);
+    print_val("dtype", static_cast<int>(dtype));
+    print_val("moeConfigIndex", moeConfigIndex);
+    print_opt_tensor("topk_weights", topk_weights);
+    print_opt_tensor("topk_ids", topk_ids);
+    std::cout << "--------------------------------" << std::endl;
+
     TORCH_CHECK(dtype == btg::Dtype::E4m3 || dtype == btg::Dtype::E2m1, "dtype can only be e4m3 or e2m1.");
     TORCH_CHECK(tensorrt_llm::common::isSM100Family(), "Only SM100f is supported by FP4 block scale MOE");
     TORCH_CHECK(tile_tokens_dim == 8 || tile_tokens_dim == 16 || tile_tokens_dim == 32 || tile_tokens_dim == 64

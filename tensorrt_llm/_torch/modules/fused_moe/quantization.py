@@ -201,12 +201,11 @@ class FusedMoEMethodBase(ABC):
 
         # bias
         if module.bias:
+            # The shape might be padded so we use weight shape[:2]
             if w3_w1_bias_shape is None:
-                w3_w1_bias_shape = (module.expert_size_per_partition,
-                                    module.intermediate_size_per_partition * 2)
+                w3_w1_bias_shape = w3_w1_weight_shape[:2]
             if w2_bias_shape is None:
-                w2_bias_shape = (module.expert_size_per_partition,
-                                 module.hidden_size)
+                w2_bias_shape = w2_weight_shape[:2]
             bias_dtype = bias_dtype or module.dtype
             w3_w1_bias = nn.Parameter(torch.empty(w3_w1_bias_shape,
                                                   dtype=bias_dtype),

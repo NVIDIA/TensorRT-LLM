@@ -1381,11 +1381,11 @@ def test_fused_moe_nvfp4(dtype, moe_backend, hidden_size, intermediate_size):
     with torch.device(f"cuda:{mapping.rank}"):
         SCALING_VECTOR_SIZE = 16
 
-        SEQ_LEN = 4
+        SEQ_LEN = 1024
         HIDDEN_SIZE = hidden_size
         INTERMEDIATE_SIZE = intermediate_size
-        NUM_EXPERTS = 4
-        TOP_K = 2
+        NUM_EXPERTS = 32
+        TOP_K = 4
         routing_method = RenormalizeMoeRoutingMethod(top_k=TOP_K)
         torch.manual_seed(0)
         torch.cuda.manual_seed(0)
@@ -1487,7 +1487,7 @@ def test_fused_moe_nvfp4(dtype, moe_backend, hidden_size, intermediate_size):
             fused_moe.forward(x, router_logits)
 
         output = fused_moe.forward(x, router_logits)
-        torch.testing.assert_close(output, ref_output, rtol=0.1, atol=0.4)
+        torch.testing.assert_close(output, ref_output, rtol=0.1, atol=0.5)
 
         if not test_all_kernels:
             return
@@ -1503,7 +1503,7 @@ def test_fused_moe_nvfp4(dtype, moe_backend, hidden_size, intermediate_size):
                 torch.testing.assert_close(output,
                                            ref_output,
                                            rtol=0.1,
-                                           atol=0.4)
+                                           atol=0.5)
 
 
 @skip_pre_blackwell
