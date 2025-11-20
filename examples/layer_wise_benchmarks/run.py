@@ -126,9 +126,22 @@ runner = Runner(
 )
 
 # Warm up
-for batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in itertools.product(
-    args.batch_size_list, args.seq_len_q_list, args.seq_len_kv_cache_list, args.balance_ratio_list
-):
+for autotune_flag, batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in [
+    [
+        True,
+        max(args.batch_size_list),
+        max(args.seq_len_q_list),
+        args.seq_len_kv_cache_list[0],
+        args.balance_ratio_list[0],
+    ],
+    *itertools.product(
+        [False],
+        args.batch_size_list,
+        args.seq_len_q_list,
+        args.seq_len_kv_cache_list,
+        args.balance_ratio_list,
+    ),
+]:
     assert batch_size <= args.max_batch_size
     assert seq_len_q + seq_len_kv_cache <= args.max_seq_len
     run_pack = runner.create_run_pack(
@@ -144,9 +157,10 @@ for batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in itertools.product(
     )
     capture_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(capture_stream):
+        if autotune_flag:
+            with autotune():
+                run_pack()
         run_pack()
-        with autotune():
-            run_pack()
     torch.cuda.current_stream().wait_stream(capture_stream)
 torch.cuda.synchronize()
 
