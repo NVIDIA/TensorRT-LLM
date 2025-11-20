@@ -68,7 +68,6 @@ from .sampling_utils import (
     Strategy,
     UtilsSamplingParams,
     get_rejected_indices,
-    process_logits,
     resolve_sampling_strategy,
     sample,
     sample_rejected,
@@ -975,7 +974,7 @@ class TorchSampler(Sampler):
             else _request_strategy(request, vocab_size=2**31)
         )
         generator = self.get_generator(request.py_draft_logits.device)
-        _, draft_probs = sample(
+        _, draft_probs, _ = sample(
             draft_sampling_strategy,
             request.py_draft_logits,
             generator=generator,
@@ -1800,7 +1799,7 @@ class TorchSampler(Sampler):
             if logprobs_mode == "processed_logprobs":
                 # Process logits with the same transformations as sampling (temperature, top-k, top-p)
                 # but without actually sampling
-                processed_logits_list = []
+                logprobs_list = []
                 for req_id in logprobs_req_indices:
                     req = requests[req_id]
                     strategy = _request_strategy(req, vocab_size=logits_cuda.size(1))
@@ -1808,13 +1807,11 @@ class TorchSampler(Sampler):
                     req_logits = logits_cuda[req_logits_indices].to(
                         dtype=torch.float32, non_blocking=True
                     )
-                    # Apply the same processing as sampling would apply
-                    processed_req_logits = process_logits(strategy, req_logits)
-                    processed_logits_list.append(processed_req_logits)
-                # Concatenate all processed logits
-                processed_logits_cuda = torch.cat(processed_logits_list, dim=0)
-                # Apply log_softmax to get log probabilities
-                logprobs_cuda = F.log_softmax(processed_logits_cuda, dim=-1)
+                    # Use sample() to get processed logprobs (after temperature, top-k, top-p applied)
+                    _, _, req_logprobs = sample(strategy, req_logits, return_probs=True)
+                    logprobs_list.append(req_logprobs)
+                # Concatenate all logprobs
+                logprobs_cuda = torch.cat(logprobs_list, dim=0)
             else:
                 # For raw_logprobs and other modes, use raw logits (before sampling modifications)
                 raw_logits_for_logprobs = raw_logits_cuda[:sum_steps]
