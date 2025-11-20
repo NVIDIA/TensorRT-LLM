@@ -918,11 +918,13 @@ def test_llm_return_logprobs_streaming(prompt_logprobs, logprobs,
 
 
 @skip_ray
-@pytest.mark.parametrize("temperature", [0.0, 0.8])
-@pytest.mark.parametrize("top_k", [None, 50])
-# temperature: 0.0 is greedy sampling
-# top_k: None means all logits
-def test_llm_logprobs_modes_basic(temperature, top_k):
+@pytest.mark.parametrize("temperature", [None, 0.8, 1.0])
+@pytest.mark.parametrize("top_k", [None, 10, 0])
+@pytest.mark.parametrize("top_p", [None, 0.5, 1.0])
+# temperature: 0.0 is greedy sampling and will be covered by below test
+# top_k: 0 means all logits
+# top_p: 1 means no top-p filtering
+def test_llm_logprobs_modes_basic(temperature, top_k, top_p):
     """
     Test processed_logprobs mode works correctly in PyTorch backend.
     Validates that:
@@ -939,6 +941,7 @@ def test_llm_logprobs_modes_basic(temperature, top_k):
         logprobs=3,
         temperature=temperature,
         top_k=top_k,
+        top_p=top_p,
         logprobs_mode="processed_logprobs",
         seed=42,
         return_context_logits=True,
@@ -964,78 +967,6 @@ def test_llm_logprobs_modes_basic(temperature, top_k):
     # Validate that processed_logprobs returns non-positive values (log probabilities)
     for val in all_values:
         assert val <= 0.0, f"processed_logprobs should have non-positive values, got {val}"
-
-    del llm
-
-
-@skip_ray
-@pytest.mark.parametrize("temperature", [0.5, 1.0, 1.5])
-def test_llm_processed_logprobs_with_temperature(temperature):
-    """
-    Test that processed_logprobs correctly applies temperature scaling.
-    """
-    llm = LLM(
-        llama_model_path,
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.7),
-    )
-
-    prompt = ["The capital of France is"]
-
-    # Get processed logprobs (after temperature/top-k/top-p modifications)
-    params = SamplingParams(
-        max_tokens=3,
-        logprobs=5,
-        temperature=temperature,
-        top_k=20,
-        logprobs_mode="processed_logprobs",
-        seed=42,
-    )
-    outputs = list(llm.generate(prompt, params))
-
-    # Check first token logprobs
-    first_token_logprobs = outputs[0].outputs[0].logprobs[0]
-    assert len(first_token_logprobs) > 0, "Should have logprobs returned"
-
-    # Validate that all values are non-positive (log probabilities)
-    for token_id, logprob_obj in first_token_logprobs.items():
-        assert logprob_obj.logprob <= 0.0, (
-            f"processed_logprobs should have non-positive values, got {logprob_obj.logprob}"
-        )
-
-    del llm
-
-
-@skip_ray
-def test_llm_processed_logprobs_with_greedy_sampling():
-    llm = LLM(
-        llama_model_path,
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.7),
-    )
-
-    prompt = ["Once upon a time"]
-
-    sampling_params = SamplingParams(
-        max_tokens=10,
-        logprobs=3,
-        temperature=0.0,  # Greedy sampling
-        logprobs_mode="processed_logprobs",
-    )
-
-    outputs = llm.generate(prompt, sampling_params=sampling_params)
-
-    assert len(outputs) == 1
-    assert len(outputs[0].outputs[0].logprobs) > 0, (
-        "processed_logprobs should return logprobs even with greedy sampling")
-
-    # Check value ranges - all should be non-positive (log probabilities)
-    logprob_vals = [
-        logprob_obj.logprob for token_logprobs in outputs[0].outputs[0].logprobs
-        for logprob_obj in token_logprobs.values()
-    ]
-
-    assert all(
-        v <= 0.0 for v in
-        logprob_vals), "processed_logprobs should have non-positive values"
 
     del llm
 
@@ -1077,52 +1008,6 @@ def test_llm_logprobs_mode_backward_compatibility():
         "Default should match explicit processed_logprobs")
 
     del llm
-
-
-@skip_ray
-@pytest.mark.parametrize("top_p", [0.5, 1.0])
-def test_llm_processed_logprobs_with_top_p(top_p):
-    """
-    Test that processed_logprobs correctly applies top-k and top-p filtering.
-    This verifies the fix for processed_logprobs implementation.
-    """
-    llm = LLM(
-        llama_model_path,
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.7),
-    )
-
-    prompt = ["The future of technology"]
-
-    # Test with top_k and top_p to ensure processed_logprobs applies filtering
-    params = SamplingParams(
-        max_tokens=5,
-        logprobs=3,
-        temperature=1.0,
-        top_p=top_p,
-        logprobs_mode="processed_logprobs",
-        seed=42,
-        return_context_logits=True,
-        return_generation_logits=True,
-    )
-
-    outputs = list(llm.generate(prompt, params))
-    assert len(outputs) == 1
-
-    # Check that some logprobs are -inf (masked by top-p) across all generated tokens
-    # Note: With top_p, not every token position will have -inf values in the top-k logprobs
-    # We need to check across all tokens.
-    all_logprobs = outputs[0].outputs[0].logprobs
-    for token_idx, token_logprobs in enumerate(all_logprobs):
-        logprob_values = [obj.logprob for obj in token_logprobs.values()]
-        if token_idx == 0:
-            print(f"First token processed_logprobs values: {logprob_values}")
-        if any(val == float("-inf") for val in logprob_values):
-            break
-    # All non-inf values should be non-positive (log probabilities)
-    non_inf_values = [v for v in logprob_values if v != float("-inf")]
-    if non_inf_values:
-        assert all(v <= 0.0 for v in non_inf_values), (
-            "processed_logprobs non-inf values should be non-positive")
 
 
 class TestLlmError:
