@@ -128,6 +128,10 @@ def _nemotron_h_moe_forward(self, hidden_states: torch.Tensor):
     topk_indices, topk_weights = self.gate(hidden_states)
     x_flat = hidden_states.view(-1, hidden_states.shape[-1])
 
+    # NOTE: So far we've seen that the dispatch order in eager code is the same as the node order in the exported graph.
+    # We dispatch shared expert first so that we can easily fork the execution of the routed experts
+    # (using the custom op below) to an auxiliary stream.
+    shared_out = self.shared_experts(residuals)
     # Check if this is a latent MOE (has fc1_latent_proj and fc2_latent_proj)
     has_latent_proj = hasattr(self, "fc1_latent_proj") and hasattr(self, "fc2_latent_proj")
 
@@ -151,8 +155,8 @@ def _nemotron_h_moe_forward(self, hidden_states: torch.Tensor):
         # Latent MOE: project back from latent space
         out_flat = self.fc2_latent_proj(out_flat)
 
-    out = out_flat.view(*orig_shape)
-    out = out + self.shared_experts(residuals)
+    routed_out = out_flat.view(*orig_shape)
+    out = shared_out + routed_out
     return out
 
 
@@ -187,23 +191,15 @@ AutoModelForCausalLM.from_config = get_model_from_config_patched
 
 _config_from_pretrained_original = AutoConfig.from_pretrained
 _nemotron_h_base_model_tp_plan = {
-    # mamba SSM layer
     "in_proj": "mamba",
     "out_proj": "rowwise",
-    # attention layer
     "q_proj": "colwise",
     "k_proj": "colwise",
     "v_proj": "colwise",
     "o_proj": "rowwise",
-    # NOTE: consider not sharding shared experts and/or
-    # latent projections at all, keeping them replicated.
-    # To do so, comment out the corresponding entries.
-    # moe layer: SHARED experts
     "up_proj": "colwise",
     "down_proj": "rowwise",
-    # MoLE: latent projections: simple shard
-    "fc1_latent_proj": "gather",
-    "fc2_latent_proj": "gather",
+    # "*": "gather",
 }
 
 
