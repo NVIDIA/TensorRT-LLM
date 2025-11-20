@@ -626,9 +626,6 @@ def deepseek_v3_model_root(request):
     elif request.param == "DeepSeek-V3-Lite-nvfp4_moe_only":
         deepseek_v3_model_root = os.path.join(models_root, "DeepSeek-V3-Lite",
                                               "nvfp4_moe_only")
-    elif request.param == "DeepSeek-R1-FP4":
-        deepseek_v3_model_root = os.path.join(models_root, "DeepSeek-R1",
-                                              "DeepSeek-R1-FP4")
     assert exists(
         deepseek_v3_model_root), f"{deepseek_v3_model_root} does not exist!"
     return deepseek_v3_model_root
