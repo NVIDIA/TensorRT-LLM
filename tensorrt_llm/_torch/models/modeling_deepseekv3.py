@@ -1240,7 +1240,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             return self.mlp(
                 hidden_states,
                 hidden_states_fp4,
-                all_rank_num_tokens=attn_metadata.all_tp_rank_num_tokens,
+                all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
                 final_all_reduce_params=AllReduceParams(
                     enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
                                           or self.mapping.tp_size == 1)),

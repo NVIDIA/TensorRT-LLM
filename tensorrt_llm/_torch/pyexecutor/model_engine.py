@@ -2030,16 +2030,16 @@ class PyTorchModelEngine(ModelEngine):
             inputs['spec_metadata'] = spec_metadata
 
             if self.enable_attention_dp:
-                all_tp_rank_num_tokens = self.dist.tp_allgather(
+                all_rank_num_tokens = self.dist.tp_allgather(
                     [spec_metadata.num_tokens,
                      len(sequence_lengths)])
 
-                spec_all_tp_rank_num_tokens = [
-                    item[0] for item in all_tp_rank_num_tokens
+                spec_all_rank_num_tokens = [
+                    item[0] for item in all_rank_num_tokens
                 ]
-                all_tp_rank_num_seqs = [item[1] for item in all_tp_rank_num_tokens]
-                spec_metadata.all_tp_rank_num_tokens = spec_all_tp_rank_num_tokens
-                spec_metadata.all_tp_rank_num_seqs = all_tp_rank_num_seqs
+                all_rank_num_seqs = [item[1] for item in all_rank_num_tokens]
+                spec_metadata.all_rank_num_tokens = spec_all_rank_num_tokens
+                spec_metadata.all_rank_num_seqs = all_rank_num_seqs
 
         if mm_token_indices is not None:
             mask = torch.ones(total_num_tokens, dtype=torch.bool)
@@ -2138,9 +2138,9 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.padded_num_tokens = padded_num_tokens if padded_num_tokens != num_tokens else None
 
         if self.enable_attention_dp:
-            all_tp_rank_num_tokens = self.dist.allgather(
+            all_rank_num_tokens = self.dist.allgather(
                 attn_metadata.num_tokens)
-            attn_metadata.all_tp_rank_num_tokens = all_tp_rank_num_tokens
+            attn_metadata.all_rank_num_tokens = all_rank_num_tokens
 
         virtual_num_tokens = num_tokens
         if attn_metadata.padded_num_tokens is not None:
@@ -2189,26 +2189,26 @@ class PyTorchModelEngine(ModelEngine):
         # support attention dp
         if self.enable_attention_dp:
             if spec_metadata is not None:
-                all_tp_rank_num_tokens = self.dist.tp_allgather([
+                all_rank_num_tokens = self.dist.tp_allgather([
                     attn_metadata.num_tokens, spec_metadata.num_tokens,
                     len(sequence_lengths)
                 ])
-                attn_all_tp_rank_num_tokens = [
-                    item[0] for item in all_tp_rank_num_tokens
+                attn_all_rank_num_tokens = [
+                    item[0] for item in all_rank_num_tokens
                 ]
-                spec_all_tp_rank_num_tokens = [
-                    item[1] for item in all_tp_rank_num_tokens
+                spec_all_rank_num_tokens = [
+                    item[1] for item in all_rank_num_tokens
                 ]
-                all_tp_rank_num_seqs = [
-                    item[2] for item in all_tp_rank_num_tokens
+                all_rank_num_seqs = [
+                    item[2] for item in all_rank_num_tokens
                 ]
-                attn_metadata.all_tp_rank_num_tokens = attn_all_tp_rank_num_tokens
-                spec_metadata.all_tp_rank_num_tokens = spec_all_tp_rank_num_tokens
-                spec_metadata.all_tp_rank_num_seqs = all_tp_rank_num_seqs
+                attn_metadata.all_rank_num_tokens = attn_all_rank_num_tokens
+                spec_metadata.all_rank_num_tokens = spec_all_rank_num_tokens
+                spec_metadata.all_rank_num_seqs = all_rank_num_seqs
             else:
-                all_tp_rank_num_tokens = self.dist.tp_allgather(
+                all_rank_num_tokens = self.dist.tp_allgather(
                     attn_metadata.num_tokens)
-                attn_metadata.all_tp_rank_num_tokens = all_tp_rank_num_tokens
+                attn_metadata.all_rank_num_tokens = all_rank_num_tokens
 
         return inputs, None
 
@@ -2423,9 +2423,9 @@ class PyTorchModelEngine(ModelEngine):
 
         attn_metadata.prepare()
         if self.enable_attention_dp:
-            all_tp_rank_num_tokens = self.dist.tp_allgather(
+            all_rank_num_tokens = self.dist.tp_allgather(
                 attn_metadata.num_tokens)
-            attn_metadata.all_tp_rank_num_tokens = all_tp_rank_num_tokens
+            attn_metadata.all_rank_num_tokens = all_rank_num_tokens
 
         return {
             'attn_metadata': attn_metadata,
