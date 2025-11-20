@@ -51,9 +51,7 @@ class Backend:
         self.capture_num_tokens = sorted(capture_num_tokens or [])
         self.piecewise_cuda_graph = enable_piecewise_cuda_graph
         self.no_optimization = False
-        # We only need to create aux streams.
-        self.aux_streams = Backend.Streams(
-            [torch.cuda.Stream() for _ in range(max_num_streams - 1)])
+        self.num_streams = max_num_streams
         self.events = Backend.Events()
         inductor_config.enable_auto_functionalized_v2 = False
 
@@ -109,10 +107,8 @@ class Backend:
         # Do not apply multi-stream if enable piecewise cuda graph or inductor
         # For piecewise cuda graph, we will apply the multi-stream optimization in piecewise_optimizer
         # For inductor, we do not control the passes inside inductor.
-        if len(
-                self.aux_streams
-        ) > 0 and not self.piecewise_cuda_graph and not self.enable_inductor:
-            num_events = multi_stream_schedule(gm, len(self.aux_streams) + 1)
+        if self.num_streams > 1 and not self.piecewise_cuda_graph and not self.enable_inductor:
+            num_events = multi_stream_schedule(gm, self.num_streams)
             self.generate_events(num_events)
 
         gm.recompile()
@@ -125,7 +121,7 @@ class Backend:
                 self.input_num_tokens,
                 self.capture_num_tokens,
                 self._graph_pool_handle,
-                len(self.aux_streams) + 1,
+                self.num_streams,
             )
             self.generate_events(num_events)
             return gm
