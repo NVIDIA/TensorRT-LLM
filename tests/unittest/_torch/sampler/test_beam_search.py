@@ -126,8 +126,8 @@ def check_logprobs(beam: CompletionOutput, sampling_params: SamplingParams,
             beam.logprobs
         ) == generated_tokens, f"expected {generated_tokens} logprobs, but got {len(beam.logprobs)}"
         log_sum = 0.0
-        for seq_idx, logprob_dict in enumerate(beam.logprobs):
-            for logprob_idx, logprob_value in logprob_dict.items():
+        for logprob_dict in (beam.logprobs):
+            for logprob_value in logprob_dict.values():
                 log_sum += logprob_value.logprob
         assert log_sum == beam.cumulative_logprob, f"expected {beam.cumulative_logprob} logprob, but got {log_sum}"
     else:
@@ -233,7 +233,9 @@ def validate_outputs(llm: LLM, input_prompts: list[list[int]],
         validate_output(output, input_prompts[output_idx], sampling_params)
 
 
+###########################################################################
 # End to end tests
+###########################################################################
 
 
 @pytest.mark.parametrize("return_log_probs", [True, False])
@@ -422,7 +424,8 @@ def test_beam_search_sampling_batch_basic():
     # Run beam search sampling
     next_tokens, softmax = beam_search_sampling_batch(
         logits=logits,
-        beam_width=beam_width,
+        beam_width_in=beam_width,
+        beam_width_out=beam_width,
         beam_search_args=beam_search_args,
         temperature=temperature,
         generator=None,
@@ -612,7 +615,7 @@ def test_create_beam_history():
         0,
         vocab_size,
         (beam_width, num_generated_tokens, original_logprobs.shape[-1]),
-        dtype=torch.float32)
+        dtype=torch.int32)
     assert (original_logprobs != 0).sum(
     ) > 0, "Original log probs must not only contain zeros. Otherwise change the seed."
     assert (original_logprob_indices).sum(
