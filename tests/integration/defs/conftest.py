@@ -2681,6 +2681,7 @@ def torch_empty_cache() -> None:
     Manually empty the torch CUDA cache before each test, to reduce risk of OOM errors.
     """
     if torch.cuda.is_available():
+        gc.collect()
         torch.cuda.empty_cache()
         gc.collect()
 

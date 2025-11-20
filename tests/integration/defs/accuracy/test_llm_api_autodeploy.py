@@ -18,6 +18,7 @@ import os
 import pytest
 
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
+from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.sampling_params import SamplingParams
 
 from ..conftest import llm_models_root
@@ -153,7 +154,8 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
 
 class TestNemotronMOE(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Nemotron-MOE"
-    MODEL_PATH = f"{llm_models_root()}/Nemotron-MOE/"
+    MODEL_PATH_BF16 = f"{llm_models_root()}/Nemotron-Nano-3-30B-A3.5B-dev-1024"
+    MODEL_PATH_FP8 = f"{llm_models_root()}/Nemotron-Nano-3-30B-A3.5B-FP8-KVFP8-dev"
 
     def get_default_kwargs(self):
         return {
@@ -196,13 +198,28 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
                               use_beam_search=beam_width > 1)
 
     @pytest.mark.skip_less_device_memory(32000)
-    def test_auto_dtype(self):
-        pytest.skip("Nemotron-MOE is not in CI yet")
+    def test_bf16(self):
         kwargs = self.get_default_kwargs()
         sampling_params = self.get_default_sampling_params()
-        with AutoDeployLLM(model=self.MODEL_PATH,
-                           tokenizer=self.MODEL_PATH,
+        with AutoDeployLLM(model=self.MODEL_PATH_BF16,
+                           tokenizer=self.MODEL_PATH_BF16,
                            **kwargs) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=sampling_params)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device_memory(32000)
+    def test_fp8(self):
+        kwargs = self.get_default_kwargs()
+        sampling_params = self.get_default_sampling_params()
+        with AutoDeployLLM(model=self.MODEL_PATH_FP8,
+                           tokenizer=self.MODEL_PATH_FP8,
+                           **kwargs) as llm:
+            # Manually set quant_config for FP8 model to get the accuracy threshold
+            llm.args.quant_config.quant_algo = QuantAlgo.FP8
+            llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME)
