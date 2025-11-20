@@ -209,8 +209,6 @@ class Qwen3Model(DecoderModel):
         hidden_states = inputs_embeds
 
         residual = None
-        if isinstance(position_ids, tuple):
-            position_ids = position_ids[0]
         for layer_idx, decoder_layer in enumerate(self.layers):
             hidden_states, residual = decoder_layer(
                 position_ids=position_ids,
