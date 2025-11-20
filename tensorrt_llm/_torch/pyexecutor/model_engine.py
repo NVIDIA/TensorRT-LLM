@@ -1218,15 +1218,6 @@ class PyTorchModelEngine(ModelEngine):
                                 previous_kv_lens_offsets_cuda[:num_gen_requests]
                             )
 
-    def _get_helix_prompt_length(self, request: LlmRequest):
-        # we split the request across KVP ranks for Helix parallelism
-        kvp_rank = self.mapping.cp_rank
-        len_per_rank = (request.py_prompt_len + self.mapping.cp_size -
-                        1) // self.mapping.cp_size
-        len_this_rank = len_per_rank if kvp_rank != self.mapping.cp_size - 1 else request.py_prompt_len - len_per_rank * (
-            self.mapping.cp_size - 1)
-        return len_this_rank
-
     def _get_all_rank_num_tokens(self, attn_metadata: AttentionMetadata):
         if self.enable_attention_dp:
             return list(self.dist.tp_allgather(attn_metadata.num_tokens))

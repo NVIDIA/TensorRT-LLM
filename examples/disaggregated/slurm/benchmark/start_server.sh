@@ -9,9 +9,6 @@ work_dir=$3
 script_dir=$4
 server_env_var=$5
 
-export TRTLLM_SERVER_DISABLE_GC=1
-export TRTLLM_WORKER_DISABLE_GC=1
-
 python3 ${script_dir}/gen_server_config.py \
     --num_ctx_servers ${num_ctx_servers} \
     --num_gen_servers ${num_gen_servers} \
@@ -24,4 +21,4 @@ for env_var in ${server_env_var}; do
     echo "Exported: ${env_var}"
 done
 
-trtllm-serve disaggregated -c ${work_dir}/server_config.yaml -t 1800 -r 1200
+trtllm-serve disaggregated -c ${work_dir}/server_config.yaml -t 7200 -r 7200

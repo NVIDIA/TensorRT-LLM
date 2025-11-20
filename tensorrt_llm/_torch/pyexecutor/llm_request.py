@@ -275,20 +275,6 @@ class PyResult:
             self, exclude_last_generation_logits: bool):
         self._exclude_last_generation_logits = exclude_last_generation_logits
 
-    def __str__(self):
-        properties = []
-        context_str = str(self._context_logits)
-        context_str = context_str.replace("\n", "\n\t")
-        properties.append(f"_streaming: {self._streaming}")
-        properties.append(f"_context_logits: {context_str}")
-        generation_str = str(self._generation_logits)
-        generation_str = generation_str.replace("\n", "\n\t")
-        properties.append(f"_generation_logits: {generation_str}")
-        log_probs_str = str(self._log_probs)
-        log_probs_str = log_probs_str.replace("\n", "\n\t")
-        properties.append(f"_log_probs: {log_probs_str}")
-        return "PyResult:\n" + "\n".join(properties)
-
     def append_context_logits(self, context_logits: torch.Tensor):
         if self._context_logits:
             self._context_logits.append(context_logits)

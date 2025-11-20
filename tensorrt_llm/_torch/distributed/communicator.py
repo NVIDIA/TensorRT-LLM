@@ -410,13 +410,6 @@ class MPIDist(Distributed):
         new_group = mpi_comm().group.Incl(self.mapping.pp_group)
         self.pp_comm = mpi_comm().Create_group(new_group)
 
-    def create_cp_comm(self):
-        new_group = mpi_comm().group.Incl(self.mapping.cp_group)
-        self.cp_comm = mpi_comm().Create_group(new_group)
-
-    def cp_allgather(self, obj):
-        return self.cp_comm.allgather(obj)
-
     def tp_allgather(self, obj):
         return self.tp_comm.allgather(obj)
 

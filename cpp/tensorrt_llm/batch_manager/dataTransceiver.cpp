@@ -71,7 +71,6 @@ runtime::BufferManager const& TransferSession::getBufferManager() const
 
 void TransferSession::send(size_t idx, void const* data, size_t size)
 {
-    printf("[TransferSession::send] sendSize: %zu\n", size);
     try
     {
         mConnections.at(idx)->send(mDataContext, data, size);
@@ -85,7 +84,6 @@ void TransferSession::send(size_t idx, void const* data, size_t size)
 
 void TransferSession::recv(size_t idx, void* data, size_t size)
 {
-    printf("[TransferSession::recv] recvSize: %zu\n", size);
     try
     {
         mConnections.at(idx)->recv(mDataContext, data, size);
