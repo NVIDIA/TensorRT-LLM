@@ -111,25 +111,19 @@ def main():
 
     print(f"Running sbatch command:\n{sbatch_cmd}")
     result = subprocess.run(sbatch_cmd, shell=True, capture_output=True, text=True)
-    print(result.stdout)
-    if result.stderr:
-        print(result.stderr, file=sys.stderr)
-
     if result.returncode != 0:
         print(f"Error: sbatch failed with return code {result.returncode}")
         sys.exit(result.returncode)
 
-    # Extract job ID from output
+    # Extract job ID
     job_id = None
     for line in result.stdout.split("\n"):
         if "Submitted batch job" in line:
             job_id = line.split()[-1]
             break
-
     if not job_id:
         print("Error: Could not extract job ID from sbatch output")
         sys.exit(1)
-
     print(f"Submitted job {job_id}")
 
     # Tail the output file
@@ -141,59 +135,31 @@ def main():
     tail_pid = tail_proc.pid
     print(f"Started tail process with PID {tail_pid}")
 
-    try:
-        # Wait until sbatch job is done
-        print("Monitoring job status...")
-        while True:
-            check_cmd = f"squeue -j {job_id} -o %T"
-            check_result = subprocess.run(check_cmd, shell=True, capture_output=True, text=True)
-            if check_result.returncode != 0:
-                print("Job is no longer in queue")
-                break
-            time.sleep(300)
+    # Wait until sbatch job is done
+    print("Monitoring job status...")
+    while True:
+        check_cmd = f"squeue -j {job_id} -o %T"
+        check_result = subprocess.run(check_cmd, shell=True, capture_output=True, text=True)
+        if check_result.returncode != 0:
+            print("Job is no longer in queue")
+            break
+        time.sleep(60)
 
-        # Kill tail -f process
-        print("Terminating tail process...")
-        tail_proc.terminate()
-        try:
-            tail_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            tail_proc.kill()
-            tail_proc.wait()
+    print("Terminating tail process...")
+    tail_proc.terminate()
+    tail_proc.wait()
 
-        # Check if the job failed or not
-        print("Checking job exit code...")
-        sacct_cmd = f"sacct -j {job_id} --format=ExitCode -Pn --allocations"
-        sacct_result = subprocess.run(sacct_cmd, shell=True, capture_output=True, text=True)
-        exit_code_str = sacct_result.stdout.strip()
-        exit_code = exit_code_str.split(":")[0] if ":" in exit_code_str else "1"
-        exit_code = int(exit_code) if exit_code.isdigit() else 1
-
-        print(f"Job exit code: {exit_code}")
-
-        if exit_code != 0:
-            print(f"Pytest failed in Slurm job {job_id} with exit code {exit_code}")
-            sys.exit(exit_code)
-
-        print("Job completed successfully")
-    except KeyboardInterrupt:
-        print("\nReceived interrupt signal, cleaning up...")
-        tail_proc.terminate()
-        try:
-            tail_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            tail_proc.kill()
-            tail_proc.wait()
-        sys.exit(1)
-    except Exception as e:
-        print(f"Error during job monitoring: {e}")
-        tail_proc.terminate()
-        try:
-            tail_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            tail_proc.kill()
-            tail_proc.wait()
-        sys.exit(1)
+    # Check if the job failed or not
+    print("Checking job exit code...")
+    sacct_cmd = f"sacct -j {job_id} --format=ExitCode -Pn --allocations"
+    sacct_result = subprocess.run(sacct_cmd, shell=True, capture_output=True, text=True)
+    exit_code_str = sacct_result.stdout.strip()
+    exit_code = exit_code_str.split(":")[0] if ":" in exit_code_str else "1"
+    exit_code = int(exit_code) if exit_code.isdigit() else 1
+    if exit_code != 0:
+        print(f"Pytest failed in Slurm job {job_id} with exit code {exit_code}")
+        sys.exit(exit_code)
+    print("Job completed successfully")
 
 
 if __name__ == "__main__":

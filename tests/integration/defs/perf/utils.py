@@ -518,7 +518,6 @@ class PerfMultiNodeDisaggScriptTestCmds(NamedTuple):
                         stderr=subprocess.STDOUT,
                         env=envs,
                     )
-                # Wait for benchmark status file to appear
                 self.wait_for_benchmark_ready(benchmark_status_file)
             finally:
                 print_info(f"Server {self.disagg_server_idx} stopped")
@@ -544,7 +543,6 @@ class PerfMultiNodeDisaggScriptTestCmds(NamedTuple):
                         stderr=subprocess.STDOUT,
                         env=envs,
                     )
-                # Wait for benchmark status file to appear
                 self.wait_for_benchmark_ready(benchmark_status_file)
             finally:
                 print_info(f"Disagg server {self.disagg_server_idx} stopped")
@@ -552,7 +550,7 @@ class PerfMultiNodeDisaggScriptTestCmds(NamedTuple):
                 disagg_server_proc.wait()
         elif self.disagg_server_idx == "BENCHMARK":
             benchmark_file_path = os.path.join(
-                self.output_dir, f"trtllm-benchmark.{cmd_idx}.disagg.log")
+                self.output_dir, f"trtllm-benchmark.{cmd_idx}.log")
             try:
                 # Get disagg server's hostname and port
                 disagg_server_hostname, disagg_server_port = self._get_disagg_server_hostname_and_port(

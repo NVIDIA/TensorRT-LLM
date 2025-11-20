@@ -1,4 +1,3 @@
-#!/bin/bash
 set -Eeuo pipefail
 
 # Parse arguments
@@ -168,4 +167,5 @@ fi
 echo "Disagg server and benchmark completed successfully"
 echo "Total runtime: $SECONDS seconds"
 
+sleep 60
 scancel ${SLURM_JOB_ID}

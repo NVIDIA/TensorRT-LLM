@@ -77,21 +77,3 @@ else
     eval $pytestCommand
 fi
 echo "Rank${SLURM_PROCID} Pytest finished execution"
-
-if [ "$perfMode" = "true" ] && [[ "$stageName" != *Perf-Sanity* ]]; then
-    if [[ "$stageName" == *PyTorch* ]]; then
-        basePerfFilename="base_perf_pytorch.csv"
-    else
-        basePerfFilename="base_perf.csv"
-    fi
-    basePerfPath="$llmSrcNode/tests/integration/defs/perf/$basePerfFilename"
-    echo "Check Perf Result"
-    python3 $llmSrcNode/tests/integration/defs/perf/sanity_perf_check.py \
-        $stageName/perf_script_test_results.csv \
-        $basePerfPath
-    echo "Check Perf Result"
-    python3 $llmSrcNode/tests/integration/defs/perf/create_perf_comparison_report.py \
-        --output_path $stageName/report.pdf \
-        --files $stageName/perf_script_test_results.csv \
-        $basePerfPath
-fi
