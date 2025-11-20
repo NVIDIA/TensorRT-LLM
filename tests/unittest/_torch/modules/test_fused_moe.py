@@ -1370,7 +1370,7 @@ def test_fused_moe_nvfp4(dtype, moe_backend):
         SEQ_LEN = 4
         HIDDEN_SIZE = 512
         INTERMEDIATE_SIZE = 512
-        NUM_EXPERTS = 4
+        NUM_EXPERTS = 8
         TOP_K = 2
         routing_method = RenormalizeMoeRoutingMethod(top_k=TOP_K)
         torch.manual_seed(0)
