@@ -23,6 +23,7 @@ from tensorrt_llm._torch.attention_backend import AttentionMetadata
 from tensorrt_llm._torch.attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import (
+    _load_weights_impl,
     DecoderModel,
     DecoderModelForCausalLM,
     register_auto_model,
@@ -35,6 +36,7 @@ from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm.functional import PositionEmbeddingType
+
 
 
 class Starcoder2Attention(Attention):
@@ -276,29 +278,11 @@ class Starcoder2ForCausalLM(DecoderModelForCausalLM[Starcoder2Model, Starcoder2C
             r"(.*?)\.mlp\.c_fc\.(.*)": r"\1.mlp.up_proj.\2",
             r"(.*?)\.mlp\.c_proj\.(.*)": r"\1.mlp.down_proj.\2",
         }
-
-        if weight_mapper is None:
-            # Use _load_weights_impl for non-weight-mapper path
-            from tensorrt_llm._torch.models.modeling_utils import _load_weights_impl
-
-            preload_weight_modules = getattr(self, "preload_weight_modules", None)
-            _load_weights_impl(
-                self,
-                weights,
-                skip_modules,
-                params_map=params_map,
-                preload_weight_modules=preload_weight_modules,
-            )
-        else:
-            # Use _load_weights_impl_v2 for weight-mapper path
-            from tensorrt_llm._torch.models.modeling_utils import _load_weights_impl_v2
-
-            preload_weight_modules = getattr(self, "preload_weight_modules", None)
-            _load_weights_impl_v2(
-                self,
-                weights,
-                weight_mapper,
-                skip_modules,
-                params_map=params_map,
-                preload_weight_modules=preload_weight_modules,
-            )
+        preload_weight_modules = getattr(self, "preload_weight_modules", None)
+        _load_weights_impl(
+            self,
+            weights,
+            skip_modules,
+            params_map=params_map,
+            preload_weight_modules=preload_weight_modules,
+        )
