@@ -81,6 +81,7 @@ l0_b200:
   - unittest/tools/test_layer_wise_benchmarks.py::test_qwen3_next_gen_tep[1]
     # ------------- AutoDeploy tests ---------------
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[False-1]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_fp8
   - unittest/_torch/auto_deploy/unit/singlegpu
 - condition:
     ranges:
