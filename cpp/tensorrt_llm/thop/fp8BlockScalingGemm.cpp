@@ -112,6 +112,44 @@ torch::Tensor fp8_block_scaling_gemm_ada(torch::Tensor const& mat1, torch::Tenso
     return out;
 }
 
+torch::Tensor fp8_block_scale_gemm_rtx_6000(torch::Tensor const& mat1, torch::Tensor const& mat2,
+    torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale)
+{
+    TORCH_CHECK(mat1.scalar_type() == at::ScalarType::Float8_e4m3fn, "Matrix dtype must be FP8.");
+    TORCH_CHECK(mat2.scalar_type() == at::ScalarType::Float8_e4m3fn, "Matrix dtype must be FP8.");
+    TORCH_CHECK(mat1Scale.scalar_type() == at::ScalarType::Int, "Scale dtype must be Int32.");
+    TORCH_CHECK(mat2Scale.scalar_type() == at::ScalarType::Int, "Scale dtype must be Int32.");
+
+    TORCH_CHECK(mat1.dim() == 2, "mat1 must be a matrix");
+    TORCH_CHECK(mat2.dim() == 2, "mat2 must be a matrix");
+    TORCH_CHECK(mat1.sizes()[1] == mat2.sizes()[1], "mat1 and mat2 shapes cannot be multiplied (", mat1.sizes()[0], "x",
+        mat1.sizes()[1], " and ", mat2.sizes()[0], "x", mat2.sizes()[1], ")");
+
+    auto const m = mat1.sizes()[0];
+    auto const n = mat2.sizes()[0];
+    auto const k = mat1.sizes()[1];
+    TORCH_CHECK(m <= std::numeric_limits<int32_t>::max(), "M must be within int32");
+    TORCH_CHECK(n <= std::numeric_limits<int32_t>::max(), "N must be within int32");
+    TORCH_CHECK(k <= std::numeric_limits<int32_t>::max(), "K must be within int32");
+
+    TORCH_CHECK(k % 128 == 0, "K must be a multiple of 128, (K=", k, ")");
+    TORCH_CHECK(n % 16 == 0, "N must be a multiple of 16, (N=", n, ")");
+
+    at::Tensor out = at::detail::empty_cuda({m, n}, at::ScalarType::BFloat16, mat1.device(), std::nullopt);
+
+    auto gemm_runner = get_gemm_runner(mat1.scalar_type(), mat2.scalar_type());
+
+    auto stream = at::cuda::getCurrentCUDAStream(mat1.get_device());
+
+    float const* mat1ScalePtr = reinterpret_cast<float const*>(mat1Scale.data_ptr());
+    float const* mat2ScalePtr = reinterpret_cast<float const*>(mat2Scale.data_ptr());
+
+    gemm_runner->gemm(reinterpret_cast<__nv_fp8_e4m3*>(mat1.data_ptr()), k,
+        reinterpret_cast<__nv_fp8_e4m3*>(mat2.data_ptr()), k, reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), n, m, n,
+        k, mat1ScalePtr, mat2ScalePtr, stream);
+    return out;
+}
+
 torch::Tensor fp8_block_scaling_gemm_hopper(torch::Tensor const& mat1, torch::Tensor const& mat2,
     torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale)
 {
@@ -209,7 +247,7 @@ extern torch::Tensor fp8_block_scaling_gemm(torch::Tensor const& mat1, torch::Te
     case 100: return fp8_block_scale_gemm_blackwell(mat1, mat2, mat1Scale, mat2Scale);
     case 90: return fp8_block_scaling_gemm_hopper(mat1, mat2, mat1Scale, mat2Scale);
     case 89: return fp8_block_scaling_gemm_ada(mat1, mat2, mat1Scale, mat2Scale);
-    case 120: return fp8_block_scaling_gemm_ada(mat1, mat2, mat1Scale, mat2Scale);
+    case 120: return fp8_block_scale_gemm_rtx_6000(mat1, mat2, mat1Scale, mat2Scale);
     default: TORCH_CHECK(false, "Unsupported SM version for FP8 block scaling GEMM");
     }
 }

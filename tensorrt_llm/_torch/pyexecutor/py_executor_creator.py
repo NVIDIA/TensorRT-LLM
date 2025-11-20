@@ -350,10 +350,12 @@ def create_py_executor(
                               RestoreMode.PINNED):
             draft_spec_config = copy.copy(spec_config)
 
-            use_chain_drafter = (guided_decoding_config is None
-                                 and draft_spec_config._allow_chain_drafter and
-                                 draft_spec_config._allow_greedy_draft_tokens
-                                 and llm_args.attn_backend == "TRTLLM")
+            use_chain_drafter = (
+                guided_decoding_config is None
+                and draft_spec_config._allow_chain_drafter
+                and draft_spec_config._allow_greedy_draft_tokens
+                and llm_args.attn_backend == "TRTLLM"
+                and draft_spec_config.draft_len_schedule is None)
 
             logger.debug(f"USE CHAIN DRAFTER: {use_chain_drafter}")
             if use_chain_drafter:
@@ -707,7 +709,8 @@ def create_py_executor(
 
     _adjust_torch_mem_fraction()
 
-    logger.info(f"{llm_args}")
+    if mapping.rank == 0:
+        logger.info(f"LLM Args:\n{llm_args}")
 
     py_executor.start_worker()
     return py_executor
