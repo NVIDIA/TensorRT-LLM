@@ -1981,19 +1981,25 @@ class PyExecutor:
         finished_requests, error_requests = self.kv_cache_transceiver.check_context_transfer_status(
             atLeastNum)
 
+        finished_error_ids = set(finished_requests + error_requests)
+
         for request_id in finished_requests + error_requests:
 
             request = self.async_transfer_manager.requests_in_transfer().get(
                 request_id)
-            if request.py_kv_transfer_timed_out:
+
+            self.async_transfer_manager.end_transfer(request)
+
+        for request in list(
+                self.async_transfer_manager.requests_in_transfer().values()):
+            if request.py_kv_transfer_timed_out and request.py_request_id not in finished_error_ids:
                 is_cancelled = self.kv_cache_transceiver.cancel_request(request)
                 # If cancel is successful, mark as complete so it can be cleaned up
                 # Otherwise, try at next iteration
                 if is_cancelled:
                     request.py_kv_transfer_start_time = None
                     request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
-
-            self.async_transfer_manager.end_transfer(request)
+                    self.async_transfer_manager.end_transfer(request)
 
         self._check_cache_transfer_errors("context requests")
 
