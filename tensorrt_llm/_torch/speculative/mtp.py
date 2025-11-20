@@ -237,6 +237,7 @@ class MTPSampler(TorchSampler):
         seq_slots = args.max_num_sequences
         max_tokens = args.max_total_draft_tokens + 1
         self.max_beam_width = args.max_beam_width
+        assert self.max_beam_width == 1, "beam width must be 1 for MTP"
 
         self.store = self.Store(
             new_tokens=int_tensor((max_tokens, seq_slots, self.max_beam_width)),

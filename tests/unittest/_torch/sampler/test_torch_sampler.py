@@ -51,7 +51,6 @@ from tensorrt_llm._torch.pyexecutor.sampler import (
 )
 from tensorrt_llm._torch.pyexecutor.sampling_utils import (
     BeamSearch,
-    BeamSearchForPrefill,
     Greedy,
     Strategy,
     TemperatureOnly,
@@ -85,6 +84,9 @@ class TestStrategySelection:
     class MockLlmRequest:
         sampling_config: SamplingConfig
         is_context_init_state: bool  # Not used in this test
+
+        def get_beam_width_by_iter(self, for_next_iteration: bool) -> int:
+            return self.sampling_config.beam_width
 
     def _check_params(self, params: SamplingParams):
         # cf. description of 'top_p' in doc-string of SamplingParams and
@@ -790,7 +792,7 @@ class TestBatchedSampling:
         # Check that all relevant strategies are covered
         # Beam search is tested in test_beam_search.py instead of here.
         # It's added here to pass the assert statement, without testing it.
-        assert Union[*BASE_CASES.keys(), BeamSearch, BeamSearchForPrefill] == Strategy
+        assert Union[*BASE_CASES.keys(), BeamSearch] == Strategy
 
         test_cases = []
 

@@ -275,20 +275,42 @@ def _unwrap_singleton(p: Optional[List[T]]) -> Optional[T]:
     return t
 
 
+def _get_beam_width_in(request: LlmRequest) -> int:
+    return (
+        1
+        if request.is_context_init_state
+        else request.get_beam_width_by_iter(for_next_iteration=False)
+    )
+
+
+def _get_beam_width_out(request: LlmRequest) -> int:
+    return request.get_beam_width_by_iter(for_next_iteration=True)
+
+
+def _get_max_beam_width(request: LlmRequest) -> int:
+    sampling_config = request.sampling_config
+    max_beam_width = sampling_config.beam_width
+    if sampling_config.beam_width_array is not None:
+        max_beam_width = max(max_beam_width, sampling_config.beam_width_array.max())
+    return max_beam_width
+
+
 def _request_get_sampling_params(request: LlmRequest) -> UtilsSamplingParams:
     sampling_config = request.sampling_config
     temperature = _unwrap_singleton(cast(Optional[list[float]], sampling_config.temperature))
     top_p = _unwrap_singleton(cast(Optional[list[float]], sampling_config.top_p))
     top_k = _unwrap_singleton(cast(Optional[list[int]], sampling_config.top_k))
-    beam_width = sampling_config.beam_width
-    is_context_init_state = request.is_context_init_state
+    beam_width_out = _get_beam_width_out(request)
+    beam_width_in = _get_beam_width_in(request)
+    use_beam_search = _get_max_beam_width(request) > 1
 
     return UtilsSamplingParams(
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
-        beam_width=beam_width,
-        is_context_init_state=is_context_init_state,
+        beam_width_in=beam_width_in,
+        beam_width_out=beam_width_out,
+        use_beam_search=use_beam_search,
     )
 
 
@@ -949,7 +971,6 @@ class TorchSampler(Sampler):
     def handle_logprobs(
         self,
         request: LlmRequest,
-        state: SampleState,
         *,
         count: int,
     ):
@@ -1120,7 +1141,7 @@ class TorchSampler(Sampler):
             requests: list[LlmRequest]. The requests to setup the sampler step for
         """
         if self._use_beam_search:
-            self._prepare_beam_search(requests)
+            self._prepare_beam_search(requests.all_requests())
 
     def _prepare_beam_search(
         self,
@@ -1285,8 +1306,6 @@ class TorchSampler(Sampler):
             logprobs_tensor: A tensor of shape (beam_width, num_generated_tokens, num_logprobs)
             logprobs_indices_tensor: A tensor of shape (beam_width, num_generated_tokens, num_logprobs)
         """
-
-        logprobs_list = request.py_result.log_probs
         num_generated_tokens = request.get_num_tokens(0) - request.py_prompt_len
         assert request.py_num_logprobs == 1, "Beam search only supports one logprob per token"
         logprobs_tensor = torch.empty(
@@ -1307,17 +1326,19 @@ class TorchSampler(Sampler):
             device="cuda",
             dtype=torch.int32,
         )
-        for beam_idx, beam_logprobs in enumerate(logprobs_list):
-            for token_idx, token_logprobs in enumerate(beam_logprobs):
-                for key, value in token_logprobs.items():
-                    logprobs_tensor[beam_idx, token_idx, value.rank - 1] = value.logprob
-                    logprobs_indices_tensor[beam_idx, token_idx, value.rank - 1] = key
+        if hasattr(request.py_result._log_probs, "log_probs"):
+            logprobs_list = request.py_result.log_probs
+            for beam_idx, beam_logprobs in enumerate(logprobs_list):
+                for token_idx, token_logprobs in enumerate(beam_logprobs):
+                    for key, value in token_logprobs.items():
+                        logprobs_tensor[beam_idx, token_idx, value.rank - 1] = value.logprob
+                        logprobs_indices_tensor[beam_idx, token_idx, value.rank - 1] = key
         return logprobs_tensor, logprobs_indices_tensor
 
     def _create_beam_history(
         self,
         request: LlmRequest,
-    ) -> BeamHistory:
+    ) -> BeamHistory | None:
         """Correct the stored tokens for each beam and return it as a BeamHistory object.
 
         Beam Search sampling only adds new tokens to the beam.
@@ -1336,12 +1357,7 @@ class TorchSampler(Sampler):
 
         if num_generated_tokens == 0 or request.state == LlmRequestState.GENERATION_COMPLETE:
             # early return if no tokens have been generated yet or the request is already finished
-            return BeamHistory(
-                tokens=None,
-                logprobs=None,
-                logprobs_indices=None,
-                cum_logprobs=None,
-            )
+            return None
         cache_indirection = self.store.cache_indirection[
             request.py_seq_slot, :num_beams, prompt_length:num_tokens
         ]
@@ -1350,58 +1366,47 @@ class TorchSampler(Sampler):
         ]
         new_path = torch.zeros_like(current_path)
         if request.py_return_log_probs:
-            # Check that logprobs are initialized in the request
-            if getattr(request.py_result._log_probs, "log_probs", None) is not None:
-                current_logprobs, current_logprobs_indices = self._get_logprobs_from_request(
-                    request
-                )
-                # concatenate the newly generated logprobs and newly
-                # generated tokens to the current logprobs and logprobs indices
-                current_logprobs = torch.cat(
-                    [
-                        current_logprobs,
-                        self.store.new_log_probs[request.py_seq_slot, :num_beams].view(-1, 1, 1),
-                    ],
-                    dim=1,
-                )
-                current_logprobs_indices = torch.cat(
-                    [
-                        current_logprobs_indices,
-                        self.store.new_tokens[0, request.py_seq_slot, :num_beams].view(-1, 1, 1),
-                    ],
-                    dim=1,
-                )
-            else:
-                current_logprobs = self.store.new_log_probs[request.py_seq_slot, :num_beams].view(
-                    -1, 1, 1
-                )
-                current_logprobs_indices = self.store.new_tokens[
-                    0, request.py_seq_slot, :num_beams
-                ].view(-1, 1, 1)
+            current_logprobs, current_logprobs_indices = self._get_logprobs_from_request(request)
+            # concatenate the newly generated logprobs and newly
+            # generated tokens to the current logprobs and logprobs indices
+            current_logprobs = torch.cat(
+                [
+                    current_logprobs,
+                    self.store.new_log_probs[request.py_seq_slot, :num_beams].view(-1, 1, 1),
+                ],
+                dim=1,
+            )
+            current_logprobs_indices = torch.cat(
+                [
+                    current_logprobs_indices,
+                    self.store.new_tokens[0, request.py_seq_slot, :num_beams].view(-1, 1, 1),
+                ],
+                dim=1,
+            )
             # Initialize the buffers to store the results
             new_logprobs = torch.zeros_like(current_logprobs)
             new_logprobs_indices = torch.zeros_like(current_logprobs_indices)
         # initialize each beam with its own index
-        basic_beams = torch.arange(num_beams, device=cache_indirection.device, dtype=torch.int32)
-        # Traverse the cache indirection backwards to obtain the correct tokens and logprobsfor each beam.
-        for token_idx in range(num_generated_tokens - 1, 0, -1):
-            active_beams = cache_indirection[basic_beams, token_idx]
-            # set the current token and logprob
-            new_path[:, token_idx] = current_path[active_beams, token_idx]
-            if request.py_return_log_probs:
-                new_logprobs[:, token_idx] = current_logprobs[active_beams, token_idx]
-                new_logprobs_indices[:, token_idx] = current_logprobs_indices[
-                    active_beams, token_idx
-                ]
-            # update the active beams
-        active_beams = cache_indirection[basic_beams, 0]
-        # set the first generated token and logprob
-        new_path[:, 0] = current_path[active_beams, 0]
 
+        # Gather the correct tokens and logprobs for each beam
+        torch.gather(input=current_path, dim=0, index=cache_indirection, out=new_path)
         if request.py_return_log_probs:
-            new_logprobs[:, 0] = current_logprobs[active_beams, 0]
-            new_logprobs_indices[:, 0] = current_logprobs_indices[active_beams, 0]
-            cum_logprobs = self.store.cum_log_probs[request.py_seq_slot, :]
+            cache_indirection_for_logprobs = cache_indirection.unsqueeze(-1).expand(
+                -1, -1, current_logprobs.shape[2]
+            )
+            torch.gather(
+                input=current_logprobs,
+                dim=0,
+                index=cache_indirection_for_logprobs,
+                out=new_logprobs,
+            )
+            torch.gather(
+                input=current_logprobs_indices,
+                dim=0,
+                index=cache_indirection_for_logprobs,
+                out=new_logprobs_indices,
+            )
+            cum_logprobs = self.store.cum_log_probs[request.py_seq_slot, :num_beams]
             return BeamHistory(
                 tokens=new_path,
                 logprobs=new_logprobs,
@@ -1502,7 +1507,7 @@ class TorchSampler(Sampler):
         grouped_requests_with_metadata: dict[RequestGroupKey, RequestGroupValueWithMetadata] = {}
         for key, value in grouped_requests.items():
             match key.strategy:
-                case ("beam_search", _, _) | ("beam_search_for_prefill", _, _):
+                case ("beam_search", _, _, _):
                     assert seq_lens is not None, "seq_lens is required for beam search"
                     metadata = BeamSearchMetadata(
                         cache_indirection=self.store.cache_indirection,
@@ -1609,7 +1614,7 @@ class TorchSampler(Sampler):
             else:
                 for beam_idx in range(req.sampling_config.beam_width):
                     add_token(req, new_tokens_list, beam_idx=beam_idx)
-                self.handle_logprobs(req, state, count=1)
+                self.handle_logprobs(req, count=1)
             self._handle_finish_reasons(req, state.host.finish_reasons, finish_reasons)
             req.py_decoding_iter += 1
 
@@ -1630,7 +1635,7 @@ class TorchSampler(Sampler):
                     for beam_idx in range(req.sampling_config.beam_width):
                         # Beam search does not support speculative decoding.
                         add_token(req, new_tokens_list, beam_idx=beam_idx)
-                    self.handle_logprobs(req, state, count=1)
+                    self.handle_logprobs(req, count=1)
                 self._handle_finish_reasons(req, state.host.finish_reasons, finish_reasons)
                 req.py_num_accepted_draft_tokens = 0
                 req.py_rewind_len = 0
@@ -1652,7 +1657,7 @@ class TorchSampler(Sampler):
                     req.py_num_accepted_draft_tokens = 0
                     req.py_rewind_len = 0
                 processed += num_accepted
-                self.handle_logprobs(req, state, count=processed)
+                self.handle_logprobs(req, count=processed)
             req.py_decoding_iter += 1
 
     def return_log_probs(self, scheduled_requests: ScheduledRequests) -> bool:
@@ -1673,10 +1678,8 @@ class TorchSampler(Sampler):
         #     case there are 1 + get_draft_token_length(request) tokens per request. In the
         #     latter case, there is always only 1 token per request because draft
         #     tokens are sampled one-by-one.
+        self.setup_sampler_step(scheduled_requests)
         requests = scheduled_requests.all_requests()
-        if self._use_beam_search:
-            # prepare the new beams for the current iteration
-            self._prepare_beam_search(requests)
         new_tokens = self.store.new_tokens
         return_log_probs = self.return_log_probs(scheduled_requests)
         seq_slots_host = torch.tensor(
