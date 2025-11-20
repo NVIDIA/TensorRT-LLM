@@ -141,8 +141,7 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
     kv_cache_config = KvCacheConfig(enable_block_reuse=enable_block_reuse,
                                     max_tokens=8192)
     cuda_graph_config = CudaGraphConfig(
-        batch_sizes=[i for i in range(1, max_batch_size + 1)
-                     ], max_batch_size=0) if use_cuda_graph else None
+        max_batch_size=max_batch_size) if use_cuda_graph else None
 
     llm_common_config = dict(
         model=target_model_dir,
