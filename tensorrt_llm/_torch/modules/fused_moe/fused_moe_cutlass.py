@@ -149,7 +149,7 @@ class CutlassFusedMoE(MoE):
                         model_config.mapping)
                     self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
                         model_config.mapping)
-                elif self.moe_alltoall_backend == "nvlink_one_sided":
+                elif self.moe_alltoall_backend == "NVLINK_ONE_SIDED":
                     workspace_mb = int(
                         os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB", "2048"))
                     self.moe_a2a = MoeAlltoAll(
