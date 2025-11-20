@@ -14,12 +14,12 @@ from _model_test_utils import FakeFP8Linear
 import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
+    FP8TPShardingInfo,
     SplitDimension,
     WeightShardingInfo,
 )
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op
-from tensorrt_llm._torch.auto_deploy.utils.sharding_utils import FP8TPShardingInfo, LayerType
 from tensorrt_llm.functional import AllReduceStrategy
 
 base_model_tp_plan = {
