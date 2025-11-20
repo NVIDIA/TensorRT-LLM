@@ -180,6 +180,9 @@ def trtllm_quant_fp8_moe_fused_aux(
     w1_weight_scale: torch.Tensor,  # [E] stacked weight scales
     w2_weight_scale: torch.Tensor,  # [E] stacked weight scales
     w3_weight_scale: torch.Tensor,  # [E] or unused
+    gemm1_dequant: torch.Tensor,  # [E]
+    gemm2_act_quant: torch.Tensor,  # [E]
+    gemm2_dequant: torch.Tensor,  # [E]
     mlp_style: str = "gated_mlp",
     act_fn: str = "silu",
 ) -> torch.Tensor:
@@ -198,6 +201,9 @@ def trtllm_quant_fp8_moe_fused_aux(
             w1_weight_scale,
             w2_weight_scale,
             w3_weight_scale,
+            gemm1_dequant,
+            gemm2_act_quant,
+            gemm2_dequant,
             mlp_style,
             act_fn,
         )
@@ -220,6 +226,9 @@ def trtllm_quant_fp8_moe_fused_fake(
     w1_weight_scale: torch.Tensor,
     w2_weight_scale: torch.Tensor,
     w3_weight_scale: torch.Tensor,
+    gemm1_dequant: torch.Tensor,
+    gemm2_act_quant: torch.Tensor,
+    gemm2_dequant: torch.Tensor,
     mlp_style: str = "gated_mlp",
     act_fn: str = "silu",
 ) -> torch.Tensor:

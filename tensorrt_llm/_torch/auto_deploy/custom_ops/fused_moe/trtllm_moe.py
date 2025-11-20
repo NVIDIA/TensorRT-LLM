@@ -67,6 +67,8 @@ def trtllm_moe_fused_fake(
     return torch.empty_like(x)
 
 
+# NOTE(suyogg): If compile ever fails because of this, just write a triton kernel
+# for this function and use it as a custom op.
 @torch.compile
 def _quantize_fp8(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """Quantize tensor to FP8 with clamping (matches torch_quant_fp8_linear)."""
@@ -107,6 +109,9 @@ def trtllm_quant_fp8_moe_fused(
     w1_weight_scale: torch.Tensor,  # [E] stacked weight scales
     w2_weight_scale: torch.Tensor,  # [E] stacked weight scales
     w3_weight_scale: torch.Tensor,  # [E] or unused
+    gemm1_dequant: torch.Tensor,  # [E]
+    gemm2_act_quant: torch.Tensor,  # [E]
+    gemm2_dequant: torch.Tensor,  # [E]
     mlp_style: str = "gated_mlp",
     act_fn: str = "silu",
 ) -> torch.Tensor:
@@ -144,10 +149,10 @@ def trtllm_quant_fp8_moe_fused(
     x_q_fp8 = _quantize_fp8(x2d, w1_input_scale[0])
 
     # Scales are stored in float32
-    w1_weight_scale = w1_weight_scale.to(torch.float32)
-    w2_weight_scale = w2_weight_scale.to(torch.float32)
+    # w1_weight_scale = w1_weight_scale.to(torch.float32)
+    # w2_weight_scale = w2_weight_scale.to(torch.float32)
     w1_input_scale = w1_input_scale.to(torch.float32)[0]
-    w2_input_scale = w2_input_scale.to(torch.float32)[0]
+    # w2_input_scale = w2_input_scale.to(torch.float32)[0]
 
     # Prepare quant_scales for TensorRT-LLM FP8 format:
     # [gemm1_dequant_scale, gemm2_act_quant_scale, gemm2_dequant_scale, gemm1_input_dequant_scale]
@@ -158,14 +163,14 @@ def trtllm_quant_fp8_moe_fused(
     # - gemm1_input_dequant_scale: w1_input_scale
 
     # Compute combined scales
-    gemm1_dequant = (w1_weight_scale * w1_input_scale).contiguous().squeeze()
-    gemm2_act_quant = (1.0 / w2_input_scale).contiguous().to(torch.float32)
-    gemm2_dequant = (w2_weight_scale * w2_input_scale).contiguous().squeeze()
-    gemm1_input_dequant = w1_input_scale.contiguous()
+    # gemm1_dequant = (w1_weight_scale * w1_input_scale).contiguous().squeeze()
+    # gemm2_act_quant = (1.0 / w2_input_scale).contiguous().to(torch.float32)
+    # gemm2_dequant = (w2_weight_scale * w2_input_scale).contiguous().squeeze()
+    # gemm1_input_dequant = w1_input_scale.contiguous()
 
     assert gemm1_dequant.ndim == 1, "gemm1_dequant must be 1D"
     assert gemm2_dequant.ndim == 1, "gemm2_dequant must be 1D"
-    quant_scales = [gemm1_dequant, gemm2_act_quant, gemm2_dequant, gemm1_input_dequant]
+    quant_scales = [gemm1_dequant, gemm2_act_quant, gemm2_dequant, w1_input_scale]
 
     # Ensure contiguous tensors
     selected_experts = selected_experts.int().contiguous()
@@ -229,6 +234,9 @@ def trtllm_quant_fp8_moe_fused_fake(
     w1_weight_scale: torch.Tensor,
     w2_weight_scale: torch.Tensor,
     w3_weight_scale: torch.Tensor,
+    gemm1_dequant: torch.Tensor,
+    gemm2_act_quant: torch.Tensor,
+    gemm2_dequant: torch.Tensor,
     mlp_style: str,
     act_fn: str,
 ) -> torch.Tensor:
