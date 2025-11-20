@@ -363,6 +363,7 @@ def buildImage(config, imageKeyToTag)
                     throw ex
                 }
                 echo "Build failed with wheel arguments, retrying without them"
+                buildWheelArgs = ""
                 trtllm_utils.llmExecStepWithRetry(this, script: """
                 cd ${LLM_ROOT} && make -C docker ${target}_${action} \
                 BASE_IMAGE=${BASE_IMAGE} \
@@ -370,7 +371,7 @@ def buildImage(config, imageKeyToTag)
                 TORCH_INSTALL_TYPE=${torchInstallType} \
                 IMAGE_WITH_TAG=${imageWithTag} \
                 STAGE=${dockerfileStage} \
-                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
+                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
                 """, sleepInSecs: randomSleep, numRetries: 2, shortCommondRunTimeMax: 7200)
             }
             if (target == "ngc-release") {
