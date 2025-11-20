@@ -2244,29 +2244,39 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
     {
         // IMPORTANT: Keep the order of the activation functions in the same order as the ActivationType enum in
         // common.h
-        auto fn = [&](auto block_scaling_type)
+        auto fn
+            = [&](auto block_scaling_type) -> void (*)(T*, GemmOutputType const*, float const*, ScaleBiasType const*,
+                                               bool, int64_t const*, int, int64_t, float const*, bool,
+                                               TmaWarpSpecializedGroupedGemmInput::ElementSF*, ActivationParams)
         {
-            auto fn_list = std::array{
-                &doActivationKernel<T, GemmOutputType, ScaleBiasType, IdentityAdaptor<cutlass::epilogue::thread::GELU>,
-                    decltype(block_scaling_type)::value>, // Gelu
-                &doActivationKernel<T, GemmOutputType, ScaleBiasType, IdentityAdaptor<cutlass::epilogue::thread::ReLu>,
-                    decltype(block_scaling_type)::value>, // Relu
-                &doActivationKernel<T, GemmOutputType, ScaleBiasType, IdentityAdaptor<cutlass::epilogue::thread::SiLu>,
-                    decltype(block_scaling_type)::value>, // Silu
-                &doActivationKernel<T, GemmOutputType, ScaleBiasType, GLUAdaptor<cutlass::epilogue::thread::SiLu>,
-                    decltype(block_scaling_type)::value>, // Swiglu
-                &doActivationKernel<T, GemmOutputType, ScaleBiasType, GLUAdaptor<cutlass::epilogue::thread::GELU>,
-                    decltype(block_scaling_type)::value>, // Geglu
-                &doActivationKernel<T, GemmOutputType, ScaleBiasType, SwigluBiasAdaptor,
-                    decltype(block_scaling_type)::value>, // SwigluBias
-                &doActivationKernel<T, GemmOutputType, ScaleBiasType,
-                    IdentityAdaptor<cutlass::epilogue::thread::Identity>,
-                    decltype(block_scaling_type)::value>, // Identity
-                &doActivationKernel<T, GemmOutputType, ScaleBiasType, IdentityAdaptor<cutlass::epilogue::thread::Relu2>,
-                    decltype(block_scaling_type)::value>  // Relu2
-
-            };
-            return fn_list[static_cast<int>(activation_type.activation_type)];
+            switch (activation_type.activation_type)
+            {
+            case ActivationType::Identity:
+                return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                    IdentityAdaptor<cutlass::epilogue::thread::Identity>, decltype(block_scaling_type)::value>;
+            case ActivationType::Gelu:
+                return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                    IdentityAdaptor<cutlass::epilogue::thread::GELU>, decltype(block_scaling_type)::value>;
+            case ActivationType::Relu:
+                return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                    IdentityAdaptor<cutlass::epilogue::thread::ReLu>, decltype(block_scaling_type)::value>;
+            case ActivationType::Silu:
+                return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                    IdentityAdaptor<cutlass::epilogue::thread::SiLu>, decltype(block_scaling_type)::value>;
+            case ActivationType::Swiglu:
+                return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                    GLUAdaptor<cutlass::epilogue::thread::SiLu>, decltype(block_scaling_type)::value>;
+            case ActivationType::Geglu:
+                return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                    GLUAdaptor<cutlass::epilogue::thread::GELU>, decltype(block_scaling_type)::value>;
+            case ActivationType::SwigluBias:
+                return &doActivationKernel<T, GemmOutputType, ScaleBiasType, SwigluBiasAdaptor,
+                    decltype(block_scaling_type)::value>;
+            case ActivationType::Relu2:
+                return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                    IdentityAdaptor<cutlass::epilogue::thread::Relu2>, decltype(block_scaling_type)::value>;
+            default: TLLM_CHECK_WITH_INFO(false, "Invalid activation type"); return nullptr;
+            }
         };
         auto NVFP4 = tensorrt_llm::common::ConstExprWrapper<TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType,
             TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4>{};
