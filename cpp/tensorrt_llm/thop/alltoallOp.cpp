@@ -64,16 +64,16 @@ public:
         // note: ensures that input_list size > 0
         TLLM_CHECK_WITH_INFO(static_cast<int>(input_list.size()) == num_ranks * num_lists_,
             "input_list size should be equal to group size * num_lists");
+        std::vector<torch::Tensor> output_list(static_cast<size_t>(num_lists_));
         auto stream = at::cuda::getCurrentCUDAStream(input_list[0].get_device());
         ncclGroupStart();
-        std::vector<torch::Tensor> output_list;
         for (int il = 0; il < num_lists_; ++il)
         {
             auto off = il * num_ranks;
-            auto output_options = input_list[off].options();
             auto output_shape = input_list[off].sizes().vec();
             output_shape.insert(output_shape.begin(), num_ranks);
-            auto output = torch::empty(output_shape, output_options);
+            auto output = torch::empty(output_shape, input_list[off].options());
+            output_list[il] = output;
             auto type = tensorrt_llm::runtime::TorchUtils::dataType(input_list[off].scalar_type());
             auto nccl_type = (*getDtypeMap())[type];
             for (int r = 0; r < num_ranks; ++r)
@@ -82,7 +82,6 @@ public:
                 ncclSend(input.data_ptr(), input.numel(), nccl_type, r, *mNcclComm, stream);
                 ncclRecv(output[r].mutable_data_ptr(), output[r].numel(), nccl_type, r, *mNcclComm, stream);
             }
-            output_list.push_back(output);
         }
         NCCLCHECK_THROW(ncclGroupEnd());
         return output_list;
