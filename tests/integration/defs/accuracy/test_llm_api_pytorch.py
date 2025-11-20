@@ -2049,6 +2049,18 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                          32,
                          "TRTLLM",
                          marks=pytest.mark.skip_less_mpi_world_size(8)),
+            pytest.param(4,
+                         1,
+                         4,
+                         3,
+                         False,
+                         True,
+                         True,
+                         True,
+                         True,
+                         16,
+                         "CUTLASS",
+                         marks=pytest.mark.skip_less_mpi_world_size(4)),
             pytest.param(8,
                          1,
                          8,
@@ -2124,9 +2136,9 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
         ],
         ids=[
             "latency", "latency_trtllmgen", "latency_adp_lmtp",
-            "latency_trtllmgen_adp_lmtp", "throughput", "throughput_tp8",
-            "throughput_tp4", "throughput_mtp", "throughput_bs8_mtp",
-            "throughput_pp4_mtp"
+            "latency_trtllmgen_adp_lmtp", "latency_adp_lmtp_tp4", "throughput",
+            "throughput_tp8", "throughput_tp4", "throughput_mtp",
+            "throughput_bs8_mtp", "throughput_pp4_mtp"
         ])
     def test_nvfp4_multi_gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                               attention_dp, enable_lm_head_tp_in_adp,
