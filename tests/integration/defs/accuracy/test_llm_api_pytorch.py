@@ -4136,6 +4136,80 @@ class TestQwen3NextThinking(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+@skip_pre_hopper
+@pytest.mark.skip_less_device_memory(80000)
+class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
+    MODEL_PATH = f"{llm_models_root()}/Qwen3-Next"
+    MODEL_NAME = "Qwen3/Qwen3-Next-80B-A3B-Instruct"
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,cuda_graph,overlap_scheduler",
+        [
+            (4, 1, 4, True, True),
+        ],
+        ids=[
+            "tp4ep4_cudagraph_overlap",
+        ],
+    )
+    def test_bf16_4gpu(self, tp_size, pp_size, ep_size, cuda_graph,
+                       overlap_scheduler):
+        model_path = f"{self.MODEL_PATH}/Qwen3-Next-80B-A3B-Instruct"
+        model_path = "Qwen/Qwen3-Next-80B-A3B-Instruct"
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
+                                        enable_block_reuse=False)
+        pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
+                              cuda_graph_config=CudaGraphConfig(
+                                  max_batch_size=512) if cuda_graph else None)
+
+        with LLM(
+                model_path,
+                tensor_parallel_size=tp_size,
+                max_num_tokens=16384,
+                pipeline_parallel_size=pp_size,
+                moe_expert_parallel_size=ep_size,
+                kv_cache_config=kv_cache_config,
+                **pytorch_config,
+        ) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_blackwell
+    @pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRTLLM"],
+                             ids=["cutlass", "trtllm"])
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,cuda_graph,overlap_scheduler",
+        [(1, 1, 1, True, True), (4, 1, 1, True, True), (4, 1, 4, True, True),
+         (4, 1, 4, False, False)],
+        ids=["tp1", "tp4ep1", "tp4ep4", "no_cuda_graph_overlap"])
+    def test_nvfp4(self, moe_backend, tp_size, pp_size, ep_size, cuda_graph,
+                   overlap_scheduler):
+        model_path = f"{self.MODEL_PATH}/qwen3-next-80b-instruct-nvfp4-ptq-fp8kv"
+        model_path = "/home/scratch.didow_sw_1/models/qwen3-next-80b-instruct-nvfp4-ptq-fp8kv"
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
+                                        enable_block_reuse=False)
+        pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
+                              cuda_graph_config=CudaGraphConfig(
+                                  max_batch_size=512) if cuda_graph else None)
+        moe_config = MoeConfig(backend=moe_backend)
+
+        with LLM(model_path,
+                 tensor_parallel_size=tp_size,
+                 max_num_tokens=16384,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config,
+                 moe_config=moe_config) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
 class TestSeedOss_36B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "ByteDance-Seed/Seed-OSS-36B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/Seed-OSS/Seed-OSS-36B-Instruct"
