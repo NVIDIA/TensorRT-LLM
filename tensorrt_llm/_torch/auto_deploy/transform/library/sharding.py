@@ -19,7 +19,7 @@ Our sharding algorithm for tensor parallelism (TP) is based on the following ste
 import operator
 import re
 from collections import defaultdict
-from typing import Any, DefaultDict, Dict, List, Optional, Set, Tuple, Type
+from typing import Any, DefaultDict, Dict, List, Set, Tuple, Type
 
 import torch
 from pydantic import Field, field_validator
@@ -67,8 +67,8 @@ class ShardingTransformConfig(TransformConfig):
     factory_source: ShardingConfigSource = Field(default=ShardingConfigSource.UNKNOWN)
     rank: int = Field(default=0)
     world_size: int = Field(default=1)
-    factory_config: Optional[Dict[str, Any]] = None
-    manual_config: Optional[Dict[str, Any]] = None
+    factory_config: Dict[str, Any] = Field(default_factory=dict)
+    manual_config: Dict[str, Any] = Field(default_factory=dict)
     simple_shard_only: bool = Field(default=False)
     support_partial_config: bool = False
     sharding_source: List[ShardingSource] = Field(
