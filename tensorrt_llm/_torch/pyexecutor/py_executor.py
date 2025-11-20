@@ -2217,7 +2217,8 @@ class PyExecutor:
         self.executor_request_queue.update_waiting_queue()
 
         # Create set from list of canceled request ids to speed up canceled test
-        canceled_req_ids = set(self.executor_request_queue.get_canceled_req_ids())
+        canceled_req_ids = set(
+            self.executor_request_queue.get_canceled_req_ids())
 
         still_pending_canceled_ids = []
         for request in self.active_requests:
@@ -2242,7 +2243,8 @@ class PyExecutor:
         else:
             # Only keep active requests that did not cancel in canceled req ids list
             self.executor_request_queue.canceled_req_ids.clear()
-            self.executor_request_queue.canceled_req_ids.extend(still_pending_canceled_ids)
+            self.executor_request_queue.canceled_req_ids.extend(
+                still_pending_canceled_ids)
 
     @nvtx_range("_enqueue_responses")
     def _enqueue_responses(self, responses: Iterable[Tuple[int, LlmResponse]]):
