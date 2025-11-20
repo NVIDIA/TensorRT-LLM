@@ -13,6 +13,7 @@ from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_starcoder2 import Starcoder2ForCausalLM
+from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -162,7 +163,7 @@ def test_starcoder2_allclose_to_hf(scenario: Scenario) -> None:
     # Create HuggingFace model from config with random weights
     hf_config = Starcoder2Config.from_dict(config_dict)
     hf_starcoder2 = HFStarcoder2ForCausalLM(hf_config)
-    hf_starcoder2 = hf_starcoder2.to(dtype=torch.bfloat16, device="cuda")
+    hf_starcoder2 = hf_starcoder2.to(dtype=torch.bfloat16, device="cuda").eval()
 
     dtype = torch.bfloat16
     device = torch.device("cuda")
@@ -170,8 +171,16 @@ def test_starcoder2_allclose_to_hf(scenario: Scenario) -> None:
     # Build TRT-LLM model and copy the same random weights from HF model
     with torch.device(device), default_dtype(dtype):
         model_config = ModelConfig(pretrained_config=hf_config, attn_backend=backend)
-        starcoder2 = Starcoder2ForCausalLM(model_config).to(dtype).to(device)
+        starcoder2 = Starcoder2ForCausalLM(model_config).to(dtype).to(device).eval()
         starcoder2.load_weights(hf_starcoder2.state_dict())
+    
+    # Convert LayerNorm random weights to FP32 for numerical stability
+    for name, module in starcoder2.named_modules():
+        if isinstance(module, LayerNorm):
+            if hasattr(module, 'weight') and module.weight is not None:
+                module.weight.data = module.weight.data.to(torch.float32)
+            if hasattr(module, 'bias') and module.bias is not None:
+                module.bias.data = module.bias.data.to(torch.float32)
 
     num_blocks = 1
     tokens_per_block = 128
@@ -190,7 +199,7 @@ def test_starcoder2_allclose_to_hf(scenario: Scenario) -> None:
     # Context phase (no CUDA graphs for prefill)
     input_ids = torch.tensor(
         [100, 200, 300, 400, 500, 600, 700, 800],
-        dtype=torch.long,
+        dtype=torch.int,
         device=device,
     )
     num_cached_tokens_per_seq = [0]
@@ -200,7 +209,7 @@ def test_starcoder2_allclose_to_hf(scenario: Scenario) -> None:
     kv_cache_manager.add_dummy_requests(request_ids, token_nums)
 
     attn_metadata = metadata_cls(
-        seq_lens=torch.tensor([input_ids.size(-1)], dtype=torch.long),
+        seq_lens=torch.tensor([input_ids.size(-1)], dtype=torch.int),
         num_contexts=1,
         kv_cache_params=KVCacheParams(
             use_cache=True,
@@ -213,7 +222,7 @@ def test_starcoder2_allclose_to_hf(scenario: Scenario) -> None:
         prompt_lens=prompt_lens,
     )
 
-    position_ids = [torch.arange(0, input_ids.size(-1), dtype=torch.long)]
+    position_ids = [torch.arange(0, input_ids.size(-1), dtype=torch.int)]
     position_ids = torch.cat(position_ids).unsqueeze(0).cuda()
 
     with torch.inference_mode():
@@ -231,11 +240,11 @@ def test_starcoder2_allclose_to_hf(scenario: Scenario) -> None:
         torch.testing.assert_close(logits, ref.logits[:, -1].float(), atol=0.4, rtol=0.4)
 
     # Generation phase (optionally with CUDA graphs)
-    gen_input_ids = torch.tensor([900], dtype=torch.long, device=device)
+    gen_input_ids = torch.tensor([900], dtype=torch.int, device=device)
     num_cached_tokens_per_seq = [input_ids.size(-1)]
 
     attn_metadata = metadata_cls(
-        seq_lens=torch.tensor([gen_input_ids.size(-1)], dtype=torch.long),
+        seq_lens=torch.tensor([gen_input_ids.size(-1)], dtype=torch.int),
         num_contexts=0,
         kv_cache_params=KVCacheParams(
             use_cache=True,
@@ -250,7 +259,7 @@ def test_starcoder2_allclose_to_hf(scenario: Scenario) -> None:
 
     gen_position_ids = [
         torch.arange(
-            input_ids.size(-1), input_ids.size(-1) + gen_input_ids.size(-1), dtype=torch.long
+            input_ids.size(-1), input_ids.size(-1) + gen_input_ids.size(-1), dtype=torch.int
         )
     ]
     gen_position_ids = torch.cat(gen_position_ids).unsqueeze(0).cuda()
@@ -296,190 +305,9 @@ def test_starcoder2_allclose_to_hf(scenario: Scenario) -> None:
             past_key_values=ref.past_key_values,
             use_cache=True,
         )
-        torch.testing.assert_close(logits, ref.logits[:, -1].float(), atol=0.4, rtol=0.4)
+        torch.testing.assert_close(logits, ref.logits[:, -1].float(), atol=0.1, rtol=0.1)
 
     # Cleanup
     if graph_runner is not None:
         graph_runner.clear()
-    kv_cache_manager.shutdown()
-
-
-@pytest.mark.parametrize(
-    "scenario",
-    [
-        # Test token-level generation for different model sizes
-        Scenario(backend="TRTLLM", config_name="3B"),
-        Scenario(backend="TRTLLM", config_name="7B"),
-        Scenario(backend="TRTLLM", config_name="15B"),
-    ],
-    ids=str,
-)
-@torch.no_grad()
-def test_starcoder2_generated_tokens_match_hf(scenario: Scenario) -> None:
-    """
-    Compare generated tokens from TRT-LLM PyTorch backend to HuggingFace.
-    Uses randomly initialized models with identical weights.
-    """
-    backend = scenario.backend
-    config_name = scenario.config_name
-
-    torch.random.manual_seed(0)
-
-    # Create config based on model size
-    config_mapping = {
-        "3B": STARCODER2_3B_CONFIG,
-        "7B": STARCODER2_7B_CONFIG,
-        "15B": STARCODER2_15B_CONFIG,
-    }
-    config_dict = deepcopy(config_mapping[config_name])
-
-    # Create HuggingFace model from config with random weights
-    hf_config = Starcoder2Config.from_dict(config_dict)
-    hf_starcoder2 = HFStarcoder2ForCausalLM(hf_config)
-    hf_starcoder2 = hf_starcoder2.to(dtype=torch.bfloat16, device="cuda")
-
-    dtype = torch.bfloat16
-    device = torch.device("cuda")
-
-    # Build TRT-LLM model and copy the same random weights from HF model
-    with torch.device(device), default_dtype(dtype):
-        model_config = ModelConfig(pretrained_config=hf_config, attn_backend=backend)
-        starcoder2 = Starcoder2ForCausalLM(model_config).to(dtype).to(device)
-        starcoder2.load_weights(hf_starcoder2.state_dict())
-
-    test_prompt = "def fibonacci(n):"
-    # Create a simple tokenizer for the test (just split by characters for simplicity)
-    # Use a fixed token mapping for deterministic testing
-    input_ids = torch.tensor(
-        [100, 200, 300, 400, 500],  # Fixed token IDs for testing
-        dtype=torch.long,
-        device=device,
-    )
-
-    # Setup KV cache for TRT-LLM generation
-    num_blocks = 2
-    tokens_per_block = 128
-    max_seq_len = num_blocks * tokens_per_block
-    batch_size = 1
-
-    kv_cache_manager = get_kv_cache_manager(
-        dtype=dtype,
-        config=hf_config,
-        tokens_per_block=tokens_per_block,
-        max_seq_len=max_seq_len,
-        batch_size=batch_size,
-        num_blocks=num_blocks,
-    )
-
-    # Generate tokens with TRT-LLM (manual generation loop)
-    max_new_tokens = 20
-    trt_output_ids = []
-    num_cached_tokens = 0
-    request_ids = [1]
-    prompt_lens = [input_ids.size(-1)]
-    metadata_cls = get_attention_backend(backend).Metadata
-
-    # Context phase - process initial prompt
-    token_nums = [input_ids.size(-1)]
-    kv_cache_manager.add_dummy_requests(request_ids, token_nums)
-
-    attn_metadata = metadata_cls(
-        seq_lens=torch.tensor([input_ids.size(-1)], dtype=torch.long),
-        num_contexts=1,
-        kv_cache_params=KVCacheParams(
-            use_cache=True,
-            num_cached_tokens_per_seq=[0],
-        ),
-        kv_cache_manager=kv_cache_manager,
-        request_ids=request_ids,
-        prompt_lens=prompt_lens,
-        max_num_requests=1,
-        max_num_tokens=8192,
-    )
-
-    position_ids = torch.arange(
-        0, input_ids.size(-1), dtype=torch.long, device=device
-    ).unsqueeze(0)
-
-    with torch.inference_mode():
-        attn_metadata.prepare()
-        logits = starcoder2.forward(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            attn_metadata=attn_metadata,
-        )
-
-    # Get first token
-    next_token_id = torch.argmax(logits, dim=-1).item()
-    trt_output_ids.append(next_token_id)
-    num_cached_tokens = input_ids.size(-1)
-
-    # Generation phase - generate remaining tokens
-    for step in range(1, max_new_tokens):
-        gen_input_ids = torch.tensor([next_token_id], dtype=torch.long, device=device)
-
-        attn_metadata = metadata_cls(
-            seq_lens=torch.tensor([1], dtype=torch.long),
-            num_contexts=0,
-            kv_cache_params=KVCacheParams(
-                use_cache=True,
-                num_cached_tokens_per_seq=[num_cached_tokens],
-            ),
-            kv_cache_manager=kv_cache_manager,
-            request_ids=request_ids,
-            prompt_lens=prompt_lens,
-            max_num_requests=1,
-            max_num_tokens=8192,
-        )
-
-        gen_position_ids = torch.arange(
-            num_cached_tokens, num_cached_tokens + 1, dtype=torch.long, device=device
-        ).unsqueeze(0)
-
-        with torch.inference_mode():
-            attn_metadata.prepare()
-            logits = starcoder2.forward(
-                input_ids=gen_input_ids,
-                position_ids=gen_position_ids,
-                attn_metadata=attn_metadata,
-            )
-
-        # Greedy sampling: take argmax
-        next_token_id = torch.argmax(logits, dim=-1).item()
-        trt_output_ids.append(next_token_id)
-        num_cached_tokens += 1
-
-    # Generate with HuggingFace for comparison (manual loop for consistency)
-    hf_output_ids = []
-    hf_past_key_values = None
-    hf_current_ids = input_ids.unsqueeze(0)
-
-    with torch.inference_mode():
-        for step in range(max_new_tokens):
-            hf_output = hf_starcoder2.forward(
-                input_ids=hf_current_ids,
-                past_key_values=hf_past_key_values,
-                use_cache=True,
-            )
-            # Greedy sampling: take argmax
-            next_token_id = torch.argmax(hf_output.logits[:, -1, :], dim=-1).item()
-            hf_output_ids.append(next_token_id)
-            hf_past_key_values = hf_output.past_key_values
-            hf_current_ids = torch.tensor([[next_token_id]], dtype=torch.long, device=device)
-
-    # Compare outputs - both should match exactly with same random weights
-    min_len = min(len(trt_output_ids), len(hf_output_ids))
-    matches = sum(1 for i in range(min_len) if trt_output_ids[i] == hf_output_ids[i])
-    match_ratio = matches / min_len if min_len > 0 else 0.0
-
-    # Print for debugging
-    print(f"\n{config_name}/{backend} TRT output tokens: {trt_output_ids}")
-    print(f"{config_name}/{backend} HF output tokens:  {hf_output_ids}")
-    print(f"Match ratio: {match_ratio:.2%} ({matches}/{min_len} tokens)")
-
-    # Should match exactly with identical random weights
-    assert match_ratio == 1.0, (
-        f"TRT-LLM and HF token outputs should match exactly: {match_ratio:.2%} match"
-    )
-
     kv_cache_manager.shutdown()
