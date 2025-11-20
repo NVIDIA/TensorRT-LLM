@@ -366,11 +366,15 @@ def test_connector_disagg_prefill(enforce_single_worker, model_with_connector,
                                   save_async):
     model_fn, scheduler, worker = model_with_connector
 
-    model = model_fn(
+    prefill_worker = model_fn(
         disable_overlap_scheduler=True,
         cache_transceiver_config=CacheTransceiverConfig(backend="DEFAULT"))
 
-    sampling_params = SamplingParams(ignore_eos=True)
+    decode_worker = model_fn(
+        cache_transceiver_config=CacheTransceiverConfig(backend="DEFAULT"),
+        kv_connector_config=None)
+
+    sampling_params = SamplingParams(ignore_eos=True, max_tokens=16)
 
     disaggregated_params = DisaggregatedParams(request_type="context_only")
 
@@ -385,10 +389,17 @@ def test_connector_disagg_prefill(enforce_single_worker, model_with_connector,
         scheduler.request_finished.return_value = False
         worker.get_finished.return_value = [], []
 
-    model.generate([0] * 48,
-                   sampling_params=sampling_params,
-                   disaggregated_params=disaggregated_params)
-    sleep(1)
+    result = prefill_worker.generate([0] * 48,
+                                     sampling_params=sampling_params,
+                                     disaggregated_params=disaggregated_params)
+
+    gen_disagg_params = result.disaggregated_params
+    gen_disagg_params.request_type = "generation_only"
+
+    result = decode_worker.generate([0] * 48,
+                                    sampling_params=sampling_params,
+                                    disaggregated_params=gen_disagg_params)
+
     assert scheduler.build_connector_meta.call_count == 1
 
     scheduler_output = scheduler.build_connector_meta.call_args.args[0]
