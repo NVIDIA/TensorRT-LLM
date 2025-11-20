@@ -10,6 +10,7 @@ from ...distributed import allgather
 from ...model_config import ModelConfig
 from ...utils import AuxStreamType, Fp4QuantizedTensor, ceil_div
 from .fused_moe_cutlass import CutlassFusedMoE
+from .interface import AlltoallMethodType
 from .quantization import MoEWeightLoadingMode, NVFP4CuteDslFusedMoEMethod
 from .routing import BaseMoeRoutingMethod
 
@@ -194,6 +195,9 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
         )
+
+    def select_alltoall_method_type(self) -> AlltoallMethodType:
+        return AlltoallMethodType.NotEnabled
 
     def _get_quant_method(self):
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
