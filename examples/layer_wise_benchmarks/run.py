@@ -152,16 +152,16 @@ for autotune_flag, batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in [
         kv_cache_manager=kv_cache_manager,
         attn_workspace=attn_workspace,
     )
-    runner.replace_routing_method(
+    with runner.replace_routing_method_ctx(
         balance_method=BalanceMethod[args.balance_method], balance_ratio=balance_ratio
-    )
-    capture_stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(capture_stream):
-        if autotune_flag:
-            with autotune():
-                run_pack()
-        run_pack()
-    torch.cuda.current_stream().wait_stream(capture_stream)
+    ):
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(capture_stream):
+            if autotune_flag:
+                with autotune():
+                    run_pack()
+            run_pack()
+        torch.cuda.current_stream().wait_stream(capture_stream)
 torch.cuda.synchronize()
 
 events = [
@@ -182,27 +182,25 @@ for batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in itertools.product(
         kv_cache_manager=kv_cache_manager,
         attn_workspace=attn_workspace,
     )
-    runner.replace_routing_method(
+    with runner.replace_routing_method_ctx(
         balance_method=BalanceMethod[args.balance_method], balance_ratio=balance_ratio
-    )
-    if args.use_cuda_graph:
-        with with_multi_stream(True):
-            g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g, stream=capture_stream, capture_error_mode="global"):
-                run_pack()
+    ):
+        if args.use_cuda_graph:
+            with with_multi_stream(True):
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g, stream=capture_stream, capture_error_mode="global"):
+                    run_pack()
 
-    balance_ratio_str = "" if balance_ratio is None else f"  balance={balance_ratio:.2f}"
-    nvtx_message = (
-        f"b={batch_size} s={seq_len_q} past={seq_len_kv_cache}{balance_ratio_str} EP{world_size}"
-    )
-    for i in range(args.warmup_times + args.run_times):
-        events[i].record()
-        with nvtx.annotate(nvtx_message):
-            if args.use_cuda_graph:
-                g.replay()
-            else:
-                run_pack()
-    events[-1].record()
+        balance_ratio_str = "" if balance_ratio is None else f"  balance={balance_ratio:.2g}"
+        nvtx_message = f"b={batch_size} s={seq_len_q} past={seq_len_kv_cache}{balance_ratio_str} EP{world_size}"
+        for i in range(args.warmup_times + args.run_times):
+            events[i].record()
+            with nvtx.annotate(nvtx_message):
+                if args.use_cuda_graph:
+                    g.replay()
+                else:
+                    run_pack()
+        events[-1].record()
     torch.cuda.synchronize()
 
     # Print statistics
@@ -214,11 +212,11 @@ for batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in itertools.product(
         f"  batch_size {batch_size}"
         f"  seq_len_q {seq_len_q}"
         f"  seq_len_kv_cache {seq_len_kv_cache}"
-        + ("" if balance_ratio is None else f"  balance_ratio {balance_ratio:.2f}")
-        + f"  min {np.min(time_list) * 1000:.1f}"
-        f"  max {np.max(time_list) * 1000:.1f}"
-        f"  mean {np.mean(time_list) * 1000:.1f}"
+        + ("" if balance_ratio is None else f"  balance_ratio {balance_ratio:.2g}")
+        + f"  mean {np.mean(time_list) * 1000:.1f}"
         f"  median {np.median(time_list) * 1000:.1f}"
+        f"  min {np.min(time_list) * 1000:.1f}"
+        f"  max {np.max(time_list) * 1000:.1f}"
         f"  P90 {np.percentile(time_list, 90) * 1000:.1f}"
         f"  (us)"
     )

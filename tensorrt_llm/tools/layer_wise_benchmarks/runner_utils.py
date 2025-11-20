@@ -1,4 +1,5 @@
 import contextlib
+import functools
 import os
 import weakref
 from abc import ABC, abstractmethod
@@ -31,6 +32,166 @@ def ceil_div(a, b):
 
 def round_up(a, b):
     return ceil_div(a, b) * b
+
+
+def get_balanced_selection_no_cache(
+    num_tokens, top_k, num_experts, dtype, device, world_size, rank
+):
+    # First, each sender selects target rank
+    target_rank_before_mod = torch.arange(num_tokens * world_size * top_k).view(
+        num_tokens, world_size, top_k
+    )
+    target_rank_before_mod += top_k * torch.arange(num_tokens).view(
+        num_tokens, 1, 1
+    )  # Shift `top_k` ranks for the next token on each rank, to balance network traffic
+    target_rank = target_rank_before_mod % world_size
+    # Second, each receiver selects target expert
+    target_expert = torch.empty_like(target_rank)
+    for reciever_rank in range(world_size):
+        mask = target_rank == reciever_rank
+        experts_per_rank = num_experts // world_size
+        local_expert = torch.arange(num_tokens * top_k) % experts_per_rank
+        target_expert[mask] = (reciever_rank * experts_per_rank) + local_expert
+    token_selected_experts = target_expert[:, rank].sort(dim=-1).values
+    return token_selected_experts.contiguous().to(dtype=dtype, device=device)
+
+
+get_balanced_selection = functools.cache(get_balanced_selection_no_cache)
+
+
+def test_get_balanced_selection():
+    dtype = torch.long
+    for num_tokens in range(1, 33):
+        for num_experts in range(1, 65):
+            print(f"{num_tokens=} {num_experts=}")
+            for top_k in range(1, min(11, num_experts)):
+                for world_size in range(1, 65):
+                    if num_experts % world_size == 0:
+                        tokens_per_expert = torch.zeros(num_experts)
+                        for rank in range(world_size):
+                            token_selected_experts = get_balanced_selection_no_cache(
+                                num_tokens, top_k, num_experts, dtype, "cpu", world_size, rank
+                            )
+                            sorted_selection = token_selected_experts.sort(dim=-1).values
+                            if (sorted_selection[:, :-1] == sorted_selection[:, 1:]).any():
+                                raise ValueError(f"duplicated experts on rank {rank}")
+                            experts_per_rank = num_experts // world_size
+                            tokens_per_rank = (
+                                (token_selected_experts // experts_per_rank)
+                                .view(-1)
+                                .bincount(minlength=world_size)
+                            )
+                            if tokens_per_rank.max() - tokens_per_rank.min() > 1:
+                                raise ValueError(f"tokens sent from rank {rank} is not balanced")
+                            tokens_per_expert += token_selected_experts.view(-1).bincount(
+                                minlength=num_experts
+                            )
+                        if tokens_per_expert.max() - tokens_per_expert.min() > 1:
+                            raise ValueError("tokens per expert is not balanced")
+
+
+def apply_balance_ratio(imbalanced_experts, num_experts, balance_ratio, world_size, rank):
+    num_tokens, top_k = imbalanced_experts.shape
+    dtype = imbalanced_experts.dtype
+    device = imbalanced_experts.device
+    balanced_experts = get_balanced_selection_no_cache(
+        num_tokens, top_k, num_experts, dtype, device, world_size, rank
+    )
+    if balance_ratio == 0.0:
+        num_balanced_tokens = 0
+    else:
+        # Activate all experts
+        min_num_balanced_tokens = min(num_tokens, ceil_div(num_experts, world_size * top_k))
+        num_balanced_tokens = min_num_balanced_tokens + round(
+            (num_tokens - min_num_balanced_tokens) * balance_ratio
+        )
+    mixed_experts = torch.cat(
+        [balanced_experts[:num_balanced_tokens], imbalanced_experts[num_balanced_tokens:]]
+    )
+    return mixed_experts
+
+
+@functools.cache
+def get_all_to_one_selection(
+    num_tokens, top_k, num_experts, balance_ratio, dtype, device, world_size, rank
+):
+    experts_per_rank = num_experts // world_size
+    if top_k > experts_per_rank:
+        raise ValueError(
+            "Cannot send all tokens to a single rank because `top_k > experts_per_rank`"
+        )
+    imbalanced_experts = (
+        torch.arange(
+            rank * num_tokens * top_k, (rank + 1) * num_tokens * top_k, dtype=dtype, device=device
+        ).view(num_tokens, top_k)
+        % experts_per_rank
+    )
+    imbalanced_experts = imbalanced_experts.sort(dim=-1).values
+    return apply_balance_ratio(imbalanced_experts, num_experts, balance_ratio, world_size, rank)
+
+
+@functools.cache
+def get_balanced_rank_imbalanced_expert_selection(
+    num_tokens, top_k, num_experts, balance_ratio, dtype, device, world_size, rank
+):
+    experts_per_rank = num_experts // world_size
+    active_experts_per_rank = ceil_div(top_k, world_size)
+    # Select expert from [0, active_experts_per_rank * world_size),
+    # then scale to [0, experts_per_rank * world_size)
+    narrow_experts = get_balanced_selection_no_cache(
+        num_tokens, top_k, active_experts_per_rank * world_size, dtype, device, world_size, rank
+    )
+    imbalanced_experts = (
+        narrow_experts // active_experts_per_rank * experts_per_rank
+        + narrow_experts % active_experts_per_rank
+    )
+    return apply_balance_ratio(imbalanced_experts, num_experts, balance_ratio, world_size, rank)
+
+
+def make_balanced_routing_method(
+    apply_method_orig, num_experts, balance_method, balance_ratio, world_size, rank
+):
+    def balanced_routing_method(router_logits):
+        token_selected_experts, token_final_scales = apply_method_orig(router_logits)
+        if balance_method == BalanceMethod.NotModified:
+            pass
+        elif balance_method == BalanceMethod.Balanced:
+            token_selected_experts = get_balanced_selection(
+                token_selected_experts.shape[0],
+                token_selected_experts.shape[1],
+                num_experts,
+                token_selected_experts.dtype,
+                token_selected_experts.device,
+                world_size,
+                rank,
+            )
+        elif balance_method == BalanceMethod.ImbalancedRanks:
+            token_selected_experts = get_all_to_one_selection(
+                token_selected_experts.shape[0],
+                token_selected_experts.shape[1],
+                num_experts,
+                balance_ratio,
+                token_selected_experts.dtype,
+                token_selected_experts.device,
+                world_size,
+                rank,
+            )
+        elif balance_method == BalanceMethod.ImbalancedExperts:
+            token_selected_experts = get_balanced_rank_imbalanced_expert_selection(
+                token_selected_experts.shape[0],
+                token_selected_experts.shape[1],
+                num_experts,
+                balance_ratio,
+                token_selected_experts.dtype,
+                token_selected_experts.device,
+                world_size,
+                rank,
+            )
+        else:
+            raise NotImplementedError(f"Not support balance_method {balance_method}")
+        return token_selected_experts, token_final_scales
+
+    return balanced_routing_method
 
 
 class RunnerMixin(ABC):
@@ -186,9 +347,44 @@ class RunnerMixin(ABC):
 
         return run_pack
 
-    def replace_routing_method(self, balance_method: BalanceMethod, balance_ratio: float):
-        if balance_method != BalanceMethod.NotModified:
-            raise NotImplementedError("not support replacing routing method for this runner")
+    @contextlib.contextmanager
+    def replace_routing_method_ctx(self, balance_method: BalanceMethod, balance_ratio: float):
+        if balance_method == BalanceMethod.NotModified:
+            pass
+        elif self.model_config.moe_backend not in [
+            "CUTEDSL",
+            "CUTLASS",
+            "DEEPGEMM",
+            "TRTLLM",
+            "WIDEEP",
+        ]:
+            raise NotImplementedError(
+                f'Not support replace routing method for moe_backend "{self.model_config.moe_backend}",'
+                f' please set balance_method to "NotModified"'
+            )
+        elif (
+            self.model_config.moe_backend == "TRTLLM"
+            and not self.model_config.mapping.enable_attention_dp
+        ):
+            raise NotImplementedError(
+                'Not support replace routing method for moe_backend "TRTLLM" with attention TP,'
+                ' please set balance_method to "NotModified"'
+            )
+        apply_methods_orig = [layer.mlp.experts.routing_method.apply for layer in self.layers]
+        try:
+            for layer, apply_method_orig in zip(self.layers, apply_methods_orig):
+                layer.mlp.experts.routing_method.apply = make_balanced_routing_method(
+                    apply_method_orig,
+                    layer.mlp.experts.num_experts,
+                    balance_method,
+                    balance_ratio,
+                    layer.mlp.experts.ep_size,
+                    layer.mlp.experts.ep_rank,
+                )
+            yield
+        finally:
+            for layer, apply_method_orig in zip(self.layers, apply_methods_orig):
+                layer.mlp.experts.routing_method.apply = apply_method_orig
 
     @staticmethod
     def create_kv_cache_manager(

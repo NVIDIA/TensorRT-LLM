@@ -41,6 +41,7 @@ def test_deepseek_r1_ctx_tep(llm_root, world_size):
             model_root / "DeepSeek-R1" / "DeepSeek-R1-0528-FP4-v2",
             "--no-enable-attention-dp",
             "--moe-backend=TRTLLM",
+            "--balance-method=NotModified",
         ],
         cwd=llm_root / "examples" / "layer_wise_benchmarks",
         env={
