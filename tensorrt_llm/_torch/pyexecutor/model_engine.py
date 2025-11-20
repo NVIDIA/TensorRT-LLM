@@ -562,13 +562,12 @@ class PyTorchModelEngine(ModelEngine):
         # Reset the global cuda graph dummy request to None in warmup.
         self.cuda_graph_runner.padding_dummy_request = None
 
+        # TODO: current warmup_request is not suitable for context parallelism.
         cp_type = self.mapping.cp_config.get('cp_type', None)
         if cp_type is not None:
-            if cp_type in [CpType.ULYSSES, CpType.STAR]:
-                assert False, "cp_type must be HELIX for helix benchmarking."
-                print("[ModelEngine::warmup] EARLY RETURN since cp_type ",
-                      cp_type)
-                return
+            logger.info("[ModelEngine::warmup] Skipping warmup for cp_type: ",
+                        cp_type.name)
+            return
 
         self._run_torch_compile_warmup(resource_manager)
         self._run_autotuner_warmup(resource_manager)
@@ -1063,12 +1062,10 @@ class PyTorchModelEngine(ModelEngine):
             # NOTE: py_executor_creator makes sure that the executor uses this
             # smaller value as its max_seq_len too.
             logger.warning(
-                f"\n*******************************************************\n"
-                f"Specified {self.max_seq_len=} is larger than what the model can support\n"
-                f"({inferred_max_seq_len}). NOT Setting max_seq_len to {inferred_max_seq_len}. "
-                f"ARE YOU SURE ABOUT THIS?\n"
-                f"*******************************************************\n")
-            # self.max_seq_len = inferred_max_seq_len
+                f"Specified {self.max_seq_len=} is larger than what the model can support "
+                f"({inferred_max_seq_len}). Setting max_seq_len to {inferred_max_seq_len}. "
+            )
+            self.max_seq_len = inferred_max_seq_len
 
     def _infer_max_seq_len_from_config(self) -> int:
 
@@ -2137,8 +2134,7 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.padded_num_tokens = padded_num_tokens if padded_num_tokens != num_tokens else None
 
         if self.enable_attention_dp:
-            all_rank_num_tokens = self.dist.allgather(attn_metadata.num_tokens)
-            attn_metadata.all_rank_num_tokens = all_rank_num_tokens
+            attn_metadata.all_rank_num_tokens = attn_all_rank_num_tokens
 
         virtual_num_tokens = num_tokens
         if attn_metadata.padded_num_tokens is not None:

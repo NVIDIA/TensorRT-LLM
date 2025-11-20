@@ -1889,9 +1889,6 @@ class PyExecutor:
 
         for req in scheduled_batch.generation_requests:
             if req.is_disagg_generation_transmission_complete:
-                print(
-                    "[PyExecutor::_prepare_disagg_gen_transmission_complete]: TRANSMISSION COMPLETE for request ID: ",
-                    req.py_request_id)
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
                 req.context_current_position = req.prompt_len
                 req.decoding_iter = 1
@@ -1903,9 +1900,6 @@ class PyExecutor:
                 beam_width = req.sampling_config.beam_width
 
                 for beam in range(0, beam_width):
-                    print(
-                        f"[PyExecutor::_prepare_disagg_gen_transmission_complete]: Adding new token {torch.tensor(first_gen_tokens[beam])} for beam {beam}."
-                    )
                     req.add_new_token(first_gen_tokens[beam], beam)
 
     @nvtx_range("_recv_disagg_gen_cache")
@@ -2001,24 +1995,12 @@ class PyExecutor:
         )
         def forward(scheduled_requests, resource_manager, new_tensors_device,
                     gather_context_logits, cache_indirection_buffer):
-            # iter_begin = time.time()
-            result = self.model_engine.forward(
+            return self.model_engine.forward(
                 scheduled_requests,
                 resource_manager,
                 new_tensors_device,
                 gather_context_logits=gather_context_logits,
                 cache_indirection_buffer=cache_indirection_buffer)
-            # torch.cuda.synchronize()
-            # iter_end = time.time()
-            # iter_latency_ms = (iter_end - iter_begin) * 1e3
-            # if self.model_engine.iter_counter > 10 and self.dist.rank == 0:
-            #     logger.info(f"[PyExecutor::_forward_step] CUSTOM LOG: iter={self.model_engine.iter_counter}, "
-            #                 f"rank={self.dist.rank}, "
-            #                 f"active_requests={len(self.active_requests)}, "
-            #                 f"scheduled_generation_requests={len(scheduled_requests.generation_requests)}, "
-            #                 f"scheduled_batch_size={scheduled_requests.batch_size}, "
-            #                 f"iter_latency_ms={iter_latency_ms}ms")
-            return result
 
         try:
             gather_context_logits = any(
@@ -2085,8 +2067,7 @@ class PyExecutor:
     @nvtx_range("_update_request_states")
     def _update_request_states(self, scheduled_requests: ScheduledRequests):
         cp_config = self.dist.cp_config
-        # note: helix parallelism uses the same logic as tp parallelism here
-        if 'cp_type' in cp_config and cp_config['cp_type'] != CpType.HELIX:
+        if 'cp_type' in cp_config:
             cp_type = cp_config['cp_type']
             if cp_type == CpType.STAR:
                 self._update_request_states_star_attention(scheduled_requests)
