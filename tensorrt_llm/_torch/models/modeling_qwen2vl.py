@@ -95,15 +95,13 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                  model_path: str,
                  config: PretrainedConfig,
                  tokenizer: AutoTokenizer,
-                 trust_remote_code: bool = True):
-
-        super().__init__()
-
-        # Initialize BaseMultimodalDummyInputsBuilder attributes
-        # These are required for get_dummy_prompt() method
-        self.image_max_dim = BaseMultimodalDummyInputsBuilder.DEFAULT_IMAGE_MAX_DIM
-        self.img_min_dim = BaseMultimodalDummyInputsBuilder.DEFAULT_IMAGE_MIN_DIM
-
+                 trust_remote_code: bool = True,
+                 **kwargs):
+        super().__init__(model_path=model_path,
+                         config=config,
+                         tokenizer=tokenizer,
+                         trust_remote_code=trust_remote_code,
+                         **kwargs)
         self._config = config
         self._dtype = self._config.torch_dtype
         self._tokenizer = tokenizer if tokenizer is not None else AutoTokenizer.from_pretrained(

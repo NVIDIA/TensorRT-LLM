@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-# Import tensorrt_llm to load custom CUDA operators (indexer_topk_decode_op, indexer_topk_prefill_op)
+# Import tensorrt_llm to load custom CUDA operators (indexer_topk_decode, indexer_topk_prefill)
 import tensorrt_llm  # noqa: F401
 
 
@@ -179,7 +179,7 @@ def test_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens):
     indices = torch.empty((num_gen_tokens, index_topk), dtype=torch.int32, device="cuda")
 
     # Run CUDA implementation
-    torch.ops.trtllm.indexer_topk_decode_op(logits, seq_lens, indices, next_n)
+    torch.ops.trtllm.indexer_topk_decode(logits, seq_lens, indices, next_n)
 
     torch.cuda.synchronize()
 
@@ -214,7 +214,7 @@ def test_indexer_topk_prefill(batch_size, index_topk, num_tokens):
     indices = torch.empty((batch_size, index_topk), dtype=torch.int32, device="cuda")
 
     # Run CUDA implementation
-    torch.ops.trtllm.indexer_topk_prefill_op(logits, row_starts, row_ends, indices)
+    torch.ops.trtllm.indexer_topk_prefill(logits, row_starts, row_ends, indices)
 
     # Run reference implementation
     torch_indices = logits.topk(min(index_topk, max(row_ends)), dim=-1)[1]

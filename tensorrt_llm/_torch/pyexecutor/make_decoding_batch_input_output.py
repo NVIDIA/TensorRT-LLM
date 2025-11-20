@@ -4,7 +4,8 @@ from typing import List
 import torch
 
 from tensorrt_llm._utils import nvtx_range
-from tensorrt_llm.bindings.internal.runtime import DecoderBatchInput
+from tensorrt_llm.bindings.internal.batch_manager import DecoderInputBuffers
+from tensorrt_llm.bindings.internal.runtime import DecoderState
 
 
 @dataclass
@@ -19,21 +20,22 @@ class MakeDecodingBatchInputOutput:
     @nvtx_range("make_decoding_batch_input_output")
     def __call__(
         self,
+        decoder_input_buffers: DecoderInputBuffers,
+        decoder_state: DecoderState,
         scheduled_requests,
         logits: torch.Tensor,
         beam_width: int,
         num_context_logits_prefix_sum: List[int],
-    ) -> DecoderBatchInput:
+    ):
         """Create decoder batch inputs and outputs for the given requests.
 
         Args:
+            decoder_input_buffers: Decoder input buffers
+            decoder_state: Current decoder state
             scheduled_requests: Scheduled requests
             logits: Logits tensor
             beam_width: Beam width
             num_context_logits_prefix_sum: Number of context logits prefix sum
-
-        Returns:
-            DecoderBatchInput
         """
         # In order to make a decoding_input assuming no drafting, we need:
         # 1. logits_vec = [[logits_slice of each active slot]]
@@ -61,10 +63,9 @@ class MakeDecodingBatchInputOutput:
                                   start=logits_index + i * beam_width,
                                   length=beam_width).unsqueeze(0))
 
-        decoding_input = DecoderBatchInput(logits_vec, 1)
-        decoding_input.generation_steps = generation_steps
-        decoding_input.batch_slots = [
+        decoder_state.generation_steps = generation_steps
+        decoder_input_buffers.forward_batch_slots = [
             torch.tensor(active_slots[0], dtype=torch.int32)
         ]
-
-        return decoding_input
+        decoder_input_buffers.logits = logits_vec
+        decoder_input_buffers.max_decoder_steps = 1

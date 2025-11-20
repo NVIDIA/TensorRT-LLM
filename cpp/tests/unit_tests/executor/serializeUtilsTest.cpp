@@ -1,13 +1,18 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #include "tensorrt_llm/executor/serializeUtils.h"
@@ -789,7 +794,7 @@ TEST(SerializeUtilsTest, ExecutorConfig)
         texec::GuidedDecodingConfig(
             texec::GuidedDecodingConfig::GuidedDecodingBackend::kXGRAMMAR, std::initializer_list<std::string>{"eos"}),
         std::vector{tensorrt_llm::executor::AdditionalModelOutput{"output_name"}},
-        texec::CacheTransceiverConfig(std::nullopt, 1024), true, true, true);
+        texec::CacheTransceiverConfig(std::nullopt, 1024, 100, 1000), true, true, true);
     auto executorConfig2 = serializeDeserialize(executorConfig);
 
     EXPECT_EQ(executorConfig.getMaxBeamWidth(), executorConfig2.getMaxBeamWidth());
@@ -1028,10 +1033,13 @@ TEST(SerializeUtilsTest, MethodReturnType)
 TEST(SerializeUtilsTest, CacheTransceiverConfig)
 {
     texec::CacheTransceiverConfig cacheTransceiverConfig(
-        tensorrt_llm::executor::CacheTransceiverConfig::BackendType::UCX, 1024);
+        tensorrt_llm::executor::CacheTransceiverConfig::BackendType::UCX, 1024, 100, 1000);
     auto cacheTransceiverConfig2 = serializeDeserialize(cacheTransceiverConfig);
     EXPECT_EQ(cacheTransceiverConfig.getBackendType(), cacheTransceiverConfig2.getBackendType());
     EXPECT_EQ(cacheTransceiverConfig.getMaxTokensInBuffer(), cacheTransceiverConfig2.getMaxTokensInBuffer());
+    EXPECT_EQ(cacheTransceiverConfig.getKvTransferTimeoutMs(), cacheTransceiverConfig2.getKvTransferTimeoutMs());
+    EXPECT_EQ(cacheTransceiverConfig.getKvTransferSenderFutureTimeoutMs(),
+        cacheTransceiverConfig2.getKvTransferSenderFutureTimeoutMs());
 }
 
 TEST(SerializeUtilsTest, BlockKeyBasic)
