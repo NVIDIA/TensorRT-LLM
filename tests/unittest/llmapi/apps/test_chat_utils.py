@@ -1,5 +1,3 @@
-import os
-import tempfile
 from unittest.mock import MagicMock
 
 import pytest
@@ -187,17 +185,12 @@ TEMPLATE_CHATML = """{% for message in messages %}{{'<|im_start|>' + message['ro
 
 
 @pytest.fixture
-def chat_template_path():
+def chat_template_path(tmp_path):
     """Return the path to the chat template."""
-    temp_dir = tempfile.gettempdir()
-    temp_file_path = os.path.join(temp_dir, "chat_template.jinja")
-    try:
-        with open(temp_file_path, "w") as f:
-            f.write(TEMPLATE_CHATML)
-        yield temp_file_path
-    finally:
-        if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
+    temp_file_path = tmp_path / "chat_template.jinja"
+    with open(temp_file_path, "w") as f:
+        f.write(TEMPLATE_CHATML)
+    return temp_file_path
 
 
 class TestLoadChatTemplate:

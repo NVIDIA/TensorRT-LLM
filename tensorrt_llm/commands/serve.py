@@ -371,7 +371,8 @@ class ChoiceWithAlias(click.Choice):
 @click.option("--chat_template",
               type=str,
               default=None,
-              help="[Experimental] Specify the chat template.")
+              help="[Experimental] Specify a custom chat template. "
+              "Can be a file path or one-liner template string")
 def serve(
         model: str, tokenizer: Optional[str], host: str, port: int,
         log_level: str, backend: str, max_beam_width: int, max_batch_size: int,

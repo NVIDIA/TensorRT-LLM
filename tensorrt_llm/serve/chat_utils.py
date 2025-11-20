@@ -259,7 +259,8 @@ def make_tool_call_id(id_type: str = "random", func_name=None, idx=None):
 
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/44b5ce956d3cf28841615a58c1c0873af87bcfe2/vllm/entrypoints/chat_utils.py
-def _load_chat_template(
+@lru_cache
+def load_chat_template(
     chat_template: Path | str | None,
     *,
     is_literal: bool = False,
@@ -290,15 +291,4 @@ def _load_chat_template(
 
         # If opening a file fails, set chat template to be args to
         # ensure we decode so our escape are interpreted correctly
-        return _load_chat_template(chat_template, is_literal=True)
-
-
-_cached_load_chat_template = lru_cache(_load_chat_template)
-
-
-def load_chat_template(
-    chat_template: Path | str | None,
-    *,
-    is_literal: bool = False,
-) -> str | None:
-    return _cached_load_chat_template(chat_template, is_literal=is_literal)
+        return load_chat_template(chat_template, is_literal=True)
