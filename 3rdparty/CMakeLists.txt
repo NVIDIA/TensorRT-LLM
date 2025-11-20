@@ -40,6 +40,8 @@ FetchContent_Declare(
   deepgemm
   GIT_REPOSITORY https://github.com/ruoqianguo/DeepGEMM
   GIT_TAG 9fa5965e265e27995f539e0dd73a06351a8a9eaf
+  GIT_SUBMODULES_RECURSE
+  ON
   SOURCE_SUBDIR
   dont-add-this-project-with-add-subdirectory)
 
@@ -53,6 +55,8 @@ FetchContent_Declare(
   flashmla
   GIT_REPOSITORY https://github.com/deepseek-ai/FlashMLA.git
   GIT_TAG 1408756a88e52a25196b759eaf8db89d2b51b5a1
+  GIT_SUBMODULES_RECURSE
+  ON
   SOURCE_SUBDIR
   dont-add-this-project-with-add-subdirectory)
 
