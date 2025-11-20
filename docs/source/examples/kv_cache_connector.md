@@ -14,7 +14,7 @@ The KV Cache Connector is designed to support a variety of advanced serving scen
 
 ## Architecture
 
-The connector architecture is split into two main components.:
+The connector architecture is split into two main components:
 
 * **Scheduler (Leader)**: Responsible for orchestration. It decides *what* needs to be loaded or saved and builds metadata instructions. It runs only on the leader rank (rank 0).
 * **Worker**: Responsible for execution. It receives metadata from the scheduler and performs the actual data transfers (loading/saving) on the KV cache tensors. It runs on all ranks.
