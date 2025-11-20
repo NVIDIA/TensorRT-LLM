@@ -64,6 +64,8 @@ def wait_event(event_name: str) -> None:
     event.wait()
 
 
+# skip during compilation
+@torch._dynamo.disable
 def record_event_wrapper(
     fn: Callable,
     *args: Tuple[Any, ...],
@@ -74,6 +76,7 @@ def record_event_wrapper(
     return output
 
 
+@torch._dynamo.disable
 def aux_stream_wrapper(
     fn: Callable,
     *args: Tuple[Any, ...],
