@@ -563,6 +563,8 @@ class TRTLLMGenFusedMoE(MoE):
                     ))
             else:
                 hidden_states_fp4, hidden_states_scale_linear_fp4 = x, x_sf
+            intermediate_size_per_partition_padded = self.w3_w1_weight.shape[
+                -2] // 2
 
             outputs = torch.ops.trtllm.fp4_block_scale_moe_runner(
                 router_logits_arg,
@@ -585,7 +587,7 @@ class TRTLLMGenFusedMoE(MoE):
                 top_k,
                 n_group,
                 topk_group,
-                self.intermediate_size_per_partition,
+                intermediate_size_per_partition_padded,
                 self.
                 slot_start,  # local_expert_start;  use ep_rank if stride!=1
                 self.expert_size_per_partition,  # local_expert_size
@@ -601,6 +603,10 @@ class TRTLLMGenFusedMoE(MoE):
                 return outputs
             else:
                 final_hidden_states = outputs[0]
+                if final_hidden_states.shape[-1] != self.hidden_size:
+                    final_hidden_states = final_hidden_states[:, :self.
+                                                              hidden_size].contiguous(
+                                                              )
         elif self.has_w4a16_mxfp4:
             assert x.dtype == torch.bfloat16
             if not post_quant_comm:
