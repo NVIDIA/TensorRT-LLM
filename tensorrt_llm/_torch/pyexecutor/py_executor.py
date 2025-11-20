@@ -1148,6 +1148,7 @@ class PyExecutor:
                     break
 
                 self._pause_requests(scheduled_batch.paused_requests)
+
                 finished_requests = []
 
                 can_queue = self._can_queue(scheduled_batch)
@@ -1898,7 +1899,6 @@ class PyExecutor:
                 ctx_draft_tokens = req.context_phase_params.draft_tokens
                 req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
                 beam_width = req.sampling_config.beam_width
-
                 for beam in range(0, beam_width):
                     req.add_new_token(first_gen_tokens[beam], beam)
 

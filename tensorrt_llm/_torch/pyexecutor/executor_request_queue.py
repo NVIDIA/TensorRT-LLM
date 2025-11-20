@@ -693,6 +693,7 @@ class ExecutorRequestQueue:
                 input_token_ids=input_ids_this_rank,
                 position_ids=position_ids_this_rank,
             )
+            req.total_input_len_cp = input_len
             req_with_children.append(req)
             if req.child_requests:
                 req_with_children.extend(req.child_requests)

@@ -80,7 +80,7 @@ class Scenario:
     rope_original_max_position_embeddings: int = 4096
     rope_type: str = "yarn"
     model_type: str = "deepseek_v3"
-    kv_cache_tokens_per_block: int = 64
+    kv_cache_tokens_per_block: int = 32
     # TODO only 1 is supported for now here
     predicted_tokens_per_seq: int = 1
     bias: bool = False
