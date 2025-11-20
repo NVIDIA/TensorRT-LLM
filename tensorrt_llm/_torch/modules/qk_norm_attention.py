@@ -291,8 +291,6 @@ class QKNormRoPEAttention(Attention):
             q, k, v = self.apply_rope(q, k, v, position_ids)
         else:
             # mrope activated. We should only apply QK Norm, and not apply RoPE.
-            # mrope_rotary_cos_sin = mrope_config['mrope_rotary_cos_sin']
-            # print(mrope_rotary_cos_sin.shape)
             q, k, v = self.split_qkv(q, k, v)
             q, k = self.apply_qk_norm(q, k)
         q, k, v = self.convert_qkv(q, k, v)

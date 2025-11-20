@@ -26,9 +26,9 @@ from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..modules.embedding import Embedding
+from ..modules.rotary_embedding import MRotaryEmbedding
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import (
-    _cache_multimodal_embeddings,
     _get_uncached_multimodal_params,
     filter_mm_token_from_input_ids,
     find_input_mm_embeds,
@@ -94,7 +94,6 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, InputProcessor):
         self._processor = AutoProcessor.from_pretrained(
             model_path, use_fast=True, trust_remote_code=trust_remote_code
         )
-        # print(self.model_config)
         self.tllm_multimodal_token_id = self.model_config.text_config.vocab_size + 1
         # temporal patch size for video frames
         self.temporal_patch_size = getattr(model_config.vision_config, "temporal_patch_size", 1)
@@ -123,21 +122,6 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, InputProcessor):
         """Return the vocab size of the model."""
         return self.model_config.text_config.vocab_size
 
-    # def get_mm_token_ids(self) -> torch.Tensor:
-    #     """Get the IDs of all multimodal tokens (placeholders and special tokens alike)."""
-    #     return torch.tensor([
-    #         # This is the `<|image_pad|>` token id inserted into the prompt that should be replaced with image
-    #         # embeddings.
-    #         self.processor.image_token_id,
-    #         # This is the `<|video_pad|>` token id inserted into the prompt that should be replaced with video
-    #         # embeddings.
-    #         self.processor.video_token_id,
-    #         # This is the `<|vision_start|>` token id to signify the start of vision part.
-    #         self.processor.vision_start_token_id,
-    #         # This is the `<|vision_end|>` token id to signify the end of vision part.
-    #         self.processor.vision_end_token_id,
-    #     ])
-
     @classmethod
     def get_rope_index(
         cls,
@@ -149,13 +133,12 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, InputProcessor):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Different from the original implementation, Qwen3VL use timestamps rather than absolute time position ids."""
 
-        # Since we use timestamps to separate videos, like <t1> <vision_start> <frame1> <vision_end> <t2> <vision_start>
-        # <frame2> <vision_end>, the video_grid_thw should also be split
+        # Since we use timestamps to separate videos, like <t1> <vision_start> <frame1> <vision_end> <t2>
+        # <vision_start> <frame2> <vision_end>, the video_grid_thw should also be split
         if video_grid_thw is not None:
             video_grid_thw = torch.repeat_interleave(video_grid_thw, video_grid_thw[:, 0], dim=0)
             video_grid_thw[:, 0] = 1
 
-        # print(model_config)
         spatial_merge_size = model_config.vision_config.spatial_merge_size
         image_token_id = model_config.image_token_id
         video_token_id = model_config.video_token_id
@@ -225,8 +208,8 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, InputProcessor):
                         torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
                     )
 
-                    # t_index is always 0 because llm_grid_t is always 1 (we use timestamps to encode the
-                    # temporal information for videos)
+                    # t_index is always 0 because llm_grid_t is always 1 (we use timestamps to encode
+                    # the temporal information for videos)
                     t_index = (
                         torch.arange(llm_grid_t)
                         .view(-1, 1)
@@ -471,7 +454,6 @@ class Qwen3VisionModelBase(nn.Module):
             image_embeds, deepstack_image_embeds = self.visual(
                 pixel_values, grid_thw=image_grid_thw
             )
-            # print("shapes", image_embeds.shape, len(deepstack_image_embeds))
             embeds.append(image_embeds)
             deepstack_embeds.append(torch.stack(deepstack_image_embeds))
 
@@ -525,11 +507,15 @@ class Qwen3VLModelBase(PreTrainedModel):
             type=PositionEmbeddingType.from_string(config.rope_scaling["type"]),
             rope=RopeParams.from_config(config),
             mrope_section=config.rope_scaling.get("mrope_section", None),
+            mrope_interleaved=config.rope_scaling.get("mrope_interleaved", False),
         )
-        self.rotary_cos_sin = pos_embd_params.rope.create_rope_const_params(interleave=False)[
-            1
-        ].reshape(pos_embd_params.rope.max_positions, 2, -1)
-        self.mrope_section = pos_embd_params.mrope_section
+        self.rotary_emb = MRotaryEmbedding(
+            pos_embd_params.rope,
+            head_dim=config.hidden_size // config.num_attention_heads,
+            is_neox=pos_embd_params.is_neox,
+            mrope_section=pos_embd_params.mrope_section,
+            mrope_interleaved=pos_embd_params.mrope_interleaved,
+        ).to("cuda")
         self.mrope_position_ids_padding_cuda = torch.zeros(
             (
                 3,
@@ -575,12 +561,7 @@ class Qwen3VLModelBase(PreTrainedModel):
                         self.mrope_position_ids_padding_cuda[
                             :, :, mrope_position_ids.shape[-1] :
                         ] = 0
-                        cos_sin = self.rotary_cos_sin[
-                            self.mrope_position_ids_padding_cuda.view(3, -1)
-                        ]
-                        cos, sin = cos_sin[:, :, 0, :], cos_sin[:, :, 1, :]
-                        cos = apply_interleaved_rope(cos, self.mrope_section)
-                        sin = apply_interleaved_rope(sin, self.mrope_section)
+                        cos, sin = self.rotary_emb.get_cos_sin(self.mrope_position_ids_padding_cuda)
                         concat_cos_sin = torch.stack((cos, sin), dim=-1)
                         concat_cos_sin = concat_cos_sin.reshape(concat_cos_sin.shape[0], -1)
                         mrope_rotary_cos_sin.append(concat_cos_sin)
@@ -671,18 +652,6 @@ class Qwen3VLModelBase(PreTrainedModel):
         return output_prob
 
 
-def apply_interleaved_rope(x: torch.Tensor, mrope_section: list[int]) -> torch.Tensor:
-    """Apply interleaved MRoPE to 3D rotary embeddings.
-    Reorganizes frequency layout from chunked [TTT...HHH...WWW] to
-    interleaved [THTHWHTHW...TT], preserving frequency continuity.
-    Copied from vllm
-    """
-    x_t = x[0].clone()
-    x_t[..., 1 : mrope_section[1] * 3 : 3] = x[1, ..., 1 : mrope_section[1] * 3 : 3]
-    x_t[..., 2 : mrope_section[2] * 3 : 3] = x[2, ..., 2 : mrope_section[2] * 3 : 3]
-    return x_t
-
-
 def fuse_input_embeds_qwen3(
     embedding_layer: Embedding,
     input_ids: torch.IntTensor,
@@ -698,11 +667,11 @@ def fuse_input_embeds_qwen3(
 
     mm_embed = torch.cat(mm_embeds, dim=0)
 
-    # TODO: support the case where only one index tensor is provided,
-    # the other is derived as the complement (try to avoid implicit host-device synchronization)
+    # TODO: support the case where only one index tensor is provided, the other is derived as the complement
+    # (try to avoid implicit host-device synchronization)
     if text_token_indices is None or mm_token_indices is None:
-        # NOTE: This function involves host-device synchronization due to torch.where() used in
-        # filter_mm_token_from_input_ids.
+        # NOTE: This function involves host-device synchronization due to torch.where()
+        # used in filter_mm_token_from_input_ids.
         text_token_indices, mm_token_indices = filter_mm_token_from_input_ids(
             input_ids, vocab_size=embedding_layer.num_embeddings, mm_token_ids=mm_token_ids
         )
@@ -729,7 +698,6 @@ def fuse_input_embeds_qwen3(
             device=deepstack_features.device,
             dtype=deepstack_features.dtype,
         )
-
         deepstack_embeds[:, mm_token_indices, :] = deepstack_features
     else:
         deepstack_embeds = None
@@ -754,13 +722,7 @@ def get_multimodal_embeddings_qwen3(
     uncached_multimodal_params = _get_uncached_multimodal_params(multimodal_params)
 
     # Step 2: Run encoder forward only on uncached parameters
-    def valid_mm_runtime(param: MultimodalParams) -> bool:
-        return (
-            hasattr(param, "multimodal_runtime")
-            and param.multimodal_runtime is not None
-            and param.multimodal_runtime.total_mm_tokens_in_request is not None
-        )
-
+    encoder_outputs = []
     deepstack_features = []
     if uncached_multimodal_params:
         kwargs = encoder_kwargs or {}
@@ -768,32 +730,7 @@ def get_multimodal_embeddings_qwen3(
             uncached_multimodal_params, **kwargs
         )
 
-        # TODO: support multiple multimodal modalities per request
-        if len(encoder_outputs) > 1:
-            return encoder_outputs, deepstack_features
-
-        # Validate that multimodal_runtime has required attributes for caching
-        for param in uncached_multimodal_params:
-            if not valid_mm_runtime(param):
-                logger.warning(
-                    "Multimodal runtime data missing or incomplete - recomputed all embeddings"
-                )
-                return encoder_outputs, deepstack_features
-
-        # Step 3: Cache the computed embeddings to multimodal_data["multimodal_embedding"]
-        _cache_multimodal_embeddings(uncached_multimodal_params, encoder_outputs)
-
-    # Step 4: Gather all embeddings for the batch
-    for param in multimodal_params:
-        # concatenate if embeds is a list of tensors
-        embeds = param.multimodal_data.get("multimodal_embedding")
-        if isinstance(embeds, list):
-            param.multimodal_data["multimodal_embedding"] = torch.cat(embeds, dim=0)
-
-    all_embeddings = torch.cat(
-        [param.multimodal_data["multimodal_embedding"] for param in multimodal_params], dim=0
-    )
-    return [all_embeddings], deepstack_features
+    return encoder_outputs, deepstack_features
 
 
 @register_vision_encoder(Qwen3VisionModelBase, vlm_base_model=Qwen3VLVisionModel)
@@ -823,13 +760,13 @@ class Qwen3VLModelTRT(Qwen3VLModelBase):
             "video.pixel_values_videos",
             "video.video_grid_thw",
             "multimodal_embedding",
+            "deepstack_feature",
         ]
 
     def load_weights(self, weights, weight_mapper: BaseWeightMapper):
         if not DISAGG:
             vision_encoder_weights = process_weights(weights, "visual")
             self.mm_encoder.load_state_dict(vision_encoder_weights, strict=True)
-        # print(weights.keys())
         transformed_weights = {}
         language_model_prefix = "model.language_model."
         for key, value in weights.items():
@@ -838,6 +775,5 @@ class Qwen3VLModelTRT(Qwen3VLModelBase):
                 transformed_weights[new_key] = value
             else:
                 transformed_weights[key] = value
-        print("mapper:", weight_mapper)
 
         self.llm.load_weights(transformed_weights, weight_mapper)

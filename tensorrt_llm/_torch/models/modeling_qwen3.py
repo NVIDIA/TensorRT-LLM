@@ -48,7 +48,8 @@ class Qwen3Attention(QKNormRoPEAttention):
                 type=PositionEmbeddingType.from_string(pos_type),
                 rope=RopeParams.from_config(config),
                 mrope_section=config.rope_scaling.get("mrope_section", None),
-            )
+                mrope_interleaved=config.rope_scaling.get(
+                    "mrope_interleaved", False))
             if config.rope_scaling.get("mrope_interleaved", False):
                 fuse_qk_norm_rope = False
         else:
@@ -205,8 +206,6 @@ class Qwen3Model(DecoderModel):
         hidden_states = inputs_embeds
 
         residual = None
-        if isinstance(position_ids, tuple):
-            position_ids = position_ids[0]
         for layer_idx, decoder_layer in enumerate(self.layers):
             hidden_states, residual = decoder_layer(
                 position_ids=position_ids,
