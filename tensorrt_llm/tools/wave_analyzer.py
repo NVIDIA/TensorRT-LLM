@@ -26,7 +26,7 @@ import math
 import sys
 import csv
 from pathlib import Path
-from typing import NamedTuple, Optional, Tuple, Set, Dict, List
+from typing import NamedTuple, Optional, Tuple, Set, Dict
 
 # --- Configuration Defaults ---
 # Tile sizes based on CUTLASS/TRT-LLM auto-tuning heuristics
@@ -43,12 +43,12 @@ SATURATION_THRESHOLD = 20.0   # Waves > 20 implies tail effects are negligible
 try:
     from safetensors import safe_open
 except ImportError:
-    print("Error: 'safetensors' not installed. Please run: pip install safetensors")
-    sys.exit(1)
+    safe_open = None
 
 # --- Logger Shim for Standalone Usage ---
 try:
-    from tensorrt_llm.logger import logger
+    import tensorrt_llm.logger as trt_logger_mod
+    logger = trt_logger_mod.logger
 except ImportError:
     import logging
     logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
@@ -79,7 +79,7 @@ HARDWARE_DB: Dict[str, GPU] = {
 
 class LayerStats(NamedTuple):
     name: str
-    shape: Tuple[int, int]
+    shape: Tuple[int, int]  # Effective shape (M, N) after TP/MoE adjustments
     waves: float
     efficiency: float
     tail_loss_percent: float
@@ -93,16 +93,18 @@ def parse_custom_hardware(custom_str: str) -> GPU:
     try:
         parts = custom_str.split(';')
         if len(parts) < 3:
-            raise ValueError
+            raise ValueError("Missing fields")
         name = parts[0]
         sms = int(parts[1])
         blocks = int(parts[2])
         # Optional: Check for dual die flag 'RTX;200;4;dual'
         dual = len(parts) > 3 and "dual" in parts[3].lower()
         return GPU(name, sms, blocks, is_dual_die=dual)
-    except (ValueError, IndexError):
-        logger.error(f"Invalid custom hardware string: '{custom_str}'. Expected format: 'Name;SMs;MaxBlocks'")
-        sys.exit(1)
+    except (ValueError, IndexError) as exc:
+        raise ValueError(
+            f"Invalid custom hardware string: '{custom_str}'. "
+            "Expected format: 'Name;SMs;MaxBlocks' or 'Name;SMs;MaxBlocks;dual'"
+        ) from exc
 
 def get_tile_heuristic(name: str, dtype: str) -> int:
     """Estimates the GEMM CTA (Tile) Size based on layer type and precision."""
@@ -172,7 +174,8 @@ def analyze_layer(name: str,
     wave_capacity = active_sms * gpu.max_blocks_per_sm
     
     waves = total_blocks / wave_capacity
-    if waves <= 0: return None
+    if waves <= 0:
+        return None
 
     full_waves = math.ceil(waves)
     efficiency = waves / full_waves
@@ -226,15 +229,31 @@ def main():
     
     args = parser.parse_args()
 
+    if safe_open is None:
+        parser.error("'safetensors' is required for this tool. Please install it (e.g. `pip install safetensors`).")
+
     if args.batch_size <= 0:
         parser.error("Batch size must be greater than 0.")
+    if args.seq_len <= 0:
+        parser.error("Sequence length must be greater than 0.")
+    if args.tp_size <= 0:
+        parser.error("Tensor parallel size must be greater than 0.")
     
-    if hasattr(logger, 'setLevel'):
-        logger.setLevel(args.log_level.upper())
+    # Logger Configuration (Prefer TRT-LLM API if available)
+    try:
+        import tensorrt_llm.logger as trt_logger_mod
+        if hasattr(trt_logger_mod, "set_level"):
+            trt_logger_mod.set_level(args.log_level)
+    except ImportError:
+        if hasattr(logger, "setLevel"):
+            logger.setLevel(args.log_level.upper())
 
     # Resolve Hardware
     if args.custom_hardware:
-        gpu = parse_custom_hardware(args.custom_hardware)
+        try:
+            gpu = parse_custom_hardware(args.custom_hardware)
+        except ValueError as exc:
+            parser.error(str(exc))
     else:
         gpu = HARDWARE_DB[args.gpu]
 
@@ -272,39 +291,53 @@ def main():
         csv_writer.writerow(["Layer Name", "M_Dim", "N_Dim", "Waves", "Efficiency", "Tail_Loss_Percent", "Recommendation"])
 
     try:
-        with safe_open(files[0], framework="np", device="cpu") as f:
-            for key in f.keys():
-                if "weight" in key and "norm" not in key and "router" not in key:
-                    # Architecture Parsing (Handles Llama, Falcon, Qwen, GPT-J)
-                    parts = key.split(".")
-                    try:
-                        layer_idx_loc = next(i for i, part in enumerate(parts) if part.isdigit())
-                        generic_name = ".".join(parts[layer_idx_loc+1:-1])
-                    except StopIteration:
-                        continue
+        # Iterate over ALL files to capture layers in multi-shard checkpoints
+        for path in files:
+            with safe_open(path, framework="np", device="cpu") as f:
+                for key in f.keys():
+                    if "weight" in key and "norm" not in key and "router" not in key:
+                        # Architecture Parsing (Handles Llama, Falcon, Qwen, GPT-J)
+                        parts = key.split(".")
+                        try:
+                            layer_idx_loc = next(i for i, part in enumerate(parts) if part.isdigit())
+                            generic_name = ".".join(parts[layer_idx_loc+1:-1])
+                        except StopIteration:
+                            continue
 
-                    shape_list = f.get_slice(key).get_shape()
-                    shape = tuple(shape_list)
-                    
-                    sig = (generic_name, shape)
-                    if sig in seen_sigs: continue
-                    seen_sigs.add(sig)
+                        shape_list = f.get_slice(key).get_shape()
+                        shape = tuple(shape_list)
+                        
+                        sig = (generic_name, shape)
+                        if sig in seen_sigs:
+                            continue
+                        seen_sigs.add(sig)
 
-                    stats = analyze_layer(key, shape, m_dim, gpu, args.tp_size, args.dtype, args.seq_len, args.split_k_threshold)
-                    
-                    if stats:
-                        icon = "✅"
-                        if "CRITICAL" in stats.recommendation: icon = "❌"
-                        elif "Tune" in stats.recommendation: icon = "⚠️"
-                        elif "Split-K" in stats.recommendation: icon = "🛡️"
-                        elif "Latency" in stats.recommendation: icon = "ℹ️"
-                        elif "Saturated" in stats.recommendation: icon = "🔹"
-                        elif "Vocab" in stats.recommendation: icon = "🔹"
+                        stats = analyze_layer(key, shape, m_dim, gpu, args.tp_size, args.dtype, args.seq_len, args.split_k_threshold)
+                        
+                        if stats:
+                            # Status Icons (ASCII safe 'i' for info)
+                            icon = "✅"
+                            if "CRITICAL" in stats.recommendation:
+                                icon = "❌"
+                            elif "Tune" in stats.recommendation:
+                                icon = "⚠️"
+                            elif "Split-K" in stats.recommendation:
+                                icon = "🛡️"
+                            elif "Latency" in stats.recommendation:
+                                icon = "i"
+                            elif "Saturated" in stats.recommendation:
+                                icon = "🔹"
+                            elif "Vocab" in stats.recommendation:
+                                icon = "🔹"
 
-                        print(f"{stats.name[-50:]:<50} | {f'{math.ceil(stats.shape[0]/128)}x{math.ceil(stats.shape[1]/128)}':<14} | {stats.waves:<8.2f} | {stats.efficiency*100:<6.1f} | {stats.tail_loss_percent:<6.1f} | {icon} {stats.recommendation}")
+                            # Calculate visual grid based on actual heuristic tile size
+                            tile = get_tile_heuristic(stats.name, args.dtype)
+                            grid_str = f"{math.ceil(stats.shape[0]/tile)}x{math.ceil(stats.shape[1]/tile)}"
 
-                        if csv_writer:
-                            csv_writer.writerow([stats.name, stats.shape[0], stats.shape[1], stats.waves, stats.efficiency, stats.tail_loss_percent, stats.recommendation])
+                            print(f"{stats.name[-50:]:<50} | {grid_str:<14} | {stats.waves:<8.2f} | {stats.efficiency*100:<6.1f} | {stats.tail_loss_percent:<6.1f} | {icon} {stats.recommendation}")
+
+                            if csv_writer:
+                                csv_writer.writerow([stats.name, stats.shape[0], stats.shape[1], stats.waves, stats.efficiency, stats.tail_loss_percent, stats.recommendation])
     finally:
         if csv_file:
             csv_file.close()
