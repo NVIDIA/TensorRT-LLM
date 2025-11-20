@@ -127,7 +127,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
         pipeline.stage('Submit Test Results') {
             sh "mkdir -p ${stageName}"
             def resultsFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/results.xml"
-            def downloadResultCmd = "sshpass -p '${remote.passwd}' scp -P ${remote.port} -r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${resultsFilePath} ${stageName}/"            downloadSucceed = sh(script: downloadResultCmd, returnStatus: true) == 0
+            def downloadResultCmd = "sshpass -p '${remote.passwd}' scp -P ${remote.port} -r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${resultsFilePath} ${stageName}/"
             downloadSucceed = Utils.exec(pipeline, script: downloadResultCmd, returnStatus: true) == 0
             if (downloadSucceed) {
                 sh "ls ${stageName}"
