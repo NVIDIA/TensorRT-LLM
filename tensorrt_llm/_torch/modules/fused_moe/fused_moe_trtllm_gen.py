@@ -548,11 +548,8 @@ class TRTLLMGenFusedMoE(MoE):
             is_scale_factor_swizzled = False  # use linear layout here
 
             if not post_quant_comm:
-                print("doing nvfp4 forward")
-                print("current x shape and dtype:", x.shape, x.dtype)
                 pad_size = self.w3_w1_weight.shape[-1] * 2 - x.shape[-1]
                 x = torch.nn.functional.pad(x, (0, pad_size))
-                print("after pad x shape and dtype:", x.shape, x.dtype)
                 hidden_states_fp4, hidden_states_scale_linear_fp4 = (
                     torch.ops.trtllm.fp4_quantize(
                         x,
