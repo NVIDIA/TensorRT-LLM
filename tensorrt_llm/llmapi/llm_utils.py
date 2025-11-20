@@ -390,7 +390,9 @@ class ModelLoader:
                     )
 
             for key, value in hf_quant_config.items():
-                logger.info(f"Setting {key}={value} from HF quant config.")
+                logger.info(
+                    f"Setting {key}={str(value)[:100]}{'...' if len(str(value)) > 100 else ''} from HF quant config."
+                )
                 setattr(quant_config, key, value)
 
             # Update the quant_config in llm_args for pytorch

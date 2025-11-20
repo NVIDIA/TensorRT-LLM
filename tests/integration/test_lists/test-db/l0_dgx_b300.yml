@@ -8,6 +8,7 @@ l0_dgx_b300:
     wildcards:
       gpu:
       - '*gb110*'
+      - '*b300*'
       linux_distribution_name: ubuntu*
       cpu: x86_64
     terms:
@@ -15,7 +16,6 @@ l0_dgx_b300:
       backend: pytorch
   tests:
   - unittest/_torch/attention
-  - unittest/_torch/thop
   - unittest/_torch/executor
   - unittest/_torch/modules
   - unittest/_torch/modeling -k "modeling_llama"
@@ -73,4 +73,5 @@ l0_dgx_b300:
   - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_nixl_backend
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_nixl_backend
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[throughput_tp4] TIMEOUT (180)
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[throughput_pp4_mtp] TIMEOUT (180)
   # ------------- AutoDeploy tests ---------------

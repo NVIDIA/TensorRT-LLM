@@ -13,8 +13,9 @@ from ..model_config import ModelConfig
 from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
-from ..pyexecutor.sampler import (SampleState, SampleStateTensors, TorchSampler,
-                                  add_token, int_tensor)
+from ..pyexecutor.sampler import (BEAM, MAX_BEAM_WIDTH, SampleState,
+                                  SampleStateTensors, TorchSampler, add_token,
+                                  int_tensor)
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecMetadata
 
@@ -216,28 +217,34 @@ class MTPSampler(TorchSampler):
 
     SampleState = SampleStateMTP
 
-    def __init__(self, args: TorchSampler.Args, *, nextn: int):
-        self.mapping = None
-        self.draft_len = nextn
-        super().__init__(args)
-
     @dataclass(frozen=True, kw_only=True)
     class Store(TorchSampler.Store):
+        new_tokens: torch.Tensor
         next_new_tokens: torch.Tensor
         next_draft_tokens: torch.Tensor
         new_tokens_lens: torch.Tensor
         max_total_draft_tokens: torch.Tensor
+        finish_reasons: None = None  # Necessary to satisfy the interface of TorchSampler.Store
 
-    def create_store(self) -> Store:
-        num_tokens, seq_slots, _ = self.NEW_TOKENS_SHAPE
-        draft_len = num_tokens - 1
-        assert draft_len == self.draft_len
-        return self.Store(
-            new_tokens=int_tensor(self.NEW_TOKENS_SHAPE),
-            next_new_tokens=int_tensor(self.NEW_TOKENS_SHAPE),
-            next_draft_tokens=int_tensor((seq_slots, draft_len)),
+        def __post_init__(self):
+            pass  # finish_reasons has no size to compare against new_tokens in MTPSampler
+
+    def __init__(self, args: TorchSampler.Args, *, nextn: int):
+        self.mapping = None
+        self.draft_len = nextn
+        self.max_seq_len = args.max_seq_len
+
+        seq_slots = args.max_num_sequences
+        max_tokens = args.max_total_draft_tokens + 1
+
+        self.store = self.Store(
+            new_tokens=int_tensor((max_tokens, seq_slots, MAX_BEAM_WIDTH)),
+            next_new_tokens=int_tensor((max_tokens, seq_slots, MAX_BEAM_WIDTH)),
+            next_draft_tokens=int_tensor(
+                (seq_slots, args.max_total_draft_tokens)),
             new_tokens_lens=int_tensor((seq_slots, )),
-            max_total_draft_tokens=int_tensor((seq_slots, draft_len)),
+            max_total_draft_tokens=int_tensor(
+                (seq_slots, args.max_total_draft_tokens)),
         )
 
     def _request_common_handling(self, request: LlmRequest,
@@ -259,12 +266,14 @@ class MTPSampler(TorchSampler):
         new_tokens = state.host.new_tokens.tolist()
         new_tokens_lens_list = state.host.new_tokens_lens.tolist()
         next_draft_tokens_list = state.host.next_draft_tokens.tolist()
-        beam_idx = self.BEAM
+        beam_idx = BEAM
         for req in state.scheduled_requests.context_requests:
             if req.state == LlmRequestState.GENERATION_COMPLETE or req.context_remaining_length != 0:
                 continue
             new_token = add_token(req, new_tokens, beam=beam_idx)
-            self._handle_stop_criteria(req, new_token)
+            TorchSampler._handle_stop_criteria(req,
+                                               new_token,
+                                               max_seq_len=self.max_seq_len)
             self._request_common_handling(req, next_draft_tokens_list)
 
         for req in state.scheduled_requests.generation_requests:
@@ -273,7 +282,8 @@ class MTPSampler(TorchSampler):
             num_new_tokens = new_tokens_lens_list[req.py_seq_slot]
             for i in range(num_new_tokens):
                 new_token = add_token(req, new_tokens, beam=beam_idx, step=i)
-                if self._handle_stop_criteria(req, new_token):
+                if TorchSampler._handle_stop_criteria(
+                        req, new_token, max_seq_len=self.max_seq_len):
                     break
             req.py_num_accepted_draft_tokens = num_new_tokens - 1
             req.py_rewind_len = self.draft_len - req.py_num_accepted_draft_tokens
@@ -827,7 +837,7 @@ class MTPWorker(nn.Module):
                 attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
             ctx_input_ids = input_ids[:attn_metadata.num_ctx_tokens]
             ctx_is_think = (ctx_input_ids ==
-                            self.spec_config.BEGIN_THINKING_PHASE_TOKEN).int()
+                            self.spec_config.begin_thinking_phase_token).int()
             ctx_is_think_cumsum = torch.cumsum(ctx_is_think, dim=0)
             ctx_last_cumsum = ctx_is_think_cumsum[
                 last_tokens_idx[:num_contexts]]
@@ -853,8 +863,8 @@ class MTPWorker(nn.Module):
                 mtp_relaxed_delta_pool, num_accepted_tokens, accepted_tokens,
                 mtp_num_modules, batch_size, num_contexts,
                 self.spec_config.relaxed_topk, self.spec_config.relaxed_delta,
-                self.spec_config.BEGIN_THINKING_PHASE_TOKEN,
-                self.spec_config.END_THINKING_PHASE_TOKEN)
+                self.spec_config.begin_thinking_phase_token,
+                self.spec_config.end_thinking_phase_token)
 
         # Strict acceptance
         else:

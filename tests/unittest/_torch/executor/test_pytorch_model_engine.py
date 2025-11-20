@@ -6,11 +6,11 @@ import torch
 
 import tensorrt_llm
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm._torch.pyexecutor.kv_cache_connector import \
     KvCacheConnectorWorker
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 # isort: off
 from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
@@ -23,7 +23,7 @@ from utils.util import skip_ray
 from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings.executor import KvCacheConfig
-from tensorrt_llm.llmapi import CudaGraphConfig, LlmArgs, SamplingParams
+from tensorrt_llm.llmapi import CudaGraphConfig, SamplingParams
 from tensorrt_llm.mapping import CpType, Mapping
 
 
@@ -70,24 +70,13 @@ class DummyModel(torch.nn.Module):
 
 class DummyModelEngine(PyTorchModelEngine):
 
-    def __init__(self,
-                 pytorch_backend_config: PyTorchConfig,
-                 batch_size: int,
-                 dtype: torch.dtype,
-                 max_seq_len: int = 32) -> None:
+    def __init__(self, llm_args: TorchLlmArgs, dtype: torch.dtype) -> None:
         self.dtype = dtype
         mapping = Mapping(world_size=tensorrt_llm.mpi_world_size(),
                           tp_size=tensorrt_llm.mpi_world_size(),
                           rank=tensorrt_llm.mpi_rank())
         model = DummyModel(self.dtype)
-        from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
-
-        model_path = "dummy"
-        llm_args = TorchLlmArgs(model=model_path,
-                                max_batch_size=batch_size,
-                                max_seq_len=max_seq_len)
-        super().__init__(model_path=model_path,
-                         pytorch_backend_config=pytorch_backend_config,
+        super().__init__(model_path="dummy",
                          mapping=mapping,
                          model=model,
                          llm_args=llm_args)
@@ -112,26 +101,26 @@ def _create_request(num_tokens, req_id: int):
     return result
 
 
-def create_model_engine_and_kvcache(config: PyTorchConfig = None):
-    max_num_requests = 15
+def create_model_engine_and_kvcache(llm_args: TorchLlmArgs = None):
     tokens_per_block = 1
     max_tokens = 258  # Atleast 1 more than the max seq len
     num_layers = 1
     batch_size = 13
 
-    config = config if config else PyTorchConfig(
-        use_cuda_graph=True, cuda_graph_padding_enabled=True)
-    config.cuda_graph_batch_sizes = [
-        1, 2, 4, 8, 16, 32, 64, 128
-    ] if config.cuda_graph_batch_sizes is None else config.cuda_graph_batch_sizes
+    llm_args = llm_args if llm_args else TorchLlmArgs(
+        model="dummy",
+        max_batch_size=batch_size,
+        max_num_tokens=max_tokens,
+        cuda_graph_config=CudaGraphConfig(
+            enable_padding=True, batch_sizes=[1, 2, 4, 8, 16, 32, 64, 128]))
     test_batches = (5, 13)
     for batch_size in test_batches:
-        assert batch_size not in config.cuda_graph_batch_sizes
+        assert batch_size not in llm_args.cuda_graph_config.batch_sizes
 
-    assert (8 in config.cuda_graph_batch_sizes
-            and 16 in config.cuda_graph_batch_sizes)
+    assert (8 in llm_args.cuda_graph_config.batch_sizes
+            and 16 in llm_args.cuda_graph_config.batch_sizes)
 
-    model_engine = DummyModelEngine(config, max_num_requests, torch.half)
+    model_engine = DummyModelEngine(llm_args, torch.half)
 
     kv_cache_config = KvCacheConfig(max_tokens=max_tokens)
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
@@ -158,12 +147,12 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         resource_manager = ResourceManager(
             {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
 
-        seqlens_and_batch_sizes = [
+        batch_sizes_and_seqlens = [
             (5, 1),
             (13, 1),
             (5, 25),
         ]
-        for (batch_size, max_seq_len) in seqlens_and_batch_sizes:
+        for (batch_size, max_seq_len) in batch_sizes_and_seqlens:
             requests = [
                 _create_request(max_seq_len, i) for i in range(batch_size)
             ]
@@ -264,10 +253,12 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         kv_cache_manager.shutdown()
 
     def test_layerwise_nvtx_marker(self):
-        config = PyTorchConfig(use_cuda_graph=True,
-                               cuda_graph_padding_enabled=True,
-                               enable_layerwise_nvtx_marker=True)
-        model_engine, kv_cache_manager = create_model_engine_and_kvcache(config)
+        llm_args = TorchLlmArgs(
+            model="dummy",
+            enable_layerwise_nvtx_marker=True,
+            cuda_graph_config=CudaGraphConfig(enable_padding=True))
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache(
+            llm_args)
         resource_manager = ResourceManager(
             {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
 
@@ -292,54 +283,22 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         kv_cache_manager.shutdown()
 
     def test_cuda_graph_padding_filters_huge_batch_size(self):
-        config = PyTorchConfig(
-            use_cuda_graph=True,
-            cuda_graph_padding_enabled=True,
-            cuda_graph_batch_sizes=[1, 2, 3, 1000000000000000000000000])
-        model_engine = DummyModelEngine(config, 32, torch.half)
+        llm_args = TorchLlmArgs(
+            model="dummy",
+            cuda_graph_config=CudaGraphConfig(
+                enable_padding=True,
+                batch_sizes=[1, 2, 3, 1000000000000000000000000]))
+        model_engine = DummyModelEngine(llm_args, torch.half)
 
         self.assertEqual(model_engine._cuda_graph_batch_sizes,
                          [1, 2, 3, model_engine.max_seq_len])
 
-    def test_cuda_graph_enable(self):
-        # Test 1: Default behavior (no cuda_graph_config specified)
-        llm_args_default = LlmArgs.from_kwargs(model="dummy_model")
-        pytorch_config_default = llm_args_default.get_pytorch_backend_config()
-        self.assertTrue(pytorch_config_default.use_cuda_graph,
-                        "CUDA graphs should be enabled by default")
-
-        # Test 2: Explicit CudaGraphConfig()
-        llm_args_explicit = LlmArgs.from_kwargs(
-            model="dummy_model", cuda_graph_config=CudaGraphConfig())
-        pytorch_config_explicit = llm_args_explicit.get_pytorch_backend_config()
-        self.assertTrue(
-            pytorch_config_explicit.use_cuda_graph,
-            "CUDA graphs should be enabled when CudaGraphConfig() is provided")
-
-        # Test 3: cuda_graph_config=None (explicitly disabled)
-        llm_args_disabled = LlmArgs.from_kwargs(model="dummy_model",
-                                                cuda_graph_config=None)
-        pytorch_config_disabled = llm_args_disabled.get_pytorch_backend_config()
-        self.assertFalse(
-            pytorch_config_disabled.use_cuda_graph,
-            "CUDA graphs should be disabled when cuda_graph_config=None")
-
-        # Test 4: Custom CudaGraphConfig with specific settings
-        custom_config = CudaGraphConfig(max_batch_size=256, enable_padding=True)
-        llm_args_custom = LlmArgs.from_kwargs(model="dummy_model",
-                                              cuda_graph_config=custom_config)
-        pytorch_config_custom = llm_args_custom.get_pytorch_backend_config()
-        self.assertTrue(pytorch_config_custom.use_cuda_graph,
-                        "CUDA graphs should be enabled with custom config")
-        self.assertEqual(pytorch_config_custom.cuda_graph_max_batch_size, 256,
-                         "Custom max_batch_size should be respected")
-        self.assertTrue(pytorch_config_custom.cuda_graph_padding_enabled,
-                        "Custom enable_padding should be respected")
-
     def test_forward_pass_callable_on_cuda_graph_on(self):
-        config = PyTorchConfig(use_cuda_graph=True,
-                               cuda_graph_padding_enabled=True)
-        model_engine, kv_cache_manager = create_model_engine_and_kvcache(config)
+        llm_args = TorchLlmArgs(model="dummy",
+                                cuda_graph_config=CudaGraphConfig(
+                                    enable_padding=True, ))
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache(
+            llm_args)
 
         mock_callable = Mock()
         model_engine.register_forward_pass_callable(mock_callable)
@@ -359,8 +318,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         mock_callable.assert_called_once()
 
     def test_forward_pass_callable_on_cuda_graph_off(self):
-        config = PyTorchConfig(use_cuda_graph=False)
-        model_engine, kv_cache_manager = create_model_engine_and_kvcache(config)
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
 
         mock_callable = Mock()
         model_engine.register_forward_pass_callable(mock_callable)
@@ -380,8 +338,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         mock_callable.assert_called_once()
 
     def test_foward_pass_callable_off(self):
-        config = PyTorchConfig(use_cuda_graph=False)
-        model_engine, kv_cache_manager = create_model_engine_and_kvcache(config)
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
         self.assertTrue(model_engine.forward_pass_callable is None,
                         "forward_pass_callback should be None by default")
 
@@ -399,8 +356,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         model_engine.forward(batch, resource_manager)
 
     def test_foward_pass_callable_backward_compat(self):
-        config = PyTorchConfig(use_cuda_graph=False)
-        model_engine, kv_cache_manager = create_model_engine_and_kvcache(config)
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
         self.assertTrue(model_engine.forward_pass_callable is None,
                         "forward_pass_callback should be None by default")
 
@@ -422,8 +378,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         """Test _prepare_tp_inputs function with helix parallelism."""
 
         # Create model engine with helix parallelism.
-        config = PyTorchConfig(use_cuda_graph=False)
-        model_engine = DummyModelEngine(config, batch_size=4, dtype=torch.half)
+        llm_args = TorchLlmArgs(model="dummy")
+        model_engine = DummyModelEngine(llm_args, dtype=torch.half)
 
         # Provide mapping for model engine.
         cp_size = 2

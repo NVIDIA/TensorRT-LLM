@@ -7,6 +7,7 @@ from .modeling_deepseekv3 import DeepseekV3ForCausalLM
 from .modeling_exaone4 import Exaone4ForCausalLM
 from .modeling_gemma3 import Gemma3ForCausalLM
 from .modeling_gemma3vl import Gemma3VLM
+from .modeling_glm import Glm4MoeForCausalLM
 from .modeling_gpt_oss import GptOssForCausalLM
 from .modeling_hunyuan_dense import HunYuanDenseV1ForCausalLM
 from .modeling_hunyuan_moe import HunYuanMoEV1ForCausalLM
@@ -15,9 +16,9 @@ from .modeling_llama import LlamaForCausalLM
 from .modeling_llava_next import LlavaNextModel
 from .modeling_mistral import Mistral3VLM, MistralForCausalLM
 from .modeling_mixtral import MixtralForCausalLM
-from .modeling_nanov2vlm import NemotronH_Nano_VL_V2
 from .modeling_nemotron import NemotronForCausalLM
 from .modeling_nemotron_h import NemotronHForCausalLM
+from .modeling_nemotron_nano import NemotronH_Nano_VL_V2
 from .modeling_nemotron_nas import NemotronNASForCausalLM
 from .modeling_phi3 import Phi3ForCausalLM
 from .modeling_phi4mm import Phi4MMForCausalLM
@@ -70,6 +71,7 @@ __all__ = [
     "Qwen3NextForCausalLM",
     "GptOssForCausalLM",
     "SeedOssForCausalLM",
+    "Glm4MoeForCausalLM",
 ]
 
 if transformers.__version__ >= "4.45.1":

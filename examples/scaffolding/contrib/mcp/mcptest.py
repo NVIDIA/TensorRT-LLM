@@ -4,8 +4,8 @@ import asyncio
 from openai import AsyncOpenAI
 
 from tensorrt_llm.scaffolding import OpenaiWorker, ScaffoldingLlm
-from tensorrt_llm.scaffolding.contrib import (ChatTask, MCPController,
-                                              MCPWorker, chat_handler)
+from tensorrt_llm.scaffolding.contrib.mcp import (ChatTask, MCPController,
+                                                  MCPWorker, chat_handler)
 
 
 def parse_arguments():
@@ -28,7 +28,7 @@ def parse_arguments():
 from openai import AsyncOpenAI
 
 from tensorrt_llm.scaffolding import OpenaiWorker, ScaffoldingLlm
-from tensorrt_llm.scaffolding.contrib import MCPController, MCPWorker
+from tensorrt_llm.scaffolding.contrib.mcp import MCPController, MCPWorker
 
 
 async def main():
@@ -41,7 +41,7 @@ async def main():
     ]
     API_KEY = args.API_KEY
     urls = [
-        "http://0.0.0.0:8080/sse", "http://0.0.0.0:8081/sse",
+        #"http://0.0.0.0:8080/sse", "http://0.0.0.0:8081/sse",
         "http://0.0.0.0:8082/sse"
     ]
     print(f"API_KEY {API_KEY}")
@@ -61,7 +61,7 @@ async def main():
 
     future = llm.generate_async(prompts[0])
     result = await future.aresult()
-    print(f"\nresult is {result.output.output_str}\n")
+    print(f"\nresult is {result.outputs[0].text}\n")
 
     print(f'main shutting down...')
     llm.shutdown()

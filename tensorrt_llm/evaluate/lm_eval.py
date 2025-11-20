@@ -219,7 +219,8 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             else:
                 text = text.replace(LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER, "")
 
-            conv = ConversationMessage(role="user", content=text)
+            conv = ConversationMessage(role=content.get("role", "user"),
+                                       content=text)
             mm_data_tracker = MultimodalDataTracker(self.model_type)
 
             # NOTE: Since we already have loaded images, for the placeholder purpose, we add data here.
@@ -236,7 +237,7 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
         output = trtllm_apply_chat_template(
             model_type=self.model_type,
             tokenizer=self.llm.tokenizer,
-            processor=self.llm.input_processor.processor,
+            processor=getattr(self.llm.input_processor, 'processor', None),
             conversation=chat_history,
             add_generation_prompt=add_generation_prompt,
             mm_placeholder_counts=mm_placeholder_counts,

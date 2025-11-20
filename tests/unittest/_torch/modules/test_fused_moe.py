@@ -1,5 +1,7 @@
+import os
 import pickle
 import sys
+from contextlib import contextmanager
 from itertools import product
 from typing import Dict, List, Optional
 from unittest import mock
@@ -38,7 +40,7 @@ from tensorrt_llm._torch.modules.fused_moe import (
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import \
     IS_TRITON_KERNELS_AVAILABLE
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
-from tensorrt_llm._utils import mpi_rank
+from tensorrt_llm._utils import get_sm_version, mpi_rank
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -49,6 +51,28 @@ MPI.pickle.__init__(
     cloudpickle.loads,
     pickle.HIGHEST_PROTOCOL,
 )
+
+
+@contextmanager
+def moe_trtllm_debug_msg(enable=False):
+    TLLM_BATCHED_GEMM_PRINT_NAME = os.environ.get(
+        "TLLM_BATCHED_GEMM_PRINT_NAME", "0")
+    TLLM_BATCHED_GEMM_PRINT_CONFIGS = os.environ.get(
+        "TLLM_BATCHED_GEMM_PRINT_CONFIGS", "0")
+    if enable:
+        os.environ["TLLM_BATCHED_GEMM_PRINT_NAME"] = "1"
+        os.environ["TLLM_BATCHED_GEMM_PRINT_CONFIGS"] = "1"
+    try:
+        yield
+    finally:
+        os.environ[
+            "TLLM_BATCHED_GEMM_PRINT_NAME"] = TLLM_BATCHED_GEMM_PRINT_NAME
+        os.environ[
+            "TLLM_BATCHED_GEMM_PRINT_CONFIGS"] = TLLM_BATCHED_GEMM_PRINT_CONFIGS
+
+
+def round_up(x, alignment):
+    return (x + alignment - 1) // alignment * alignment
 
 
 @pytest.mark.parametrize(
@@ -579,10 +603,6 @@ def test_fused_moe_fp8(moe_backend, dtype, routing_cls, bias):
         fused_moe.cuda()
         fused_moe.load_weights([weights])
 
-        AutoTuner.get().clear_cache()
-        with torch.inference_mode(), autotune():
-            fused_moe.forward(x, router_logits)
-
         ref_fused_moe = RefGatedMLPFusedMoE(
             num_experts=NUM_EXPERTS,
             routing_method=routing_method,
@@ -593,13 +613,27 @@ def test_fused_moe_fp8(moe_backend, dtype, routing_cls, bias):
             bias=bias)
         ref_fused_moe.load_weights([weights])
         ref_fused_moe.cuda()
+
+        AutoTuner.get().clear_cache()
         with torch.inference_mode():
-            output = fused_moe.forward(x, router_logits)
             ref_output = ref_fused_moe.forward(x, router_logits)
 
-        # compare
-        torch.cuda.synchronize()
-        check_accuracy(output, ref_output, rtol=0.04, atol=0.1, percent=0.99)
+        with torch.inference_mode(), autotune():
+            fused_moe.forward(x, router_logits)
+
+        # Explicitly capture context for kernel testing
+        with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
+            output = fused_moe.forward(x, router_logits)
+
+        # Test all kernel tactics
+        for tactic in all_tactics:
+            with AutoTuner.get().replay(tactic), torch.inference_mode():
+                output = fused_moe.forward(x, router_logits)
+                check_accuracy(output,
+                               ref_output,
+                               rtol=0.04,
+                               atol=0.1,
+                               percent=0.99)
 
 
 def set_tensor_value_2(x, num_row, num_cols):
@@ -645,7 +679,6 @@ def set_tensor_value_4(x, num_row, num_cols):
     x.copy_(repeated)
 
 
-@pytest.mark.skip(reason="https://nvbugs/5565565")
 @skip_pre_blackwell
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
@@ -1321,6 +1354,11 @@ def test_fused_moe_nvfp4(dtype, moe_backend):
     if moe_backend == "TRTLLM" and dtype == torch.float16:
         pytest.skip("TRTLLM NVFP4 MoE backend does not support float16 yet")
 
+    test_all_kernels = True
+    if get_sm_version() == 120:
+        # Disable; got "Assertion failed: Failed to initialize cutlass TMA WS grouped gemm. Error: Error Internal"
+        test_all_kernels = False
+
     mapping = Mapping()
     mapping.rank = mpi_rank()
 
@@ -1426,16 +1464,30 @@ def test_fused_moe_nvfp4(dtype, moe_backend):
         ref_fused_moe.cuda()
 
         AutoTuner.get().clear_cache()
+        with torch.inference_mode():
+            ref_output = ref_fused_moe.forward(x, router_logits)
+
         with torch.inference_mode(), autotune():
             fused_moe.forward(x, router_logits)
 
-        with torch.inference_mode():
-            output = fused_moe.forward(x, router_logits)
-            ref_output = ref_fused_moe.forward(x, router_logits)
-
-        # compare
-        torch.cuda.synchronize()
+        output = fused_moe.forward(x, router_logits)
         torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.15)
+
+        if not test_all_kernels:
+            return
+
+        # Explicitly capture context for kernel testing
+        with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
+            output = fused_moe.forward(x, router_logits)
+
+        # Test all kernel tactics
+        for tactic in all_tactics:
+            with AutoTuner.get().replay(tactic), torch.inference_mode():
+                output = fused_moe.forward(x, router_logits)
+                torch.testing.assert_close(output,
+                                           ref_output,
+                                           rtol=1e-2,
+                                           atol=0.15)
 
 
 @skip_pre_blackwell
@@ -1555,16 +1607,24 @@ def test_fused_moe_w4a8_nvfp4_fp8(moe_backend):
         ref_fused_moe.cuda()
 
         AutoTuner.get().clear_cache()
+        with torch.inference_mode():
+            ref_output = ref_fused_moe.forward(x, router_logits)
+
         with torch.inference_mode(), autotune():
             fused_moe.forward(x, router_logits)
 
-        with torch.inference_mode():
+        # Explicitly capture context for kernel testing
+        with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
             output = fused_moe.forward(x, router_logits)
-            ref_output = ref_fused_moe.forward(x, router_logits)
 
-        # compare
-        torch.cuda.synchronize()
-        torch.testing.assert_close(output, ref_output, rtol=1e-1, atol=0.5)
+        # Test all kernel tactics
+        for tactic in all_tactics:
+            with AutoTuner.get().replay(tactic), torch.inference_mode():
+                output = fused_moe.forward(x, router_logits)
+                torch.testing.assert_close(output,
+                                           ref_output,
+                                           rtol=1e-1,
+                                           atol=0.5)
 
 
 @skip_neither_ada_nor_hopper_unittest
@@ -1811,21 +1871,34 @@ def test_fused_moe_w4afp8(dtype, weight_loading_mode):
             return results
 
         AutoTuner.get().clear_cache()
+        with torch.inference_mode():
+            ref_output = ref()
+
         with torch.inference_mode(), autotune():
             fused_moe.forward(x, router_logits)
 
-        torch.cuda.synchronize()
-        with torch.inference_mode():
+        # Explicitly capture context for kernel testing
+        with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
             output = fused_moe.forward(x, router_logits)
-            ref_output = ref()
+
+        # Test all kernel tactics
+        for tactic in all_tactics:
+            with AutoTuner.get().replay(tactic), torch.inference_mode():
+                output = fused_moe.forward(x, router_logits)
+                # assert that result does not contain NaN or is all 0s
+                assert not torch.isnan(output).any(), "output contains NaN"
+                assert torch.nonzero(output).numel() > 0, "output is empty"
+                torch.testing.assert_close(output,
+                                           ref_output,
+                                           rtol=1e-2,
+                                           atol=0.1)
 
         torch.cuda.synchronize()
-        # assert that result does not contain NaN or is all 0s
         assert not torch.isnan(ref_output).any(), "ref_output contains NaN"
         assert not torch.isnan(output).any(), "output contains NaN"
         assert torch.nonzero(output).numel() > 0, "output is empty"
         assert torch.nonzero(ref_output).numel() > 0, "ref_output is empty"
-        # compare
+        # Final comparison
         torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
 
 
@@ -1833,71 +1906,32 @@ def test_fused_moe_w4afp8(dtype, weight_loading_mode):
 @pytest.mark.parametrize(
     "moe_backend",
     [pytest.param("TRTLLM", marks=skip_blackwell_geforce), "CUTLASS"])
+@pytest.mark.parametrize("hidden_unpadded", [64, 192, 256])
+@pytest.mark.parametrize("seq_len", [8, 128])
 @pytest.mark.parametrize("bias", [True, False])
-def test_fused_moe_mxfp4_mxfp8(moe_backend, bias):
+def test_fused_moe_mxfp4_mxfp8(moe_backend, hidden_unpadded, seq_len, bias):
+
+    if moe_backend == "CUTLASS" and hidden_unpadded % 128 != 0:
+        pytest.skip()
 
     SCALING_VECTOR_SIZE = 32
     dtype = torch.bfloat16
-    SEQ_LEN = 128
-    HIDDEN_SIZE = 256
-    INTERMEDIATE_SIZE = 256
+    SEQ_LEN = seq_len
+    HIDDEN_SIZE_UNPADDED = hidden_unpadded
+    INTERMEDIATE_SIZE_UNPADDED = hidden_unpadded
     NUM_EXPERTS = 8
     TOP_K = 4
     routing_method = RenormalizeMoeRoutingMethod(top_k=TOP_K)
     torch.manual_seed(0)
     torch.cuda.manual_seed(0)
-    x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype).cuda() * 0.1
     router_logits = torch.randn((SEQ_LEN, NUM_EXPERTS), dtype=dtype).cuda()
-
-    weights = {}
-    for expert_id in range(NUM_EXPERTS):
-        if bias:
-            w1_bias = torch.randn(
-                (INTERMEDIATE_SIZE, ), dtype=dtype).cuda() * 0.1
-            w2_bias = torch.randn((HIDDEN_SIZE, ), dtype=dtype).cuda() * 0.1
-            w3_bias = torch.randn(
-                (INTERMEDIATE_SIZE, ), dtype=dtype).cuda() * 0.1
-            weights[f"{expert_id}.w1.bias"] = w1_bias
-            weights[f"{expert_id}.w2.bias"] = w2_bias
-            weights[f"{expert_id}.w3.bias"] = w3_bias
-        w1_weight = torch.randn(
-            (INTERMEDIATE_SIZE, HIDDEN_SIZE), dtype=dtype).cuda() * 0.1
-        w2_weight = torch.randn(
-            (HIDDEN_SIZE, INTERMEDIATE_SIZE), dtype=dtype).cuda() * 0.1
-        w3_weight = torch.randn((INTERMEDIATE_SIZE, HIDDEN_SIZE),
-                                dtype=dtype).cuda()
-
-        w1_weight_mxfp4, w1_sf_block = torch.ops.trtllm.fp4_quantize(
-            w1_weight, None, SCALING_VECTOR_SIZE, True)
-        w1_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
-            w1_sf_block.cpu().view(INTERMEDIATE_SIZE, -1))
-
-        w2_weight_mxfp4, w2_sf_block = torch.ops.trtllm.fp4_quantize(
-            w2_weight, None, SCALING_VECTOR_SIZE, True)
-        w2_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
-            w2_sf_block.cpu().view(HIDDEN_SIZE, -1))
-
-        w3_weight_mxfp4, w3_sf_block = torch.ops.trtllm.fp4_quantize(
-            w3_weight, None, SCALING_VECTOR_SIZE, True)
-        w3_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
-            w3_sf_block.cpu().view(INTERMEDIATE_SIZE, -1))
-
-        weights[f"{expert_id}.w1.weight"] = w1_weight_mxfp4
-        weights[f"{expert_id}.w2.weight"] = w2_weight_mxfp4
-        weights[f"{expert_id}.w3.weight"] = w3_weight_mxfp4
-        weights[f"{expert_id}.w1.weight_scale"] = w1_sf_block_unswizzled.view(
-            torch.uint8).cuda()
-        weights[f"{expert_id}.w2.weight_scale"] = w2_sf_block_unswizzled.view(
-            torch.uint8).cuda()
-        weights[f"{expert_id}.w3.weight_scale"] = w3_sf_block_unswizzled.view(
-            torch.uint8).cuda()
 
     quant_config = QuantConfig(quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8)
     fused_moe = create_moe(
         num_experts=NUM_EXPERTS,
         routing_method=routing_method,
-        hidden_size=HIDDEN_SIZE,
-        intermediate_size=INTERMEDIATE_SIZE,
+        hidden_size=HIDDEN_SIZE_UNPADDED,
+        intermediate_size=INTERMEDIATE_SIZE_UNPADDED,
         dtype=dtype,
         reduce_results=True,
         model_config=ModelConfig(quant_config=quant_config,
@@ -1905,31 +1939,217 @@ def test_fused_moe_mxfp4_mxfp8(moe_backend, bias):
         bias=bias,
     )
     fused_moe.cuda()
-    fused_moe.load_weights([weights])
+    fused_moe.create_weights()
 
-    # Evaluate the outputs on a variant sequence length to cover all possible keys in Autotuner cache
+    num_elts_per_dtype = torch.iinfo(
+        fused_moe.quant_method.weight_dtype).bits // 4
+
+    HIDDEN_SIZE_IN = fused_moe.w3_w1_weight.shape[
+        -1] * num_elts_per_dtype  # last dim packed type factor
+    HIDDEN_SIZE_OUT = fused_moe.w2_weight.shape[-2]
+    INTERMEDIATE_SIZE = fused_moe.w2_weight.shape[
+        -1] * num_elts_per_dtype  # last dim packed type factor
+
+    def dist_to_alignment(size, alignment):
+        return round_up(size, alignment) - size
+
+    x = torch.randn((SEQ_LEN, HIDDEN_SIZE_UNPADDED), dtype=dtype).cuda() * 0.1
+    x = torch.nn.functional.pad(
+        x, (0, dist_to_alignment(HIDDEN_SIZE_UNPADDED, HIDDEN_SIZE_IN)))
+
+    def prepare_weights(num_experts: int,
+                        hidden_size_in: int,
+                        hidden_size_out: int,
+                        intermediate_size: int,
+                        bias: bool,
+                        hidden_size_unpadded: int,
+                        intermediate_size_unpadded: int,
+                        pad_zero_or_val: bool,
+                        weight_alignment: int = 128,
+                        input_hidden_alignment: int = 512):
+        # Ensures each call gives same outcome
+        torch.manual_seed(42)
+        # Contamination value
+        contam_val = 42
+        intermediate_size_unpadded = intermediate_size_unpadded or intermediate_size
+        weights = {}
+        for expert_id in range(num_experts):
+            if bias:
+                w1_bias = torch.randn(
+                    (intermediate_size_unpadded, ), dtype=dtype).cuda() * 0.1
+                w2_bias = torch.randn(
+                    (hidden_size_unpadded, ), dtype=dtype).cuda() * 0.1
+                w3_bias = torch.randn(
+                    (intermediate_size_unpadded, ), dtype=dtype).cuda() * 0.1
+                # Pad to output dimension using contamination
+                w1_bias = torch.nn.functional.pad(
+                    w1_bias,
+                    (0, dist_to_alignment(w1_bias.shape[-1],
+                                          intermediate_size)), "constant",
+                    0 if pad_zero_or_val else contam_val)
+                w2_bias = torch.nn.functional.pad(
+                    w2_bias,
+                    (0, dist_to_alignment(hidden_size_unpadded,
+                                          hidden_size_out)), "constant",
+                    0 if pad_zero_or_val else contam_val)
+                w3_bias = torch.nn.functional.pad(
+                    w3_bias,
+                    (0, dist_to_alignment(w3_bias.shape[-1],
+                                          intermediate_size)), "constant",
+                    0 if pad_zero_or_val else contam_val)
+                weights[f"{expert_id}.w1.bias"] = w1_bias
+                weights[f"{expert_id}.w2.bias"] = w2_bias
+                weights[f"{expert_id}.w3.bias"] = w3_bias
+
+            w1_weight = torch.randn(
+                (intermediate_size_unpadded, hidden_size_unpadded),
+                dtype=dtype).cuda() * 0.1
+            w2_weight = torch.randn(
+                (hidden_size_unpadded, intermediate_size_unpadded),
+                dtype=dtype).cuda() * 0.1
+            w3_weight = torch.randn(
+                (intermediate_size_unpadded, hidden_size_unpadded),
+                dtype=dtype).cuda()
+            # First padding step: pad weight tensors from unpadded dimensions to weight-aligned dimensions using 0s
+            w1_weight = torch.nn.functional.pad(
+                w1_weight, (0,
+                            dist_to_alignment(hidden_size_unpadded,
+                                              input_hidden_alignment), 0,
+                            dist_to_alignment(intermediate_size_unpadded,
+                                              weight_alignment)))
+            w2_weight = torch.nn.functional.pad(
+                w2_weight, (0,
+                            dist_to_alignment(intermediate_size_unpadded,
+                                              weight_alignment)))
+            w3_weight = torch.nn.functional.pad(
+                w3_weight, (0,
+                            dist_to_alignment(hidden_size_unpadded,
+                                              input_hidden_alignment), 0,
+                            dist_to_alignment(intermediate_size_unpadded,
+                                              weight_alignment)))
+            # Second padding step: pad from aligned dimensions to final dimensions using contamination
+            w1_weight = torch.nn.functional.pad(
+                w1_weight,
+                (0, dist_to_alignment(w1_weight.shape[-1], hidden_size_in), 0,
+                 dist_to_alignment(w1_weight.shape[-2], intermediate_size)),
+                "constant", 0 if pad_zero_or_val else contam_val)
+            w2_weight = torch.nn.functional.pad(
+                w2_weight,
+                (0, dist_to_alignment(w2_weight.shape[-1], intermediate_size),
+                 0, dist_to_alignment(w2_weight.shape[-2], hidden_size_out)),
+                "constant", 0 if pad_zero_or_val else contam_val)
+            w3_weight = torch.nn.functional.pad(
+                w3_weight,
+                (0, dist_to_alignment(w3_weight.shape[-1], hidden_size_in), 0,
+                 dist_to_alignment(w3_weight.shape[-2], intermediate_size)),
+                "constant", 0 if pad_zero_or_val else contam_val)
+
+            w1_weight_mxfp4, w1_sf_block = torch.ops.trtllm.fp4_quantize(
+                w1_weight, None, SCALING_VECTOR_SIZE, True)
+            w1_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
+                w1_sf_block.cpu().view(intermediate_size, -1))
+
+            w2_weight_mxfp4, w2_sf_block = torch.ops.trtllm.fp4_quantize(
+                w2_weight, None, SCALING_VECTOR_SIZE, True)
+            w2_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
+                w2_sf_block.cpu().view(hidden_size_out, -1))
+
+            w3_weight_mxfp4, w3_sf_block = torch.ops.trtllm.fp4_quantize(
+                w3_weight, None, SCALING_VECTOR_SIZE, True)
+            w3_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
+                w3_sf_block.cpu().view(intermediate_size, -1))
+
+            weights[f"{expert_id}.w1.weight"] = w1_weight_mxfp4
+            weights[f"{expert_id}.w2.weight"] = w2_weight_mxfp4
+            weights[f"{expert_id}.w3.weight"] = w3_weight_mxfp4
+            weights[
+                f"{expert_id}.w1.weight_scale"] = w1_sf_block_unswizzled.view(
+                    torch.uint8).cuda()
+            weights[
+                f"{expert_id}.w2.weight_scale"] = w2_sf_block_unswizzled.view(
+                    torch.uint8).cuda()
+            weights[
+                f"{expert_id}.w3.weight_scale"] = w3_sf_block_unswizzled.view(
+                    torch.uint8).cuda()
+        return weights
+
+    weights_pad_unsanitized = prepare_weights(
+        NUM_EXPERTS,
+        HIDDEN_SIZE_IN,
+        HIDDEN_SIZE_OUT,
+        INTERMEDIATE_SIZE,
+        bias,
+        HIDDEN_SIZE_UNPADDED,
+        INTERMEDIATE_SIZE_UNPADDED,
+        pad_zero_or_val=False,
+        weight_alignment=fused_moe.quant_method.weight_alignment,
+        input_hidden_alignment=getattr(fused_moe.quant_method,
+                                       "input_hidden_alignment",
+                                       fused_moe.quant_method.weight_alignment),
+    )
+    fused_moe.cuda()
+    fused_moe.load_weights([weights_pad_unsanitized])
+    fused_moe.post_load_weights()
+
+    if moe_backend == "TRTLLM":
+        # Check sizes match. Note shape[-1] is in number of uint8 elements each containing 2x mxfp4 elements.
+        assert (fused_moe.quant_method.intermediate_size_per_partition_lean ==
+                INTERMEDIATE_SIZE_UNPADDED)
+        assert fused_moe.w2_weight.shape[-1] * num_elts_per_dtype == round_up(
+            INTERMEDIATE_SIZE, fused_moe.quant_method.weight_alignment)
+        assert fused_moe.w3_w1_weight.shape[-1] * num_elts_per_dtype == round_up(
+            HIDDEN_SIZE_IN, fused_moe.quant_method.input_hidden_alignment)
+
+    weights_pad_sanitized = prepare_weights(
+        NUM_EXPERTS,
+        HIDDEN_SIZE_IN,
+        HIDDEN_SIZE_IN,
+        INTERMEDIATE_SIZE,
+        bias,
+        HIDDEN_SIZE_UNPADDED,
+        INTERMEDIATE_SIZE_UNPADDED,
+        pad_zero_or_val=True,
+        weight_alignment=fused_moe.quant_method.weight_alignment,
+        input_hidden_alignment=fused_moe.quant_method.weight_alignment,
+    )
     ref_fused_moe = RefGatedMLPFusedMoE(
         num_experts=NUM_EXPERTS,
         routing_method=routing_method,
-        hidden_size=HIDDEN_SIZE,
+        hidden_size=HIDDEN_SIZE_IN,
         intermediate_size=INTERMEDIATE_SIZE,
         dtype=dtype,
         bias=bias,
-        model_config=ModelConfig(quant_config=quant_config))
+        model_config=ModelConfig(quant_config=quant_config),
+    )
     ref_fused_moe.cuda()
-    ref_fused_moe.load_weights([weights])
+    ref_fused_moe.load_weights([weights_pad_sanitized])
 
     AutoTuner.get().clear_cache()
+    with torch.inference_mode():
+        ref_output = ref_fused_moe.forward(x,
+                                           router_logits)[:, :HIDDEN_SIZE_OUT]
+
     with torch.inference_mode(), autotune():
         fused_moe.forward(x, router_logits)
 
-    with torch.inference_mode():
+    # Capture fused_moe underlying runners as autotuner context
+    with AutoTuner.get().capture() as all_tactics, torch.inference_mode(
+    ), moe_trtllm_debug_msg(enable=False):
         output = fused_moe.forward(x, router_logits)
-        ref_output = ref_fused_moe.forward(x, router_logits)
+        output = torch.nn.functional.pad(
+            output, (0, HIDDEN_SIZE_OUT - HIDDEN_SIZE_UNPADDED))
+        assert not torch.isnan(output).any(), "output contains NaN"
+        torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.15)
 
-    # compare
-    torch.cuda.synchronize()
-    torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.15)
+    for i, tactic in enumerate(all_tactics):
+        with AutoTuner.get().replay(tactic), torch.inference_mode(
+        ), moe_trtllm_debug_msg(enable=False):
+            output = fused_moe.forward(x, router_logits)
+            output = torch.nn.functional.pad(
+                output, (0, HIDDEN_SIZE_OUT - HIDDEN_SIZE_UNPADDED))
+            assert not torch.isnan(output).any(
+            ), f"tactic {tactic} at index {i} output contains NaN"
+            torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.15)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
@@ -2061,13 +2281,25 @@ def test_fused_moe_wfp4a16(dtype, hidden_size, moe_backend):
             return results
 
         AutoTuner.get().clear_cache()
+        with torch.inference_mode():
+            ref_output = ref()
+
         with torch.inference_mode(), autotune():
             fused_moe.forward(x, router_logits)
 
-        torch.cuda.synchronize()
-        with torch.inference_mode():
+        # Explicitly capture context for kernel testing
+        with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
             output = fused_moe.forward(x, router_logits)
-            ref_output = ref()
+
+        # Test all kernel tactics
+        for tactic in all_tactics:
+            with AutoTuner.get().replay(tactic), torch.inference_mode():
+                output = fused_moe.forward(x, router_logits)
+                check_accuracy(output,
+                               ref_output,
+                               rtol=1e-2,
+                               atol=0.1,
+                               percent=0.99)
 
         # compare
         torch.cuda.synchronize()
@@ -2324,18 +2556,25 @@ def test_fused_moe_int8_woq_per_channel(dtype, weight_dtype):
             return results
 
         AutoTuner.get().clear_cache()
+        with torch.inference_mode():
+            ref_output = ref()
+
         with torch.inference_mode(), autotune():
             fused_moe.forward(x, router_logits)
 
-        torch.cuda.synchronize()
-        with torch.inference_mode():
+        # Explicitly capture context for kernel testing
+        with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
             output = fused_moe.forward(x, router_logits)
-            ref_output = ref()
 
-        # compare
-        torch.cuda.synchronize()
+        # Test all kernel tactics
         atol = calc_woq_tolerence(ref_output, weight_dtype)
-        torch.testing.assert_close(output, ref_output, rtol=1e-7, atol=atol)
+        for tactic in all_tactics:
+            with AutoTuner.get().replay(tactic), torch.inference_mode():
+                output = fused_moe.forward(x, router_logits)
+                torch.testing.assert_close(output,
+                                           ref_output,
+                                           rtol=1e-7,
+                                           atol=atol)
 
 
 class RefGatedMLPFusedMoE(nn.Module):

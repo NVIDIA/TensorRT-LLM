@@ -13,7 +13,8 @@ from tensorrt_llm.llmapi.utils import enable_llm_debug
 
 from ..utils import (get_model_extra_attrs,
                      get_per_request_piecewise_cuda_graph_flag,
-                     get_piecewise_cuda_graph_flag, make_weak_ref)
+                     get_piecewise_cuda_graph_flag, make_weak_ref,
+                     set_piecewise_running)
 from .multi_stream.auto_multi_stream import multi_stream_schedule
 from .utils import get_capture_piecewise_cuda_graph_flag, is_call_function
 
@@ -27,6 +28,7 @@ class PiecewiseInterpreter(Interpreter):
         compile_time_num_tokens: Union[int | torch.SymInt],
         capture_num_tokens: list[int],
         exclude_modules_id: list[int],
+        piecewise_runner_num: int,
         graph_pool_handle: tuple[int, int],
         garbage_collect_values: bool = True,
         graph=None,
@@ -38,6 +40,8 @@ class PiecewiseInterpreter(Interpreter):
 
         self.compile_time_num_tokens = compile_time_num_tokens
         self.capture_num_tokens = capture_num_tokens
+        self.piecewise_runner_num = piecewise_runner_num
+        self.piecewise_runner_idx = 0
         self.exclude_modules = [f"submod_{i}" for i in exclude_modules_id]
         self.graph_pool_handle = graph_pool_handle
         self.enable_inductor = enable_inductor
@@ -90,8 +94,10 @@ class PiecewiseInterpreter(Interpreter):
                 self.graph_pool_handle,
                 compile_fx(submod, args) if self.enable_inductor else submod,
                 self.enable_inductor,
+                self.piecewise_runner_idx == 0,
+                self.piecewise_runner_idx == self.piecewise_runner_num - 1,
             )
-
+            self.piecewise_runner_idx += 1
         return output
 
 
@@ -124,6 +130,8 @@ class PiecewiseRunner(object):
         graph_pool_handle,
         default_callable: Callable,
         enable_inductor: bool,
+        is_first_runner: bool,
+        is_last_runner: bool,
     ):
         if runtime_num_tokens_idx != None:
             assert isinstance(compile_time_num_tokens, torch.SymInt)
@@ -138,6 +146,8 @@ class PiecewiseRunner(object):
         self.enable_inductor = enable_inductor
 
         self.entries: dict[int, Entry] = {}
+        self.is_first_runner = is_first_runner
+        self.is_last_runner = is_last_runner
 
         for num_tokens in capture_num_tokens:
             self.entries[num_tokens] = Entry(
@@ -160,6 +170,12 @@ class PiecewiseRunner(object):
                 or not get_piecewise_cuda_graph_flag()
                 or not get_per_request_piecewise_cuda_graph_flag()):
             return self.default_callable(*args)
+
+        if self.is_first_runner or self.is_last_runner:
+            if self.is_first_runner == self.is_last_runner:
+                set_piecewise_running(False)
+            else:
+                set_piecewise_running(self.is_first_runner)
 
         entry = self.entries[runtime_num_of_token]
 
@@ -267,6 +283,7 @@ def piecewise_optimizer(
         input_num_tokens,
         capture_num_tokens,
         exclude_modules_id,
+        len(set(node_to_graph_id.values())) - len(exclude_modules_id),
         graph_pool_handle,
         max_num_streams=max_num_streams,
     )

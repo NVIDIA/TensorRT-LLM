@@ -1,9 +1,4 @@
-# Disaggregated Serving (Beta)
-
-```{note}
-Note:
-This feature is currently in beta, and the related APIs are subjected to change in future versions.
-```
+# Disaggregated Serving 
 
 - [Motivation](#Motivation)
 - [KV Cache Exchange](#KV-Cache-Exchange)
@@ -11,8 +6,8 @@ This feature is currently in beta, and the related APIs are subjected to change 
   - [Overlap Optimization](#Overlap-Optimization)
   - [Cache Layout Transformation](#Cache-Layout-Transformation)
 - [Usage](#Usage)
-  - [trtllm-serve](#trtllm-serve)
   - [Dynamo](#Dynamo)
+  - [trtllm-serve](#trtllm-serve)
 - [Environment Variables](#Environment-Variables)
 - [Troubleshooting and FAQ](#Troubleshooting-and-FAQ)
 
@@ -84,9 +79,26 @@ The optimizations required for KV cache transmission vary depending on whether i
 
 ## Usage
 
+### Dynamo
+
+The first approach involves the use of [Dynamo](https://github.com/ai-dynamo/dynamo), a data center-scale inference server developed specifically for LLM workloads. Dynamo introduces several advanced features not present in the other methods, including decoupled pre- and post-processing workers, which are particularly beneficial under high concurrency conditions. The disaggregated LLM inference workflow with Dynamo is illustrated in Figure 7.
+
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture4.png" width="800" height="auto">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 7. Dynamo integration with disaggregated service</em></sub></p>
+
+In the Dynamo workflow, requests are initially processed by pre- and post-processing workers, which then query a smart router to determine the optimal decode worker to route the requests to. Depending on the availability of KV cache blocks, the decoder worker may bypass the prefill stage or forward the request to the prefill worker. Once the prefill worker is done processing the prompt, the KV cache blocks can be sent from the prefill worker to the decoder worker, using the metadata referred to as ctx_params in the figure above.
+
+Dynamo also includes built-in support for Kubernetes deployment, monitoring, and metrics collection. The development team is actively working on enabling dynamic instance scaling, further enhancing its suitability for production environments.
+
+For more information on how to use Dynamo with TensorRT-LLM, please refer to [this documentation](https://docs.nvidia.com/dynamo/latest/examples/trtllm.html).
+
 ### trtllm-serve
 
-The first approach to do disaggregated LLM inference with TensorRT LLM involves launching a separate OpenAI-compatible server per context and generation instance using `trtllm-serve`. An additional server, referred to as the "disaggregated" server, is also launched with `trtllm-serve` and acts as an orchestrator which receives client requests and dispatches them to the appropriate context and generation servers via OpenAI REST API. Figure 6 below illustrates the disaggregated serving workflow when using this approach. When a context instance is done generating the KV blocks associated with the prompt, it returns a response to the disaggregated server. This response includes the prompt tokens, the first generated token and metadata associated with the context request and context instance. This metadata is referred to as context parameters (`ctx_params` in Figure 6). These parameters are then used by the generation instances to establish communication with the context instance and retrieve the KV cache blocks associated with the request.
+The second approach to evaluate disaggregated LLM inference with TensorRT LLM involves launching a separate OpenAI-compatible server per context and generation instance using `trtllm-serve`. An additional server, referred to as the "disaggregated" server, is also launched with `trtllm-serve` and acts as an orchestrator which receives client requests and dispatches them to the appropriate context and generation servers via OpenAI REST API. Figure 6 below illustrates the disaggregated serving workflow when using this approach. When a context instance is done generating the KV blocks associated with the prompt, it returns a response to the disaggregated server. This response includes the prompt tokens, the first generated token and metadata associated with the context request and context instance. This metadata is referred to as context parameters (`ctx_params` in Figure 6). These parameters are then used by the generation instances to establish communication with the context instance and retrieve the KV cache blocks associated with the request.
 
 <div align="center">
 <figure>
@@ -170,23 +182,6 @@ curl http://localhost:8000/v1/completions \
 #### Launching disaggregated servers on SLURM clusters
 
 Please refer to [Disaggregated Inference Benchmark Scripts](../../../examples/disaggregated/slurm).
-
-### Dynamo
-
-The second approach involves the use of [Dynamo](https://github.com/ai-dynamo/dynamo), a data center-scale inference server developed specifically for LLM workloads. Dynamo introduces several advanced features not present in the other methods, including decoupled pre- and post-processing workers, which are particularly beneficial under high concurrency conditions. The disaggregated LLM inference workflow with Dynamo is illustrated in Figure 7.
-
-<div align="center">
-<figure>
-  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture4.png" width="800" height="auto">
-</figure>
-</div>
-<p align="center"><sub><em>Figure 7. Dynamo integration with disaggregated service</em></sub></p>
-
-In the Dynamo workflow, requests are initially processed by pre- and post-processing workers, which then query a smart router to determine the optimal decode worker to route the requests to. Depending on the availability of KV cache blocks, the decoder worker may bypass the prefill stage or forward the request to the prefill worker. Once the prefill worker is done processing the prompt, the KV cache blocks can be sent from the prefill worker to the decoder worker, using the metadata referred to as ctx_params in the figure above.
-
-Dynamo also includes built-in support for Kubernetes deployment, monitoring, and metrics collection. The development team is actively working on enabling dynamic instance scaling, further enhancing its suitability for production environments.
-
-For more information on how to use Dynamo with TensorRT-LLM, please refer to [this documentation](https://docs.nvidia.com/dynamo/latest/examples/trtllm.html).
 
 ## Environment Variables
 

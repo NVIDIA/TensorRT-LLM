@@ -100,6 +100,10 @@ def weighted_majority_vote(tasks: List[Task],
 
 def majority_vote(tasks_list: List[List[Task]], vote_policy: str = 'majority'):
     tasks = [tasks[0] for tasks in tasks_list]
+    output_token_num = sum([
+        len(task.customized_result_fields['confidence_info'].conf_list)
+        for task in tasks
+    ])
     for task in tasks:
         task.customized_result_fields[
             'extracted_answer'] = extract_answer_from_boxed(task.output_str)
@@ -113,7 +117,7 @@ def majority_vote(tasks_list: List[List[Task]], vote_policy: str = 'majority'):
         print(
             "Warning: No valid tasks, maybe you should increase max_output_len, a random task will be returned"
         )
-        return random.choice(tasks)
+        return {}, random.choice(tasks)
 
     answers = [
         task.customized_result_fields['extracted_answer']
@@ -123,53 +127,44 @@ def majority_vote(tasks_list: List[List[Task]], vote_policy: str = 'majority'):
         task.customized_result_fields['confidence_info'] for task in valid_tasks
     ]
 
-    match vote_policy:
-        case 'majority':
-            return basic_majority_vote(valid_tasks, answers=answers)
-        case 'mean_confidence_weighted':
-            mean_confidences = [conf.mean_conf for conf in confidences]
-            return weighted_majority_vote(valid_tasks,
-                                          answers=answers,
-                                          confidences=mean_confidences,
-                                          type=vote_policy)
-        case 'tail_confidence_weighted':
-            tail_confidences = [conf.tail_mean_conf for conf in confidences]
-            return weighted_majority_vote(valid_tasks,
-                                          answers=answers,
-                                          confidences=tail_confidences,
-                                          type=vote_policy)
-        case 'bottom_window_weighted':
-            bottom_window_confidences = [
-                conf.bottom_window_mean_conf for conf in confidences
-            ]
-            return weighted_majority_vote(valid_tasks,
-                                          answers=answers,
-                                          confidences=bottom_window_confidences,
-                                          type=vote_policy)
-        case 'min_window_weighted':
-            min_window_confidences = [
-                conf.min_window_conf for conf in confidences
-            ]
-            return weighted_majority_vote(valid_tasks,
-                                          answers=answers,
-                                          confidences=min_window_confidences,
-                                          type=vote_policy)
-        case 'top10_tail_filtered':
-            tail_confidences = [conf.tail_mean_conf for conf in confidences]
-            return weighted_majority_vote(valid_tasks,
-                                          answers=answers,
-                                          confidences=tail_confidences,
-                                          filter_top_percent=0.1,
-                                          type=vote_policy)
-        case 'top10_bottom_window_filtered':
-            bottom_window_confidences = [
-                conf.bottom_window_mean_conf for conf in confidences
-            ]
-            return weighted_majority_vote(valid_tasks,
-                                          answers=answers,
-                                          confidences=bottom_window_confidences,
-                                          filter_top_percent=0.1,
-                                          type=vote_policy)
-        case _:
-            raise NotImplementedError(
-                f"Vote policy '{vote_policy}' is not implemented")
+    mean_confs = [conf.mean_conf for conf in confidences]
+    tail_confs = [conf.tail_mean_conf for conf in confidences]
+    bottom_window_confs = [conf.bottom_window_mean_conf for conf in confidences]
+    min_window_confs = [conf.min_window_conf for conf in confidences]
+    vote_policy_to_voted_task = {
+        'single_vote':
+        random.choice(valid_tasks),
+        'basic_majority_vote':
+        basic_majority_vote(valid_tasks, answers=answers),
+        'mean_confidence_weighted':
+        weighted_majority_vote(valid_tasks,
+                               answers=answers,
+                               confidences=mean_confs),
+        'tail_confidence_weighted':
+        weighted_majority_vote(valid_tasks,
+                               answers=answers,
+                               confidences=tail_confs),
+        'bottom_window_weighted':
+        weighted_majority_vote(valid_tasks,
+                               answers=answers,
+                               confidences=bottom_window_confs),
+        'min_window_weighted':
+        weighted_majority_vote(valid_tasks,
+                               answers=answers,
+                               confidences=min_window_confs),
+        'top10_tail_filtered':
+        weighted_majority_vote(valid_tasks,
+                               answers=answers,
+                               confidences=tail_confs,
+                               filter_top_percent=0.1),
+        'top10_bottom_window_filtered':
+        weighted_majority_vote(valid_tasks,
+                               answers=answers,
+                               confidences=bottom_window_confs,
+                               filter_top_percent=0.1),
+    }
+
+    voted_task = vote_policy_to_voted_task[vote_policy]
+    voted_task.result.vote_policy_to_voted_task = vote_policy_to_voted_task
+    voted_task.result.output_token_num = output_token_num
+    return voted_task

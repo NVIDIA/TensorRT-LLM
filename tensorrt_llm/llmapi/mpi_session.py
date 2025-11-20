@@ -48,6 +48,10 @@ class MPINodeState:
     '''
 
     state = None
+    # Global MPICommExecutor instance to be reused across multiple MpiCommSession instances
+    # This is necessary because MPICommExecutor can only be created once per MPI process
+    _global_comm_executor = None
+    _global_mpi_pool = None
 
     @staticmethod
     def is_initialized() -> bool:
@@ -183,6 +187,7 @@ class MpiCommSession(MpiSession):
         self.n_workers = n_workers
         self.thread_pool: Optional[ThreadPoolExecutor] = None
         self.mpi_pool: Optional[MPIPoolExecutor] = None
+        self.owns_mpi_pool = False  # Track if this instance owns the mpi_pool
 
         if n_workers <= 0:
             raise ValueError(
@@ -230,9 +235,11 @@ class MpiCommSession(MpiSession):
         return [future.result() for future in futures]
 
     def shutdown(self, wait=True):
-        if self.mpi_pool is not None:
+        # Only shutdown the mpi_pool if this instance created it
+        # For shared global mpi_pool, we don't shut it down
+        if self.mpi_pool is not None and self.owns_mpi_pool:
             self.mpi_pool.shutdown(wait=wait)
-            self.mpi_pool = None
+        self.mpi_pool = None
         if self.thread_pool is not None:
             self.thread_pool.shutdown(wait=wait)
             self.thread_pool = None
@@ -244,8 +251,36 @@ class MpiCommSession(MpiSession):
         assert not self.mpi_pool, 'MPI session already started'
 
         self.thread_pool = ThreadPoolExecutor(max_workers=2)
-        comm_executor = MPICommExecutor(self.comm)
-        self.mpi_pool = comm_executor.__enter__()
+
+        # Use global MPICommExecutor if using COMM_WORLD
+        # This is necessary because MPICommExecutor can only be created once per MPI process
+        logger_debug(
+            f"_start_mpi_pool: ENABLE_MULTI_DEVICE={ENABLE_MULTI_DEVICE}, self.comm={self.comm}\n",
+            "grey")
+        if ENABLE_MULTI_DEVICE:
+            logger_debug(
+                f"_start_mpi_pool: Checking if self.comm == mpi4py.MPI.COMM_WORLD: {self.comm == mpi4py.MPI.COMM_WORLD}\n",
+                "grey")
+        if ENABLE_MULTI_DEVICE and self.comm == mpi4py.MPI.COMM_WORLD:
+            if MPINodeState._global_comm_executor is None:
+                logger_debug("Creating global MPICommExecutor for COMM_WORLD\n",
+                             "yellow")
+                MPINodeState._global_comm_executor = MPICommExecutor(self.comm)
+                MPINodeState._global_mpi_pool = MPINodeState._global_comm_executor.__enter__(
+                )
+            else:
+                logger_debug("Reusing global MPICommExecutor for COMM_WORLD\n",
+                             "yellow")
+            self.mpi_pool = MPINodeState._global_mpi_pool
+            self.owns_mpi_pool = False
+        else:
+            logger_debug(
+                f"_start_mpi_pool: Creating new MPICommExecutor (not COMM_WORLD or ENABLE_MULTI_DEVICE=False)\n",
+                "grey")
+            # For non-COMM_WORLD communicators, create a new executor
+            comm_executor = MPICommExecutor(self.comm)
+            self.mpi_pool = comm_executor.__enter__()
+            self.owns_mpi_pool = True
 
     def __del__(self):
         self.shutdown_abort()
@@ -264,9 +299,35 @@ class RemoteTask(NamedTuple):
 class RemoteMpiCommSessionClient(MpiSession):
     '''
     RemoteMpiCommSessionClient is a variant of MpiCommSession that is used to connect to a remote MPI pool.
+
+    Note: This class uses a global singleton pattern because ZeroMQ PAIR sockets only support
+    one connection at a time. Multiple LLM instances will reuse the same client connection.
     '''
+    _global_instance = None
+    _global_instance_lock = threading.Lock()
+
+    def __new__(cls, addr: str, hmac_key: Optional[bytes] = None):
+        # Implement singleton pattern to reuse the same client connection
+        # for multiple LLM instances, since PAIR sockets only support one connection
+        with cls._global_instance_lock:
+            if cls._global_instance is None or cls._global_instance.addr != addr:
+                logger_debug(
+                    f"Creating new global RemoteMpiCommSessionClient for {addr}\n",
+                    "yellow")
+                instance = super().__new__(cls)
+                cls._global_instance = instance
+                instance._initialized = False
+            else:
+                logger_debug(
+                    f"Reusing existing global RemoteMpiCommSessionClient for {addr}\n",
+                    "yellow")
+            return cls._global_instance
 
     def __init__(self, addr: str, hmac_key: Optional[bytes] = None):
+        # Only initialize once
+        if self._initialized:
+            return
+
         # FIXME: this is a hack to avoid circular import, resolve later
         from tensorrt_llm.executor.ipc import ZeroMqQueue
         self.addr = addr
@@ -277,6 +338,7 @@ class RemoteMpiCommSessionClient(MpiSession):
                                  socket_type=zmq.PAIR,
                                  use_hmac_encryption=bool(hmac_key))
         self._is_shutdown = False
+        self._initialized = True
 
     def submit(self,
                task: Callable[..., T],
@@ -329,10 +391,16 @@ class RemoteMpiCommSessionClient(MpiSession):
         self.shutdown()
 
     def shutdown(self, wait=True):
-        pass
+        # NOTE: We do NOT close the queue or mark as shutdown for the singleton instance.
+        # The RemoteMpiCommSessionClient is a global singleton that's reused across multiple
+        # LLM instances. Marking it as shutdown would prevent subsequent LLM instances from
+        # using it. The connection stays open for the entire lifetime of the mgmn setup.
+        logger_debug(
+            f"RemoteMpiCommSessionClient.shutdown() called (no-op for singleton)\n",
+            "grey")
 
     def shutdown_abort(self, grace: float = 60, reason=None):
-        pass
+        self.shutdown()
 
 
 class RemoteMpiCommSessionServer():
@@ -393,7 +461,26 @@ class RemoteMpiCommSessionServer():
     def serve(self):
         logger_debug(f"RemoteMpiCommSessionServer listening on {self.addr}\n",
                      "yellow")
+        pending_futures = []
         while True:
+            # Wait for any pending futures from previous tasks to complete
+            # This ensures all ranks are ready before accepting the next task
+            if pending_futures:
+                logger_debug(
+                    f"RemoteMpiCommSessionServer waiting for {len(pending_futures)} pending futures to complete\n",
+                    "grey")
+                for future in pending_futures:
+                    try:
+                        future.result()  # Wait for completion
+                    except Exception as e:
+                        print_colored(
+                            f"RemoteMpiCommSessionServer future failed with exception: {e}\n",
+                            "red")
+                pending_futures.clear()
+                logger_debug(
+                    "RemoteMpiCommSessionServer all pending futures completed\n",
+                    "grey")
+
             message: Optional[RemoteTask] = self.queue.get()
             if message is None:
                 logger_debug(
@@ -410,6 +497,8 @@ class RemoteMpiCommSessionServer():
                     *message.args, **message.kwargs)
                 self.num_results = self.session.n_workers
                 assert len(futures) == self.num_results == mpi_world_size()
+                # Store futures to wait for them before the next task
+                pending_futures = list(futures)
                 if message.sync:
                     for future in futures:
                         future.add_done_callback(self.mpi_future_callback)

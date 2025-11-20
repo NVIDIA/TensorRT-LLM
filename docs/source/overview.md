@@ -25,6 +25,11 @@ TensorRT LLM delivers breakthrough performance on the latest NVIDIA GPUs:
 
 TensorRT LLM supports the latest and most popular LLM architectures:
 
+- **Language Models**: GPT-OSS, Deepseek-R1/V3, Llama 3/4, Qwen2/3, Gemma 3, Phi 4...
+- **Multi-modal Models**: LLaVA-NeXT, Qwen2-VL, VILA, Llama 3.2 Vision...
+
+TensorRT LLM strives to support the most popular models on **Day 0**.
+
 ### FP4 Support
 [NVIDIA B200 GPUs](https://www.nvidia.com/en-us/data-center/dgx-b200/) , when used with TensorRT LLM, enable seamless loading of model weights in the new [FP4 format](https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/#what_is_nvfp4), allowing you to automatically leverage optimized FP4 kernels for efficient and accurate low-precision inference.
 

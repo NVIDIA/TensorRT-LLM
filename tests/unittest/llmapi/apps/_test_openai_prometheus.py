@@ -48,6 +48,7 @@ def server(model_name: str,
 
 
 def test_metrics_endpoint(server: RemoteOpenAIServer):
+    metric_prefix = "trtllm_"
 
     client = server.get_client()
     client.completions.create(
@@ -61,7 +62,7 @@ def test_metrics_endpoint(server: RemoteOpenAIServer):
     assert response.status is 200
 
     data = response.read().decode("utf-8")
-    assert "request_success_total" in data
-    assert "e2e_request_latency_seconds" in data
-    assert "time_to_first_token_seconds" in data
-    assert "request_queue_time_seconds" in data
+    assert metric_prefix + "request_success_total" in data
+    assert metric_prefix + "e2e_request_latency_seconds" in data
+    assert metric_prefix + "time_to_first_token_seconds" in data
+    assert metric_prefix + "request_queue_time_seconds" in data

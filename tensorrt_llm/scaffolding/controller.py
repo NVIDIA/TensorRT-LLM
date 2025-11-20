@@ -67,7 +67,7 @@ class NativeGenerationController(Controller):
             for key, value in self.sampling_params.items():
                 if getattr(task, key) is None:
                     setattr(task, key, value)
-            task.streaming = self.streaming
+            task.streaming_output_flag = self.streaming
 
         yield tasks
 

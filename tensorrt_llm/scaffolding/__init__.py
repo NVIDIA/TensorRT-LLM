@@ -25,6 +25,7 @@ __all__ = [
     "GenerationTask",
     "StreamGenerationTask",
     "RewardTask",
+    "StreamGenerationTask",
     "Worker",
     "OpenaiWorker",
     "TRTOpenaiWorker",

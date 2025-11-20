@@ -8,6 +8,10 @@ import torch
 from tensorrt_llm.logger import logger
 
 
+def get_size_in_byte(target_shape: list[int], target_dtype: torch.dtype):
+    return math.prod(target_shape) * target_dtype.itemsize
+
+
 @dataclass
 class BufferBlock:
     """A container for a buffer tensor and its state."""
@@ -36,13 +40,13 @@ class Buffers:
                  target_dtype: torch.dtype) -> torch.Tensor:
         """Safely creates a view of a raw byte buffer with the desired shape and dtype."""
         # The buffer is stored as uint8, so its numel is its size in bytes.
-        required_size_in_bytes = math.prod(target_shape) * target_dtype.itemsize
-        if buffer.numel() < required_size_in_bytes:
+        required_memory_size = get_size_in_byte(target_shape, target_dtype)
+        if buffer.numel() < required_memory_size:
             raise ValueError(
                 "Buffer is too small for the requested shape and dtype.")
 
         # Slice the buffer to the exact required size, then view it with the correct type and shape.
-        return buffer[:required_size_in_bytes].view(target_dtype).view(
+        return buffer[:required_memory_size].view(target_dtype).view(
             target_shape)
 
     def get_buffer(self, tensor_shape: list[int], dtype: torch.dtype,
@@ -50,6 +54,7 @@ class Buffers:
 
         # all buffers are allocated with 1 byte element size
         required_memory_size = math.prod(tensor_shape) * dtype.itemsize
+
         candidate_blocks = self.buffers.get(buffer_name, [])
 
         # Find the best-fit available buffer.

@@ -5,8 +5,10 @@ from typing import Iterable, List, Optional, Tuple
 
 import torch
 
+from tensorrt_llm.llmapi.llm_args import GuidedDecodingConfig
+
 from ..._utils import nvtx_range
-from ...bindings.executor import GuidedDecodingConfig, GuidedDecodingParams
+from ...bindings.executor import GuidedDecodingParams
 from ...bindings.internal.batch_manager import LlmRequestType
 from ...logger import logger
 from ..hostfunc import hostfunc

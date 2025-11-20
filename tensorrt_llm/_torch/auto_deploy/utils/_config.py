@@ -190,6 +190,7 @@ class DynamicYamlMixInForSettings:
     ) -> tuple[PydanticBaseSettingsSource, ...]:
         """Customise settings sources."""
         deferred_yaml_settings = DynamicYamlWithDeepMergeSettingsSource(settings_cls)
+        env_settings.env_prefix = "AD_"  # NOTE: set prefix to avoid conflicts with other env vars
         return (
             init_settings,
             env_settings,

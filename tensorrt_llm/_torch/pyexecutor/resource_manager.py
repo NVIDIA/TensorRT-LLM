@@ -172,6 +172,9 @@ class KVCacheManager(BaseResourceManager):
         max_beam_width: int = 1,
         is_draft: bool = False,
         kv_connector_manager: Optional[KvCacheConnectorManager] = None,
+        enable_indexer_k_cache: bool = False,
+        indexer_k_cache_quant_block_size: int = 128,
+        indexer_k_cache_index_head_dim: int = 0,
         **kwargs,
     ) -> None:
         self.mapping = mapping
@@ -344,6 +347,10 @@ class KVCacheManager(BaseResourceManager):
             'enable_partial_reuse': kv_cache_config.enable_partial_reuse,
             'copy_on_partial_reuse': kv_cache_config.copy_on_partial_reuse,
             'kv_connector_manager': self.kv_connector_manager,
+            'enable_indexer_k_cache': enable_indexer_k_cache,
+            'indexer_k_cache_quant_block_size':
+            indexer_k_cache_quant_block_size,
+            'indexer_k_cache_index_head_dim': indexer_k_cache_index_head_dim
         }
 
         if self.event_buffer_max_size > 0:
@@ -711,7 +718,7 @@ class KVCacheManager(BaseResourceManager):
             if kv_cache_config.free_gpu_memory_fraction is not None:
                 max_tokens = min(kv_cache_config.max_tokens, max_tokens)
                 logger.warning(
-                    f'Both free_gpu_memory_fraction and max_tokens are set (to {free_mem_fraction} and {max_tokens} with free memory {free_mem / (1 << 32)} of total memory {total_mem / (1<<32)}, respectively). The smaller value will be used.'
+                    f'Both free_gpu_memory_fraction and max_tokens are set (to {free_mem_fraction} and {max_tokens} with free memory {free_mem / (1 << 30)}GiB of total memory {total_mem / (1<<30)}GiB, respectively). The smaller value will be used.'
                 )
             else:
                 max_tokens = kv_cache_config.max_tokens
@@ -806,16 +813,47 @@ class KVCacheManager(BaseResourceManager):
         return (self.get_num_free_blocks() * self.tokens_per_block -
                 self.num_extra_kv_tokens - max_num_draft_tokens)
 
-    def get_buffers(self, layer_idx: int) -> Optional[torch.Tensor]:
+    def get_buffers(self,
+                    layer_idx: int,
+                    kv_layout: str = "NHD") -> Optional[torch.Tensor]:
+        ''' Slice KV tensor for a specified layer and reshape it.
+
+        1. Slice:
+            [max_num_pages, num_layers, kv_factor, page_size * num_kv_heads * head_dim] ->
+            [max_num_pages, kv_factor, page_size * num_kv_heads * head_dim]
+
+        2. Reshape:
+            kv_layout = "NHD" -> [max_num_pages, kv_factor, page_size, num_kv_heads, head_dim]
+            kv_layout = "HND" -> [max_num_pages, kv_factor, num_kv_heads, page_size, head_dim]
+
+        Note that different attention backend/implementation can have different KV layouts,
+        "kv_layout" should be set accordingly to avoid surprises.
+        '''
         layer_offset = self.layer_offsets[layer_idx]
         result = self.impl.get_primary_pool_data(layer_offset)
-        return result.reshape(
-            result.shape[0],
-            self.kv_factor,
-            self.tokens_per_block,
-            self.num_kv_heads_per_layer[layer_offset],
-            self.head_dim,
-        )
+
+        assert kv_layout in ["NHD",
+                             "HND"], f"Unsupported kv_layout: {kv_layout}"
+        if kv_layout == "NHD":
+            return result.reshape(
+                result.shape[0],
+                self.kv_factor,
+                self.tokens_per_block,
+                self.num_kv_heads_per_layer[layer_offset],
+                self.head_dim,
+            )
+        else:
+            return result.reshape(
+                result.shape[0],
+                self.kv_factor,
+                self.num_kv_heads_per_layer[layer_offset],
+                self.tokens_per_block,
+                self.head_dim,
+            )
+
+    def get_indexer_k_cache_pool_data(self, layer_idx: int) -> torch.Tensor:
+        result = self.impl.get_indexer_k_cache_pool_data(layer_idx)
+        return result.view(result.shape[0], -1)
 
     def get_unique_primary_pool(self) -> torch.Tensor:
         return self.impl.get_unique_primary_pool()
@@ -1153,6 +1191,10 @@ class KVCacheManager(BaseResourceManager):
         else:
             return None
 
+    def reset_reuse_state(self):
+        """Reset the reuse state of the KV cache manager."""
+        self.impl.reset_reuse_state()
+
 
 class SlotManager:
 
@@ -1275,18 +1317,20 @@ class BlockManager:
 
 class ResourceManager:
 
-    def __init__(self, resource_managers: dict[str, BaseResourceManager]):
+    def __init__(self, resource_managers: dict[ResourceManagerType,
+                                               BaseResourceManager]):
         self.resource_managers = OrderedDict(resource_managers)
 
-    def __call__(self, name: str):
-        return self.resource_managers[name]
+    def __call__(self, type: ResourceManagerType):
+        return self.resource_managers[type]
 
-    def register_resource_manager(self, name: str,
+    def register_resource_manager(self, type: ResourceManagerType,
                                   resource_manager: BaseResourceManager):
-        self.resource_managers[name] = resource_manager
+        self.resource_managers[type] = resource_manager
 
-    def get_resource_manager(self, name: str) -> BaseResourceManager:
-        return self.resource_managers.get(name)
+    def get_resource_manager(
+            self, type: ResourceManagerType) -> Optional[BaseResourceManager]:
+        return self.resource_managers.get(type)
 
     @nvtx_range("prepare_resources")
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
@@ -1297,8 +1341,8 @@ class ResourceManager:
     @nvtx_range("update_resources")
     def update_resources(self,
                          scheduled_batch: ScheduledRequests,
-                         attn_metadata: "AttentionMetadata" = None,
-                         kv_cache_dtype_byte_size: float = None):
+                         attn_metadata: Optional["AttentionMetadata"] = None,
+                         kv_cache_dtype_byte_size: Optional[float] = None):
         for _, resource_manager in self.resource_managers.items():
             if hasattr(resource_manager, "update_resources"):
                 if isinstance(resource_manager, KVCacheManager):
@@ -1313,7 +1357,8 @@ class ResourceManager:
             if hasattr(resource_manager, "free_resources"):
                 resource_manager.free_resources(request)
 
-    def reorder_pipeline(self, resource_manager_list: list[str]):
+    def reorder_pipeline(self,
+                         resource_manager_list: list[ResourceManagerType]):
         assert set(resource_manager_list) == set(self.resource_managers.keys())
         for resource_manager in resource_manager_list:
             self.resource_managers.move_to_end(resource_manager)

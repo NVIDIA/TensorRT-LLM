@@ -127,6 +127,12 @@ private:
             // convert back to io_dtype and store the topk expert results in hostData.mPtrTopKPacked
             for (int ie = 0; ie < param.topK; ++ie)
             {
+                // Set invalid topk indices for the first half of the topk
+                if (param.hasInvalidTopKInput && ie < param.topK / 2 + 1)
+                {
+                    expIdx[ie].idx = -1;
+                }
+
                 PackedType si{static_cast<T>(expIdx[ie].score), expIdx[ie].idx};
                 reinterpret_cast<PackedType*>(bufferCast<int8_t>(*this->mPtrTopKPackedHost))[it * param.topK + ie] = si;
                 if (param.useTopKAsInput)
@@ -198,7 +204,7 @@ TYPED_TEST(RoutingRenormalizeKernelTest, BlockLevelParallelization)
         /*numExperts=*/128, /*topK=*/8,
         /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/256,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false,
+        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false, /*hasInvalidTopKInput=*/false,
         /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
     this->runTest(param);
 };
@@ -209,7 +215,18 @@ TYPED_TEST(RoutingRenormalizeKernelTest, BlockLevelParallelizationWithExpertPara
         /*numExperts=*/128, /*topK=*/8,
         /*expertParallelization=*/2, /*expertParallelizationId=*/1, /*tileTokensDim=*/192,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/true,
+        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false, /*hasInvalidTopKInput=*/false,
+        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingRenormalizeKernelTest, BlockLevelParallelizationWithInvalidTopKInput)
+{
+    RoutingKernelTestParam param(RoutingMethodType::Renormalize, /*numTokens=*/4,
+        /*numExperts=*/128, /*topK=*/8,
+        /*expertParallelization=*/2, /*expertParallelizationId=*/1, /*tileTokensDim=*/192,
+        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
+        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/true, /*hasInvalidTopKInput=*/true,
         /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
     this->runTest(param);
 };
@@ -220,7 +237,7 @@ TYPED_TEST(RoutingRenormalizeKernelTest, ClusterLevelParallelization)
         /*numExperts=*/128, /*topK=*/8,
         /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/192,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false,
+        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false, /*hasInvalidTopKInput=*/false,
         /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
     this->runTest(param);
 };
@@ -231,7 +248,18 @@ TYPED_TEST(RoutingRenormalizeKernelTest, ClusterLevelParallelizationWithExpertPa
         /*numExperts=*/128, /*topK=*/8,
         /*expertParallelization=*/2, /*expertParallelizationId=*/1, /*tileTokensDim=*/256,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false,
+        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false, /*hasInvalidTopKInput=*/false,
+        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingRenormalizeKernelTest, ClusterLevelParallelizationWithInvalidTopKInput)
+{
+    RoutingKernelTestParam param(RoutingMethodType::Renormalize, /*numTokens=*/100,
+        /*numExperts=*/128, /*topK=*/8,
+        /*expertParallelization=*/2, /*expertParallelizationId=*/1, /*tileTokensDim=*/256,
+        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
+        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/true, /*hasInvalidTopKInput=*/true,
         /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
     this->runTest(param);
 };
@@ -242,7 +270,7 @@ TYPED_TEST(RoutingRenormalizeKernelTest, ClusterLevelParallelizationWithRenormal
         /*numExperts=*/128, /*topK=*/8,
         /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/256,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false,
+        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false, /*hasInvalidTopKInput=*/false,
         /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
     this->runTest(param);
 };
@@ -264,7 +292,18 @@ TYPED_TEST(RoutingRenormalizeKernelTest, ClusterLevelParallelizationTop4)
         /*numExperts=*/128, /*topK=*/4,
         /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/8,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/true,
+        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false, /*hasInvalidTopKInput=*/false,
+        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingRenormalizeKernelTest, ClusterLevelParallelizationWithInvalidTopKInputTop4)
+{
+    RoutingKernelTestParam param(RoutingMethodType::Renormalize, /*numTokens=*/200,
+        /*numExperts=*/128, /*topK=*/4,
+        /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/8,
+        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
+        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/true, /*hasInvalidTopKInput=*/true,
         /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
     this->runTest(param);
 };
@@ -275,7 +314,7 @@ TYPED_TEST(RoutingRenormalizeKernelTest, ClusterLevelParallelizationWithExpertPa
         /*numExperts=*/128, /*topK=*/4,
         /*expertParallelization=*/2, /*expertParallelizationId=*/1, /*tileTokensDim=*/8,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/true,
+        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false, /*hasInvalidTopKInput=*/false,
         /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
     this->runTest(param);
 };
@@ -286,7 +325,7 @@ TYPED_TEST(RoutingRenormalizeKernelTest, ClusterLevelParallelizationWithRenormal
         /*numExperts=*/128, /*topK=*/4,
         /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/8,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/true,
+        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false, /*hasInvalidTopKInput=*/false,
         /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
     this->runTest(param);
 };
@@ -297,7 +336,7 @@ TYPED_TEST(RoutingRenormalizeKernelTest, DeviceLevelParallelizationTop4)
         /*numExperts=*/128, /*topK=*/4,
         /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/256,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/true,
+        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/true, /*hasInvalidTopKInput=*/true,
         /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 8);
     this->runTest(param);
 };
@@ -308,7 +347,7 @@ TYPED_TEST(RoutingRenormalizeKernelTest, BlockLevelParallelizationLargeN)
         /*numExperts=*/512, /*topK=*/10,
         /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/256,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false,
+        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false, /*hasInvalidTopKInput=*/false,
         /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
     this->runTest(param);
 };
@@ -319,7 +358,7 @@ TYPED_TEST(RoutingRenormalizeKernelTest, ClusterLevelParallelizationLargeN)
         /*numExperts=*/512, /*topK=*/10,
         /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/256,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false,
+        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false, /*hasInvalidTopKInput=*/false,
         /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
     this->runTest(param);
 };
@@ -330,7 +369,18 @@ TYPED_TEST(RoutingRenormalizeKernelTest, DeviceLevelParallelizationLargeN)
         /*numExperts=*/512, /*topK=*/10,
         /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/256,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false,
+        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false, /*hasInvalidTopKInput=*/false,
+        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 8);
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingRenormalizeKernelTest, DeviceLevelParallelizationLargeNWithInvalidTopKInput)
+{
+    RoutingKernelTestParam param(RoutingMethodType::Renormalize, /*numTokens=*/1000,
+        /*numExperts=*/512, /*topK=*/10,
+        /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/256,
+        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
+        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/true, /*hasInvalidTopKInput=*/true,
         /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 8);
     this->runTest(param);
 };

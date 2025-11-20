@@ -19,7 +19,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
-namespace tensorrt_llm::kernels::moe_a2a
+namespace tensorrt_llm::kernels::mnnvl_throughput
 {
 
 // Configuration constants
@@ -91,7 +91,7 @@ struct MoeA2ADispatchParams
 
     // Token configuration
     int local_num_tokens;    // Number of tokens on this rank
-    int max_tokens_per_rank; // Maximum tokens per rank for pre-allocation
+    int max_tokens_per_rank; // Maximum tokens per rank for pre-allocation TODO: Rename to runtime_max_tokens_per_rank
     int top_k;               // Number of experts per token
 
     // Expert routing information
@@ -101,23 +101,22 @@ struct MoeA2ADispatchParams
     int num_payloads;                         // Number of different payload types
     PayloadDescriptor payloads[kMaxPayloads]; // Array of payload descriptors
 
-    // Receive buffers and synchronization
-    void* recv_buffers[kMaxRanks][kMaxPayloads]; // Per-rank receive buffers for each payload
+    // Local aux data
+    uint32_t* flag_val;       // The value of the flag for this round (stored on the local rank)
+    int* local_token_counter; // Atomic counter for completed tokens on this rank
+    int* send_counters;       // [ep_size] atomic counters - tracks tokens sent to each target rank
+    int* topk_target_ranks; // Top-K compact routing info per local token (size: [local_num_tokens, top_k]), target rank
+                            // per k, -1 for duplicates
+    int* topk_send_indices; // Top-K compact routing info per local token (size: [local_num_tokens, top_k]), dst index
+                            // per k, -1 for duplicates
 
-    // Synchronization
+    // Distributed aux data and recv buffers
+    int* recv_counters[kMaxRanks]; // tracks tokens received from each source rank. Each rank has [ep_size] counters
     uint32_t* completion_flags[kMaxRanks]; // If completion_flags[target_rank][source_rank] == *flag_val, then source
                                            // rank has signaled the target rank
-    uint32_t* flag_val;                    // The value of the flag for this round (stored on the local rank)
+    void* recv_buffers[kMaxRanks][kMaxPayloads]; // Per-rank receive buffers for each payload
 
-    // Communication tracking
-    int* send_counters;            // [ep_size] atomic counters - tracks tokens sent to each target rank
-    int* recv_counters[kMaxRanks]; // tracks tokens received from each source rank. Each rank has [ep_size] counters
-    int* local_token_counter;      // Atomic counter for completed tokens on this rank
-
-    // Top-K compact routing info per local token (size: [local_num_tokens, top_k])
-    int* topk_target_ranks; // target rank per k, -1 for duplicates
-    int* topk_send_indices; // dst index per k, -1 for duplicates
-
+    // CUDA stream
     cudaStream_t stream;
 };
 
@@ -137,30 +136,33 @@ struct MoeA2ACombineParams
 
     // Token configuration
     int local_num_tokens;    // Number of tokens on this rank
-    int max_tokens_per_rank; // Maximum tokens per rank for pre-allocation
+    int max_tokens_per_rank; // Maximum tokens per rank for pre-allocation TODO: Rename to runtime_max_tokens_per_rank
     int top_k;               // Number of experts per token
 
-    // Expert routing information
-    int const* recv_counters; // [ep_size] number of valid tokens per source rank for this target
-
-    // Top-K compact routing info per local token (size: [local_num_tokens, top_k])
-    int const* topk_target_ranks; // target rank per k, -1 for duplicates
-    int const* topk_send_indices; // dst index per k, -1 for duplicates
-
-    // Single payload information
-    void const* recv_buffers[kMaxRanks]; // Per-rank receive buffers (only for single payload)
-    void* output_data;                   // Output buffer [local_num_tokens, elements_per_token]
-    int elements_per_token;              // Number of elements per token
-    nvinfer1::DataType dtype;            // Data type for proper summation
-
-    // Synchronization
-    uint32_t* completion_flags[kMaxRanks]; // If completion_flags[target_rank][source_rank] == *flag_val, then source
-                                           // rank has signaled the target rank
-    uint32_t* flag_val;                    // The value of the flag for this round (stored on the local rank)
-
-    cudaStream_t stream;
     // Prepare-only field: original payload tensor pointer used to stage into workspace
     void const* prepare_payload;
+
+    // Output tensor
+    void* output_data; // Output buffer [local_num_tokens, elements_per_token]
+    // Payload information
+    int elements_per_token;   // Number of elements per token
+    nvinfer1::DataType dtype; // Data type for proper summation
+
+    // Local aux data
+    uint32_t* flag_val;     // The value of the flag for this round (stored on the local rank)
+    int* topk_target_ranks; // Top-K compact routing info per local token (size: [local_num_tokens, top_k]), target rank
+                            // per k, -1 for duplicates
+    int* topk_send_indices; // Top-K compact routing info per local token (size: [local_num_tokens, top_k]), dst index
+                            // per k, -1 for duplicates
+    int const* recv_counters; // [ep_size] number of valid tokens per source rank for this target
+
+    // Distributed aux data and recv buffers
+    uint32_t* completion_flags[kMaxRanks]; // If completion_flags[target_rank][source_rank] == *flag_val, then source
+                                           // rank has signaled the target rank
+    void const* recv_buffers[kMaxRanks];   // Per-rank receive buffers (only for single payload)
+
+    // CUDA stream
+    cudaStream_t stream;
 };
 
 // Combine kernels
@@ -175,4 +177,4 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params);
 void moe_a2a_sanitize_expert_ids_launch(int32_t* expert_ids, int32_t const* recv_counters, int32_t invalid_id,
     int ep_size, int max_tokens_per_rank, int top_k, cudaStream_t stream);
 
-} // namespace tensorrt_llm::kernels::moe_a2a
+} // namespace tensorrt_llm::kernels::mnnvl_throughput

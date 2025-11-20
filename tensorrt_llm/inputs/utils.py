@@ -374,7 +374,7 @@ NOTE:
 """
 
 HF_CHAT_TEMPLATE_EXCEPTIONS = ["llava_llama"]
-PLACEHOLDER_EXCEPTIONS = ["llava_next"]
+PLACEHOLDER_EXCEPTIONS = ["llava_next", "NemotronH_Nano_VL_V2"]
 
 
 # Helpers to always get the latest supported multimodal model types from the registry
@@ -533,6 +533,29 @@ def handle_placeholder_exceptions(model_type: str,
                                               mm_placeholder_counts):
             conv["content"] = [{"type": "text", "text": conv["content"]}, \
                 *[{"type": "image"} for _ in range(mm_placeholder_count['<image>'])]]
+    elif model_type == "NemotronH_Nano_VL_V2":
+        # There are divergences between trtllm and vllm on how to handle the placeholders.
+        # For now, we will use this exception to handle with the divergences in TRTLLM.
+        # In the near future, we will remove this placeholder exception and use dict format as vllm does.
+        for conv, mm_placeholder_count in zip(conversation,
+                                              mm_placeholder_counts):
+            if '<image>' not in mm_placeholder_count and '<video>' not in mm_placeholder_count:
+                # Skip if no image or video placeholders.
+                continue
+
+            # Contents from all kinds of roles will be handled.
+            content = []
+            content.append({"type": "text", "text": conv["content"]})
+            # Extend image/video placeholders so that the chat_template can be applied correctly.
+            if '<image>' in mm_placeholder_count:
+                content.extend([{
+                    "type": "image"
+                } for _ in range(mm_placeholder_count['<image>'])])
+            if '<video>' in mm_placeholder_count:
+                content.extend([{
+                    "type": "video"
+                } for _ in range(mm_placeholder_count['<video>'])])
+            conv["content"] = content
     else:
         raise ValueError(f"This path should not be reached for: {model_type}")
     return conversation
@@ -545,7 +568,7 @@ def apply_chat_template(
     processor: ProcessorMixin,
     conversation: list[ConversationMessage],
     add_generation_prompt: bool,
-    mm_placeholder_counts: dict[str, int],
+    mm_placeholder_counts: list[dict[str, int]],
     tools: Optional[list[dict[str, Any]]] = None,
     documents: Optional[list[dict[str, str]]] = None,
     chat_template: Optional[str] = None,
@@ -567,7 +590,7 @@ def apply_chat_template(
     if model_type in PLACEHOLDER_EXCEPTIONS:
         # flattened content do not work for these models, so go back to other formats as needed
         conversation = handle_placeholder_exceptions(model_type, conversation,
-                                                     [mm_placeholder_counts])
+                                                     mm_placeholder_counts)
 
     return tokenizer.apply_chat_template(
         conversation=conversation,
@@ -732,7 +755,7 @@ def default_multimodal_input_loader(
             processor=processor,
             conversation=[conv],
             add_generation_prompt=True,
-            mm_placeholder_counts=mm_placeholder_counts)
+            mm_placeholder_counts=[mm_placeholder_counts])
         input = {"prompt": prompt}
         if mm_placeholder_counts:
             if mm_embeddings is not None:

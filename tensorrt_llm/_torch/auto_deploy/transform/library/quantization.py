@@ -14,7 +14,7 @@ from ...custom_ops.quant import (
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.node_utils import (
-    extract_param_names_from_lin_node,
+    extract_param_names_from_node,
     get_quantization_params_from_linear_node,
     is_bmm_op,
     is_linear_op,
@@ -136,7 +136,7 @@ class Quantization(BaseTransform):
 
         The state_dict is also updated to contain the sharded weights.
         """
-        param_name, _ = extract_param_names_from_lin_node(node)
+        param_name, _ = extract_param_names_from_node(node)
         original_weight = gm.get_parameter(param_name)
         new_param = nn.Parameter(self.quantize_weight(original_weight), requires_grad=False)
         modname, _, attrname = param_name.rpartition(".")
@@ -375,12 +375,10 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
                     )
                     state_dict[input_scale_name] = 1 / state_dict[input_scale_name]
                     weight_scale = state_dict[weight_name + "_scale"].view(float4_sf_dtype)
-                    ori_shape = weight_scale.shape
                     state_dict[weight_name + "_scale"] = (
                         torch.ops.trtllm.block_scale_interleave(
                             weight_scale.view(torch.uint8).cpu().contiguous()
                         )
-                        .reshape(ori_shape)
                         .view(float4_sf_dtype)
                         .reshape(-1)
                     )
@@ -552,7 +550,7 @@ class FP8BMMQuantizationFromConfig(Quantization):
                 cnt += 1
 
         return gm, TransformInfo(
-            skipped=False, num_matches=cnt, is_clean=False, has_valid_shapes=True
+            skipped=False, num_matches=cnt, is_clean=cnt == 0, has_valid_shapes=True
         )
 
 
@@ -583,7 +581,7 @@ class FP8QuantizationFromGraph(FP8LinearQuantizationFromConfig):
 
         remove_output_quantizers(gm)
         return gm, TransformInfo(
-            skipped=False, num_matches=cnt, is_clean=False, has_valid_shapes=True
+            skipped=False, num_matches=cnt, is_clean=cnt == 0, has_valid_shapes=True
         )
 
 
@@ -612,7 +610,8 @@ class NVFP4QuantizationFromGraph(NVFP4LinearQuantizationFromConfig):
                 self._insert_quantized_linear(gm, n, is_quantized_graph=True)
                 cnt += 1
 
+        # if cnt > 0:
         remove_output_quantizers(gm)
         return gm, TransformInfo(
-            skipped=False, num_matches=cnt, is_clean=False, has_valid_shapes=True
+            skipped=False, num_matches=cnt, is_clean=cnt == 0, has_valid_shapes=True
         )

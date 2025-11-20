@@ -10,7 +10,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -99,6 +99,7 @@ class TuningConfig:
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
     tune_max_num_tokens: int = None
     inputs_pre_hook: Callable = None
+    use_cuda_graph: bool = False
 
 
 @dataclass(unsafe_hash=True)
@@ -127,7 +128,7 @@ Dim = Union[DynamicDim, StaticDim]
 class OptimizationProfile:
     '''Ranges of all tensors, all dimension
     '''
-    shapes: List[List[Dim]]
+    shapes: List[List[Dim]] = field(default_factory=lambda: [[]])
 
     def get_hash_key(self):
         return self.get_opt_shapes()
@@ -522,6 +523,7 @@ class AutoTuner:
         repeat (int): Number of profiling iterations for averaging (default: 10)
         stream_delay_micro_secs (int): Delay on CUDA stream before the profiled kernel runs in microseconds (default: 1000)
     """
+    _CUDA_GRAPH_DELAY_MICRO_SECS = 100
     _instance = None
 
     def __init__(self, warmup=3, repeat=10, stream_delay_micro_secs=1000):
@@ -534,13 +536,89 @@ class AutoTuner:
         # Add statistics tracking
         self.stats = AutoTunerStatistics()
 
-        self.profiling_debug = True
+        # Current captured choose_one() contexts
+        self._active_capture: Optional['AutoTuner.TacticsCapture'] = None
+        # Last captured choose_one() contexts
+        self._last_capture: Optional['AutoTuner.TacticsCapture'] = None
 
     @classmethod
     def get(cls):
         if cls._instance is None:
             cls._instance = AutoTuner()
         return cls._instance
+
+    class TacticsCapture:
+        """Object returned by capture() that can be iterated to get all tactic combinations.
+
+        This class encapsulates all state related to capturing and replaying tactics:
+        - Captured execution contexts
+        - Generated tactic configurations
+        - Current replay state (which config and call index)
+        """
+
+        def __init__(self, autotuner):
+            # State for captured contexts
+            self._captured_contexts: List[Dict[str, Any]] = []
+            self._configurations = None
+            # State for replay mode
+            self._replay_runner_tactic_list: Optional[List[Tuple[int,
+                                                                 int]]] = None
+            self._replay_context_idx: int = 0
+
+        def __iter__(self):
+            """Iterate through all tactic configurations.
+
+            For single context: yields (runner, tactic)
+            For multiple contexts: yields ((runner_ctx0, tactic_ctx0), (runner_ctx1, tactic_ctx1), ...)
+            """
+            if self._configurations is None:
+                self._configurations = self._generate_configurations()
+
+            for config in self._configurations:
+                # config is a tuple of (runner_idx, tactic) for each context
+                # Convert to (runner, tactic) format for user
+                runner_tactic_pairs = []
+                for ctx_idx, (runner_idx, tactic) in enumerate(config):
+                    runners = self._captured_contexts[ctx_idx]['runners']
+                    runner = runners[runner_idx]
+                    runner_tactic_pairs.append((runner, tactic))
+
+                yield tuple(runner_tactic_pairs)
+
+        def _generate_configurations(self):
+            """Generate all valid tactic combinations."""
+            if not self._captured_contexts:
+                raise RuntimeError(
+                    "No context available for testing.\n"
+                    "Use capture() to capture the operation context first:\n"
+                    "  with AutoTuner.get().capture() as tactics_capture:\n"
+                    "      output = operation.forward(...)\n")
+
+            # Collect valid tactics for each context separately
+            context_tactics_lists = []
+
+            for context in self._captured_contexts:
+                runners = context['runners']
+                inputs = context['inputs']
+                kwargs = context.get('kwargs', {})
+
+                # Collect all valid (runner, tactic) combinations for this context
+                tactics_lists = []
+                for runner_idx, runner in enumerate(runners):
+                    valid_tactics = runner.get_valid_tactics(
+                        inputs, OptimizationProfile(), **kwargs)
+                    for tactic in valid_tactics:
+                        tactics_lists.append((runner_idx, tactic))
+                context_tactics_lists.append(tactics_lists)
+
+            # Generate cartesian product from context and tactics where all_configrations[i][ctx] = (runner, tactic)
+            # Such that each element in all_configrations is a replay of multiple contexts of all possible replays
+            all_configurations = list(itertools.product(*context_tactics_lists))
+            return all_configurations
+
+        def is_replaying(self) -> bool:
+            """Check if this TacticsCapture is currently in replay mode."""
+            return self._replay_runner_tactic_list is not None
 
     def choose_one(
         self,
@@ -573,6 +651,52 @@ class AutoTuner:
             Runner authors are suggested to provide a fallback implementation for each runner to avoid potential issues.
         """
 
+        # Check if we're in replay mode via active TacticsCapture
+        if self._active_capture is not None and self._active_capture.is_replaying(
+        ):
+            tactics_capture = self._active_capture
+            call_idx = tactics_capture._replay_context_idx
+
+            assert call_idx < len(tactics_capture._replay_runner_tactic_list
+                                  ), "call_idx out of range"
+            assert call_idx < len(
+                tactics_capture._captured_contexts), "call_idx out of range"
+            assert len(tactics_capture._replay_runner_tactic_list) == len(
+                tactics_capture._captured_contexts)
+
+            # Check if we have a forced tactic for this call and both custom_op match
+            captured_custom_op = tactics_capture._captured_contexts[
+                call_idx].get('custom_op')
+            if captured_custom_op != custom_op:
+                raise RuntimeError(
+                    f"Custom op mismatch in kernel testing mode.\n"
+                    f"Expected operation: '{captured_custom_op}'\n"
+                    f"Actual operation: '{custom_op}'\n"
+                    f"Context index: {call_idx}\n"
+                    f"Make sure the forward() call in test mode uses the same operation as captured."
+                )
+
+            runner_idx, tactic = tactics_capture._replay_runner_tactic_list[
+                call_idx]
+            # Increment context counter
+            tactics_capture._replay_context_idx += 1
+            # Reset counter after all contexts have been used
+            if tactics_capture._replay_context_idx >= len(
+                    tactics_capture._replay_runner_tactic_list):
+                tactics_capture._replay_context_idx = 0
+            return (runners[runner_idx], tactic)
+
+        # Capture context for testing all underlying kernels
+        if self._active_capture is not None and not self._active_capture.is_replaying(
+        ):
+            self._active_capture._captured_contexts.append({
+                'custom_op': custom_op,
+                'runners': runners,
+                'tuning_config': tuning_config,
+                'inputs': inputs,
+                'kwargs': kwargs,
+            })
+
         input_shapes = tuple(self._get_input_sizes(inputs))
         # Early return if it's not tuning, use cache found one or fallback one
         if not self.is_tuning_mode:
@@ -587,7 +711,7 @@ class AutoTuner:
             if not is_cache_hit:
                 logger.warning_once(
                     f"[AutoTunner] Using the fallback tactic, due to cache miss on input shapes={input_shapes}",
-                    key=custom_op)
+                    key=(custom_op, "warning_autotuning_cache_miss_fallback"))
 
             return (best_runner, best_tactic)
 
@@ -626,22 +750,24 @@ class AutoTuner:
                         f"[Autotuner] Profiling runner={runners[best_runner_id]}, tactic={best_tactic} for cache_key={cache_key}."
                     )
                 else:
-                    logger.warning(
+                    logger.warning_once(
                         f"[Autotuner] No valid runner/tactic was found for custom_op={custom_op}, input_shapes={input_shapes}. "
                         f"At least one valid (runner, tactic) pair is required. "
                         f"If get_valid_tactics is intended to return empty list, please ensure that this profile is not valid for the custom_op "
-                        f"and should not occurs during the inference stage, or fallback tactic is implemented. Otherwise, the the tuning process will crash."
+                        f"and should not occurs during the inference stage, or fallback tactic is implemented. Otherwise, the the tuning process will crash.",
+                        key=(custom_op, "warning_autotuning_no_valid_tactic"),
                     )
                 new_tuning_failure_occured = new_tuning_failure_occured or has_tuning_failure_occured
 
         # If failed profiling tactics occurs, log the error.
         if new_tuning_failure_occured:
-            logger.warning(
+            logger.warning_once(
                 f"[Autotuner] New tuning error occurs:"
                 f"Total failed profiling tactics occurs: {len(self.stats.failed_profiling_count[custom_op])} for custom_op={custom_op}. "
                 f"This will not block the tuning process. "
                 f"Please set TLLM_LOG_LEVEL=WARNING to find out when the tactic profiling fails. "
-                f"Set TLLM_LOG_LEVEL=DEBUG to get more details of the failures."
+                f"Set TLLM_LOG_LEVEL=DEBUG to get more details of the failures.",
+                key=(custom_op, "warning_autotuning_tuning_error_summary"),
             )
 
         # Get the best runner and tactic from cache
@@ -685,14 +811,23 @@ class AutoTuner:
             for tac in valid_tactics:
                 try:
                     time_measured = self._profile_single_kernel(
-                        runner, input_tensors, tac, **kwargs)
+                        runner=runner,
+                        inputs=input_tensors,
+                        tactic=tac,
+                        use_cuda_graph=tuning_config.use_cuda_graph,
+                        **kwargs,
+                    )
                 except Exception as e:
                     # Handle None tensors for optional inputs
                     shapes = self._get_input_sizes(input_tensors)
-                    logger.warning(
-                        f"[Autotuner] Failed when profiling runner={runner}, tactic={tac}, shapes={shapes}. Set TLLM_LOG_LEVEL=DEBUG for more details."
+                    logger.warning_once(
+                        f"[Autotuner] Failed when profiling runner={runner}, tactic={tac}, shapes={shapes}. Set TLLM_LOG_LEVEL=DEBUG for more details.",
+                        key=(custom_op, "warning_autotuning_profile_failure"),
                     )
-                    logger.debug(f"[Autotuner] Exception captured: {e}")
+                    logger.debug_once(
+                        f"[Autotuner] Exception captured: {e}",
+                        key=(custom_op, "debug_autotuning_exception"),
+                    )
 
                     # Record the failed profiling combinations
                     if custom_op not in self.stats.failed_profiling_count:
@@ -727,6 +862,7 @@ class AutoTuner:
         runner: TunableRunner,
         inputs: List[torch.Tensor],
         tactic: Any,
+        use_cuda_graph: bool = False,
         **kwargs,
     ) -> float:
         """Profile a single kernel implementation for performance measurement.
@@ -745,22 +881,40 @@ class AutoTuner:
             are used to ensure accurate timing.
         """
         stream = torch.cuda.current_stream()
-        # warm up, no timing
-        for _ in range(self.warmup):
-            runner(inputs, tactic=tactic, **kwargs)
-        stream.synchronize()
-
-        # Delay the profiled kernel launch to eliminate affects of host time overhead in profiling.
-        # TODO: This is build time sensitive, O(tactic_num * impl_num * num_profile * tunable_ops)
-        # Consider apply a preprofiling to estimate the kernel execution time, then decide the necessity.
-        delay_kernel(self.stream_delay_micro_secs, stream)
+        graph = torch.cuda.CUDAGraph()
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
 
-        start.record(stream=stream)
-        for _ in range(self.repeat):
-            runner(inputs, tactic=tactic, **kwargs)
-        end.record(stream=stream)
+        with torch.cuda.stream(stream):
+            # warm up, no timing
+            for _ in range(self.warmup):
+                runner(inputs, tactic=tactic, **kwargs)
+
+            if use_cuda_graph:
+                with torch.cuda.graph(graph):
+                    for _ in range(self.repeat):
+                        runner(inputs, tactic=tactic, **kwargs)
+
+            stream.synchronize()
+
+            # Delay the profiled kernel launch to eliminate affects of host time overhead in profiling.
+            # TODO: This is build time sensitive, O(tactic_num * impl_num * num_profile * tunable_ops)
+            # Consider apply a preprofiling to estimate the kernel execution time, then decide the necessity.
+            if use_cuda_graph:
+                delay_kernel(self._CUDA_GRAPH_DELAY_MICRO_SECS, stream)
+            else:
+                delay_kernel(self.stream_delay_micro_secs, stream)
+
+            start.record()
+
+            if use_cuda_graph:
+                graph.replay()
+            else:
+                for _ in range(self.repeat):
+                    runner(inputs, tactic=tactic, **kwargs)
+
+            end.record()
+
         stream.synchronize()
 
         avg_time = start.elapsed_time(end) / self.repeat
@@ -802,9 +956,9 @@ class AutoTuner:
         dynamic_dims = []
 
         for spec in tuning_config.dynamic_tensor_specs:
-            assert inspect.isfunction(spec.gen_tuning_buckets) or isinstance(spec.gen_tuning_buckets, (list, tuple)), \
+            assert callable(spec.gen_tuning_buckets) or isinstance(spec.gen_tuning_buckets, (list, tuple)), \
                 "The given dynamic dimension must provide a opt value generation function or a list of opt values"
-            if inspect.isfunction(spec.gen_tuning_buckets):
+            if callable(spec.gen_tuning_buckets):
                 if tuning_config.tune_max_num_tokens is None:
                     # Use the current input size as the opt value
                     opt_shapes = spec.gen_tuning_buckets(
@@ -914,18 +1068,34 @@ class AutoTuner:
         dtype = origin_tensor.dtype
         device = origin_tensor.device
         shapes = []
-        for d in dims:
+        for i, d in enumerate(dims):
             if isinstance(d, StaticDim):
+                assert d.val == origin_tensor.shape[i]
                 shapes.append(d.val)
             else:
                 # TODO: how to make sure the created Tensor has the min/max info
                 assert isinstance(d, DynamicDim)
                 shapes.append(d.opt)
+
+        if len(dims) == 2 and isinstance(dims[0], DynamicDim) and isinstance(
+                dims[1], StaticDim) and (dtype == torch.int32
+                                         or dtype == torch.int64):
+            # We should be carefully about int values, since they might be index like topk_index.
+            # We want to keep them legal, so just repeating input tensor.
+            repeat_times = (shapes[0] + origin_tensor.shape[0] -
+                            1) // origin_tensor.shape[0]
+            dup_tensor = origin_tensor.repeat(repeat_times, 1)[:shapes[0]]
+            return dup_tensor
+
         # TODO: FIXME, sometimes the content of the tensor can affect the performance, like MOE
         # One solution is to manituplate the tensor content to make it more like the real data
         # during the tuning process. This can by controlled in the preparation phase by the runner.
         # It must not use all zero tensors. Otherwise the timing results become unreliable.
-        return torch.randint(-5, 5, shapes, device=device).to(dtype)
+        if dtype == torch.float4_e2m1fn_x2:
+            return torch.randint(-5, 5, shapes,
+                                 device=device).to(torch.uint8).view(dtype)
+        else:
+            return torch.randint(-5, 5, shapes, device=device).to(dtype)
 
     def _prepare_input_tensors(
             self, profile: OptimizationProfile,
@@ -957,3 +1127,91 @@ class AutoTuner:
             logger.debug(
                 f"[Autotuner] {key}: (runner_id={runner_id}, tactic={tactic}, min_time={min_time})"
             )
+
+    @contextlib.contextmanager
+    def capture(self):
+        """Context manager for capturing execution contexts for testing.
+
+        Returns a TacticsCapture object that can be iterated to get all valid
+        (runner, tactic) combinations.
+
+        Example:
+            >>> # Single context case
+            >>> with AutoTuner.get().capture() as tactics_capture:
+            ...     y = custom_op.forward(x)
+            >>>
+            >>> for runner, tactic in tactics_capture:
+            ...     with AutoTuner.get().replay(runner, tactic):
+            ...         y = custom_op.forward(x)
+
+            >>> # Multiple contexts case
+            >>> with AutoTuner.get().capture() as tactics_capture:
+            ...     y = custom_op1.forward(x)
+            ...     z = custom_op2.forward(y)
+            >>>
+            >>> for config in tactics_capture:
+            ...     with AutoTuner.get().replay(config):
+            ...         y = custom_op1.forward(x)
+            ...         z = custom_op2.forward(y)
+        """
+        tactics_capture = self.TacticsCapture(self)
+        self._active_capture = tactics_capture
+        try:
+            yield tactics_capture
+        finally:
+            self._active_capture = None
+            self._last_capture = tactics_capture
+
+    @contextlib.contextmanager
+    def replay(self, *config: Tuple[Tuple[TunableRunner, int], ...]):
+        """Context manager for replaying with specific runner/tactic configuration.
+
+        Args:
+            config:
+                - A tuple of (runner, tactic) pairs. The tuple size matches the number of captured choose_one() contexts.
+        """
+        # Parse config argument
+        if len(config) == 1:
+            if isinstance(config[0], tuple):
+                # Multiple contexts: replay(((r0,t0), (r1,t1), ...))
+                runner_tactic_pairs = list(config[0])
+            else:
+                # Also handle single context passed as replay((runner, tactic))
+                runner_tactic_pairs = [config[0]]
+        else:
+            raise ValueError(
+                f"Invalid config for replay: {config}\n"
+                "Expected replay(((runner, tactic), (runner, tactic), ...))")
+
+        # Find the TacticsCapture to use
+        tactics_capture = self._active_capture or self._last_capture
+
+        if tactics_capture is None:
+            raise RuntimeError(
+                "No TacticsCapture available for replay. "
+                "Make sure you've called capture() before replay().")
+
+        # Temporarily set as active capture during replay
+        prev_active = self._active_capture
+        self._active_capture = tactics_capture
+
+        runner_tactic_list = []
+        for ctx_idx, (runner, tactic) in enumerate(runner_tactic_pairs):
+            runners = tactics_capture._captured_contexts[ctx_idx]['runners']
+            runner_idx = runners.index(runner)
+            runner_tactic_list.append((runner_idx, tactic))
+
+        logger.debug(
+            f"[Autotuner][replay]: Testing configuration: {runner_tactic_list}")
+
+        # Replay the contexts with given (runner, tactic) pairs
+        tactics_capture._replay_runner_tactic_list = runner_tactic_list
+        tactics_capture._replay_context_idx = 0
+
+        try:
+            yield
+        finally:
+            tactics_capture._replay_runner_tactic_list = None
+            tactics_capture._replay_context_idx = 0
+            # Restore previous active capture state
+            self._active_capture = prev_active

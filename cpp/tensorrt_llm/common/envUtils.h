@@ -82,9 +82,13 @@ bool getEnvUseUCXKvCache();
 bool getEnvUseMPIKvCache();
 bool getEnvUseNixlKvCache();
 
+bool getEnvUseRoundRobinBlockDistForCP();
+
 std::string getEnvUCXInterface();
 
 std::string getEnvNixlInterface();
+
+std::string getEnvNixlBackend();
 
 bool getEnvDisaggLayerwise();
 

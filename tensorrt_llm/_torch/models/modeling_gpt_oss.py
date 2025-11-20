@@ -140,6 +140,9 @@ class MLPBlock(torch.nn.Module):
         self.config = config  # Store config as instance variable
         pretrained_config = config.pretrained_config
         self.num_experts = pretrained_config.num_local_experts
+        moe_load_balancer_config = config.moe_load_balancer
+        self.num_slots = moe_load_balancer_config.num_slots if moe_load_balancer_config and moe_load_balancer_config.num_slots else self.num_experts
+
         self.layer_idx = layer_idx
         self.enable_attention_dp = config.mapping.enable_attention_dp
         self.mapping = config.mapping
@@ -162,13 +165,13 @@ class MLPBlock(torch.nn.Module):
             if config.moe_backend.upper() == "TRTLLM" else torch.float32)
 
         self.swiglu_alpha = torch.tensor(
-            [1.702] * (self.num_experts // config.mapping.moe_ep_size),
+            [1.702] * (self.num_slots // config.mapping.moe_ep_size),
             dtype=torch.float32).cuda()
         self.swiglu_beta = torch.tensor(
-            [1.0] * (self.num_experts // config.mapping.moe_ep_size),
+            [1.0] * (self.num_slots // config.mapping.moe_ep_size),
             dtype=torch.float32).cuda()
         self.swiglu_limit = torch.tensor(
-            [7.0] * (self.num_experts // config.mapping.moe_ep_size),
+            [7.0] * (self.num_slots // config.mapping.moe_ep_size),
             dtype=torch.float32).cuda()
         # Prepare MoE creation parameters
         moe_params = {

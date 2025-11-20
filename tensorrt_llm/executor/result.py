@@ -20,7 +20,7 @@ except ModuleNotFoundError:
     from tensorrt_llm import ray_stub as ray
 
 from .._ray_utils import unwrap_ray_errors
-from .._utils import mpi_disabled, nvtx_range_debug
+from .._utils import mpi_disabled, nvtx_range_debug, ray_use_rpc
 from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.tracer import global_tracer
@@ -272,8 +272,10 @@ class GenerationResultBase:
         self._done = False
         self.metrics_dict = {}
         self.trace_headers: Optional[dict[str, str]] = None
+        # torch backend will use trtllm sampler in beam search mode, but it does not support return logprobs incrementally
+        self.use_trtllm_sampler = sampling_params.use_beam_search and sampling_params.best_of > 1
 
-        if ray_queue is not None:
+        if ray_queue is not None and not ray_use_rpc():
             if has_event_loop():
                 self.aqueue = ray_queue
                 self.queue = self.aqueue
@@ -378,20 +380,27 @@ class GenerationResultBase:
             # each streamed response_tensors.log_probs[src_idx]
             # contains a streamwise monotonically growing list of logprobs.
             # so we need to accumulate only the new ones unique to that particular streamed response
-            assert output._last_logprobs_len <= len(
-                response_tensors.log_probs[src_idx]
-            ), (f"_last_logprobs_len ({output._last_logprobs_len}) > log_probs length ("
-                f"{len(response_tensors.log_probs[src_idx])})")
-            output.logprobs += response_tensors.log_probs[src_idx][
-                output._last_logprobs_len:]
+            if self.use_trtllm_sampler:
+                assert output._last_logprobs_len <= len(
+                    response_tensors.log_probs[src_idx]
+                ), (f"_last_logprobs_len ({output._last_logprobs_len}) > log_probs length ("
+                    f"{len(response_tensors.log_probs[src_idx])})")
+                output.logprobs += response_tensors.log_probs[src_idx][
+                    output._last_logprobs_len:]
+            else:
+                output.logprobs += response_tensors.log_probs[src_idx]
+
             # overcome some WAR in the cpp executor
-            if finish_reasons[src_idx] != tllm.FinishReason.CANCELLED:
+            if finish_reasons[
+                    src_idx] != tllm.FinishReason.CANCELLED and self.use_trtllm_sampler:
                 # Check if logprobs is a list (not a dict or other structure)
                 if len(output.logprobs) > output.length:
                     # LlmResult holds a reference to LogProbStorage, which may be updated by the worker before the result is serialized.
                     # Therefore, we treat extra logprobs/logits as expected and only consume what's needed.
                     output.logprobs = output.logprobs[:output.length]
-                assert len(output.logprobs) == output.length
+            assert len(
+                output.logprobs
+            ) == output.length, f"logprobs length: {len(output.logprobs)} != output.length: {output.length}"
 
         if response_tensors.generation_logits is not None:
             output.generation_logits = response_tensors.generation_logits[
@@ -548,7 +557,7 @@ class GenerationResultBase:
         else:
             raise ValueError(f"Unknown response type: {response}")
 
-        if self._done and mpi_disabled():
+        if self._done and mpi_disabled() and not ray_use_rpc():
             assert hasattr(
                 self.queue, "unregister"
             ), "Ray path should be activated for unregistering the Ray queue."
@@ -781,7 +790,7 @@ class GenerationResult(GenerationResultBase):
     ) -> None:
         use_async_queue = has_event_loop()
         shared_queue = None
-        if executor and executor.use_ray_queue():
+        if executor and executor.use_ray_queue() and not ray_use_rpc():
             shared_queue = executor.async_response_queue_weakref if use_async_queue else executor.sync_response_queue_weakref
 
         super().__init__(
@@ -846,7 +855,7 @@ class GenerationResult(GenerationResultBase):
         return response
 
     def _result_step(self, timeout: Optional[float] = None):
-        if mpi_disabled():
+        if mpi_disabled() and not ray_use_rpc():
             with unwrap_ray_errors():
                 response = ray.get(self.queue.get.remote(self.request_id))
             response = self._handle_ray_response(response)
@@ -857,7 +866,7 @@ class GenerationResult(GenerationResultBase):
 
     async def _aresult_step(self):
         assert self.aqueue is not None, "The asyncio event loop was not present during initialization, so async operations are not available."
-        if mpi_disabled():
+        if mpi_disabled() and not ray_use_rpc():
             response = await self.aqueue.get_async.remote(self.request_id)
             response = self._handle_ray_response(response)
         else:

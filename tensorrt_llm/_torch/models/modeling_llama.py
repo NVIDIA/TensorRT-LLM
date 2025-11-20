@@ -5,8 +5,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 from PIL.Image import Image
 from torch import nn
-from transformers import (AutoProcessor, Llama4Config, Llama4VisionModel,
-                          LlamaConfig)
+from transformers import (AutoProcessor, AutoTokenizer, Llama4Config,
+                          Llama4VisionModel, LlamaConfig, PretrainedConfig)
 from transformers.modeling_utils import load_sharded_checkpoint
 from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
 
@@ -21,7 +21,8 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import HfLoraLoader
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
-from ...inputs import (ExtraProcessedInputs, InputProcessor,
+from ...inputs import (BaseMultimodalDummyInputsBuilder,
+                       BaseMultimodalInputProcessor, ExtraProcessedInputs,
                        MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
@@ -40,7 +41,7 @@ from ..modules.linear import Linear, TensorParallelMode
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
-from ..utils import Fp4QuantizedTensor
+from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
@@ -292,6 +293,7 @@ class Llama4MoE(nn.Module):
             weight_loading_mode=MoEWeightLoadingMode.FUSED_GATE_UP_PROJ,
             model_config=model_config,
             apply_router_weight_on_input=True,
+            aux_stream_dict={AuxStreamType.MoeChunkingOverlap: aux_stream},
             layer_idx=layer_idx)
 
         self.router = Linear(
@@ -1042,26 +1044,59 @@ class Llama4VisionEncoder(nn.Module):
         return [image_features]
 
 
-class Llama4InputProcessor(InputProcessor):
+from transformers import AutoTokenizer, PretrainedConfig
+
+
+class Llama4InputProcessor(BaseMultimodalInputProcessor,
+                           BaseMultimodalDummyInputsBuilder):
 
     def __init__(self,
-                 model_path,
-                 model_config,
-                 tokenizer,
-                 trust_remote_code: bool = True):
-        self.use_fast = True
-        self.processor = AutoProcessor.from_pretrained(
+                 model_path: str,
+                 config: PretrainedConfig,
+                 tokenizer: AutoTokenizer,
+                 trust_remote_code: bool = True,
+                 **kwargs):
+        super().__init__(model_path=model_path,
+                         config=config,
+                         tokenizer=tokenizer,
+                         trust_remote_code=trust_remote_code,
+                         **kwargs)
+        self._config = config
+        self._dtype = self._config.torch_dtype
+        self._tokenizer = tokenizer if tokenizer is not None else AutoTokenizer.from_pretrained(
+            model_path)
+        self._model_path = model_path
+        self._processor = AutoProcessor.from_pretrained(
             model_path,
-            trust_remote_code=trust_remote_code,
-            use_fast=self.use_fast)
-        self.model_config = model_config
-        self.tokenizer = tokenizer
-        self.vocab_size = model_config.text_config.vocab_size
-        self.image_token_index = model_config.image_token_index
+            use_fast=self.use_fast,
+            trust_remote_code=trust_remote_code)
+
+        self.vocab_size = self.config.text_config.vocab_size
+        self.image_token_index = self.config.image_token_index
         self.fake_image_token = self.processor.fake_image_token
         self.image_token = self.processor.img_patch_token
-        self.image_token_start_index = self.model_config.boi_token_index
-        self.image_token_end_index = self.model_config.eoi_token_index
+        self.image_token_start_index = self.config.boi_token_index
+        self.image_token_end_index = self.config.eoi_token_index
+
+    @property
+    def config(self) -> PretrainedConfig:
+        return self._config
+
+    @property
+    def tokenizer(self) -> AutoTokenizer:
+        return self._tokenizer
+
+    @property
+    def model_path(self) -> str:
+        return self._model_path
+
+    @property
+    def processor(self) -> AutoProcessor:
+        return self._processor
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._dtype
 
     def attach_multimodal_embeddings(
         self, inputs: TextPrompt, multimodal_embedding: Dict[str,
@@ -1121,7 +1156,7 @@ class Llama4InputProcessor(InputProcessor):
                 f"Missing required key in multimodal embedding: {e}")
 
         # Validate embedding dimensions
-        model_hidden_size = self.model_config.text_config.hidden_size
+        model_hidden_size = self.config.text_config.hidden_size
         for i, embedding in enumerate(mm_embeddings):
             if embedding.shape[-1] != model_hidden_size:
                 raise ValueError(

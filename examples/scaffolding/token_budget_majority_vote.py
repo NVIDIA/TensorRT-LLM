@@ -104,7 +104,7 @@ def main():
     prompt = "Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?\r\n\r\n"
 
     result = llm.generate(prompt)
-    extracted_answer = extract_answer_from_boxed(result.output.output_str)
+    extracted_answer = extract_answer_from_boxed(result.outputs[0].text)
     print(f'extracted_answer={extracted_answer}')
 
     llm.shutdown(shutdown_workers=True)

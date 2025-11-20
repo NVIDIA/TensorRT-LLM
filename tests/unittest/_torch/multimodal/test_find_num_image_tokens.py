@@ -84,13 +84,13 @@ def test_get_num_tokens_per_image(model_key, multimodal_model_configs):
         if model_type == 'llava_next':
             input_processor = LlavaNextInputProcessor(
                 model_path=encoder_model_dir,
-                model_config=model_config_dict,
+                config=model_config_dict,
                 tokenizer=tokenizer,
                 trust_remote_code=True)
         elif model_type == 'qwen2_5_vl':
             input_processor = Qwen2VLInputProcessorBase(
                 model_path=encoder_model_dir,
-                model_config=model_config_dict,
+                config=model_config_dict,
                 tokenizer=tokenizer,
                 trust_remote_code=True)
         else:
@@ -191,13 +191,13 @@ def test_get_num_tokens_per_video(model_key, multimodal_model_configs):
         if model_type == 'llava_next':
             input_processor = LlavaNextInputProcessor(
                 model_path=encoder_model_dir,
-                model_config=model_config_dict,
+                config=model_config_dict,
                 tokenizer=tokenizer,
                 trust_remote_code=True)
         elif model_type == 'qwen2_5_vl':
             input_processor = Qwen2VLInputProcessorBase(
                 model_path=encoder_model_dir,
-                model_config=model_config_dict,
+                config=model_config_dict,
                 tokenizer=tokenizer,
                 trust_remote_code=True)
         else:
