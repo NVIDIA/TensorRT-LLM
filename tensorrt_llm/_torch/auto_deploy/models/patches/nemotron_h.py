@@ -191,15 +191,23 @@ AutoModelForCausalLM.from_config = get_model_from_config_patched
 
 _config_from_pretrained_original = AutoConfig.from_pretrained
 _nemotron_h_base_model_tp_plan = {
+    # mamba SSM layer
     "in_proj": "mamba",
     "out_proj": "rowwise",
+    # attention layer
     "q_proj": "colwise",
     "k_proj": "colwise",
     "v_proj": "colwise",
     "o_proj": "rowwise",
+    # NOTE: consider not sharding shared experts and/or
+    # latent projections at all, keeping them replicated.
+    # To do so, comment out the corresponding entries.
+    # moe layer: SHARED experts
     "up_proj": "colwise",
     "down_proj": "rowwise",
-    # "*": "gather",
+    # MoLE: latent projections: simple shard
+    "fc1_latent_proj": "gather",
+    "fc2_latent_proj": "gather",
 }
 
 

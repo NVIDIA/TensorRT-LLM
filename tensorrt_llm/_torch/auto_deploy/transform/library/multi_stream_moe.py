@@ -66,10 +66,6 @@ class MultiStreamMOE(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        with open("graph-before-moe.txt", "w") as f:
-            f.write(str(gm.graph))
-        print("wrote graph to graph-before-moe.txt")
-
         op_dict = {
             torch.ops.auto_deploy.trtllm_moe_fused: torch.ops.auto_deploy.trtllm_moe_fused_aux,
             torch.ops.auto_deploy.triton_moe_fused: torch.ops.auto_deploy.triton_moe_fused_aux,
@@ -84,7 +80,5 @@ class MultiStreamMOE(BaseTransform):
             is_clean=False,
             has_valid_shapes=False,
         )
-        with open("graph-after-moe.txt", "w") as f:
-            f.write(str(gm.graph))
-        print("wrote graph to graph-after-moe.txt")
+
         return gm, info
