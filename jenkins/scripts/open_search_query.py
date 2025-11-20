@@ -3,12 +3,7 @@ import json
 import os
 import sys
 
-import requests
-
-OPEN_SEARCH_QUERY_URL = (
-    "http://gpuwa.nvidia.com/opensearch/df-swdl-trtllm-infra-ci-prod-test_info-*/_search"
-)
-headers = {"Content-Type": "application/json", "Accept-Charset": "UTF-8"}
+from open_search_db import OpenSearchDB
 
 
 def queryJobEvents(commitID="", stageName="", onlySuccess=True):
@@ -37,11 +32,15 @@ def queryJobEvents(commitID="", stageName="", onlySuccess=True):
             ],
             "size": page_size,
             "from": from_index,
-            "sort": [{"_id": "asc"}],
         }
 
         formattedRequestBody = json.dumps(requestBody)
-        response = requests.post(OPEN_SEARCH_QUERY_URL, headers=headers, data=formattedRequestBody)
+        response = OpenSearchDB.queryFromOpenSearchDB(
+            formattedRequestBody, "swdl-trtllm-infra-ci-prod-test_info"
+        )
+        if response is None:
+            print("Failed to query from OpenSearchDB")
+            break
         data = response.json()
 
         hits = data["hits"]["hits"]
