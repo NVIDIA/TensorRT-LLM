@@ -56,6 +56,6 @@ def test_scaffolding_benchmark():
 
     assert len(results) == requests_num
     assert len(requests_execution_time) == requests_num
-    assert results[0].cur_output == OUTPUT_STR
+    assert results[0].outputs[0].text == OUTPUT_STR
     assert results[0].task_collections[
         "bench_dummy_collection"].output_len == len(OUTPUT_STR)

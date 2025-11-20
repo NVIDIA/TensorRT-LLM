@@ -279,7 +279,6 @@ def create_rsp(id, finished: bool = False):
     return tllm.Response(request_id=0, result=result, client_id=0)
 
 
-@pytest.mark.skip(reason="https://nvbugs/5477359")
 def test_GenerationResultBase():
     sampling_params = SamplingParams(max_tokens=4)
     result = GenerationResultBase(
@@ -294,7 +293,6 @@ def test_GenerationResultBase():
     assert result._done
 
 
-@pytest.mark.skip(reason="https://nvbugs/5477359")
 def test_GenerationResult():
     request = GenerationRequest(prompt_token_ids=[12, 23, 34],
                                 sampling_params=SamplingParams(max_tokens=4))
@@ -307,7 +305,6 @@ def test_GenerationResult():
     assert result._done
 
 
-@pytest.mark.skip(reason="https://nvbugs/5477359")
 def test_DetokenizedGenerationResultBase():
     sampling_params = SamplingParams(max_tokens=4)
     model_path = llm_models_root() / "llama-models/llama-7b-hf"
@@ -439,7 +436,6 @@ def ResponsePostprocessWorker_worker_task(pull_pipe_addr, push_pipe_addr,
     worker.start()
 
 
-@pytest.mark.skip(reason="https://nvbugs/5477369")
 def test_ResponsePostprocessWorker():
 
     input_pipe = ZeroMqQueue(is_server=True)

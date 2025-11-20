@@ -2,7 +2,7 @@ import json
 import tarfile
 import tempfile
 from pathlib import Path
-from typing import OrderedDict, Type
+from typing import List, OrderedDict, Type
 
 import torch
 from utils.llm_data import llm_models_root
@@ -11,10 +11,62 @@ from utils.util import duplicate_list_to_length, flatten_list, similar
 from tensorrt_llm import SamplingParams
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.llmapi.llm import BaseLLM
+from tensorrt_llm.lora_helper import LoraConfig
+
+_RU_LORA_ADAPTER_PROMPTS = [
+    "Назови главную площадь в центре Москвы.",
+    "Напиши полное предложение, описывающее, что в музее не хватает женских скульптур. Используй фразу \"не хватает\".",
+    "Что означает выражение \"водить за нос\"? Объясни в двух словах.",
+]
+
+
+def _generate_phi3_response_lora_fused_modules(llm_class: Type[BaseLLM],
+                                               prompts: List[str],
+                                               **extra_llm_kwargs) -> List[str]:
+    """Generates responses with LoRA requests with the Phi-3-mini-4k-instruct-ru-lora adapter.
+    The used LoRA adapter has fused attention QKV and fused MLP gate up proj modules.
+    Returns the generated texts.
+    """  # noqa: D205
+    hf_model_dir = f"{llm_models_root()}/Phi-3/Phi-3-mini-4k-instruct"
+    hf_lora_dir = f"{llm_models_root()}/lora/phi/Phi-3-mini-4k-instruct-ru-lora"
+
+    lora_req = LoRARequest("ru-lora", 0, hf_lora_dir)
+    sampling_params = SamplingParams(max_tokens=20)
+
+    lora_config = LoraConfig(lora_dir=[hf_lora_dir],
+                             max_lora_rank=16,
+                             max_loras=2,
+                             max_cpu_loras=2)
+
+    lora_requests = [lora_req] * len(prompts)
+    with llm_class(hf_model_dir, lora_config=lora_config,
+                   **extra_llm_kwargs) as llm:
+        outputs = llm.generate(prompts,
+                               sampling_params,
+                               lora_request=lora_requests)
+
+    return [output.outputs[0].text for output in outputs]
+
+
+def check_phi3_lora_fused_modules_output_tp2_identical_to_tp1(
+        llm_class: Type[BaseLLM], **extra_llm_kwargs) -> None:
+    """Tests the output with LoRA requests with the Phi-3-mini-4k-instruct-ru-lora adapter with TP=2 is identical to
+    the output with TP=1.
+    That LoRA adapter has fused attention QKV and fused MLP gate up proj modules.
+    """  # noqa: D205
+    extra_llm_kwargs["tensor_parallel_size"] = 1
+    outputs_tp1 = _generate_phi3_response_lora_fused_modules(
+        llm_class, _RU_LORA_ADAPTER_PROMPTS, **extra_llm_kwargs)
+
+    extra_llm_kwargs["tensor_parallel_size"] = 2
+    outputs_tp2 = _generate_phi3_response_lora_fused_modules(
+        llm_class, _RU_LORA_ADAPTER_PROMPTS, **extra_llm_kwargs)
+
+    assert outputs_tp1 == outputs_tp2
 
 
 def check_llama_7b_multi_unique_lora_adapters_from_request(
-        lora_adapter_count_per_call: list[int], repeat_calls: int,
+        lora_adapter_count_per_call: List[int], repeat_calls: int,
         repeats_per_call: int, llm_class: Type[BaseLLM], **llm_kwargs):
     """Calls llm.generate s.t. for each C in lora_adapter_count_per_call, llm.generate is called with C requests
     repeated 'repeats_per_call' times, where each request is configured with a unique LoRA adapter ID.

@@ -17,6 +17,7 @@
 #include "xqaDispatcher.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplCommon.h"
+#include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 #include <cstdint>
 
@@ -258,9 +259,9 @@ bool XqaDispatcher::isSupported()
             TLLM_LOG_WARNING("Unsupported data type combination.");
             return false;
         }
-        if (mFixedParams.isSpecDecoding)
+        if (mFixedParams.isSpecDecoding && mFixedParams.isMLA)
         {
-            TLLM_LOG_WARNING("TRTLLM-GEN does not support Speculative decoding.");
+            TLLM_LOG_WARNING("TRTLLM-GEN does not support tree-based speculative decoding with MLA.");
             return false;
         }
         if (mFixedParams.hasAlibi)
@@ -273,7 +274,9 @@ bool XqaDispatcher::isSupported()
         TllmGenFmhaRunnerParams tllmRunnerParams;
         memset(&tllmRunnerParams, 0, sizeof(tllmRunnerParams));
         tllmRunnerParams.mQkvLayout = mFixedParams.isPagedKv ? QkvLayout::PagedKv : QkvLayout::ContiguousKv;
-        tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
+        tllmRunnerParams.mMaskType
+            = mFixedParams.isSpecDecoding ? TrtllmGenAttentionMaskType::Custom : TrtllmGenAttentionMaskType::Dense;
+        tllmRunnerParams.mIsSpecDecTree = mFixedParams.isSpecDecoding;
         tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
         tllmRunnerParams.mTileScheduler = TileScheduler::Static;
         tllmRunnerParams.mMultiCtasKvMode = true;
@@ -291,6 +294,7 @@ bool XqaDispatcher::isSupported()
 
         // Check if it is supported or not.
         auto [isSupported, info] = mTllmGenFMHARunner->isSupportedWithInfo(tllmRunnerParams);
+
         if (!isSupported)
         {
             TLLM_LOG_WARNING("TRTLLLM-Gen kernels are not selected: " + info);
@@ -397,16 +401,21 @@ void XqaDispatcher::runImpl(
         memset(&tllmRunnerParams, 0, sizeof(tllmRunnerParams));
 
         // Parameters to select kernels.
-        tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
         tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
         tllmRunnerParams.mMultiCtasKvMode = params.multi_block_mode;
         // Note that the tileScheduler and multiCtasKvMode will be automatically tuned when using multi_block mode.
         // Otherwise, always enable the persistent scheduler for better performance.
         tllmRunnerParams.mTileScheduler = params.multi_block_mode ? TileScheduler::Static : TileScheduler::Persistent;
 
+        // The sequence lengths for K/V.
+        tllmRunnerParams.seqLensKvPtr = params.cross_attention ? params.encoder_input_lengths : params.sequence_lengths;
+
         // Q buffer.
         tllmRunnerParams.qPtr = xqa_q_input_ptr;
-        // KV buffer
+
+        // Use block sparse attention.
+        tllmRunnerParams.mUseBlockSparseAttention = false;
+
         if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
         {
             // Paged KV
@@ -416,9 +425,24 @@ void XqaDispatcher::runImpl(
             tllmRunnerParams.kvPageIdxPtr = reinterpret_cast<KVCacheIndex::UnderlyingType const*>(kv_cache_buffer.data);
             tllmRunnerParams.mMaxNumPagesPerSeqKv = kv_cache_buffer.mMaxBlocksPerSeq;
             tllmRunnerParams.mNumTokensPerPage = kv_cache_buffer.mTokensPerBlock;
+
+            // Gather kv page offsets for sparse attention.
+            if (params.use_sparse_attention)
+            {
+                invokeGatherKvPageOffsets(reinterpret_cast<int32_t*>(launchParams.sparse_kv_block_offsets),
+                    launchParams.sparse_seq_lengths, reinterpret_cast<int32_t const*>(kv_cache_buffer.data),
+                    params.sequence_lengths, params.sparse_params, batch_beam_size, num_kv_heads,
+                    kv_cache_buffer.mTokensPerBlock, kv_cache_buffer.mMaxBlocksPerSeq, params.stream);
+                sync_check_cuda_error(params.stream);
+                tllmRunnerParams.seqLensKvPtr = launchParams.sparse_seq_lengths;
+                tllmRunnerParams.kvPageIdxPtr
+                    = reinterpret_cast<KVCacheIndex::UnderlyingType const*>(launchParams.sparse_kv_block_offsets);
+                tllmRunnerParams.mUseBlockSparseAttention = true;
+            }
         }
         else
         {
+            TLLM_CHECK_WITH_INFO(!params.use_sparse_attention, "Sparse attention is not supported for KVLinearBuffer.");
             static_assert(std::is_same_v<KVCacheBuffer, KVLinearBuffer>);
             // Contiguous KV
             tllmRunnerParams.mQkvLayout = QkvLayout::ContiguousKv;
@@ -437,8 +461,6 @@ void XqaDispatcher::runImpl(
         tllmRunnerParams.scaleSoftmaxLog2Ptr
             = reinterpret_cast<float const*>(launchParams.bmm1_scale_ptr + kIdxScaleSoftmaxLog2Ptr);
         tllmRunnerParams.oSfScalePtr = params.fp4_out_sf_scale;
-        // The sequence lengths for K/V.
-        tllmRunnerParams.seqLensKvPtr = params.cross_attention ? params.encoder_input_lengths : params.sequence_lengths;
 
         tllmRunnerParams.oPtr = params.output;
         tllmRunnerParams.oSfPtr = params.output_sf;
@@ -466,7 +488,15 @@ void XqaDispatcher::runImpl(
         tllmRunnerParams.mMultiProcessorCount = mMultiProcessorCount;
         tllmRunnerParams.stream = params.stream;
         tllmRunnerParams.mSfStartTokenIdx = params.start_token_idx_sf;
-
+        tllmRunnerParams.mIsSpecDecTree = params.is_spec_dec_tree && params.multi_query_tokens;
+        tllmRunnerParams.mMaskType
+            = tllmRunnerParams.mIsSpecDecTree ? TrtllmGenAttentionMaskType::Custom : TrtllmGenAttentionMaskType::Dense;
+        tllmRunnerParams.mLayerIdx = params.layer_idx;
+        tllmRunnerParams.seqlensQPtr = params.spec_decoding_generation_lengths;
+        tllmRunnerParams.generalPackedCustoMaskPtr = params.spec_decoding_packed_mask;
+        tllmRunnerParams.customMaskPtr = params.spec_decoding_bl_tree_mask;
+        tllmRunnerParams.customMaskOffsetsPtr = params.spec_decoding_bl_tree_mask_offset;
+        tllmRunnerParams.firstSparseMaskOffsetsKvPtr = params.spec_bl_tree_first_sparse_mask_offset_kv;
         mTllmGenFMHARunner->run(tllmRunnerParams);
     }
     else

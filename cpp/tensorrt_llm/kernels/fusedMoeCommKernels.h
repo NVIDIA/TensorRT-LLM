@@ -20,6 +20,7 @@
 #include <cuda_runtime_api.h>
 
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/moeCommKernelsCommon.h"
 
 namespace tensorrt_llm

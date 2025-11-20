@@ -161,7 +161,7 @@ def demonstrate_with_logprobs(prompt: str):
 
 def run_all_demonstrations(model_path: Optional[str] = None):
     """Run all sampling demonstrations."""
-    print("🚀 TensorRT-LLM Sampling Techniques Showcase")
+    print("🚀 TensorRT LLM Sampling Techniques Showcase")
     print("=" * 50)
 
     # Use the first prompt for most demonstrations

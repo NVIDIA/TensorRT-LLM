@@ -219,7 +219,7 @@ private:
 class MultiThreadWorker
 {
 public:
-    explicit MultiThreadWorker(int numThreads);
+    explicit MultiThreadWorker(int numThreads, int cudaDeviceId);
     ~MultiThreadWorker();
 
     void start();
@@ -239,6 +239,7 @@ private:
     void workerLoop(int rank);
 
     int mNumThreads;
+    int mCudaDeviceId;
     std::vector<std::thread> mThreads;
     std::mutex mMutex;
     std::condition_variable mCondition;

@@ -30,3 +30,6 @@
 	path = 3rdparty/DeepGEMM
 	url = https://github.com/ruoqianguo/DeepGEMM.git
 	branch = swapab_sm100
+[submodule "3rdparty/flash-mla"]
+	path = 3rdparty/flash-mla
+	url = https://github.com/deepseek-ai/FlashMLA.git

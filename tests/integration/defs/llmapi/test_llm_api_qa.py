@@ -5,7 +5,11 @@ from defs.common import venv_check_output
 
 from ..conftest import llm_models_root
 
-model_path = llm_models_root() + "/llama-models-v3/llama-v3-8b-instruct-hf"
+model_path = os.path.join(
+    llm_models_root(),
+    "llama-models-v3",
+    "llama-v3-8b-instruct-hf",
+)
 
 
 class TestLlmDefaultBackend:

@@ -115,12 +115,16 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
             ncclCommDestroy(*comm);
             delete comm;
         });
-// Need static connection initialization for accurate KV cache size estimation
 #if defined(_WIN32)
+    // Need static connection initialization for accurate KV cache size estimation
     if (getenv("NCCL_RUNTIME_CONNECT") == nullptr)
         _putenv_s("NCCL_RUNTIME_CONNECT", "0");
+    // Disable graph register to avoid startup hangs
+    if (getenv("NCCL_GRAPH_REGISTER") == nullptr)
+        _putenv_s("NCCL_GRAPH_REGISTER", "0");
 #else
     setenv("NCCL_RUNTIME_CONNECT", "0", 0);
+    setenv("NCCL_GRAPH_REGISTER", "0", 0);
 #endif // _WIN32
     NCCLCHECK_THROW(ncclCommInitRank(ncclComm.get(), group.size(), id, groupRank));
     commMap[group] = ncclComm;

@@ -76,12 +76,12 @@ void initRequestBindings(nb::module_& m)
         return nb::make_tuple(self.getBeamWidth(), self.getTopK(), self.getTopP(), self.getTopPMin(),
             self.getTopPResetIds(), self.getTopPDecay(), self.getSeed(), self.getTemperature(), self.getMinTokens(),
             self.getBeamSearchDiversityRate(), self.getRepetitionPenalty(), self.getPresencePenalty(),
-            self.getFrequencyPenalty(), self.getLengthPenalty(), self.getEarlyStopping(), self.getNoRepeatNgramSize(),
-            self.getNumReturnSequences(), self.getMinP(), self.getBeamWidthArray());
+            self.getFrequencyPenalty(), self.getPromptIgnoreLength(), self.getLengthPenalty(), self.getEarlyStopping(),
+            self.getNoRepeatNgramSize(), self.getNumReturnSequences(), self.getMinP(), self.getBeamWidthArray());
     };
     auto samplingConfigSetstate = [](tle::SamplingConfig& samplingConfig, nb::tuple const& state)
     {
-        if (state.size() != 19)
+        if (state.size() != 20)
         {
             throw std::runtime_error("Invalid SamplingConfig state!");
         }
@@ -98,12 +98,13 @@ void initRequestBindings(nb::module_& m)
             nb::cast<std::optional<FloatType>>(state[10]),                        // RepetitionPenalty
             nb::cast<std::optional<FloatType>>(state[11]),                        // PresencePenalty
             nb::cast<std::optional<FloatType>>(state[12]),                        // FrequencyPenalty
-            nb::cast<std::optional<FloatType>>(state[13]),                        // LengthPenalty
-            nb::cast<std::optional<SizeType32>>(state[14]),                       // EarlyStopping
-            nb::cast<std::optional<SizeType32>>(state[15]),                       // NoRepeatNgramSize
-            nb::cast<std::optional<SizeType32>>(state[16]),                       // NumReturnSequences
-            nb::cast<std::optional<FloatType>>(state[17]),                        // MinP
-            nb::cast<std::optional<std::vector<SizeType32>>>(state[18])           // BeamWidthArray
+            nb::cast<std::optional<SizeType32>>(state[13]),                       // PromptIgnoreLength
+            nb::cast<std::optional<FloatType>>(state[14]),                        // LengthPenalty
+            nb::cast<std::optional<SizeType32>>(state[15]),                       // EarlyStopping
+            nb::cast<std::optional<SizeType32>>(state[16]),                       // NoRepeatNgramSize
+            nb::cast<std::optional<SizeType32>>(state[17]),                       // NumReturnSequences
+            nb::cast<std::optional<FloatType>>(state[18]),                        // MinP
+            nb::cast<std::optional<std::vector<SizeType32>>>(state[19])           // BeamWidthArray
         );
     };
     nb::class_<tle::SamplingConfig>(m, "SamplingConfig")
@@ -120,6 +121,7 @@ void initRequestBindings(nb::module_& m)
                  std::optional<tle::FloatType> const&,              // repetitionPenalty
                  std::optional<tle::FloatType> const&,              // presencePenalty
                  std::optional<tle::FloatType> const&,              // frequencyPenalty
+                 std::optional<tle::SizeType32> const&,             // promptIgnoreLength
                  std::optional<tle::FloatType> const&,              // lengthPenalty
                  std::optional<tle::SizeType32> const&,             // earlyStopping
                  std::optional<tle::SizeType32> const&,             // noRepeatNgramSize
@@ -142,6 +144,7 @@ void initRequestBindings(nb::module_& m)
             nb::arg("repetition_penalty") = nb::none(),
             nb::arg("presence_penalty") = nb::none(),
             nb::arg("frequency_penalty") = nb::none(),
+            nb::arg("prompt_ignore_length") = nb::none(),
             nb::arg("length_penalty") = nb::none(),
             nb::arg("early_stopping") = nb::none(),
             nb::arg("no_repeat_ngram_size") = nb::none(),
@@ -165,6 +168,8 @@ void initRequestBindings(nb::module_& m)
             [](tle::SamplingConfig& self, std::optional<FloatType> v) { self.setPresencePenalty(v); })
         .def_prop_rw(
             "frequency_penalty", &tle::SamplingConfig::getFrequencyPenalty, &tle::SamplingConfig::setFrequencyPenalty)
+        .def_prop_rw("prompt_ignore_length", &tle::SamplingConfig::getPromptIgnoreLength,
+            &tle::SamplingConfig::setPromptIgnoreLength)
         .def_prop_rw("length_penalty", &tle::SamplingConfig::getLengthPenalty, &tle::SamplingConfig::setLengthPenalty)
         .def_prop_rw("early_stopping", &tle::SamplingConfig::getEarlyStopping, &tle::SamplingConfig::setEarlyStopping)
         .def_prop_rw("no_repeat_ngram_size", &tle::SamplingConfig::getNoRepeatNgramSize,

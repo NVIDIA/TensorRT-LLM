@@ -5,8 +5,10 @@ from typing import Iterable, List, Optional, Tuple
 
 import torch
 
+from tensorrt_llm.llmapi.llm_args import GuidedDecodingConfig
+
 from ..._utils import nvtx_range
-from ...bindings.executor import GuidedDecodingConfig, GuidedDecodingParams
+from ...bindings.executor import GuidedDecodingParams
 from ...bindings.internal.batch_manager import LlmRequestType
 from ...logger import logger
 from ..hostfunc import hostfunc
@@ -423,6 +425,11 @@ class CapturableGuidedDecoder(GuidedDecoder):
         self.num_accepted_tokens = torch.empty(self.max_num_sequences,
                                                dtype=torch.int32,
                                                pin_memory=True)
+
+        # torch.compile kernels are called with GIL being held;
+        # this could cause deadlock with CUDA callback to Python code.
+        # See: https://github.com/pytorch/pytorch/issues/163061
+        torch.compiler.set_stance("force_eager")
 
     @nvtx_range("GuidedDecoder.add_batch")
     def add_batch(self,

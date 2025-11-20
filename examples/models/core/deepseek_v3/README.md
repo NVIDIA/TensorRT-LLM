@@ -1,11 +1,12 @@
-# DeepSeek‑V3 and DeepSeek-R1
+# DeepSeek‑V3, DeepSeek-R1, and DeepSeek-V3.2-Exp
 
-This guide walks you through the examples to run the DeepSeek‑V3/DeepSeek-R1 models using NVIDIA's TensorRT-LLM framework with the PyTorch backend.
-**DeepSeek-R1 and DeepSeek-V3 share exact same model architecture other than weights differences, and share same code path in TensorRT-LLM, for brevity we only provide one model example, the example command to be used interchangeably by only replacing the model name to the other one**.
+This guide walks you through the examples to run the DeepSeek‑V3/DeepSeek-R1/DeepSeek-V3.2-Exp models using NVIDIA's TensorRT LLM framework with the PyTorch backend.
+**DeepSeek-R1 and DeepSeek-V3 share exact same model architecture other than weights differences, and share same code path in TensorRT LLM. DeepSeek-V3.2-Exp features DeepSeek Sparse Attention (DSA), but otherwise shares the same code as DeepSeek-R1 and DeepSeek-V3 in TensorRT LLM. For brevity we only provide one model example, the example command to be used interchangeably by only replacing the model name to the other one**.
+
 
 To benchmark the model with best configurations, refer to [DeepSeek R1 benchmarking blog](../../../../docs/source/blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.md).
 
-Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html) for how to build TensorRT-LLM from source and start a TRT-LLM docker container.
+Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html) for how to build TensorRT LLM from source and start a TRT-LLM docker container.
 
 > [!NOTE]
 > This guide assumes that you replace placeholder values (e.g. `<YOUR_MODEL_DIR>`) with the appropriate paths.
@@ -14,7 +15,7 @@ Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/
 ## Table of Contents
 
 
-- [DeepSeek‑V3 and DeepSeek-R1](#deepseekv3-and-deepseek-r1)
+- [DeepSeek‑V3, DeepSeek-R1, and DeepSeek-V3.2-Exp](#deepseekv3-deepseek-r1-and-deepseekv32-exp)
   - [Table of Contents](#table-of-contents)
   - [Hardware Requirements](#hardware-requirements)
   - [Downloading the Model Weights](#downloading-the-model-weights)
@@ -56,15 +57,15 @@ Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/
 ## Hardware Requirements
 
 DeepSeek-v3 has 671B parameters which needs about 671GB GPU memory for FP8 weights, and needs more memories for activation tensors and KV cache.
-The minimum hardware requirements for running DeepSeek V3/R1 at FP8/FP4/W4A8 are listed as follows.
+The minimum hardware requirements for running DeepSeek V3/R1/V3.2-Exp at FP8/FP4/W4A8 are listed as follows.
 
-| GPU  | DeepSeek-V3/R1 FP8 | DeepSeek-V3/R1 FP4 | DeepSeek-V3/R1 W4A8 |
+| GPU  | DeepSeek-V3/R1/V3.2-Exp FP8 | DeepSeek-V3/R1/V3.2-Exp FP4 | DeepSeek-V3/R1 W4A8 |
 | -------- | ------- | -- | -- |
 | H100 80GB | 16 | N/A | 8 |
 | H20 141GB | 8 | N/A | 4 |
 | H20 96GB | 8  | N/A | 4 |
 | H200 | 8     | N/A | 4 |
-| B200/GB200| Not supported yet, WIP | 4 (8 GPUs is recommended for best perf) | Not supported yet, WIP |
+| B200/GB200| 8 | 4 (8 GPUs is recommended for best perf) | Not supported yet, WIP |
 
 Ampere architecture (SM80 & SM86) is not supported.
 
@@ -88,6 +89,7 @@ To quickly run DeepSeek-V3, [examples/llm-api/quickstart_advanced.py](../llm-api
 cd examples/llm-api
 python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --tp_size 8
 ```
+Please include `--tokens_per_block 64` when running DeepSeek-V3.2-Exp, as this model uses the deep_gemm.fp8_paged_mqa_logits kernel, which requires a KV cache block size of 64.
 
 The model will be run by PyTorch backend and generate outputs like:
 ```
@@ -105,7 +107,7 @@ cd examples/llm-api
 python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_max_draft_len N
 ```
 
-`N` is the number of MTP modules. When `N` is equal to `0`, which means that MTP is not used (default). When `N` is greater than `0`, which means that `N` MTP modules are enabled. In the current implementation, the weight of each MTP module is shared.
+`N` is the number of MTP modules. When `N` is equal to `0`, which means that MTP is not used (default). When `N` is greater than `0`, which means that `N` MTP modules are enabled. In the current implementation, the weight of each MTP module is shared. Please include `--tokens_per_block 64` when running DeepSeek-V3.2-Exp.
 
 #### Relaxed acceptance
 **NOTE: This feature can only be used for DeepSeek R1.**
@@ -245,6 +247,7 @@ cuda_graph_config:
     max_batch_size: 1024
 enable_attention_dp: false
 kv_cache_config:
+    enable_block_reuse: false
     dtype: fp8
 stream_interval: 10
 EOF
@@ -256,22 +259,34 @@ cat >./extra-llm-api-config.yml <<EOF
 cuda_graph_config:
   enable_padding: true
   batch_sizes:
+  - 2048
   - 1024
   - 896
   - 512
+  - 384
   - 256
+  - 192
+  - 160
   - 128
+  - 96
   - 64
+  - 48
   - 32
+  - 24
   - 16
   - 8
   - 4
   - 2
   - 1
 kv_cache_config:
+  enable_block_reuse: false
   dtype: fp8
 stream_interval: 10
 enable_attention_dp: true
+attention_dp_config:
+  batching_wait_iters: 0
+  enable_balance: true
+  timeout_iters: 60
 EOF
 ```
 
@@ -283,6 +298,7 @@ cuda_graph_config:
     max_batch_size: 1024
 enable_attention_dp: false
 kv_cache_config:
+    enable_block_reuse: false
     dtype: fp8
     free_gpu_memory_fraction: 0.8
 stream_interval: 10
@@ -299,7 +315,12 @@ cuda_graph_config:
     enable_padding: true
     max_batch_size: 512
 enable_attention_dp: true
+attention_dp_config:
+  batching_wait_iters: 0
+  enable_balance: true
+  timeout_iters: 60
 kv_cache_config:
+    enable_block_reuse: false
     dtype: fp8
     free_gpu_memory_fraction: 0.8
 stream_interval: 10
@@ -314,12 +335,11 @@ trtllm-serve \
   --host localhost \
   --port 8000 \
   --backend pytorch \
-  --max_batch_size 1024 \
+  --max_batch_size 2048 \
   --max_num_tokens 8192 \
   --tp_size 8 \
   --ep_size 8 \
   --pp_size 1 \
-  --kv_cache_free_gpu_memory_fraction 0.9 \
   --extra_llm_api_options ./extra-llm-api-config.yml
 ```
 It's possible seeing OOM issues on some configs. Considering reducing `kv_cache_free_gpu_mem_fraction` to a smaller value as a workaround. We're working on the investigation and addressing the problem. If you are using max-throughput config, reduce `max_num_tokens` to `3072` to avoid OOM issues.
@@ -450,7 +470,7 @@ settings for your specific use case.
 ### Dynamo
 
 NVIDIA Dynamo is a high-throughput low-latency inference framework designed for serving generative AI and reasoning models in multi-node distributed environments.
-Dynamo supports TensorRT-LLM as one of its inference engine. For details on how to use TensorRT-LLM with Dynamo please refer to [LLM Deployment Examples using TensorRT-LLM](https://github.com/ai-dynamo/dynamo/blob/main/examples/tensorrt_llm/README.md)
+Dynamo supports TensorRT LLM as one of its inference engine. For details on how to use TensorRT LLM with Dynamo please refer to [LLM Deployment Examples using TensorRT-LLM](https://github.com/ai-dynamo/dynamo/blob/main/examples/tensorrt_llm/README.md)
 
 ### tensorrtllm_backend for triton inference server (Prototype)
 To serve the model using [tensorrtllm_backend](https://github.com/triton-inference-server/tensorrtllm_backend.git), make sure the version is v0.19+ in which the pytorch path is added as a prototype feature.
@@ -474,7 +494,7 @@ Available parameters for the requests are listed in https://github.com/triton-in
 
 ## Advanced Usages
 ### Multi-node
-TensorRT-LLM supports multi-node inference. You can use mpirun or Slurm to launch multi-node jobs. We will use two nodes for this example.
+TensorRT LLM supports multi-node inference. You can use mpirun or Slurm to launch multi-node jobs. We will use two nodes for this example.
 
 #### mpirun
 mpirun requires each node to have passwordless ssh access to the other node. We need to setup the environment inside the docker container. Run the container with host network and mount the current directory as well as model directory to the container.
@@ -666,7 +686,7 @@ sbatch --nodes=2 --ntasks=8 --ntasks-per-node=4 benchmark.slurm
 
 
 ### DeepGEMM
-TensorRT-LLM uses DeepGEMM for DeepSeek-V3/R1, which provides significant e2e performance boost on Hopper GPUs. DeepGEMM can be disabled by setting the environment variable `TRTLLM_DG_ENABLED` to `0`:
+TensorRT LLM uses DeepGEMM for DeepSeek-V3/R1, which provides significant e2e performance boost on Hopper GPUs. DeepGEMM can be disabled by setting the environment variable `TRTLLM_DG_ENABLED` to `0`:
 
 DeepGEMM-related behavior can be controlled by the following environment variables:
 
@@ -737,7 +757,7 @@ mpirun -H <HOST1>:8,<HOST2>:8 \
 ```
 
 ### FlashMLA
-TensorRT-LLM has already integrated FlashMLA in the PyTorch backend. It is enabled automatically when running DeepSeek-V3/R1.
+TensorRT LLM has already integrated FlashMLA in the PyTorch backend. It is enabled automatically when running DeepSeek-V3/R1. When running DeepSeek-V3.2-Exp on Hopper, FlashMLA is the default backend for the sparse MLA.
 
 ### FP8 KV Cache and MLA
 
@@ -745,7 +765,7 @@ FP8 KV Cache and MLA quantization could be enabled, which delivers two key perfo
 - Compression of the latent KV cache enables larger batch sizes, resulting in higher throughput;
 - MLA kernel of the generation phase is accelerated by FP8 arithmetic and reduced KV cache memory access.
 
-FP8 KV Cache and MLA is supported on Hopper and Blackwell. The accuracy loss is small, with GSM8k accuracy drop less than 1%.
+FP8 KV Cache and MLA is supported on Hopper and Blackwell for DeepSeek-V3 and DeepSeek-R1, while it is only supported on Blackwell for DeepSeek-V3.2-Exp. The accuracy loss is small, with GPQA accuracy drop less than 1%.
 - On Hopper we use the [FP8 FlashMLA kernel](https://github.com/deepseek-ai/FlashMLA/pull/54) from community.
 - On Blackwell we use the kernel generated from an internal code-gen based solution called `trtllm-gen`.
 
@@ -753,7 +773,7 @@ You can enable FP8 MLA through either of these methods:
 
 **Option 1: Checkpoint config**
 
-TensorRT-LLM automatically detects the `hf_quant_config.json` file in the model directory, which configures both GEMM and KV cache quantization. For example, see the FP4 DeepSeek-R1 checkpoint [configuration](https://huggingface.co/nvidia/DeepSeek-R1-FP4/blob/main/hf_quant_config.json) provided by [ModelOpt](https://github.com/NVIDIA/TensorRT-Model-Optimizer).
+TensorRT LLM automatically detects the `hf_quant_config.json` file in the model directory, which configures both GEMM and KV cache quantization. For example, see the FP4 DeepSeek-R1 checkpoint [configuration](https://huggingface.co/nvidia/DeepSeek-R1-FP4/blob/main/hf_quant_config.json) provided by [ModelOpt](https://github.com/NVIDIA/TensorRT-Model-Optimizer).
 
 To enable FP8 MLA, modify the `kv_cache_quant_algo` property. The following shows the config for DeepSeek's block-wise FP8 GEMM quantization + FP8 MLA:
 
@@ -777,7 +797,7 @@ kv_cache_dtype: fp8
 
 ### W4AFP8
 
-TensorRT-LLM supports W(INT)4-A(FP)8 for DeepSeek on __Hopper__. Activations and weights are quantized at per-tensor and per-group (1x128) granularity respectively for MoE, and FP8 block scaling is preserved for dense layers.
+TensorRT LLM supports W(INT)4-A(FP)8 for DeepSeek on __Hopper__. Activations and weights are quantized at per-tensor and per-group (1x128) granularity respectively for MoE, and FP8 block scaling is preserved for dense layers.
 
 We provide a pre-quantized checkpoint for DeepSeek-R1 W4AFP8 at [HF model hub](https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8).
 
@@ -861,3 +881,12 @@ python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --enable_chunked_pref
 - **GPU Memory:** Adjust `--max_batch_size` and `--max_num_tokens` if you encounter out-of-memory errors.
 - **Logs:** Check `/workspace/trt_bench.log` for detailed performance information and troubleshooting messages.
 - **Configuration Files:** Verify that the configuration files are correctly formatted to avoid runtime issues.
+
+## Known Issues
+- Support for KV Cache Reuse and Chunked Prefill in DeepSeek-V3.2-Exp is currently under development. When running `quickstart_advanced.py`, please include `--disable_kv_cache_reuse` to disable KV Cache Reuse. When using `trtllm-eval`/`trtllm-serve`/`trtllm-bench`, please include the following configuration in the extra llm_api options:
+```
+kv_cache_config:
+    enable_block_reuse: false
+    tokens_per_block: 64
+enable_chunked_prefill: false
+```

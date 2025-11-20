@@ -2,12 +2,12 @@
 
 ## Multi-stage Builds with Docker
 
-TensorRT-LLM can be compiled in Docker using a multi-stage build implemented in [`Dockerfile.multi`](Dockerfile.multi).
+TensorRT LLM can be compiled in Docker using a multi-stage build implemented in [`Dockerfile.multi`](Dockerfile.multi).
 The following build stages are defined:
 
 * `devel`: this image provides all dependencies for building TensorRT-LLM.
 * `wheel`: this image contains the source code and the compiled binary distribution.
-* `release`: this image has the binaries installed and contains TensorRT-LLM examples in `/app/tensorrt_llm`.
+* `release`: this image has the binaries installed and contains TensorRT LLM examples in `/app/tensorrt_llm`.
 
 ## Building Docker Images with GNU `make`
 
@@ -19,7 +19,7 @@ separated by `_`. The following actions are available:
 * `<stage>_push`: pushes the docker image for the stage to a docker registry (implies `<stage>_build`).
 * `<stage>_run`: runs the docker image for the stage in a new container.
 
-For example, the `release` stage is built and pushed from the top-level directory of TensorRT-LLM as follows:
+For example, the `release` stage is built and pushed from the top-level directory of TensorRT LLM as follows:
 
 ```bash
 make -C docker release_push
@@ -178,4 +178,4 @@ a corresponding message. The heuristics can be overridden by specifying
 Since Docker rootless mode remaps the UID/GID and the remapped UIDs and GIDs
  (typically configured in `/etc/subuid` and `/etc/subgid`) generally do not coincide
 with the local UID/GID, both IDs need to be translated using a tool like `bindfs` in order to be able to smoothly share a local working directory with any containers
-started with `LOCAL_USER=1`. In this case, the `SOURCE_DIR` and `HOME_DIR` Makefile variables need to be set to the locations of the translated versions of the TensorRT-LLM working copy and the user home directory, respectively.
+started with `LOCAL_USER=1`. In this case, the `SOURCE_DIR` and `HOME_DIR` Makefile variables need to be set to the locations of the translated versions of the TensorRT LLM working copy and the user home directory, respectively.

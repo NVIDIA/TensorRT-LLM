@@ -177,7 +177,7 @@ class TestMamba(unittest.TestCase):
 
         # get hf mamba
         hf_mamba = AutoModelForCausalLM.from_config(
-            hf_config, torch_dtype=str_dtype_to_torch(dtype)).cuda().eval()
+            hf_config, dtype=str_dtype_to_torch(dtype)).cuda().eval()
 
         # inputs
         if remove_padding:
@@ -373,7 +373,7 @@ class TestMamba(unittest.TestCase):
 
         # get hf mamba
         hf_mamba = AutoModelForCausalLM.from_pretrained(
-            hf_path, device_map='cpu', torch_dtype=str_dtype_to_torch(dtype))
+            hf_path, device_map='cpu', dtype=str_dtype_to_torch(dtype))
 
         # get tensort llm mamba
         hf_config = MambaConfig.from_pretrained(hf_path)

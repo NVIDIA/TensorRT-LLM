@@ -19,15 +19,16 @@ scaling_vector_size = 16
 @pytest.mark.parametrize(
     "dtype", [torch.float16, torch.bfloat16]
 )  # TODO: Do we need float32 test case? fp4_quantize only supports fp16, bf16, fp8_e4m3
-def test_fp4_linear(dtype):
-    SEQ_LEN = 10
-    HIDDEN_SIZE = 128
+@pytest.mark.parametrize("mnk", [(1, 192, 128), (4, 192, 128), (8, 7168, 16384),
+                                 (128, 7168, 16384)])
+def test_fp4_linear(dtype, mnk):
+    SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE = mnk
     torch.manual_seed(0)
 
     x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype).cuda()
     x_sf_global = (448 * 6) / x.abs().max().float()
 
-    w = torch.randn((HIDDEN_SIZE, HIDDEN_SIZE), dtype=dtype).cuda()
+    w = torch.randn((OUTPUT_SIZE, HIDDEN_SIZE), dtype=dtype).cuda()
     w_sf_global = (448 * 6) / w.abs().max().float()
     w_fp4, w_sf_block = torch.ops.trtllm.fp4_quantize(w, w_sf_global,
                                                       scaling_vector_size,
@@ -35,7 +36,7 @@ def test_fp4_linear(dtype):
 
     qc = QuantConfig(quant_algo=QuantAlgo.NVFP4)
     l_fp4 = Linear(in_features=HIDDEN_SIZE,
-                   out_features=HIDDEN_SIZE,
+                   out_features=OUTPUT_SIZE,
                    bias=False,
                    dtype=dtype,
                    quant_config=qc)
@@ -44,7 +45,7 @@ def test_fp4_linear(dtype):
     assert l_fp4.weight_scale.dtype == fp4_utils.float4_sf_dtype
 
     w_sf_block_unswizzled = (torch.ops.trtllm.block_scale_interleave_reverse(
-        w_sf_block.cpu().view(HIDDEN_SIZE, -1)))
+        w_sf_block.cpu().view(pad_up(OUTPUT_SIZE, 128), -1)))
 
     l_fp4.load_weights([{
         'input_scale':
@@ -68,7 +69,7 @@ def test_fp4_linear(dtype):
     with torch.inference_mode(), autotune():
         output = l_fp4.forward(x)
 
-    output_ref = l_fp4.forward(x)
+    output = l_fp4.forward(x)
 
     # ref linear
     with torch.inference_mode():
@@ -388,6 +389,60 @@ def nvfp4_gemm_perf_test(
                     dtype,
                 )
                 buffer_idx = buffer_idx + 1
+
+
+@pytest.mark.skipif(
+    get_sm_version() not in [100, 103],
+    reason="This test is only supported in Blackwell architecture",
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("mnk", [(128, 7168, 16384), (128, 24576, 1536),
+                                 (128, 2112, 7168), (128, 4096, 7168),
+                                 (128, 7168, 2048), [127, 1024, 3200]])
+def test_fp4_linear_cublaslt(dtype, mnk):
+    """Test cuBLASLt FP4 GEMM implementation and compare with nvfp4_gemm"""
+    from tensorrt_llm._torch.cublaslt_utils import IS_CUBLASLT_AVAILABLE
+    if not IS_CUBLASLT_AVAILABLE:
+        pytest.skip("cuBLASLt FP4 GEMM not available in this build")
+
+    SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE = mnk
+    torch.manual_seed(0)
+
+    x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype).cuda()
+    x_sf_global = (448 * 6) / x.abs().max().float()
+
+    w = torch.randn((OUTPUT_SIZE, HIDDEN_SIZE), dtype=dtype).cuda()
+    w_sf_global = (448 * 6) / w.abs().max().float()
+    w_fp4, w_sf_block = torch.ops.trtllm.fp4_quantize(w, w_sf_global,
+                                                      scaling_vector_size,
+                                                      False)
+
+    with torch.inference_mode():
+        x_fp4, x_sf_block = torch.ops.trtllm.fp4_quantize(
+            x, x_sf_global, scaling_vector_size, False)
+
+        alpha_ref = 1.0 / (w_sf_global * x_sf_global)
+        alpha_tensor = torch.tensor(alpha_ref, dtype=torch.float32).cuda()
+
+        # Use cuBLASLt FP4 GEMM with autotuning support
+        with autotune():
+            output_cublaslt = torch.ops.trtllm.nvfp4_gemm_cublaslt(
+                act_fp4=x_fp4,
+                weight=w_fp4,
+                act_sf=x_sf_block,
+                weight_scale=w_sf_block,
+                alpha=alpha_tensor,
+                output_dtype=dtype)
+
+    # Reference implementation: use torch.ops.trtllm.nvfp4_gemm (CUTLASS)
+    with torch.inference_mode():
+        output_cutlass = torch.ops.trtllm.nvfp4_gemm(x_fp4, w_fp4, x_sf_block,
+                                                     w_sf_block, alpha_ref,
+                                                     dtype)
+
+    # Compare results
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output_cublaslt, output_cutlass)
 
 
 if __name__ == "__main__":

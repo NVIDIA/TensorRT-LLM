@@ -2,6 +2,7 @@
 # Note: The code is to extract image embedding from RADIO model, to support Nano v2 VLM.
 # TODO: Check and add more compatible logic for the full-series RADIO model.
 
+import copy
 import math
 from collections import namedtuple
 from typing import (Dict, Iterable, List, Literal, NamedTuple, Optional, Tuple,
@@ -21,6 +22,7 @@ from tensorrt_llm._torch.attention_backend import utils as attention_utils
 from tensorrt_llm._torch.models import modeling_utils
 from tensorrt_llm._torch.modules import attention as trtllm_attention
 from tensorrt_llm._torch.modules import mlp as trtllm_mlp
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 InputDimT = Union[int, Tuple[int, int]]
 
@@ -770,14 +772,26 @@ class RADIOVisionModelBase(nn.Module):
 class RADIOVisionModel(PreTrainedModel):
     """Modify from https://huggingface.co/nvidia/C-RADIOv2-H/blob/main/hf_model.py."""
 
-    def __init__(self, model_config: model_config_lib.ModelConfig):
+    def __init__(self,
+                 model_config: model_config_lib.ModelConfig,
+                 disable_quantization: bool = True):
         """
         Args:
             model_config: Model configuration.
+            disable_quantization: Disable quantization for RADIO model.
+                Since the radio model is for vision only, we can disable quantization for it by default.
         """
         config = model_config.pretrained_config
         super().__init__(config)
-        self.model_config = model_config
+
+        self.model_config = copy.deepcopy(model_config)
+        if self.model_config.quant_config is not None:
+            if disable_quantization:
+                # The basic method `apply_quant_config_exclude_modules` in DecoderModelForCausalLM keeps the kv_cache_quant_algo so we also keep it here.
+                self.model_config.quant_config = QuantConfig(
+                    kv_cache_quant_algo=self.model_config.quant_config.
+                    kv_cache_quant_algo)
+
         self.config = config
 
         RADIOArgs = namedtuple("RADIOArgs", config.args.keys())
@@ -809,7 +823,7 @@ class RADIOVisionModel(PreTrainedModel):
             mlp_ratio=mlp_ratio,
             drop_rate=args.drop,
             special_args=args,
-            model_config=model_config,
+            model_config=self.model_config,
         )
         if hasattr(vit_model,
                    'norm') and not getattr(args, 'model_norm', False):
@@ -848,7 +862,7 @@ class RADIOVisionModel(PreTrainedModel):
             adaptors=adaptors,
             feature_normalizer=feature_normalizer,
             inter_feature_normalizer=inter_feature_normalizer,
-            model_config=model_config,
+            model_config=self.model_config,
         )
 
     def load_weights(self, weights):
@@ -861,8 +875,10 @@ class RADIOVisionModel(PreTrainedModel):
             filter_weights, strict=False)
         # Check missing and unexpected keys.
         # The input conditioner is not initialized in current implementation.
-        unexpected_keys.remove("input_conditioner.norm_mean")
-        unexpected_keys.remove("input_conditioner.norm_std")
+        if "input_conditioner.norm_mean" in unexpected_keys:
+            unexpected_keys.remove("input_conditioner.norm_mean")
+        if "input_conditioner.norm_std" in unexpected_keys:
+            unexpected_keys.remove("input_conditioner.norm_std")
         # Partial model.blocks weights will loaded in the following step.
         for m in missing_keys:
             if not m.startswith('model.blocks.'):

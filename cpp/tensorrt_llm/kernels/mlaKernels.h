@@ -99,8 +99,14 @@ struct MlaParams
     float const* dequant_scale_kv;
     float host_bmm1_scale;
 
+    // Is it absorption mode?
+    bool absorption_mode = false;
+
     // For FP8 context qkv quantization
     float const* quant_scale_qkv = nullptr;
+
+    // for Helix parallelism: the rotary position offsets [b]
+    int32_t const* helix_position_offsets{nullptr};
 };
 
 template <typename T, typename KVCacheBuffer>

@@ -27,6 +27,7 @@
 #include <string>
 #include <vector>
 
+#include "6kd_blockwise_gemm/sm120_fp8_gemm_1d2d.cuh"
 #include "ada_blockwise_gemm/sm89_fp8_gemm_1d1d.cuh"
 #include "fp8_blockscale_mma_utils.cuh"
 #include "fp8_blockscale_tma_utils.cuh"
@@ -964,7 +965,7 @@ __forceinline__ __device__ T find_max_elem_in_warp(T value)
     return value;
 }
 
-template <typename InputType, typename OutputType, typename ScaleType = float>
+template <typename InputType, typename OutputType, typename ScaleType = float, bool USE_UE8M0 = false>
 __global__ void scale_1x128_kernel(
     OutputType* output, ScaleType* scales, InputType const* const input, int dim_x, int dim_y)
 {
@@ -1012,11 +1013,28 @@ __global__ void scale_1x128_kernel(
         }
 
         InputType amax = find_max_elem_in_warp(input_amax);
-        ScaleType scale = amax != InputType(0.f) ? 448.f / ScaleType(amax) : 1.f;
+        ScaleType quant_scale = amax != InputType(0.f) ? 448.f / ScaleType(amax) : 1.f;
+        ScaleType dequant_scale;
+
+        if constexpr (USE_UE8M0)
+        {
+            // Round dequant scale to UE8M0 (power of 2)
+            ScaleType dequant_scale_raw = 1.f / quant_scale;
+            __nv_fp8_e8m0 ue8m0_scale;
+            ue8m0_scale.__x = __nv_cvt_float_to_e8m0(float(dequant_scale_raw), __NV_SATFINITE, cudaRoundPosInf);
+            // Cast back to float automatically decodes E8M0 format
+            dequant_scale = ScaleType(static_cast<float>(ue8m0_scale));
+            // Recompute quant scale from rounded dequant scale for consistency
+            quant_scale = dequant_scale != ScaleType(0.f) ? 1.f / dequant_scale : 1.f;
+        }
+        else
+        {
+            dequant_scale = 1.f / quant_scale;
+        }
 
         if (lane_id == 0)
         {
-            scales[(size_t) scales_idx_x * stride_scale_dim_y + scales_idx_y] = ScaleType(1.f / scale);
+            scales[(size_t) scales_idx_x * stride_scale_dim_y + scales_idx_y] = dequant_scale;
         }
 
         OutputType* output_line = output + (size_t) scales_idx_y * dim_x + scales_idx_x * 128;
@@ -1029,8 +1047,8 @@ __global__ void scale_1x128_kernel(
             }
             else
             {
-                ScaleType value_1 = ScaleType(input_frag2[i].x) * scale;
-                ScaleType value_2 = ScaleType(input_frag2[i].y) * scale;
+                ScaleType value_1 = ScaleType(input_frag2[i].x) * quant_scale;
+                ScaleType value_2 = ScaleType(input_frag2[i].y) * quant_scale;
                 output_line[lane_id] = OutputType(value_1);
                 output_line[lane_id + 1] = OutputType(value_2);
             }
@@ -1365,14 +1383,23 @@ static bool kDeepGemmEnabled = []() -> bool
     return deep_gemm::jit::getGlobalCompiler().isValid() && (!env_var || std::string(env_var) != "0");
 }();
 
-void fp8_1x128_cs(
-    __nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x, int shape_y, cudaStream_t stream)
+void fp8_1x128_cs(__nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x, int shape_y,
+    cudaStream_t stream, bool use_ue8m0 = false)
 {
     if (kNumDeviceSMs < 0)
     {
         kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
     }
-    scale_1x128_kernel<<<kNumDeviceSMs * 8, 256, 0, stream>>>(mat_quant, scales, mat, shape_x, shape_y);
+    if (use_ue8m0)
+    {
+        scale_1x128_kernel<__nv_bfloat16, __nv_fp8_e4m3, float, true>
+            <<<kNumDeviceSMs * 8, 256, 0, stream>>>(mat_quant, scales, mat, shape_x, shape_y);
+    }
+    else
+    {
+        scale_1x128_kernel<__nv_bfloat16, __nv_fp8_e4m3, float, false>
+            <<<kNumDeviceSMs * 8, 256, 0, stream>>>(mat_quant, scales, mat, shape_x, shape_y);
+    }
 }
 
 void fp8_1x128_cs_reshape(__nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x, int shape_h,
@@ -1596,16 +1623,65 @@ void gemm_dispatch_sm89(void* mat_a, void* mat_b, void* mat_d, float* scales_a, 
     dim3 grid = dim3(grid_m, grid_n, grid_k);
     dim3 block = dim3(kThreadCount, 1, 1);
 
-    if (kSmemSize > (48 << 10))
-    {
-        cudaFuncSetAttribute(ada_blockwise_gemm::sm89_fp8_gemm_1d1d_impl<GemmKernel>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize);
-        auto result = cudaGetLastError();
-        TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm89 gemm kernel cannot launch: %s", cudaGetErrorString(result));
-    }
+    auto result = cudaFuncSetAttribute(ada_blockwise_gemm::sm89_fp8_gemm_1d1d_impl<GemmKernel>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize);
+    TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm89 gemm kernel cannot launch: %s", cudaGetErrorString(result));
 
     ada_blockwise_gemm::sm89_fp8_gemm_1d1d_impl<GemmKernel>
         <<<grid, block, kSmemSize, stream>>>(shape_m, shape_n, shape_k, mat_a, mat_b, mat_d, scales_a, scales_b);
+
+    result = cudaGetLastError();
+    TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm89 gemm kernel runtime error: %s", cudaGetErrorString(result));
+}
+
+void gemm_dispatch_sm120(void* mat_a, void* mat_b, void* mat_d, float* scales_a, float* scales_b, uint32_t shape_m,
+    uint32_t shape_n, uint32_t shape_k, cudaStream_t stream, int num_device_sms = kNumDeviceSMs)
+{
+    if (num_device_sms < 0)
+    {
+        num_device_sms = kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
+    }
+    using ElementInput = cute::float_e4m3_t;
+    using ElementOutput = cute::bfloat16_t;
+    using ElementAccum = float;
+    using ElementBlockScale = int32_t;
+    using KT = sm120_blockscaled_gemm::SM120BlockScaledBuilder<32, 128>;
+    using GemmKernel = sm120_blockscaled_gemm::SM120BlockScaledKernel<KT>;
+    using Params = typename GemmKernel::Params;
+    using Arguments = typename GemmKernel::Arguments;
+    using ProblemShape = typename GemmKernel::ProblemShape;
+
+    auto ptr_A = reinterpret_cast<ElementInput*>(mat_a);
+    auto ptr_B = reinterpret_cast<ElementInput*>(mat_b);
+    auto ptr_SFA = reinterpret_cast<ElementBlockScale*>(scales_a);
+    auto ptr_SFB = reinterpret_cast<ElementBlockScale*>(scales_b);
+    auto ptr_D = reinterpret_cast<ElementOutput*>(mat_d);
+    Arguments args = {ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D};
+    ProblemShape problem_shape = make_shape((int) shape_m, (int) shape_n, (int) shape_k, 1);
+
+    Params kernel_params = GemmKernel::to_underlying_arguments(problem_shape, args);
+    auto kernel_ptr = &cutlass::device_kernel<GemmKernel>;
+
+    cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, GemmKernel::kSmemSize);
+    auto result = cudaGetLastError();
+    TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm120 gemm kernel cannot launch: %s", cudaGetErrorString(result));
+
+    cudaLaunchConfig_t launch_config;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = 1;
+
+    launch_config.gridDim = GemmKernel::get_grid_shape(kernel_params);
+    launch_config.blockDim = GemmKernel::get_block_shape();
+    launch_config.dynamicSmemBytes = GemmKernel::kSmemSize;
+    launch_config.stream = stream;
+    launch_config.attrs = attrs;
+    launch_config.numAttrs = 1;
+
+    cudaLaunchKernelEx(&launch_config, kernel_ptr, kernel_params);
+
+    result = cudaGetLastError();
+    TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm120 gemm kernel runtime error: %s", cudaGetErrorString(result));
 }
 
 void fp8_gemm_run(__nv_fp8_e4m3* mat_a, int ld_a, __nv_fp8_e4m3* mat_b, int ld_b, __nv_bfloat16* mat_d, int ld_d,
@@ -1620,6 +1696,11 @@ void fp8_gemm_run(__nv_fp8_e4m3* mat_a, int ld_a, __nv_fp8_e4m3* mat_b, int ld_b
     if (arch == 89)
     {
         gemm_dispatch_sm89(mat_a, mat_b, mat_d, scales_a, scales_b, shape_m, shape_n, shape_k, stream);
+        return;
+    }
+    if (arch == 120)
+    {
+        gemm_dispatch_sm120(mat_a, mat_b, mat_d, scales_a, scales_b, shape_m, shape_n, shape_k, stream);
         return;
     }
     if (kDeepGemmEnabled)
@@ -1857,7 +1938,7 @@ void fp8_stride_batch_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_ma
     }
 
     int arch = tensorrt_llm::common::getSMVersion();
-    if (arch == 89)
+    if (arch == 89 || arch == 120)
     {
         strided_batch_gemm_dispatch_sm89(fp8_mat_a, ld_a, stride_a, fp8_mat_b, ld_b, stride_b, mat_d, ld_d, stride_d,
             scales_a, stride_scales_a, scales_b, num_problems, shape_m, shape_n, shape_k, stream);

@@ -10,9 +10,9 @@ This directory contains several examples that demonstrate how to use the `Execut
 
 ## Building the examples
 
-To build the examples, you first need to build the TensorRT-LLM C++ shared libraries (`libtensorrt_llm.so` and `libnvinfer_plugin_tensorrt_llm.so`) using the [`build_wheel.py`](source:scripts/build_wheel.py) script. Alternatively, if you have already build the TensorRT-LLM libraries, you can modify the provided `CMakeLists.txt` such that the `libtensorrt_llm.so` and `libnvinfer_plugin_tensorrt_llm.so` are imported properly.
+To build the examples, you first need to build the TensorRT LLM C++ shared libraries (`libtensorrt_llm.so` and `libnvinfer_plugin_tensorrt_llm.so`) using the [`build_wheel.py`](source:scripts/build_wheel.py) script. Alternatively, if you have already build the TensorRT LLM libraries, you can modify the provided `CMakeLists.txt` such that the `libtensorrt_llm.so` and `libnvinfer_plugin_tensorrt_llm.so` are imported properly.
 
-Once the TensorRT-LLM libraries are built, you can run
+Once the TensorRT LLM libraries are built, you can run
 
 ```
 mkdir build
@@ -22,9 +22,9 @@ make -j
 ```
 from the `./examples/cpp/executor/` folder to build the basic and advanced examples.
 
-## Preparing the TensorRT-LLM engine(s)
+## Preparing the TensorRT LLM engine(s)
 
-Before you run the examples, please make sure that you have already built engine(s) using the TensorRT-LLM API.
+Before you run the examples, please make sure that you have already built engine(s) using the TensorRT LLM API.
 
 Use `trtllm-build` to build the TRT-LLM engine.
 

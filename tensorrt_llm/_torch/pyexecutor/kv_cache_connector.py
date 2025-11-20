@@ -66,6 +66,8 @@ class RequestData:
     new_block_ids: List[int]
     # The position of the latest token with computed (valid) kv cache values.
     computed_position: int
+    # The number of scheduled tokens for the upcoming forward pass.
+    num_scheduled_tokens: int
 
 
 # A class to store some basic data regarding all inflight requests.
@@ -94,6 +96,18 @@ class KvCacheConnectorWorker(ABC):
 
     def _clear_connector_meta(self):
         self._metadata = None
+
+    def register_forward_pass_callable(self) -> Callable:
+        """
+        This callable will be called at the end of the forward pass.
+
+        Any CUDA calls which happen in the callable will execute on the
+        same stream as the forward pass.
+
+        This method is typically used by the connector to insert a
+        cuda event into the forward pass cuda stream to obtain a
+        signal of when it's appropriate to start offloading cache blocks.
+        """
 
     @abstractmethod
     def register_kv_caches(self, kv_cache_tensor: torch.Tensor):
@@ -289,12 +303,17 @@ class KvCacheConnectorSchedulerOutputRequest:
         self.block_ids.extend(new_block_ids)
         self.tokens.extend(new_tokens)
 
-        computed_position = len(
-            tokens
-        ) - 1 if req.state != LlmRequestState.CONTEXT_INIT and req.state != LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS else req.context_current_position
+        if req.state in (LlmRequestState.CONTEXT_INIT,
+                         LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS):
+            computed_position = req.context_current_position
+            num_scheduled_tokens = min(req.context_remaining_length,
+                                       req.context_chunk_size)
+        else:
+            computed_position = len(tokens) - 1
+            num_scheduled_tokens = 1  # Specdec with draft tokens is not supported yet.
 
         return RequestData(req.request_id, new_tokens, new_block_ids,
-                           computed_position)
+                           computed_position, num_scheduled_tokens)
 
 
 class KvCacheConnectorSchedulerOutputManager:
@@ -392,6 +411,10 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
     def get_num_new_matched_tokens(self, request: LlmRequest,
                                    num_computed_tokens: int) -> int:
+        if request.is_generation_only_request:
+            raise RuntimeError(
+                "Connector API is not supported for generation-only requests!")
+
         num_tokens, load_kv_async = self._run_on_leader(
             lambda: self.scheduler.get_num_new_matched_tokens(
                 request, num_computed_tokens))
