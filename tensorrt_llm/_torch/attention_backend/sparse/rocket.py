@@ -459,6 +459,11 @@ class RocketTrtllmAttention(TrtllmAttention):
             q = q[metadata.num_ctx_tokens:]
             k = k[metadata.num_ctx_tokens:]
 
+        if not q.is_contiguous():
+            q = q.contiguous()
+        if not k.is_contiguous():
+            k = k.contiguous()
+
         q = q.view(-1, self.num_kv_heads, self.num_heads // self.num_kv_heads,
                    self.head_dim)
 
