@@ -629,10 +629,6 @@ class ModelDrafter(Drafter):
             # The overlap scheduler doesn't support rejection sampling yet, so we don't update the py_draft_logits to get it fallback to greedy sampling.
             if self.disable_overlap_scheduler:
                 target_model_req.py_draft_logits = torch.stack(py_draft_logits)
-            else:
-                logger.warning(
-                    "Overlap scheduler doesn't support rejection sampling yet. Fallback to greedy sampling."
-                )
 
     def process_dynamic_draft_outputs(
             self,
