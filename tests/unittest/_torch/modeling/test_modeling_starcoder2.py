@@ -237,7 +237,7 @@ def test_starcoder2_allclose_to_hf(scenario: Scenario) -> None:
             position_ids=position_ids,
             use_cache=True,
         )
-        torch.testing.assert_close(logits, ref.logits[:, -1].float(), atol=0.4, rtol=0.4)
+        torch.testing.assert_close(logits, ref.logits[:, -1].float(), atol=0.1, rtol=0.1)
 
     # Generation phase (optionally with CUDA graphs)
     gen_input_ids = torch.tensor([900], dtype=torch.int, device=device)
