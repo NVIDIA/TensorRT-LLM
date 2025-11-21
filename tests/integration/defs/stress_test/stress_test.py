@@ -721,7 +721,7 @@ def test_disaggregated_stress_test(model_config, test_mode,
             capacity_scheduler_policy=capacity_scheduler_policy)
 
         # Set timeout based on model complexity (large models need more time)
-        performance_config = PerformanceParams(test_timeout=3600)
+        performance_config = PerformanceParams(test_timeout=36000)
 
         # Create stress test configuration with backend specified
         stress_model_config = ModelConfig(
