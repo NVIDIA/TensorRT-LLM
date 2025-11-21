@@ -18,6 +18,7 @@ import os
 import re
 from pathlib import Path
 
+import defs.ci_profiler
 import pytest
 from defs.common import (convert_weights, generate_summary_cmd, parse_mpi_cmd,
                          parse_output, quantize_data, run_and_check, similar,
@@ -1927,4 +1928,64 @@ def test_llm_minitron_fp8_with_pseudo_loras(gpt_example_root,
         target_hf_modules=["q_proj", "k_proj", "v_proj"],
         target_trtllm_modules=["attn_q", "attn_k", "attn_v"],
         zero_lora_weights=True,
+    )
+
+
+@pytest.mark.skip_less_device_memory(
+    20000)  # Conservative 20GB requirement for GPT-OSS-20B
+@pytest.mark.parametrize("gpt_oss_model_root", [
+    "gpt-oss-20b",
+], indirect=True)
+def test_gpt_oss_20b_lora_torch(gpt_example_root, llm_venv, gpt_oss_model_root,
+                                llm_datasets_root, llm_rouge_root, engine_dir,
+                                cmodel_dir):
+    """Run GPT-OSS-20B with multiple dummy LoRAs using LLM-API Torch backend."""
+
+    from tensorrt_llm import LLM
+    from tensorrt_llm.executor.request import LoRARequest
+    from tensorrt_llm.lora_manager import LoraConfig
+    from tensorrt_llm.sampling_params import SamplingParams
+
+    llm_lora_model_root = f"/code/tensorrt_llm/lora_gpt_oss_adapter/lora_gpt_oss_adapter"
+
+    print(f"Using real LoRA from: {llm_lora_model_root}")
+
+    defs.ci_profiler.start("test_nemotron_real_lora_torch")
+
+    lora_config = LoraConfig(
+        lora_dir=[llm_lora_model_root],
+        max_lora_rank=8,  # Match adapter_config.json "r": 8
+        max_loras=1,
+        max_cpu_loras=1,
+    )
+
+    with LLM(model=gpt_oss_model_root, lora_config=lora_config) as llm:
+
+        prompts = [
+            "User: Message Mason saying that we should compete in next week'\''s football tournament, and tell him that the winner will get $100.\n\nAssistant: "
+        ]
+
+        sampling_params = SamplingParams(max_tokens=50)
+
+        lora_request = [LoRARequest("nemotron-lora", 0, llm_lora_model_root)]
+
+        print("Running inference with real LoRA adapter...")
+        outputs = llm.generate(prompts,
+                               sampling_params,
+                               lora_request=lora_request)
+
+        for i, output in enumerate(outputs):
+            print(f"Prompt {i+1}: {prompts[i]}")
+            print(f"Response {i+1}: {output.outputs[0].text}")
+            print("-" * 50)
+
+        # assert len(outputs) == 2
+        # assert len(outputs[0].outputs) > 0
+        # assert len(outputs[1].outputs) > 0
+        # assert len(outputs[0].outputs[0].text) > 0
+        # assert len(outputs[1].outputs[0].text) > 0
+
+    defs.ci_profiler.stop("test_nemotron_real_lora_torch")
+    print(
+        f"test_nemotron_real_lora_torch: {defs.ci_profiler.elapsed_time_in_sec('test_nemotron_real_lora_torch')} sec"
     )
