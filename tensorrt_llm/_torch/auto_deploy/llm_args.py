@@ -197,6 +197,16 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         "backends, this should equal max_seq_len. Temporary field until tokens_per_block gets "
         "properly passed through.",
     )
+    enable_iter_perf_stats: bool = Field(
+        default=False, description="Enable iteration performance statistics.", status="prototype"
+    )
+
+    enable_iter_req_stats: bool = Field(
+        default=False,
+        description="If true, enables per request stats per iteration. Must also set "
+        "enable_iter_perf_stats to true to get request stats.",
+        status="prototype",
+    )
 
     ### VALIDATION #################################################################################
     @model_validator(mode="after")

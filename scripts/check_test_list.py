@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 This script is used to verify test lists for L0, QA, and waives file.
 
@@ -110,19 +111,56 @@ def verify_qa_test_lists(llm_src):
                         f.write(f"{cleaned_line}\n")
 
 
-def verify_waive_list(llm_src, args):
+def check_waive_duplicates(llm_src):
+    """Check for duplicate entries in waives.txt and write report."""
     waives_list_path = f"{llm_src}/tests/integration/test_lists/waives.txt"
     dup_cases_record = f"{llm_src}/dup_cases.txt"
-    non_existent_cases_record = f"{llm_src}/nonexits_cases.json"
-    # Remove prefix and markers in wavies.txt
-    dedup_lines = {
-    }  # Track all occurrences: processed_line -> [(line_no, original_line), ...]
-    processed_lines = set()
+
+    # Track all occurrences: processed_line -> [(line_no, original_line), ...]
+    dedup_lines = {}
+
     with open(waives_list_path, "r") as f:
         lines = f.readlines()
 
     for line_no, line in enumerate(lines, 1):
         original_line = line.strip()
+        line = line.strip()
+
+        if not line:
+            continue
+
+        # Check for SKIP marker in waives.txt and split by the first occurrence
+        line = line.split(" SKIP", 1)[0].strip()
+
+        # Track all occurrences of each processed line
+        if line in dedup_lines:
+            dedup_lines[line].append((line_no, original_line))
+        else:
+            dedup_lines[line] = [(line_no, original_line)]
+
+    # Write duplicate report after processing all lines
+    for processed_line, occurrences in dedup_lines.items():
+        if len(occurrences) > 1:
+            with open(dup_cases_record, "a") as f:
+                f.write(
+                    f"Duplicate waive records found for '{processed_line}' ({len(occurrences)} occurrences):\n"
+                )
+                for i, (line_no, original_line) in enumerate(occurrences, 1):
+                    f.write(
+                        f"  Occurrence {i} at line {line_no}: '{original_line}'\n"
+                    )
+                f.write(f"\n")
+
+
+def verify_waive_list(llm_src, args):
+    waives_list_path = f"{llm_src}/tests/integration/test_lists/waives.txt"
+    non_existent_cases_record = f"{llm_src}/nonexits_cases.json"
+
+    processed_lines = set()
+    with open(waives_list_path, "r") as f:
+        lines = f.readlines()
+
+    for line in lines:
         line = line.strip()
 
         if not line:
@@ -134,12 +172,6 @@ def verify_waive_list(llm_src, args):
 
         # Check for SKIP marker in waives.txt and split by the first occurrence
         line = line.split(" SKIP", 1)[0].strip()
-
-        # Track all occurrences of each processed line
-        if line in dedup_lines:
-            dedup_lines[line].append((line_no, original_line))
-        else:
-            dedup_lines[line] = [(line_no, original_line)]
 
         # If the line starts with 'full:', process it
         if line.startswith("full:"):
@@ -173,19 +205,6 @@ def verify_waive_list(llm_src, args):
 
         processed_lines.add(line)
 
-    # Write duplicate report after processing all lines
-    for processed_line, occurrences in dedup_lines.items():
-        if len(occurrences) > 1:
-            with open(dup_cases_record, "a") as f:
-                f.write(
-                    f"Duplicate waive records found for '{processed_line}' ({len(occurrences)} occurrences):\n"
-                )
-                for i, (line_no, original_line) in enumerate(occurrences, 1):
-                    f.write(
-                        f"  Occurrence {i} at line {line_no}: '{original_line}'\n"
-                    )
-                f.write(f"\n")
-
     # Write the processed lines to a tmp file
     tmp_waives_file = f"{llm_src}/processed_waive_list.txt"
     with open(tmp_waives_file, "w") as f:
@@ -210,11 +229,19 @@ def main():
     parser.add_argument("--waive",
                         action="store_true",
                         help="Enable test list verification for waive file.")
+    parser.add_argument(
+        "--check-duplicate-waives",
+        action="store_true",
+        help="Enable duplicate check in waives.txt (fails if duplicates found)."
+    )
     args = parser.parse_args()
     script_dir = os.path.dirname(os.path.realpath(__file__))
     llm_src = os.path.abspath(os.path.join(script_dir, "../"))
 
-    install_python_dependencies(llm_src)
+    # Only skip installing dependencies if ONLY --check-duplicates is used
+    if args.l0 or args.qa or args.waive:
+        install_python_dependencies(llm_src)
+
     pass_flag = True
     # Verify L0 test lists
     if args.l0:
@@ -243,6 +270,12 @@ def main():
         print("-----------Skipping waive list verification.-----------",
               flush=True)
 
+    # Check for duplicates in waives.txt if requested
+    if args.check_duplicate_waives:
+        print("-----------Checking for duplicates in waives.txt...-----------",
+              flush=True)
+        check_waive_duplicates(llm_src)
+
     invalid_json_file = os.path.join(llm_src, "invalid_tests.json")
     if os.path.isfile(invalid_json_file) and os.path.getsize(
             invalid_json_file) > 0:
@@ -261,7 +294,8 @@ def main():
         print(
             "Duplicate test names found in waives.txt, please delete one or combine them first!!!\n"
         )
-        # pass_flag = False
+        if args.check_duplicate_waives:
+            pass_flag = False
 
     non_existent_cases_file = os.path.join(llm_src, "nonexits_cases.json")
     if os.path.isfile(non_existent_cases_file) and os.path.getsize(

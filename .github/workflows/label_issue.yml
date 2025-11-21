@@ -15,10 +15,9 @@ jobs:
       - name: Checkout private action repository
         uses: actions/checkout@v4
         with:
-          repository: poweiw/goggles_action
+          repository: NVIDIA/goggles_action
           path: ./.github/actions/goggles_action # local path to store the action
-          token: ${{ secrets.GOGGLES_ACTION_REPO_TOKEN}} # token to access poweiw/goggles_action
-          ref: v1.2.1
+          ref: v1.3.0
 
       - name: AI Label Issue
         uses: ./.github/actions/goggles_action/actions/llm_label

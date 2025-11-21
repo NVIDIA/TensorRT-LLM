@@ -405,8 +405,8 @@ class MPIDist(Distributed):
     def pp_allgather(self, obj):
         return self.pp_comm.allgather(obj)
 
-    def pp_gather(self, obj):
-        return self.pp_comm.gather(obj)
+    def pp_gather(self, obj, root=0):
+        return self.pp_comm.gather(obj, root=root)
 
     def pp_broadcast(self, obj, root=0):
         return self.pp_comm.bcast(obj, root)
