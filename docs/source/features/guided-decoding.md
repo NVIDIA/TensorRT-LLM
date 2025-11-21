@@ -19,7 +19,7 @@ EOF
 trtllm-serve nvidia/Llama-3.1-8B-Instruct-FP8 --extra_llm_api_options extra_llm_api_options.yaml
 ```
 
-You should see log like below, which indicates the grammar backend is successfully enabled.
+You should see a log like the following, which indicates the grammar backend is successfully enabled.
 
 ```txt
 ......
@@ -29,7 +29,7 @@ You should see log like below, which indicates the grammar backend is successful
 
 ### JSON Schema
 
-Define a JSON schema and pass it to `response_format` when creating the OpenAI chat completion request. Alternatively, the JSON schema can be create using [pydantic](https://docs.pydantic.dev/latest/).
+Define a JSON schema and pass it to `response_format` when creating the OpenAI chat completion request. Alternatively, the JSON schema can be created using [pydantic](https://docs.pydantic.dev/latest/).
 
 ```python
 from openai import OpenAI
@@ -322,7 +322,7 @@ llm = LLM("nvidia/Llama-3.1-8B-Instruct-FP8", guided_decoding_backend="xgrammar"
 
 ### JSON Schema
 
-Create a `GuidedDecodingParams` with the `json` field specified with a JSON schema, use it to create `SamplingParams`, and then pass to `llm.generate` or `llm.generate_async`. Alternatively, the JSON schema can be create using [pydantic](https://docs.pydantic.dev/latest/).
+Create a `GuidedDecodingParams` with the `json` field specified with a JSON schema, use it to create `SamplingParams`, and then pass to `llm.generate` or `llm.generate_async`. Alternatively, the JSON schema can be created using [pydantic](https://docs.pydantic.dev/latest/).
 
 ```python
 from tensorrt_llm import LLM
