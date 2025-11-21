@@ -64,7 +64,7 @@ There are a few pitfalls that can prevent kv cache reuse when that seems possibl
 
 Kv cache state for system prompts will remain reusable until memory is needed for launching a new request or propagating an existing one. When this happens, reusable blocks are evicted based on LRU. System prompts that are frequently used have a better chance of remaining reusable, but there is no guarantee since launching new requests take priority over possible reuse. Running with a larger batch size, or larger output sequence lengths for example will reduce the probability of kv cache blocks being reused, since it increases memory needs.
 
-KV cache state is stored in blocks, each block holds multiple tokens. Only full blocks can be shared by multiple requests, thus the block size matters. The block size is a trade-off, larger block size may improve efficiency of compute kernels, but it reduces the likelihood of kv cache state reuse. The block defaults to 128 tokens, this can be changed when the model is built with the trtllm-build command, for example
+KV cache state is stored in blocks, each block holds multiple tokens. Only full blocks can be shared by multiple requests, thus the block size matters. Partially matched blocks can also be reused, but that creates a new copy of the block for each sequence. The block size is a trade-off, larger block size may improve efficiency of compute kernels, but it reduces the likelihood of kv cache state reuse. The block defaults to 128 tokens, this can be changed when the model is built with the trtllm-build command, for example
 
 ```trtllm-build --tokens_per_block 32 ...```
 
