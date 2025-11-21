@@ -19,18 +19,13 @@ class HFModel:
         self.cuda_device = torch.cuda.current_device()
         self.all_weights = {}
         self.device_uuid = [HFModel.get_device_uuid(i) for i in range(torch.cuda.device_count())]
+        self._replicate_weights()
 
     @staticmethod
     def get_device_uuid(cuda_device: int):
         from tensorrt_llm._torch.utils import get_device_uuid
 
         return get_device_uuid(cuda_device)
-
-    def flip_weights(self):
-        for _, p in self.model.named_parameters():
-            p.data = -p.data
-
-        self._replicate_weights()
 
     def _replicate_weights(self):
         model_weights = []
@@ -159,7 +154,8 @@ def run_generate(llm, hf_model, prompts, sampling_params):
 
 
 @pytest.mark.parametrize(
-    "model_dir", ["Qwen3/Qwen3-8B", "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"]
+    "model_dir",
+    ["Qwen2.5-0.5B-Instruct", "Qwen3/Qwen3-8B", "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"],
 )
 def test_llm_update_weights(model_dir):
     model_dir = str(llm_models_root() / model_dir)
@@ -171,6 +167,7 @@ def test_llm_update_weights(model_dir):
         model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
         tensor_parallel_size=1,
+        load_format="dummy",
         pipeline_parallel_size=1,
         kv_cache_config=kv_cache_config,
     )
@@ -185,27 +182,46 @@ def test_llm_update_weights(model_dir):
 
     sampling_params = SamplingParams(temperature=0, return_generation_logits=True)
 
-    results = []
-
-    # Stage 1: Generate with original model
-    results.append(run_generate(llm, hf_model, prompts, sampling_params))
-    llm_logits, ref_logits = results[0]
-    compare_logits(llm_logits, ref_logits)
-
-    # Stage 2: Test update weights with full weights
-    hf_model.flip_weights()
     ipc_handles = hf_model.get_weight_ipc_handles([0])
 
     llm._collective_rpc("update_weights", (ipc_handles,))
     # Finalize the update weights
     llm._collective_rpc("update_weights", (None,))
 
-    results.append(run_generate(llm, hf_model, prompts, sampling_params))
-    llm_logits, ref_logits = results[1]
+    llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
     compare_logits(llm_logits, ref_logits)
 
-    # Stage 3: Test update weights with partial weights
-    hf_model.flip_weights()
+
+@pytest.mark.parametrize(
+    "model_dir",
+    ["Qwen2.5-0.5B-Instruct", "Qwen3/Qwen3-8B", "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"],
+)
+def test_llm_partial_update_weights(model_dir):
+    model_dir = str(llm_models_root() / model_dir)
+    kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
+
+    hf_model = HFModel(model_dir)
+
+    llm = LLM(
+        model=model_dir,
+        ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
+        tensor_parallel_size=1,
+        load_format="dummy",
+        pipeline_parallel_size=1,
+        kv_cache_config=kv_cache_config,
+    )
+
+    # Generate texts from the prompts.
+    prompts = [
+        "Hello, my name is",
+        "The president of the United States is",
+        "The capital of France is",
+        "The future of AI is",
+    ]
+
+    sampling_params = SamplingParams(temperature=0, return_generation_logits=True)
+
+    ipc_handles = hf_model.get_weight_ipc_handles([0])
 
     def common_filter(filter_name: str) -> Callable[[str], bool]:
         def filter_fn(name: str) -> bool:
@@ -225,6 +241,14 @@ def test_llm_update_weights(model_dir):
         "embed_tokens.weight",
         "lm_head.weight",
     ]
+    if "Qwen2.5" in model_dir or "Qwen2" in model_dir:
+        filter_list.extend(
+            [
+                "q_proj.bias",
+                "k_proj.bias",
+                "v_proj.bias",
+            ]
+        )
     for filter_name in filter_list:
         weight_filter = common_filter(filter_name=filter_name)
         ipc_handles = hf_model.get_weight_ipc_handles([0], weight_filter=weight_filter)
@@ -232,6 +256,5 @@ def test_llm_update_weights(model_dir):
     # Finalize the update weights
     llm._collective_rpc("update_weights", (None,))
 
-    results.append(run_generate(llm, hf_model, prompts, sampling_params))
-    llm_logits, ref_logits = results[2]
+    llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
     compare_logits(llm_logits, ref_logits)
