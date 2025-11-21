@@ -1,5 +1,6 @@
 import argparse
 import itertools
+import json
 
 import numpy as np
 import nvtx
@@ -170,10 +171,20 @@ events = [
 [e.record() for e in events]  # Explicitly warmup events because torch is lazy
 
 torch.cuda.cudart().cudaProfilerStart()
+with nvtx.annotate(f"layer_wise_benchmarks args {json.dumps(args.__dict__)}"):
+    pass  # Use `annotate` instead of `mark` to avoid addition lines on the Nsight Systems UI
 for batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in itertools.product(
     args.batch_size_list, args.seq_len_q_list, args.seq_len_kv_cache_list, args.balance_ratio_list
 ):
     # Profile: capture graph and replay it
+    problem_spec = {
+        "batch_size": batch_size,
+        "seq_len_q": seq_len_q,
+        "seq_len_kv_cache": seq_len_kv_cache,
+        "balance_ratio": balance_ratio,
+    }
+    with nvtx.annotate(f"layer_wise_benchmarks problem_spec {json.dumps(problem_spec)}"):
+        pass
     run_pack = runner.create_run_pack(
         args.run_type,
         batch_size=batch_size,

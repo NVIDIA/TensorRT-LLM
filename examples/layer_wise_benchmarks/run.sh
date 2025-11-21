@@ -24,7 +24,7 @@ if [ "$PROFILE" -eq 1 ]; then
         --cpuctxsw none --cuda-event-trace false
         --cuda-graph-trace node
         -c cudaProfilerApi --capture-range-end stop
-        -o ${PROFILE_DIR}/report_ep${WORLD_SIZE}_rank${RANK}.nsys-rep
+        -o ${PROFILE_DIR}/report_np${WORLD_SIZE}_rank${RANK}.nsys-rep
         --force-overwrite true"
     if [ "$GPU_METRICS" -eq 1 ]; then
         PROFILE_CMD+=" --gpu-metrics-devices $LOCAL_RANK
@@ -36,5 +36,5 @@ fi
 
 set -x
 $PROFILE_CMD bash -c \
-    "python3 -u run.py \"\$@\" 2>&1 | tee \"$PROFILE_DIR/report_ep${WORLD_SIZE}_rank${RANK}.log\"" \
+    "python3 -u run.py \"\$@\" 2>&1 | tee \"$PROFILE_DIR/report_np${WORLD_SIZE}_rank${RANK}.log\"" \
     bash "$@"
