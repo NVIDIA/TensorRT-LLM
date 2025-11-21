@@ -16,6 +16,8 @@ from tensorrt_llm.llmapi import (CudaGraphConfig, KvCacheConfig,
 from tensorrt_llm.mapping import Mapping
 
 
+@pytest.mark.skipif(getSMVersion() < 100,
+                    reason="RocketKV requires SM100 (Blackwell)")
 @pytest.mark.parametrize("backend", ["pytorch"])
 @pytest.mark.parametrize("model_name",
                          ["llama-3.1-model/Llama-3.1-8B-Instruct"])
