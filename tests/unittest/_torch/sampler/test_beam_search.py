@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import pathlib as _pl
+from typing import Any
 
 import pytest
 import torch
@@ -49,7 +50,7 @@ def sampler_type(request):
 
 
 @pytest.fixture(scope="module")
-def model_kwargs(fixed_params) -> dict[str, Any]:
+def model_kwargs(fixed_params, sampler_type) -> dict[str, Any]:
     assert fixed_params[
         "max_beam_width"] == 2, "This test only works for a beam width of 2"
     return dict(
@@ -58,6 +59,7 @@ def model_kwargs(fixed_params) -> dict[str, Any]:
             weight_loader=DummyWeightLoader(),
             config_loader=DummyConfigLoader(),
         ),
+        sampler_type=sampler_type,
     )
 
 
@@ -72,19 +74,18 @@ def _build_llm(fixed_params, input_prompts, model_kwargs):
         max_beam_width=fixed_params["max_beam_width"],
         disable_overlap_scheduler=True,
         cuda_graph_config=None,
-        sampler_type=sampler_type,
     )
 
 
 @pytest.fixture(scope="module")
 def llm(fixed_params, input_prompts, model_kwargs):
-    return _build_llm(fixed_params, input_prompts, model_kwargs)
+    llm = _build_llm(fixed_params, input_prompts, model_kwargs)
     yield llm
     llm.shutdown()
 
 
 @pytest.fixture(scope="module")
-def llm_cuda_graph(fixed_params, input_prompts, sampler_type, model_kwargs):
+def llm_cuda_graph(fixed_params, input_prompts, model_kwargs):
     llm = LLM(
         **model_kwargs,
         kv_cache_config=KvCacheConfig(max_tokens=10000),
@@ -96,7 +97,6 @@ def llm_cuda_graph(fixed_params, input_prompts, sampler_type, model_kwargs):
         disable_overlap_scheduler=False,
         cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4, 8],
                                           enable_padding=True),
-        sampler_type=sampler_type,
     )
     yield llm
     llm.shutdown()
@@ -327,7 +327,9 @@ def test_beam_search_e2e_cuda_graph_and_overlap(
                      sampling_params)
 
 
+###########################################################################
 # Unit tests
+###########################################################################
 class GeneralTestParams:
     # Test Parameters for the update_beam_history and finish_beams tests
     beam_width = 3
