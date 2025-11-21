@@ -202,7 +202,8 @@ public:
     virtual void requestAndReceiveSync(LlmRequest* llmRequest) = 0;
     virtual void requestAndReceiveAsync(LlmRequest* llmRequest) = 0;
 
-    virtual void checkContextTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) = 0;
+    virtual std::tuple<std::vector<LlmRequest::RequestIdType>, std::vector<LlmRequest::RequestIdType>>
+    checkContextTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) = 0;
 
     virtual void checkGenTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) = 0;
 
@@ -243,7 +244,8 @@ public:
     void requestAndReceiveSync(LlmRequest* llmRequest) override;
     void requestAndReceiveAsync(LlmRequest* llmRequest) override;
 
-    void checkContextTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override;
+    std::tuple<std::vector<LlmRequest::RequestIdType>, std::vector<LlmRequest::RequestIdType>>
+    checkContextTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override;
 
     void checkGenTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override;
 

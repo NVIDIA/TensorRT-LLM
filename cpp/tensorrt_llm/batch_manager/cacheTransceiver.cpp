@@ -416,7 +416,8 @@ void updateKVCacheTransferBW(std::shared_ptr<CacheTransceiverComm> const& mComm,
     }
 }
 
-void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLeastRequestNum)
+std::tuple<std::vector<LlmRequest::RequestIdType>, std::vector<LlmRequest::RequestIdType>>
+CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLeastRequestNum)
 {
     bool blockAll = !atLeastRequestNum.has_value();
     std::optional<int> senderFutureTimeoutMs = std::nullopt;
@@ -475,6 +476,9 @@ void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLe
         toCompleteIdSet.insert(request->mRequestId);
     }
 
+    std::vector<LlmRequest::RequestIdType> completedRequestIds;
+    std::vector<LlmRequest::RequestIdType> errorRequestIds;
+
     // Complete all the requests in toCompleteIdSet
     for (auto it = mSenderFutures.begin(); it != mSenderFutures.end();)
     {
@@ -488,7 +492,7 @@ void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLe
                 if (status == std::future_status::ready || !senderFutureTimeoutMs.has_value())
                 {
                     future.get();
-                    request->setState(LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
+                    completedRequestIds.push_back(request->mRequestId);
                     it = mSenderFutures.erase(it);
                 }
                 else if (status == std::future_status::timeout)
@@ -503,6 +507,7 @@ void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLe
                         "Future returned unexpected status for request %ld. Marking as error", request->mRequestId);
 
                     request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                    errorRequestIds.push_back(request->mRequestId);
                     it = mSenderFutures.erase(it);
                 }
             }
@@ -511,6 +516,7 @@ void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLe
                 TLLM_LOG_ERROR(
                     "Error occurred during context transfer for request %ld: %s", request->mRequestId, e.what());
                 request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                errorRequestIds.push_back(request->mRequestId);
                 it = mSenderFutures.erase(it);
             }
         }
@@ -519,6 +525,7 @@ void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLe
             ++it;
         }
     }
+    return std::make_tuple(completedRequestIds, errorRequestIds);
 }
 
 void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastRequestNum)

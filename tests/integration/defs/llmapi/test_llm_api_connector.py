@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import math
+from time import sleep
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -82,6 +83,10 @@ def test_connector_simple(enforce_single_worker, model_with_connector,
     sampling_params = SamplingParams(max_tokens=NUM_TOKENS, ignore_eos=True)
 
     model.generate(["Hello, world"], sampling_params)
+
+    sleep(
+        1
+    )  # When using the overlap scheduler, we generate an extra token. We want to be able to track these
 
     assert scheduler.update_state_after_alloc.call_count == 1
 
@@ -157,6 +162,7 @@ def test_connector_async_onboard(enforce_single_worker, model_with_connector,
     model.generate([
         "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua."
     ], SamplingParams(max_tokens=NUM_TOKENS, ignore_eos=True))
+    sleep(1)
 
     # Once for the initial poll, then once for each token. One extra token when using the overlap scheduler.
     assert worker.get_finished.call_count == NUM_TOKENS + 1 + int(
@@ -188,6 +194,7 @@ def test_connector_async_save(enforce_single_worker, model_with_connector,
     sampling_params = SamplingParams(max_tokens=NUM_TOKENS, ignore_eos=True)
 
     model.generate(["Hello, world"], sampling_params)
+    sleep(1)
 
     assert scheduler.request_finished.call_count == 1
 
@@ -228,6 +235,7 @@ def test_connector_scheduler_output(enforce_single_worker, model_with_connector,
     sampling_params = SamplingParams(max_tokens=32, ignore_eos=True)
 
     model.generate([0] * NUM_INPUT_TOKENS, sampling_params)
+    sleep(1)
 
     assert scheduler.update_state_after_alloc.call_count == 1
     assert len(
@@ -278,6 +286,7 @@ def test_connector_scheduler_output(enforce_single_worker, model_with_connector,
         (NUM_INPUT_TOKENS + NUM_TOKENS) / BLOCK_SIZE)
 
     model.generate([1] * NUM_INPUT_TOKENS, sampling_params)
+    sleep(1)
 
     # The initial computed position should be 0, since we haven't yet onboarded any blocks.
     assert scheduler.build_connector_meta.call_args_list[0].args[
@@ -307,6 +316,7 @@ def test_connector_scheduler_output_chunked_context(enforce_single_worker,
     sampling_params = SamplingParams(max_tokens=BLOCK_SIZE, ignore_eos=True)
 
     model.generate([0] * (CHUNK_SIZE * 2), sampling_params)
+    sleep(1)
 
     assert scheduler.update_state_after_alloc.call_count == 1
 
@@ -425,6 +435,6 @@ def test_connector_multi_request(enforce_single_worker, model_with_connector):
                        SamplingParams(ignore_eos=True, max_tokens=4),
                        SamplingParams(ignore_eos=True, max_tokens=3)
                    ])
-
+    sleep(1)
     # The KV cache of both prior requests should be freed, allowing the third request to run.
     model.generate([2] * 110, sampling_params=sampling_params)
