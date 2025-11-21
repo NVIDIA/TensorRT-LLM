@@ -355,8 +355,6 @@ accuracy/test_llm_api_pytorch.py::TestNemotronH_47B_Base::test_auto_dtype[tp8ep4
 accuracy/test_llm_api_pytorch.py::TestNemotronH_47B_Base::test_reasoning_fp8_prequantized[tp8ep8-cuda_graph=True] SKIP (https://nvbugs/5640697)
 accuracy/test_llm_api_pytorch.py::TestQwQ_32B::test_auto_dtype_tp4 SKIP (https://nvbugs/5640697)
 accuracy/test_llm_api_pytorch_multimodal.py::TestLlava_V1_6_Mistral_7B::test_auto_dtype SKIP (https://nvbugs/5644187)
-accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype[True] SKIP (https://nvbugs/5644632)
-accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype[False] SKIP (https://nvbugs/5644632)
 test_e2e.py::test_ptp_quickstart_multimodal_kv_cache_reuse[phi4-multimodal-instruct-multimodals/Phi-4-multimodal-instruct-0.8-image] SKIP (https://nvbugs/5644190)
 test_e2e.py::test_ptp_quickstart_multimodal[mistral-small-3.1-24b-instruct-Mistral-Small-3.1-24B-Instruct-2503-image-True] SKIP (https://nvbugs/5648560)
 test_e2e.py::test_ptp_quickstart_multimodal[mistral-small-3.1-24b-instruct-Mistral-Small-3.1-24B-Instruct-2503-image-False] SKIP (https://nvbugs/5648560)

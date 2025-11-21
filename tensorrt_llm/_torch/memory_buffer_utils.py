@@ -57,27 +57,28 @@ class Buffers:
 
         candidate_blocks = self.buffers.get(buffer_name, [])
 
-        # Find the best-fit available buffer.
-        best_fit_block: Optional[BufferBlock] = None
-        smallest_sufficient_size = float('inf')
-        for block in candidate_blocks:
-            # Skip buffers that are too small.
-            if block.buffer.numel() < required_memory_size:
-                continue
-
-            # Find the smallest buffer that is still large enough (best-fit).
-            if block.buffer.numel() < smallest_sufficient_size:
-                # Use reserved block if find one.
-                if best_fit_block is not None and best_fit_block.is_reserved and not block.is_reserved:
+        if reserve_buffer:
+            # Find the best-fit available buffer.
+            best_fit_block: Optional[BufferBlock] = None
+            smallest_sufficient_size = float('inf')
+            for block in candidate_blocks:
+                # Skip buffers that are too small.
+                if block.buffer.numel() < required_memory_size:
                     continue
 
-                best_fit_block = block
-                smallest_sufficient_size = block.buffer.numel()
+                # Find the smallest buffer that is still large enough (best-fit).
+                if block.buffer.numel() < smallest_sufficient_size:
+                    # Use reserved block if find one.
+                    if best_fit_block is not None and best_fit_block.is_reserved and not block.is_reserved:
+                        continue
 
-        if reserve_buffer and best_fit_block is not None:
-            # A suitable buffer was found, so reuse it.
-            best_fit_block.is_reserved = True
-            return self._view_as(best_fit_block.buffer, tensor_shape, dtype)
+                    best_fit_block = block
+                    smallest_sufficient_size = block.buffer.numel()
+
+            if best_fit_block is not None:
+                # A suitable buffer was found, so reuse it.
+                best_fit_block.is_reserved = True
+                return self._view_as(best_fit_block.buffer, tensor_shape, dtype)
 
         for block in list(candidate_blocks):
             if not block.is_reserved:
@@ -88,12 +89,19 @@ class Buffers:
 
         # No suitable buffer was found, so allocate a new one.
         # The new buffer is created with uint8 to represent raw bytes.
+        def _create_buffer():
+            return torch.zeros((required_memory_size, ),
+                               device='cuda',
+                               dtype=torch.uint8)
+
         new_buffer_tensor = None
         try:
-            with torch.cuda.memory.use_mem_pool(get_shared_pool()):
-                new_buffer_tensor = torch.zeros((required_memory_size, ),
-                                                device='cuda',
-                                                dtype=torch.uint8)
+            mem_pool = get_shared_pool()
+            if mem_pool is not None:
+                with torch.cuda.memory.use_mem_pool(mem_pool):
+                    new_buffer_tensor = _create_buffer()
+            else:
+                new_buffer_tensor = _create_buffer()
         except Exception as ex:
             # Need to check if this is an OOM exception
             logger.debug(
@@ -101,9 +109,7 @@ class Buffers:
             )
             # if exception happens during allocating memory from shared pool, retry
             # to allocate from default pool
-            new_buffer_tensor = torch.zeros((required_memory_size, ),
-                                            device='cuda',
-                                            dtype=torch.uint8)
+            new_buffer_tensor = _create_buffer()
 
         new_block = BufferBlock(buffer=new_buffer_tensor,
                                 is_reserved=reserve_buffer)
