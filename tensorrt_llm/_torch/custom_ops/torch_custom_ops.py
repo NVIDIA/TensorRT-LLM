@@ -602,8 +602,8 @@ def nvfp4_gemm_cublaslt(
     """cuBLASLt-based NVFP4 GEMM with heuristic-based auto-tuning.
 
     Note:
-        This function is primarily used internally by nvfp4_gemm_unified.
-        Direct usage is discouraged. Consider using nvfp4_gemm_unified instead
+        This function is primarily used internally by nvfp4_gemm.
+        Direct usage is discouraged. Consider using nvfp4_gemm instead
         for automatic backend selection with better performance.
     """
     tuner = AutoTuner.get()
@@ -642,8 +642,8 @@ def _(
                              dtype=output_dtype)
 
 
-@torch.library.custom_op("trtllm::nvfp4_gemm", mutates_args=())
-def nvfp4_gemm(
+@torch.library.custom_op("trtllm::nvfp4_gemm_cutlass", mutates_args=())
+def nvfp4_gemm_cutlass(
     act_fp4: torch.Tensor,
     weight: torch.Tensor,
     act_sf: torch.Tensor,
@@ -655,8 +655,8 @@ def nvfp4_gemm(
     """CUTLASS-based NVFP4 GEMM with auto-tuning.
 
     Note:
-        This function is primarily used internally by nvfp4_gemm_unified.
-        Direct usage is discouraged. Consider using nvfp4_gemm_unified instead
+        This function is primarily used internally by nvfp4_gemm.
+        Direct usage is discouraged. Consider using nvfp4_gemm instead
         for automatic backend selection with better performance.
     """
     tuner = AutoTuner.get()
@@ -678,7 +678,7 @@ def nvfp4_gemm(
         tactic=best_tactic)
 
 
-@nvfp4_gemm.register_fake
+@nvfp4_gemm_cutlass.register_fake
 def _(
     act_fp4: torch.Tensor,
     weight: torch.Tensor,
@@ -833,10 +833,10 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                 out_dtype=self.output_dtype,
                 to_userbuffers=self.to_userbuffers)
         elif tactic == "cutlass":
-            return torch.ops.trtllm.nvfp4_gemm(act_fp4, weight, act_sf,
-                                               weight_scale, alpha,
-                                               self.output_dtype,
-                                               self.to_userbuffers)
+            return torch.ops.trtllm.nvfp4_gemm_cutlass(act_fp4, weight, act_sf,
+                                                       weight_scale, alpha,
+                                                       self.output_dtype,
+                                                       self.to_userbuffers)
         elif tactic == "cublaslt":
             return torch.ops.trtllm.nvfp4_gemm_cublaslt(act_fp4, weight, act_sf,
                                                         weight_scale, alpha,
@@ -846,16 +846,16 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
             return torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
                 act_fp4, weight, act_sf, weight_scale, alpha, self.output_dtype)
         elif tactic == -1:
-            return torch.ops.trtllm.nvfp4_gemm(act_fp4, weight, act_sf,
-                                               weight_scale, alpha,
-                                               self.output_dtype,
-                                               self.to_userbuffers)
+            return torch.ops.trtllm.nvfp4_gemm_cutlass(act_fp4, weight, act_sf,
+                                                       weight_scale, alpha,
+                                                       self.output_dtype,
+                                                       self.to_userbuffers)
         else:
             raise ValueError(f"Invalid tactic: {tactic}")
 
 
-@torch.library.custom_op("trtllm::nvfp4_gemm_unified", mutates_args=())
-def nvfp4_gemm_unified(
+@torch.library.custom_op("trtllm::nvfp4_gemm", mutates_args=())
+def nvfp4_gemm(
     act_fp4: torch.Tensor,
     weight: torch.Tensor,
     act_sf: torch.Tensor,
@@ -916,7 +916,7 @@ def nvfp4_gemm_unified(
 
     try:
         _, best_tactic = tuner.choose_one(
-            "trtllm::nvfp4_gemm_unified::gemm",
+            "trtllm::nvfp4_gemm::gemm",
             [runner],
             FP4GemmRunner.
             tuning_config,  # All runners use the same tuning_config
@@ -940,7 +940,7 @@ def nvfp4_gemm_unified(
     )
 
 
-@nvfp4_gemm_unified.register_fake
+@nvfp4_gemm.register_fake
 def _(
     act_fp4: torch.Tensor,
     weight: torch.Tensor,

@@ -365,8 +365,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         """CuteDSL-based NVFP4 GEMM optimized for Blackwell.
 
         Note:
-            This function is primarily used internally by nvfp4_gemm_unified.
-            Direct usage is discouraged. Consider using nvfp4_gemm_unified instead
+            This function is primarily used internally by nvfp4_gemm.
+            Direct usage is discouraged. Consider using nvfp4_gemm instead
             for automatic backend selection with better performance.
         """
         tuner = AutoTuner.get()

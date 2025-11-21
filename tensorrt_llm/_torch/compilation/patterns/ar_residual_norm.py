@@ -555,10 +555,10 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
 
         def register_nvfp4_gemm_prologue(custom_pass: PatternMatcherPass):
             trtllm_nvfp4_gemm_default = CallFunction(
-                torch.ops.trtllm.nvfp4_gemm.default, KeywordArg('act_fp4'),
-                KeywordArg('weight'), KeywordArg('act_sf'),
-                KeywordArg('weight_scale'), KeywordArg('alpha'),
-                KeywordArg('output_dtype'))
+                torch.ops.trtllm.nvfp4_gemm_cutlass.default,
+                KeywordArg('act_fp4'), KeywordArg('weight'),
+                KeywordArg('act_sf'), KeywordArg('weight_scale'),
+                KeywordArg('alpha'), KeywordArg('output_dtype'))
             ub_copy = CallFunction(torch.ops.trtllm.copy_to_userbuffers,
                                    trtllm_nvfp4_gemm_default)
 
@@ -580,12 +580,12 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
                 alpha: torch.Tensor,
                 output_dtype: torch.dtype,
             ):
-                nvfp4_gemm_output = torch.ops.trtllm.nvfp4_gemm(
+                nvfp4_gemm_output = torch.ops.trtllm.nvfp4_gemm_cutlass(
                     act_fp4, weight, act_sf, weight_scale, alpha, output_dtype,
                     True)
                 return nvfp4_gemm_output
 
-            # No extra check needed as the output dtype of nvfp4_gemm has been verified when
+            # No extra check needed as the output dtype of nvfp4_gemm_cutlass has been verified when
             # ub_copy is inserted.
             register_replacement(
                 empty_nvfp4_gemm_prologue_pattern,
