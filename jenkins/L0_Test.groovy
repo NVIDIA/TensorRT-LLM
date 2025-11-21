@@ -2333,7 +2333,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             error "Some tests still failed after rerun attempts, please check the test report."
         }
 
-        if (perfMode) {
+        if (perfMode && !stageName.contains("Perf-Sanity")) {
             basePerfFilename = stageName.contains("PyTorch") ? "base_perf_pytorch.csv" : "base_perf.csv"
             basePerfPath = "${llmSrc}/tests/integration/defs/perf/${basePerfFilename}"
             stage("Check perf result") {
@@ -2744,8 +2744,8 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["b200-trtllm", "l0_dgx_b200", 1, 1, 4, 1, true],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["b300-x4", "l0_dgx_b300", 1, 1, 4],
         // Perf sanity post merge test
-        // Disable perf stages due to https://nvbugs/5643646
-        // "DGX_B200-4_GPUs-PyTorch-Perf-Sanity-Post-Merge-1": ["b200-x4", "perf_sanity_l0_dgx_b200", 1, 1, 4],
+        "DGX_B200-4_GPUs-PyTorch-Perf-Sanity-Post-Merge-1": ["b200-x4", "perf_sanity_l0_dgx_b200", 1, 1, 4],
+        // "DGX_B200-8_GPUs-PyTorch-Perf-Sanity-Post-Merge-1": ["b200-x8", "perf_sanity_l0_dgx_b200", 1, 1, 8],
         // "DGX_B300-4_GPUs-PyTorch-Perf-Sanity-Post-Merge-1": ["b300-x4", "perf_sanity_l0_dgx_b300", 1, 1, 4],
     ]
     fullSet += x86SlurmTestConfigs.keySet()
@@ -2788,7 +2788,9 @@ def launchTestJobs(pipeline, testFilter)
         // "GB200-8_GPUs-2_Nodes-PyTorch-4": ["gb200-trtllm", "l0_gb200_multi_nodes", 4, 5, 8, 2],
         // "GB200-8_GPUs-2_Nodes-PyTorch-5": ["gb200-trtllm", "l0_gb200_multi_nodes", 5, 5, 8, 2],
     // ]
-    multiNodesSBSAConfigs = [:]
+    multiNodesSBSAConfigs = [
+        "GB200-8_GPUs-2_Nodes-PyTorch-Perf-Sanity-Post-Merge-1": ["gb200-trtllm", "perf_sanity_l0_gb200_multi_nodes", 1, 1, 8, 2],
+    ]
     def numMultiNodeTests = 3
     multiNodesSBSAConfigs += (1..numMultiNodeTests).collectEntries { i ->
         ["GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-${i}".toString(), ["gb200-oci-trtllm", "l0_gb200_multi_nodes", i, numMultiNodeTests, 8, 2]]
