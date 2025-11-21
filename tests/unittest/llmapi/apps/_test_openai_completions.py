@@ -205,6 +205,34 @@ async def test_batch_completions_streaming(async_client: openai.AsyncOpenAI,
 
 
 @pytest.mark.asyncio(loop_scope="module")
+@pytest.mark.parametrize("prompts",
+                         [["Hello, my name is"] * 2, [[0, 0, 0, 0, 0]] * 2])
+async def test_batch_completions_beam_search_streaming(
+        async_client_with_beam_search: openai.AsyncOpenAI, model_name, prompts):
+    # test beam search with streaming
+    batch = await async_client_with_beam_search.completions.create(
+        model=model_name,
+        prompt=prompts,
+        n=2,
+        max_tokens=5,
+        temperature=0.0,
+        stream=True,
+        extra_body=dict(use_beam_search=True),
+    )
+    texts = [""] * 4  # 2 prompts × 2 beams = 4 choices
+    async for chunk in batch:
+        assert len(chunk.choices) == 1
+        choice = chunk.choices[0]
+        texts[choice.index] += choice.text
+
+    # Verify beam search produces different outputs for different beams
+    assert texts[0] != texts[1], "beam search should produce different outputs"
+    # Verify the two copies of the same prompt produce the same beams
+    assert texts[0] == texts[2], "same prompt should produce same first beam"
+    assert texts[1] == texts[3], "same prompt should produce same second beam"
+
+
+@pytest.mark.asyncio(loop_scope="module")
 async def test_completion_stream_options(async_client: openai.AsyncOpenAI,
                                          model_name: str):
     prompt = "Hello, my name is"
