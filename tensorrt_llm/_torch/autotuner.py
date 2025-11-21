@@ -698,22 +698,24 @@ class AutoTuner:
             })
 
         input_shapes = tuple(self._get_input_sizes(inputs))
+        is_cache_hit, best_runner_id, best_tactic, min_time = self.profiling_cache.search_cache(
+            custom_op, runners, input_shapes, tuning_config)
+
         # Early return if it's not tuning, use cache found one or fallback one
         if not self.is_tuning_mode:
-            is_cache_hit, best_runner_id, best_tactic, min_time = self.profiling_cache.search_cache(
-                custom_op, runners, input_shapes, tuning_config)
             best_runner = runners[best_runner_id]
             # TODO: check the stored runner and tactic can implement this shape here
-            # Should not directly try (runner, tactic) here, or it will hurt a lot of inference perf.
-
-            # Record the cache miss config.
-            # Expect no cache miss in inference. Thus, any cache miss should be recorded.
+            # Log the cache miss. Expect no cache miss in inference.
             if not is_cache_hit:
                 logger.warning_once(
                     f"[AutoTunner] Using the fallback tactic, due to cache miss on input shapes={input_shapes}",
                     key=(custom_op, "warning_autotuning_cache_miss_fallback"))
 
             return (best_runner, best_tactic)
+
+        # If it's tuning mode and cache hit, return the best runner and tactic to avoid redundant profiling.
+        if self.is_tuning_mode and is_cache_hit:
+            return (runners[best_runner_id], best_tactic)
 
         assert len(runners) > 0, "At least one runner is required"
         assert all([isinstance(r, TunableRunner) for r in runners]), \
