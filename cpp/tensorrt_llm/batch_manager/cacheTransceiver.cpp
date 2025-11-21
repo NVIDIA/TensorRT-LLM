@@ -89,7 +89,7 @@ std::unique_ptr<BaseCacheTransceiver> CacheTransceiverFactory::createCacheTransc
         }
         else
         {
-            backendType = executor::CacheTransceiverConfig::BackendType::NIXL;
+            backendType = executor::CacheTransceiverConfig::BackendType::UCX;
         }
     }
     cacheTransceiverConfig.value().setBackendType(backendType);
