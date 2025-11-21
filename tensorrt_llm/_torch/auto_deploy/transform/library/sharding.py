@@ -16,10 +16,8 @@ Our sharding algorithm for tensor parallelism (TP) is based on the following ste
        happens automatically via the checkpoint loading hook added in step 2c.
 """
 
-import operator
 import re
-from collections import defaultdict
-from typing import DefaultDict, Dict, List, Set, Tuple, Type
+from typing import Dict, List, Tuple, Type, Union
 
 import torch
 from pydantic import Field
@@ -32,7 +30,7 @@ from ...utils.node_utils import (
     bfs,
     extract_weight_node,
     filtered_nodes,
-    identify_regions_between_residuals,
+    get_all_layer_subgraphs,
     is_any_lin_op,
     is_op,
     subgraph,
@@ -110,33 +108,36 @@ class ShardingTransformExecutor(BaseTransform):
             is_clean=num_matches == 0,
             has_valid_shapes=num_matches == 0,
         )
-        # exit()
         return gm, info
 
 
 def _process_simple_shard(
-    nodes_linear: Dict[Node, List[Node]],
+    nodes_linear: Union[Dict[Node, List[Node]], List[Node]],
     rank: int,
     world_size: int,
     sharding_config: ShardingConfig,
 ) -> int:
     # for every linear node:
     # --> row_split (dim 0 of weight) + all_gather (dim -1 of output)
+    # if nodes_linear is a dict, flatten it to a 1D list of nodes
+
+    if isinstance(nodes_linear, dict):
+        nodes_linear = [n for group in nodes_linear.values() for n in group]
+
     num_simple_shards = 0
-    for node_group in nodes_linear.values():
-        for n in node_group:
-            num_simple_shards += int(
-                sharding_config.add(
-                    WeightShardingInfo.from_node(
-                        n,
-                        split_dim=SplitDimension.COLUMN,
-                        rank=rank,
-                        world_size=world_size,
-                        dist_op="all_gather",
-                        min_local_shape=1,
-                    )
+    for n in nodes_linear:
+        num_simple_shards += int(
+            sharding_config.add(
+                WeightShardingInfo.from_node(
+                    n,
+                    split_dim=SplitDimension.COLUMN,
+                    rank=rank,
+                    world_size=world_size,
+                    dist_op="all_gather",
+                    min_local_shape=1,
                 )
             )
+        )
     return num_simple_shards
 
 
@@ -150,7 +151,7 @@ class ShardingTransformConfig(TransformConfig):
     support_partial_config: bool = Field(default=False)
     # Which sharding dimensions to run: any subset of {"tp", "ep", "bmm"}
     sharding_dims: List[ShardingDim] = Field(
-        default_factory=lambda: [ShardingDim.SSM, ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
+        default_factory=lambda: [ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
     )
 
 
@@ -187,8 +188,6 @@ class Sharding(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         local_rank, world_size = shared_config.local_rank, shared_config.world_size
-        # world_size = 2
-
         if world_size < 2:
             ad_logger.info("Skipping sharding for single device")
             return gm, TransformInfo(
@@ -227,8 +226,6 @@ class Sharding(BaseTransform):
                 ad_logger.info(
                     f"Running autodeploy sharding heuristics: {sharding_config.sharding_dims}"
                 )
-                if ShardingDim.SSM in sharding_config.sharding_dims:
-                    info += detect_ssm_shard(gm, sharding_config)
 
                 # run TP sharding across ranks
                 if ShardingDim.TP in sharding_config.sharding_dims:
@@ -348,6 +345,7 @@ def _process_ssm_sharding(
             dist_op=None,
             min_local_shape=min_local_shape,
             fused_weight_dims=fused_weight_dims["in_proj"],
+            layer_type=LayerType.MAMBA,
         )
     )
 
@@ -386,6 +384,7 @@ def _process_ssm_sharding(
                 dist_op=None,
                 min_local_shape=min_local_shape,
                 fused_weight_dims=fused_dims,
+                layer_type=LayerType.MAMBA,
             )
         )
 
@@ -422,6 +421,7 @@ def _process_ssm_sharding(
             rank=rank,
             world_size=world_size,
             dist_op="all_reduce",
+            layer_type=LayerType.MAMBA,
         )
     )
     return 1
@@ -430,15 +430,40 @@ def _process_ssm_sharding(
 def _process_column_sharding(
     gm: GraphModule,
     linear_nodes: List[Node],
+    subgraph_nodes: List[Node],
     sharding_config: ShardingConfig,
     rank: int,
     world_size: int,
     min_local_shape: int = 1,
-    fused_weight: bool = False,
 ) -> None:
     """
     Parse the column sharding from the candidate nodes and update the view and split nodes accordingly.
     """
+    fused_weight_dims = None
+    # check if there are split nodes in the subgraph. They may indicate fused weights (e.g., QKV)
+    split_nodes = list(filtered_nodes(subgraph_nodes, ops=[torch.ops.aten.split_with_sizes]))
+    if len(split_nodes) > 0:
+        assert len(linear_nodes) == 1
+        linear_node = linear_nodes[0]
+        assert len(split_nodes) == 1, "Expecting exactly one split node for fused weights"
+        fused_weight_dims = split_nodes[0].args[1]
+    slice_nodes = list(filtered_nodes(subgraph_nodes, ops=[torch.ops.aten.slice]))
+    if len(slice_nodes) > 0:
+        # we are probably in fused QKV case with single linear node and 3 slice nodes
+        assert len(linear_nodes) == 1
+        linear_node = linear_nodes[0]
+        assert all(s.args[1] == 2 for s in linear_node.users), "Expecting slice nodes with dim=3"
+        fused_weight_dims = [s.args[3] - s.args[2] for s in linear_node.users]
+        weight_dim = linear_node.meta["val"].shape[2]
+        if sum(fused_weight_dims) != weight_dim:
+            if fused_weight_dims[-1] > weight_dim:
+                fused_weight_dims[-1] = weight_dim - sum(fused_weight_dims[:-1])
+            else:
+                ad_logger.warning(
+                    f"Fused weight dims {fused_weight_dims} do not sum to weight dim {weight_dim}. Skipping."
+                )
+                return
+
     for linear_node in linear_nodes:
         sharding_config.add(
             WeightShardingInfo.from_node(
@@ -448,15 +473,10 @@ def _process_column_sharding(
                 world_size=world_size,
                 dist_op=None,  # for column sharding, no dist op is performed
                 min_local_shape=min_local_shape,
+                fused_weight_dims=fused_weight_dims,
+                layer_type=LayerType.MLP if min_local_shape == 1 else LayerType.ATTENTION,
             )
         )
-
-    # get the subgraph of this module. Subgraph boundary is the next linear node.
-    next_lin_node, _ = bfs(linear_nodes[0], is_any_lin_op, include_root=False)
-    subgraph_nodes = subgraph(
-        linear_nodes,
-        [next_lin_node],
-    )
 
     nodes_to_validate = [
         n for n in subgraph_nodes if is_op(n, [torch.ops.aten.view, torch.ops.aten.reshape])
@@ -469,7 +489,7 @@ def _process_column_sharding(
             continue
         if len(view_shape) >= 3 and isinstance(view_shape[2], int) and view_shape[2] != -1:
             args = list(view_node.args)
-            view_shape[2] = view_shape[2] // world_size
+            view_shape[2] = -1
             args[1] = tuple(view_shape)
             sharding_config.add(
                 ParameterUpdateInfo(
@@ -479,13 +499,15 @@ def _process_column_sharding(
             ad_logger.debug(f"\nUpdated view node {view_node} arguments to {view_node.args}")
 
     # if fused_weight_dims is provided, we need to update all split sizes
-    if fused_weight:
-        assert len(linear_nodes) == 1, "Fused weight should be only one linear node"
-        node = linear_nodes[0]
+    if fused_weight_dims is not None:
         assert world_size is not None, "World size is required to update the split node params"
-        assert len(node.users) == 1, "Fused linear node should have only one user: a split node"
-        user = list(node.users)[0]
-        if is_op(user, [torch.ops.aten.split_with_sizes]):
+
+        # fused weight may either be processed by several slice nodes or a single split node
+        assert len(split_nodes) > 0 or len(slice_nodes) > 0, (
+            "Expecting at least one split or slice node for fused weights"
+        )
+        if len(split_nodes) > 0:
+            user = split_nodes[0]
             orig_sizes = user.args[1]
             new_sizes = [orig_sizes[i] // world_size for i in range(len(orig_sizes))]
             args = list(user.args)
@@ -495,9 +517,19 @@ def _process_column_sharding(
                     rank=rank, world_size=world_size, target_node=user.name, args=tuple(args)
                 )
             )
-            ad_logger.debug(
-                f"\nInserted parameter update transformation for split node {user} arguments to {user.args}"
-            )
+        else:
+            for slice_node in linear_node.users:
+                args = list(slice_node.args)
+                args[2] = args[2] // world_size
+                args[3] = args[3] // world_size
+                sharding_config.add(
+                    ParameterUpdateInfo(
+                        rank=rank,
+                        world_size=world_size,
+                        target_node=slice_node.name,
+                        args=tuple(args),
+                    )
+                )
 
 
 def detect_sharding_from_factory_config(
@@ -557,8 +589,10 @@ def detect_sharding_from_factory_config(
 
         if any(attn_name in module_name for attn_name in attn_names):
             min_local_shape = head_dim
+            layer_type = LayerType.ATTENTION
         else:
             min_local_shape = 1
+            layer_type = LayerType.MLP
 
         # use regex to find if module_name matches any of the keys in sharding_config
         for key in tp_plan.keys():
@@ -573,7 +607,7 @@ def detect_sharding_from_factory_config(
                 # we have a match. Get the config for this layer
                 config = tp_plan[key]
                 if config == "colwise":
-                    sharding_config.weight_sharding_transforms.append(
+                    sharding_config.add(
                         WeightShardingInfo.from_node(
                             lin_node,
                             split_dim=SplitDimension.COLUMN,
@@ -581,11 +615,12 @@ def detect_sharding_from_factory_config(
                             world_size=world_size,
                             dist_op=None,
                             min_local_shape=min_local_shape,
+                            layer_type=layer_type,
                         )
                     )
                     num_row_col_shards += 1
                 elif config == "rowwise":
-                    sharding_config.weight_sharding_transforms.append(
+                    sharding_config.add(
                         WeightShardingInfo.from_node(
                             lin_node,
                             split_dim=SplitDimension.ROW,
@@ -593,11 +628,12 @@ def detect_sharding_from_factory_config(
                             world_size=world_size,
                             dist_op="all_reduce",
                             min_local_shape=min_local_shape,
+                            layer_type=layer_type,
                         )
                     )
                     num_row_col_shards += 1
                 elif config == "mamba":
-                    sharding_config.weight_sharding_transforms.append(
+                    sharding_config.add(
                         WeightShardingInfo.from_node(
                             lin_node,
                             split_dim=SplitDimension.COLUMN,
@@ -605,7 +641,7 @@ def detect_sharding_from_factory_config(
                             world_size=world_size,
                             dist_op=None,
                             min_local_shape=min_local_shape,
-                            layer_type=LayerType.MAMBA,
+                            layer_type=LayerType.MAMBA_FULL,
                         )
                     )
                     num_row_col_shards += 1
@@ -618,7 +654,7 @@ def detect_sharding_from_factory_config(
                     if "shared" in module_name:
                         col_row_action = config.replace("local_", "")
                         if col_row_action == "colwise":
-                            sharding_config.weight_sharding_transforms.append(
+                            sharding_config.add(
                                 WeightShardingInfo(
                                     target_node=lin_node.name,
                                     split_dim=SplitDimension.COLUMN,
@@ -626,10 +662,11 @@ def detect_sharding_from_factory_config(
                                     world_size=world_size,
                                     dist_op=None,
                                     min_local_shape=min_local_shape,
+                                    layer_type=layer_type,
                                 )
                             )
                         elif col_row_action == "rowwise":
-                            sharding_config.weight_sharding_transforms.append(
+                            sharding_config.add(
                                 WeightShardingInfo(
                                     target_node=lin_node.name,
                                     split_dim=SplitDimension.ROW,
@@ -637,6 +674,7 @@ def detect_sharding_from_factory_config(
                                     world_size=world_size,
                                     dist_op="all_reduce",
                                     min_local_shape=min_local_shape,
+                                    layer_type=layer_type,
                                 )
                             )
                             num_row_col_shards += 1
@@ -648,7 +686,7 @@ def detect_sharding_from_factory_config(
 
                 elif "gather" in config:
                     # Simple shard (row + all_gather)
-                    sharding_config.weight_sharding_transforms.append(
+                    sharding_config.add(
                         WeightShardingInfo.from_node(
                             lin_node,
                             split_dim=SplitDimension.COLUMN,
@@ -656,6 +694,7 @@ def detect_sharding_from_factory_config(
                             world_size=world_size,
                             dist_op="all_gather",
                             min_local_shape=1,
+                            layer_type=layer_type,
                         )
                     )
                     num_simple_shards += 1
@@ -663,7 +702,7 @@ def detect_sharding_from_factory_config(
                     ad_logger.warning(
                         f"Unsupported sharding action {config}. Fallback to simple shard"
                     )
-                    sharding_config.weight_sharding_transforms.append(
+                    sharding_config.add(
                         WeightShardingInfo.from_node(
                             lin_node,
                             split_dim=SplitDimension.COLUMN,
@@ -671,6 +710,7 @@ def detect_sharding_from_factory_config(
                             world_size=world_size,
                             dist_op="all_gather",
                             min_local_shape=1,
+                            layer_type=layer_type,
                         )
                     )
                 # after successful match, break the loop
@@ -770,31 +810,16 @@ def detect_column_row_shard(
     splitting, e.g., the individual heads into smaller shards.
     """
     ad_logger.debug("Before sharding graph: " + str(gm))
-
     rank, world_size = sharding_config.rank, sharding_config.world_size
-    if world_size < 2:
-        ad_logger.info("Skipping TP sharding for single device")
-        return TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
 
     assert isinstance(gm, GraphModule), "Expecting GraphModule"
-
     ad_logger.info("Running TP sharding detection")
+    linear_nodes = list(filtered_nodes(gm.graph.nodes, is_any_lin_op))
+    if len(linear_nodes) == 0:
+        ad_logger.warning("Could not find any linear nodes in the graph. Skipping TP sharding.")
+        return TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
 
-    # find boundary nodes of regions we want to shard
-    boundary_nodes = identify_regions_between_residuals(gm)
-
-    # TODO: continue updating these lists
-    # pointwise ops that don't affect the sharder
-    pointwise_ops = {
-        torch.ops.aten.gelu,
-        torch.ops.aten.leaky_relu,
-        torch.ops.aten.mul,
-        torch.ops.aten.relu,
-        torch.ops.aten.sigmoid,
-        torch.ops.aten.silu,
-        torch.ops.aten.tanh,
-        torch.ops.aten.contiguous,
-    }
+    layer_subgraphs, unprocessed_linear_nodes = get_all_layer_subgraphs(gm)
 
     # acceptable attention nodes between sharded GEMMs
     shardable_attention_nodes = {
@@ -802,111 +827,49 @@ def detect_column_row_shard(
         torch.ops.auto_deploy.torch_attention,
     }
 
-    # This is a heuristic. Basically, we assume those are okay to shard if we also encounter an
-    # attention node because we know that those ops must be compatible with the attention op. Now
-    # since the attention op is shardable, we will assume those are as well if used in conjunction
-    # with the attention op.
-    shardable_nodes_with_attention = {
-        torch.ops.aten.view,
-        torch.ops.aten.reshape,
-        torch.ops.auto_deploy.flashinfer_rope,
-        operator.getitem,
+    # acceptable SSM nodes between sharded GEMMs
+    shardable_ssm_nodes = {
+        torch.ops.auto_deploy.torch_ssm,
     }
 
-    # let's look at linear nodes we can identify between pairs of boundary nodes
-    # There is three potential cases we can handle:
-    # 1. No linear nodes:
-    #       --> just continue
-    # 2. Two groups of linear nodes and we can account for all to the view nodes:
-    #       --> row_split (dim 0) 1st group + check for supported nodes +
-    #           col_split (dim 1) 2nd group + all_reduce output of 2nd group
-    # 3. Linear nodes that are not in two groups or we cannot account for all nodes:
-    #       --> row_split (dim 0 of weight) + all_gather (dim -1 of output) output
     num_shards = 0
     num_simple_shards = 0
-    num_row_col_shards = 0
-    for n_start, n_end in zip(boundary_nodes[:-1], boundary_nodes[1:]):
-        # we iterate through all nodes between the two boundary nodes and store linear nodes
-        # sorted by their input activation node. We also store remaining nodes.
-        nodes_linear: DefaultDict[Node, List[Node]] = defaultdict(list)
-        attention_nodes: Set[Node] = set()
-        attention_related_nodes: Set[Node] = set()
-        unaccounted_nodes: Set[Node] = set()
-        current_node = n_start
-        while current_node != n_end:
-            if is_any_lin_op(current_node):
-                nodes_linear[current_node.args[0]].append(current_node)
-            elif is_op(current_node, shardable_attention_nodes):
-                attention_nodes.add(current_node)
-            elif is_op(current_node, shardable_nodes_with_attention):
-                attention_related_nodes.add(current_node)
-            elif not is_op(current_node, pointwise_ops):
-                unaccounted_nodes.add(current_node)
-            current_node = current_node.next
-            assert current_node, "Could not identify next node"
-
-        # nothing to shard
-        if len(nodes_linear) == 0:
-            continue
-
+    num_ssm_shards = 0
+    num_attention_shards = 0
+    num_column_row_shards = 0
+    for opening, layer_subgraph, closing in layer_subgraphs:
+        nodes_linear = opening + [closing]
         num_shards += 1
 
         if sharding_config.simple_shard_only:
-            ad_logger.debug(f"Forcing Simple Shard: Linear groups: {nodes_linear}")
+            ad_logger.debug(f"Forcing Simple Shard on nodes: {nodes_linear}")
             num_simple_shards += _process_simple_shard(
                 nodes_linear, rank, world_size, sharding_config
             )
             continue
 
-        # simple shard when we have != 2 groups of linear nodes
-        if len(nodes_linear) != 2:
-            ad_logger.debug(f"Linear groups: {nodes_linear}")
-            num_simple_shards += _process_simple_shard(
-                nodes_linear, rank, world_size, sharding_config
+        ssm_nodes = list(filtered_nodes(layer_subgraph, ops=shardable_ssm_nodes))
+        attention_nodes = list(filtered_nodes(layer_subgraph, ops=shardable_attention_nodes))
+        min_local_shape = 1
+        layer_type = LayerType.MLP
+
+        if len(ssm_nodes) > 0:
+            # Mamba layers need special handling due to the fused weights for in_proj and conv1d
+            assert len(ssm_nodes) == 1, "Expected exactly one SSM node in layer subgraph"
+            assert len(opening) == 1, "Expected exactly one opening node in Mamba layer"
+            ad_logger.debug(f"Found SSM nodes in layer subgraph: {ssm_nodes}")
+            num_ssm_shards += _process_ssm_sharding(
+                gm, opening[0], sharding_config, rank, world_size
             )
             continue
 
-        # let's look at the unnacounted nodes. They are okay as long as they fall before the
-        # first linear node or after the last linear node, i.e., outside the sharded region
-        lin_nodes_flat: Set[Node] = {n for group in nodes_linear.values() for n in group}
-        lin_nodes_passed: Set[Node] = set()
-        current_node = n_start
-        while current_node != n_end:
-            # check if this is another linear node
-            if current_node in lin_nodes_flat:
-                lin_nodes_passed.add(current_node)
-
-            # check if we are OUTSIDE sharded region
-            if len(lin_nodes_passed) == 0 or lin_nodes_passed == lin_nodes_flat:
-                # remove node from unaccounted nodes since we are outside and it doesn't matter
-                unaccounted_nodes.discard(current_node)
-                attention_related_nodes.discard(current_node)
-                attention_nodes.discard(current_node)
-
-            current_node = current_node.next
-
-        # let's post-process the attention-related nodes
-        # we can disregard them if we also see attention nodes and we assume they are compatible
         if len(attention_nodes) > 0:
-            attention_related_nodes.clear()
-
-        # check if any unaccounted nodes are left. If so, do a simply shard
-        if unaccounted_nodes or attention_related_nodes:
-            ad_logger.debug(f"Unaccounted nodes: {unaccounted_nodes}")
-            num_simple_shards += _process_simple_shard(
-                nodes_linear, rank, world_size, sharding_config
-            )
-            continue
-
-        # If we can account for all sharded nodes, we can do a two-way shard
-        # --> row_split (dim 0) + col_split (dim 1) + all_reduce
-
-        # check if we are sharding the attention block
-        if attention_nodes:
+            layer_type = LayerType.ATTENTION
+            ad_logger.debug(f"Found attention nodes in layer subgraph: {attention_nodes}")
             if len(attention_nodes) > 1:
                 # Column-row shard boundary region detection is probably wrong - there should be
                 # only one attention operation. Fall back to simple shard.
-                ad_logger.debug(f"More than one attention node: {unaccounted_nodes}")
+                ad_logger.debug(f"More than one attention node: {attention_nodes}")
                 num_simple_shards += _process_simple_shard(
                     nodes_linear, rank, world_size, sharding_config
                 )
@@ -914,28 +877,15 @@ def detect_column_row_shard(
             # Extract head dimension. We cannot shard below the head_dim size.
             # Assume that head_dim is the last (innermost) dimension of the tensor
             min_local_shape = attention_nodes.pop().meta["val"].shape[-1]
+            num_attention_shards += 1
         else:
-            min_local_shape = 1
-
-        # We are inserting column-row shard for each group of linear enodes
-        # This may require parameter update of nodes whose args depend on (sharded) dimensions,
-        # such as view or split nodes.
-        nodes_to_column_shard = list(nodes_linear.values())[0]
-        nodes_to_row_shard = list(nodes_linear.values())[1]
-        if len(nodes_to_row_shard) != 1:
-            ad_logger.warning(
-                "Expecting only one linear node for row sharding, but got %s",
-                len(nodes_to_row_shard),
-            )
-            num_simple_shards += _process_simple_shard(
-                nodes_linear, rank, world_size, sharding_config
-            )
-            continue
+            layer_type = LayerType.MLP
 
         # column-row sharding
         _process_column_sharding(
             gm,
-            linear_nodes=nodes_to_column_shard,
+            linear_nodes=opening,
+            subgraph_nodes=layer_subgraph,
             sharding_config=sharding_config,
             rank=rank,
             world_size=world_size,
@@ -943,21 +893,28 @@ def detect_column_row_shard(
         )
 
         # shard single row node
-        sharding_config.weight_sharding_transforms.append(
+        sharding_config.add(
             WeightShardingInfo.from_node(
-                nodes_to_row_shard[0],
+                closing,
                 split_dim=SplitDimension.ROW,
                 rank=rank,
                 world_size=world_size,
                 dist_op="all_reduce",
                 min_local_shape=min_local_shape,
+                layer_type=layer_type,
             )
         )
 
-        num_row_col_shards += 1
+        num_column_row_shards += 1
+
+    # simple shard remaining linear nodes
+    num_simple_shards += _process_simple_shard(
+        unprocessed_linear_nodes, rank, world_size, sharding_config
+    )
 
     ad_logger.info(
-        f"Found {num_shards} TP shards (simple: {num_simple_shards}, row-col: {num_row_col_shards})"
+        f"Found {num_shards} TP shards (simple: {num_simple_shards}, row-col: {num_column_row_shards}, "
+        f"ssm: {num_ssm_shards}, attention: {num_attention_shards})"
     )
     return TransformInfo(
         skipped=False, num_matches=num_shards, is_clean=False, has_valid_shapes=False

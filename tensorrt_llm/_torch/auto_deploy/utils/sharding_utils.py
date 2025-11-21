@@ -110,7 +110,7 @@ def _validate_sharded_shapes(
         split_nodes = subgraph(
             [node],
             [next_lin_node],
-            include=lambda n: is_op(n, [torch.ops.aten.split, torch.ops.aten.split_with_sizes]),
+            include=lambda n: is_op(n, [torch.ops.aten.split_with_sizes]),
         )
         for split_node in split_nodes:
             orig_sizes = split_node.args[1]
@@ -179,10 +179,6 @@ def shard_weight_tensor(
             fused_dims: list = fused_weight_dims,
             d: int = dim,
         ) -> torch.Tensor:
-            # dim_d = t.shape[d]
-            # num_parts = 1
-            # part_size = dim_d // num_parts
-            # fused_dims = [part_size] * num_parts
             return torch.cat(
                 [split_tensor(w) for w in torch.split(t, fused_dims, dim=d)],
                 dim=d,
@@ -479,10 +475,10 @@ def _shard_parameter_node(
 
     # # # column shard with no gather: the output is sharded
     if not add_dist:
-        if is_any_lin_op(node):
-            _validate_sharded_shapes(
-                node, fused_weight_dims=fused_weight_dims, world_size=world_size
-            )
+        # if is_any_lin_op(node):
+        #     _validate_sharded_shapes(
+        #         node, fused_weight_dims=fused_weight_dims, world_size=world_size
+        #     )
         return
 
     # figure out the right dist op
@@ -490,6 +486,7 @@ def _shard_parameter_node(
         0: (torch.ops.auto_deploy.torch_dist_all_gather.default, -1),
         1: (torch.ops.auto_deploy.torch_dist_all_reduce.default,),
     }
+
     fn_dist, *dist_args = dist_lookup[dim]
 
     # add reduction node
@@ -560,6 +557,7 @@ class ShardingTransformInfo(BaseModel, ABC):
 class LayerType(Enum):
     ATTENTION = "attention"
     MAMBA = "mamba"
+    MAMBA_FULL = "mamba_full"
     MLP = "mlp"
     MOE = "moe"
 
@@ -615,7 +613,7 @@ class WeightShardingInfo(ShardingTransformInfo):
 
     def apply(self, gm: GraphModule, node: Node) -> None:
         """Apply TP sharding transformation to the graph module."""
-        if self.layer_type == LayerType.MAMBA:
+        if self.layer_type == LayerType.MAMBA_FULL:
             _insert_sharded_mamba(
                 gm=gm,
                 entry_node=node,
@@ -1192,7 +1190,6 @@ class ShardingSource(Enum):
 class ShardingDim(Enum):
     """Enum for sharding dimension."""
 
-    SSM = "ssm"
     TP = "tp"
     EP = "ep"
     BMM = "bmm"
@@ -1211,7 +1208,7 @@ class ShardingConfig(BaseModel):
         default_factory=lambda: [ShardingSource.HEURISTIC]
     )
     sharding_dims: List[ShardingDim] = Field(
-        default_factory=lambda: [ShardingDim.SSM, ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
+        default_factory=lambda: [ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
     )
     weight_sharding_transforms: List[WeightShardingInfo] = Field(default_factory=list)
     parameter_update_transforms: List[ParameterUpdateInfo] = Field(default_factory=list)
