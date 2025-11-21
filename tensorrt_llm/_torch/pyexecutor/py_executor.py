@@ -233,6 +233,8 @@ class PyExecutor:
                                  | None] = [None] * self.num_micro_batches
         self.send_handles = [None] * self.num_micro_batches
 
+        # Set of request IDs that are currently in flight across all micro batches.
+        # The scheduler will avoid scheduling requests that are already in flight.
         self.inflight_req_ids = ReqIdsSet()
 
         # During warmup, we don't enable the profiler
@@ -2494,7 +2496,13 @@ class PyExecutor:
             self._terminate_request(req)
 
     def _add_inflight_ids(self, scheduled_requests):
-        """Add reqids of current requests to self.inflight_req_ids."""
+        """Add request IDs of current requests to self.inflight_req_ids.
+
+        Non‑final context chunks are not added to the inflight set, so the scheduler can keep scheduling further
+        context chunks while earlier ones are in the PP pipeline. Only context requests that finish context phase
+        are inserted into the inflight set and collected into finished_ctx_reqs.
+        All generation requests are still inserted into the inflight set.
+        """
         finished_ctx_reqs = []
         for req in scheduled_requests.context_requests:
             if req.is_last_context_chunk:
@@ -2511,7 +2519,11 @@ class PyExecutor:
         return finished_ctx_reqs
 
     def _remove_inflight_ids(self, batch_state: BatchStatePP):
-        """Remove reqids of current requests from self.inflight_req_ids."""
+        """Remove request IDs of current requests from self.inflight_req_ids.
+
+        Context IDs are erased from the inflight set using batch_state.finished_ctx_reqs.
+        Generation IDs are erased using batch_state.sample_state.scheduled_requests.generation_requests.
+        """
         for req in batch_state.finished_ctx_reqs:
             logger.debug(
                 f"Context request with ID {req.request_id} removed from DECODER model inflight set"
