@@ -832,8 +832,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def outputPath = "${jobWorkspace}/job-output.log"
             def scriptLaunchPathLocal = Utils.createTempLocation(pipeline, "./slurm_launch.sh")
             def scriptLaunchPathNode = "${jobWorkspace}/slurm_launch.sh"
-            def scriptExecPathLocal = Utils.createTempLocation(pipeline, "./slurm_exec.sh")
-            def scriptExecPathNode = "${jobWorkspace}/slurm_exec.sh"
+            def scriptSubmitPathLocal = Utils.createTempLocation(pipeline, "./slurm_submit.sh")
+            def scriptSubmitPathNode = "${jobWorkspace}/slurm_submit.sh"
+            def scriptTrackPathLocal = Utils.createTempLocation(pipeline, "./slurm_track.sh")
+            def scriptTrackPathNode = "${jobWorkspace}/slurm_track.sh"
             def isAarch64 = config.contains("aarch64")
             def coverageConfigFile = "${jobWorkspace}/.coveragerc"
 
@@ -1005,7 +1007,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     scriptLaunchPathNode,
                     true
                 )
-                def scriptExec = """
+                def scriptSubmit = """#!/bin/bash
+                    set -Eeuo pipefail
+                    trap 'rc=\$?; echo "Error in file \${BASH_SOURCE[0]} on line \$LINENO: \$BASH_COMMAND (exit \$rc)"; exit \$rc' ERR
                     touch ${outputPath}
                     jobId=\$(sbatch ${scriptLaunchPathNode} | awk '{print \$4}')
                     if [ -z "\$jobId" ]; then
@@ -1013,7 +1017,31 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         exit 1
                     fi
                     echo "Submitted job \$jobId"
-                    tail -f ${outputPath} &
+                    # save job ID in $jobWorkspace/slurm_job_id.txt for later job to retrieve
+                    echo \$jobId > $jobWorkspace/slurm_job_id.txt
+                """.replaceAll("(?m)^\\s*", "").trim()
+                pipeline.writeFile(file: scriptSubmitPathLocal, text: scriptSubmit)
+                Utils.copyFileToRemoteHost(
+                    pipeline,
+                    remote,
+                    scriptSubmitPathLocal,
+                    scriptSubmitPathNode,
+                    true
+                )
+            }
+            stage("[${stageName}] Run Pytest") {
+                // Submit the sbatch job
+                Utils.exec(
+                    pipeline,
+                    timeout: false,
+                    script: Utils.sshUserCmd(
+                        remote,
+                        scriptSubmitPathNode
+                    )
+                )
+                def scriptTrack = """#!/bin/bash
+                    jobId=\$(cat $jobWorkspace/slurm_job_id.txt)
+                    tail -f $outputPath &
                     tailPid=\$!
                     # Wait until sbatch job is done.
                     while squeue -j \$jobId -o %T >/dev/null 2>&1; do
@@ -1027,27 +1055,41 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         echo "Pytest failed in Slurm job \$jobId with exit code \$EXIT_CODE"
                         exit \$EXIT_CODE
                     fi
-                """.replaceAll("(?m)^\\s*", "").trim()
-                pipeline.writeFile(file: scriptExecPathLocal, text: scriptExec)
+                """
+                pipeline.writeFile(file: scriptTrackPathLocal, text: scriptTrack)
                 Utils.copyFileToRemoteHost(
                     pipeline,
                     remote,
-                    scriptExecPathLocal,
-                    scriptExecPathNode,
+                    scriptTrackPathLocal,
+                    scriptTrackPathNode,
                     true
                 )
-            }
-            stage("[${stageName}] Run Pytest") {
-                Utils.exec(
-                    pipeline,
-                    timeout: false,
-                    script: Utils.sshUserCmd(
-                        remote,
-                        scriptExecPathNode
+                while (true) {
+                    // Check if the job is done by running squeue via SSH
+                    def result = Utils.exec(
+                        pipeline,
+                        returnStdout: true,
+                        script: Utils.sshUserCmd(
+                            remote,
+                            "\"set jobId = `cat $jobWorkspace/slurm_job_id.txt`; squeue -j \$jobId -h\""
+                        )
                     )
-                )
+                    if (result == "") {
+                        echo "Job is done."
+                        break
+                    } else {
+                        echo "Job is still running, pulling the job log."
+                        Utils.exec(
+                            pipeline,
+                            timeout: false,
+                            script: Utils.sshUserCmd(
+                                remote,
+                                scriptTrackPathNode
+                            )
+                        )
+                    }
+                }
             }
-
             echo "Finished test stage execution."
         }
     } finally {
