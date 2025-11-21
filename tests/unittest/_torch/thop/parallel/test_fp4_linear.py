@@ -394,12 +394,51 @@ def nvfp4_gemm_perf_test(
 
 @skip_pre_blackwell
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("mnk", [(128, 7168, 16384), (128, 4096, 7168)])
+@pytest.mark.parametrize(
+    "mnk",
+    [
+        # Small batch sizes (M <= 16) - test small M handling
+        (1, 4096, 4096, "Batch=1, Square 4K"),
+        (4, 4096, 4096, "Batch=4, Square 4K"),
+        (16, 4096, 4096, "Batch=16, Square 4K"),
+
+        # Odd M values
+        (3, 4096, 4096, "Odd M: M=3"),
+        (7, 4096, 4096, "Odd M: M=7"),
+        (9, 4096, 4096, "Odd M: M=9"),
+
+        # Medium batch sizes - common inference scenarios
+        (128, 4096, 4096, "Batch=128, Square 4K"),
+        (128, 7168, 16384, "Batch=128, Large K/N"),
+        (128, 4096, 7168, "Batch=128, Asymmetric"),
+
+        # Large batch sizes - training scenarios
+        (512, 4096, 4096, "Batch=512, Square 4K"),
+        (1024, 4096, 4096, "Batch=1024, Square 4K"),
+
+        # Very large batch - maximum performance
+        (2048, 4096, 4096, "Batch=2048, Square 4K"),
+        (4096, 4096, 4096, "Batch=4096, Square 4K"),
+
+        # Large K and N - test memory bandwidth
+        (128, 8192, 8192, "Batch=128, Square 8K"),
+        (256, 16384, 16384, "Batch=256, Square 16K"),
+
+        # Size asymmetry tests
+        (1024, 128, 4096, "Wide M: M >> N"),
+        (128, 16384, 128, "Wide N: N >> K"),
+    ])
 def test_nvfp4_gemm_unified_all_tactics(dtype, mnk):
     """Test nvfp4_gemm_unified with auto backend selection, ensuring all tactics are tested."""
     from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+    from tensorrt_llm._torch.cublaslt_utils import IS_CUBLASLT_AVAILABLE
 
-    SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE = mnk
+    # Unpack mnk with optional description
+    if len(mnk) == 4:
+        SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE, desc = mnk
+    else:
+        SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE = mnk
+        desc = f"M={SEQ_LEN}, K={HIDDEN_SIZE}, N={OUTPUT_SIZE}"
     torch.manual_seed(0)
 
     x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype).cuda()
@@ -448,205 +487,118 @@ def test_nvfp4_gemm_unified_all_tactics(dtype, mnk):
     torch.cuda.synchronize()
     torch.testing.assert_close(output_auto, output_ref, rtol=1e-2, atol=0.15)
 
-    # # Capture all tactics using AutoTuner.capture()
-    # with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
-    #     output = torch.ops.trtllm.nvfp4_gemm_unified(act_fp4=x_fp4,
-    #                                                  weight=w_fp4,
-    #                                                  act_sf=x_sf_block,
-    #                                                  weight_scale=w_sf_block,
-    #                                                  alpha=alpha_tensor,
-    #                                                  output_dtype=dtype,
-    #                                                  to_userbuffers=False,
-    #                                                  backend='auto')
-
-    # # Convert tactics generator to list for counting
-    # all_tactics_list = list(all_tactics)
-
-    # print(f"\n{'='*80}")
-    # print(
-    #     f"Testing nvfp4_gemm_unified with M={SEQ_LEN}, N={OUTPUT_SIZE}, K={HIDDEN_SIZE}"
-    # )
-    # print(f"Total tactics found: {len(all_tactics_list)}")
-    # print(f"{'='*80}")
-
-    # # Test each tactic individually
-    # for idx, tactic in enumerate(all_tactics_list):
-    #     with AutoTuner.get().replay(tactic), torch.inference_mode():
-    #         output = torch.ops.trtllm.nvfp4_gemm_unified(
-    #             act_fp4=x_fp4,
-    #             weight=w_fp4,
-    #             act_sf=x_sf_block,
-    #             weight_scale=w_sf_block,
-    #             alpha=alpha_tensor,
-    #             output_dtype=dtype,
-    #             to_userbuffers=False,
-    #             backend='auto')
-
-    #         # Verify each tactic produces correct results
-    #         torch.testing.assert_close(output, output_ref, rtol=1e-2, atol=0.15)
-    #         # Get runner and tactic info from the captured tactic tuple
-    #         runner, tactic_value = tactic[
-    #             0]  # First element of tuple for single context
-    #         print(
-    #             f"  ✓ Tactic {idx+1}/{len(all_tactics_list)}: {runner.__class__.__name__} tactic={tactic_value} - PASSED"
-    #         )
-
-    # print(f"{'='*80}")
-    # print(f"All {len(all_tactics_list)} tactics verified successfully!")
-    # print(f"{'='*80}\n")
-
-
-@skip_pre_blackwell
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("backend", ["cutlass", "cublaslt"])
-@pytest.mark.parametrize("mnk", [(128, 4096, 7168), (256, 2048, 4096)])
-def test_nvfp4_gemm_unified_explicit_backend(dtype, backend, mnk):
-    """Test nvfp4_gemm_unified with explicit backend selection."""
-    from tensorrt_llm._torch.cublaslt_utils import IS_CUBLASLT_AVAILABLE
-
-    # Skip cuBLASLt test if not available
-    if backend == "cublaslt" and not IS_CUBLASLT_AVAILABLE:
-        pytest.skip("cuBLASLt FP4 GEMM not available in this build")
-
-    SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE = mnk
-    torch.manual_seed(0)
-
-    x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype).cuda()
-    x_sf_global = (448 * 6) / x.abs().max().float()
-
-    w = torch.randn((OUTPUT_SIZE, HIDDEN_SIZE), dtype=dtype).cuda()
-    w_sf_global = (448 * 6) / w.abs().max().float()
-    w_fp4, w_sf_block = torch.ops.trtllm.fp4_quantize(w, w_sf_global,
-                                                      scaling_vector_size,
-                                                      False)
-
-    # Prepare input
-    with torch.inference_mode():
-        x_fp4, x_sf_block = torch.ops.trtllm.fp4_quantize(
-            x, x_sf_global, scaling_vector_size, False)
-        alpha_ref = 1.0 / (w_sf_global * x_sf_global)
-        alpha_tensor = torch.tensor(alpha_ref, dtype=torch.float32).cuda()
-
-    # Test with explicit backend
-    with torch.inference_mode():
-        output = torch.ops.trtllm.nvfp4_gemm_unified(act_fp4=x_fp4,
-                                                     weight=w_fp4,
-                                                     act_sf=x_sf_block,
-                                                     weight_scale=w_sf_block,
-                                                     alpha=alpha_tensor,
-                                                     output_dtype=dtype,
-                                                     to_userbuffers=False,
-                                                     backend=backend)
-
-    # Reference: Use CUTLASS backend
-    with torch.inference_mode():
-        output_ref = torch.ops.trtllm.nvfp4_gemm_unified(
-            act_fp4=x_fp4,
-            weight=w_fp4,
-            act_sf=x_sf_block,
-            weight_scale=w_sf_block,
-            alpha=alpha_tensor,
-            output_dtype=dtype,
-            to_userbuffers=False,
-            backend='cutlass')
-
-    # Compare results
-    torch.cuda.synchronize()
-    torch.testing.assert_close(output, output_ref, rtol=1e-2, atol=0.15)
-    print(
-        f"✓ Backend '{backend}' test passed for M={SEQ_LEN}, N={OUTPUT_SIZE}, K={HIDDEN_SIZE}"
-    )
-
-
-@pytest.mark.skipif(sys.version_info < (3, 12),
-                    reason="cutlass-dsl 4.1.0 requires Python 3.12+")
-@pytest.mark.skipif(
-    get_sm_version() != 100,
-    reason="This test is only supported in Blackwell architecture",
-)
-@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE,
-                    reason="cutlass-dsl is not available")
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("mnk", [(128, 7168, 16384), (256, 4096, 7168)])
-def test_nvfp4_gemm_unified_cutedsl_all_tactics(dtype, mnk):
-    """Test nvfp4_gemm_unified with CuteDSL backend, ensuring all tactics are tested."""
-    from tensorrt_llm._torch.autotuner import AutoTuner
-
-    SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE = mnk
-    torch.manual_seed(0)
-
-    x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype).cuda()
-    x_sf_global = (448 * 6) / x.abs().max().float()
-
-    w = torch.randn((OUTPUT_SIZE, HIDDEN_SIZE), dtype=dtype).cuda()
-    w_sf_global = (448 * 6) / w.abs().max().float()
-    w_fp4, w_sf_block = torch.ops.trtllm.fp4_quantize(w, w_sf_global,
-                                                      scaling_vector_size,
-                                                      False)
-
-    # Prepare input
-    with torch.inference_mode():
-        x_fp4, x_sf_block = torch.ops.trtllm.fp4_quantize(
-            x, x_sf_global, scaling_vector_size, False)
-        alpha_ref = 1.0 / (w_sf_global * x_sf_global)
-        alpha_tensor = torch.tensor(alpha_ref, dtype=torch.float32).cuda()
-
-    # Reference: Use CUTLASS backend
-    with torch.inference_mode():
-        output_ref = torch.ops.trtllm.nvfp4_gemm_unified(
-            act_fp4=x_fp4,
-            weight=w_fp4,
-            act_sf=x_sf_block,
-            weight_scale=w_sf_block,
-            alpha=alpha_tensor,
-            output_dtype=dtype,
-            to_userbuffers=False,
-            backend='cutlass')
-
-    # Test CuteDSL backend with autotuning
-    with torch.inference_mode(), autotune():
-        output_cutedsl = torch.ops.trtllm.nvfp4_gemm_unified(
-            act_fp4=x_fp4,
-            weight=w_fp4,
-            act_sf=x_sf_block,
-            weight_scale=w_sf_block,
-            alpha=alpha_tensor,
-            output_dtype=dtype,
-            to_userbuffers=False,
-            backend='cutedsl')
-
-    # Verify CuteDSL result matches reference
-    torch.cuda.synchronize()
-    torch.testing.assert_close(output_cutedsl, output_ref, rtol=1e-2, atol=0.15)
-
-    # Capture all tactics using AutoTuner.capture()
-    with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
-        output = torch.ops.trtllm.nvfp4_gemm_unified(act_fp4=x_fp4,
-                                                     weight=w_fp4,
-                                                     act_sf=x_sf_block,
-                                                     weight_scale=w_sf_block,
-                                                     alpha=alpha_tensor,
-                                                     output_dtype=dtype,
-                                                     to_userbuffers=False,
-                                                     backend='cutedsl')
-
-    # Convert to list and filter CuteDSL tactics
-    all_tactics_list = list(all_tactics)
-    cutedsl_tactics = [
-        t for t in all_tactics_list if 'CuteDSL' in t[0][0].__class__.__name__
-    ]
+    # Test all combinations of outer layer (backend selection) and inner layer (backend tactics)
+    # Outer layer: nvfp4_gemm_unified selects backend
+    # Inner layer: each backend has its own tactics
+    from collections import defaultdict
 
     print(f"\n{'='*80}")
-    print(
-        f"Testing CuteDSL tactics for M={SEQ_LEN}, N={OUTPUT_SIZE}, K={HIDDEN_SIZE}"
-    )
-    print(f"Total CuteDSL tactics: {len(cutedsl_tactics)}")
+    print(f"Testing nvfp4_gemm_unified (2-layer tactics): {desc}")
+    print(f"Shape: M={SEQ_LEN}, K={HIDDEN_SIZE}, N={OUTPUT_SIZE}")
     print(f"{'='*80}")
 
-    # Test each CuteDSL tactic
-    for idx, tactic in enumerate(cutedsl_tactics):
-        with AutoTuner.get().replay(tactic), torch.inference_mode():
-            output = torch.ops.trtllm.nvfp4_gemm_unified(
+    print(f"\n[Outer Layer] Capturing backend selection tactics...")
+    with AutoTuner.get().capture() as outer_capture, torch.inference_mode():
+        output = torch.ops.trtllm.nvfp4_gemm_unified(act_fp4=x_fp4,
+                                                     weight=w_fp4,
+                                                     act_sf=x_sf_block,
+                                                     weight_scale=w_sf_block,
+                                                     alpha=alpha_tensor,
+                                                     output_dtype=dtype,
+                                                     to_userbuffers=False,
+                                                     backend='auto')
+
+    outer_tactics_list = list(outer_capture)
+    print(f"  Found {len(outer_tactics_list)} outer layer tactics (backends)")
+
+    # Parse outer tactics to get backend names
+    backend_map = {}
+    for outer_tactic in outer_tactics_list:
+        outer_runner, backend_name = outer_tactic[0]
+        backend_map[backend_name] = outer_tactic
+        print(f"    - Backend: {backend_name}")
+
+    print(f"\n[Inner Layer] Testing tactics for each backend...")
+
+    # All backends have independent APIs, but cuda_core needs special handling, because it requires unswizzled scale factors
+    backend_apis = {}
+    if IS_CUTLASS_DSL_AVAILABLE:
+        if 'cutlass' in backend_map:
+            backend_apis['cutlass'] = torch.ops.trtllm.nvfp4_gemm
+    if IS_CUBLASLT_AVAILABLE:
+        if 'cublaslt' in backend_map:
+            backend_apis['cublaslt'] = torch.ops.trtllm.nvfp4_gemm_cublaslt
+    if IS_CUTLASS_DSL_AVAILABLE:
+        if 'cutedsl' in backend_map:
+            backend_apis[
+                'cutedsl'] = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell
+
+    # cuda_core needs special handling (different parameters, single tactic)
+    test_cuda_core = 'cuda_core' in backend_map
+
+    # Step 3: For each backend, capture and immediately test all tactics
+    # Must test immediately after capture to avoid _last_capture being overwritten
+    tactics_by_backend = defaultdict(list)
+    total_tactics_tested = 0
+
+    for backend_name, backend_api in backend_apis.items():
+        print(f"\n  Backend: {backend_name}")
+
+        # Capture inner tactics for this backend
+        with AutoTuner.get().capture() as inner_capture, torch.inference_mode():
+            output = backend_api(
+                x_fp4,  # input/act_fp4
+                w_fp4,  # weight
+                x_sf_block,  # input_scale/act_sf
+                w_sf_block,  # weight_scale
+                alpha_tensor,  # alpha
+                dtype  # output_dtype
+            )
+
+        inner_tactics_list = list(inner_capture)
+        print(f"    Found {len(inner_tactics_list)} inner tactics")
+
+        # Verify tactics uniqueness (ensure we're testing different tactics, not repeating the same one)
+        tactic_values = [t[0][1] for t in inner_tactics_list]
+        unique_tactics = len(set(tactic_values))
+        assert len(tactic_values) == unique_tactics, \
+            f"Duplicate tactics detected! Total: {len(tactic_values)}, Unique: {unique_tactics}"
+
+        # Test each tactic immediately (while _last_capture is still valid)
+        for tactic_idx, inner_tactic in enumerate(inner_tactics_list):
+            inner_runner, inner_tactic_value = inner_tactic[0]
+            runner_name = inner_runner.__class__.__name__
+
+            # Replay this tactic
+            with AutoTuner.get().replay(inner_tactic), torch.inference_mode():
+                # Call backend API directly (using positional args)
+                output = backend_api(
+                    x_fp4,  # input/act_fp4
+                    w_fp4,  # weight
+                    x_sf_block,  # input_scale/act_sf
+                    w_sf_block,  # weight_scale
+                    alpha_tensor,  # alpha
+                    dtype  # output_dtype
+                )
+
+                # Verify correctness
+                torch.testing.assert_close(output,
+                                           output_ref,
+                                           rtol=1e-2,
+                                           atol=0.15)
+
+            total_tactics_tested += 1
+            tactics_by_backend[runner_name].append(total_tactics_tested)
+            print(f"    ✓ Tactic {tactic_idx+1}/{len(inner_tactics_list)}: "
+                  f"{runner_name} tactic={inner_tactic_value} - PASSED")
+
+    # Step 4: Test cuda_core if it's available (single tactic, no capture needed)
+    if test_cuda_core:
+        print(f"\n  Backend: cuda_core")
+        print(f"    Found 1 tactic (single implementation, no autotuning)")
+
+        with torch.inference_mode():
+            output_cuda_core = torch.ops.trtllm.nvfp4_gemm_unified(
                 act_fp4=x_fp4,
                 weight=w_fp4,
                 act_sf=x_sf_block,
@@ -654,16 +606,28 @@ def test_nvfp4_gemm_unified_cutedsl_all_tactics(dtype, mnk):
                 alpha=alpha_tensor,
                 output_dtype=dtype,
                 to_userbuffers=False,
-                backend='cutedsl')
+                backend='cuda_core')
 
-            torch.testing.assert_close(output, output_ref, rtol=1e-2, atol=0.15)
-            runner, tactic_value = tactic[0]
-            print(
-                f"  ✓ CuteDSL tactic {idx+1}/{len(cutedsl_tactics)}: {runner.__class__.__name__} tactic={tactic_value} - PASSED"
-            )
+            torch.testing.assert_close(output_cuda_core,
+                                       output_ref,
+                                       rtol=1e-2,
+                                       atol=0.15)
 
-    print(f"{'='*80}")
-    print(f"All {len(cutedsl_tactics)} CuteDSL tactics verified successfully!")
+        total_tactics_tested += 1
+        tactics_by_backend['CudaCoreNVFP4Runner'].append(total_tactics_tested)
+        print(f"    ✓ Tactic 1/1: CudaCoreNVFP4Runner tactic=0 - PASSED")
+
+    print(f"\n{'='*80}")
+    print(f"All {total_tactics_tested} tactics verified successfully!")
+    print(f"\nBreakdown by backend:")
+    for runner_name, indices in tactics_by_backend.items():
+        print(f"  - {runner_name}: {len(indices)} tactics")
+    if test_cuda_core:
+        print(f"\n  Note: cuda_core has no autotuning (single tactic)")
+    print(f"  Note: Tested all inner layer tactics for each backend")
+    print(
+        f"  Outer layer (backend selection) was tested separately with backend='auto'"
+    )
     print(f"{'='*80}\n")
 
 

@@ -3,6 +3,8 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from tensorrt_llm.logger import logger
+
 from ..._utils import get_sm_version
 from ...math_utils import pad_up
 from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
@@ -77,10 +79,47 @@ if IS_CUTLASS_DSL_AVAILABLE:
             real_k = k * 2
             batch_size = 1
             sf_vec_size = 16
-            # m,k
+
+            # Fixed layout for FP4: A and B are always K-major
             a_major = "k"
-            # n, k
             b_major = "k"
+
+            # Data types
+            ab_dtype = cutlass.Float4E2M1FN
+            c_dtype = cutlass.BFloat16
+
+            # Early exit: Check K dimension alignment
+            # For K-major layout (A and B tensors), K is the major mode (contiguous dimension).
+            # 16-byte alignment requirement: K must be divisible by 32 for FP4 (128 bits / 4 bits = 32)
+            if real_k % 32 != 0:
+                logger.debug(
+                    f"CuteDSL: K={real_k} does not meet 16-byte alignment requirement "
+                    f"(K%32={real_k%32}, expected 0). Skipping all tactics.")
+                return []
+
+            # Optimize swap_ab candidates based on M and N alignment
+            # swap_ab=False → C is N-major → requires N%8==0 (BF16: 128 bits / 16 bits = 8)
+            # swap_ab=True  → C is M-major → requires M%8==0
+            m_aligned = (m % 8 == 0)
+            n_aligned = (n % 8 == 0)
+
+            if not m_aligned and not n_aligned:
+                logger.debug(
+                    f"CuteDSL: Neither M={m} nor N={n} meets 16-byte alignment "
+                    f"(M%8={m%8}, N%8={n%8}). No valid C layout. Skipping all tactics."
+                )
+                return []
+
+            # Only test swap_ab values that satisfy alignment
+            swap_ab_candidates = []
+            if n_aligned:
+                swap_ab_candidates.append(False)  # N-major layout
+            if m_aligned:
+                swap_ab_candidates.append(True)  # M-major layout
+
+            logger.debug(
+                f"CuteDSL: M={m}(aligned={m_aligned}), N={n}(aligned={n_aligned}), K={real_k}(aligned=True). "
+                f"Testing swap_ab={swap_ab_candidates}")
 
             # full shamoo
             mma_tiler_mn_candidates = [
@@ -102,7 +141,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 (4, 2),
                 (4, 4),
             ]
-            swap_ab_candidates = [True, False]
 
             valid_tactics = []
             for swap_ab in swap_ab_candidates:
@@ -118,10 +156,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             kernel_n = n
 
                         if self.__class__.kernel_class.can_implement(
-                                cutlass.Float4E2M1FN,  # ab_dtype,
+                                ab_dtype,
                                 cutlass.Float8E4M3FN,  # sf_dtype
-                                sf_vec_size,  # sf_vec_size,
-                                cutlass.BFloat16,  # c_dtype,
+                                sf_vec_size,
+                                c_dtype,
                                 mma_tiler_mn,
                                 cluster_shape_mn,
                                 kernel_m,
@@ -135,6 +173,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             valid_tactics.append(
                                 (mma_tiler_mn, cluster_shape_mn, swap_ab))
 
+            logger.debug(
+                f"CuteDSL: Found {len(valid_tactics)} valid tactics for M={m}, N={n}, K={real_k}"
+            )
             return valid_tactics
 
         def make_cute_dsl_global_pointer(self, tensor: torch.Tensor, dtype,
@@ -193,9 +234,27 @@ if IS_CUTLASS_DSL_AVAILABLE:
             sf_k = pad_up(real_k // sf_vec_size, 4)
             sf_n = pad_up(n, 128)
 
-            # the scaling tensor is 1D. we need to make sure it has been padded to the correct shape
-            assert a_sf_tensor.shape == (sf_m * sf_k, )
-            assert b_sf_tensor.shape == (sf_n * sf_k, )
+            # Reshape scale factors to CuteDSL's expected format
+            # Input format (from CUTLASS/cuBLASLt): (m*k//16,) and (n*k//16,)
+            # CuteDSL format: (sf_m*sf_k,) and (sf_n*sf_k,)
+            # Note: This is just a view change, no memory copy
+            expected_a_sf_size = sf_m * sf_k
+            expected_b_sf_size = sf_n * sf_k
+
+            if a_sf_tensor.numel() != expected_a_sf_size:
+                raise ValueError(
+                    f"CuteDSL: act scale factor size mismatch. "
+                    f"Expected {expected_a_sf_size} (sf_m={sf_m} * sf_k={sf_k}), "
+                    f"got {a_sf_tensor.numel()} for shape M={m}, K={real_k}")
+            if b_sf_tensor.numel() != expected_b_sf_size:
+                raise ValueError(
+                    f"CuteDSL: weight scale factor size mismatch. "
+                    f"Expected {expected_b_sf_size} (sf_n={sf_n} * sf_k={sf_k}), "
+                    f"got {b_sf_tensor.numel()} for shape N={n}, K={real_k}")
+
+            # Reshape to CuteDSL's expected format (just a view, no copy)
+            a_sf_tensor = a_sf_tensor.reshape(sf_m * sf_k)
+            b_sf_tensor = b_sf_tensor.reshape(sf_n * sf_k)
 
             a_ptr = self.make_cute_dsl_global_pointer(a_tensor,
                                                       cutlass.Float4E2M1FN, 32)
@@ -313,7 +372,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         tuner = AutoTuner.get()
 
         runner = CuteDSLNVFP4BlackwellLinear(output_dtype)
-        inputs = [input, weight, input_scale, weight_scale]
+        inputs = [input, weight, input_scale, weight_scale, alpha]
         _, best_tactic = tuner.choose_one(
             "trtllm::cute_dsl_nvfp4_gemm_blackwell",
             [runner],

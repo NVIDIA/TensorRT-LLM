@@ -1,5 +1,5 @@
 from functools import lru_cache
-from typing import List, Mapping, Optional, Tuple
+from typing import List, Mapping, Optional, Tuple, Union
 
 import torch
 import triton  # type: ignore[import]
@@ -748,7 +748,29 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
         # Add CuteDSL runner if available
         if backend in ["auto", "cutedsl"]:
             if IS_CUTLASS_DSL_AVAILABLE:
-                tactics.append("cutedsl")
+                # Check if CuteDSL actually supports the current shape
+                from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
+                    CuteDSLNVFP4BlackwellLinear
+                cutedsl_runner = CuteDSLNVFP4BlackwellLinear(self.output_dtype)
+                cutedsl_tactics = cutedsl_runner.get_valid_tactics(
+                    inputs, profile)
+
+                if cutedsl_tactics:
+                    # CuteDSL supports this shape
+                    tactics.append("cutedsl")
+                elif backend == "cutedsl":
+                    # Explicitly requested CuteDSL but it doesn't support this shape
+                    m, n, k = inputs[0].shape[0], inputs[1].shape[
+                        0], inputs[0].shape[1] * 2
+                    raise ValueError(
+                        f"CuteDSL backend does not support the current shape:\n"
+                        f"  M={m}, N={n}, K={k}\n"
+                        f"CuteDSL requires 16-byte alignment for major (contiguous) dimensions:\n"
+                        f"  - K must be divisible by 32 (FP4 K-major layout): K%32={'0✓' if k % 32 == 0 else str(k%32)+'✗'}\n"
+                        f"  - Or the combination of (M, N, K, tiling, cluster shape) is not supported\n"
+                        f"Please use backend='auto' to automatically select a compatible backend."
+                    )
+                # else: backend='auto' and CuteDSL doesn't support → silently skip
             elif backend == "cutedsl":
                 raise ValueError(
                     "CuteDSL backend is not available. "
@@ -759,10 +781,39 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
     def forward(
         self,
         inputs: List[torch.Tensor],
-        tactic: str = "cutlass",
+        tactic: Union[
+            str, int] = "cutlass",  # str: backend name, or int: -1 for fallback
         **kwargs,
     ) -> torch.Tensor:
         act_fp4, weight, act_sf, weight_scale, alpha = inputs
+
+        # Check if a specific backend was requested
+        requested_backend = kwargs.get('backend', 'auto')
+
+        # If a specific backend was requested (not 'auto') and we're using fallback tactic
+        # This can happen on cache miss, where AutoTuner uses tactic=-1 as default
+        if requested_backend != 'auto' and requested_backend != tactic and tactic == -1:
+            # User explicitly requested a backend, but we're falling back to default
+            # This might happen on cache miss. We should validate the requested backend supports this shape.
+
+            # Get valid tactics for the requested backend
+            from tensorrt_llm._torch.autotuner import OptimizationProfile
+            valid_tactics = self.get_valid_tactics(inputs,
+                                                   OptimizationProfile(),
+                                                   backend=requested_backend)
+
+            if not valid_tactics or requested_backend not in valid_tactics:
+                # Requested backend doesn't support this shape
+                m, n, k = inputs[0].shape[0], inputs[1].shape[
+                    0], inputs[0].shape[1] * 2
+                raise ValueError(
+                    f"Backend '{requested_backend}' was explicitly requested but does not support the current shape:\n"
+                    f"  M={m}, N={n}, K={k}\n"
+                    f"Please use backend='auto' to automatically select a compatible backend."
+                )
+
+            # Backend supports it, use the requested backend instead of fallback
+            tactic = requested_backend
 
         if tactic == "cuda_core":
             # Unswizzle the activation scale factors
@@ -885,6 +936,7 @@ def nvfp4_gemm_unified(
     return runner(
         inputs=[act_fp4, weight, act_sf, weight_scale, alpha],
         tactic=best_tactic,
+        backend=backend,
     )
 
 

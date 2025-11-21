@@ -300,7 +300,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sfa_tensor: cute.Tensor,
         sfb_tensor: cute.Tensor,
         c_tensor: cute.Tensor,
-        alpha: cute.Pointer,  # Changed from cutlass.Float32 to device pointer
+        alpha: cute.Tensor,  # Single-element tensor containing alpha value
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
@@ -571,13 +571,12 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             epi_tile: cute.Tile,
             tile_sched_params: utils.PersistentTileSchedulerParams,
             epilogue_op: cutlass.Constexpr,
-            alpha: cute.
-        Pointer,  # Changed from cutlass.Float32 to device pointer
+            alpha: cute.Tensor,  # Single-element tensor containing alpha value
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
         """
-        alpha_value = alpha.load().to(self.c_dtype)
+        alpha_value = alpha[0].to(self.c_dtype)
 
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -1896,7 +1895,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         a_sf_ptr: cute.Pointer,
         b_sf_ptr: cute.Pointer,
         c_ptr: cute.Pointer,
-        alpha: cute.Pointer,  # Changed from cutlass.Float32 to device pointer
+        alpha: cute.
+        Pointer,  # Device pointer to alpha, will be converted to Tensor
         max_active_clusters: cutlass.Constexpr,
         current_stream: cuda.CUstream,
         swap_ab: cutlass.Constexpr = False,
@@ -1917,7 +1917,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             a_sf_ptr (cute.Pointer): Pointer to the scale factor tensor for A.
             b_sf_ptr (cute.Pointer): Pointer to the scale factor tensor for B.
             c_ptr (cute.Pointer): Pointer to the C tensor.
-            alpha (cute.Pointer): Pointer to alpha scaling factor on device (avoids CPU-GPU sync).
+            alpha (cute.Pointer): Device pointer to alpha scaling factor (converted to Tensor internally).
             max_active_clusters (cutlass.Constexpr): Maximum number of active
                 clusters.
             current_stream (cuda.CUstream): CUDA stream for the operation.
@@ -1962,8 +1962,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                                           (32, 4, sf_n, 4, sf_k, l),
                                           order=(2, 1, 4, 0, 3, 5),
                                       ))
+        alpha_tensor = cute.make_tensor(alpha,
+                                        layout=cute.make_ordered_layout(
+                                            (1, ), order=(0, )))
 
-        self(a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_tensor, alpha,
+        self(a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_tensor, alpha_tensor,
              max_active_clusters, current_stream, epilogue_op)
 
 
