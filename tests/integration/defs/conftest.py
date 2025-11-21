@@ -1354,6 +1354,10 @@ def llm_lora_model_root(request):
                 os.path.join(
                     models_root, "nemotron-nas",
                     "Llama-3_3-Nemotron-Super-49B-v1-lora-adapter_NIM_r32"))
+        elif item == "gpt-oss-20b-lora-adapter_NIM_r8":
+            model_root_list.append(
+                os.path.join(models_root, "gpt_oss",
+                             "gpt-oss-20b-lora-adapter_NIM_r8"))
 
     return ",".join(model_root_list)
 
