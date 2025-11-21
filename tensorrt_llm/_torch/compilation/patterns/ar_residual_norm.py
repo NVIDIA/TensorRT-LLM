@@ -716,6 +716,87 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
     register_ub_finalize_patterns(custom_passes[-1])
 
 
+# This force all the allreduce use trigger_completion_at_end=True
+# When using torch compile, there is no guarantee on the order of custom ops.
+# The allreduce may be followed by a kernel with aggressive grid dependency setup.
+# Makes sure the allreduce trigger completion at the end of kernel to avoid potential
+# issues.
+def register_remove_trigger_completion_at_end(custom_pass: PatternMatcherPass):
+    # TODO: add pp + tp support
+    mapping = Mapping(
+        world_size=tensorrt_llm.mpi_world_size(),
+        tp_size=tensorrt_llm.mpi_world_size(),
+        rank=tensorrt_llm.mpi_rank(),
+    )
+
+    KeywordArg("input")
+    KeywordArg("strategy")
+    allreduce_default = CallFunction(
+        torch.ops.trtllm.allreduce.default,
+        KeywordArg("input"),
+        KeywordArg("residual"),
+        KeywordArg("gamma"),
+        KeywordArg("scale"),
+        KeywordArg("bias"),
+        KeywordArg("workspace"),
+        mapping.tp_group,
+        KeywordArg("strategy"),
+        KeywordArg("op"),
+        KeywordArg("eps"),
+        False,
+    )
+
+    pattern = MultiOutputPattern([allreduce_default])
+
+    def empty_pattern(
+        input: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        gamma: Optional[torch.Tensor],
+        scale: Optional[torch.Tensor],
+        bias: Optional[torch.Tensor],
+        workspace: torch.LongTensor,
+        strategy: int,
+        op: int,
+        eps: float,
+    ):
+        return
+
+    def target_pattern(
+        input: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        gamma: Optional[torch.Tensor],
+        scale: Optional[torch.Tensor],
+        bias: Optional[torch.Tensor],
+        workspace: torch.LongTensor,
+        strategy: int,
+        op: int,
+        eps: float,
+    ):
+        allreduce = torch.ops.trtllm.allreduce(
+            input,
+            residual,
+            gamma,
+            scale,
+            bias,
+            workspace,
+            mapping.tp_group,
+            strategy,
+            op,
+            eps,
+            True,
+        )
+        return allreduce
+
+    register_replacement(
+        empty_pattern,
+        target_pattern,
+        [],
+        fwd_only,
+        custom_pass,
+        search_fn_pattern=pattern,
+    )
+
+
 def register_ar_fusions(custom_passes: List[PatternMatcherPass],
                         enable_ub: bool):
     register_ar_residual_norm(custom_passes[-1])
@@ -730,3 +811,6 @@ def register_ar_fusions(custom_passes: List[PatternMatcherPass],
 
     if enable_ub:
         register_ub_patterns(custom_passes)
+
+    custom_passes.append(PatternMatcherPass())
+    register_remove_trigger_completion_at_end(custom_passes[-1])
