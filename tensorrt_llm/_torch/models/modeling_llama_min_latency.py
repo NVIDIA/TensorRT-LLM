@@ -384,6 +384,11 @@ class Llama4MinLatencyAttention(Llama4Attention):
                 and self.floor_scale == 8192.0 \
                 and self.attn_scale == 0.1
 
+            qkv_shard_indices_mapping = {
+                "q": (0, self.q_size),
+                "k": (self.q_size, self.kv_size),
+                "v": (self.q_size + self.kv_size, self.kv_size),
+            }
             # When min-latency QKV gemm is enabled, override qkv_proj.
             self.qkv_proj = Llama4MinLatencyLinear(
                 self.hidden_size,
@@ -400,6 +405,7 @@ class Llama4MinLatencyAttention(Llama4Attention):
                 enable_fused_gemm_attn_scaling=self.
                 enable_fused_gemm_attn_scaling,
                 enable_trtllm_gen=True,
+                fused_weight_shard_indices_mapping=qkv_shard_indices_mapping,
             )
 
     def _forward_nope(

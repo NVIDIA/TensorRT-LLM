@@ -234,6 +234,15 @@ class Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_key_value_heads * self.head_dim
 
+        qkv_shard_indices_mapping = {
+            "q": (0, self.q_size * (2 if self.attn_output_gate else 1)),
+            "k":
+            (self.q_size * (2 if self.attn_output_gate else 1), self.kv_size),
+            "v":
+            (self.q_size * (2 if self.attn_output_gate else 1) + self.kv_size,
+             self.kv_size),
+        }
+
         self.qkv_proj = Linear(
             self.hidden_size,
             tp_size * self.q_size * (2 if self.attn_output_gate else 1) +
@@ -249,7 +258,8 @@ class Attention(nn.Module):
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
             disable_deep_gemm=disable_deep_gemm,
-            use_custom_cublas_mm=use_custom_cublas_mm)
+            use_custom_cublas_mm=use_custom_cublas_mm,
+            fused_weight_shard_indices_mapping=qkv_shard_indices_mapping)
 
         self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
                                 [self.hidden_size])

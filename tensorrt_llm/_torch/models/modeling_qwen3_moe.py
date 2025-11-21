@@ -58,10 +58,14 @@ class Qwen3Gate(nn.Module):
             hidden_states, self.weight.t(), bias=None, out_dtype=self.out_dtype)
         return logits
 
-    def load_weights(self, weights: List[Dict]):
+    def load_weights(self,
+                     weights: List[Dict],
+                     allow_partial_loading: bool = False):
         assert len(weights) == 1
-
-        self.weight.copy_(weights[0]["weight"][:])
+        if not allow_partial_loading:
+            assert "weight" in weights[0]
+        if weights[0]["weight"] is not None:
+            self.weight.copy_(weights[0]["weight"][:])
 
     @property
     def routing_method(self) -> BaseMoeRoutingMethod:
