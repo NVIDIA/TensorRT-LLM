@@ -267,10 +267,6 @@ class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
     def from_dict(cls, data: dict):
         return cls(**data)
 
-    @property
-    def algorithm(self) -> str:
-        return "rocket"
-
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
 
@@ -317,16 +313,13 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
     """
     Configuration for skip softmax attention.
     """
+    algorithm: ClassVar[str] = "skip_softmax"
     threshold: Optional[float] = Field(
         default=None, description="The threshold for skip softmax attention.")
 
     @classmethod
     def from_dict(cls, data: dict):
         return cls(**data)
-
-    @property
-    def algorithm(self) -> str:
-        return "skip_softmax"
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "trtllm"
