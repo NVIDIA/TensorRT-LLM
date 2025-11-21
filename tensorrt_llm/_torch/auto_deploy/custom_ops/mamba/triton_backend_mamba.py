@@ -189,8 +189,10 @@ def _triton_cached_ssm(
 
     num_prefill, num_prefill_tokens, num_decode = batch_info_tensor.tolist()
 
-    # Prefill: concatenate tokens at the front and run combined scan
     y_prefill = None
+    y_dec = None
+
+    # Prefill: concatenate tokens at the front and run combined scan
     if num_prefill > 0:
         hs_prefill = hs_flat[:num_prefill_tokens].unsqueeze(0)  # [1, S_p, H, D]
         B_prefill = B_flat[:num_prefill_tokens].unsqueeze(0)  # [1, S_p, G, N]
@@ -234,11 +236,7 @@ def _triton_cached_ssm(
             0, slot_idx[:num_prefill], varlen_states.to(ssm_state_cache.dtype)
         )
 
-        # y_prefill is [1, S_p, H, D] -> remove batch dim
-        y_prefill = y_prefill[0]
-
     # Decode: batch single-token updates via selective_state_update
-    y_dec = None
     if num_decode > 0:
         slot_idx_decode = slot_idx[num_prefill:]
 
@@ -266,27 +264,19 @@ def _triton_cached_ssm(
             state_batch_indices=slot_idx_decode,
         )  # [nd, H, D]
 
-    # Combine results
+    # Dispatch return logic
     if num_prefill > 0 and num_decode > 0:
-        # Concatenate prefill and decode outputs to form the final flattened output
-        # Both need to be the same dtype
-        y_flat = torch.cat(
-            [y_prefill.to(hidden_states.dtype), y_dec.to(hidden_states.dtype)], dim=0
-        )
+        y = torch.empty_like(hidden_states, memory_format=torch.contiguous_format)
+        y_flat = y.view(bs, *y.shape[2:])
+        y_flat[:num_prefill_tokens].copy_(y_prefill[0])
+        y_flat[num_prefill_tokens : num_prefill_tokens + num_decode].copy_(y_dec)
+        return y
     elif num_prefill > 0:
-        y_flat = y_prefill.to(hidden_states.dtype)
+        return y_prefill[0].view(b, s, num_heads, head_dim).to(hidden_states.dtype)
     elif num_decode > 0:
-        y_flat = y_dec.to(hidden_states.dtype)
+        return y_dec.view(b, s, num_heads, head_dim).to(hidden_states.dtype)
     else:
-        # Should not happen given input shapes, but handle empty case
-        y_flat = torch.empty(
-            0, num_heads, head_dim, device=hidden_states.device, dtype=hidden_states.dtype
-        )
-
-    # Reshape back to [B, S, H, D] if needed, or return flat if layout allows
-    # The original code reshaped y_flat into y [b, s, h, d] via view at the start.
-    # We constructed y_flat directly, so we just view it back to original shape.
-    return y_flat.view(b, s, num_heads, head_dim)
+        return torch.empty_like(hidden_states)
 
 
 @_triton_cached_ssm.register_fake
