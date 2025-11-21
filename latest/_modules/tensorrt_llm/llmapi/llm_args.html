@@ -31,7 +31,7 @@
 <link href="../../../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=8f2a1f02" />
-    <link rel="stylesheet" type="text/css" href="../../../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
     <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../../../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../../../_static/togglebutton.css?v=13237357" />
@@ -42,6 +42,8 @@
   <!-- Pre-loaded scripts that we'll load fully later -->
   <link rel="preload" as="script" href="../../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
 <link rel="preload" as="script" href="../../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+
 
     <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
     <script src="../../../_static/doctools.js?v=9a2dae69"></script>
@@ -58,20 +60,24 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc2';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc3';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
+
     <link rel="icon" href="../../../_static/favicon.png"/>
+
     <link rel="index" title="Index" href="../../../genindex.html" />
     <link rel="search" title="Search" href="../../../search.html" />
 
+
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc2" />
+  <meta name="docsearch:version" content="1.2.0rc3" />
 
 
   </head>
+
   
   
   <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
@@ -79,6 +85,8 @@
   
   
   <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+
   
   <div id="pst-scroll-pixel-helper"></div>
   
@@ -513,9 +521,8 @@
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">enum</span><span class="w"> </span><span class="kn">import</span> <span class="n">Enum</span><span class="p">,</span> <span class="n">EnumMeta</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">Any</span><span class="p">,</span> <span class="n">ClassVar</span><span class="p">,</span> <span class="n">Dict</span><span class="p">,</span> <span class="n">List</span><span class="p">,</span> <span class="n">Literal</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span>
-                    <span class="n">Set</span><span class="p">,</span> <span class="n">Tuple</span><span class="p">,</span> <span class="n">Type</span><span class="p">,</span> <span class="n">TypeAlias</span><span class="p">,</span> <span class="n">TypeVar</span><span class="p">,</span> <span class="n">Union</span><span class="p">,</span> <span class="n">get_args</span><span class="p">,</span>
-                    <span class="n">get_origin</span><span class="p">)</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">Any</span><span class="p">,</span> <span class="n">ClassVar</span><span class="p">,</span> <span class="n">Dict</span><span class="p">,</span> <span class="n">List</span><span class="p">,</span> <span class="n">Literal</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Set</span><span class="p">,</span> <span class="n">Tuple</span><span class="p">,</span>
+                    <span class="n">Type</span><span class="p">,</span> <span class="n">TypeAlias</span><span class="p">,</span> <span class="n">TypeVar</span><span class="p">,</span> <span class="n">Union</span><span class="p">,</span> <span class="n">get_args</span><span class="p">,</span> <span class="n">get_origin</span><span class="p">)</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">yaml</span>
@@ -529,9 +536,6 @@
                                       <span class="n">get_default_trtllm_modules_to_hf_modules</span><span class="p">)</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">.._utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">mpi_rank</span>
-
-<span class="k">if</span> <span class="n">TYPE_CHECKING</span><span class="p">:</span>
-    <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.pyexecutor.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">PyTorchConfig</span>
 
 <span class="c1"># yapf: disable</span>
 <span class="c1"># isort: off</span>
@@ -730,6 +734,9 @@
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="k">return</span> <span class="kc">True</span>
 
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_indices_block_size</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="k">return</span> <span class="mi">1</span>
+
 
 <div class="viewcode-block" id="RocketSparseAttentionConfig">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig">[docs]</a>
@@ -759,6 +766,12 @@
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.supports_backend">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">supports_backend</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">backend</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">backend</span> <span class="o">==</span> <span class="s2">&quot;pytorch&quot;</span></div>
+
+
+<div class="viewcode-block" id="RocketSparseAttentionConfig.get_indices_block_size">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.get_indices_block_size">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_indices_block_size</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">page_size</span></div>
 </div>
 
 
@@ -792,6 +805,109 @@
         <span class="k">return</span> <span class="n">backend</span> <span class="o">==</span> <span class="s2">&quot;pytorch&quot;</span></div>
 </div>
 
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">MoeLoadBalancerConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    Pydantic configuration model for the Mixture of Experts (MoE) load balancer.</span>
+
+<span class="sd">    This model holds configuration data (`num_slots`, etc.) as well as</span>
+<span class="sd">    runtime state (`_ep_rank`, `_ep_size`) which must be set via the</span>
+<span class="sd">    `setup()` method before use.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+
+    <span class="n">num_slots</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">initial_global_assignments</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="nb">repr</span><span class="o">=</span><span class="kc">False</span>  <span class="c1"># Exclude this large dict from model representation</span>
+    <span class="p">)</span>
+    <span class="n">layer_updates_per_iter</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="n">_ep_rank</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">PrivateAttr</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
+    <span class="n">_ep_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">PrivateAttr</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
+
+    <span class="c1"># --- Methods ---</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">setup</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">ep_rank</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">ep_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        Initializes the runtime state of the configuration.</span>
+<span class="sd">        This must be called before accessing properties like `num_local_slots`.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_ep_rank</span> <span class="o">=</span> <span class="n">ep_rank</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_ep_size</span> <span class="o">=</span> <span class="n">ep_size</span>
+
+        <span class="c1"># This assertion was in the original and is critical.</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_slots</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;`num_slots` cannot be None when calling setup().&quot;</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_slots</span> <span class="o">%</span> <span class="n">ep_size</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;`num_slots` (</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">num_slots</span><span class="si">}</span><span class="s2">) must be divisible by `ep_size` (</span><span class="si">{</span><span class="n">ep_size</span><span class="si">}</span><span class="s2">).&quot;</span>
+            <span class="p">)</span>
+
+    <span class="c1"># --- Computed Properties ---</span>
+    <span class="c1"># These properties depend on the runtime state set by setup()</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">ep_rank</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Public accessor for the private expert parallel rank.&quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_ep_rank</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">AttributeError</span><span class="p">(</span><span class="s2">&quot;ep_rank is not set. Call setup() first.&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_ep_rank</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">ep_size</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Public accessor for the private expert parallel size.&quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_ep_size</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">AttributeError</span><span class="p">(</span><span class="s2">&quot;ep_size is not set. Call setup() first.&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_ep_size</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">num_local_slots</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Calculates the number of slots local to this rank.&quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_slots</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">_ep_size</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">&quot;Cannot calculate `num_local_slots`. &quot;</span>
+                <span class="s2">&quot;`num_slots` must be set and setup() must be called.&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_slots</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">_ep_size</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">slot_start</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Calculates the starting global slot index for this rank.&quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_ep_rank</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">&quot;Cannot calculate `slot_start`. Call setup() first.&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_ep_rank</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_local_slots</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">slot_end</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Calculates the ending global slot index (exclusive) for this rank.&quot;&quot;&quot;</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">slot_start</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_local_slots</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_layer_initial_global_assignments</span><span class="p">(</span>
+            <span class="bp">self</span><span class="p">,</span> <span class="n">layer_idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        Retrieves the initial global assignments for a specific layer.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">initial_global_assignments</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">None</span>
+
+        <span class="k">if</span> <span class="n">layer_idx</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">initial_global_assignments</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">KeyError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;layer_idx </span><span class="si">{</span><span class="n">layer_idx</span><span class="si">}</span><span class="s2"> not found in `initial_global_assignments`.&quot;</span>
+            <span class="p">)</span>
+
+        <span class="n">assignments</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">initial_global_assignments</span><span class="p">[</span><span class="n">layer_idx</span><span class="p">]</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_slots</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">&quot;`num_slots` is not set, cannot verify assignment length.&quot;</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">assignments</span><span class="p">)</span> <span class="o">!=</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_slots</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;Assignment length (</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">assignments</span><span class="p">)</span><span class="si">}</span><span class="s2">) for layer </span><span class="si">{</span><span class="n">layer_idx</span><span class="si">}</span><span class="s2"> &quot;</span>
+                <span class="sa">f</span><span class="s2">&quot;does not match `num_slots` (</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">num_slots</span><span class="si">}</span><span class="s2">).&quot;</span><span class="p">)</span>
+
+        <span class="k">return</span> <span class="n">assignments</span>
 
 
 <div class="viewcode-block" id="MoeConfig">
@@ -871,6 +987,7 @@
     <span class="n">moe_tp_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span>
     <span class="n">moe_ep_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span>
     <span class="n">cp_config</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
+    <span class="n">pp_partition</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
     <span class="n">enable_attention_dp</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="n">enable_lm_head_tp_in_adp</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
@@ -917,6 +1034,7 @@
                        <span class="n">gpus_per_node</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">gpus_per_node</span><span class="p">,</span>
                        <span class="n">tp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
                        <span class="n">pp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">pp_size</span><span class="p">,</span>
+                       <span class="n">pp_partition</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">pp_partition</span><span class="p">,</span>
                        <span class="n">cp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">cp_size</span><span class="p">,</span>
                        <span class="n">cp_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">cp_config</span><span class="p">,</span>
                        <span class="n">enable_attention_dp</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_attention_dp</span><span class="p">,</span>
@@ -1003,6 +1121,16 @@
     <span class="c1"># this value. Otherwise, speculation will always be on.</span>
     <span class="n">max_concurrency</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
 
+    <span class="c1"># Developer interface: dynamically adjust draft length based on active batch size in runtime.</span>
+    <span class="c1"># Maps batch size to draft lengths. For example:</span>
+    <span class="c1"># {1: 4, 4: 2, 8: 0} means:</span>
+    <span class="c1"># - batch_size &gt;= 1: use draft_len=4</span>
+    <span class="c1"># - batch_size &gt;= 4: use draft_len=2</span>
+    <span class="c1"># - batch_size &gt;= 8: use draft_len=0 (disable speculation)</span>
+    <span class="c1"># draft_len_schedule is enforced to contain batch_size=1 and its according draft_len equals max_draft_len for consistency</span>
+    <span class="c1"># for example, if max_draft_len=4, the schedule must contain {1: 4}</span>
+    <span class="n">draft_len_schedule</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
+
     <span class="n">load_format</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="c1"># PyTorch only.</span>
     <span class="c1"># Rolling average window size (N) for acceptance length across completed requests.</span>
@@ -1039,6 +1167,51 @@
     <span class="n">_allow_chain_drafter</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">PrivateAttr</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
     <span class="c1"># If set, drafting uses greedy sampling, irrespective of sampling parameters.</span>
     <span class="n">_allow_greedy_draft_tokens</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">PrivateAttr</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
+
+    <span class="nd">@field_validator</span><span class="p">(</span><span class="s1">&#39;draft_len_schedule&#39;</span><span class="p">)</span>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_draft_len_schedule_and_sort</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">info</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Validate and sort draft_len_schedule by batch size thresholds.&quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="n">v</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="c1"># Validate values</span>
+            <span class="k">for</span> <span class="n">batch_size</span><span class="p">,</span> <span class="n">draft_len</span> <span class="ow">in</span> <span class="n">v</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+                <span class="k">if</span> <span class="n">batch_size</span> <span class="o">&lt;</span> <span class="mi">1</span><span class="p">:</span>
+                    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                        <span class="sa">f</span><span class="s2">&quot;draft_len_schedule: batch size threshold must be &gt;= 1, got </span><span class="si">{</span><span class="n">batch_size</span><span class="si">}</span><span class="s2">&quot;</span>
+                    <span class="p">)</span>
+                <span class="k">if</span> <span class="n">draft_len</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">:</span>
+                    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                        <span class="sa">f</span><span class="s2">&quot;draft_len_schedule: draft length must be &gt;= 0, got </span><span class="si">{</span><span class="n">draft_len</span><span class="si">}</span><span class="s2">&quot;</span>
+                    <span class="p">)</span>
+
+            <span class="c1"># Require batch_size=1 in schedule</span>
+            <span class="k">if</span> <span class="mi">1</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">v</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="s2">&quot;draft_len_schedule must include batch_size=1. &quot;</span>
+                    <span class="s2">&quot;All systems can have batch_size=1. Add {1: &lt;max_draft_len&gt;} to your schedule.&quot;</span>
+                <span class="p">)</span>
+
+            <span class="c1"># Enforce schedule[1] == max_draft_len for consistency</span>
+            <span class="n">max_draft_len</span> <span class="o">=</span> <span class="n">info</span><span class="o">.</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;max_draft_len&#39;</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">max_draft_len</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">v</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">!=</span> <span class="n">max_draft_len</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">&quot;draft_len_schedule[1] must equal max_draft_len for consistency. &quot;</span>
+                    <span class="sa">f</span><span class="s2">&quot;Got schedule[1]=</span><span class="si">{</span><span class="n">v</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span><span class="si">}</span><span class="s2">, but max_draft_len=</span><span class="si">{</span><span class="n">max_draft_len</span><span class="si">}</span><span class="s2">. &quot;</span>
+                    <span class="sa">f</span><span class="s2">&quot;batch_size=1 should use maximum draft length.&quot;</span><span class="p">)</span>
+
+            <span class="c1"># Enforce all draft lengths &lt;= max_draft_len</span>
+            <span class="k">if</span> <span class="n">max_draft_len</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">for</span> <span class="n">batch_size</span><span class="p">,</span> <span class="n">draft_len</span> <span class="ow">in</span> <span class="n">v</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+                    <span class="k">if</span> <span class="n">draft_len</span> <span class="o">&gt;</span> <span class="n">max_draft_len</span><span class="p">:</span>
+                        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                            <span class="sa">f</span><span class="s2">&quot;draft_len_schedule: all draft lengths must be &lt;= max_draft_len. &quot;</span>
+                            <span class="sa">f</span><span class="s2">&quot;Got draft_len=</span><span class="si">{</span><span class="n">draft_len</span><span class="si">}</span><span class="s2"> for batch_size=</span><span class="si">{</span><span class="n">batch_size</span><span class="si">}</span><span class="s2">, &quot;</span>
+                            <span class="sa">f</span><span class="s2">&quot;but max_draft_len=</span><span class="si">{</span><span class="n">max_draft_len</span><span class="si">}</span><span class="s2">.&quot;</span><span class="p">)</span>
+
+            <span class="c1"># Return sorted dict (by batch size thresholds)</span>
+            <span class="c1"># This ensures efficient lookup</span>
+            <span class="k">return</span> <span class="nb">dict</span><span class="p">(</span><span class="nb">sorted</span><span class="p">(</span><span class="n">v</span><span class="o">.</span><span class="n">items</span><span class="p">(),</span> <span class="n">key</span><span class="o">=</span><span class="k">lambda</span> <span class="n">x</span><span class="p">:</span> <span class="n">x</span><span class="p">[</span><span class="mi">0</span><span class="p">]))</span>
+        <span class="k">return</span> <span class="n">v</span>
 
     <span class="nd">@classmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">from_dict</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">):</span>
@@ -1445,12 +1618,11 @@
     <span class="c1"># Now we need a flag when MTPDecodingConfig is updated by PyTorchModelEngine.</span>
     <span class="n">num_nextn_predict_layers_from_model_config</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
 
-    <span class="c1"># TODO: Hard code for DeepSeek R1</span>
     <span class="c1"># When encounter &lt;think&gt;, start thinking phase.</span>
     <span class="c1"># When encounter &lt;/think&gt;, end thinking phase.</span>
     <span class="c1"># &lt;think&gt; [thinking phase] &lt;/think&gt; [real output]</span>
-    <span class="n">BEGIN_THINKING_PHASE_TOKEN</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">128798</span>
-    <span class="n">END_THINKING_PHASE_TOKEN</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">128799</span>
+    <span class="n">begin_thinking_phase_token</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">128798</span>
+    <span class="n">end_thinking_phase_token</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">128799</span>
 
 <div class="viewcode-block" id="MTPDecodingConfig.__init__">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.__init__">[docs]</a>
@@ -2158,11 +2330,20 @@
         <span class="s2">&quot;Timeout in milliseconds for KV cache transfer. Requests exceeding this timeout will be cancelled.&quot;</span>
     <span class="p">)</span>
 
+    <span class="n">kv_transfer_sender_future_timeout_ms</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">1000</span><span class="p">,</span>
+        <span class="n">gt</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Timeout in milliseconds to wait for the sender future to be ready when scheduled batch size is 0. This allows the request to be eventually cancelled by the user or because of kv_transfer_timeout_ms&quot;</span>
+    <span class="p">)</span>
+
     <span class="k">def</span><span class="w"> </span><span class="nf">_to_pybind</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="n">_CacheTransceiverConfig</span><span class="p">(</span>
             <span class="n">backend</span><span class="o">=</span><span class="n">_CacheTransceiverBackendType</span><span class="o">.</span><span class="n">from_string</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">backend</span><span class="p">),</span>
             <span class="n">max_tokens_in_buffer</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_tokens_in_buffer</span><span class="p">,</span>
-            <span class="n">kv_transfer_timeout_ms</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">kv_transfer_timeout_ms</span><span class="p">)</span></div>
+            <span class="n">kv_transfer_timeout_ms</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">kv_transfer_timeout_ms</span><span class="p">,</span>
+            <span class="n">kv_transfer_sender_future_timeout_ms</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span>
+            <span class="n">kv_transfer_sender_future_timeout_ms</span><span class="p">)</span></div>
 
 
 
@@ -2286,6 +2467,12 @@
     <span class="n">enable_lm_head_tp_in_adp</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Enable LM head TP in attention dp.&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
+
+    <span class="n">pp_partition</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Pipeline parallel partition, a list of each rank&#39;s layer number.&quot;</span><span class="p">,</span>
         <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
 
     <span class="n">cp_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">,</span>
@@ -2544,6 +2731,7 @@
             <span class="n">moe_ep_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_expert_parallel_size</span><span class="p">,</span>
             <span class="n">enable_attention_dp</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_attention_dp</span><span class="p">,</span>
             <span class="n">enable_lm_head_tp_in_adp</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_lm_head_tp_in_adp</span><span class="p">,</span>
+            <span class="n">pp_partition</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">pp_partition</span><span class="p">,</span>
             <span class="n">cp_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">cp_config</span><span class="p">)</span>
         <span class="k">return</span> <span class="bp">self</span>
 
@@ -3323,6 +3511,9 @@
     <span class="c1"># PrivateVars</span>
     <span class="n">_quant_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">QuantConfig</span><span class="p">]</span> <span class="o">=</span> <span class="n">PrivateAttr</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
 
+    <span class="n">_disable_flash_infer_sampling</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">PrivateAttr</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Unless this is set to False, FlashInfer.sampling is not used, even if available.&quot;&quot;&quot;</span>
+
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">quant_config</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">QuantConfig</span><span class="p">:</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_quant_config</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
@@ -3405,7 +3596,6 @@
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_load_balancer">[docs]</a>
     <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">&quot;after&quot;</span><span class="p">)</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">validate_load_balancer</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;TorchLlmArgs&#39;</span><span class="p">:</span>
-        <span class="kn">from</span><span class="w"> </span><span class="nn">.._torch</span><span class="w"> </span><span class="kn">import</span> <span class="n">MoeLoadBalancerConfig</span>
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_config</span><span class="o">.</span><span class="n">load_balancer</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
             <span class="k">if</span> <span class="ow">not</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">exists</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_config</span><span class="o">.</span><span class="n">load_balancer</span><span class="p">):</span>
                 <span class="k">raise</span> <span class="ne">FileNotFoundError</span><span class="p">(</span>
@@ -3607,82 +3797,6 @@
         <span class="n">executor_config</span> <span class="o">=</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">get_executor_config</span><span class="p">(</span><span class="n">_hf_model_dir</span><span class="p">,</span> <span class="n">tokenizer</span><span class="p">)</span>
         <span class="n">executor_config</span><span class="o">.</span><span class="n">mm_encoder_only</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mm_encoder_only</span>
         <span class="k">return</span> <span class="n">executor_config</span></div>
-
-
-    <span class="c1"># TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig</span>
-<div class="viewcode-block" id="TorchLlmArgs.get_pytorch_backend_config">
-<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.get_pytorch_backend_config">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">get_pytorch_backend_config</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;PyTorchConfig&quot;</span><span class="p">:</span>
-        <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.pyexecutor.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">PyTorchConfig</span>
-
-        <span class="k">return</span> <span class="n">PyTorchConfig</span><span class="p">(</span>
-            <span class="n">extra_resource_managers</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">extra_resource_managers</span><span class="p">,</span>
-            <span class="n">use_cuda_graph</span><span class="o">=</span><span class="nb">bool</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">cuda_graph_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">),</span>
-            <span class="n">cuda_graph_batch_sizes</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">cuda_graph_config</span><span class="o">.</span><span class="n">batch_sizes</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">cuda_graph_config</span> <span class="k">else</span>
-            <span class="n">CudaGraphConfig</span><span class="o">.</span><span class="n">model_fields</span><span class="p">[</span><span class="s1">&#39;batch_sizes&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">default</span><span class="p">,</span>
-            <span class="n">cuda_graph_max_batch_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">cuda_graph_config</span><span class="o">.</span><span class="n">max_batch_size</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">cuda_graph_config</span> <span class="k">else</span>
-            <span class="n">CudaGraphConfig</span><span class="o">.</span><span class="n">model_fields</span><span class="p">[</span><span class="s1">&#39;max_batch_size&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">default</span><span class="p">,</span>
-            <span class="n">cuda_graph_padding_enabled</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">cuda_graph_config</span><span class="o">.</span><span class="n">enable_padding</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">cuda_graph_config</span> <span class="k">else</span>
-            <span class="n">CudaGraphConfig</span><span class="o">.</span><span class="n">model_fields</span><span class="p">[</span><span class="s1">&#39;enable_padding&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">default</span><span class="p">,</span>
-            <span class="n">disable_overlap_scheduler</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">disable_overlap_scheduler</span><span class="p">,</span>
-            <span class="n">moe_max_num_tokens</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_config</span><span class="o">.</span><span class="n">max_num_tokens</span><span class="p">,</span>
-            <span class="n">moe_load_balancer</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_config</span><span class="o">.</span><span class="n">load_balancer</span><span class="p">,</span>
-            <span class="n">attn_backend</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">attn_backend</span><span class="p">,</span>
-            <span class="n">moe_backend</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_config</span><span class="o">.</span><span class="n">backend</span><span class="p">,</span>
-            <span class="n">use_low_precision_moe_combine</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_config</span><span class="o">.</span>
-            <span class="n">use_low_precision_moe_combine</span><span class="p">,</span>
-            <span class="n">sampler_type</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">sampler_type</span><span class="p">,</span>
-            <span class="n">kv_cache_dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
-            <span class="n">mamba_ssm_cache_dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">mamba_ssm_cache_dtype</span><span class="p">,</span>
-            <span class="n">enable_iter_perf_stats</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_iter_perf_stats</span><span class="p">,</span>
-            <span class="n">enable_iter_req_stats</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_iter_req_stats</span><span class="p">,</span>
-            <span class="n">print_iter_log</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">print_iter_log</span><span class="p">,</span>
-            <span class="n">torch_compile_enabled</span><span class="o">=</span><span class="nb">bool</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">torch_compile_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">),</span>
-            <span class="n">torch_compile_fullgraph</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">torch_compile_config</span><span class="o">.</span><span class="n">enable_fullgraph</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">torch_compile_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span>
-            <span class="n">TorchCompileConfig</span><span class="o">.</span><span class="n">model_fields</span><span class="p">[</span><span class="s1">&#39;enable_fullgraph&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">default</span><span class="p">,</span>
-            <span class="n">torch_compile_inductor_enabled</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">torch_compile_config</span><span class="o">.</span>
-            <span class="n">enable_inductor</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">torch_compile_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span>
-            <span class="n">TorchCompileConfig</span><span class="o">.</span><span class="n">model_fields</span><span class="p">[</span><span class="s1">&#39;enable_inductor&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">default</span><span class="p">,</span>
-            <span class="n">torch_compile_piecewise_cuda_graph</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">torch_compile_config</span><span class="o">.</span>
-            <span class="n">enable_piecewise_cuda_graph</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">torch_compile_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">TorchCompileConfig</span><span class="o">.</span>
-            <span class="n">model_fields</span><span class="p">[</span><span class="s1">&#39;enable_piecewise_cuda_graph&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">default</span><span class="p">,</span>
-            <span class="n">torch_compile_piecewise_cuda_graph_num_tokens</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span>
-            <span class="n">torch_compile_config</span><span class="o">.</span><span class="n">capture_num_tokens</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">torch_compile_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span>
-            <span class="n">TorchCompileConfig</span><span class="o">.</span><span class="n">model_fields</span><span class="p">[</span><span class="s1">&#39;capture_num_tokens&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">default</span><span class="p">,</span>
-            <span class="n">torch_compile_enable_userbuffers</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">torch_compile_config</span><span class="o">.</span>
-            <span class="n">enable_userbuffers</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">torch_compile_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span>
-            <span class="n">TorchCompileConfig</span><span class="o">.</span><span class="n">model_fields</span><span class="p">[</span><span class="s1">&#39;enable_userbuffers&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">default</span><span class="p">,</span>
-            <span class="n">torch_compile_max_num_streams</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">torch_compile_config</span><span class="o">.</span>
-            <span class="n">max_num_streams</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">torch_compile_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span>
-            <span class="n">TorchCompileConfig</span><span class="o">.</span><span class="n">model_fields</span><span class="p">[</span><span class="s1">&#39;max_num_streams&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">default</span><span class="p">,</span>
-            <span class="n">enable_autotuner</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_autotuner</span><span class="p">,</span>
-            <span class="n">enable_layerwise_nvtx_marker</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_layerwise_nvtx_marker</span><span class="p">,</span>
-            <span class="n">load_format</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">load_format</span><span class="p">,</span>
-            <span class="n">enable_min_latency</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_min_latency</span><span class="p">,</span>
-            <span class="n">moe_disable_finalize_fusion</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_config</span><span class="o">.</span><span class="n">disable_finalize_fusion</span><span class="p">,</span>
-            <span class="n">stream_interval</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">stream_interval</span><span class="p">,</span>
-            <span class="n">force_dynamic_quantization</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">force_dynamic_quantization</span><span class="p">,</span>
-            <span class="n">allreduce_strategy</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">allreduce_strategy</span><span class="p">,</span>
-            <span class="n">attention_dp_enable_balance</span><span class="o">=</span><span class="nb">bool</span><span class="p">(</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">attention_dp_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
-                <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_dp_config</span><span class="o">.</span><span class="n">enable_balance</span><span class="p">),</span>
-            <span class="n">attention_dp_time_out_iters</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">attention_dp_config</span><span class="o">.</span><span class="n">timeout_iters</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_dp_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span>
-            <span class="n">AttentionDpConfig</span><span class="o">.</span><span class="n">model_fields</span><span class="p">[</span><span class="s1">&#39;timeout_iters&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">default</span><span class="p">,</span>
-            <span class="n">attention_dp_batching_wait_iters</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">attention_dp_config</span><span class="o">.</span>
-            <span class="n">batching_wait_iters</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_dp_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span>
-            <span class="n">AttentionDpConfig</span><span class="o">.</span><span class="n">model_fields</span><span class="p">[</span><span class="s1">&#39;batching_wait_iters&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">default</span><span class="p">,</span>
-            <span class="n">batch_wait_timeout_ms</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">batch_wait_timeout_ms</span><span class="p">,</span>
-            <span class="n">batch_wait_timeout_iters</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">batch_wait_timeout_iters</span><span class="p">,</span>
-            <span class="n">batch_wait_max_tokens_ratio</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">batch_wait_max_tokens_ratio</span><span class="p">,</span>
-            <span class="n">enable_sleep</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_sleep</span><span class="p">,</span>
-        <span class="p">)</span></div>
 </div>
 
 
@@ -3820,9 +3934,11 @@
     </div>
   </div>
   
+
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
   <script defer src="../../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
 <script defer src="../../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
 
   <footer class="bd-footer">
 <div class="bd-footer__inner bd-page-width">
@@ -3845,12 +3961,7 @@
   
   
   
-  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
-   | 
-  
-  
-  
-  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Your Privacy Choices</a>
    | 
   
   
@@ -3898,9 +4009,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 05, 2025.</p>
+  <p>Last updated on November 20, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/3111682">3111682</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/2128f73">2128f73</a>.</p>
   
 </div></div>
       

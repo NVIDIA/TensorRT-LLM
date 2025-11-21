@@ -32,7 +32,7 @@
 <link href="../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
-    <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
     <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=13237357" />
@@ -43,6 +43,8 @@
   <!-- Pre-loaded scripts that we'll load fully later -->
   <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
 <link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+
 
     <script src="../_static/documentation_options.js?v=5929fcd5"></script>
     <script src="../_static/doctools.js?v=9a2dae69"></script>
@@ -59,22 +61,26 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc2';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc3';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
+
     <link rel="icon" href="../_static/favicon.png"/>
+
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
     <link rel="next" title="Introduction to KV Cache Transmission" href="kv-transfer.html" />
     <link rel="prev" title="Using Dev Containers" href="dev-containers.html" />
 
+
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc2" />
+  <meta name="docsearch:version" content="1.2.0rc3" />
 
 
   </head>
+
   
   
   <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
@@ -82,6 +88,8 @@
   
   
   <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+
   
   <div id="pst-scroll-pixel-helper"></div>
   
@@ -560,36 +568,41 @@
 <h3>1. Knob Naming<a class="headerlink" href="#knob-naming" title="Link to this heading">#</a></h3>
 <p><strong>Use Semantic Clarity</strong></p>
 <p>Argument names should describe what the argument represents, not how it is used internally.</p>
-<p>✅ <strong>Good</strong>: <code class="docutils literal notranslate"><span class="pre">max_new_tokens</span></code> (clear meaning)<br />
-❌ <strong>Bad</strong>: <code class="docutils literal notranslate"><span class="pre">num</span></code> (ambiguous)</p>
+<p>✅ <strong>Good</strong>: <code class="docutils literal notranslate"><span class="pre">max_new_tokens</span></code> (clear meaning)</p>
+<p>❌ <strong>Bad</strong>: <code class="docutils literal notranslate"><span class="pre">num</span></code> (ambiguous)</p>
 <p><strong>Reflect Argument Type and Granularity</strong></p>
-<ul class="simple">
-<li><p>For <strong>boolean</strong> knobs, prefix with verbs like <code class="docutils literal notranslate"><span class="pre">enable_</span></code> and so on.
-Examples: <code class="docutils literal notranslate"><span class="pre">enable_cache</span></code>, <code class="docutils literal notranslate"><span class="pre">enable_flash_attention</span></code></p></li>
-<li><p>For <strong>numerical threshold</strong> knobs, suffix with <code class="docutils literal notranslate"><span class="pre">_limit</span></code>, <code class="docutils literal notranslate"><span class="pre">_size</span></code>, <code class="docutils literal notranslate"><span class="pre">_count</span></code>, <code class="docutils literal notranslate"><span class="pre">_len_</span></code> or <code class="docutils literal notranslate"><span class="pre">_ratio</span></code><br />
-Examples: <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code>, <code class="docutils literal notranslate"><span class="pre">prefill_batch_size</span></code></p></li>
+<ul>
+<li><p>For <strong>boolean</strong> knobs, prefix with verbs like <code class="docutils literal notranslate"><span class="pre">enable_</span></code> and so on.</p>
+<p>Examples: <code class="docutils literal notranslate"><span class="pre">enable_cache</span></code>, <code class="docutils literal notranslate"><span class="pre">enable_flash_attention</span></code></p>
+</li>
+<li><p>For <strong>numerical threshold</strong> knobs, suffix with <code class="docutils literal notranslate"><span class="pre">_limit</span></code>, <code class="docutils literal notranslate"><span class="pre">_size</span></code>, <code class="docutils literal notranslate"><span class="pre">_count</span></code>, <code class="docutils literal notranslate"><span class="pre">_len_</span></code> or <code class="docutils literal notranslate"><span class="pre">_ratio</span></code></p>
+<p>Examples: <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code>, <code class="docutils literal notranslate"><span class="pre">prefill_batch_size</span></code></p>
+</li>
 </ul>
 <p><strong>Avoid Redundant Prefixes</strong></p>
 <p>Example (in <code class="docutils literal notranslate"><span class="pre">MoeConfig</span></code>):</p>
-<p>✅ <strong>Good</strong>: <code class="docutils literal notranslate"><span class="pre">backend</span></code><br />
-❌ <strong>Bad</strong>: <code class="docutils literal notranslate"><span class="pre">moe_backend</span></code> (redundant since it’s already in <code class="docutils literal notranslate"><span class="pre">MoeConfig</span></code>)</p>
+<p>✅ <strong>Good</strong>: <code class="docutils literal notranslate"><span class="pre">backend</span></code></p>
+<p>❌ <strong>Bad</strong>: <code class="docutils literal notranslate"><span class="pre">moe_backend</span></code> (redundant since it’s already in <code class="docutils literal notranslate"><span class="pre">MoeConfig</span></code>)</p>
 <p><strong>Use Specific Names for Narrow Scenarios</strong></p>
 <p>When adding knobs for specific use cases, make the name convey the restriction clearly via a prefix. It’s acceptable to rename later when the knob becomes more generic or is moved into a dedicated config.</p>
 <p>Example (argument to the LLM class):</p>
-<p>✅ <strong>Good</strong>: <code class="docutils literal notranslate"><span class="pre">rope_scaling_factor</span></code> → clearly indicates it’s for RoPE<br />
-❌ <strong>Bad</strong>: <code class="docutils literal notranslate"><span class="pre">scaling_factor</span></code> → too generic and prone to misuse</p>
+<p>✅ <strong>Good</strong>: <code class="docutils literal notranslate"><span class="pre">rope_scaling_factor</span></code> → clearly indicates it’s for RoPE</p>
+<p>❌ <strong>Bad</strong>: <code class="docutils literal notranslate"><span class="pre">scaling_factor</span></code> → too generic and prone to misuse</p>
 </section>
 <section id="hierarchical-configuration">
 <h3>2. Hierarchical Configuration<a class="headerlink" href="#hierarchical-configuration" title="Link to this heading">#</a></h3>
 <p>Organize complex or hierarchical arguments into <strong>dedicated configuration dataclasses</strong> with intuitive and consistent naming.</p>
 <p><strong>Guidelines</strong></p>
-<ul class="simple">
-<li><p>Use the <code class="docutils literal notranslate"><span class="pre">XxxConfig</span></code> suffix consistently<br />
-Examples: <code class="docutils literal notranslate"><span class="pre">ModelConfig</span></code>, <code class="docutils literal notranslate"><span class="pre">ParallelConfig</span></code>, <code class="docutils literal notranslate"><span class="pre">MoeConfig</span></code></p></li>
-<li><p><strong>Reflect conceptual hierarchy</strong><br />
-The dataclass name should represent a coherent functional unit, not an arbitrary grouping</p></li>
-<li><p><strong>Avoid over-nesting</strong><br />
-Use only one level of configuration hierarchy whenever possible (e.g., <code class="docutils literal notranslate"><span class="pre">LlmArgs</span> <span class="pre">→</span> <span class="pre">ParallelConfig</span></code>) to balance readability and modularity</p></li>
+<ul>
+<li><p>Use the <code class="docutils literal notranslate"><span class="pre">XxxConfig</span></code> suffix consistently</p>
+<p>Examples: <code class="docutils literal notranslate"><span class="pre">ModelConfig</span></code>, <code class="docutils literal notranslate"><span class="pre">ParallelConfig</span></code>, <code class="docutils literal notranslate"><span class="pre">MoeConfig</span></code></p>
+</li>
+<li><p><strong>Reflect conceptual hierarchy</strong></p>
+<p>The dataclass name should represent a coherent functional unit, not an arbitrary grouping</p>
+</li>
+<li><p><strong>Avoid over-nesting</strong></p>
+<p>Use only one level of configuration hierarchy whenever possible (e.g., <code class="docutils literal notranslate"><span class="pre">LlmArgs</span> <span class="pre">→</span> <span class="pre">ParallelConfig</span></code>) to balance readability and modularity</p>
+</li>
 </ul>
 </section>
 <section id="prefer-llmargs-over-environment-variables">
@@ -671,7 +684,7 @@ Use only one level of configuration hierarchy whenever possible (e.g., <code cla
 <h4>2. Update the API schema<a class="headerlink" href="#update-the-api-schema" title="Link to this heading">#</a></h4>
 <p>Add the field to the appropriate schema file:</p>
 <ul>
-<li><p><strong>Non-committed arguments</strong>: <code class="docutils literal notranslate"><span class="pre">tests/unittest/api_stability/references/llm_args.yaml</span></code></p>
+<li><p><strong>Non-committed arguments</strong>: <code class="docutils literal notranslate"><span class="pre">tests/unittest/api_stability/references/llm.yaml</span></code></p>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">garbage_collection_gen0_threshold</span><span class="p">:</span>
 <span class="w">  </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">int</span>
 <span class="w">  </span><span class="nt">default</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">20000</span>
@@ -679,7 +692,7 @@ Use only one level of configuration hierarchy whenever possible (e.g., <code cla
 </pre></div>
 </div>
 </li>
-<li><p><strong>Committed arguments</strong>: <code class="docutils literal notranslate"><span class="pre">tests/unittest/api_stability/references_committed/llm_args.yaml</span></code></p>
+<li><p><strong>Committed arguments</strong>: <code class="docutils literal notranslate"><span class="pre">tests/unittest/api_stability/references_committed/llm.yaml</span></code></p>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">garbage_collection_gen0_threshold</span><span class="p">:</span>
 <span class="w">  </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">int</span>
 <span class="w">  </span><span class="nt">default</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">20000</span>
@@ -715,16 +728,16 @@ Use only one level of configuration hierarchy whenever possible (e.g., <code cla
 <p>For non-committed APIs, use the <code class="docutils literal notranslate"><span class="pre">&#64;set_api_status</span></code> decorator:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@set_api_status</span><span class="p">(</span><span class="s2">&quot;beta&quot;</span><span class="p">)</span>
 <span class="k">def</span><span class="w"> </span><span class="nf">generate_with_streaming</span><span class="p">(</span>
-    <span class="bp">self</span><span class="p">,</span> 
-    <span class="n">prompts</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> 
+    <span class="bp">self</span><span class="p">,</span>
+    <span class="n">prompts</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span>
     <span class="o">**</span><span class="n">kwargs</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Iterator</span><span class="p">[</span><span class="n">GenerationOutput</span><span class="p">]:</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;Generate text with streaming output.</span>
-<span class="sd">    </span>
+
 <span class="sd">    Args:</span>
 <span class="sd">        prompts: Input prompts for generation</span>
 <span class="sd">        **kwargs: Additional generation parameters</span>
-<span class="sd">        </span>
+
 <span class="sd">    Returns:</span>
 <span class="sd">        Iterator of generation outputs</span>
 <span class="sd">    &quot;&quot;&quot;</span>
@@ -946,9 +959,11 @@ python<span class="w"> </span>-m<span class="w"> </span>pytest<span class="w"> <
     </div>
   </div>
   
+
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
   <script defer src="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
 <script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
 
   <footer class="bd-footer">
 <div class="bd-footer__inner bd-page-width">
@@ -971,12 +986,7 @@ python<span class="w"> </span>-m<span class="w"> </span>pytest<span class="w"> <
   
   
   
-  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
-   | 
-  
-  
-  
-  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Your Privacy Choices</a>
    | 
   
   
@@ -1024,9 +1034,9 @@ python<span class="w"> </span>-m<span class="w"> </span>pytest<span class="w"> <
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 05, 2025.</p>
+  <p>Last updated on November 20, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/3111682">3111682</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/2128f73">2128f73</a>.</p>
   
 </div></div>
       

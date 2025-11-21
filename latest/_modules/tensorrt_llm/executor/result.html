@@ -31,7 +31,7 @@
 <link href="../../../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=8f2a1f02" />
-    <link rel="stylesheet" type="text/css" href="../../../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
     <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../../../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../../../_static/togglebutton.css?v=13237357" />
@@ -42,6 +42,8 @@
   <!-- Pre-loaded scripts that we'll load fully later -->
   <link rel="preload" as="script" href="../../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
 <link rel="preload" as="script" href="../../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+
 
     <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
     <script src="../../../_static/doctools.js?v=9a2dae69"></script>
@@ -58,20 +60,24 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc2';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc3';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
+
     <link rel="icon" href="../../../_static/favicon.png"/>
+
     <link rel="index" title="Index" href="../../../genindex.html" />
     <link rel="search" title="Search" href="../../../search.html" />
 
+
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc2" />
+  <meta name="docsearch:version" content="1.2.0rc3" />
 
 
   </head>
+
   
   
   <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
@@ -79,6 +85,8 @@
   
   
   <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+
   
   <div id="pst-scroll-pixel-helper"></div>
   
@@ -525,7 +533,7 @@
     <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">ray_stub</span> <span class="k">as</span> <span class="n">ray</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">.._ray_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">unwrap_ray_errors</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.._utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">mpi_disabled</span><span class="p">,</span> <span class="n">nvtx_range_debug</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.._utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">mpi_disabled</span><span class="p">,</span> <span class="n">nvtx_range_debug</span><span class="p">,</span> <span class="n">ray_use_rpc</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..bindings</span><span class="w"> </span><span class="kn">import</span> <span class="n">executor</span> <span class="k">as</span> <span class="n">tllm</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..disaggregated_params</span><span class="w"> </span><span class="kn">import</span> <span class="n">DisaggregatedParams</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..llmapi.tracer</span><span class="w"> </span><span class="kn">import</span> <span class="n">global_tracer</span>
@@ -780,8 +788,10 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">_done</span> <span class="o">=</span> <span class="kc">False</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">metrics_dict</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">trace_headers</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="c1"># torch backend will use trtllm sampler in beam search mode, but it does not support return logprobs incrementally</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">use_trtllm_sampler</span> <span class="o">=</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">use_beam_search</span> <span class="ow">and</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">best_of</span> <span class="o">&gt;</span> <span class="mi">1</span>
 
-        <span class="k">if</span> <span class="n">ray_queue</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">ray_queue</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">ray_use_rpc</span><span class="p">():</span>
             <span class="k">if</span> <span class="n">has_event_loop</span><span class="p">():</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">aqueue</span> <span class="o">=</span> <span class="n">ray_queue</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">queue</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">aqueue</span>
@@ -886,20 +896,27 @@
             <span class="c1"># each streamed response_tensors.log_probs[src_idx]</span>
             <span class="c1"># contains a streamwise monotonically growing list of logprobs.</span>
             <span class="c1"># so we need to accumulate only the new ones unique to that particular streamed response</span>
-            <span class="k">assert</span> <span class="n">output</span><span class="o">.</span><span class="n">_last_logprobs_len</span> <span class="o">&lt;=</span> <span class="nb">len</span><span class="p">(</span>
-                <span class="n">response_tensors</span><span class="o">.</span><span class="n">log_probs</span><span class="p">[</span><span class="n">src_idx</span><span class="p">]</span>
-            <span class="p">),</span> <span class="p">(</span><span class="sa">f</span><span class="s2">&quot;_last_logprobs_len (</span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">_last_logprobs_len</span><span class="si">}</span><span class="s2">) &gt; log_probs length (&quot;</span>
-                <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">response_tensors</span><span class="o">.</span><span class="n">log_probs</span><span class="p">[</span><span class="n">src_idx</span><span class="p">])</span><span class="si">}</span><span class="s2">)&quot;</span><span class="p">)</span>
-            <span class="n">output</span><span class="o">.</span><span class="n">logprobs</span> <span class="o">+=</span> <span class="n">response_tensors</span><span class="o">.</span><span class="n">log_probs</span><span class="p">[</span><span class="n">src_idx</span><span class="p">][</span>
-                <span class="n">output</span><span class="o">.</span><span class="n">_last_logprobs_len</span><span class="p">:]</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_trtllm_sampler</span><span class="p">:</span>
+                <span class="k">assert</span> <span class="n">output</span><span class="o">.</span><span class="n">_last_logprobs_len</span> <span class="o">&lt;=</span> <span class="nb">len</span><span class="p">(</span>
+                    <span class="n">response_tensors</span><span class="o">.</span><span class="n">log_probs</span><span class="p">[</span><span class="n">src_idx</span><span class="p">]</span>
+                <span class="p">),</span> <span class="p">(</span><span class="sa">f</span><span class="s2">&quot;_last_logprobs_len (</span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">_last_logprobs_len</span><span class="si">}</span><span class="s2">) &gt; log_probs length (&quot;</span>
+                    <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">response_tensors</span><span class="o">.</span><span class="n">log_probs</span><span class="p">[</span><span class="n">src_idx</span><span class="p">])</span><span class="si">}</span><span class="s2">)&quot;</span><span class="p">)</span>
+                <span class="n">output</span><span class="o">.</span><span class="n">logprobs</span> <span class="o">+=</span> <span class="n">response_tensors</span><span class="o">.</span><span class="n">log_probs</span><span class="p">[</span><span class="n">src_idx</span><span class="p">][</span>
+                    <span class="n">output</span><span class="o">.</span><span class="n">_last_logprobs_len</span><span class="p">:]</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">output</span><span class="o">.</span><span class="n">logprobs</span> <span class="o">+=</span> <span class="n">response_tensors</span><span class="o">.</span><span class="n">log_probs</span><span class="p">[</span><span class="n">src_idx</span><span class="p">]</span>
+
             <span class="c1"># overcome some WAR in the cpp executor</span>
-            <span class="k">if</span> <span class="n">finish_reasons</span><span class="p">[</span><span class="n">src_idx</span><span class="p">]</span> <span class="o">!=</span> <span class="n">tllm</span><span class="o">.</span><span class="n">FinishReason</span><span class="o">.</span><span class="n">CANCELLED</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">finish_reasons</span><span class="p">[</span>
+                    <span class="n">src_idx</span><span class="p">]</span> <span class="o">!=</span> <span class="n">tllm</span><span class="o">.</span><span class="n">FinishReason</span><span class="o">.</span><span class="n">CANCELLED</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_trtllm_sampler</span><span class="p">:</span>
                 <span class="c1"># Check if logprobs is a list (not a dict or other structure)</span>
                 <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">output</span><span class="o">.</span><span class="n">logprobs</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">output</span><span class="o">.</span><span class="n">length</span><span class="p">:</span>
                     <span class="c1"># LlmResult holds a reference to LogProbStorage, which may be updated by the worker before the result is serialized.</span>
                     <span class="c1"># Therefore, we treat extra logprobs/logits as expected and only consume what&#39;s needed.</span>
                     <span class="n">output</span><span class="o">.</span><span class="n">logprobs</span> <span class="o">=</span> <span class="n">output</span><span class="o">.</span><span class="n">logprobs</span><span class="p">[:</span><span class="n">output</span><span class="o">.</span><span class="n">length</span><span class="p">]</span>
-                <span class="k">assert</span> <span class="nb">len</span><span class="p">(</span><span class="n">output</span><span class="o">.</span><span class="n">logprobs</span><span class="p">)</span> <span class="o">==</span> <span class="n">output</span><span class="o">.</span><span class="n">length</span>
+            <span class="k">assert</span> <span class="nb">len</span><span class="p">(</span>
+                <span class="n">output</span><span class="o">.</span><span class="n">logprobs</span>
+            <span class="p">)</span> <span class="o">==</span> <span class="n">output</span><span class="o">.</span><span class="n">length</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;logprobs length: </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">output</span><span class="o">.</span><span class="n">logprobs</span><span class="p">)</span><span class="si">}</span><span class="s2"> != output.length: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">length</span><span class="si">}</span><span class="s2">&quot;</span>
 
         <span class="k">if</span> <span class="n">response_tensors</span><span class="o">.</span><span class="n">generation_logits</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">output</span><span class="o">.</span><span class="n">generation_logits</span> <span class="o">=</span> <span class="n">response_tensors</span><span class="o">.</span><span class="n">generation_logits</span><span class="p">[</span>
@@ -1056,7 +1073,7 @@
         <span class="k">else</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Unknown response type: </span><span class="si">{</span><span class="n">response</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
 
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_done</span> <span class="ow">and</span> <span class="n">mpi_disabled</span><span class="p">():</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_done</span> <span class="ow">and</span> <span class="n">mpi_disabled</span><span class="p">()</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">ray_use_rpc</span><span class="p">():</span>
             <span class="k">assert</span> <span class="nb">hasattr</span><span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="p">,</span> <span class="s2">&quot;unregister&quot;</span>
             <span class="p">),</span> <span class="s2">&quot;Ray path should be activated for unregistering the Ray queue.&quot;</span>
@@ -1289,7 +1306,7 @@
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">use_async_queue</span> <span class="o">=</span> <span class="n">has_event_loop</span><span class="p">()</span>
         <span class="n">shared_queue</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="k">if</span> <span class="n">executor</span> <span class="ow">and</span> <span class="n">executor</span><span class="o">.</span><span class="n">use_ray_queue</span><span class="p">():</span>
+        <span class="k">if</span> <span class="n">executor</span> <span class="ow">and</span> <span class="n">executor</span><span class="o">.</span><span class="n">use_ray_queue</span><span class="p">()</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">ray_use_rpc</span><span class="p">():</span>
             <span class="n">shared_queue</span> <span class="o">=</span> <span class="n">executor</span><span class="o">.</span><span class="n">async_response_queue_weakref</span> <span class="k">if</span> <span class="n">use_async_queue</span> <span class="k">else</span> <span class="n">executor</span><span class="o">.</span><span class="n">sync_response_queue_weakref</span>
 
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span>
@@ -1354,7 +1371,7 @@
         <span class="k">return</span> <span class="n">response</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_result_step</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
-        <span class="k">if</span> <span class="n">mpi_disabled</span><span class="p">():</span>
+        <span class="k">if</span> <span class="n">mpi_disabled</span><span class="p">()</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">ray_use_rpc</span><span class="p">():</span>
             <span class="k">with</span> <span class="n">unwrap_ray_errors</span><span class="p">():</span>
                 <span class="n">response</span> <span class="o">=</span> <span class="n">ray</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">get</span><span class="o">.</span><span class="n">remote</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">request_id</span><span class="p">))</span>
             <span class="n">response</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_handle_ray_response</span><span class="p">(</span><span class="n">response</span><span class="p">)</span>
@@ -1365,7 +1382,7 @@
 
     <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">_aresult_step</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">aqueue</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">&quot;The asyncio event loop was not present during initialization, so async operations are not available.&quot;</span>
-        <span class="k">if</span> <span class="n">mpi_disabled</span><span class="p">():</span>
+        <span class="k">if</span> <span class="n">mpi_disabled</span><span class="p">()</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">ray_use_rpc</span><span class="p">():</span>
             <span class="n">response</span> <span class="o">=</span> <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">aqueue</span><span class="o">.</span><span class="n">get_async</span><span class="o">.</span><span class="n">remote</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">request_id</span><span class="p">)</span>
             <span class="n">response</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_handle_ray_response</span><span class="p">(</span><span class="n">response</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
@@ -1625,9 +1642,11 @@
     </div>
   </div>
   
+
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
   <script defer src="../../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
 <script defer src="../../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
 
   <footer class="bd-footer">
 <div class="bd-footer__inner bd-page-width">
@@ -1650,12 +1669,7 @@
   
   
   
-  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
-   | 
-  
-  
-  
-  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Your Privacy Choices</a>
    | 
   
   
@@ -1703,9 +1717,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 05, 2025.</p>
+  <p>Last updated on November 20, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/3111682">3111682</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/2128f73">2128f73</a>.</p>
   
 </div></div>
       
