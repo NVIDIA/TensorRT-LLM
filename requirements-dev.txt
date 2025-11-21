@@ -31,3 +31,4 @@ ruff==0.9.4
 lm_eval[api]==0.4.8
 docstring_parser
 genai-perf==0.0.13
+nvidia-ml-py
