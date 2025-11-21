@@ -38,7 +38,7 @@ def create_kv_cache_transceiver(
 
     if cache_transceiver_config.backend == "DEFAULT":
         # When cache_transceiver_config.backend is not set, fallback to env_vars settings
-        # NIXL is the default backend
+        # UCX is the default backend
         cache_transceiver_config.backend = "UCX"
         # Ordered by priority
         env_vars = [("TRTLLM_USE_NIXL_KVCACHE", "NIXL"),
