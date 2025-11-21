@@ -4,7 +4,7 @@ set -ex
 GITHUB_URL="https://github.com"
 UCX_INSTALL_PATH="/usr/local/ucx/"
 CUDA_PATH="/usr/local/cuda"
-NIXL_VERSION="0.5.0"
+NIXL_VERSION="0.7.1"
 NIXL_REPO="https://github.com/ai-dynamo/nixl.git"
 OLD_LD_LIBRARY_PATH=$LD_LIBRARY_PATH
 

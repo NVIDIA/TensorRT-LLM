@@ -1336,7 +1336,7 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk,
     in the decode phase of sparse_attn_indexer.
 
     This test validates:
-    1. Custom CUDA top-k kernel (indexer_topk_decode_op) correctness
+    1. Custom CUDA top-k kernel (indexer_topk_decode) correctness
     2. Consistency with PyTorch fallback implementation
     3. Handling of decode scenarios with next_n > 1 (speculative decoding)
     4. Proper masking and handling of variable-length sequences
@@ -1555,7 +1555,7 @@ def test_indexer_prefill_chunked_custom_vs_fallback(batch_size, index_topk,
     with metadata.indexer_prefill_chunks != None.
 
     This test validates:
-    1. Custom CUDA top-k kernel (indexer_topk_prefill_op) correctness in chunked mode
+    1. Custom CUDA top-k kernel (indexer_topk_prefill) correctness in chunked mode
     2. Consistency with PyTorch fallback implementation
     3. Proper handling of multiple chunks
     4. Correct masking and local index computation per chunk

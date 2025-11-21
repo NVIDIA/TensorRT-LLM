@@ -268,6 +268,10 @@ class PyTorchModelEngine(ModelEngine):
                 use_ub = not use_ub_for_nccl and (
                     torch_compile_enable_userbuffers
                     and self._init_userbuffers(self.model.config.hidden_size))
+                self.backend_num_streams = Backend.Streams([
+                    torch.cuda.Stream()
+                    for _ in range(torch_compile_max_num_streams - 1)
+                ])
                 self._torch_compile_backend = Backend(
                     torch_compile_inductor_enabled,
                     enable_userbuffers=use_ub,
@@ -2658,8 +2662,7 @@ class PyTorchModelEngine(ModelEngine):
         if self._torch_compile_backend is not None:
             # Register aux streams and events to model extra attrs.
             # The streams and events are list which could be updated during compilation.
-            attrs["aux_streams"] = weakref.ref(
-                self._torch_compile_backend.aux_streams)
+            attrs["aux_streams"] = weakref.ref(self.backend_num_streams)
             attrs["events"] = weakref.ref(self._torch_compile_backend.events)
             attrs["global_stream"] = torch.cuda.current_stream()
 

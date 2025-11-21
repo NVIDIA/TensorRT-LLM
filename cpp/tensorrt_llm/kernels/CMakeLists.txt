@@ -22,6 +22,8 @@ file(GLOB_RECURSE SRC_CU *.cu)
 # selectiveScan trtllmGenKernels folder
 list(FILTER SRC_CPP EXCLUDE REGEX "cutlass_kernels/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "cutlass_kernels/.*")
+list(FILTER SRC_CPP EXCLUDE REGEX "cuteDslKernels/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "cuteDslKernels/.*")
 list(FILTER SRC_CPP EXCLUDE REGEX "flashMLA/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "flashMLA/.*")
 list(FILTER SRC_CPP EXCLUDE REGEX "contextFusedMultiHeadAttention/.*")
@@ -75,6 +77,7 @@ target_include_directories(
 add_cuda_architectures(kernels_src 89)
 
 add_subdirectory(cutlass_kernels)
+add_subdirectory(cuteDslKernels)
 add_subdirectory(flashMLA)
 add_subdirectory(contextFusedMultiHeadAttention)
 add_subdirectory(decoderMaskedMultiheadAttention)

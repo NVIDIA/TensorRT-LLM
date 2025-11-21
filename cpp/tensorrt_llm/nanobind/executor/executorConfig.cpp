@@ -465,15 +465,19 @@ void initConfigBindings(nb::module_& m)
 
     nb::class_<tle::CacheTransceiverConfig>(m, "CacheTransceiverConfig")
         .def(nb::init<std::optional<tle::CacheTransceiverConfig::BackendType>, std::optional<size_t>,
-                 std::optional<int>>(),
+                 std::optional<int>, std::optional<int>>(),
             nb::arg("backend") = std::nullopt, nb::arg("max_tokens_in_buffer") = std::nullopt,
-            nb::arg("kv_transfer_timeout_ms") = std::nullopt)
+            nb::arg("kv_transfer_timeout_ms") = std::nullopt,
+            nb::arg("kv_transfer_sender_future_timeout_ms") = std::nullopt)
         .def_prop_rw(
             "backend", &tle::CacheTransceiverConfig::getBackendType, &tle::CacheTransceiverConfig::setBackendType)
         .def_prop_rw("max_tokens_in_buffer", &tle::CacheTransceiverConfig::getMaxTokensInBuffer,
             &tle::CacheTransceiverConfig::setMaxTokensInBuffer)
         .def_prop_rw("kv_transfer_timeout_ms", &tle::CacheTransceiverConfig::getKvTransferTimeoutMs,
             &tle::CacheTransceiverConfig::setKvTransferTimeoutMs)
+        .def_prop_rw("kv_transfer_sender_future_timeout_ms",
+            &tle::CacheTransceiverConfig::getKvTransferSenderFutureTimeoutMs,
+            &tle::CacheTransceiverConfig::setKvTransferSenderFutureTimeoutMs)
         .def("__getstate__", cacheTransceiverConfigGetstate)
         .def("__setstate__", cacheTransceiverConfigSetstate);
 

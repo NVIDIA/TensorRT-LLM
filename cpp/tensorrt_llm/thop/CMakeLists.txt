@@ -44,6 +44,7 @@ add_library(
   attentionOp.cpp
   causalConv1dOp.cpp
   convertSpecDecodingMaskToPackedMaskOp.cpp
+  cuteDslMoeUtilsOp.cpp
   cutlassScaledMM.cpp
   cublasScaledMM.cpp
   cublasFp4ScaledMM.cpp

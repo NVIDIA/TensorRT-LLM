@@ -2,7 +2,7 @@ import os
 import time
 
 import requests
-from defs.conftest import llm_models_root, skip_pre_hopper
+from defs.conftest import llm_models_root, skip_no_hopper
 from defs.trt_test_alternative import popen, print_error, print_info
 from openai import OpenAI
 from requests.exceptions import RequestException
@@ -92,9 +92,11 @@ def check_openai_chat_completion(http_port="8000",
         raise
 
 
-@skip_pre_hopper
+@skip_no_hopper
 def test_extra_llm_api_options(serve_test_root):
     test_configs_root = f"{serve_test_root}/test_configs"
+
+    # moe backend = CUTLASS which only supports fp8 blockscale on Hopper
     config_file = f"{test_configs_root}/Qwen3-30B-A3B-FP8.yml"
     model_path = f"{llm_models_root()}/Qwen3/Qwen3-30B-A3B-FP8"
 
