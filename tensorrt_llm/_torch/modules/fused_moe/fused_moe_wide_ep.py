@@ -400,7 +400,6 @@ class WideEPMoE(MoE):
         all_rank_max_num_tokens = max(all_rank_num_tokens)
         if isinstance(x, Fp4QuantizedTensor):
             assert output_dtype is not None
-            output_dtype = output_dtype
         else:
             output_dtype = x.dtype
 
@@ -762,7 +761,7 @@ class WideEPMoE(MoE):
             ] for idx_chunk in range(num_chunks)]
             all_rank_max_num_tokens_list = split_chunk(all_rank_max_num_tokens,
                                                        num_chunks)
-            chunk_size_list = all_rank_chunk_size_list[self.rank]
+            chunk_size_list = all_rank_chunk_size_list[self.parallel_rank]
             if use_all_to_all:
                 all_rank_num_tokens_list = [[
                     1 if val == 0 else val for val in val_list
@@ -850,7 +849,7 @@ class WideEPMoE(MoE):
                     self.event_dict[EventType.MoeChunkingOverlap].record()
                 self.event_dict[EventType.MoeChunkingOverlap].wait()
             outputs = torch.cat(outputs_list)
-        rank = self.mapping.tp_rank
+        rank = self.parallel_rank
         outputs = outputs[:all_rank_num_tokens[rank]]
         self.repeat_idx = 0 if self.repeat_idx == self.repeat_count - 1 else self.repeat_idx + 1
         return outputs

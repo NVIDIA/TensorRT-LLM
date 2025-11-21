@@ -6,7 +6,6 @@ from pydantic import AliasChoices, BaseModel, Field
 
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm._tensorrt_engine import LLM
-from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 from tensorrt_llm.bench.benchmark.utils.processes import IterationWriter
 from tensorrt_llm.bench.build.build import get_model_config
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
@@ -108,13 +107,15 @@ def get_llm(runtime_config: RuntimeConfig, kwargs: dict):
     if runtime_config.backend != None:
         ignore_trt_only_args(kwargs, runtime_config.backend)
 
+    if runtime_config.iteration_log is not None:
+        kwargs["enable_iter_perf_stats"] = True
+
     if runtime_config.backend == 'pytorch':
         llm_cls = PyTorchLLM
 
-        if runtime_config.iteration_log is not None:
-            kwargs["enable_iter_perf_stats"] = True
-
     elif runtime_config.backend == "_autodeploy":
+        from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
+
         kwargs["world_size"] = kwargs.pop("tensor_parallel_size", None)
         llm_cls = AutoDeployLLM
 

@@ -182,28 +182,30 @@ def test_llm_reward_model():
 
 @skip_ray
 def test_llm_perf_metrics():
-    llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
-    sampling_params = SamplingParams(max_tokens=10, return_perf_metrics=True)
-    outputs = llm.generate(prompts, sampling_params)
-    assert outputs[0].outputs[0].request_perf_metrics is not None
+    with LLM(model=llama_model_path,
+             kv_cache_config=global_kvcache_config) as llm:
+        sampling_params = SamplingParams(max_tokens=10,
+                                         return_perf_metrics=True)
+        outputs = llm.generate(prompts, sampling_params)
+        assert outputs[0].outputs[0].request_perf_metrics is not None
 
-    perf_metrics = outputs[0].outputs[0].request_perf_metrics
+        perf_metrics = outputs[0].outputs[0].request_perf_metrics
 
-    timing_metrics = perf_metrics.timing_metrics
-    assert timing_metrics.arrival_time < timing_metrics.first_scheduled_time
-    assert timing_metrics.first_scheduled_time < timing_metrics.first_token_time
-    assert timing_metrics.first_token_time < timing_metrics.last_token_time
+        timing_metrics = perf_metrics.timing_metrics
+        assert timing_metrics.arrival_time < timing_metrics.first_scheduled_time
+        assert timing_metrics.first_scheduled_time < timing_metrics.first_token_time
+        assert timing_metrics.first_token_time < timing_metrics.last_token_time
 
-    kv_cache_metrics = perf_metrics.kv_cache_metrics
-    assert kv_cache_metrics.num_total_allocated_blocks == 1
-    assert kv_cache_metrics.num_new_allocated_blocks == 1
-    assert kv_cache_metrics.num_reused_blocks == 0
-    assert kv_cache_metrics.num_missed_blocks == 1
-    assert kv_cache_metrics.kv_cache_hit_rate == 0
+        kv_cache_metrics = perf_metrics.kv_cache_metrics
+        assert kv_cache_metrics.num_total_allocated_blocks == 1
+        assert kv_cache_metrics.num_new_allocated_blocks == 1
+        assert kv_cache_metrics.num_reused_blocks == 0
+        assert kv_cache_metrics.num_missed_blocks == 1
+        assert kv_cache_metrics.kv_cache_hit_rate == 0
 
-    assert perf_metrics.first_iter is not None
-    assert perf_metrics.iter - perf_metrics.first_iter == sampling_params.max_tokens - 1
-    assert perf_metrics.last_iter == perf_metrics.iter
+        assert perf_metrics.first_iter is not None
+        assert perf_metrics.iter - perf_metrics.first_iter == sampling_params.max_tokens - 1
+        assert perf_metrics.last_iter == perf_metrics.iter
 
 
 @skip_ray
@@ -1017,6 +1019,85 @@ def test_llm_context_only_timed_out():
 
     assert len(results) == 1
     context_only_used_num_blocks = results[0]["kvCacheStats"]["usedNumBlocks"]
+    print(f"Context only used num blocks: {context_only_used_num_blocks}")
+
+    # Sleep 5 seconds to allow context only request to time out
+    time.sleep(5)
+
+    # Send regular request
+    for output in llm.generate(prompts0, sampling_params=sampling_params):
+        print(output)
+
+    # Get number of allocated blocks
+    results = llm.get_stats(2)
+    assert len(results) == 1
+    final_used_num_blocks = results[0]["kvCacheStats"]["usedNumBlocks"]
+
+    assert final_used_num_blocks == 0
+
+
+# This test is to verify that when the KV cache is exhausted and scheduled batch size is 0, the context only request will be aborted due to timeout.
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.part0
+@skip_ray
+@pytest.mark.parametrize("sender_future_timeout_ms", [100, 1000])
+def test_llm_context_only_timed_out_kv_cache_exhausted(
+        sender_future_timeout_ms):
+    tp_size = 1
+    use_overlap = False
+    enable_iter_req_stats = False
+
+    llm_args_extra = {}
+
+    llm_args_extra.update(
+        dict(enable_iter_perf_stats=True,
+             enable_iter_req_stats=enable_iter_req_stats,
+             disable_overlap_scheduler=not use_overlap))
+
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.1,
+                                    max_tokens=1000,
+                                    enable_block_reuse=False)
+    llm = LLM(
+        model=llama_model_path,
+        kv_cache_config=kv_cache_config,
+        tensor_parallel_size=tp_size,
+        cache_transceiver_config=CacheTransceiverConfig(
+            backend="DEFAULT",
+            kv_transfer_timeout_ms=1000,
+            kv_transfer_sender_future_timeout_ms=sender_future_timeout_ms),
+        **llm_args_extra)
+
+    max_tokens = 1
+    sampling_params = SamplingParams(max_tokens=max_tokens)
+
+    disaggregated_params = DisaggregatedParams(request_type="context_only")
+
+    prompts0 = [
+        "What is your name?",
+    ]
+    prompts1 = [
+        "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua "
+        * 10
+    ]
+
+    # Send context-only request
+    for output in llm.generate(prompts1 * 10,
+                               sampling_params=sampling_params,
+                               disaggregated_params=disaggregated_params):
+        print(output)
+
+    max_retries = 10
+    all_results = []
+    for _ in range(max_retries):
+        results = llm.get_stats(2)
+        all_results.extend(results)
+
+    assert len(all_results) > 0
+
+    context_only_used_num_blocks = all_results[-1]["kvCacheStats"][
+        "usedNumBlocks"]
     print(f"Context only used num blocks: {context_only_used_num_blocks}")
 
     # Sleep 5 seconds to allow context only request to time out

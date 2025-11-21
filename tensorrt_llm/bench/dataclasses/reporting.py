@@ -1,8 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
 from collections import defaultdict
 from typing import Any, Dict, List, NamedTuple
+
+import torch
+
+try:
+    import pynvml
+except ImportError:
+    pynvml = None
 
 from tensorrt_llm._torch.pyexecutor.model_loader import \
     validate_and_set_kv_cache_quant
@@ -199,6 +207,35 @@ class ReportUtility:
         self.streaming = streaming
 
     @staticmethod
+    def _query_gpu_info() -> Dict[str, Any]:
+        """Query first GPU info (all GPUs must be identical for TRT-LLM)."""
+        if not torch.cuda.is_available():
+            return None
+
+        try:
+            cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+            physical_idx = int(
+                cuda_visible.split(",")[0].strip()) if cuda_visible else 0
+
+            props = torch.cuda.get_device_properties(physical_idx)
+            gpu_info = {
+                "name":
+                getattr(props, "name", "Unknown"),
+                "memory.total":
+                float(getattr(props, "total_memory", 0.0)) / (1024.0**3),
+                "clocks.mem":
+                None,
+            }
+            if pynvml:
+                # Memory clock information is not reported by torch, using NVML instead
+                handle = pynvml.nvmlDeviceGetHandleByIndex(physical_idx)
+                gpu_info["clocks.mem"] = pynvml.nvmlDeviceGetMaxClockInfo(
+                    handle, pynvml.NVML_CLOCK_MEM) / 1000.0
+            return gpu_info
+        except (RuntimeError, AssertionError):
+            return None
+
+    @staticmethod
     def convert_to_ms(ns: float) -> float:
         """Convert nanoseconds to milliseconds."""
         return ns * 1.0e-6
@@ -272,6 +309,9 @@ class ReportUtility:
                 "version": self.rt_cfg.sw_version,
             },
         }
+
+        # Machine / GPU details - query only first GPU (all GPUs must be identical)
+        stats_dict["machine"] = self._query_gpu_info()
 
         # Retrieve KV cache information.
         kv_cache_config = self.kwargs.get("kv_cache_config", KvCacheConfig())
@@ -478,6 +518,7 @@ class ReportUtility:
         """
         stats_dict = self.get_statistics_dict()
         engine = stats_dict["engine"]
+        machine = stats_dict.get("machine")
         world_info = stats_dict["world_info"]
         requests = stats_dict["request_info"]
         perf = stats_dict["performance"]
@@ -525,6 +566,20 @@ class ReportUtility:
         kv_cache_percentage = world_info.get("kv_cache_percentage", None)
         if kv_cache_percentage is not None:
             kv_cache_percentage = f"{kv_cache_percentage * 100.0:.2f}%"
+
+        machine_info = (
+            "===========================================================\n"
+            "= MACHINE DETAILS \n"
+            "===========================================================\n")
+        if machine is None:
+            machine_info += "No GPU info available\n\n"
+        else:
+            name = machine.get("name", "Unknown")
+            mem_total_str = f"{machine['memory.total']:.2f} GB" if machine.get(
+                "memory.total") is not None else "N/A"
+            mem_clock_str = f"{machine['clocks.mem']:.2f} GHz" if machine.get(
+                'clocks.mem') is not None else "N/A"
+            machine_info += f"{name}, memory {mem_total_str}, {mem_clock_str}\n\n"
 
         world_info = (
             "===========================================================\n"
@@ -663,6 +718,7 @@ class ReportUtility:
                 )
 
         logging_info = (f"{backend_info}"
+                        f"{machine_info}"
                         f"{request_info}"
                         f"{world_info}"
                         f"{perf_header}"
