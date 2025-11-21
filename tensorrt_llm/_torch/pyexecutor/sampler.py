@@ -784,9 +784,12 @@ class TorchSampler(Sampler):
 
         self._grouped_sampler_cls: Type[GroupedStrategySampler]
         if IS_FLASHINFER_AVAILABLE and not args.disable_flashinfer_sampling:
-            from .sampling_utils_flashinfer import FlashInferGroupedStrategySampler
+            if self._use_beam_search:  # Beam search requires SimpleGroupedStrategySampler
+                self._grouped_sampler_cls = SimpleGroupedStrategySampler
+            else:
+                from .sampling_utils_flashinfer import FlashInferGroupedStrategySampler
 
-            self._grouped_sampler_cls = FlashInferGroupedStrategySampler
+                self._grouped_sampler_cls = FlashInferGroupedStrategySampler
         else:
             self._grouped_sampler_cls = SimpleGroupedStrategySampler
 
@@ -1024,8 +1027,12 @@ class TorchSampler(Sampler):
             force_limit = min(self._force_num_accepted_tokens, len(request.py_draft_tokens))
             for _ in request.py_draft_tokens[:force_limit]:
                 num_accepted += 1
-                new_token = add_token(request, new_tokens, beam=BEAM, step=num_accepted)
-                if self.finish_if_reason(request, finish_reasons, step=num_accepted):
+                new_token = add_token(
+                    request, new_tokens, beam_idx=DEFAULT_BEAM_IDX, step=num_accepted
+                )
+                if self.finish_if_reason(
+                    request, finish_reasons, step=num_accepted, beam_idx=DEFAULT_BEAM_IDX
+                ):
                     break
         else:
             for draft_token in request.py_draft_tokens:
@@ -1034,10 +1041,12 @@ class TorchSampler(Sampler):
                     break
 
                 num_accepted += 1
-                new_token = add_token(request, new_tokens, beam_idx=DEFAULT_BEAM_IDX, step=num_accepted)
+                new_token = add_token(
+                    request, new_tokens, beam_idx=DEFAULT_BEAM_IDX, step=num_accepted
+                )
                 if self.finish_if_reason(
-                request, finish_reasons, step=num_accepted, beam_idx=DEFAULT_BEAM_IDX
-            ):
+                    request, finish_reasons, step=num_accepted, beam_idx=DEFAULT_BEAM_IDX
+                ):
                     break
         return num_accepted
 
@@ -1118,12 +1127,16 @@ class TorchSampler(Sampler):
         # Take the longest accepted path as the next new token.
         num_accepted_draft_tokens = 0
         for idx in eagle_paths[longest_match_path_idx][:longest_accepted_len]:
-            add_token(request, new_tokens_list, beam_idx=self.DEFAULT_BEAM_IDX, step=cast(int, idx.item()))
+            add_token(
+                request, new_tokens_list, beam_idx=DEFAULT_BEAM_IDX, step=cast(int, idx.item())
+            )
             num_accepted_draft_tokens += 1
-            if self.finish_if_reason(request,
-                        finish_reasons,
-                        step=num_accepted_draft_tokens,
-                        beam_idx=DEFAULT_BEAM_IDX,):
+            if self.finish_if_reason(
+                request,
+                finish_reasons,
+                step=num_accepted_draft_tokens,
+                beam_idx=DEFAULT_BEAM_IDX,
+            ):
                 break
 
         assert num_accepted_draft_tokens <= longest_accepted_len
@@ -1132,7 +1145,6 @@ class TorchSampler(Sampler):
         request.py_num_accepted_draft_tokens_indices = (tree_node_indices - 1).tolist()
 
         return num_accepted_draft_tokens - 1
-
 
     def setup_sampler_step(self, requests: ScheduledRequests):
         """Setup the sampler step for the requests
@@ -2240,7 +2252,7 @@ class TorchSampler(Sampler):
             [
                 [
                     [
-                        ((req.get_num_tokens(beam_idx) + num_tokens) - req.py_orig_prompt_len)
+                        (req.get_num_tokens(beam_idx) + num_tokens)
                         for beam_idx in range(self.max_beam_width)
                     ]
                     for req in requests
@@ -2251,7 +2263,7 @@ class TorchSampler(Sampler):
         max_lengths_tensor = torch.tensor(
             [
                 (
-                    [min(req.py_max_new_tokens, self.max_seq_len - req.orig_prompt_len)]
+                    [min(req.py_max_new_tokens + req.orig_prompt_len, self.max_seq_len)]
                     * self.max_beam_width
                 )
                 for req in requests

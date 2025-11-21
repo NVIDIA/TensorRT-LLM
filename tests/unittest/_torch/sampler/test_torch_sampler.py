@@ -83,9 +83,11 @@ class TestStrategySelection:
 
     class MockLlmRequest:
         sampling_config: SamplingConfig
-        is_context_init_state: bool  # Not used in this test
+        is_context_init_state: bool  # Torch sampler accesses this, but it does not affect this test
 
-        def get_beam_width_by_iter(self, for_next_iteration: bool) -> int:
+        def get_beam_width_by_iter(
+            self, for_next_iteration: bool
+        ) -> int:  # Torch sampler accesses this, but it does not affect this test
             return self.sampling_config.beam_width
 
     def _check_params(self, params: SamplingParams):
