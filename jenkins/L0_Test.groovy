@@ -1065,10 +1065,222 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     }
 }
 
+def runLLMMultiNodeDisaggTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, skipInstallWheel=false, cpver="cp312")
+{
+    SlurmPartition partition = SlurmConfig.partitionConfig[platform] as SlurmPartition
+    SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
+
+    // Create a unique suffix for the job name
+    String customSuffix = "${env.BUILD_TAG}-${UUID.randomUUID().toString().replaceAll("-", "").substring(0, 6)}".toLowerCase()
+    def jobUID = "${cluster.host}-multi_node_disagg_test-${customSuffix}"
+
+    Utils.exec(pipeline, script: "env | sort && pwd && ls -alh")
+
+    def slurmOutputFile = null
+
+    try {
+        // Run ssh command to start node in desired cluster via SLURM
+        withCredentials([
+            usernamePassword(
+                credentialsId: 'svc_tensorrt',
+                usernameVariable: 'USERNAME',
+                passwordVariable: 'PASSWORD'
+            )
+        ]) {
+            def randomLoginNode = SlurmConfig.getRandomLoginNode(cluster.host)
+            def remote = [
+                    ip           : randomLoginNode,
+                    host         : randomLoginNode,
+                    user         : "${pipeline.USERNAME}",
+                    passwd       : "${pipeline.PASSWORD}",
+                    allowAnyHosts: true,
+            ]
+            Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client python3")
+            def tarName = BUILD_CONFIGS[config][TARNAME]
+            def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
+            def llmPath = sh (script: "realpath .", returnStdout: true).trim()
+            def jobWorkspace = "/home/svc_tensorrt/bloom/scripts/${jobUID}"
+            def resourcePathNode = "/tmp"
+            def llmSrcNode = "${resourcePathNode}/TensorRT-LLM/src"
+            def llmSrcLocal = "${llmPath}/TensorRT-LLM/src"
+            def scriptRunNode = "${jobWorkspace}/${jobUID}-slurm_run.sh"
+            slurmOutputFile = SlurmConfig.getOutputFilePath("/home/svc_tensorrt/slurm-logs", jobUID)
+            def testListPathNode = "${jobWorkspace}/${testList}.txt"
+            def waivesListPathNode = "${jobWorkspace}/waives.txt"
+            def outputPath = "${jobWorkspace}/job-output.log"
+            def scriptLaunchPathNode = "${jobWorkspace}/slurm_launch.sh"
+            def scriptExecPathNode = "${jobWorkspace}/slurm_exec.py"
+            def scriptInstallPathNode = "${jobWorkspace}/install.sh"
+            def isAarch64 = config.contains("aarch64")
+            def coverageConfigFile = "${jobWorkspace}/.coveragerc"
+
+            // Determine the config yaml file path based on testList
+            def configYamlFile = "${llmSrcLocal}/tests/scripts/perf-sanity/${testList}.yaml"
+
+            stage("[${stageName}] Initializing Test") {
+                // Create Job Workspace folder in Frontend Node
+                Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"mkdir -p ${jobWorkspace}\""), numRetries: 3)
+
+                // Download and Unzip Tar File
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv ${llmTarfile}")
+                sh "cd ${llmPath} && tar -zxf ${BUILD_CONFIGS[config][TARNAME]}"
+
+                // Copy script files from repository to remote host
+                // Copy slurm_run.sh
+                def scriptRunLocalPath = "${llmSrcLocal}/jenkins/scripts/perf/disaggregated/slurm_run.sh"
+                Utils.copyFileToRemoteHost(
+                    pipeline,
+                    remote,
+                    scriptRunLocalPath,
+                    scriptRunNode,
+                    true
+                )
+
+                // Copy slurm_launch.sh
+                def scriptLaunchLocalPath = "${llmSrcLocal}/jenkins/scripts/perf/disaggregated/slurm_launch.sh"
+                Utils.copyFileToRemoteHost(
+                    pipeline,
+                    remote,
+                    scriptLaunchLocalPath,
+                    scriptLaunchPathNode,
+                    true
+                )
+
+                // Copy slurm_exec.py
+                def scriptExecLocalPath = "${llmSrcLocal}/jenkins/scripts/perf/disaggregated/slurm_exec.py"
+                Utils.copyFileToRemoteHost(
+                    pipeline,
+                    remote,
+                    scriptExecLocalPath,
+                    scriptExecPathNode,
+                    true
+                )
+
+                // Copy install.sh
+                def scriptInstallLocalPath = "${llmSrcLocal}/jenkins/scripts/perf/disaggregated/install.sh"
+                Utils.copyFileToRemoteHost(
+                    pipeline,
+                    remote,
+                    scriptInstallLocalPath,
+                    scriptInstallPathNode,
+                    true
+                )
+
+                // Generate Test List and Upload to Frontend Node
+                def makoArgs = getMakoArgsFromStageName(stageName, true)
+                def makoOptsJson = transformMakoArgsToJson(["Mako options:"] + makoArgs)
+                def testListPathLocal = renderTestDB(testList, llmSrcLocal, stageName, makoOptsJson)
+                Utils.copyFileToRemoteHost(
+                    pipeline,
+                    remote,
+                    testListPathLocal,
+                    testListPathNode
+                )
+
+                // generate .coveragerc in workspace and add file path to pytest command
+                sh """
+                    touch ./.coveragerc
+                    echo '[run]' > ./.coveragerc
+                    echo 'branch = True' >> ./.coveragerc
+                    echo 'data_file = ${jobWorkspace}/.coverage.${stageName}' >> ./.coveragerc
+                    echo '[paths]' >> ./.coveragerc
+                    echo 'source =\n    ${llmSrcNode}/tensorrt_llm/\n    ---wheel_path---/tensorrt_llm//tensorrt_llm/' >> ./.coveragerc
+                    cat ./.coveragerc
+                """
+
+                Utils.copyFileToRemoteHost(
+                    pipeline,
+                    remote,
+                    "./.coveragerc",
+                    coverageConfigFile
+                )
+
+                // Generate Pytest command
+                String pytestUtil = ""
+                if (nodeCount > 1) {
+                    pytestUtil = "$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"
+                }
+
+                def pytestCommand = getPytestBaseCommandLine(
+                    llmSrcNode,
+                    stageName,
+                    perfMode,
+                    jobWorkspace,
+                    "__PLACEHOLDER_TRTLLM_WHL_PATH__",
+                    "$jobWorkspace/.coveragerc",
+                    pytestUtil,
+                    [
+                      "--test-list=$testListPathNode",
+                      "--splitting-algorithm least_duration",
+                      "--splits $splits",
+                      "--group $splitId"
+                    ]
+                ).join(" ")
+            }
+
+            stage("[${stageName}] Run Pytest") {
+                // Define container and mounts for slurm_exec.py
+                def container = LLM_DOCKER_IMAGE.replace("urm.nvidia.com/", "urm.nvidia.com#")
+                def mounts = "/home/scratch.trt_llm_data:/scratch.trt_llm_data:ro,/home/svc_tensorrt/bloom/scripts:/home/svc_tensorrt/bloom/scripts"
+
+                // Generate sbatch parameter string (without --nodes, --ntasks, etc. which will come from config yaml)
+                def sbatchParams = """--output=${outputPath}
+${partition.additionalArgs}
+${(partition?.name && partition.name != "unspecified") ? "--partition=${partition.name}" : ""}"""
+
+                def python_exec_cmd = """python3 ${scriptExecPathNode} \\
+--sbatch-params '${sbatchParams.replaceAll("'", "'\\\\''")}' \\
+--config-yaml '${configYamlFile}' \\
+--slurm-launch-sh '${scriptLaunchPathNode}' \\
+--job-workspace '${jobWorkspace}' \\
+--llm-tarfile '${llmTarfile}' \\
+--tar-name '${tarName}' \\
+--llm-src-node '${llmSrcNode}' \\
+--stage-name '${stageName}' \\
+--perf-mode '${perfMode}' \\
+--resource-path-node '${resourcePathNode}' \\
+--pytest-command '${pytestCommand.replaceAll("'", "'\\\\''")}' \\
+--coverage-config-file '${coverageConfigFile}' \\
+--container '${container}' \\
+--mounts '${mounts}' \\
+--script-run-node '${scriptRunNode}' \\
+--script-install-node '${scriptInstallPathNode}' \\
+--test-list-path-node '${testListPathNode}' \\
+--output-path '${outputPath}'"""
+
+                Utils.exec(
+                    pipeline,
+                    timeout: false,
+                    script: Utils.sshUserCmd(
+                        remote,
+                        "\"${python_exec_cmd}\""
+                    )
+                )
+            }
+
+            echo "Finished test stage execution."
+        }
+    } finally {
+        uploadResults(pipeline, cluster, jobUID, stageName)
+        stage("Clean up SLURM Resources") {
+            // Workaround to handle the interruption during clean up SLURM resources
+            retry(3) {
+                try {
+                    cleanUpSlurmResources(pipeline, cluster, jobUID)
+                } catch (Exception e) {
+                    error "Error during clean up SLURM resources: ${e.getMessage()} and retrying."
+                }
+            }
+        }
+    }
+}
+
 def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, runWithSbatch=false, skipInstallWheel=false, cpver="cp312")
 {
   echo "Run Slurm job with native sbatch: $runWithSbatch"
-  if(nodeCount > 1 || runWithSbatch) {
+  if(nodeCount > 1 && stageName.contains("Perf-Sanity-Disagg")) {
+    runLLMMultiNodeDisaggTestlistWithSbatch(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, nodeCount, skipInstallWheel, cpver)
+  } else if(nodeCount > 1 || runWithSbatch) {
     runLLMTestlistWithSbatch(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, nodeCount, skipInstallWheel, cpver)
   } else {
     runLLMTestlistWithAgent(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, skipInstallWheel, cpver)
@@ -2333,7 +2545,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             error "Some tests still failed after rerun attempts, please check the test report."
         }
 
-        if (perfMode) {
+        if (perfMode && !stageName.contains("Perf-Sanity")) {
             basePerfFilename = stageName.contains("PyTorch") ? "base_perf_pytorch.csv" : "base_perf.csv"
             basePerfPath = "${llmSrc}/tests/integration/defs/perf/${basePerfFilename}"
             stage("Check perf result") {
@@ -2744,8 +2956,8 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["b200-trtllm", "l0_dgx_b200", 1, 1, 4, 1, true],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["b300-x4", "l0_dgx_b300", 1, 1, 4],
         // Perf sanity post merge test
-        // Disable perf stages due to https://nvbugs/5643646
-        // "DGX_B200-4_GPUs-PyTorch-Perf-Sanity-Post-Merge-1": ["b200-x4", "perf_sanity_l0_dgx_b200", 1, 1, 4],
+        "DGX_B200-4_GPUs-PyTorch-Perf-Sanity-Post-Merge-1": ["b200-x4", "perf_sanity_l0_dgx_b200", 1, 1, 4],
+        // "DGX_B200-8_GPUs-PyTorch-Perf-Sanity-Post-Merge-1": ["b200-x8", "perf_sanity_l0_dgx_b200", 1, 1, 8],
         // "DGX_B300-4_GPUs-PyTorch-Perf-Sanity-Post-Merge-1": ["b300-x4", "perf_sanity_l0_dgx_b300", 1, 1, 4],
     ]
     fullSet += x86SlurmTestConfigs.keySet()
@@ -2788,7 +3000,10 @@ def launchTestJobs(pipeline, testFilter)
         // "GB200-8_GPUs-2_Nodes-PyTorch-4": ["gb200-trtllm", "l0_gb200_multi_nodes", 4, 5, 8, 2],
         // "GB200-8_GPUs-2_Nodes-PyTorch-5": ["gb200-trtllm", "l0_gb200_multi_nodes", 5, 5, 8, 2],
     // ]
-    multiNodesSBSAConfigs = [:]
+    multiNodesSBSAConfigs = [
+        "GB200-8_GPUs-2_Nodes-PyTorch-Perf-Sanity-Post-Merge-1": ["gb200-trtllm", "perf_sanity_l0_gb200_multi_nodes", 1, 1, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Perf-Sanity-Disagg-Post-Merge-1": ["gb200-trtllm", "perf_sanity_l0_gb200_multi_nodes_disagg", 1, 1, 8, 2],
+    ]
     def numMultiNodeTests = 3
     multiNodesSBSAConfigs += (1..numMultiNodeTests).collectEntries { i ->
         ["GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-${i}".toString(), ["gb200-oci-trtllm", "l0_gb200_multi_nodes", i, numMultiNodeTests, 8, 2]]
