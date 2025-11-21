@@ -4155,7 +4155,6 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
     def test_bf16_4gpu(self, tp_size, pp_size, ep_size, cuda_graph,
                        overlap_scheduler):
         model_path = f"{self.MODEL_PATH}/Qwen3-Next-80B-A3B-Instruct"
-        model_path = "Qwen/Qwen3-Next-80B-A3B-Instruct"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         enable_block_reuse=False)
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
@@ -4187,7 +4186,6 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
     def test_nvfp4(self, moe_backend, tp_size, pp_size, ep_size, cuda_graph,
                    overlap_scheduler):
         model_path = f"{self.MODEL_PATH}/qwen3-next-80b-instruct-nvfp4-ptq-fp8kv"
-        model_path = "/home/scratch.didow_sw_1/models/qwen3-next-80b-instruct-nvfp4-ptq-fp8kv"
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         enable_block_reuse=False)
