@@ -1,5 +1,4 @@
 from abc import ABC, abstractmethod
-from bisect import bisect_right
 from typing import Dict, List, Optional, final
 
 from tensorrt_llm.logger import logger
@@ -79,35 +78,26 @@ class Drafter(ABC):
                 0 for _ in range(self._static_max_total_draft_tokens -
                                  num_draft_tokens))
 
-    def get_draft_len_for_batch_size(self, batch_size: int) -> int:
+    def get_draft_len_for_batch_size(self, runtime_batch_size: int) -> int:
         """
         Get the appropriate draft length for the given batch size using binary search.
         Args:
-            batch_size: Current batch size (has been sorted by config validator)
+            batch_size: Current batch size (already sorted by config validator)
         Returns:
             The draft length to use for this batch size
         """
 
-        # Binary search to find the largest threshold <= batch_size
         # draft_len_schedule is already sorted by config validator
-        thresholds = list(self.draft_len_schedule.keys())
+        schedule_batch_sizes = list(self.draft_len_schedule.keys())
+        idx = bisect_left(schedule_batch_sizes, runtime_batch_size)
+        if idx < len(schedule_batch_sizes):
+            return self.draft_len_schedule[schedule_batch_sizes[idx]]
 
-        # bisect_right finds where to insert batch_size to keep list sorted
-        # The element before insertion point is the largest threshold <= batch_size
-        idx = bisect_right(thresholds, batch_size)
-
-        if idx == 0:
-            # batch_size is smaller than smallest threshold (batch_size smaller than 1)
-            # This shouldn't happen in practice, but handle defensively
-            logger.warning(
-                f"get_draft_len_for_batch_size called with batch_size={batch_size} < 1. "
-                f"This is unexpected. Disabling speculation (returning draft_len=0)."
-            )
-            return 0
-
-        # Return draft_len for the largest threshold <= batch_size
-        threshold = thresholds[idx - 1]
-        return self.draft_len_schedule[threshold]
+        # runtime_batch_size > all batch sizes in draft_len_schedule: speculation disabled (implicit)
+        logger.debug(
+            f"Runtime batch size {runtime_batch_size} exceeds largest schedule key {max(schedule_batch_sizes)}. "
+            f"Speculation disabled (draft_len=0).")
+        return 0
 
     def update_max_total_draft_tokens(self,
                                       new_max_total_draft_tokens: int) -> None:
