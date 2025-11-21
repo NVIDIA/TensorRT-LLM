@@ -19,7 +19,7 @@ gradio = "4.44.1"
 mdtex2html = "^1.3.1"
 sse-starlette = "^3.0.3"
 aiohttp-sse-client = "^0.2.1"
-openai = "^2.7.2"
+openai = "^2.8.1"
 
 
 [build-system]

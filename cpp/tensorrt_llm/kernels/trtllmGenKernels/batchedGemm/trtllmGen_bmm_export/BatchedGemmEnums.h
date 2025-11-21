@@ -16,8 +16,8 @@
  */
 #pragma once
 
-#include <cassert>
 #include <string>
+#include <cassert>
 
 namespace batchedGemm
 {
@@ -34,7 +34,9 @@ enum class RouteImpl
     // Use LDGSTS to do the routing
     Ldgsts = 1,
     // Use UTMALDG.GATHER4 to do the routing
-    Tma = 2
+    Tma = 2,
+    // Use LDG+STS to do the routing
+    LdgPlusSts = 3
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -56,6 +58,13 @@ inline bool doesRouteImplUseLdgsts(RouteImpl mode)
 inline bool doesRouteImplUseTma(RouteImpl mode)
 {
     return (mode == RouteImpl::Tma);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline bool doesRouteImplUseLdgPlusSts(RouteImpl mode)
+{
+    return (mode == RouteImpl::LdgPlusSts);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

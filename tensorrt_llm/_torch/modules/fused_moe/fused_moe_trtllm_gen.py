@@ -128,7 +128,7 @@ class TRTLLMGenFusedMoE(MoE):
                         model_config.mapping)
                 elif self.moe_alltoall_backend == "mnnvlthroughput":
                     workspace_mb = int(
-                        os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB", "512"))
+                        os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB", "2048"))
                     self.moe_a2a = MoeAlltoAll(
                         mapping=self.mapping,
                         max_num_tokens=model_config.max_num_tokens,
@@ -154,6 +154,17 @@ class TRTLLMGenFusedMoE(MoE):
             self.create_weights()
 
     def select_alltoall_method_type(self) -> AlltoallMethodType:
+        # If no attention DP, no need to use AlltoAll.
+        if self.mapping.dp_size == 1:
+            return AlltoallMethodType.NotEnabled
+
+        # AlltoAll cannot support MoE TP.
+        if self.mapping.moe_tp_size != 1:
+            return AlltoallMethodType.NotEnabled
+
+        if not MnnvlMemory.supports_mnnvl():
+            return AlltoallMethodType.NotEnabled
+
         all2all_method_type = os.environ.get("TRTLLM_FORCE_ALLTOALL_METHOD")
         if all2all_method_type is not None:
             if AlltoallMethodType[all2all_method_type] in [
@@ -165,18 +176,13 @@ class TRTLLMGenFusedMoE(MoE):
                 )
             return AlltoallMethodType[all2all_method_type]
 
-        if not self.mapping.enable_attention_dp:
-            return AlltoallMethodType.NotEnabled
-
-        if self.mapping.tp_size == 1:
-            return AlltoallMethodType.NotEnabled
-
         if os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") == "1":
             return AlltoallMethodType.NotEnabled
 
-        if not (self.mapping.moe_ep_size > self.routing_method.experts_per_token
-                and MnnvlMemory.supports_mnnvl()):
-            return AlltoallMethodType.NotEnabled
+        # TODO: We found that MNNVL performs better than NCCL AllGather/ReduceScatter,
+        # regardless of the relationship between EP size and topK. We favor AlltoAll for now.
+        # if not self.mapping.moe_ep_size > self.routing_method.experts_per_token:
+        #     return AlltoallMethodType.NotEnabled
 
         return AlltoallMethodType.MNNVL
 
@@ -192,9 +198,9 @@ class TRTLLMGenFusedMoE(MoE):
 
     @cached_property
     def moe_alltoall_backend(self):
-        # "mnnvllatency" (default) or "mnnvlthroughput"
+        # "mnnvlthroughput" (default) or "mnnvllatency"
         return os.environ.get("TRTLLM_MOE_ALLTOALL_BACKEND",
-                              "mnnvllatency").strip().lower()
+                              "mnnvlthroughput").strip().lower()
 
     def _check_configs(self):
         assert self.has_deepseek_fp8_block_scales \
@@ -286,7 +292,7 @@ class TRTLLMGenFusedMoE(MoE):
                     False)
         elif self.has_w4a8_mxfp4_mxfp8:
             x, x_sf = torch.ops.trtllm.mxfp8_quantize(
-                x, False, alignment=self.quant_method.weight_alignment)
+                x, False, alignment=self.quant_method.input_hidden_alignment)
             x_row, x_col = x.shape[0], x.shape[1]
         elif self.has_deepseek_fp8_block_scales:
             # No change required before communication
@@ -503,7 +509,8 @@ class TRTLLMGenFusedMoE(MoE):
 
         moe_output: Optional[torch.Tensor] = None
         use_workspace_output = False
-        if self.enable_alltoall and self.moe_alltoall_backend == "mnnvlthroughput":
+        # TODO: use_workspace_output only supports w4a8_mxfp4_mxfp8 (gpt-oss) for now
+        if self.enable_alltoall and self.moe_alltoall_backend == "mnnvlthroughput" and self.has_w4a8_mxfp4_mxfp8:
             moe_output = self.moe_a2a.get_combine_payload_tensor_in_workspace(
                 runtime_max_tokens_per_rank, self.hidden_size, torch.bfloat16)
             use_workspace_output = True
@@ -612,6 +619,9 @@ class TRTLLMGenFusedMoE(MoE):
                 n_group,
                 topk_group,
                 intermediate_size_per_partition_padded,
+                self.hidden_size,  # valid_hidden_size
+                self.quant_method.
+                intermediate_size_per_partition_lean,  # valid_intermediate_size
                 self.
                 slot_start,  # local_expert_start;  use ep_rank if stride!=1
                 self.expert_size_per_partition,  # local_expert_size
@@ -695,6 +705,9 @@ class TRTLLMGenFusedMoE(MoE):
                 n_group,
                 topk_group,
                 intermediate_size_per_partition_padded,
+                self.hidden_size,  # valid_hidden_size_per_partition
+                self.quant_method.
+                intermediate_size_per_partition_lean,  # valid_intermediate_size_per_partition
                 self.
                 slot_start,  # local_expert_start;  use ep_rank if stride!=1
                 self.expert_size_per_partition,  # local_expert_size
@@ -710,7 +723,9 @@ class TRTLLMGenFusedMoE(MoE):
             if not post_quant_comm:
                 # TRTLLM-Gen uses linear SF layout for the mxfp8 input.
                 mxfp8_x, sf = torch.ops.trtllm.mxfp8_quantize(
-                    x, False, alignment=self.quant_method.weight_alignment)
+                    x,
+                    False,
+                    alignment=self.quant_method.input_hidden_alignment)
             else:
                 mxfp8_x, sf = x, x_sf
 
@@ -736,7 +751,9 @@ class TRTLLMGenFusedMoE(MoE):
                 n_group,
                 topk_group,
                 intermediate_size_per_partition_padded,
-                self.hidden_size,
+                self.hidden_size,  # valid_hidden_size
+                self.quant_method.
+                intermediate_size_per_partition_lean,  # valid_intermediate_size
                 self.
                 slot_start,  # local_expert_start;  use ep_rank if stride!=1
                 self.expert_size_per_partition,  # local_expert_size
@@ -805,7 +822,7 @@ class TRTLLMGenFusedMoE(MoE):
         self._load_balancer_done_set_cpu_stage(is_last_call)
 
         if use_dp_padding:
-            rank = self.mapping.tp_rank
+            rank = self.parallel_rank
             final_hidden_states = final_hidden_states[:
                                                       all_rank_num_tokens[rank]]
 

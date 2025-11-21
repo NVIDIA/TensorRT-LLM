@@ -1,7 +1,8 @@
 import contextlib
+import os
 import threading
 from dataclasses import dataclass
-from enum import Enum
+from enum import Enum, IntEnum
 from typing import Dict, List
 
 import torch
@@ -29,6 +30,20 @@ EventType = Enum(
     ['Main', *aux_stream_name_list],
     start=0,
 )
+
+
+# IMPORTANT: Keep the same order of activation functions in this enum and the enum in
+# cpp/tensorrt_llm/kernels/cutlass_kernels/include/common.h
+class ActivationType(IntEnum):
+    InvalidType = 0
+    Identity = 1
+    Gelu = 2
+    Relu = 3
+    Silu = 4
+    Swiglu = 5
+    Geglu = 6
+    SwigluBias = 7
+    Relu2 = 8
 
 
 def set_torch_compiling(enable: bool):
@@ -302,10 +317,16 @@ def create_lm_head_tp_mapping(mapping: Mapping, token_count: int) -> Mapping:
     # We use heuristic to determine the lm_head_tp_size
     # Since token_count=256 will hit the boundary of math-bound problem
     # We use 256 // token_count to determine the lm_head_tp_size
+    # For more details, refer to the blog: https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.md#mtp-lm-head-tensor-parallelism
     lm_head_tp_size_raw = 256 // token_count
-    lm_head_tp_size = nearest_in_buckets(lm_head_tp_size_raw,
-                                         [1, mapping.gpus_per_node])
-    assert mapping.tp_size % lm_head_tp_size == 0
+    # TODO: On platforms like GB200, setting lm_head_tp_size_upper_bound to world_size could be more efficient when world_size > gpus_per_node, we need to do further investigation.
+    lm_head_tp_size_upper_bound = min(mapping.world_size, mapping.gpus_per_node)
+    lm_head_tp_size = int(
+        os.getenv(
+            'LM_HEAD_TP_SIZE',
+            nearest_in_buckets(lm_head_tp_size_raw,
+                               [1, lm_head_tp_size_upper_bound])))
+    assert mapping.tp_size % lm_head_tp_size == 0, f"mapping.tp_size: {mapping.tp_size}, lm_head_tp_size: {lm_head_tp_size}"
     lm_head_pp_size = mapping.pp_size * mapping.tp_size // lm_head_tp_size
 
     return Mapping(
@@ -339,11 +360,12 @@ def maybe_compile(func=None, **compile_kwargs):
     """
 
     def decorator(f):
+        compiled_func = torch.compile(f, **compile_kwargs)
 
         def wrapper(*args, **kwargs):
             if is_piecewise_running():
                 return f(*args, **kwargs)
-            return torch.compile(f, **compile_kwargs)(*args, **kwargs)
+            return compiled_func(*args, **kwargs)
 
         return wrapper
 

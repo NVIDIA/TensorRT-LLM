@@ -83,7 +83,6 @@ common-files: &common_files |
         examples/infinitebench/compute_scores.py |
         examples/infinitebench/construct_synthetic_dataset.py |
         examples/infinitebench/eval_utils.py |
-        examples/layer_wise_benchmarks/run_single.py |
         examples/llm-api/_tensorrt_engine/llm_eagle_decoding.py |
         examples/llm-api/_tensorrt_engine/llm_eagle2_decoding.py |
         examples/llm-api/_tensorrt_engine/llm_inference_customize.py |
@@ -811,7 +810,6 @@ common-files: &common_files |
         tensorrt_llm/serve/tool_parser/utils.py |
         tensorrt_llm/tools/__init__.py |
         tensorrt_llm/tools/importlib_utils.py |
-        tensorrt_llm/tools/layer_wise_benchmarks/deepseekv3_runner.py |
         tensorrt_llm/tools/multimodal_builder.py |
         tensorrt_llm/tools/onnx_utils.py |
         tensorrt_llm/tools/plugin_gen/__init__.py |
@@ -1061,7 +1059,6 @@ common-files: &common_files |
         tests/unittest/_torch/thop/parallel/test_logits_bitmask_op.py |
         tests/unittest/_torch/thop/parallel/test_mamba_conv1d_op.py |
         tests/unittest/_torch/thop/parallel/test_mamba2_chunk_ss_update.py |
-        tests/unittest/_torch/thop/parallel/test_moe.py |
         tests/unittest/_torch/thop/parallel/test_noaux_tc.py |
         tests/unittest/_torch/thop/parallel/test_scaled_mm.py |
         tests/unittest/_torch/thop/parallel/test_selective_scan_op.py |
@@ -1073,6 +1070,7 @@ common-files: &common_files |
         tests/unittest/_torch/thop/parallel/test_weight_only_quant_gemm.py |
         tests/unittest/_torch/thop/parallel/test_weight_only_quant_linear.py |
         tests/unittest/_torch/thop/serial/test_moe_alltoall.py |
+        tests/unittest/_torch/thop/serial/test_moe.py |
         tests/unittest/api_stability/api_stability_core.py |
         tests/unittest/api_stability/test_llm_api.py |
         tests/unittest/bindings/binding_test_utils.py |
@@ -1188,7 +1186,6 @@ common-files: &common_files |
         tests/unittest/tools/plugin_gen/test_core.py |
         tests/unittest/tools/plugin_gen/test_plugin_gen.py |
         tests/unittest/tools/plugin_gen/test_shape_infer.py |
-        tests/unittest/tools/test_layer_wise_benchmarks.py |
         tests/unittest/tools/test_prepare_dataset.py |
         tests/unittest/tools/test_test_to_stage_mapping.py |
         tests/unittest/trt/__init__.py |
@@ -1463,6 +1460,11 @@ repos:
         entry: ./scripts/format_test_list.py
         language: script
         files: tests/integration/test_lists/.*\.txt$
+    -   id: waive list check
+        name: Checks for duplicated test items in waives.txt
+        entry: ./scripts/check_test_list.py --check-duplicate-waives
+        language: script
+        pass_filenames: false
     -   id: DCO check
         name: Checks the commit message for a developer certificate of origin signature
         entry: ./scripts/dco_check.py

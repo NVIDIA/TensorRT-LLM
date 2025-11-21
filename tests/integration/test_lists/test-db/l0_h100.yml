@@ -23,7 +23,8 @@ l0_h100:
   - unittest/_torch/modules
   - unittest/_torch/multimodal
   - unittest/_torch/sampler
-  - unittest/_torch/speculative
+  - unittest/_torch/speculative -k "eagle3"
+  - unittest/_torch/speculative -k "not eagle3"
   - unittest/_torch/thop/parallel
   - unittest/_torch/thop/serial
   # Only key models in H100: llama/mixtral/nemotron/deepseek
@@ -32,6 +33,9 @@ l0_h100:
   - unittest/_torch/modeling -k "modeling_nemotron"
   - unittest/_torch/modeling -k "modeling_gemma3"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
+  - unittest/disaggregated/test_disagg_utils.py
+  - unittest/disaggregated/test_router.py
+  - unittest/disaggregated/test_remoteDictionary.py
   - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype
   - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype_vswa_without_reuse
   - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype_vswa_reuse
@@ -131,7 +135,7 @@ l0_h100:
     - unittest/_torch/executor
     - unittest/_torch/ray_orchestrator/single_gpu
     - unittest/llmapi/test_llm_pytorch.py
-    - examples/test_ray.py::test_llm_inference_async_ray
+    - examples/test_ray.py::test_llm_inference_async_ray[no_rpc]
 - condition:
     ranges:
       system_gpu_count:

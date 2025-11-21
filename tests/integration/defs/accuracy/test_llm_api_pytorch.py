@@ -33,7 +33,8 @@ from ..conftest import (get_device_count, get_device_memory, llm_models_root,
                         skip_post_blackwell, skip_pre_ada, skip_pre_blackwell,
                         skip_pre_hopper, skip_ray)
 from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
-                            JsonModeEval, LlmapiAccuracyTestHarness)
+                            JsonModeEval, LlmapiAccuracyTestHarness,
+                            LongBenchV2)
 
 
 class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
@@ -652,15 +653,15 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @skip_pre_blackwell
-    def test_fp8_tp2pp2(self):
-        model_path = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct-FP8"
+    def test_fp4_tp2pp2(self):
+        model_path = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct-FP4"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
         with LLM(model_path,
                  tensor_parallel_size=2,
                  pipeline_parallel_size=2,
                  max_batch_size=32,
                  kv_cache_config=kv_cache_config) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             sampling_params = SamplingParams(
                 max_tokens=256,
                 temperature=0.0,
@@ -1684,13 +1685,15 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                            (False, False, False, True),
                            (True, False, True, True), (True, True, True, True)])
     @parametrize_with_ids("mtp_nextn", [0, 2])
-    @parametrize_with_ids("moe_backend", ["CUTLASS", "TRTLLM"])
+    @parametrize_with_ids("moe_backend", ["CUTLASS", "TRTLLM", "CUTEDSL"])
     def test_nvfp4(self, fp8kv, attention_dp, cuda_graph, overlap_scheduler,
                    torch_compile, mtp_nextn, moe_backend):
         if moe_backend == "TRTLLM" and (get_sm_version() == 120
                                         or get_sm_version() == 121):
             pytest.skip(
                 "MOE TRTLLM backend does not support SM version 120 or 121")
+        if moe_backend == "CUTEDSL" and get_sm_version() != 100:
+            pytest.skip(f"{moe_backend} backend supports SM 100 only")
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         torch_compile_config = TorchCompileConfig(
@@ -1777,7 +1780,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                                          (2, 2, 1), (1, 4, 1)],
                              ids=["tp4", "ep4", "tp2pp2", "pp4"])
     @parametrize_with_ids("mtp_nextn", [0, 2])
-    @parametrize_with_ids("moe_backend", ["CUTLASS", "TRTLLM"])
+    @parametrize_with_ids("moe_backend", ["CUTLASS", "TRTLLM", "CUTEDSL"])
     def test_nvfp4_4gpus(self, fp8kv, attention_dp, cuda_graph,
                          overlap_scheduler, tp_size, pp_size, ep_size,
                          torch_compile, mtp_nextn, moe_backend):
@@ -1787,6 +1790,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                         or get_sm_version() == 121):
             pytest.skip(
                 "MOE TRTLLM backend does not support SM version 120 or 121")
+        if moe_backend == "CUTEDSL" and get_sm_version() != 100:
+            pytest.skip(f"{moe_backend} backend supports SM 100 only")
+
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         # Picewise Cuda Graph cannot be enabled for nvfp4 attention dp.
         torch_compile_config = TorchCompileConfig(
@@ -2043,6 +2049,18 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                          32,
                          "TRTLLM",
                          marks=pytest.mark.skip_less_mpi_world_size(8)),
+            pytest.param(4,
+                         1,
+                         4,
+                         3,
+                         False,
+                         True,
+                         True,
+                         True,
+                         True,
+                         16,
+                         "CUTLASS",
+                         marks=pytest.mark.skip_less_mpi_world_size(4)),
             pytest.param(8,
                          1,
                          8,
@@ -2118,9 +2136,9 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
         ],
         ids=[
             "latency", "latency_trtllmgen", "latency_adp_lmtp",
-            "latency_trtllmgen_adp_lmtp", "throughput", "throughput_tp8",
-            "throughput_tp4", "throughput_mtp", "throughput_bs8_mtp",
-            "throughput_pp4_mtp"
+            "latency_trtllmgen_adp_lmtp", "latency_adp_lmtp_tp4", "throughput",
+            "throughput_tp8", "throughput_tp4", "throughput_mtp",
+            "throughput_bs8_mtp", "throughput_pp4_mtp"
         ])
     def test_nvfp4_multi_gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                               attention_dp, enable_lm_head_tp_in_adp,
@@ -2382,6 +2400,7 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3.2-Exp-hf"
 
     @pytest.mark.skip_less_mpi_world_size(8)
+    @pytest.mark.skip_less_device(8)
     @skip_pre_hopper
     @pytest.mark.skip_less_device_memory(140000)
     @pytest.mark.parametrize(
@@ -2451,6 +2470,8 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                 task = GSM8K(self.MODEL_NAME)
                 task.evaluate(llm)
 
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @pytest.mark.skip_less_device(8)
     @skip_pre_blackwell
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
@@ -2509,6 +2530,74 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                 task.evaluate(llm)
                 task = GSM8K(self.MODEL_NAME)
                 task.evaluate(llm)
+
+
+@skip_pre_blackwell
+class TestGLM4_6(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "zai-org/GLM-4.6"
+    MODEL_PATH = f"{llm_models_root()}/GLM-4.6"
+
+    @pytest.mark.timeout(14400)
+    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.skip_less_device(4)
+    @parametrize_with_ids("mtp_nextn", [0, 2])
+    @parametrize_with_ids("overlap_scheduler", [False, True])
+    @parametrize_with_ids("tp_size, ep_size", [(4, 4), (4, 1)])
+    @parametrize_with_ids("max_batch_size, moe_backend", [(4, "CUTLASS")])
+    def test_bfloat16_4gpus(self, tp_size, ep_size, mtp_nextn,
+                            overlap_scheduler, max_batch_size, moe_backend):
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            moe_config=MoeConfig(backend=moe_backend),
+        )
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.50)
+
+        mtp_config = None
+        if mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+
+        with LLM(self.MODEL_PATH,
+                 max_batch_size=max_batch_size,
+                 tensor_parallel_size=tp_size,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 enable_chunked_prefill=True,
+                 max_num_tokens=512,
+                 **pytorch_config,
+                 speculative_config=mtp_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,mtp_nextn,cuda_graph,overlap_scheduler,chunked_prefill,max_batch_size,moe_backend",
+        [pytest.param(4, 1, 2, True, True, True, 16, "CUTLASS")],
+        ids=["throughput"])
+    def test_nvfp4_multi_gpus(self, tp_size, pp_size, mtp_nextn, cuda_graph,
+                              overlap_scheduler, chunked_prefill,
+                              max_batch_size, moe_backend):
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.70)
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            moe_config=MoeConfig(backend=moe_backend))
+
+        mtp_config = None
+        if mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+        with LLM(f"{llm_models_root()}/glm-4.6-fp4",
+                 max_batch_size=max_batch_size,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config,
+                 speculative_config=mtp_config,
+                 enable_chunked_prefill=chunked_prefill) as llm:
+
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
 
 
 @pytest.mark.timeout(7200)
@@ -4062,3 +4151,110 @@ class TestSeedOss_36B(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=dict(
                               apply_chat_template=True,
                               chat_template_kwargs=chat_template_kwargs))
+
+
+@skip_pre_blackwell
+@pytest.mark.skip_less_device_memory(183000)
+@pytest.mark.timeout(28800)
+class TestDeepSeekR1LongBenchV2(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "DeepSeek-R1-0528"
+
+    @pytest.mark.skip_less_mpi_world_size(8)
+    def test_fp8_8gpus(self):
+        original_model_dir = f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-0528"
+        if not os.path.exists(original_model_dir):
+            pytest.skip(f"Model directory {original_model_dir} does not exist")
+
+        temp_dir = None
+        try:
+            # Create modified model directory using LongBenchV2 static method
+            # This is a WAR for the fact that the model config is not modified to support long context.
+            # TODO: remove this once the model config is modified to support long context.
+            temp_dir = LongBenchV2.create_modified_model_dir(original_model_dir)
+
+            # Configure model settings
+            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
+                                            enable_block_reuse=True,
+                                            enable_partial_reuse=False,
+                                            dtype="fp8")
+
+            cuda_graph_config = CudaGraphConfig(enable_padding=True,
+                                                max_batch_size=32)
+
+            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3)
+
+            moe_config = MoeConfig(backend='DEEPGEMM', max_num_tokens=32000)
+
+            pytorch_config = dict(cuda_graph_config=cuda_graph_config,
+                                  kv_cache_config=kv_cache_config,
+                                  speculative_config=mtp_config,
+                                  moe_config=moe_config,
+                                  enable_chunked_prefill=True,
+                                  enable_autotuner=True)
+
+            # Create LLM instance and evaluate
+            with LLM(temp_dir,
+                     tensor_parallel_size=8,
+                     moe_expert_parallel_size=8,
+                     max_num_tokens=32000,
+                     max_batch_size=32,
+                     **pytorch_config) as llm:
+
+                task = LongBenchV2(self.MODEL_NAME)
+
+                sampling_params = SamplingParams(max_tokens=32000)
+
+                task.evaluate(llm, sampling_params=sampling_params)
+
+        finally:
+            # Cleanup temporary files
+            if temp_dir and os.path.exists(temp_dir):
+                import shutil
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+    @pytest.mark.skip_less_mpi_world_size(4)
+    def test_nvfp4_4gpus(self):
+        original_model_dir = f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-0528-FP4"
+        temp_dir = None
+        try:
+            # Create modified model directory using LongBenchV2 static method
+            temp_dir = LongBenchV2.create_modified_model_dir(original_model_dir)
+
+            # Configure model settings (no MOE config for FP4 version)
+            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
+                                            enable_block_reuse=True,
+                                            enable_partial_reuse=False,
+                                            dtype="fp8")
+
+            cuda_graph_config = CudaGraphConfig(enable_padding=True,
+                                                max_batch_size=32)
+
+            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3)
+
+            pytorch_config = dict(cuda_graph_config=cuda_graph_config,
+                                  kv_cache_config=kv_cache_config,
+                                  speculative_config=mtp_config,
+                                  enable_chunked_prefill=True,
+                                  enable_autotuner=True)
+
+            # Create LLM instance and evaluate
+            with LLM(temp_dir,
+                     tensor_parallel_size=4,
+                     moe_expert_parallel_size=4,
+                     max_num_tokens=32000,
+                     max_batch_size=32,
+                     **pytorch_config) as llm:
+
+                assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+
+                task = LongBenchV2(self.MODEL_NAME)
+
+                sampling_params = SamplingParams(max_tokens=32000)
+
+                task.evaluate(llm, sampling_params=sampling_params)
+
+        finally:
+            # Cleanup temporary files
+            if temp_dir and os.path.exists(temp_dir):
+                import shutil
+                shutil.rmtree(temp_dir, ignore_errors=True)

@@ -151,7 +151,7 @@ class CutlassFusedMoE(MoE):
                         model_config.mapping)
                 elif self.moe_alltoall_backend == "mnnvlthroughput":
                     workspace_mb = int(
-                        os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB", "512"))
+                        os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB", "2048"))
                     self.moe_a2a = MoeAlltoAll(
                         mapping=self.mapping,
                         max_num_tokens=model_config.max_num_tokens,
@@ -213,6 +213,17 @@ class CutlassFusedMoE(MoE):
         ) and not self.quant_config.layer_quant_mode.has_per_group_scaling()
 
     def select_alltoall_method_type(self) -> AlltoallMethodType:
+        # If no attention DP, no need to use AlltoAll.
+        if self.mapping.dp_size == 1:
+            return AlltoallMethodType.NotEnabled
+
+        # AlltoAll cannot support MoE TP.
+        if self.mapping.moe_tp_size != 1:
+            return AlltoallMethodType.NotEnabled
+
+        if not MnnvlMemory.supports_mnnvl():
+            return AlltoallMethodType.NotEnabled
+
         all2all_method_type = os.environ.get("TRTLLM_FORCE_ALLTOALL_METHOD")
         if all2all_method_type is not None:
             if AlltoallMethodType[all2all_method_type] in [
@@ -224,18 +235,13 @@ class CutlassFusedMoE(MoE):
                 )
             return AlltoallMethodType[all2all_method_type]
 
-        if not self.mapping.enable_attention_dp:
-            return AlltoallMethodType.NotEnabled
-
-        if self.mapping.tp_size == 1:
-            return AlltoallMethodType.NotEnabled
-
         if os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") == "1":
             return AlltoallMethodType.NotEnabled
 
-        if not (self.mapping.moe_ep_size > self.routing_method.experts_per_token
-                and MnnvlMemory.supports_mnnvl()):
-            return AlltoallMethodType.NotEnabled
+        # TODO: We found that MNNVL performs better than NCCL AllGather/ReduceScatter,
+        # regardless of the relationship between EP size and topK. We favor AlltoAll for now.
+        # if not self.mapping.moe_ep_size > self.routing_method.experts_per_token:
+        #     return AlltoallMethodType.NotEnabled
 
         return AlltoallMethodType.MNNVL
 
@@ -247,9 +253,9 @@ class CutlassFusedMoE(MoE):
 
     @cached_property
     def moe_alltoall_backend(self):
-        # "mnnvllatency" (default) or "mnnvlthroughput"
+        # "mnnvlthroughput" (default) or "mnnvllatency"
         return os.environ.get("TRTLLM_MOE_ALLTOALL_BACKEND",
-                              "mnnvllatency").strip().lower()
+                              "mnnvlthroughput").strip().lower()
 
     def _supports_load_balancer(self) -> bool:
         """CutlassFusedMoE supports load balancer."""
@@ -303,7 +309,6 @@ class CutlassFusedMoE(MoE):
     ) -> torch.Tensor:
         if isinstance(x, Fp4QuantizedTensor):
             assert output_dtype is not None
-            output_dtype = output_dtype
         else:
             output_dtype = x.dtype
 
@@ -565,6 +570,7 @@ class CutlassFusedMoE(MoE):
             tune_max_num_tokens=self.tune_max_num_tokens,
             tuner_num_tokens=tuner_num_tokens,
             tuner_top_k=tuner_top_k,
+            activation_type=self.activation_type,
             unpadded_hidden_size=self.unpadded_hidden_size,
             out_tensor=moe_output,
         )
@@ -669,7 +675,7 @@ class CutlassFusedMoE(MoE):
                 all_rank_num_tokens_list = [[
                     val[idx_chunk] for val in all_rank_chunk_size_list
                 ] for idx_chunk in range(num_chunks)]
-                chunk_size_list = all_rank_chunk_size_list[self.rank]
+                chunk_size_list = all_rank_chunk_size_list[self.parallel_rank]
             else:
                 all_rank_num_tokens_list = [None] * num_chunks
                 chunk_size_list = self.split_chunk(x.shape[0], num_chunks)
@@ -735,7 +741,7 @@ class CutlassFusedMoE(MoE):
             outputs = torch.cat(outputs_list)
 
         if self.use_dp and self.parallel_size > 1:
-            rank = self.mapping.tp_rank
+            rank = self.parallel_rank
             outputs = outputs[:all_rank_num_tokens[rank]]
         self.repeat_idx = 0 if self.repeat_idx == self.repeat_count - 1 else self.repeat_idx + 1
         return outputs
@@ -751,25 +757,15 @@ class CutlassFusedMoE(MoE):
         use_dp_padding: Optional[bool] = None,
         **kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
-        if not self.enable_alltoall:
-            return super().forward_fake(
-                x,
-                router_logits,
-                do_finalize=do_finalize,
-                output_dtype=output_dtype,
-                all_rank_num_tokens=all_rank_num_tokens,
-                use_dp_padding=use_dp_padding,
-                **kwargs,
-            )
-        else:
-            is_nvfp4_input = isinstance(x, Fp4QuantizedTensor)
-            data_type = output_dtype if is_nvfp4_input else x.dtype
-            num_tokens = all_rank_num_tokens[
-                self.mapping.tp_rank] if all_rank_num_tokens else x.shape[0]
-            hidden_size = x.shape[1] * (2 if is_nvfp4_input else 1)
-            top_k = self.routing_method.experts_per_token
-            return x.new_empty((num_tokens, top_k, hidden_size),
-                               dtype=data_type)
+        return super().forward_fake(
+            x,
+            router_logits,
+            do_finalize=do_finalize,
+            output_dtype=output_dtype,
+            all_rank_num_tokens=all_rank_num_tokens,
+            use_dp_padding=use_dp_padding,
+            **kwargs,
+        )
 
     def load_weights(self, weights: List[Dict]):
         assert self._weights_created

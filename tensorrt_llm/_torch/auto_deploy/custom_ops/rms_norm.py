@@ -83,8 +83,8 @@ def _(input: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     return torch.empty_like(input)
 
 
-@torch.library.custom_op("auto_deploy::torch_rmsnorm_gated", mutates_args=())
-def torch_rmsnorm_gated(
+@torch.library.custom_op("auto_deploy::triton_rmsnorm_gated", mutates_args=())
+def triton_rmsnorm_gated(
     x: torch.Tensor,
     weight: torch.Tensor,
     gate: torch.Tensor | None,
@@ -140,8 +140,8 @@ def torch_rmsnorm_gated(
     return out2.reshape(x_shape)
 
 
-@torch_rmsnorm_gated.register_fake
-def _torch_rmsnorm_gated_meta(
+@triton_rmsnorm_gated.register_fake
+def _triton_rmsnorm_gated_meta(
     x,
     weight,
     gate,

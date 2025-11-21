@@ -49,7 +49,7 @@ private:
         // note that for invalid scores, we simply use a negative value:
         // they work well even with the compacted format used in topK, and
         // sigmoid / bias activated scores cannot be negative
-        static constexpr float invalidScoreFloat = -1.F;
+        static constexpr float invalidScoreFloat = float{-INFINITY};
         const T invalidScore = T{invalidScoreFloat};
 
         float scoreSigmoid[param.numExperts];

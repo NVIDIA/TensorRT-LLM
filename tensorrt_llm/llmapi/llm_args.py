@@ -215,6 +215,9 @@ class BaseSparseAttentionConfig(StrictBaseModel):
         """
         return True
 
+    def get_indices_block_size(self) -> int:
+        return 1
+
 
 class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
     """
@@ -237,6 +240,9 @@ class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
+
+    def get_indices_block_size(self) -> int:
+        return self.page_size
 
 
 class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
@@ -554,6 +560,16 @@ class DecodingBaseConfig(StrictBaseModel):
     # this value. Otherwise, speculation will always be on.
     max_concurrency: Optional[int] = None
 
+    # Developer interface: dynamically adjust draft length based on active batch size in runtime.
+    # Maps batch size to draft lengths. For example:
+    # {1: 4, 4: 2, 8: 0} means:
+    # - batch_size >= 1: use draft_len=4
+    # - batch_size >= 4: use draft_len=2
+    # - batch_size >= 8: use draft_len=0 (disable speculation)
+    # draft_len_schedule is enforced to contain batch_size=1 and its according draft_len equals max_draft_len for consistency
+    # for example, if max_draft_len=4, the schedule must contain {1: 4}
+    draft_len_schedule: Optional[dict[int, int]] = None
+
     load_format: Optional[str] = None
     # PyTorch only.
     # Rolling average window size (N) for acceptance length across completed requests.
@@ -590,6 +606,51 @@ class DecodingBaseConfig(StrictBaseModel):
     _allow_chain_drafter: bool = PrivateAttr(True)
     # If set, drafting uses greedy sampling, irrespective of sampling parameters.
     _allow_greedy_draft_tokens: bool = PrivateAttr(True)
+
+    @field_validator('draft_len_schedule')
+    @classmethod
+    def validate_draft_len_schedule_and_sort(cls, v, info):
+        """Validate and sort draft_len_schedule by batch size thresholds."""
+        if v is not None:
+            # Validate values
+            for batch_size, draft_len in v.items():
+                if batch_size < 1:
+                    raise ValueError(
+                        f"draft_len_schedule: batch size threshold must be >= 1, got {batch_size}"
+                    )
+                if draft_len < 0:
+                    raise ValueError(
+                        f"draft_len_schedule: draft length must be >= 0, got {draft_len}"
+                    )
+
+            # Require batch_size=1 in schedule
+            if 1 not in v:
+                raise ValueError(
+                    "draft_len_schedule must include batch_size=1. "
+                    "All systems can have batch_size=1. Add {1: <max_draft_len>} to your schedule."
+                )
+
+            # Enforce schedule[1] == max_draft_len for consistency
+            max_draft_len = info.data.get('max_draft_len')
+            if max_draft_len is not None and v[1] != max_draft_len:
+                raise ValueError(
+                    f"draft_len_schedule[1] must equal max_draft_len for consistency. "
+                    f"Got schedule[1]={v[1]}, but max_draft_len={max_draft_len}. "
+                    f"batch_size=1 should use maximum draft length.")
+
+            # Enforce all draft lengths <= max_draft_len
+            if max_draft_len is not None:
+                for batch_size, draft_len in v.items():
+                    if draft_len > max_draft_len:
+                        raise ValueError(
+                            f"draft_len_schedule: all draft lengths must be <= max_draft_len. "
+                            f"Got draft_len={draft_len} for batch_size={batch_size}, "
+                            f"but max_draft_len={max_draft_len}.")
+
+            # Return sorted dict (by batch size thresholds)
+            # This ensures efficient lookup
+            return dict(sorted(v.items(), key=lambda x: x[0]))
+        return v
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -922,12 +983,11 @@ class MTPDecodingConfig(DecodingBaseConfig):
     # Now we need a flag when MTPDecodingConfig is updated by PyTorchModelEngine.
     num_nextn_predict_layers_from_model_config: int = 1
 
-    # TODO: Hard code for DeepSeek R1
     # When encounter <think>, start thinking phase.
     # When encounter </think>, end thinking phase.
     # <think> [thinking phase] </think> [real output]
-    BEGIN_THINKING_PHASE_TOKEN: int = 128798
-    END_THINKING_PHASE_TOKEN: int = 128799
+    begin_thinking_phase_token: int = 128798
+    end_thinking_phase_token: int = 128799
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -1563,11 +1623,20 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "Timeout in milliseconds for KV cache transfer. Requests exceeding this timeout will be cancelled."
     )
 
+    kv_transfer_sender_future_timeout_ms: Optional[int] = Field(
+        default=1000,
+        gt=0,
+        description=
+        "Timeout in milliseconds to wait for the sender future to be ready when scheduled batch size is 0. This allows the request to be eventually cancelled by the user or because of kv_transfer_timeout_ms"
+    )
+
     def _to_pybind(self):
         return _CacheTransceiverConfig(
             backend=_CacheTransceiverBackendType.from_string(self.backend),
             max_tokens_in_buffer=self.max_tokens_in_buffer,
-            kv_transfer_timeout_ms=self.kv_transfer_timeout_ms)
+            kv_transfer_timeout_ms=self.kv_transfer_timeout_ms,
+            kv_transfer_sender_future_timeout_ms=self.
+            kv_transfer_sender_future_timeout_ms)
 
 
 @dataclass
@@ -2608,7 +2677,8 @@ class TorchLlmArgs(BaseLlmArgs):
 
     enable_autotuner: bool = Field(
         default=True,
-        description="Enable autotuner only when torch compile is enabled.",
+        description=
+        "Enable autotuner for all tunable ops. This flag is for debugging purposes only, and the performance may significantly degrade if set to false.",
         status="prototype")
 
     enable_layerwise_nvtx_marker: bool = Field(

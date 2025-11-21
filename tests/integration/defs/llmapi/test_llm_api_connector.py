@@ -89,8 +89,7 @@ def test_connector_simple(enforce_single_worker, model_with_connector,
     assert len(scheduler.update_state_after_alloc.call_args.args[1]) == 1
 
     # With the overlap scheduler, we generate one extra token.
-    assert scheduler.build_connector_meta.call_count == NUM_TOKENS + int(
-        use_overlap_scheduler)
+    assert scheduler.build_connector_meta.call_count == NUM_TOKENS
 
     # We should have a single `SchedulerOutput` per forward pass.
     for i, call in enumerate(scheduler.build_connector_meta.call_args_list):
@@ -110,8 +109,7 @@ def test_connector_simple(enforce_single_worker, model_with_connector,
             assert len(scheduler_output.cached_requests[0].new_tokens) == 1
 
     # We call `start_load_kv` once at the beginning of each forward pass.
-    assert worker.start_load_kv.call_count == NUM_TOKENS + int(
-        use_overlap_scheduler)
+    assert worker.start_load_kv.call_count == NUM_TOKENS
 
     # Only called once when the request is received.
     assert scheduler.get_num_new_matched_tokens.call_count == 1
@@ -120,10 +118,8 @@ def test_connector_simple(enforce_single_worker, model_with_connector,
                      for call in worker.wait_for_layer_load.call_args_list) + 1
 
     # Called num_layers * num_forward_passes times.
-    assert worker.wait_for_layer_load.call_count == num_layers * (
-        NUM_TOKENS + int(use_overlap_scheduler))
-    assert worker.save_kv_layer.call_count == num_layers * (
-        NUM_TOKENS + int(use_overlap_scheduler))
+    assert worker.wait_for_layer_load.call_count == num_layers * (NUM_TOKENS)
+    assert worker.save_kv_layer.call_count == num_layers * (NUM_TOKENS)
 
     for i, call in enumerate(worker.wait_for_layer_load.call_args_list):
         assert call.args[0] == i % num_layers
@@ -131,8 +127,7 @@ def test_connector_simple(enforce_single_worker, model_with_connector,
     for i, call in enumerate(worker.save_kv_layer.call_args_list):
         assert call.args[0] == i % num_layers
 
-    assert worker.wait_for_save.call_count == NUM_TOKENS + int(
-        use_overlap_scheduler)
+    assert worker.wait_for_save.call_count == NUM_TOKENS
 
     assert scheduler.request_finished.call_count == 1
 
@@ -239,9 +234,7 @@ def test_connector_scheduler_output(enforce_single_worker, model_with_connector,
         scheduler.update_state_after_alloc.call_args.args[1]) == math.ceil(
             NUM_INPUT_TOKENS / BLOCK_SIZE)
 
-    # Additional token when using the overlap scheduler.
-    assert scheduler.build_connector_meta.call_count == NUM_TOKENS + int(
-        use_overlap_scheduler)
+    assert scheduler.build_connector_meta.call_count == NUM_TOKENS
 
     for i, call in enumerate(scheduler.build_connector_meta.call_args_list):
         sched_output = call.args[0]
@@ -363,11 +356,15 @@ def test_connector_disagg_prefill(enforce_single_worker, model_with_connector,
                                   save_async):
     model_fn, scheduler, worker = model_with_connector
 
-    model = model_fn(
+    prefill_worker = model_fn(
         disable_overlap_scheduler=True,
         cache_transceiver_config=CacheTransceiverConfig(backend="DEFAULT"))
 
-    sampling_params = SamplingParams(ignore_eos=True)
+    decode_worker = model_fn(
+        cache_transceiver_config=CacheTransceiverConfig(backend="DEFAULT"),
+        kv_connector_config=None)
+
+    sampling_params = SamplingParams(ignore_eos=True, max_tokens=16)
 
     disaggregated_params = DisaggregatedParams(request_type="context_only")
 
@@ -382,9 +379,16 @@ def test_connector_disagg_prefill(enforce_single_worker, model_with_connector,
         scheduler.request_finished.return_value = False
         worker.get_finished.return_value = [], []
 
-    model.generate([0] * 48,
-                   sampling_params=sampling_params,
-                   disaggregated_params=disaggregated_params)
+    result = prefill_worker.generate([0] * 48,
+                                     sampling_params=sampling_params,
+                                     disaggregated_params=disaggregated_params)
+
+    gen_disagg_params = result.disaggregated_params
+    gen_disagg_params.request_type = "generation_only"
+
+    result = decode_worker.generate([0] * 48,
+                                    sampling_params=sampling_params,
+                                    disaggregated_params=gen_disagg_params)
 
     assert scheduler.build_connector_meta.call_count == 1
 

@@ -59,6 +59,7 @@ def save_metadata_state(attn_metadata: AttentionMetadata,
             spec_metadata.eagle3_resource_manager.is_first_draft = True
 
 
+@torch.compile(options={'max-autotune': True})
 def prepare_for_generation(attn_metadata: AttentionMetadata,
                            spec_metadata: SpecMetadata,
                            position_ids: torch.Tensor) -> torch.Tensor:

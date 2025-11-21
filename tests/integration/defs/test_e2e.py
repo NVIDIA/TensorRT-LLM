@@ -31,10 +31,10 @@ from defs.trt_test_alternative import (check_call, check_call_negative_test,
 from .common import (PluginOptions, convert_weights, get_mmlu_accuracy,
                      prune_checkpoint, quantize_data, refit_model,
                      venv_check_call)
-from .conftest import (get_device_count, llm_models_root, skip_no_sm120,
-                       skip_nvlink_inactive, skip_post_blackwell, skip_pre_ada,
-                       skip_pre_blackwell, skip_pre_hopper, tests_path,
-                       unittest_path)
+from .conftest import (get_device_count, get_sm_version, llm_models_root,
+                       skip_no_sm120, skip_nvlink_inactive, skip_post_blackwell,
+                       skip_pre_ada, skip_pre_blackwell, skip_pre_hopper,
+                       tests_path, unittest_path)
 
 sys.path.append(os.path.join(str(tests_path()), '/../examples/apps'))
 
@@ -2195,7 +2195,6 @@ def test_ptp_quickstart_advanced_deepseek_r1_8gpus(llm_root, llm_venv,
         _check_mem_usage(running_log, [106.3, 0, 0, 0], 8)
 
 
-@skip_post_blackwell
 @pytest.mark.skip_less_device_memory(110000)
 @pytest.mark.skip_less_device(8)
 @pytest.mark.parametrize("model_name,model_path", [
@@ -2206,6 +2205,7 @@ def test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus(
         llm_root, llm_venv, model_name, model_path):
     print(f"Testing {model_name}.")
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
+    is_blackwell = get_sm_version() > 90
     with tempfile.NamedTemporaryFile(mode='w+t',
                                      suffix=f".{model_name}.log",
                                      dir="./",
@@ -2219,7 +2219,7 @@ def test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus(
             "--moe_ep_size=8",
             "--tp_size=8",
             "--use_cuda_graph",
-            f"--kv_cache_fraction={_MEM_FRACTION_95}",
+            f"--kv_cache_fraction={_MEM_FRACTION_50 if is_blackwell else _MEM_FRACTION_95}",
             "--max_batch_size=1",
             "--max_seq_len=3000",
             "--disable_kv_cache_reuse",
@@ -2232,6 +2232,8 @@ def test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus(
             "--relaxed_delta=0.5",
             "--enable_attention_dp",
             "--use_one_model",
+            "--moe_backend",
+            "DEEPGEMM" if is_blackwell else "CUTLASS",
         ],
                          stdout=running_log)
         _check_mem_usage(running_log, [85.6, 0, 0, 0], 8)
@@ -2273,7 +2275,7 @@ def test_ptp_quickstart_advanced_deepseek_r1_w4afp8_8gpus(
 
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("model_name,model_path,gpu_count", [
-    ("Llama3.1-70B-BF16", "llama-3.1-model/Meta-Llama-3.1-70B", 2),
+    ("Llama3.1-70B-BF16", "llama-3.1-model/Meta-Llama-3.1-70B", 8),
     ("Mixtral-8x7B-BF16", "Mixtral-8x7B-v0.1", 8),
     pytest.param('Llama3.1-70B-FP8',
                  'llama-3.1-model/Llama-3.1-70B-Instruct-FP8',
@@ -2304,7 +2306,7 @@ def test_ptp_quickstart_advanced_multi_gpus(llm_root, llm_venv, model_name,
         pytest.skip(f"Not enough GPUs for {model_name}")
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
     mapping = {
-        "Llama3.1-70B-BF16": 91.0,
+        "Llama3.1-70B-BF16": 24.6,
         "Mixtral-8x7B-BF16": 16.5,
         "Llama3.1-70B-FP8": 58.5,
         "Llama3.1-405B-FP8": 63.2,
@@ -3470,3 +3472,90 @@ def test_llmapi_generation_logits(llm_venv, model_path,
     # Run the async test
     loop = asyncio.get_event_loop()
     loop.run_until_complete(async_generation_test())
+
+
+@pytest.mark.skip_less_device(4)
+@pytest.mark.skip_less_device_memory(80000)
+@skip_pre_hopper
+@pytest.mark.parametrize("model_dir,draft_model_dir", [
+    ("modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8",
+     "EAGLE3-LLaMA3.3-Instruct-70B"),
+    ("Qwen3/Qwen3-30B-A3B", "Qwen3/Qwen3-30B-eagle3"),
+    pytest.param("Qwen3/saved_models_Qwen3-235B-A22B_fp8_hf",
+                 "Qwen3/qwen3-235B-eagle3",
+                 marks=pytest.mark.skip_less_device_memory(90000)),
+    pytest.param("llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8",
+                 "Llama-4-Maverick-17B-128E-Eagle3",
+                 marks=pytest.mark.skip_less_device_memory(140000)),
+    pytest.param("Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",
+                 "Qwen3/qwen3-235B-eagle3",
+                 marks=skip_pre_blackwell),
+])
+def test_eagle3_output_consistency_4gpus(model_dir: str, draft_model_dir: str):
+    """
+    RCCA: https://nvbugspro.nvidia.com/bug/5575211
+    """
+    from tensorrt_llm import LLM, SamplingParams
+    from tensorrt_llm.llmapi import (CudaGraphConfig, EagleDecodingConfig,
+                                     KvCacheConfig)
+
+    models_path = llm_models_root()
+    target_model_dir = f"{models_path}/{model_dir}"
+    eagle_model_dir = f"{models_path}/{draft_model_dir}"
+
+    # Common configuration matching the bug report
+    llm_common_config = {
+        "model":
+        target_model_dir,
+        "tensor_parallel_size":
+        4,
+        "moe_expert_parallel_size":
+        4,
+        "max_seq_len":
+        4096,
+        "max_batch_size":
+        8,
+        "max_num_tokens":
+        2048,
+        "disable_overlap_scheduler":
+        True,
+        "kv_cache_config":
+        KvCacheConfig(
+            free_gpu_memory_fraction=0.2,
+            enable_block_reuse=False,
+        ),
+        "cuda_graph_config":
+        CudaGraphConfig(),
+    }
+
+    # Test prompt
+    prompt = "Who are you?"
+    sampling_params = SamplingParams(max_tokens=1024, temperature=0)
+
+    # Run with Eagle3
+    spec_config = EagleDecodingConfig(
+        max_draft_len=3,
+        speculative_model_dir=eagle_model_dir,
+        eagle3_one_model=True,
+    )
+    with LLM(**llm_common_config, speculative_config=spec_config) as llm_spec:
+        results_spec = llm_spec.generate([prompt], sampling_params)
+        output_spec = results_spec[0].outputs[0].text
+
+    # Run without Eagle3 (baseline)
+    with LLM(**llm_common_config) as llm_ref:
+        results_ref = llm_ref.generate([prompt], sampling_params)
+        output_ref = results_ref[0].outputs[0].text
+
+    length_ratio = min(len(output_spec), len(output_ref)) / max(
+        len(output_spec), len(output_ref))
+    assert length_ratio > 0.5, (
+        f"Output lengths differ too much! "
+        f"Eagle3: {len(output_spec)} chars, Baseline: {len(output_ref)} chars")
+
+    repetitive_pattern = re.compile(
+        r'(.)\1{10,}')  # Check for 10+ repeated chars
+    assert not repetitive_pattern.search(output_spec), (
+        f"Eagle3 output contains repetitive characters: {output_spec[:500]}")
+    assert not repetitive_pattern.search(output_ref), (
+        f"Baseline output contains repetitive characters: {output_ref[:500]}")
