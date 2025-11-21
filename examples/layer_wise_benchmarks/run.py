@@ -48,16 +48,11 @@ group.add_argument("--use-cuda-graph", action="store_true", dest="use_cuda_graph
 group.add_argument("--no-use-cuda-graph", action="store_false", dest="use_cuda_graph")
 parser.set_defaults(use_cuda_graph=None)
 # Per iteration args
-parser.add_argument("--batch-size", type=int)
-parser.add_argument("--seq-len-q", type=int)
-parser.add_argument("--seq-len-kv-cache", type=int)
+parser.add_argument("--batch-size", type=comma_separated_ints, dest="batch_size_list")
+parser.add_argument("--seq-len-q", type=comma_separated_ints, dest="seq_len_q_list")
+parser.add_argument("--seq-len-kv-cache", type=comma_separated_ints, dest="seq_len_kv_cache_list")
 parser.add_argument("--balance-method", type=str)
-parser.add_argument("--balance-ratio", type=float)
-# Batched run args
-parser.add_argument("--batch-size-list", type=comma_separated_ints)
-parser.add_argument("--seq-len-q-list", type=comma_separated_ints)
-parser.add_argument("--seq-len-kv-cache-list", type=comma_separated_ints)
-parser.add_argument("--balance-ratio-list", type=comma_separated_floats)
+parser.add_argument("--balance-ratio", type=comma_separated_floats, dest="balance_ratio_list")
 # Schedule
 parser.add_argument("--warmup-times", type=int, default=20)
 parser.add_argument("--run-times", type=int, default=100)
@@ -67,21 +62,26 @@ with open(args.config_path) as f:
     config = yaml.safe_load(f)
 del args.config_path
 for k, v in vars(args).items():
-    if v is None and k in config:
-        setattr(args, k, config[k])
-# Set list arguments
-if args.batch_size_list is None:
-    args.batch_size_list = [args.batch_size]
-del args.batch_size
-if args.seq_len_q_list is None:
-    args.seq_len_q_list = [args.seq_len_q]
-del args.seq_len_q
-if args.seq_len_kv_cache_list is None:
-    args.seq_len_kv_cache_list = [args.seq_len_kv_cache]
-del args.seq_len_kv_cache
-if args.balance_ratio_list is None:
-    args.balance_ratio_list = [args.balance_ratio]
-del args.balance_ratio
+    if k.endswith("_list"):
+        config_key = k[: -len("_list")]
+        if v is None and config_key in config:
+            v = config[config_key]
+            if isinstance(v, list):
+                pass
+            elif v is None or isinstance(v, (int, float)):
+                v = [v]
+            else:
+                raise ValueError(f'Config "{config_key}" in YAML should be a value or a list')
+            setattr(args, k, v)
+    else:
+        config_key = k
+        if v is None and config_key in config:
+            v = config[config_key]
+            setattr(args, k, v)
+    if config_key in config:
+        del config[config_key]
+if config:
+    raise ValueError(f"Config {','.join(config.keys())} from file are not options")
 # Set default values
 if args.max_batch_size is None:
     args.max_batch_size = max(args.batch_size_list)

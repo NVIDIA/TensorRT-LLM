@@ -109,19 +109,21 @@ SLURM_JOB_ID=$SLURM_JOB_ID NODES=2 NP=8 ./slurm_launch.sh ./run.sh config_gtx.ya
 
 ### Batched run
 
-By specifying `--batch-size-list` on the command line (or `batch_size_list` in the YAML file), the script runs multiple configurations in a single process. This significantly reduces the total runtime because it avoids repeated library initialization and model initialization. When `--batch-size-list` is set, the value of `--batch-size` is ignored.
+By specifying a list for `--batch-size` on the command line (or `batch_size` in the YAML file), the script runs multiple configurations in a single process. This significantly reduces the total runtime because it avoids repeated library initialization and model initialization.
 
 Supported list arguments:
-- `--batch-size-list` (or `batch_size_list` in YAML)
-- `--seq-len-q-list` (or `seq_len_q_list` in YAML)
-- `--seq-len-kv-cache-list` (or `seq_len_kv_cache_list` in YAML)
-- `--balance-ratio-list` (or `balance_ratio_list` in YAML)
+- `--batch-size` (or `batch_size` in YAML)
+- `--seq-len-q` (or `seq_len_q` in YAML)
+- `--seq-len-kv-cache` (or `seq_len_kv_cache` in YAML)
+- `--balance-ratio` (or `balance_ratio` in YAML)
+
+Command line arguments are comma separated, for example, `--batch-size 1,2,4`. Configs in the YAML file are lists, for example, `batch_size: [1, 2, 4]`.
 
 Run with OpenMPI:
 
 ```
-NP=4 ./mpi_launch.sh ./run.sh config_ctx.yaml --batch-size-list 1,2,4 --seq-len-q-list 1024,8192
-NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --scaled-from 16 --moe-backend WIDEEP --batch-size-list 32,64,128,256,512 --seq-len-q-list 1,2,3,4
+NP=4 ./mpi_launch.sh ./run.sh config_ctx.yaml --batch-size 1,2,4 --seq-len-q 1024,8192
+NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --scaled-from 16 --moe-backend WIDEEP --batch-size 32,64,128,256,512 --seq-len-q 1,2,3,4
 ```
 
 ## Parse profiles
