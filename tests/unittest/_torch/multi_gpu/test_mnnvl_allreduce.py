@@ -108,7 +108,7 @@ def row_linear_residual_norm_fusion_forward(
         ub.initialize_userbuffers_manager(
             tensor_parallel_size, 1, 1, tensor_parallel_rank,
             torch.cuda.device_count(),
-            x_list[0].nelement() * x_list[0].element_size(), True)
+            x_list[0].nelement() * x_list[0].element_size())
     elif strategy == AllReduceStrategy.MNNVL:
         os.environ["TLLM_TEST_MNNVL"] = "1"
 
