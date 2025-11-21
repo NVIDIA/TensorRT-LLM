@@ -8,7 +8,7 @@ endif()
 # =============
 
 # Use DeepGEMM submodule
-set(DEEP_GEMM_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../3rdparty/DeepGEMM)
+set(DEEP_GEMM_SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/deepgemm-src)
 get_filename_component(DEEP_GEMM_SOURCE_DIR ${DEEP_GEMM_SOURCE_DIR} ABSOLUTE)
 
 if(NOT EXISTS ${DEEP_GEMM_SOURCE_DIR})
