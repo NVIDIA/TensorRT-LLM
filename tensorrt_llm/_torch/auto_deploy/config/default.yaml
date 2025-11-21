@@ -96,6 +96,8 @@ transforms:
   ############################################################################################
   # RUN POST-LOAD FUSION AND OPTIMIZATIONS
   ############################################################################################
+  fuse_mamba_a_log:
+    stage: post_load_fusion
   fuse_gemms:
     stage: post_load_fusion
     enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
