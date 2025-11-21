@@ -560,16 +560,6 @@ class DecodingBaseConfig(StrictBaseModel):
     # this value. Otherwise, speculation will always be on.
     max_concurrency: Optional[int] = None
 
-    # Developer interface: dynamically adjust draft length based on active batch size in runtime.
-    # Maps batch size to draft lengths. For example:
-    # {1: 4, 4: 2, 8: 0} means:
-    # - batch_size >= 1: use draft_len=4
-    # - batch_size >= 4: use draft_len=2
-    # - batch_size >= 8: use draft_len=0 (disable speculation)
-    # draft_len_schedule is enforced to contain batch_size=1 and its according draft_len equals max_draft_len for consistency
-    # for example, if max_draft_len=4, the schedule must contain {1: 4}
-    draft_len_schedule: Optional[dict[int, int]] = None
-
     load_format: Optional[str] = None
     # PyTorch only.
     # Rolling average window size (N) for acceptance length across completed requests.
@@ -607,49 +597,76 @@ class DecodingBaseConfig(StrictBaseModel):
     # If set, drafting uses greedy sampling, irrespective of sampling parameters.
     _allow_greedy_draft_tokens: bool = PrivateAttr(True)
 
+    # Developer interface: dynamically adjust draft length based on active batch size in runtime.
+    # Maps batch size to draft lengths. For example:
+    # {4: 4, 8: 2, 32: 1} means:
+    # - batch_size 1-4:   use draft_len=4
+    # - batch_size 5-8:   use draft_len=2
+    # - batch_size 9-32:  use draft_len=1
+    # - batch_size 33+:   use draft_len=0 (speculation disabled, implicit)
+    # Requirements:
+    # - All keys (batch sizes) must exist in cuda_graph_config.batch_sizes
+    # - The smallest batch size's value (draft_len) must equal max_draft_len for consistency
+    # - Keys (batch sizes) should decrease in draft_len as batch_size increases
+    draft_len_schedule: Optional[dict[int, int]] = None
+
     @field_validator('draft_len_schedule')
     @classmethod
     def validate_draft_len_schedule_and_sort(cls, v, info):
-        """Validate and sort draft_len_schedule by batch size thresholds."""
+        """Validate and sort draft_len_schedule by batch size transition points.
+
+        New semantics: Keys represent specific batch sizes (must be in cuda_graph_batch_sizes).
+        Values represent draft_len to use for batch sizes UP TO that key.
+        """
         if v is not None:
-            # Validate values
-            for batch_size, draft_len in v.items():
+            # Sort at the beginning - makes everything simpler!
+            sorted_items = sorted(v.items(), key=lambda x: x[0])
+
+            # Validate keys and values
+            for batch_size, draft_len in sorted_items:
                 if batch_size < 1:
                     raise ValueError(
-                        f"draft_len_schedule: batch size threshold must be >= 1, got {batch_size}"
+                        f"draft_len_schedule: batch size must be >= 1, got {batch_size}"
                     )
                 if draft_len < 0:
                     raise ValueError(
                         f"draft_len_schedule: draft length must be >= 0, got {draft_len}"
                     )
 
-            # Require batch_size=1 in schedule
-            if 1 not in v:
-                raise ValueError(
-                    "draft_len_schedule must include batch_size=1. "
-                    "All systems can have batch_size=1. Add {1: <max_draft_len>} to your schedule."
-                )
+            # Get min/max from sorted list (first/last elements)
+            min_batch_size, draft_len_for_min_batch_size = sorted_items[0]
 
-            # Enforce schedule[1] == max_draft_len for consistency
+            # Enforce schedule[min_batch_size] == max_draft_len for consistency
             max_draft_len = info.data.get('max_draft_len')
-            if max_draft_len is not None and v[1] != max_draft_len:
-                raise ValueError(
-                    f"draft_len_schedule[1] must equal max_draft_len for consistency. "
-                    f"Got schedule[1]={v[1]}, but max_draft_len={max_draft_len}. "
-                    f"batch_size=1 should use maximum draft length.")
-
-            # Enforce all draft lengths <= max_draft_len
             if max_draft_len is not None:
-                for batch_size, draft_len in v.items():
+                if draft_len_for_min_batch_size != max_draft_len:
+                    raise ValueError(
+                        f"draft_len_schedule[{min_batch_size}] must equal max_draft_len for consistency. "
+                        f"Got schedule[{min_batch_size}]={draft_len_for_min_batch_size}, but max_draft_len={max_draft_len}. "
+                        f"The smallest key in the schedule should use maximum draft length."
+                    )
+
+                # Check all draft lengths <= max_draft_len (already iterating sorted)
+                for batch_size, draft_len in sorted_items:
                     if draft_len > max_draft_len:
                         raise ValueError(
                             f"draft_len_schedule: all draft lengths must be <= max_draft_len. "
                             f"Got draft_len={draft_len} for batch_size={batch_size}, "
                             f"but max_draft_len={max_draft_len}.")
 
-            # Return sorted dict (by batch size thresholds)
-            # This ensures efficient lookup
-            return dict(sorted(v.items(), key=lambda x: x[0]))
+            # Validate monotonicity: draft_len should decrease as batch_size increases
+            for i in range(len(sorted_items) - 1):
+                curr_bs, curr_draft = sorted_items[i]
+                next_bs, next_draft = sorted_items[i + 1]
+                if curr_draft < next_draft:
+                    raise ValueError(
+                        f"draft_len_schedule: draft_len increases as batch_size increases "
+                        f"({curr_bs}→{curr_draft}, {next_bs}→{next_draft}). "
+                        f"Usually draft_len should decrease for larger batches for better performance."
+                    )
+
+            # Return sorted dict
+            return dict(sorted_items)
         return v
 
     @classmethod
@@ -2896,6 +2913,45 @@ class TorchLlmArgs(BaseLlmArgs):
                 max_batch_size, config.enable_padding)
             config.batch_sizes = generated_sizes
             config.max_batch_size = max_batch_size
+
+        return self
+
+    @model_validator(mode='after')
+    def validate_draft_len_schedule_with_cuda_graphs(self) -> 'TorchLlmArgs':
+        """Validate draft_len_schedule keys are valid CUDA graph batch sizes.
+
+        This ensures predictable CUDA graph capture behavior and respects
+        the constraint that schedule keys must be capturable as CUDA graphs.
+        """
+        if self.speculative_config is None:
+            return self
+
+        if not hasattr(self.speculative_config, 'draft_len_schedule') or \
+           self.speculative_config.draft_len_schedule is None:
+            return self
+
+        schedule_keys = set(self.speculative_config.draft_len_schedule.keys())
+
+        if self.cuda_graph_config is None:
+            raise ValueError(
+                f"draft_len_schedule is set to {self.speculative_config.draft_len_schedule}, "
+                f"but cuda_graph_config is None (CUDA graphs disabled). "
+                f"Dynamic draft length requires CUDA graphs. Please set cuda_graph_config."
+            )
+
+        graph_sizes = set(self.cuda_graph_config.batch_sizes)
+
+        # Validate: all schedule keys must be in cuda_graph_batch_sizes
+        invalid_keys = schedule_keys - graph_sizes
+        if invalid_keys:
+            raise ValueError(
+                f"draft_len_schedule keys {sorted(invalid_keys)} are not subset of "
+                f"cuda_graph_config.batch_sizes {sorted(graph_sizes)}.\n"
+                f"All draft_len_schedule keys must be valid CUDA graph batch sizes.\n"
+                f"Either:\n"
+                f"  1. Change draft_len_schedule keys to match available cuda graph batch sizes, or\n"
+                f"  2. Explicitly set cuda_graph_config.batch_sizes to include all your draft_len_schedule keys: {sorted(schedule_keys)}"
+            )
 
         return self
 

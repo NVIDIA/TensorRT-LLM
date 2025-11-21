@@ -356,7 +356,8 @@ class PyTorchModelEngine(ModelEngine):
 
         self._max_cuda_graph_batch_size = (self._cuda_graph_batch_sizes[-1] if
                                            self._cuda_graph_batch_sizes else 0)
-
+        self._dynamic_draft_len_mapping = self._compute_dynamic_draft_len_mapping(
+        )
         self.previous_batch_indices_cuda = torch.empty((self.max_num_tokens, ),
                                                        dtype=torch.int,
                                                        device='cuda')
@@ -410,6 +411,7 @@ class PyTorchModelEngine(ModelEngine):
             max_beam_width=self.max_beam_width,
             spec_config=self.spec_config,
             cuda_graph_mem_pool=self._cuda_graph_mem_pool,
+            dynamic_draft_len_mapping=self._dynamic_draft_len_mapping,
             max_num_tokens=self.max_num_tokens,
             use_mrope=self.use_mrope,
             original_max_draft_len=self.original_max_draft_len,
@@ -662,6 +664,48 @@ class PyTorchModelEngine(ModelEngine):
         self._capture_generation_cuda_graphs(resource_manager)
         self._capture_piecewise_cuda_graphs(resource_manager)
 
+    def _compute_dynamic_draft_len_mapping(self) -> dict[int, int]:
+        """Compute graph_bs → draft_len mapping for dynamic draft length feature.
+
+        Example: draft_len_schedule = {4:4, 8:2, 32:1}, cuda_graph_batch_sizes = [1,2,3,4,5,6,7,8,16,24,32,64]
+        - Batch sizes 1-4:   use draft_len=4 (up to key 4)
+        - Batch sizes 5-8:   use draft_len=2 (up to key 8)
+        - Batch sizes 9-32:  use draft_len=1 (up to key 32)
+        - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled)
+
+        Returns: {1:4, 2:4, 3:4, 4:4, 5:2, 6:2, 7:2, 8:2, 16:1, 24:1, 32:1, 64:0}
+        """
+        if not self.spec_config or not self.spec_config.draft_len_schedule:
+            return {}
+
+        schedule = self.spec_config.draft_len_schedule
+        schedule_keys = list(schedule.keys())
+        mapping = {}
+        key_idx = 0
+
+        for graph_bs in self._cuda_graph_batch_sizes:
+            while key_idx < len(
+                    schedule_keys) and schedule_keys[key_idx] < graph_bs:
+                key_idx += 1
+            if key_idx < len(schedule_keys):
+                draft_len = schedule[schedule_keys[key_idx]]
+            else:
+                # graph_bs > all schedule keys: draft_len=0
+                draft_len = 0
+            mapping[graph_bs] = draft_len
+
+        return mapping
+
+    def _graphs_for_dynamic_draft_length(self) -> list[tuple[int, int]]:
+        """Convert the dynamic draft_len mapping to list of (batch_size, draft_len) pairs."""
+        if not self._dynamic_draft_len_mapping:
+            return []
+
+        return [
+            (graph_bs, draft_len)
+            for graph_bs, draft_len in self._dynamic_draft_len_mapping.items()
+        ]
+
     def _capture_generation_cuda_graphs(self,
                                         resource_manager: ResourceManager):
         """Captures CUDA graphs for pure generation steps."""
@@ -677,39 +721,50 @@ class PyTorchModelEngine(ModelEngine):
         # Reverse order so smaller graphs can reuse memory from larger ones
         cuda_graph_batch_sizes = sorted(self._cuda_graph_batch_sizes,
                                         reverse=True)
+
         # Create CUDA graphs for different draft lengths
-        draft_lengths = []
         if self.is_draft_model:
             if self.model_is_wrapped and self.is_spec_decode and spec_resource_manager is not None and isinstance(
                     spec_resource_manager, Eagle3ResourceManager):
                 # The CDL path uses draft_len > 0 for the number of iterations in the drafting loop.
-                draft_lengths.append(self.original_max_total_draft_tokens)
+                draft_len = self.original_max_total_draft_tokens
             else:
-                draft_lengths.append(self.max_total_draft_tokens)
+                draft_len = self.max_total_draft_tokens
+            graphs_to_capture = [(bs, draft_len)
+                                 for bs in cuda_graph_batch_sizes]
         else:
-            # For non-draft model, we also capture the CUDA graph instance for draft length 0,
-            # so that when we disable spec decode at runtime, we can still run the captured graph.
-            # Note that for one engine mode, we are not able to turn off spec decode at runtime.
-            if (self.max_total_draft_tokens > 0
-                    and not self.spec_config.spec_dec_mode.use_one_engine()
-                    # Assume that speculation is always on if the user didn't give us a max_concurrency
-                    # value. This will save on memory.
-                    and self.spec_config.max_concurrency is not None):
-                draft_lengths.append(0)
-            draft_lengths = [self.max_total_draft_tokens]
+            if self.spec_config and self.spec_config.draft_len_schedule:
+                graphs_to_capture = self._graphs_for_dynamic_draft_length()
+                logger.info(
+                    f"Dynamic draft length enabled. Capturing {len(graphs_to_capture)} graphs: "
+                    f"{graphs_to_capture}")
+            else:
+                # For non-draft model, dynamic draft length disabled case, we also capture the CUDA graph instance for draft length 0,
+                # so that when we disable spec decode at runtime, we can still run the captured graph.
+                # Note that for one engine mode, we are not able to turn off spec decode at runtime.
+                graphs_to_capture = []
+                if (self.max_total_draft_tokens > 0
+                        and not self.spec_config.spec_dec_mode.use_one_engine()
+                        # Assume that speculation is always on if the user didn't give us a max_concurrency
+                        # value. This will save on memory.
+                        and self.spec_config.max_concurrency is not None):
+                    graphs_to_capture.extend([(bs, 0)
+                                              for bs in cuda_graph_batch_sizes])
+                graphs_to_capture.extend([(bs, self.max_total_draft_tokens)
+                                          for bs in cuda_graph_batch_sizes])
 
-        for bs in cuda_graph_batch_sizes:
+        graphs_to_capture = sorted(graphs_to_capture, reverse=True)
+        for bs, draft_len in graphs_to_capture:
             if bs > self.batch_size:
                 continue
 
-            for draft_len in draft_lengths:
-                warmup_request = self._create_cuda_graph_warmup_request(
-                    resource_manager, bs, draft_len)
-                with self._release_batch_context(warmup_request,
-                                                 resource_manager) as batch:
-                    if batch is None:
-                        # No KV cache space, cannot continue capturing graphs
-                        return
+            warmup_request = self._create_cuda_graph_warmup_request(
+                resource_manager, bs, draft_len)
+            with self._release_batch_context(warmup_request,
+                                             resource_manager) as batch:
+                if batch is None:
+                    # No KV cache space, cannot continue capturing graphs
+                    return
 
                     logger.info(
                         f"Run generation-only CUDA graph warmup for batch size={bs}, draft_len={draft_len}"
