@@ -51,10 +51,16 @@ tar -xzf Mooncake-${MOONCAKE_VERSION}.tar.gz
 MOONCAKE_DIR=$(tar -tzf Mooncake-${MOONCAKE_VERSION}.tar.gz | head -1 | cut -f1 -d"/")
 mv ${MOONCAKE_DIR} Mooncake
 cd Mooncake
-# Only update submodules if this is a git repository
-if [ -d .git ]; then
-    git submodule update --init --recursive --depth 1
-fi
+
+# Manually download pybind11 submodule (since tarball doesn't include submodules)
+PYBIND11_VERSION="v2.13.6"
+mkdir -p extern
+curl -L ${GITHUB_URL}/pybind/pybind11/archive/refs/tags/${PYBIND11_VERSION}.tar.gz -o pybind11.tar.gz
+tar -xzf pybind11.tar.gz
+PYBIND11_DIR=$(tar -tzf pybind11.tar.gz | head -1 | cut -f1 -d"/")
+mv ${PYBIND11_DIR} extern/pybind11
+rm pybind11.tar.gz
+
 mkdir build && cd build
 cmake .. -DUSE_CUDA=ON -DBUILD_SHARED_LIBS=ON -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF \
     -DCMAKE_INSTALL_PREFIX=${MOONCAKE_INSTALL_PATH}
