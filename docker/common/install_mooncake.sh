@@ -34,7 +34,9 @@ mkdir -p /third-party-source
 YALANTINGLIBS_VERSION="0.5.5"
 curl -L ${GITHUB_URL}/alibaba/yalantinglibs/archive/refs/tags/${YALANTINGLIBS_VERSION}.tar.gz -o yalantinglibs-${YALANTINGLIBS_VERSION}.tar.gz
 tar -xzf yalantinglibs-${YALANTINGLIBS_VERSION}.tar.gz
-mv yalantinglibs-${YALANTINGLIBS_VERSION} yalantinglibs
+# Auto-detect extracted directory name
+YALANTINGLIBS_DIR=$(tar -tzf yalantinglibs-${YALANTINGLIBS_VERSION}.tar.gz | head -1 | cut -f1 -d"/")
+mv ${YALANTINGLIBS_DIR} yalantinglibs
 cd yalantinglibs
 mkdir build && cd build
 cmake .. -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=OFF
@@ -45,10 +47,14 @@ rm -rf yalantinglibs
 
 curl -L ${GITHUB_URL}/kvcache-ai/Mooncake/archive/refs/tags/v${MOONCAKE_VERSION}.tar.gz -o Mooncake-${MOONCAKE_VERSION}.tar.gz
 tar -xzf Mooncake-${MOONCAKE_VERSION}.tar.gz
-mv Mooncake-${MOONCAKE_VERSION} Mooncake
+# Auto-detect extracted directory name
+MOONCAKE_DIR=$(tar -tzf Mooncake-${MOONCAKE_VERSION}.tar.gz | head -1 | cut -f1 -d"/")
+mv ${MOONCAKE_DIR} Mooncake
 cd Mooncake
-git submodule update --init --recursive --depth 1
-
+# Only update submodules if this is a git repository
+if [ -d .git ]; then
+    git submodule update --init --recursive --depth 1
+fi
 mkdir build && cd build
 cmake .. -DUSE_CUDA=ON -DBUILD_SHARED_LIBS=ON -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF \
     -DCMAKE_INSTALL_PREFIX=${MOONCAKE_INSTALL_PATH}
