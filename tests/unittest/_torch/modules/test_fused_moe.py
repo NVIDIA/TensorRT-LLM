@@ -1381,7 +1381,7 @@ def test_fused_moe_nvfp4(dtype, moe_backend, hidden_size, intermediate_size):
     with torch.device(f"cuda:{mapping.rank}"):
         SCALING_VECTOR_SIZE = 16
 
-        SEQ_LEN = 1024
+        SEQ_LEN = 8192
         HIDDEN_SIZE = hidden_size
         INTERMEDIATE_SIZE = intermediate_size
         NUM_EXPERTS = 32
