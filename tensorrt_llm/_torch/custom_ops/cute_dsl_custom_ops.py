@@ -592,6 +592,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                           5, 0,
                                           helper.infer_shape_max_num_tiles)),
                     inputs_pre_hook=helper.inputs_pre_hook,
+                    use_cuda_graph=True,
                 )
             return self.__class__.tuning_config_cache[key]
 
@@ -869,6 +870,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             7, 0, helper.infer_shape_max_num_permuted_tokens),
                         ConstraintSpec(9, 0, helper.infer_shape_num_tokens)),
                     inputs_pre_hook=helper.inputs_pre_hook_finalize_fusion,
+                    use_cuda_graph=True,
                 )
             return self.__class__.tuning_config_cache[key]
 
@@ -1183,6 +1185,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                           5, 0,
                                           helper.infer_shape_max_num_tiles)),
                     inputs_pre_hook=helper.inputs_pre_hook,
+                    use_cuda_graph=True,
                 )
             return self.__class__.tuning_config_cache[key]
 
@@ -1470,6 +1473,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                       ConstraintSpec(
                                           3, 0, helper.infer_shape_num_tokens)),
                     inputs_pre_hook=helper.inputs_pre_hook,
+                    use_cuda_graph=True,
                 )
             return self.__class__.tuning_config_cache[key]
 
