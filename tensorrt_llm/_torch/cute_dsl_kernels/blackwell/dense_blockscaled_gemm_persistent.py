@@ -300,7 +300,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sfa_tensor: cute.Tensor,
         sfb_tensor: cute.Tensor,
         c_tensor: cute.Tensor,
-        alpha: cutlass.Float32,
+        alpha: cute.Tensor,  # Single-element tensor containing alpha value
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
@@ -548,34 +548,36 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
     # GPU device kernel
     @cute.kernel
     def kernel(
-        self,
-        tiled_mma: cute.TiledMma,
-        tiled_mma_sfb: cute.TiledMma,
-        tma_atom_a: cute.CopyAtom,
-        mA_mkl: cute.Tensor,
-        tma_atom_b: cute.CopyAtom,
-        mB_nkl: cute.Tensor,
-        tma_atom_sfa: cute.CopyAtom,
-        mSFA_mkl: cute.Tensor,
-        tma_atom_sfb: cute.CopyAtom,
-        mSFB_nkl: cute.Tensor,
-        tma_atom_c: Optional[cute.CopyAtom],
-        mC_mnl: cute.Tensor,
-        cluster_layout_vmnk: cute.Layout,
-        cluster_layout_sfb_vmnk: cute.Layout,
-        a_smem_layout_staged: cute.ComposedLayout,
-        b_smem_layout_staged: cute.ComposedLayout,
-        sfa_smem_layout_staged: cute.Layout,
-        sfb_smem_layout_staged: cute.Layout,
-        c_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout, None],
-        epi_tile: cute.Tile,
-        tile_sched_params: utils.PersistentTileSchedulerParams,
-        epilogue_op: cutlass.Constexpr,
-        alpha: cutlass.Float32,
+            self,
+            tiled_mma: cute.TiledMma,
+            tiled_mma_sfb: cute.TiledMma,
+            tma_atom_a: cute.CopyAtom,
+            mA_mkl: cute.Tensor,
+            tma_atom_b: cute.CopyAtom,
+            mB_nkl: cute.Tensor,
+            tma_atom_sfa: cute.CopyAtom,
+            mSFA_mkl: cute.Tensor,
+            tma_atom_sfb: cute.CopyAtom,
+            mSFB_nkl: cute.Tensor,
+            tma_atom_c: Optional[cute.CopyAtom],
+            mC_mnl: cute.Tensor,
+            cluster_layout_vmnk: cute.Layout,
+            cluster_layout_sfb_vmnk: cute.Layout,
+            a_smem_layout_staged: cute.ComposedLayout,
+            b_smem_layout_staged: cute.ComposedLayout,
+            sfa_smem_layout_staged: cute.Layout,
+            sfb_smem_layout_staged: cute.Layout,
+            c_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout, None],
+            epi_tile: cute.Tile,
+            tile_sched_params: utils.PersistentTileSchedulerParams,
+            epilogue_op: cutlass.Constexpr,
+            alpha: cute.Tensor,  # Single-element tensor containing alpha value
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
         """
+        alpha_value = alpha[0].to(self.c_dtype)
+
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
 
@@ -1248,6 +1250,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 #
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
                 num_prev_subtiles = tile_sched.num_tiles_executed * subtile_cnt
+
                 for subtile_idx in cutlass.range(subtile_cnt):
                     #
                     # Load accumulator from tensor memory buffer to register
@@ -1259,8 +1262,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     # Convert to C type
                     #
                     acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
-                    acc_vec = epilogue_op(
-                        alpha.to(self.c_dtype) * acc_vec.to(self.c_dtype))
+                    acc_vec = epilogue_op(alpha_value *
+                                          acc_vec.to(self.c_dtype))
                     tRS_rC.store(acc_vec)
 
                     #
@@ -1940,7 +1943,8 @@ class Sm100BlockScaledPersistentDenseGemmKernelWrapper:
         a_sf_ptr: cute.Pointer,
         b_sf_ptr: cute.Pointer,
         c_ptr: cute.Pointer,
-        alpha: cutlass.Float32,
+        alpha: cute.
+        Pointer,  # Device pointer to alpha, will be converted to Tensor
         max_active_clusters: cutlass.Constexpr,
         current_stream: cuda.CUstream,
         swap_ab: cutlass.Constexpr = False,
@@ -1961,7 +1965,7 @@ class Sm100BlockScaledPersistentDenseGemmKernelWrapper:
             a_sf_ptr (cute.Pointer): Pointer to the scale factor tensor for A.
             b_sf_ptr (cute.Pointer): Pointer to the scale factor tensor for B.
             c_ptr (cute.Pointer): Pointer to the C tensor.
-            alpha (cutlass.Float32): Scaling factor for the GEMM output.
+            alpha (cute.Pointer): Device pointer to alpha scaling factor (converted to Tensor internally).
             max_active_clusters (cutlass.Constexpr): Maximum number of active
                 clusters.
             current_stream (cuda.CUstream): CUDA stream for the operation.
@@ -2007,11 +2011,17 @@ class Sm100BlockScaledPersistentDenseGemmKernelWrapper:
                                           order=(2, 1, 4, 0, 3, 5),
                                       ))
 
+        # Convert alpha pointer to a single-element cute.Tensor for easier kernel usage
+        # Create a 1D layout with a single element
+        alpha_tensor = cute.make_tensor(alpha,
+                                        layout=cute.make_ordered_layout(
+                                            (1, ), order=(0, )))
+
         Sm100BlockScaledPersistentDenseGemmKernel(
             self.sf_vec_size,
             self.mma_tiler_mn,
             self.cluster_shape_mn,
-        )(a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_tensor, alpha,
+        )(a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_tensor, alpha_tensor,
           max_active_clusters, current_stream, epilogue_op)
 
 

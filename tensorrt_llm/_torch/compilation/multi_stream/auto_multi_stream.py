@@ -43,7 +43,7 @@ def estimate_time(node: Node) -> int:
 
     gemm_ops = {
         torch.ops.aten.mm.default,
-        torch.ops.trtllm.nvfp4_gemm.default,
+        torch.ops.trtllm.nvfp4_gemm_cutlass.default,
         torch.ops.trtllm.fp8_batched_gemm_trtllmgen.default,
         torch.ops.trtllm.w4a8_mxfp4_fp8_gemm.default,
         torch.ops.trtllm.finegrained_mixed_dtype_gemm.default,

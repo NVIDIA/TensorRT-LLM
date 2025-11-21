@@ -351,11 +351,14 @@ class AutoTunerProfilingCache:
         Returns:
             A tuple containing:
             [is_cache_hit, runner_id, tactic, stored_profile]
+            runner_id is the index in the current runners list
         """
-        for r in runners:
+        for idx, r in enumerate(runners):
             if (cache_key := self.get_cache_key(custom_op, r, input_shapes,
                                                 tuning_config)) in self.cache:
-                return True, *self.cache[cache_key]
+                # Return the current index in runners list, not the cached runner_id
+                cached_runner_id, tactic, min_time = self.cache[cache_key]
+                return True, idx, tactic, min_time
 
         return False, *self.fallback_entry()
 
@@ -698,10 +701,13 @@ class AutoTuner:
             })
 
         input_shapes = tuple(self._get_input_sizes(inputs))
+        is_cache_hit, best_runner_id, best_tactic, min_time = self.profiling_cache.search_cache(
+            custom_op, runners, input_shapes, tuning_config)
+
         # Early return if it's not tuning, use cache found one or fallback one
         if not self.is_tuning_mode:
-            is_cache_hit, best_runner_id, best_tactic, min_time = self.profiling_cache.search_cache(
-                custom_op, runners, input_shapes, tuning_config)
+            # is_cache_hit, best_runner_id, best_tactic, min_time = self.profiling_cache.search_cache(
+            #     custom_op, runners, input_shapes, tuning_config)
             best_runner = runners[best_runner_id]
             # TODO: check the stored runner and tactic can implement this shape here
             # Should not directly try (runner, tactic) here, or it will hurt a lot of inference perf.
@@ -714,6 +720,10 @@ class AutoTuner:
                     key=(custom_op, "warning_autotuning_cache_miss_fallback"))
 
             return (best_runner, best_tactic)
+
+        # If it's tuning mode and cache hit, return the best runner and tactic to avoid redundant profiling.
+        if self.is_tuning_mode and is_cache_hit:
+            return (runners[best_runner_id], best_tactic)
 
         assert len(runners) > 0, "At least one runner is required"
         assert all([isinstance(r, TunableRunner) for r in runners]), \
@@ -824,7 +834,7 @@ class AutoTuner:
                         f"[Autotuner] Failed when profiling runner={runner}, tactic={tac}, shapes={shapes}. Set TLLM_LOG_LEVEL=DEBUG for more details.",
                         key=(custom_op, "warning_autotuning_profile_failure"),
                     )
-                    logger.debug_once(
+                    logger.info_once(
                         f"[Autotuner] Exception captured: {e}",
                         key=(custom_op, "debug_autotuning_exception"),
                     )
@@ -1118,8 +1128,8 @@ class AutoTuner:
         self.stats = AutoTunerStatistics()
 
     def print_profiling_cache(self):
-        logger.debug(f"[Autotuner] The profiling_cache entries:")
-        logger.debug(
+        logger.info(f"[Autotuner] The profiling_cache entries:")
+        logger.info(
             f"[Autotuner] Cache contents: (custom_op, runner, hash(attributes), shape_profiles) -> (runner_id, tactic, shape_profile(ignored))"
         )
         for key, value in self.profiling_cache.cache.items():
@@ -1201,7 +1211,7 @@ class AutoTuner:
             runner_idx = runners.index(runner)
             runner_tactic_list.append((runner_idx, tactic))
 
-        logger.debug(
+        logger.info(
             f"[Autotuner][replay]: Testing configuration: {runner_tactic_list}")
 
         # Replay the contexts with given (runner, tactic) pairs

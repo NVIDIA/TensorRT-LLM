@@ -221,7 +221,7 @@ To address this, we implemented an auto multi-stream scheduler:
    call_function  fp4_quantize_2                           trtllm.fp4_quantize.default                  (mm_1, arg18_1, 16)                                                                    {}
    call_function  getitem_9                                <built-in function getitem>                  (fp4_quantize_2, 0)                                                                    {}
    call_function  getitem_10                               <built-in function getitem>                  (fp4_quantize_2, 1)                                                                    {}
-   call_function  nvfp4_gemm_2                             trtllm.nvfp4_gemm.default                    (getitem_9, arg19_1, getitem_10, arg20_1, arg21_1, torch.bfloat16)                     {}
+   call_function  nvfp4_gemm_2                             trtllm.nvfp4_gemm_cutlass.default                    (getitem_9, arg19_1, getitem_10, arg20_1, arg21_1, torch.bfloat16)                     {}
    call_function  permute_2                                aten.permute.default                         (arg17_1, [1, 0])                                                                      {}
    call_function  record_event_1                           trtllm.record_event                          (0,)                                                                                   {}
    call_function  silu_and_mul_1                           trtllm.silu_and_mul.default                  (nvfp4_gemm_2,)                                                                        {}
