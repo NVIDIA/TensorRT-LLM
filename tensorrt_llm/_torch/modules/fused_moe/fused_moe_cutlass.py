@@ -532,7 +532,7 @@ class CutlassFusedMoE(MoE):
 
         # Optionally provide an output tensor to fused_moe so it writes directly to our buffer
         moe_output: Optional[torch.Tensor] = None
-        if self.enable_alltoall and self.moe_alltoall_backend == "NVLINK_ONE_SIDEDz":
+        if self.enable_alltoall and self.moe_alltoall_backend == "NVLINK_ONE_SIDED":
             # Retrieve a workspace-backed output tensor sized by runtime tokens
             runtime_max_tokens_per_rank = max(
                 all_rank_num_tokens) if all_rank_num_tokens else x.shape[0]
