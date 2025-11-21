@@ -99,7 +99,7 @@ class TuningConfig:
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
     tune_max_num_tokens: int = None
     inputs_pre_hook: Callable = None
-    use_cuda_graph: bool = False
+    use_cuda_graph: bool = True
 
 
 @dataclass(unsafe_hash=True)
