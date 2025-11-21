@@ -325,7 +325,7 @@ def nvfp4_gemm_perf_test(
                 f"ref tune, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}",
                 color="orange"):
             with torch.inference_mode(), autotune():
-                output_ref = torch.ops.trtllm.nvfp4_gemm(
+                output_ref = torch.ops.trtllm.nvfp4_gemm_cutlass(
                     x_fp4, w_fp4, x_sf_block, w_sf_block, alpha_tensor, dtype)
         torch.testing.assert_close(output, output_ref)
         print(f"PASSED")
@@ -368,7 +368,7 @@ def nvfp4_gemm_perf_test(
                 f"ref warmup, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}",
                 color="red"):
             for _ in range(warmup_iterations):
-                output_ref = torch.ops.trtllm.nvfp4_gemm(
+                output_ref = torch.ops.trtllm.nvfp4_gemm_cutlass(
                     x_fp4_list[buffer_idx % workspace_count],
                     w_fp4_list[buffer_idx % workspace_count],
                     x_sf_block_list[buffer_idx % workspace_count],
@@ -381,7 +381,7 @@ def nvfp4_gemm_perf_test(
                 f"ref run, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}",
                 color="red"):
             for i in range(iterations):
-                output_ref = torch.ops.trtllm.nvfp4_gemm(
+                output_ref = torch.ops.trtllm.nvfp4_gemm_cutlass(
                     x_fp4_list[buffer_idx % workspace_count],
                     w_fp4_list[buffer_idx % workspace_count],
                     x_sf_block_list[buffer_idx % workspace_count],
@@ -429,7 +429,7 @@ def nvfp4_gemm_perf_test(
         (128, 16384, 128, "Wide N: N >> K"),
     ])
 def test_nvfp4_gemm_unified_all_tactics(dtype, mnk):
-    """Test nvfp4_gemm_unified with auto backend selection, ensuring all tactics are tested."""
+    """Test nvfp4_gemm with auto backend selection, ensuring all tactics are tested."""
     from tensorrt_llm._torch.autotuner import AutoTuner, autotune
     from tensorrt_llm._torch.cublaslt_utils import IS_CUBLASLT_AVAILABLE
 
@@ -459,27 +459,25 @@ def test_nvfp4_gemm_unified_all_tactics(dtype, mnk):
 
     # Reference: Use CUTLASS backend explicitly for reference output
     with torch.inference_mode():
-        output_ref = torch.ops.trtllm.nvfp4_gemm_unified(
-            act_fp4=x_fp4,
-            weight=w_fp4,
-            act_sf=x_sf_block,
-            weight_scale=w_sf_block,
-            alpha=alpha_tensor,
-            output_dtype=dtype,
-            to_userbuffers=False,
-            backend='cutlass')
+        output_ref = torch.ops.trtllm.nvfp4_gemm(act_fp4=x_fp4,
+                                                 weight=w_fp4,
+                                                 act_sf=x_sf_block,
+                                                 weight_scale=w_sf_block,
+                                                 alpha=alpha_tensor,
+                                                 output_dtype=dtype,
+                                                 to_userbuffers=False,
+                                                 backend='cutlass')
 
     # Test auto backend selection with autotuning
     with torch.inference_mode(), autotune():
-        output_auto = torch.ops.trtllm.nvfp4_gemm_unified(
-            act_fp4=x_fp4,
-            weight=w_fp4,
-            act_sf=x_sf_block,
-            weight_scale=w_sf_block,
-            alpha=alpha_tensor,
-            output_dtype=dtype,
-            to_userbuffers=False,
-            backend='auto')
+        output_auto = torch.ops.trtllm.nvfp4_gemm(act_fp4=x_fp4,
+                                                  weight=w_fp4,
+                                                  act_sf=x_sf_block,
+                                                  weight_scale=w_sf_block,
+                                                  alpha=alpha_tensor,
+                                                  output_dtype=dtype,
+                                                  to_userbuffers=False,
+                                                  backend='auto')
 
     AutoTuner.get().print_profiling_cache()
 
@@ -488,25 +486,25 @@ def test_nvfp4_gemm_unified_all_tactics(dtype, mnk):
     torch.testing.assert_close(output_auto, output_ref, rtol=1e-2, atol=0.15)
 
     # Test all combinations of outer layer (backend selection) and inner layer (backend tactics)
-    # Outer layer: nvfp4_gemm_unified selects backend
+    # Outer layer: nvfp4_gemm selects backend
     # Inner layer: each backend has its own tactics
     from collections import defaultdict
 
     print(f"\n{'='*80}")
-    print(f"Testing nvfp4_gemm_unified (2-layer tactics): {desc}")
+    print(f"Testing nvfp4_gemm (2-layer tactics): {desc}")
     print(f"Shape: M={SEQ_LEN}, K={HIDDEN_SIZE}, N={OUTPUT_SIZE}")
     print(f"{'='*80}")
 
     print(f"\n[Outer Layer] Capturing backend selection tactics...")
     with AutoTuner.get().capture() as outer_capture, torch.inference_mode():
-        output = torch.ops.trtllm.nvfp4_gemm_unified(act_fp4=x_fp4,
-                                                     weight=w_fp4,
-                                                     act_sf=x_sf_block,
-                                                     weight_scale=w_sf_block,
-                                                     alpha=alpha_tensor,
-                                                     output_dtype=dtype,
-                                                     to_userbuffers=False,
-                                                     backend='auto')
+        output = torch.ops.trtllm.nvfp4_gemm(act_fp4=x_fp4,
+                                             weight=w_fp4,
+                                             act_sf=x_sf_block,
+                                             weight_scale=w_sf_block,
+                                             alpha=alpha_tensor,
+                                             output_dtype=dtype,
+                                             to_userbuffers=False,
+                                             backend='auto')
 
     outer_tactics_list = list(outer_capture)
     print(f"  Found {len(outer_tactics_list)} outer layer tactics (backends)")
@@ -524,7 +522,7 @@ def test_nvfp4_gemm_unified_all_tactics(dtype, mnk):
     backend_apis = {}
     if IS_CUTLASS_DSL_AVAILABLE:
         if 'cutlass' in backend_map:
-            backend_apis['cutlass'] = torch.ops.trtllm.nvfp4_gemm
+            backend_apis['cutlass'] = torch.ops.trtllm.nvfp4_gemm_cutlass
     if IS_CUBLASLT_AVAILABLE:
         if 'cublaslt' in backend_map:
             backend_apis['cublaslt'] = torch.ops.trtllm.nvfp4_gemm_cublaslt
@@ -598,7 +596,7 @@ def test_nvfp4_gemm_unified_all_tactics(dtype, mnk):
         print(f"    Found 1 tactic (single implementation, no autotuning)")
 
         with torch.inference_mode():
-            output_cuda_core = torch.ops.trtllm.nvfp4_gemm_unified(
+            output_cuda_core = torch.ops.trtllm.nvfp4_gemm(
                 act_fp4=x_fp4,
                 weight=w_fp4,
                 act_sf=x_sf_block,
@@ -640,7 +638,7 @@ def test_nvfp4_gemm_unified_all_tactics(dtype, mnk):
                                  (128, 2112, 7168), (128, 4096, 7168),
                                  (128, 7168, 2048), [127, 1024, 3200]])
 def test_fp4_linear_cublaslt(dtype, mnk):
-    """Test cuBLASLt FP4 GEMM implementation and compare with nvfp4_gemm"""
+    """Test cuBLASLt FP4 GEMM implementation and compare with nvfp4_gemm_cutlass"""
     from tensorrt_llm._torch.cublaslt_utils import IS_CUBLASLT_AVAILABLE
     if not IS_CUBLASLT_AVAILABLE:
         pytest.skip("cuBLASLt FP4 GEMM not available in this build")
@@ -674,11 +672,10 @@ def test_fp4_linear_cublaslt(dtype, mnk):
                 alpha=alpha_tensor,
                 output_dtype=dtype)
 
-    # Reference implementation: use torch.ops.trtllm.nvfp4_gemm (CUTLASS)
+    # Reference implementation: use torch.ops.trtllm.nvfp4_gemm_cutlass (CUTLASS)
     with torch.inference_mode():
-        output_cutlass = torch.ops.trtllm.nvfp4_gemm(x_fp4, w_fp4, x_sf_block,
-                                                     w_sf_block, alpha_ref,
-                                                     dtype)
+        output_cutlass = torch.ops.trtllm.nvfp4_gemm_cutlass(
+            x_fp4, w_fp4, x_sf_block, w_sf_block, alpha_ref, dtype)
 
     # Compare results
     torch.cuda.synchronize()
@@ -715,26 +712,24 @@ def test_fp4_linear_cuda_core(dtype, mnk):
         alpha_tensor = torch.tensor(alpha_ref, dtype=torch.float32).cuda()
 
         # Reference: Use CUTLASS backend
-        output_ref = torch.ops.trtllm.nvfp4_gemm_unified(
-            act_fp4=x_fp4,
-            weight=w_fp4,
-            act_sf=x_sf_block,
-            weight_scale=w_sf_block,
-            alpha=alpha_tensor,
-            output_dtype=dtype,
-            to_userbuffers=False,
-            backend='cutlass')
+        output_ref = torch.ops.trtllm.nvfp4_gemm(act_fp4=x_fp4,
+                                                 weight=w_fp4,
+                                                 act_sf=x_sf_block,
+                                                 weight_scale=w_sf_block,
+                                                 alpha=alpha_tensor,
+                                                 output_dtype=dtype,
+                                                 to_userbuffers=False,
+                                                 backend='cutlass')
 
         # Test CUDA Core backend
-        output_cuda_core = torch.ops.trtllm.nvfp4_gemm_unified(
-            act_fp4=x_fp4,
-            weight=w_fp4,
-            act_sf=x_sf_block,
-            weight_scale=w_sf_block,
-            alpha=alpha_tensor,
-            output_dtype=dtype,
-            to_userbuffers=False,
-            backend='cuda_core')
+        output_cuda_core = torch.ops.trtllm.nvfp4_gemm(act_fp4=x_fp4,
+                                                       weight=w_fp4,
+                                                       act_sf=x_sf_block,
+                                                       weight_scale=w_sf_block,
+                                                       alpha=alpha_tensor,
+                                                       output_dtype=dtype,
+                                                       to_userbuffers=False,
+                                                       backend='cuda_core')
 
     # Compare results
     torch.cuda.synchronize()

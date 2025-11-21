@@ -337,7 +337,7 @@ def nvfp4_linear(
         input, input_scale, TRTLLM_NVFP4_SCALING_VECTOR_SIZE, False
     )
     with autotune():
-        output = torch.ops.trtllm.nvfp4_gemm(
+        output = torch.ops.trtllm.nvfp4_gemm_cutlass(
             x_fp4, weight_fp4, x_sf_block, weight_scale, alpha, input.dtype
         )
 

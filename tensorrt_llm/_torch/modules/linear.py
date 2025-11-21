@@ -918,11 +918,9 @@ class NVFP4LinearMethod(LinearMethodBase):
         backend = getattr(module, 'nvfp4_backend', 'auto')
 
         # Use unified interface - supports CUTLASS, cuBLASLt, CuteDSL
-        output = torch.ops.trtllm.nvfp4_gemm_unified(act_fp4, module.weight,
-                                                     act_sf,
-                                                     module.weight_scale,
-                                                     module.alpha, module.dtype,
-                                                     False, backend)
+        output = torch.ops.trtllm.nvfp4_gemm(act_fp4, module.weight, act_sf,
+                                             module.weight_scale, module.alpha,
+                                             module.dtype, False, backend)
         # Take the dim of out_features if padded. Make sure the output is contiguous
         if output.shape[-1] > module.out_features:
             output = output[..., :module.out_features].contiguous()

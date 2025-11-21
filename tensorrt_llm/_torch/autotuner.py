@@ -756,7 +756,7 @@ class AutoTuner:
                     self.stats.tuned_op_successful_configs[
                         custom_op] = self.stats.tuned_op_successful_configs.get(
                             custom_op, 0) + 1
-                    logger.info(
+                    logger.debug(
                         f"[Autotuner] Profiling runner={runners[best_runner_id]}, tactic={best_tactic} for cache_key={cache_key}."
                     )
                 else:
@@ -960,7 +960,7 @@ class AutoTuner:
             avg_time = pure_profile(stream, self.repeat)
 
         shapes = self._get_input_sizes(inputs)
-        logger.info(
+        logger.debug(
             f"[Autotuner] Profiled runner={runner}, tactic={tactic}, shapes={shapes}: {avg_time:.6f}ms."
         )
 
@@ -1046,7 +1046,7 @@ class AutoTuner:
                 p.shapes[spec.input_idx][spec.dim_idx] = DynamicDim(
                     min_value, opt_value, max_value)
             generated_profiles.append(p)
-            logger.info(f"[Autotuner] Generated profile: {p}")
+            logger.debug(f"[Autotuner] Generated profile: {p}")
         return generated_profiles
 
     @classmethod
@@ -1197,7 +1197,7 @@ class AutoTuner:
         )
         for key, value in self.profiling_cache.cache.items():
             runner_id, tactic, min_time = value
-            logger.info(
+            logger.debug(
                 f"[Autotuner] {key}: (runner_id={runner_id}, tactic={tactic}, min_time={min_time})"
             )
 
