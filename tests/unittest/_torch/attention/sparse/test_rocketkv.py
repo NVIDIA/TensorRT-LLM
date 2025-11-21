@@ -4,6 +4,7 @@ import os
 import pytest
 import torch
 from utils.llm_data import llm_models_root
+from utils.util import getSMVersion
 
 import tensorrt_llm
 from tensorrt_llm import LLM, SamplingParams
