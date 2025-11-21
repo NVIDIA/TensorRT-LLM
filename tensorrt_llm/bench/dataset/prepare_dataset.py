@@ -12,14 +12,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import logging
+from pathlib import Path
 from typing import Optional, Tuple
 
 import click
 from pydantic import BaseModel, model_validator
 from transformers import AutoTokenizer
-from utils.prepare_real_data import dataset
-from utils.prepare_synthetic_data import token_norm_dist, token_unif_dist
+
+from tensorrt_llm.bench.dataset.prepare_real_data import real_dataset
+from tensorrt_llm.bench.dataset.prepare_synthetic_data import (token_norm_dist,
+                                                               token_unif_dist)
 
 
 class RootArgs(BaseModel):
@@ -27,45 +29,33 @@ class RootArgs(BaseModel):
     output: str
     random_seed: int
     task_id: int
-    std_out: bool
     trust_remote_code: bool = False
     rand_task_id: Optional[Tuple[int, int]]
     lora_dir: Optional[str] = None
 
-    @model_validator(mode='after')
+    @model_validator(mode="after")
     def validate_tokenizer(self):
         try:
             tokenizer = AutoTokenizer.from_pretrained(
                 self.tokenizer,
-                padding_side='left',
+                padding_side="left",
                 trust_remote_code=self.trust_remote_code)
         except EnvironmentError as e:
             raise ValueError(
-                f"Cannot find a tokenizer from the given string because of {e}\nPlease set tokenizer to the directory that contains the tokenizer, or set to a model name in HuggingFace."
-            )
+                "Cannot find a tokenizer from the given string because of "
+                f"{e}\nPlease set tokenizer to the directory that contains "
+                "the tokenizer, or set to a model name in HuggingFace.")
         tokenizer.pad_token = tokenizer.eos_token
         self.tokenizer = tokenizer
 
         return self
 
 
-@click.group(deprecated=True)
-@click.option(
-    "--tokenizer",
-    required=True,
-    type=str,
-    help=
-    "Tokenizer dir for the model run by gptManagerBenchmark, or the model name from HuggingFace."
-)
+@click.group(name="dataset")
 @click.option("--output",
               type=str,
               help="Output json filename.",
               default="preprocessed_dataset.json")
-@click.option(
-    "--stdout",
-    is_flag=True,
-    help="Print output to stdout with a JSON dataset entry on each line.",
-    default=False)
 @click.option("--random-seed",
               required=False,
               type=int,
@@ -83,36 +73,33 @@ class RootArgs(BaseModel):
               help="Directory containing LoRA adapters")
 @click.option("--log-level",
               default="info",
-              type=click.Choice(['info', 'debug']),
+              type=click.Choice(["info", "debug"]),
               help="Logging level.")
-@click.option("--trust-remote-code",
-              is_flag=True,
-              default=False,
-              envvar="TRUST_REMOTE_CODE",
-              help="Trust remote code.")
+@click.option(
+    "--trust-remote-code",
+    is_flag=True,
+    default=False,
+    envvar="TRUST_REMOTE_CODE",
+    help="Trust remote code.",
+)
 @click.pass_context
-def cli(ctx, **kwargs):
-    """This script generates dataset input for gptManagerBenchmark."""
-    if kwargs['log_level'] == 'info':
-        logging.basicConfig(level=logging.INFO)
-    elif kwargs['log_level'] == 'debug':
-        logging.basicConfig(level=logging.DEBUG)
-    else:
-        raise ValueError(f"Unsupported logging level {kwargs['log_level']}")
+def prepare_dataset(ctx, **kwargs):
+    """Prepare dataset for benchmarking with trtllm-bench."""
+    model = ctx.obj.model or ctx.obj.checkpoint_path
+    output_path = Path(kwargs["output"])
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    ctx.obj = RootArgs(tokenizer=kwargs['tokenizer'],
-                       output=kwargs['output'],
-                       std_out=kwargs['stdout'],
-                       random_seed=kwargs['random_seed'],
-                       task_id=kwargs['task_id'],
-                       rand_task_id=kwargs['rand_task_id'],
-                       lora_dir=kwargs['lora_dir'],
-                       trust_remote_code=kwargs['trust_remote_code'])
+    ctx.obj = RootArgs(
+        tokenizer=model,
+        output=kwargs["output"],
+        random_seed=kwargs["random_seed"],
+        task_id=kwargs["task_id"],
+        rand_task_id=kwargs["rand_task_id"],
+        lora_dir=kwargs["lora_dir"],
+        trust_remote_code=kwargs["trust_remote_code"],
+    )
 
 
-cli.add_command(dataset)
-cli.add_command(token_norm_dist)
-cli.add_command(token_unif_dist)
-
-if __name__ == "__main__":
-    cli()
+prepare_dataset.add_command(real_dataset)
+prepare_dataset.add_command(token_norm_dist)
+prepare_dataset.add_command(token_unif_dist)
