@@ -93,6 +93,29 @@ class MoERunner(TunableRunner):
                           profile: OptimizationProfile, **kwargs) -> List[int]:
         return range(self.fused_moe_runner.get_tactic_num(kwargs["gemm_idx"]))
 
+    def unique_id(self):
+        return (
+            self.x_dtype,
+            self.weight_dtype,
+            self.output_dtype,
+            self.top_k,
+            self.tp_size,
+            self.tp_rank,
+            self.ep_size,
+            self.ep_rank,
+            self.cluster_size,
+            self.cluster_rank,
+            self.enable_alltoall,
+            self.use_deepseek_fp8_block_scale,
+            self.use_w4_group_scaling,
+            self.use_int8_woq_per_channel,
+            self.use_mxfp8_act_scaling,
+            self.min_latency_mode,
+            self.use_fused_finalize,
+            self.activation_type,
+            self.unpadded_hidden_size,
+        )
+
     def forward(
         self,
         inputs: List[torch.Tensor],
@@ -316,6 +339,12 @@ class FP8RowwiseGemmRunner(TunableRunner):
         self.fp8_rowwise_gemm_runner = FP8RowwiseGemmRunner.runner_dict[
             instance_key]
 
+    def unique_id(self):
+        return (
+            self.to_userbuffers,
+            self.output_dtype,
+        )
+
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile, **kwargs) -> List[int]:
         return list(range(self.fp8_rowwise_gemm_runner.get_num_configs()))
@@ -398,6 +427,12 @@ class FP4GemmRunner(TunableRunner):
                     output_dtype, int(fp4_gemm_type))
         self.fp4_gemm_runner = FP4GemmRunner.runner_dict[instance_key]
 
+    def unique_id(self):
+        return (
+            self.to_userbuffers,
+            self.output_dtype,
+        )
+
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile, **kwargs) -> List[int]:
         return list(range(self.fp4_gemm_runner.get_num_configs()))
@@ -446,6 +481,12 @@ class CublasLtFP4GemmRunner(TunableRunner):
                     output_dtype)
 
         self.cublaslt_runner = CublasLtFP4GemmRunner.runner_dict[instance_key]
+
+    def unique_id(self):
+        return hash((
+            self.to_userbuffers,
+            self.output_dtype,
+        ))
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile, **kwargs) -> List[int]:
@@ -591,6 +632,15 @@ class FP8BatchedGemmRunner(TunableRunner):
                     tile_size, epilogue_tile_m)
 
         self.kernel_runner = FP8BatchedGemmRunner.runner_dict[instance_key]
+
+    def unique_id(self):
+        return (
+            self.output_dtype,
+            self.use_deep_seek_fp8,
+            self.low_latency_kernel,
+            self.tile_size,
+            self.epilogue_tile_m,
+        )
 
     def forward(
         self,
@@ -827,6 +877,12 @@ class WeightOnlyQuantGemmRunner(TunableRunner):
         self.weight_only_quant_gemm_runner = WeightOnlyQuantGemmRunner.runner_dict[
             instance_key]
 
+    def unique_id(self):
+        return (
+            self.output_dtype,
+            self.to_userbuffers,
+        )
+
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile, **kwargs) -> List[int]:
         return list(range(self.weight_only_quant_gemm_runner.get_num_configs()))
@@ -894,6 +950,9 @@ class FinegrainedMixedDtypeGemm(TunableRunner):
 
     def __init__(self, activation_dtype: torch.dtype, output_dtype: torch.dtype,
                  quant_mode: int):
+        self.activation_dtype = activation_dtype
+        self.output_dtype = output_dtype
+        self.quant_mode = quant_mode
         instance_key = (activation_dtype, output_dtype, quant_mode)
         if instance_key not in FinegrainedMixedDtypeGemm._runner_dict:
             FinegrainedMixedDtypeGemm._runner_dict[
@@ -901,6 +960,13 @@ class FinegrainedMixedDtypeGemm(TunableRunner):
                     activation_dtype, output_dtype, quant_mode)
         self._finegrained_mixed_dtype_gemm_runner = FinegrainedMixedDtypeGemm._runner_dict[
             instance_key]
+
+    def unique_id(self):
+        return (
+            self.activation_dtype,
+            self.output_dtype,
+            self.quant_mode,
+        )
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile, **kwargs) -> List[int]:
@@ -1011,6 +1077,12 @@ class fp8SwapABGemmRunner(TunableRunner):
     def __init__(self, output_dtype: torch.dtype, disable_ue8m0_cast: bool):
         self.output_dtype = output_dtype
         self.disable_ue8m0_cast = disable_ue8m0_cast
+
+    def unique_id(self):
+        return (
+            self.output_dtype,
+            self.disable_ue8m0_cast,
+        )
 
     def get_valid_tactics(
         self,
