@@ -151,48 +151,30 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
         TLLM_LOG_DEBUG("copyBlock: DRAM mode complete. Returning...");
         return;
     }
-
-    std::vector<kvc::FileDesc> fileBlobs;
-    std::vector<kvc::MemoryDesc> memoryBlobs;
-
-    for (size_t poolIdx = 0; poolIdx < pools.size(); ++poolIdx)
+    else if (mode == executor::KvCacheTransferMode::GDS)
     {
-        auto ptr = isOffload ? computeBlockPointer(src, pools, poolIdx) : computeBlockPointer(dst, pools, poolIdx);
-        auto block_id = src->getBlockId();
+        std::vector<kvc::FileDesc> fileBlobs;
+        std::vector<kvc::MemoryDesc> memoryBlobs;
 
-        TLLM_CHECK_WITH_INFO(
-            !directory.empty(), "Expected a directory path for KVCache offload, but none was provided.");
-
-        int size = std::snprintf(nullptr, 0, "%s/block_%d_pool_%zu.bin", directory.c_str(), block_id, poolIdx);
-        std::string filename;
-        filename.resize(size + 1);
-        std::snprintf(
-            filename.data(), filename.size(), "%s/block_%d_pool_%zu.bin", directory.c_str(), block_id, poolIdx);
-
-        if (mode == executor::KvCacheTransferMode::POSIX_DEBUG_FALLBACK)
+        for (size_t poolIdx = 0; poolIdx < pools.size(); ++poolIdx)
         {
-            TLLM_LOG_INFO("Forcing POSIX fallback for file: %s", filename.c_str());
-            if (isOffload)
-            {
-                gpuToFilePosix(ptr, filename);
-            }
-            else
-            {
-                fileToGpuPosix(ptr, filename);
-            }
-            continue;
-        }
-        else if (mode == executor::KvCacheTransferMode::GDS)
-        {
+            auto ptr = isOffload ? computeBlockPointer(src, pools, poolIdx) : computeBlockPointer(dst, pools, poolIdx);
+            auto block_id = src->getBlockId();
+
+            TLLM_CHECK_WITH_INFO(
+                !directory.empty(), "Expected a directory path for KVCache offload, but none was provided.");
+
+            int size = std::snprintf(nullptr, 0, "%s/block_%d_pool_%zu.bin", directory.c_str(), block_id, poolIdx);
+            std::string filename;
+            filename.resize(size + 1);
+            std::snprintf(
+                filename.data(), filename.size(), "%s/block_%d_pool_%zu.bin", directory.c_str(), block_id, poolIdx);
 
             int openFlags = isOffload ? (O_CREAT | O_WRONLY) : O_RDONLY;
             fileBlobs.emplace_back(filename, openFlags, 0664, ptr->getSizeInBytes());
             memoryBlobs.emplace_back(ptr->data(), ptr->getSizeInBytes(), mDeviceId);
         }
-    }
 
-    if (mode == executor::KvCacheTransferMode::GDS)
-    {
         if (mLoopbackAgent == nullptr)
         {
             TLLM_LOG_DEBUG("KVCacheTransferManager: creating mLoopbackAgent lazily");
@@ -204,6 +186,23 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
         kvc::MemoryDescs memoryDescs(kvc::MemoryType::kVRAM, memoryBlobs);
 
         mLoopbackAgent->executeLoopbackRequest(memoryDescs, fileDescs, isOffload);
+    }
+    else if (mode == executor::KvCacheTransferMode::POSIX_DEBUG_FALLBACK)
+    {
+        TLLM_LOG_INFO("Forcing POSIX fallback for file: %s", filename.c_str());
+        if (isOffload)
+        {
+            gpuToFilePosix(ptr, filename);
+        }
+        else
+        {
+            fileToGpuPosix(ptr, filename);
+        }
+    }
+    else
+    {
+        // Expected to be unreachable
+        TLLM_LOG_ERROR("Unexpected mode: %d", static_cast<int>(mode));
     }
 }
 
