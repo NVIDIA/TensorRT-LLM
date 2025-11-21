@@ -544,6 +544,13 @@ def find_free_port() -> int:
         return s.getsockname()[1]
 
 
+def find_free_ipc_addr() -> str:
+    import os
+    import tempfile
+    import uuid
+    return f'ipc://{os.path.join(tempfile.gettempdir(), "rpc_" + str(uuid.uuid4()))}'
+
+
 def get_mpi_world_size() -> int:
     # avoid cyclic import
     from ..executor.utils import get_spawn_proxy_process_env
