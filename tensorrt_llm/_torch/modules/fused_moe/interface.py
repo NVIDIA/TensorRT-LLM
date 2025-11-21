@@ -198,6 +198,7 @@ class MoE(nn.Module):
         self.parallel_rank = self.mapping.tp_rank
         self.parallel_size = self.mapping.tp_size
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
+        self.expand_intermediate_size_per_partition = self.intermediate_size_per_partition * self.intermediate_size_expand_ratio
 
         self.all_reduce = None
         if not self.use_dp and self.mapping.tp_size > 1:
