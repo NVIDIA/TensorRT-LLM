@@ -2131,6 +2131,13 @@ def pytest_addoption(parser):
         "Number of completed tests before triggering a periodic save (default: 10). "
         "Only used with --periodic-junit.",
     )
+    parser.addoption(
+        "--periodic-junit-xmlpath",
+        action="store",
+        default=None,
+        help="Path to the output XML file for periodic JUnit XML reporter. "
+        "Only used with --periodic-junit.",
+    )
 
 
 @pytest.hookimpl(trylast=True)
@@ -2235,7 +2242,8 @@ def pytest_configure(config):
     # Initialize PeriodicJUnitXML reporter if enabled
     periodic = config.getoption("--periodic-junit", default=False)
     output_dir = config.getoption("--output-dir", default=None)
-
+    periodic_junit_xmlpath = config.getoption("--periodic-junit-xmlpath",
+                                              default=None)
     if periodic and output_dir:
         periodic_interval = config.getoption("--periodic-interval")
         periodic_batch_size = config.getoption("--periodic-batch-size")
@@ -2245,7 +2253,8 @@ def pytest_configure(config):
         os.makedirs(output_dir, exist_ok=True)
 
         # Create the reporter with logger
-        xmlpath = os.path.join(output_dir, "results.xml")
+        xmlpath = periodic_junit_xmlpath or os.path.join(
+            output_dir, "results.xml")
         reporter = PeriodicJUnitXML(
             xmlpath=xmlpath,
             interval=periodic_interval,
