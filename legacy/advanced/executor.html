@@ -32,7 +32,7 @@
 <link href="../../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
-    <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
     <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=13237357" />
@@ -43,6 +43,8 @@
   <!-- Pre-loaded scripts that we'll load fully later -->
   <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
 <link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+
 
     <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
     <script src="../../_static/doctools.js?v=9a2dae69"></script>
@@ -59,20 +61,24 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc2';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc3';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
+
     <link rel="icon" href="../../_static/favicon.png"/>
+
     <link rel="index" title="Index" href="../../genindex.html" />
     <link rel="search" title="Search" href="../../search.html" />
 
+
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc2" />
+  <meta name="docsearch:version" content="1.2.0rc3" />
 
 
   </head>
+
   
   
   <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
@@ -80,6 +86,8 @@
   
   
   <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+
   
   <div id="pst-scroll-pixel-helper"></div>
   
@@ -509,7 +517,7 @@
 <p>TensorRT-LLM includes a high-level C++ API called the Executor API which allows you to execute requests
 asynchronously, with in-flight batching, and without the need to define callbacks.</p>
 <p>A software component (referred to as “the client” in the text that follows) can interact
-with the executor using the API defined in the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/3111682/cpp/include/tensorrt_llm/executor/executor.h"><code class="docutils literal notranslate"><span class="pre">executor.h</span></code></a> file.
+with the executor using the API defined in the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/2128f73/cpp/include/tensorrt_llm/executor/executor.h"><code class="docutils literal notranslate"><span class="pre">executor.h</span></code></a> file.
 For details about the API, refer to the <span class="xref std std-ref">_cpp_gen/executor.rst</span>.</p>
 <p>The following sections provide an overview of the main classes defined in the Executor API.</p>
 <section id="api">
@@ -577,7 +585,7 @@ This allows the runtime to reconfigure itself for a new beam width when no reque
 <span class="n">stop_token_ids</span> <span class="o">=</span> <span class="p">[</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">eos_token_id</span><span class="p">]</span>
 </pre></div>
 </div>
-<p>Refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/3111682/tensorrt_llm/llmapi/tokenizer.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm/llmapi/tokenizer.py</span></code></a> for more details. You may dump these materials to disk, and reload them to C++ runtime for use.</p>
+<p>Refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/2128f73/tensorrt_llm/llmapi/tokenizer.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm/llmapi/tokenizer.py</span></code></a> for more details. You may dump these materials to disk, and reload them to C++ runtime for use.</p>
 <p>Each request can be optionally specified with a <code class="docutils literal notranslate"><span class="pre">GuidedDecodingParams</span></code>, which defines the desired structured format. Currently, it supports four types:</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">GuidedDecodingParams::GuideType::kJSON</span></code>: The generated text is amenable to JSON format;</p></li>
@@ -626,12 +634,12 @@ This allows the runtime to reconfigure itself for a new beam width when no reque
 </section>
 <section id="c-executor-api-example">
 <h2>C++ Executor API Example<a class="headerlink" href="#c-executor-api-example" title="Link to this heading">#</a></h2>
-<p>Two C++ examples are provided that shows how to use the Executor API and can be found in the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/3111682/examples/cpp/executor/"><code class="docutils literal notranslate"><span class="pre">examples/cpp/executor</span></code></a> folder.</p>
+<p>Two C++ examples are provided that shows how to use the Executor API and can be found in the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/2128f73/examples/cpp/executor/"><code class="docutils literal notranslate"><span class="pre">examples/cpp/executor</span></code></a> folder.</p>
 </section>
 <section id="python-bindings-for-the-executor-api">
 <h2>Python Bindings for the Executor API<a class="headerlink" href="#python-bindings-for-the-executor-api" title="Link to this heading">#</a></h2>
-<p>Python bindings for the Executor API are also available to use the Executor API from Python. The Python bindings are defined in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/3111682/cpp/tensorrt_llm/pybind/executor/bindings.cpp">bindings.cpp</a> and once built, are available in package <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.bindings.executor</span></code>. Running <code class="docutils literal notranslate"><span class="pre">'help('tensorrt_llm.bindings.executor')</span></code> in a Python interpreter will provide an overview of the classes available.</p>
-<p>In addition, three Python examples are provided to demonstrate how to use the Python bindings to the Executor API for single and multi-GPU models. They can be found in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/3111682/examples/bindings"><code class="docutils literal notranslate"><span class="pre">examples/bindings</span></code></a>.</p>
+<p>Python bindings for the Executor API are also available to use the Executor API from Python. The Python bindings are defined in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/2128f73/cpp/tensorrt_llm/pybind/executor/bindings.cpp">bindings.cpp</a> and once built, are available in package <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.bindings.executor</span></code>. Running <code class="docutils literal notranslate"><span class="pre">'help('tensorrt_llm.bindings.executor')</span></code> in a Python interpreter will provide an overview of the classes available.</p>
+<p>In addition, three Python examples are provided to demonstrate how to use the Python bindings to the Executor API for single and multi-GPU models. They can be found in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/2128f73/examples/bindings"><code class="docutils literal notranslate"><span class="pre">examples/bindings</span></code></a>.</p>
 </section>
 <section id="in-flight-batching-with-the-triton-inference-server">
 <h2>In-flight Batching with the Triton Inference Server<a class="headerlink" href="#in-flight-batching-with-the-triton-inference-server" title="Link to this heading">#</a></h2>
@@ -711,9 +719,11 @@ the TensorRT-LLM C++ Executor API.</p>
     </div>
   </div>
   
+
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
   <script defer src="../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
 <script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
 
   <footer class="bd-footer">
 <div class="bd-footer__inner bd-page-width">
@@ -736,12 +746,7 @@ the TensorRT-LLM C++ Executor API.</p>
   
   
   
-  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
-   | 
-  
-  
-  
-  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Your Privacy Choices</a>
    | 
   
   
@@ -789,9 +794,9 @@ the TensorRT-LLM C++ Executor API.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 05, 2025.</p>
+  <p>Last updated on November 20, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/3111682">3111682</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/2128f73">2128f73</a>.</p>
   
 </div></div>
       
