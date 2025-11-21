@@ -137,8 +137,7 @@ bool AllreducePlugin::supportsFormatCombination(
     int pos, nvinfer1::PluginTensorDesc const* inOut, int nbInputs, int nbOutputs) noexcept
 {
     int base_inputs = 0;
-    if (mStrategy == AllReduceStrategyType::NCCL || mStrategy == AllReduceStrategyType::UB
-        || mStrategy == AllReduceStrategyType::NCCL_SYMMETRIC)
+    if (mStrategy == AllReduceStrategyType::NCCL || mStrategy == AllReduceStrategyType::UB)
     {
         base_inputs = 1;
     }

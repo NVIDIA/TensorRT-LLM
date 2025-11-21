@@ -444,17 +444,17 @@ private:
         {
             auto torchPg = std::get<1>(mNcclComm);
 
-            torch::Tensor reduce_output = input.clone();
-            std::vector tensors{reduce_output};
+            torch::Tensor reduceOutput = input.clone();
+            std::vector tensors{reduceOutput};
             PGCHECK_THROW(torchPg->allreduce(tensors, {c10d::ReduceOp::SUM}));
 
             if (mOp == AllReduceFusionOp::NONE)
             {
-                return {reduce_output};
+                return {reduceOutput};
             }
 
             // Treat any other patterns as fallback cases.
-            return fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, reduce_output);
+            return fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, reduceOutput);
         }
 
         // From here on, we have a raw NCCL comm - can proceed with window registration
@@ -468,72 +468,72 @@ private:
 
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
         int size = input.numel();
-        size_t buffer_size_bytes = size * input.element_size();
+        size_t bufferSizeBytes = size * input.element_size();
 
         // Manual tuning
         double const a = -4986.43478503;
         double const b = 156716.52177552;
         int nRanks;
         NCCLCHECK_THROW(ncclCommCount(comm, &nRanks));
-        size_t min_registration_threshold = static_cast<size_t>(std::max(0.0, a * nRanks + b)) * input.element_size();
-        char const* env_threshold = std::getenv("TLLM_NCCL_MIN_REGISTRATION");
-        if (env_threshold != nullptr)
+        size_t minRegistrationThreshold = static_cast<size_t>(std::max(0.0, a * nRanks + b)) * input.element_size();
+        char const* envThreshold = std::getenv("TLLM_NCCL_MIN_REGISTRATION");
+        if (envThreshold != nullptr)
         {
-            min_registration_threshold = static_cast<size_t>(std::atoi(env_threshold)) * input.element_size();
+            minRegistrationThreshold = static_cast<size_t>(std::atoi(envThreshold)) * input.element_size();
         }
 
         // Search for existing buffer
         auto& allocator = NCCLWindowAllocator::getInstance();
-        auto window_buffer0 = allocator.searchBuffer(comm, input.data_ptr());
+        auto windowBuffer0 = allocator.searchBuffer(comm, input.data_ptr());
 
-        torch::Tensor input_tensor = input;
-        void* input_ptr = input.data_ptr();
+        torch::Tensor inputTensor = input;
+        void* inputPtr = input.data_ptr();
 
         // If buffer is not registered, decide whether to register based on size
-        if (!window_buffer0.isValid())
+        if (!windowBuffer0.isValid())
         {
-            if (buffer_size_bytes < min_registration_threshold)
+            if (bufferSizeBytes < minRegistrationThreshold)
             {
                 // Small buffer: use input directly without window registration
                 TLLM_LOG_DEBUG(
                     "[runNCCLAllReduceSymmetric] Buffer size %zu bytes < threshold %zu bytes, "
                     "skipping window registration",
-                    buffer_size_bytes, min_registration_threshold);
-                // input_tensor and input_ptr remain pointing to original input
+                    bufferSizeBytes, minRegistrationThreshold);
+                // inputTensor and inputPtr remain pointing to original input
             }
             else
             {
-                // Large buffer: create window buffer and copy input (can swap input_tensor reference)
-                auto [symmetric_input, symmetric_buffer0]
+                // Large buffer: create window buffer and copy input (can swap inputTensor reference)
+                auto [symmetricInput, symmetricBuffer0]
                     = createNCCLWindowTensor(comm, input.sizes(), input.scalar_type());
                 TLLM_CUDA_CHECK(cudaMemcpyAsync(
-                    symmetric_buffer0.ptr, input.data_ptr(), buffer_size_bytes, cudaMemcpyDeviceToDevice, stream));
-                window_buffer0 = symmetric_buffer0;
-                input_tensor = symmetric_input; // Swap to window-backed tensor
-                input_ptr = window_buffer0.ptr;
+                    symmetricBuffer0.ptr, input.data_ptr(), bufferSizeBytes, cudaMemcpyDeviceToDevice, stream));
+                windowBuffer0 = symmetricBuffer0;
+                inputTensor = symmetricInput; // Swap to window-backed tensor
+                inputPtr = windowBuffer0.ptr;
             }
         }
         else
         {
             // Buffer already registered - use it directly
-            input_ptr = window_buffer0.ptr;
+            inputPtr = windowBuffer0.ptr;
         }
 
         // Use window-backed output buffer
-        auto [norm_out, window_buffer1] = createNCCLWindowTensor(comm, input.sizes(), input.scalar_type());
-        torch::Tensor output_tensor = norm_out;
-        void* output_ptr = window_buffer1.ptr;
+        auto [normOut, windowBuffer1] = createNCCLWindowTensor(comm, input.sizes(), input.scalar_type());
+        torch::Tensor outputTensor = normOut;
+        void* outputPtr = windowBuffer1.ptr;
 
         // Perform allreduce
-        NCCLCHECK_THROW(ncclAllReduce(input_ptr, output_ptr, size, (*getDtypeMap())[mType], ncclSum, comm, stream));
+        NCCLCHECK_THROW(ncclAllReduce(inputPtr, outputPtr, size, (*getDtypeMap())[mType], ncclSum, comm, stream));
 
         if (mOp == AllReduceFusionOp::NONE)
         {
-            return {output_tensor};
+            return {outputTensor};
         }
 
         // Treat any other patterns as fallback cases.
-        return fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, output_tensor);
+        return fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, outputTensor);
     }
 
     std::vector<torch::Tensor> runLowPrecisionAllReduce(torch::Tensor const& input,

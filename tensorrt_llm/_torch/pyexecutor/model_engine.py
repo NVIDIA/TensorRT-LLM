@@ -2846,14 +2846,15 @@ class PyTorchModelEngine(ModelEngine):
             return False
         # NCCL_SYMMETRIC strategy no longer requires UserBuffer allocator initialization.
         # It uses NCCLWindowAllocator from ncclUtils directly.
-        use_nccl_symmetric = False
         if self.llm_args.allreduce_strategy == "NCCL_SYMMETRIC":
             # Skip UB initialization for NCCL_SYMMETRIC - it uses NCCLWindowAllocator directly
             return False
-        ub.initialize_userbuffers_manager(
-            self.mapping.tp_size, self.mapping.pp_size, self.mapping.cp_size,
-            self.mapping.rank, self.mapping.gpus_per_node,
-            hidden_size * self.max_num_tokens * 2, use_nccl_symmetric)
+        ub.initialize_userbuffers_manager(self.mapping.tp_size,
+                                          self.mapping.pp_size,
+                                          self.mapping.cp_size,
+                                          self.mapping.rank,
+                                          self.mapping.gpus_per_node,
+                                          hidden_size * self.max_num_tokens * 2)
 
         return True
 

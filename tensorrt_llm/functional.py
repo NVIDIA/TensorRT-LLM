@@ -4022,11 +4022,8 @@ def create_allreduce_plugin(
     pfc = trt.PluginFieldCollection(pfc)
     ar_plug = allreduce_plg_creator.create_plugin("allreduce", pfc)
     plug_inputs = [tensor]
-    if all_reduce_params.strategy not in (AllReduceStrategy.NCCL,
-                                          AllReduceStrategy.UB,
-                                          AllReduceStrategy.NCCL_SYMMETRIC):
-        if workspace is not None:
-            plug_inputs.append(workspace)
+    if all_reduce_params.strategy != AllReduceStrategy.NCCL and all_reduce_params.strategy != AllReduceStrategy.UB:
+        plug_inputs.append(workspace)
     if all_reduce_params.fusion_op != AllReduceFusionOp.NONE:
         if all_reduce_params.has_bias() == 1:
             plug_inputs.append(all_reduce_params.bias.trt_tensor)
