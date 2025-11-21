@@ -1100,11 +1100,11 @@ def rocket_paged_kt_cache_bmm_kernel(
 
     q_values = q_values.to(kt_cache_tensor_ptr.dtype.element_ty)
 
-    for kt_block_idx_start in tl.range(0,
-                                       num_kt_tokens,
-                                       KT_BLOCK_SIZE,
-                                       flatten=True,
-                                       warp_specialize=True):
+    for kt_block_idx_start in tl.range(
+            0,
+            num_kt_tokens,
+            KT_BLOCK_SIZE,
+    ):
         kt_block_idx_start = tl.multiple_of(kt_block_idx_start, KT_BLOCK_SIZE)
 
         kt_token_indices = kt_block_idx_start + tl.arange(0, KT_BLOCK_SIZE)
