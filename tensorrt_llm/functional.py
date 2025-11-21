@@ -3279,8 +3279,6 @@ def identity(input: Tensor) -> Tensor:
     '''
     Add an identity operation.
 
-    TODO: Document why it can be done using a plugin!!!
-
     Parameters:
         input : Tensor
             The input tensor.
