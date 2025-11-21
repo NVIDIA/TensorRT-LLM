@@ -216,6 +216,8 @@ struct KernelTraits<1>
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+constexpr int DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA = 128;
+
 template <typename KernelParams>
 __global__ void activationDeepSeekKernel(KernelParams params)
 {
@@ -224,7 +226,7 @@ __global__ void activationDeepSeekKernel(KernelParams params)
     using KernelTraits = KernelTraits<NumTokensPerCta>;
     using MaxOp = typename KernelTraits::MaxOp;
     using PackedType = typename KernelTraits::PackedType;
-    using BlockReduce = cub::BlockReduce<PackedType, 128>;
+    using BlockReduce = cub::BlockReduce<PackedType, DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA>;
 
     __shared__ float s_scaleOutArr[NumTokensPerCta];
     __shared__ typename BlockReduce::TempStorage tempStorage;
@@ -260,6 +262,16 @@ __global__ void activationDeepSeekKernel(KernelParams params)
             for (int hiddenIdx = threadIdx.x + blockDim.x * blockIdx.x; hiddenIdx < params.innerDim / 2;
                  hiddenIdx += blockDim.x * gridDim.x)
             {
+#pragma unroll
+                for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++)
+                {
+                    scale1Arr[tokenInCtaIdx] = 0.0f;
+                    scale2Arr[tokenInCtaIdx] = 0.0f;
+                    dataX1Arr[tokenInCtaIdx] = 0.0f;
+                    dataX2Arr[tokenInCtaIdx] = 0.0f;
+                    outArr[tokenInCtaIdx] = 0.0f;
+                    absOutArr[tokenInCtaIdx] = 0.0f;
+                }
 #pragma unroll
                 for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++)
                 {
@@ -366,7 +378,6 @@ void run(Data const& data, void* stream)
     {
         constexpr int NUM_ELTS_PER_LOAD = 1;
         constexpr int NUM_ELTS_PER_SF = 128;
-        int const NUM_THREADS_PER_CTA = 128;
 
         int device{-1};
         cudaGetDevice(&device);
@@ -398,7 +409,8 @@ void run(Data const& data, void* stream)
 
         const dim3 grid(gridSizeX, gridSizeY, data.topK);
 
-        LAUNCH_ACTIVATION(data, activationDeepSeekKernel, numTokensPerCta, grid, NUM_THREADS_PER_CTA, 0, stream);
+        LAUNCH_ACTIVATION(
+            data, activationDeepSeekKernel, numTokensPerCta, grid, DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA, 0, stream);
     }
     else
     {
