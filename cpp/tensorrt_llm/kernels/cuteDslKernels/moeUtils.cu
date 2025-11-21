@@ -31,6 +31,7 @@ namespace
 {
 using ElemCopyType = uint4;
 using SFCopyType = uint32_t;
+using ActivationType = tensorrt_llm::kernels::cutlass_kernels::ActivationType;
 
 template <typename T>
 auto constexpr bitsPerElem()
@@ -385,23 +386,43 @@ void moeActivation(InputType const* input, OutputType* output, float const* glob
     int32_t const blocks = std::min(smCount, max_num_permuted_tokens);
     int32_t const threads = kThreadsPerBlock;
 
-    auto kernel_array
-        = std::array{&moeActivationKernel<InputType, OutputType, SFType, kSFVecSize,
-                         cutlass_kernels::IdentityAdaptor<cutlass::epilogue::thread::GELU>, kThreadsPerBlock>,
-            &moeActivationKernel<InputType, OutputType, SFType, kSFVecSize,
-                cutlass_kernels::IdentityAdaptor<cutlass::epilogue::thread::ReLu>, kThreadsPerBlock>,
-            &moeActivationKernel<InputType, OutputType, SFType, kSFVecSize,
-                cutlass_kernels::IdentityAdaptor<cutlass::epilogue::thread::SiLu>, kThreadsPerBlock>,
-            &moeActivationKernel<InputType, OutputType, SFType, kSFVecSize,
-                cutlass_kernels::GLUAdaptor<cutlass::epilogue::thread::SiLu>, kThreadsPerBlock>,
-            &moeActivationKernel<InputType, OutputType, SFType, kSFVecSize,
-                cutlass_kernels::GLUAdaptor<cutlass::epilogue::thread::GELU>, kThreadsPerBlock>,
-            &moeActivationKernel<InputType, OutputType, SFType, kSFVecSize, cutlass_kernels::SwigluBiasAdaptor,
-                kThreadsPerBlock>,
-            &moeActivationKernel<InputType, OutputType, SFType, kSFVecSize,
-                cutlass_kernels::IdentityAdaptor<cutlass::epilogue::thread::Identity>, kThreadsPerBlock>};
-
-    auto kernel = kernel_array[static_cast<int32_t>(activation_params.activation_type)];
+    auto get_act_kernel = [](ActivationType activation_type) -> void (*)(InputType const* input, OutputType* output,
+                                                                 float const* global_sf, SFType* output_sf,
+                                                                 int32_t const* tile_idx_to_mn_limit,
+                                                                 int32_t const* num_non_exiting_tiles,
+                                                                 int32_t const interm_size, int32_t const tile_size)
+    {
+        switch (activation_type)
+        {
+        case ActivationType::Identity:
+            return &moeActivationKernel<InputType, OutputType, SFType, kSFVecSize,
+                cutlass_kernels::IdentityAdaptor<cutlass::epilogue::thread::Identity>, kThreadsPerBlock>;
+        case ActivationType::Gelu:
+            return &moeActivationKernel<InputType, OutputType, SFType, kSFVecSize,
+                cutlass_kernels::IdentityAdaptor<cutlass::epilogue::thread::GELU>, kThreadsPerBlock>;
+        case ActivationType::Geglu:
+            return &moeActivationKernel<InputType, OutputType, SFType, kSFVecSize,
+                cutlass_kernels::GLUAdaptor<cutlass::epilogue::thread::GELU>, kThreadsPerBlock>;
+        case ActivationType::Relu:
+            return &moeActivationKernel<InputType, OutputType, SFType, kSFVecSize,
+                cutlass_kernels::IdentityAdaptor<cutlass::epilogue::thread::ReLu>, kThreadsPerBlock>;
+        case ActivationType::Silu:
+            return &moeActivationKernel<InputType, OutputType, SFType, kSFVecSize,
+                cutlass_kernels::IdentityAdaptor<cutlass::epilogue::thread::SiLu>, kThreadsPerBlock>;
+        case ActivationType::Swiglu:
+            return &moeActivationKernel<InputType, OutputType, SFType, kSFVecSize,
+                cutlass_kernels::GLUAdaptor<cutlass::epilogue::thread::SiLu>, kThreadsPerBlock>;
+        case ActivationType::SwigluBias:
+            return &moeActivationKernel<InputType, OutputType, SFType, kSFVecSize, cutlass_kernels::SwigluBiasAdaptor,
+                kThreadsPerBlock>;
+        case ActivationType::Relu2:
+            // Unsupported activation type
+            break;
+        }
+        TLLM_CHECK_WITH_INFO(false, "Unsupported activation type: %d", int(activation_type));
+        return nullptr;
+    };
+    auto kernel = get_act_kernel(activation_params.activation_type);
 
     cudaLaunchConfig_t config;
     config.gridDim = blocks;
