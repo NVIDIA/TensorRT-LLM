@@ -470,7 +470,16 @@ private:
         int size = input.numel();
         size_t bufferSizeBytes = size * input.element_size();
 
-        // Manual tuning
+        // Using unregistered input buffers with NCCL symmetric, requires a memcpy
+        // This is an overhead introduced with using NCCL_SYMMTRIC over NCCL.
+        // Both the memcpy and the perf benefit from using NCCL_SYMMETRIC scale linear with the message size.
+        // But a local memcpy is cheaper than the remote operations, so with larger message sizes the benefit is
+        // stronger. Additionally, the perf benefit scales with the number of ranks, since multimem enables O(const.)
+        // versus O(N) complexity. Hence we model this cutoff with a linear model. The numbers below were obtained on
+        // GB200, scanning different message sizes and ranks. You can determine the regression onset for each number of
+        // ranks to a single message size. And the following formula was obtained by fitting a linear model to the
+        // regression onset. It is possible to override this empirical heuristic with the TLLM_NCCL_MIN_REGISTRATION
+        // environment variable.
         double const a = -4986.43478503;
         double const b = 156716.52177552;
         int nRanks;
