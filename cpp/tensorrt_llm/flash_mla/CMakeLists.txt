@@ -11,6 +11,14 @@ endif()
 set(FLASH_MLA_SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/flashmla-src)
 get_filename_component(FLASH_MLA_SOURCE_DIR ${FLASH_MLA_SOURCE_DIR} ABSOLUTE)
 
+# Check if submodules are initialized
+if(NOT EXISTS ${FLASH_MLA_SOURCE_DIR}/csrc/cutlass/include)
+  message(
+    FATAL_ERROR
+      "FlashMLA submodules not initialized. Something went wrong with FetchContent"
+  )
+endif()
+
 # Compiler compatibility for SM100 inline assembly
 # =================================================
 # FlashMLA SM100 contains PTX inline assembly that Clang++ on ARM64 incorrectly
