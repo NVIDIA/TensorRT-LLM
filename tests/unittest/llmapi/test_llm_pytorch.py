@@ -54,36 +54,40 @@ def test_tinyllama_logits_processor(enable_chunked_prefill):
 
 @skip_ray
 @pytest.mark.parametrize(
-    "return_context_logits, use_overlap, enable_iter_req_stats", [
-        (False, False, False),
-        (False, False, True),
-        (False, True, False),
-        (False, True, True),
+    "return_context_logits, use_overlap, enable_chunked_prefill, enable_iter_req_stats",
+    [
+        (False, False, False, True),
+        (False, False, True, True),
+        (False, True, False, True),
+        (False, True, True, True),
     ])
 def test_llm_get_stats(return_context_logits, use_overlap,
-                       enable_iter_req_stats):
+                       enable_chunked_prefill, enable_iter_req_stats):
     llm_get_stats_test_harness(tp_size=1,
+                               pp_size=1,
                                return_context_logits=return_context_logits,
                                pytorch_backend=True,
                                use_overlap=use_overlap,
+                               enable_chunked_prefill=enable_chunked_prefill,
                                enable_iter_req_stats=enable_iter_req_stats)
 
 
 @skip_ray
 @pytest.mark.parametrize(
-    "return_context_logits, use_overlap, enable_iter_req_stats", [
-        (False, False, False),
-        (False, False, True),
-        (False, True, False),
-        (False, True, True),
+    "return_context_logits, use_overlap, enable_chunked_prefill, enable_iter_req_stats",
+    [
+        (False, False, False, True),
+        (False, True, False, True),
     ])
 def test_llm_get_stats_async(return_context_logits, use_overlap,
-                             enable_iter_req_stats):
+                             enable_chunked_prefill, enable_iter_req_stats):
     llm_get_stats_async_test_harness(
         tp_size=1,
+        pp_size=1,
         return_context_logits=return_context_logits,
         pytorch_backend=True,
         use_overlap=use_overlap,
+        enable_chunked_prefill=enable_chunked_prefill,
         enable_iter_req_stats=enable_iter_req_stats)
 
 

@@ -2046,39 +2046,64 @@ def test_llm_handling_per_request_submit_error():
     batch_task()
 
 
-def validate_stats(results,
-                   pytorch_backend,
-                   max_tokens,
-                   enable_iter_req_stats=False):
+def validate_stats(
+    *,
+    results,
+    pytorch_backend,
+    max_tokens,
+    use_overlap=False,
+    enable_chunked_prefill=False,
+    enable_iter_req_stats=False,
+):
     assert results
-    assert len(results) == max_tokens if pytorch_backend else max_tokens + 1
+    expected_num_results = max_tokens if pytorch_backend else max_tokens + 1
+    if enable_chunked_prefill:
+        expected_num_results += 1
+    assert len(results) == expected_num_results
+
+    context_iterations = 2 if enable_chunked_prefill else 1
+    generation_iterations = max_tokens - 1
     for iter, result in enumerate(results):
         ifbStats = result["inflightBatchingStats"]
-        expected_num_scheduled = 1 if (iter < max_tokens) else 0
-        assert ifbStats["numScheduledRequests"] == expected_num_scheduled
-        if iter == 0:
+
+        if iter < context_iterations:
+            assert ifbStats["numScheduledRequests"] == 1
             assert ifbStats["numContextRequests"] == 1
             assert ifbStats["numGenRequests"] == 0
             assert result["numActiveRequests"] == 1
-        elif iter == max_tokens:
-            assert ifbStats["numContextRequests"] == 0
-            assert ifbStats["numGenRequests"] == 0
-            assert result["numActiveRequests"] == 0
-        else:
+        elif iter < (context_iterations + generation_iterations):
+            assert ifbStats["numScheduledRequests"] == 1
             assert ifbStats["numContextRequests"] == 0
             assert ifbStats["numGenRequests"] == 1
             assert result["numActiveRequests"] == 1
+        else:
+            assert ifbStats["numScheduledRequests"] == 0
+            assert ifbStats["numContextRequests"] == 0
+            assert ifbStats["numGenRequests"] == 0
+            assert result["numActiveRequests"] == 0
 
         if enable_iter_req_stats:
             assert "requestStats" in result
             req_stats = result["requestStats"]
             assert len(req_stats) == 1
             req_stat = req_stats[0]
-            assert req_stat["numGeneratedTokens"] == iter + 1
+            if iter < (context_iterations - 1):
+                # If use_overlap, the stats are one iteration ahead
+                assert req_stat[
+                    "stage"] == "GENERATION_IN_PROGRESS" if use_overlap else "CONTEXT_IN_PROGRESS"
+                assert req_stat[
+                    "contextPrefillPosition"] == 54 if use_overlap else 32
+                assert req_stat["numGeneratedTokens"] == 0
+            elif iter < (context_iterations - 1 + generation_iterations):
+                assert req_stat["stage"] == "GENERATION_IN_PROGRESS"
+                assert req_stat["contextPrefillPosition"] == 54
+                assert req_stat["numGeneratedTokens"] == iter - (
+                    context_iterations - 1) + 1
+            else:
+                assert req_stat["stage"] == "GENERATION_COMPLETE"
+                assert req_stat["contextPrefillPosition"] == 54
+                assert req_stat["numGeneratedTokens"] == max_tokens
             assert req_stat["scheduled"] == True
-            assert req_stat[
-                "stage"] == "GENERATION_IN_PROGRESS" if iter + 1 < max_tokens else "GENERATION_COMPLETE"
-            assert req_stat["contextPrefillPosition"] == 4
 
         expected_num_completed = 1 if iter == len(results) - 1 else 0
 
@@ -2088,9 +2113,11 @@ def validate_stats(results,
 
 
 def llm_get_stats_test_harness(tp_size: int = 1,
+                               pp_size: int = 1,
                                return_context_logits: bool = False,
                                pytorch_backend: bool = False,
                                use_overlap: bool = False,
+                               enable_chunked_prefill: bool = False,
                                enable_iter_req_stats: bool = False):
 
     if return_context_logits and pytorch_backend:
@@ -2104,6 +2131,7 @@ def llm_get_stats_test_harness(tp_size: int = 1,
     print("return_context_logits: ", return_context_logits)
     print("pytorch_backend: ", pytorch_backend)
     print("use_overlap: ", use_overlap)
+    print("enable_chunked_prefill: ", enable_chunked_prefill)
     print("enable_iter_req_stats: ", enable_iter_req_stats)
     print("-------------")
 
@@ -2113,6 +2141,10 @@ def llm_get_stats_test_harness(tp_size: int = 1,
         llm_args_extra["build_config"] = BuildConfig(gather_context_logits=True)
         llm_args_extra["gather_generation_logits"] = True
         sampling_args_extra["return_context_logits"] = True
+
+    if enable_chunked_prefill:
+        llm_args_extra["enable_chunked_prefill"] = True
+        llm_args_extra["max_num_tokens"] = 32
 
     if pytorch_backend:
         llm_args_extra.update(
@@ -2126,27 +2158,38 @@ def llm_get_stats_test_harness(tp_size: int = 1,
     if not pytorch_backend:
         llm_args_extra["fast_build"] = True
 
-    llm = LLM_CLASS(model=llama_model_path,
-                    kv_cache_config=global_kvcache_config,
-                    tensor_parallel_size=tp_size,
-                    **llm_args_extra)
+    with LLM_CLASS(model=llama_model_path,
+                   kv_cache_config=global_kvcache_config,
+                   tensor_parallel_size=tp_size,
+                   pipeline_parallel_size=pp_size,
+                   **llm_args_extra) as llm:
 
-    max_tokens = 5
-    sampling_params = SamplingParams(max_tokens=max_tokens,
-                                     **sampling_args_extra)
+        max_tokens = 5
+        sampling_params = SamplingParams(max_tokens=max_tokens,
+                                         **sampling_args_extra)
 
-    for output in llm.generate(prompts, sampling_params=sampling_params):
-        print(output)
+        long_prompts = [
+            "A B C D E F G H I J K L M N O P Q R S T U V W X Y Z " * 2
+        ]
 
-    results = llm.get_stats(2)
+        for output in llm.generate(long_prompts,
+                                   sampling_params=sampling_params):
+            print(output)
 
-    validate_stats(results, pytorch_backend, max_tokens, enable_iter_req_stats)
+        results = llm.get_stats(2)
 
-    assert not llm.get_stats(2)
+        validate_stats(results=results,
+                       pytorch_backend=pytorch_backend,
+                       max_tokens=max_tokens,
+                       use_overlap=use_overlap,
+                       enable_chunked_prefill=enable_chunked_prefill,
+                       enable_iter_req_stats=enable_iter_req_stats)
 
-    # test that IterationResult()._done is properly set
-    _ = llm.generate(prompts, sampling_params=sampling_params)
-    assert llm.get_stats(2)
+        assert not llm.get_stats(2)
+
+        # test that IterationResult()._done is properly set
+        _ = llm.generate(prompts, sampling_params=sampling_params)
+        assert llm.get_stats(2)
 
 
 @pytest.mark.parametrize("return_context_logits", [True, False])
@@ -2214,9 +2257,11 @@ def test_llm_get_queued_stats():
 
 
 def llm_get_stats_async_test_harness(tp_size: int = 1,
+                                     pp_size: int = 1,
                                      return_context_logits: bool = False,
                                      pytorch_backend: bool = False,
                                      use_overlap: bool = False,
+                                     enable_chunked_prefill: bool = False,
                                      enable_iter_req_stats: bool = False):
 
     if return_context_logits and pytorch_backend:
@@ -2230,6 +2275,7 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
     print("return_context_logits: ", return_context_logits)
     print("pytorch_backend: ", pytorch_backend)
     print("use_overlap: ", use_overlap)
+    print("enable_chunked_prefill: ", enable_chunked_prefill)
     print("enable_iter_req_stats: ", enable_iter_req_stats)
     print("-------------")
 
@@ -2238,6 +2284,10 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
     if return_context_logits:
         llm_args_extra["build_config"] = BuildConfig(gather_context_logits=True)
         sampling_args_extra["return_context_logits"] = True
+
+    if enable_chunked_prefill:
+        llm_args_extra["enable_chunked_prefill"] = True
+        llm_args_extra["max_num_tokens"] = 32
 
     if pytorch_backend:
         llm_args_extra.update(
@@ -2249,38 +2299,47 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
         LLM_CLASS = LLM
         llm_args_extra["fast_build"] = True
 
-    llm = LLM_CLASS(model=llama_model_path,
-                    kv_cache_config=global_kvcache_config,
-                    tensor_parallel_size=tp_size,
-                    **llm_args_extra)
+    with LLM_CLASS(model=llama_model_path,
+                   kv_cache_config=global_kvcache_config,
+                   tensor_parallel_size=tp_size,
+                   **llm_args_extra) as llm:
 
-    max_tokens = 6
-    sampling_params = SamplingParams(max_tokens=max_tokens,
-                                     **sampling_args_extra)
+        max_tokens = 6
+        sampling_params = SamplingParams(max_tokens=max_tokens,
+                                         **sampling_args_extra)
 
-    async def task0():
-        async for output in llm.generate_async(prompts[0],
-                                               streaming=True,
-                                               sampling_params=sampling_params):
-            print(output)
+        long_prompts = [
+            "A B C D E F G H I J K L M N O P Q R S T U V W X Y Z " * 2
+        ]
 
-    async def task1():
-        results = []
-        await asyncio.sleep(
-            3)  # ensure there's stats to collect for the assertion
-        async for stats in llm.get_stats_async(timeout=2):
-            results.append(stats)
+        async def task0():
+            async for output in llm.generate_async(
+                    long_prompts[0],
+                    streaming=True,
+                    sampling_params=sampling_params):
+                print(output)
 
-        assert results
-        if not use_overlap:
-            validate_stats(results, pytorch_backend, max_tokens,
-                           enable_iter_req_stats)
+        async def task1():
+            results = []
+            await asyncio.sleep(
+                3)  # ensure there's stats to collect for the assertion
+            async for stats in llm.get_stats_async(timeout=2):
+                results.append(stats)
 
-    async def main():
-        for i in range(2):  # test recurrent usage
-            await asyncio.gather(task0(), task1())
+            assert results
+            if not use_overlap:
+                validate_stats(results=results,
+                               pytorch_backend=pytorch_backend,
+                               max_tokens=max_tokens,
+                               use_overlap=use_overlap,
+                               enable_chunked_prefill=enable_chunked_prefill,
+                               enable_iter_req_stats=enable_iter_req_stats)
 
-    asyncio.run(main())
+        async def main():
+            for i in range(2):  # test recurrent usage
+                await asyncio.gather(task0(), task1())
+
+        asyncio.run(main())
 
 
 @pytest.mark.parametrize("return_context_logits", [True, False])
