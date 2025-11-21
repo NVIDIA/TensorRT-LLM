@@ -1059,7 +1059,6 @@ common-files: &common_files |
         tests/unittest/_torch/thop/parallel/test_logits_bitmask_op.py |
         tests/unittest/_torch/thop/parallel/test_mamba_conv1d_op.py |
         tests/unittest/_torch/thop/parallel/test_mamba2_chunk_ss_update.py |
-        tests/unittest/_torch/thop/parallel/test_moe.py |
         tests/unittest/_torch/thop/parallel/test_noaux_tc.py |
         tests/unittest/_torch/thop/parallel/test_scaled_mm.py |
         tests/unittest/_torch/thop/parallel/test_selective_scan_op.py |
@@ -1071,6 +1070,7 @@ common-files: &common_files |
         tests/unittest/_torch/thop/parallel/test_weight_only_quant_gemm.py |
         tests/unittest/_torch/thop/parallel/test_weight_only_quant_linear.py |
         tests/unittest/_torch/thop/serial/test_moe_alltoall.py |
+        tests/unittest/_torch/thop/serial/test_moe.py |
         tests/unittest/api_stability/api_stability_core.py |
         tests/unittest/api_stability/test_llm_api.py |
         tests/unittest/bindings/binding_test_utils.py |
@@ -1460,6 +1460,11 @@ repos:
         entry: ./scripts/format_test_list.py
         language: script
         files: tests/integration/test_lists/.*\.txt$
+    -   id: waive list check
+        name: Checks for duplicated test items in waives.txt
+        entry: ./scripts/check_test_list.py --check-duplicate-waives
+        language: script
+        pass_filenames: false
     -   id: DCO check
         name: Checks the commit message for a developer certificate of origin signature
         entry: ./scripts/dco_check.py

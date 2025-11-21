@@ -16,18 +16,15 @@
 # GoogleTest Preparation - Code block copied from
 # https://google.github.io/googletest/quickstart-cmake.html
 include(FetchContent)
-FetchContent_Declare(
-  googletest
-  GIT_REPOSITORY https://github.com/google/googletest.git
-  GIT_TAG v1.15.2)
 FetchContent_MakeAvailable(googletest)
 include(GoogleTest)
 
+set(cutlass_source_dir ${CMAKE_BINARY_DIR}/_deps/cutlass-src)
 include_directories(
   ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/include
   ${PROJECT_SOURCE_DIR}/include
-  ${3RDPARTY_DIR}/cutlass/include
-  ${3RDPARTY_DIR}/cutlass/tools/util/include
+  ${cutlass_source_dir}/include
+  ${cutlass_source_dir}/tools/util/include
   ${PROJECT_SOURCE_DIR}/tests/batch_manager
   ${PROJECT_SOURCE_DIR}/tests/utils)
 

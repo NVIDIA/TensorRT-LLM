@@ -2677,7 +2677,8 @@ class TorchLlmArgs(BaseLlmArgs):
 
     enable_autotuner: bool = Field(
         default=True,
-        description="Enable autotuner only when torch compile is enabled.",
+        description=
+        "Enable autotuner for all tunable ops. This flag is for debugging purposes only, and the performance may significantly degrade if set to false.",
         status="prototype")
 
     enable_layerwise_nvtx_marker: bool = Field(

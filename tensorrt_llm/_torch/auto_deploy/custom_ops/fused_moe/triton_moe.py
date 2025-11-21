@@ -341,7 +341,7 @@ def get_moe_configs(
     for config_file_path in config_file_paths:
         if os.path.exists(config_file_path):
             with open(config_file_path) as f:
-                ad_logger.info("Using configuration from %s for MoE layer.", config_file_path)
+                ad_logger.info(f"Using configuration from {config_file_path} for MoE layer.")
                 # If a configuration has been found, return it
                 tuned_config = json.load(f)
                 # Delete triton_version from tuned_config
@@ -601,8 +601,16 @@ def triton_fused_moe(
     routing_weights: torch.Tensor,
     w1_stacked_weight: torch.Tensor,
     w2_stacked_weight: torch.Tensor,
+    mlp_style: str = "mlp",
+    act_fn: str = "relu2",
 ) -> torch.Tensor:
     """Triton unquantized MoE with 2-layer MLP and ReLU^2 activation."""
+
+    mlp_style = mlp_style.lower()
+    act_fn = act_fn.lower()
+    assert mlp_style == "mlp", "Triton backend only supports mlp style."
+    assert act_fn == "relu2", "Triton backend only supports relu2 activation."
+
     x_shape = x.shape
     x2d = x.view(-1, x_shape[-1])
 

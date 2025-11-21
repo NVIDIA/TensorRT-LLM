@@ -763,8 +763,13 @@ class Phi4MMInputProcessor(BaseMultimodalInputProcessor,
                  model_path: str,
                  config: transformers.PretrainedConfig,
                  tokenizer: transformers.AutoTokenizer,
-                 trust_remote_code: bool = True):
-        super().__init__()
+                 trust_remote_code: bool = True,
+                 **kwargs):
+        super().__init__(model_path=model_path,
+                         config=config,
+                         tokenizer=tokenizer,
+                         trust_remote_code=trust_remote_code,
+                         **kwargs)
         if not trust_remote_code:
             raise ValueError("trust_remote_code must be True for Phi4MM")
 

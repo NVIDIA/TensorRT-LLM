@@ -653,15 +653,15 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @skip_pre_blackwell
-    def test_fp8_tp2pp2(self):
-        model_path = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct-FP8"
+    def test_fp4_tp2pp2(self):
+        model_path = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct-FP4"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
         with LLM(model_path,
                  tensor_parallel_size=2,
                  pipeline_parallel_size=2,
                  max_batch_size=32,
                  kv_cache_config=kv_cache_config) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             sampling_params = SamplingParams(
                 max_tokens=256,
                 temperature=0.0,
@@ -2049,6 +2049,18 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                          32,
                          "TRTLLM",
                          marks=pytest.mark.skip_less_mpi_world_size(8)),
+            pytest.param(4,
+                         1,
+                         4,
+                         3,
+                         False,
+                         True,
+                         True,
+                         True,
+                         True,
+                         16,
+                         "CUTLASS",
+                         marks=pytest.mark.skip_less_mpi_world_size(4)),
             pytest.param(8,
                          1,
                          8,
@@ -2124,9 +2136,9 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
         ],
         ids=[
             "latency", "latency_trtllmgen", "latency_adp_lmtp",
-            "latency_trtllmgen_adp_lmtp", "throughput", "throughput_tp8",
-            "throughput_tp4", "throughput_mtp", "throughput_bs8_mtp",
-            "throughput_pp4_mtp"
+            "latency_trtllmgen_adp_lmtp", "latency_adp_lmtp_tp4", "throughput",
+            "throughput_tp8", "throughput_tp4", "throughput_mtp",
+            "throughput_bs8_mtp", "throughput_pp4_mtp"
         ])
     def test_nvfp4_multi_gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                               attention_dp, enable_lm_head_tp_in_adp,
