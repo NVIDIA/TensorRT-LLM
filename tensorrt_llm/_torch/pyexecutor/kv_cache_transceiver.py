@@ -39,9 +39,9 @@ def create_kv_cache_transceiver(
     if cache_transceiver_config.backend == "DEFAULT":
         # When cache_transceiver_config.backend is not set, fallback to env_vars settings
         # NIXL is the default backend
-        cache_transceiver_config.backend = "NIXL"
+        cache_transceiver_config.backend = "UCX"
         # Ordered by priority
-        env_vars = [("TRTLLM_USE_UCX_KVCACHE", "UCX"),
+        env_vars = [("TRTLLM_USE_NIXL_KVCACHE", "NIXL"),
                     ("TRTLLM_USE_MPI_KVCACHE", "MPI")]
         for env_var, be_type in env_vars:
             if getenv(env_var) == "1":
