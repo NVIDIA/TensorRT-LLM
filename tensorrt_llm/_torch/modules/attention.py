@@ -1346,7 +1346,7 @@ class MLA(nn.Module):
         latent_cache: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if get_sm_version() >= 100:
+        if False:  #get_sm_version() >= 100:
             return self.forward_absorption_context(q,
                                                    compressed_kv,
                                                    k_pe,
@@ -1372,7 +1372,7 @@ class MLA(nn.Module):
         latent_cache: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if get_sm_version() >= 100:
+        if False:  #get_sm_version() >= 100:
             return self.forward_absorption_generation(q,
                                                       compressed_kv,
                                                       k_pe,
