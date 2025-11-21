@@ -60,42 +60,6 @@ llm.generate(["Hello, my name is",
             "Hello, my name is"], sampling_params)
 ```
 
-## Guided decoding
-
-Guided decoding controls the generation outputs to conform to pre-defined structured formats, ensuring outputs follow specific schemas or patterns.
-
-The PyTorch backend supports guided decoding with the XGrammar and Low-level Guidance (llguidance) backends and the following formats:
-- JSON schema
-- JSON object
-- Regular expressions
-- Extended Backus-Naur form (EBNF) grammar
-- Structural tags
-
-To enable guided decoding, you must:
-
-1. Set the `guided_decoding_backend` parameter to `'xgrammar'` or `'llguidance'` in the `LLM` class
-2. Create a [`GuidedDecodingParams`](source:tensorrt_llm/sampling_params.py#L14) object with the desired format specification
-    * Note: Depending on the type of format, a different parameter needs to be chosen to construct the object (`json`, `regex`, `grammar`, `structural_tag`).
-3. Pass the `GuidedDecodingParams` object to the `guided_decoding` parameter of the `SamplingParams` object
-
-The following example demonstrates guided decoding with a JSON schema:
-
-```python
-from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import GuidedDecodingParams
-
-llm = LLM(model='nvidia/Llama-3.1-8B-Instruct-FP8',
-          guided_decoding_backend='xgrammar')
-structure = '{"title": "Example JSON", "type": "object", "properties": {...}}'
-guided_decoding_params = GuidedDecodingParams(json=structure)
-sampling_params = SamplingParams(
-        guided_decoding=guided_decoding_params,
-    )
-llm.generate("Generate a JSON response", sampling_params)
-```
-
-You can find a more detailed example on guided decoding [here](source:examples/llm-api/llm_guided_decoding.py).
-
 ## Logits processor
 
 Logits processors allow you to modify the logits produced by the network before sampling, enabling custom generation behavior and constraints.
