@@ -651,6 +651,11 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                     dockerArgs += " -e NVIDIA_IMEX_CHANNELS=0"
                     dockerArgs += " --device=/dev/gdrdrv:/dev/gdrdrv"
                 }
+                // Check for existence of RDMA devices and mount if present
+                def hasRdmaCm = sh(script: "[ -e /dev/infiniband/rdma_cm ] && echo 1 || echo 0", returnStdout: true).trim() == "1"
+                if (hasRdmaCm) {
+                    dockerArgs += " --device=/dev/infiniband/rdma_cm --device=/dev/infiniband/uverbs0"
+                }
                 echo "Final dockerArgs: ${dockerArgs}"
             } else {
                 error "The Slurm node does not come online in the waiting period. Terminating the job."
