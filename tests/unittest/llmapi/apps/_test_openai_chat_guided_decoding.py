@@ -136,6 +136,7 @@ def test_openai_compatible_json_schema(client: openai.OpenAI, model_name: str):
             "type": "json_schema",
             "json_schema": json_schema
         },
+        temperature=0.0,
     )
 
     message = chat_completion.choices[0].message
@@ -375,6 +376,7 @@ You are a helpful assistant."""
         model=model_name,
         messages=messages,
         max_completion_tokens=256,
+        temperature=0.0,
         response_format={
             "type": "structural_tag",
             "format": {
