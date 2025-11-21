@@ -222,6 +222,7 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
             if custom_model_cls is not None:
                 # `_from_config` has some behavior we would like to use where possible. It is
                 # defined in the `PreTrainedModel` mixin.
+                ad_logger.info(f"Using custom model implementation {custom_model_cls}")
                 if not hasattr(custom_model_cls, "_from_config"):
                     raise ValueError(
                         f"`{custom_model_cls.__name__}` must have a `_from_config` class method. "
