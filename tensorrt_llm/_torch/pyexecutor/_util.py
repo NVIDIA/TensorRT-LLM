@@ -961,7 +961,7 @@ def _adjust_torch_mem_fraction():
     #     torch.cuda._set_allocator_settings (added in PyTorch 2.8.0-rc1)
     #   or a similar API is available, the warning below should be removed
     #   and the allocator GC threshold be set via the new API instead.
-    torch_allocator_config = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+    torch_allocator_config = os.environ.get("PYTORCH_ALLOC_CONF", "")
     torch_mem_threshold_advised = (
         torch.cuda.get_allocator_backend() == "native"
         and "expandable_segments:True" not in torch_allocator_config)
@@ -969,7 +969,7 @@ def _adjust_torch_mem_fraction():
     if torch_mem_threshold_advised and not torch_mem_threshold_set:
         logger.warning(
             "It is recommended to incl. 'garbage_collection_threshold:0.???' or 'backend:cudaMallocAsync'"
-            " or 'expandable_segments:True' in PYTORCH_CUDA_ALLOC_CONF.")
+            " or 'expandable_segments:True' in PYTORCH_ALLOC_CONF.")
 
     # NOTE: Even if a memory threshold was not set (cf. warning above), setting a memory
     #       fraction < 1.0 is beneficial, because
