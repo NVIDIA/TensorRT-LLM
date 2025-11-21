@@ -230,7 +230,9 @@ class MLPBlock(torch.nn.Module):
             device=device,
             dtype=pretrained_config.torch_dtype)
 
-    def compute_gate_output(self, x: torch.Tensor) -> torch.Tensor:
+    def compute_gate_output(self,
+                            x: torch.Tensor,
+                            lora_params: Optional[dict] = None) -> torch.Tensor:
         if get_sm_version() in [
                 90, 100, 103
         ] and x.shape[0] <= MIN_LATENCY_TINYGEMM_NUM_TOKENS:
@@ -238,13 +240,14 @@ class MLPBlock(torch.nn.Module):
             bias = self.gate.bias
             g = torch.ops.trtllm.tinygemm2(x, weight, bias)
         else:
-            g = self.gate(x)
+            g = self.gate(x, lora_params=lora_params, layer_idx=self.layer_idx)
         return g
 
     def forward_normal(
         self,
         x: torch.Tensor,
-        residual: Optional[torch.Tensor] = None
+        residual: Optional[torch.Tensor] = None,
+        lora_params: Optional[dict] = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         orig_shape = x.shape
         hidden_dim = orig_shape[-1]
@@ -253,7 +256,7 @@ class MLPBlock(torch.nn.Module):
         # t = self.norm(x) was done in the parent block
         t = x
 
-        g = self.compute_gate_output(t)
+        g = self.compute_gate_output(t, lora_params=lora_params)
         # Use ideal load balanced logits if enabled, otherwise use gate output
         if os.environ.get('ENABLE_PERFECT_ROUTER', '0') == '1':
             # WARNING: This discards the learned gate output and uses ideal logits for perfect load balancing
@@ -272,7 +275,8 @@ class MLPBlock(torch.nn.Module):
         self,
         x: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        residual: Optional[torch.Tensor] = None
+        residual: Optional[torch.Tensor] = None,
+        lora_params: Optional[dict] = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         orig_shape = x.shape
         hidden_dim = orig_shape[-1]
@@ -288,7 +292,7 @@ class MLPBlock(torch.nn.Module):
             if (isinstance(self.experts, (TritonFusedMoE))):
                 t = allgather(t, self.mapping, dim=0, sizes=all_rank_num_tokens)
 
-        g = self.compute_gate_output(t)
+        g = self.compute_gate_output(t, lora_params=lora_params)
         # Use ideal load balanced logits if enabled, otherwise use gate output
         if os.environ.get('ENABLE_PERFECT_ROUTER', '0') == '1':
             # WARNING: This discards the learned gate output and uses ideal logits for perfect load balancing
@@ -312,12 +316,13 @@ class MLPBlock(torch.nn.Module):
         self,
         x: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        residual: Optional[torch.Tensor] = None
+        residual: Optional[torch.Tensor] = None,
+        lora_params: Optional[dict] = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.enable_attention_dp:
-            return self.forward_attn_dp(x, attn_metadata, residual)
+            return self.forward_attn_dp(x, attn_metadata, residual, lora_params)
         else:
-            return self.forward_normal(x, residual)
+            return self.forward_normal(x, residual, lora_params)
 
 
 class TransformerBlock(DecoderLayer):
@@ -378,6 +383,7 @@ class TransformerBlock(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor] = ...,
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
@@ -388,10 +394,14 @@ class TransformerBlock(DecoderLayer):
                                 hidden_states,
                                 attn_metadata,
                                 residual=residual,
+                                lora_params=lora_params,
                                 **kwargs)
         x, residual = self.post_attention_layernorm(x, residual)
 
-        x, residual = self.mlp(x, attn_metadata, residual)
+        x, residual = self.mlp(x,
+                               attn_metadata,
+                               residual,
+                               lora_params=lora_params)
 
         if spec_metadata is not None:
             spec_metadata.maybe_capture_hidden_states(self.layer_idx, x,
@@ -407,6 +417,7 @@ class TransformerBlock(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor] = ...,
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
@@ -419,6 +430,7 @@ class TransformerBlock(DecoderLayer):
             attn_metadata,
             residual=residual,
             all_reduce_params=AllReduceParams(enable_allreduce=False),
+            lora_params=lora_params,
             **kwargs)
 
         x, residual = self.allreduce(
@@ -431,7 +443,10 @@ class TransformerBlock(DecoderLayer):
                 trigger_completion_at_end=False,
             ))
 
-        x, residual = self.mlp(x, attn_metadata, residual)
+        x, residual = self.mlp(x,
+                               attn_metadata,
+                               residual,
+                               lora_params=lora_params)
 
         if spec_metadata is not None and spec_metadata.is_layer_capture(
                 self.layer_idx):
@@ -467,6 +482,7 @@ class TransformerBlock(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor] = ...,
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if self.is_tp:
@@ -478,6 +494,7 @@ class TransformerBlock(DecoderLayer):
                         attn_metadata,
                         residual,
                         spec_metadata=spec_metadata,
+                        lora_params=lora_params,
                         **kwargs)
 
 
@@ -540,6 +557,7 @@ class Transformer(DecoderModel):
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -557,6 +575,7 @@ class Transformer(DecoderModel):
                 attn_metadata=attn_metadata,
                 residual=residual,
                 spec_metadata=spec_metadata,
+                lora_params=lora_params,
             )
 
         return hidden_states
