@@ -700,6 +700,10 @@ class DecodingBaseConfig(StrictBaseModel):
         return TorchSpeculativeDecodingMode.from_string(
             self.decoding_type.upper())
 
+    @functools.cached_property
+    def is_linear_tree(self) -> bool:
+        return self.max_draft_len == self.max_total_draft_tokens
+
 
 class KvCacheConnectorConfig(StrictBaseModel):
     """

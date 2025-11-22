@@ -361,12 +361,23 @@ def create_py_executor(
             if use_chain_drafter:
 
                 def drafting_loop_wrapper(model):
-                    from tensorrt_llm._torch.speculative.drafting_loops import \
-                        ChainDrafter
+                    from tensorrt_llm._torch.speculative.drafting_loops import (
+                        LinearDraftingLoopWrapper, TreeDraftingLoopWrapper)
+                    from tensorrt_llm.llmapi import EagleDecodingConfig
 
-                    return ChainDrafter(spec_config.max_draft_len,
-                                        spec_config.max_total_draft_tokens,
-                                        model)
+                    use_tree_drafter = isinstance(
+                        draft_spec_config, EagleDecodingConfig
+                    ) and not draft_spec_config.is_linear_tree
+
+                    if use_tree_drafter:
+                        return TreeDraftingLoopWrapper(
+                            spec_config.max_draft_len,
+                            spec_config.max_total_draft_tokens, max_batch_size,
+                            model)
+                    else:
+                        return LinearDraftingLoopWrapper(
+                            spec_config.max_draft_len,
+                            spec_config.max_total_draft_tokens, model)
             else:
                 drafting_loop_wrapper = None
 
