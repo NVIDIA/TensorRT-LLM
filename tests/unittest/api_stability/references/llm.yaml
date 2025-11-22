@@ -107,6 +107,10 @@ methods:
         annotation: bool
         default: False
         status: beta
+      sm_disagg_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.SmDisaggConfig]
+        status: prototype
+        default: null
       moe_config:
         annotation: tensorrt_llm.llmapi.llm_args.MoeConfig
         status: beta
