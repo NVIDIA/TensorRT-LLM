@@ -1462,7 +1462,8 @@ public:
         DEFAULT = 0,
         MPI = 1,
         UCX = 2,
-        NIXL = 3
+        NIXL = 3,
+        MOONCAKE = 4
     };
     explicit CacheTransceiverConfig(std::optional<BackendType> backendType = std::nullopt,
         std::optional<size_t> maxNumTokens = std::nullopt, std::optional<int> kvTransferTimeoutMs = std::nullopt,
