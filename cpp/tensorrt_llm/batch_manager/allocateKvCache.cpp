@@ -26,6 +26,8 @@ void tensorrt_llm::batch_manager::AllocateKvCache::operator()(BaseKVCacheManager
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(allocateKvCache);
 
+    kvCacheManager.syncTransferManagerWithBufferManager();
+
     for (auto const& llmReq : contextRequests)
     {
         if (llmReq->isFirstContextChunk())
