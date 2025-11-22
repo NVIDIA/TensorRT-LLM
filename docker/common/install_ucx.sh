@@ -1,13 +1,19 @@
 #!/bin/bash
 set -ex
 
-UCX_VERSION="v1.19.x"
+GITHUB_URL="https://github.com"
+if [ -n "${GITHUB_MIRROR}" ]; then
+    GITHUB_URL=${GITHUB_MIRROR}
+fi
+
+UCX_VERSION="1.19.x"
 UCX_INSTALL_PATH="/usr/local/ucx/"
 CUDA_PATH="/usr/local/cuda"
-UCX_REPO="https://github.com/openucx/ucx.git"
 
 rm -rf ${UCX_INSTALL_PATH}
-git clone --depth 1 -b ${UCX_VERSION} ${UCX_REPO}
+curl -L ${GITHUB_URL}/openucx/ucx/archive/refs/heads/v${UCX_VERSION}.tar.gz -o ucx-${UCX_VERSION}.tar.gz
+tar -xzf ucx-${UCX_VERSION}.tar.gz
+mv ucx-${UCX_VERSION} ucx
 cd ucx
 ./autogen.sh
 ./contrib/configure-release       \
