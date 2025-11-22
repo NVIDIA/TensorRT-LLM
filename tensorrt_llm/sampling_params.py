@@ -403,13 +403,16 @@ class SamplingParams:
             and isinstance(generation_config.eos_token_id, List)
             and all(isinstance(i, int) for i in generation_config.eos_token_id)
         ):
-            all_stop_tokens_id = set(i for sublist in self._stop_word_ids for i in sublist)
-            from_generation_stop_tokens = [
-                i for i in generation_config.eos_token_id if i not in all_stop_tokens_id
-            ]
+            if self._stop_word_ids:
+                all_stop_tokens_id = set(i for sublist in self._stop_word_ids for i in sublist)
+                from_generation_stop_tokens = [
+                    i for i in generation_config.eos_token_id if i not in all_stop_tokens_id
+                ]
 
-            if from_generation_stop_tokens:
-                self._stop_word_ids.append(from_generation_stop_tokens)
+                if from_generation_stop_tokens:
+                    self._stop_word_ids.append(from_generation_stop_tokens)
+            else:
+                self._stop_word_ids = [generation_config.eos_token_id]
 
         return self
 
