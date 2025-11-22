@@ -581,13 +581,44 @@ class CustomAllReduceHelper:
     @staticmethod
     def max_workspace_size_auto(tp_size: int,
                                 support_deterministic=True) -> int:
+        """Calculate workspace size for allreduce fusion kernel.
+
+        The workspace is used for lamport buffers in the fusion kernel.
+        Required size calculation:
+        - Each GPU needs 3 sub-buffers (for triple buffering)
+        - Each sub-buffer stores: max_num_tokens * hidden_size * dtype_size (bf16=2)
+        - The lamport allocation multiplies by tp_size, so:
+          lamport_size = 3 * size * tp_size (per GPU)
+
+        Example: Llama 8B (hidden=4096), max_tokens=8192, bf16, TP=4
+        - Data per sub-buffer: 8192 * 4096 * 2 = 64 MiB
+        - Total lamport: 3 * 64MB * 4 = 768 MiB per GPU
+        - Required 'size' parameter: 64 MiB (gets multiplied by tp_size in allocation)
+
+        Default (67,108,864 = 64 MiB) supports:
+        - Models up to hidden_size=4096 with max_num_tokens=8192
+        - Or hidden_size=8192 with max_num_tokens=4096
+
+        Override with TRTLLM_ALLREDUCE_FUSION_WORKSPACE_SIZE env var if needed for larger models.
+        """
         if force_all_reduce_deterministic() and support_deterministic:
             workspace_size = os.getenv("FORCE_ALLREDUCE_KERNEL_WORKSPACE_SIZE",
                                        "1000000000")
             return int(workspace_size)
-        if tp_size <= 2:
-            return 16_000_000
-        return 8_000_000
+
+        # Allow override via environment variable for edge cases
+        workspace_size_env = os.getenv("TRTLLM_ALLREDUCE_FUSION_WORKSPACE_SIZE")
+        if workspace_size_env:
+            size = int(workspace_size_env)
+            logger.info(
+                f"Using custom allreduce fusion workspace size: {size} bytes ({size / (1024**2):.1f} MiB)"
+            )
+            return size
+
+        # Default: 64 MiB - supports most common model configurations
+        # Increase via env var if you see CUDA illegal memory access errors with large models
+        default_size = 67_108_864  # Exactly 64 MiB
+        return default_size
 
     @staticmethod
     def max_workspace_size_lowprecision(tp_size: int) -> int:
