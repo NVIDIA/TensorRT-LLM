@@ -65,6 +65,14 @@ def parse_arguments():
                         type=int,
                         default=2048,
                         help="The prompt budget for RocketKV.")
+    parser.add_argument('--topk',
+                        type=int,
+                        default=64,
+                        help='Top-k for RocketKV')
+    parser.add_argument('--kt_cache_dtype',
+                        type=str,
+                        default='float8_e5m2',
+                        choices=['bfloat16', 'float8_e5m2'])
     parser.add_argument('--index_max_chunk_size',
                         type=int,
                         default=32768,
@@ -106,6 +114,7 @@ def parse_arguments():
     # KV cache
     parser.add_argument('--kv_cache_dtype', type=str, default='auto')
     parser.add_argument("--kv_cache_fraction", type=float, default=0.7)
+    parser.add_argument('--tokens_per_block', type=int, default=64)
     parser.add_argument('--num_samples', type=int, default=10)
 
     # Runtime
@@ -135,6 +144,7 @@ def run_llm(args, sparse_attention_config):
         enable_block_reuse=
         False,  # sparse attention does not support kv cache reuse now
         free_gpu_memory_fraction=args.kv_cache_fraction,
+        tokens_per_block=args.tokens_per_block,
         dtype=args.kv_cache_dtype,
     )
 
@@ -185,6 +195,8 @@ def run_RocketKV(args):
         window_size=args.window_size,
         kernel_size=args.kernel_size,
         prompt_budget=args.prompt_budget,
+        topk=args.topk,
+        kt_cache_dtype=args.kt_cache_dtype,
     )
     run_llm(args, sparse_attention_config)
 
