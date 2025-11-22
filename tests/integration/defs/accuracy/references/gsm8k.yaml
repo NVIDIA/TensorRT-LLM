@@ -270,3 +270,9 @@ zai-org/GLM-4.6:
   - quant_algo: NVFP4
     spec_dec_algo: MTP
     accuracy: 88.0
+bigcode/starcoder2-3b:
+  - accuracy: 20.2
+bigcode/starcoder2-7b:
+  - accuracy: 26.5
+bigcode/starcoder2-15b:
+  - accuracy: 54.5
