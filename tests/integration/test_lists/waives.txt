@@ -415,3 +415,5 @@ unittest/llmapi/test_llm_pytorch.py::test_llm_context_only_timed_out_kv_cache_ex
 accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[False-4] SKIP (https://nvbugs/5680312, https://nvbugs/5636912)
 accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[False-2] SKIP (https://nvbugs/5680312, https://nvbugs/5636912)
 unittest/_torch/auto_deploy/unit/multigpu/test_ad_build_small_multi.py::test_build_ad[meta-llama/Meta-Llama-3.1-8B-Instruct-llm_extra_args0-2] SKIP (https://nvbugs/5680755)
+examples/test_ray.py::test_ray_disaggregated_serving[tp2] SKIP (https://nvbugs/5683039)
+full:H100_PCIe/unittest/llmapi/test_llm_pytorch.py::test_llama_7b_multi_lora_evict_and_reload_lora_gpu_cache SKIP (https://nvbugs/5682551)
