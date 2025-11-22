@@ -181,7 +181,7 @@ class SamplingParams:
 
         logprobs (int, optional): Number of log probabilities to return per output token. Defaults to None.
         prompt_logprobs (int, optional): Number of log probabilities to return per prompt token. Defaults to None.
-        logprobs_mode (str): Controls return logprobs after sampling modifications. Defaults to "processed_logprobs".
+        logprobs_mode (Literal['processed_logprobs']): Controls return logprobs after sampling modifications. Defaults to "processed_logprobs".
             Options:
             - "processed_logprobs": Return log-softmax of processed logits
         return_context_logits (bool): Controls if Result should contain the context logits. Defaults to False.
