@@ -470,6 +470,13 @@ class Eagle3OneModelWorker(nn.Module):
                 "attn_metadata": attn_metadata,
                 "spec_metadata": spec_metadata,
             }
+        for layer in draft_model.parallel_draft_heads:
+            med_out = layer(hidden_states)
+            logits = layer.logits_processor(med_out, layer.lm_head,
+                                            attn_metadata, True)
+            new_draft_token = self.draft_decoder(logits, layer)
+            next_draft_tokens.append(new_draft_token)
+
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
 
         # restore attn_metadata to support cuda graph
