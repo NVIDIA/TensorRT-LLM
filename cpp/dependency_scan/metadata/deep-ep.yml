@@ -1,0 +1,7 @@
+name: deep-ep
+description: DeepEP distributed execution platform for distributed training
+source: fetched
+basename_matches: []
+linker_flags_matches: []
+directory_matches:
+- deep_ep_download-src

@@ -1,0 +1,92 @@
+# JSON Schema for validating dependency YAML files
+# Used by scanner to validate structure and required fields
+
+type: object
+
+required:
+  - name
+  - description
+
+properties:
+  name:
+    type: string
+    pattern: "^[a-z0-9-+]+$"
+    description: "Canonical dependency name (lowercase, hyphenated, + allowed)"
+    minLength: 1
+
+  version:
+    type: string
+    description: "Version string (semantic versioning recommended)"
+    minLength: 1
+
+  description:
+    type: string
+    description: "Brief description of the dependency"
+    minLength: 10
+
+  license:
+    type: string
+    description: "SPDX license identifier or license name"
+
+  copyright:
+    type: string
+    description: "Copyright notice"
+
+  homepage:
+    type: string
+    format: uri
+    description: "URL to project homepage or repository"
+
+  source:
+    type: string
+    enum: ["submodule", "container", "fetched"]
+    description: |
+      How this dependency is obtained:
+        - submodule: Git submodules in 3rdparty/ directory
+        - container: Pre-installed in the container image (e.g., PyTorch)
+        - fetched: Downloaded from URL and built from source
+
+  basename_matches:
+    type: array
+    items:
+      type: string
+      minLength: 1
+    uniqueItems: true
+    description: "Exact basename matches (filename or library name)"
+
+  linker_flags_matches:
+    type: array
+    items:
+      type: string
+      pattern: "^-l"
+      minLength: 3
+    uniqueItems: true
+    description: "Linker flags (-l flags)"
+
+  directory_matches:
+    type: array
+    items:
+      type: string
+      minLength: 1
+    uniqueItems: true
+    description: |
+      Directory path patterns (single or multi-directory).
+      Supports exact consecutive component matching (no substring matching).
+
+      Examples:
+        - "pytorch" (single component: matches any path containing /pytorch/)
+        - "3rdparty/cutlass" (multi-directory: matches /3rdparty/cutlass/ sequence)
+        - "foo/bar/baz" (multi-directory: matches /foo/bar/baz/ sequence)
+
+      Matching behavior:
+        - Exact component match only (no substrings)
+        - "foo/bar" matches "/home/foo/bar/file.h" ✓
+        - "foo/bar" does NOT match "/home/foobar/file.h" ✗
+        - "oo/ba" does NOT match "/foo/bar/file.h" ✗
+        - Rightmost match wins if pattern appears multiple times in path
+
+# At least one pattern matching section required
+anyOf:
+  - required: ["basename_matches"]
+  - required: ["linker_flags_matches"]
+  - required: ["directory_matches"]

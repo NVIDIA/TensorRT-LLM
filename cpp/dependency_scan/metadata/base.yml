@@ -1,0 +1,13 @@
+dependencies:
+- name: libc6
+  description: GNU C Library - shared libraries and system calls
+  source: container
+  path_components: []
+  aliases: []
+  basename_matches: []
+  linker_flags_matches:
+  - -lc
+  - -ldl
+  - -lm
+  - -lpthread
+  - -lrt
