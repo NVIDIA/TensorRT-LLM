@@ -2227,11 +2227,29 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
         # matching the kernel's expectation (similar to test_moe.py logic).
         if module.w3_w1_bias is not None:
             # gemm1_bias * gemm1_scales_global * hidden_states_scale_global
+            print("Divided w3_w1_bias by fc31_alpha")
+            print("before:", module.w3_w1_bias.data)
             module.w3_w1_bias.data.div_((module.fc31_alpha.data).view(-1, 1))
+            print("after:", module.w3_w1_bias.data)
 
         if module.w2_bias is not None:
             # gemm2_bias * c_global_sf * gemm2_scales_global
+            print("Divided w2_bias by fc2_alpha")
+            print("before:", module.w2_bias.data)
             module.w2_bias.data.div_((module.fc2_alpha.data).view(-1, 1))
+            print("after:", module.w2_bias.data)
+
+        if module.swiglu_beta is not None:
+            print("Dividing swiglu_beta by fc31_alpha")
+            print("before:", module.swiglu_beta.data)
+            module.swiglu_beta.data.div_((module.fc31_alpha.data))
+            print("after:", module.swiglu_beta.data)
+
+        if module.swiglu_limit is not None:
+            print("Dividing swiglu_limit by fc31_alpha")
+            print("before:", module.swiglu_limit.data)
+            module.swiglu_limit.data.div_((module.fc31_alpha.data))
+            print("after:", module.swiglu_limit.data)
 
         if self.need_load_shared_weights(module):
             local_shared_load_expert_ids = module.layer_load_balancer.get_load_expert_ids(
