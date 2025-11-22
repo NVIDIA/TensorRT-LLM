@@ -482,6 +482,18 @@ def _create_mock_metadata(request_ids,
 
             self.enable_context_mla_with_cached_kv = enable_context_mla_with_cached_kv
 
+            # Add runtime_features for chunked prefill detection
+            class RuntimeFeatures:
+
+                def __init__(self):
+                    self.chunked_prefill = enable_context_mla_with_cached_kv
+                    self.cache_reuse = False
+                    self.has_speculative_draft_tokens = False
+                    self.chunk_size = 512
+                    self.chunked_prefill_buffer_batch_size = 4
+
+            self.runtime_features = RuntimeFeatures()
+
     return MockMetadata()
 
 
@@ -2017,3 +2029,171 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk,
 
     assert avg_similarity >= 0.95, \
         f"Single-pass prefill differ: avg similarity {avg_similarity:.4f} < 0.95"
+
+
+@skip_pre_hopper
+def test_indexer_topk_multi_request_with_different_cache():
+    """
+    Test that custom topk kernel handles multi-request batches with different cached amounts.
+
+    Bug: When requests have different cached tokens (e.g., Req0: 0, Req1: 3584),
+    the kernel may select invalid indices from masked regions, producing fewer than 2048 valid topk.
+
+    This happens because:
+    1. fp8_mqa_logits masks cross-request positions to -inf
+    2. Radix histogram in indexer_topk_prefill_op doesn't properly skip -inf
+    3. Some -inf positions get selected → converted to negative local indices
+    4. After masking: fewer than 2048 valid indices remain
+    """
+    torch.manual_seed(42)
+
+    # Parameters matching your problematic case
+    batch_size = 2
+    heads, head_dim = 64, 128
+    block_size = 64
+    index_topk = 2048
+    max_model_len = 10240
+    layer_idx = 0
+
+    # Critical: different cached amounts
+    seq_lens = [256, 237]  # NEW tokens
+    cached_tokens = [0, 3584]  # Req0: no cache, Req1: large cache
+    total_kv_lens = [seq_lens[i] + cached_tokens[i] for i in range(batch_size)]
+    total_tokens = sum(seq_lens)
+
+    print(f"\n=== Test: Multi-request with different cache ===")
+    print(
+        f"  Req0: {cached_tokens[0]} cached + {seq_lens[0]} new = {total_kv_lens[0]} total"
+    )
+    print(
+        f"  Req1: {cached_tokens[1]} cached + {seq_lens[1]} new = {total_kv_lens[1]} total"
+    )
+
+    # Create cache manager
+    cache_manager, sparse_attn_config = create_dsa_cache_manager(
+        batch_size=batch_size,
+        head_dim=head_dim,
+        tokens_per_block=block_size,
+        max_seq_len=max_model_len,
+        num_layers=1)
+    sparse_attn_config.index_topk = index_topk
+    indexer = create_indexer(sparse_attn_config, layer_idx=layer_idx)
+
+    # Allocate blocks
+    request_ids = [0, 1]
+    cache_manager.add_dummy_requests(request_ids,
+                                     total_kv_lens,
+                                     is_gen=False,
+                                     prepare_resource=True)
+
+    # Generate test data
+    q = torch.randn((total_tokens, heads, head_dim),
+                    device="cuda",
+                    dtype=torch.bfloat16)
+    k = torch.randn((total_tokens, head_dim),
+                    device="cuda",
+                    dtype=torch.bfloat16)
+    weights = torch.randn((total_tokens, heads),
+                          device="cuda",
+                          dtype=torch.float32)
+    hidden_states = torch.randn((total_tokens, 4096),
+                                device="cuda",
+                                dtype=torch.bfloat16)
+
+    q_fp8 = q.to(torch.float8_e4m3fn)
+    k_fp8, k_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(k)
+
+    # Create metadata with chunked prefill enabled
+    metadata = _create_mock_metadata(request_ids,
+                                     batch_size,
+                                     batch_size,
+                                     0,
+                                     torch.tensor(seq_lens, dtype=torch.int32),
+                                     torch.tensor(total_kv_lens,
+                                                  dtype=torch.int32),
+                                     cached_tokens,
+                                     cache_manager,
+                                     total_tokens,
+                                     total_tokens,
+                                     indexer_max_chunk_size=32768,
+                                     enable_context_mla_with_cached_kv=True)
+
+    Indexer.prepare(metadata)
+    indexer._update_k_cache(k_fp8, k_scale, metadata)
+
+    # Test custom kernel
+    topk_custom = indexer.sparse_attn_indexer(metadata,
+                                              hidden_states,
+                                              q_fp8,
+                                              k_fp8,
+                                              k_scale,
+                                              weights,
+                                              use_custom_topk=True)
+
+    # Test fallback
+    topk_fallback = indexer.sparse_attn_indexer(metadata,
+                                                hidden_states,
+                                                q_fp8,
+                                                k_fp8,
+                                                k_scale,
+                                                weights,
+                                                use_custom_topk=False)
+
+    # Validate: custom and fallback should match
+    print(f"\n=== Validation ===")
+
+    # First, check for INVALID negative indices (< -1) which indicate kernel bugs
+    print(f"Checking for invalid negative indices:")
+    for tok_id in [0, 255, 256, 492]:  # First/last of each request
+        num_valid_custom = (topk_custom[tok_id] >= 0).sum().item()
+        num_valid_fallback = (topk_fallback[tok_id] >= 0).sum().item()
+        min_val_custom = topk_custom[tok_id].min().item()
+        min_val_fallback = topk_fallback[tok_id].min().item()
+
+        # Check for invalid negatives (not -1)
+        has_invalid = min_val_custom < -1
+        if has_invalid or num_valid_custom != num_valid_fallback:
+            print(
+                f"  Token {tok_id}: custom={num_valid_custom}, fallback={num_valid_fallback}"
+            )
+            print(
+                f"    Custom min={min_val_custom}, Fallback min={min_val_fallback}"
+            )
+            if has_invalid:
+                print(
+                    f"    ⚠️ INVALID: Custom has negative indices < -1 (kernel bug!)"
+                )
+
+    # Then check set equality (order doesn't matter)
+    print(f"\n=== Set Comparison ===")
+    num_exact_matches = 0
+    num_set_matches = 0
+
+    for token_idx in range(total_tokens):
+        custom_valid = topk_custom[token_idx][topk_custom[token_idx] >= 0]
+        fallback_valid = topk_fallback[token_idx][topk_fallback[token_idx] >= 0]
+
+        custom_set = set(custom_valid.cpu().tolist())
+        fallback_set = set(fallback_valid.cpu().tolist())
+
+        if custom_set == fallback_set:
+            num_set_matches += 1
+            if torch.equal(custom_valid, fallback_valid):
+                num_exact_matches += 1
+
+    set_match_ratio = num_set_matches / total_tokens
+    exact_ratio = num_exact_matches / total_tokens
+
+    print(
+        f"  Set matches: {num_set_matches}/{total_tokens} ({set_match_ratio:.1%})"
+    )
+    print(
+        f"  Exact order matches: {num_exact_matches}/{total_tokens} ({exact_ratio:.1%})"
+    )
+
+    assert set_match_ratio == 1.0, \
+        f"Custom kernel selects different indices than fallback: only {num_set_matches}/{total_tokens} match"
+
+    print(
+        f"✅ Test passed: Custom and fallback kernels produce identical topk sets"
+    )

@@ -834,8 +834,6 @@ class Indexer(nn.Module):
             cached_tokens_cpu: Cached token lengths for all requests
         """
         device = metadata.cu_seqlen_ks.device
-        assert cached_tokens_cpu.sum().item(
-        ) == 0, "DEBUG: cached_tokens_cpu should be 0"
         if len(chunk_specs) == 1:
             # Single request or intra-request Q-block
             req_idx, token_start_in_req, token_end_in_req, req_cum_start = chunk_specs[
