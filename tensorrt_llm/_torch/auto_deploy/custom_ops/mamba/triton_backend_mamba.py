@@ -43,10 +43,6 @@ def _triton_ssm_prepare_metadata(
     seq_len_sanitized = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
     num_seq = len(seq_len_sanitized)
 
-    seq_start = torch.zeros_like(seq_len_sanitized)
-    if num_seq > 1:
-        seq_start[1:] = torch.cumsum(seq_len_sanitized[:-1], 0)
-
     # Truncate slot indices to match active sequences
     slot_idx_sanitized = slot_idx[:num_seq].clone().to(torch.long)
     # TODO(https://github.com/NVIDIA/TensorRT-LLM/issues/8170): update torch
@@ -88,7 +84,6 @@ def _triton_ssm_prepare_metadata(
 
     return (
         seq_len_sanitized,
-        seq_start,
         slot_idx_sanitized,
         use_initial_states,
         cu_seqlens,
@@ -109,7 +104,6 @@ def _triton_ssm_prepare_metadata_fake(
     device = slot_idx.device
     # Always-correct shapes
     seq_len_fake = torch.empty_like(seq_len_sanitized)
-    seq_start_fake = torch.empty_like(seq_len_sanitized)
     slot_idx_fake = torch.empty(num_seq, dtype=torch.long, device=device)
     use_initial_states_fake = torch.empty(num_seq, dtype=torch.bool, device=device)
     cu_seqlens_fake = torch.empty(num_seq + 1, dtype=torch.int32, device=device)
@@ -142,7 +136,6 @@ def _triton_ssm_prepare_metadata_fake(
 
     return (
         seq_len_fake,
-        seq_start_fake,
         slot_idx_fake,
         use_initial_states_fake,
         cu_seqlens_fake,
@@ -165,7 +158,6 @@ def _triton_cached_ssm(
     dt_bias: torch.Tensor,  # [num_heads]
     # METADATA
     seq_len: torch.Tensor,  # [num_seq]
-    seq_start: torch.Tensor,  # [num_seq]
     slot_idx: torch.Tensor,  # [num_seq]
     use_initial_states: torch.Tensor,  # [num_seq]
     cu_seqlens: torch.Tensor,  # [num_seq + 1]
@@ -290,7 +282,6 @@ def _triton_cached_ssm_fake(
     dt_bias: torch.Tensor,  # [num_heads]
     # METADATA
     seq_len: torch.Tensor,  # [num_seq]
-    seq_start: torch.Tensor,  # [num_seq]
     slot_idx: torch.Tensor,  # [num_seq]
     use_initial_states: torch.Tensor,  # [num_seq]
     cu_seqlens: torch.Tensor,  # [num_seq + 1]
@@ -340,9 +331,9 @@ class TritonBackendSSM(AttentionDescriptor):
 
     @classmethod
     def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
-        # Returns: seq_len, seq_start, slot_idx, use_initial_states,
+        # Returns: seq_len, slot_idx, use_initial_states,
         # cu_seqlens, chunk_indices, chunk_offsets, seq_idx_prefill, batch_info_tensor
-        return torch.ops.auto_deploy.triton_ssm_prepare_metadata, 9
+        return torch.ops.auto_deploy.triton_ssm_prepare_metadata, 8
 
     @classmethod
     def get_cache_initializers(
