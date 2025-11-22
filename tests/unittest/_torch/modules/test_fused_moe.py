@@ -1507,7 +1507,7 @@ def test_fused_moe_nvfp4(dtype, moe_backend, hidden_size, intermediate_size):
         print()
         print("actual", output)
         print("ref", ref_output)
-        torch.testing.assert_close(output, ref_output, rtol=0.2, atol=0.75)
+        check_accuracy(output, ref_output, rtol=0.1, atol=0.1, percent=0.975)
 
         if not test_all_kernels:
             return
@@ -1520,10 +1520,11 @@ def test_fused_moe_nvfp4(dtype, moe_backend, hidden_size, intermediate_size):
         for tactic in all_tactics:
             with AutoTuner.get().replay(tactic), torch.inference_mode():
                 output = fused_moe.forward(x, router_logits)
-                torch.testing.assert_close(output,
-                                           ref_output,
-                                           rtol=0.2,
-                                           atol=0.75)
+                check_accuracy(output,
+                               ref_output,
+                               rtol=0.1,
+                               atol=0.1,
+                               percent=0.975)
 
 
 @skip_pre_blackwell
