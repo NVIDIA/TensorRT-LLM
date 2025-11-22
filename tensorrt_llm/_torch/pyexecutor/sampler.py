@@ -748,15 +748,44 @@ class TorchSampler(Sampler):
             topk_log_probs_vals = request.py_topk_logprobs_vals[:count]
             topk_log_probs_indices = request.py_topk_logprobs_indices[:count]
 
-            token_log_probs = [
-                {
-                    token: Logprob(logprob=logprob, rank=rank + 1)
-                    for rank, (token, logprob) in enumerate(
-                        zip(topk_token.tolist(), topk_logprob.tolist())
-                    )
-                }
-                for topk_token, topk_logprob in zip(topk_log_probs_indices, topk_log_probs_vals)
-            ]
+            sampled_tokens = request.get_tokens(beam)[-count:]
+
+            token_log_probs = []
+            for step, (topk_token, topk_logprob) in enumerate(zip(topk_log_probs_indices, topk_log_probs_vals)):
+                sampled_token = sampled_tokens[step]
+
+                # TODO. WAR: If both gather_generation_logits and return_generation_logits are set,
+                # return ONLY the sampled token's logprob (not top-K).
+                if request.py_return_generation_logits:
+                    generation_logits_storage = request.py_result._generation_logits
+                    if generation_logits_storage and generation_logits_storage._storage is not None:
+                        # Compute log_softmax to get logprobs for the sampled token
+                        # Iinternal storage tensor: [seq_length, beam_width, vocab_size]
+                        logits_for_step = generation_logits_storage._storage[step]  # [beam_width, vocab_size]
+                        logprobs_for_step = F.log_softmax(logits_for_step[beam].float(), dim=-1)
+                        sampled_logprob = logprobs_for_step[sampled_token].item()
+
+                        rank = (logprobs_for_step > sampled_logprob).sum().item() + 1
+
+                        step_dict = {sampled_token: Logprob(logprob=sampled_logprob, rank=rank)}
+                    else:
+                        step_dict = {
+                            token: Logprob(logprob=logprob, rank=rank + 1)
+                            for rank, (token, logprob) in enumerate(
+                                zip(topk_token.tolist(), topk_logprob.tolist())
+                            )
+                        }
+                else:
+                    # Original behavior: return top-K
+                    step_dict = {
+                        token: Logprob(logprob=logprob, rank=rank + 1)
+                        for rank, (token, logprob) in enumerate(
+                            zip(topk_token.tolist(), topk_logprob.tolist())
+                        )
+                    }
+
+                token_log_probs.append(step_dict)
+
             assert beam == 0, (
                 "The following call relies on beam_width to be 1 - hence the list with a single element"
             )
