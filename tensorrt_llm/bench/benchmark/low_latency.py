@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from functools import partial
 from pathlib import Path
 
@@ -46,12 +45,14 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Path to a serialized TRT-LLM engine.",
 )
 @optgroup.option(
+    "--config",
     "--extra_llm_api_options",
+    "extra_llm_api_options",
     type=str,
     default=None,
     help=
-    "Path to a YAML file that overwrites the parameters specified by trtllm-bench."
-)
+    "Path to a YAML file that overwrites the parameters specified by trtllm-bench. "
+    "Can be specified as either --config or --extra_llm_api_options.")
 @optgroup.option(
     "--backend",
     type=click.Choice(ALL_SUPPORTED_BACKENDS),
@@ -192,6 +193,7 @@ def latency_command(
 ) -> None:
     """Run a latency test on a TRT-LLM engine."""
     logger.info("Preparing to run latency benchmark...")
+
     # Parameters from CLI
     # Model, experiment, and engine params
     options = get_general_cli_options(params, bench_env)
@@ -262,14 +264,6 @@ def latency_command(
     exec_settings["settings_config"][
         "scheduler_policy"] = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
 
-    # Set environment variables for setting runtime options.
-    # TODO: Once passing of variables is fixed, these should work
-    # when using MPI in C++ runtime.
-    os.environ["TRTLLM_ENABLE_MMHA_MULTI_BLOCK_DEBUG"] = "1"
-    os.environ["TRTLLM_MMHA_KERNEL_BLOCK_SIZE"] = "256"
-    os.environ["FORCE_MULTI_BLOCK_MODE"] = "1"
-    os.environ["TRTLLM_ENABLE_PDL"] = "1"
-
     # Performance options
     exec_settings["performance_options"]["cuda_graphs"] = True
     exec_settings["performance_options"]["multi_block_mode"] = True
@@ -288,6 +282,17 @@ def latency_command(
     llm = None
     kwargs = kwargs | runtime_config.get_llm_args()
     kwargs['backend'] = options.backend
+
+    # Set environment variables for setting runtime options.
+    default_env_overrides = {
+        "TRTLLM_ENABLE_MMHA_MULTI_BLOCK_DEBUG": "1",
+        "TRTLLM_MMHA_KERNEL_BLOCK_SIZE": "256",
+        "FORCE_MULTI_BLOCK_MODE": "1",
+        "TRTLLM_ENABLE_PDL": "1",
+    }
+    # Update defaults with existing overrides (user preference takes priority)
+    default_env_overrides.update(kwargs.get("env_overrides", {}))
+    kwargs["env_overrides"] = default_env_overrides
 
     try:
         logger.info("Setting up latency benchmark.")
