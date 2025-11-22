@@ -370,8 +370,8 @@ class AsyncQueue:
     class MixedSyncAsyncAPIError(Exception):
         pass
 
-    def __init__(self):
-        self._q = collections.deque()
+    def __init__(self, maxsize: Optional[int] = None):
+        self._q = collections.deque(maxlen=maxsize)
         self._event = asyncio.Event()
         self._tainted = False
         self._sync_q = _SyncQueue(self)
