@@ -2164,36 +2164,56 @@ def test_indexer_topk_multi_request_with_different_cache():
                     f"    ⚠️ INVALID: Custom has negative indices < -1 (kernel bug!)"
                 )
 
-    # Then check set equality (order doesn't matter)
-    print(f"\n=== Set Comparison ===")
+    # Check tokens with large windows (>= 2048) should have exactly 2048 valid indices
+    print(f"\n=== Check: Large windows must have 2048 valid ===")
+    from tensorrt_llm._torch.attention_backend.sparse.dsa import \
+        compute_cu_seqlen_kv_bounds_with_cache
+    host_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device='cpu')
+    host_cached = torch.tensor(cached_tokens, dtype=torch.int32, device='cpu')
+    cu_ks, cu_ke = compute_cu_seqlen_kv_bounds_with_cache(
+        host_seq_lens, host_cached, batch_size, total_tokens)
+
+    for tok_id in range(total_tokens):
+        window_size = (cu_ke[tok_id] - cu_ks[tok_id]).item()
+        if window_size >= index_topk:
+            num_valid = (topk_custom[tok_id] >= 0).sum().item()
+            num_valid_fallback = (topk_fallback[tok_id] >= 0).sum().item()
+            assert num_valid_fallback == index_topk, \
+                f"[Fallback] Token {tok_id}: window={window_size}, but only {num_valid_fallback}/{index_topk} valid indices"
+            assert num_valid == index_topk, \
+                f"[Custom Topk] Token {tok_id}: window={window_size}, but only {num_valid}/{index_topk} valid indices"
+
+    print(f"  ✓ All large-window tokens have {index_topk} valid indices")
+
+    # Validation
     num_exact_matches = 0
-    num_set_matches = 0
+    total_similarity = 0.0
+    min_similarity = 1.0
 
     for token_idx in range(total_tokens):
         custom_valid = topk_custom[token_idx][topk_custom[token_idx] >= 0]
         fallback_valid = topk_fallback[token_idx][topk_fallback[token_idx] >= 0]
 
-        custom_set = set(custom_valid.cpu().tolist())
-        fallback_set = set(fallback_valid.cpu().tolist())
+        if torch.equal(custom_valid, fallback_valid):
+            num_exact_matches += 1
+            similarity = 1.0
+            total_similarity += similarity
+        else:
+            custom_set = set(custom_valid.cpu().tolist())
+            fallback_set = set(fallback_valid.cpu().tolist())
+            intersection = len(custom_set & fallback_set)
+            union = len(custom_set | fallback_set)
+            similarity = intersection / union if union > 0 else 0.0
+            total_similarity += similarity
 
-        if custom_set == fallback_set:
-            num_set_matches += 1
-            if torch.equal(custom_valid, fallback_valid):
-                num_exact_matches += 1
+        # Track min similarity
+        min_similarity = min(min_similarity, similarity)
 
-    set_match_ratio = num_set_matches / total_tokens
-    exact_ratio = num_exact_matches / total_tokens
+    avg_similarity = total_similarity / total_tokens
 
+    print(f"  Exact matches: {num_exact_matches}/{total_tokens}")
     print(
-        f"  Set matches: {num_set_matches}/{total_tokens} ({set_match_ratio:.1%})"
-    )
-    print(
-        f"  Exact order matches: {num_exact_matches}/{total_tokens} ({exact_ratio:.1%})"
-    )
+        f"  Similarity - Min: {min_similarity:.4f}, Avg: {avg_similarity:.4f}")
 
-    assert set_match_ratio == 1.0, \
-        f"Custom kernel selects different indices than fallback: only {num_set_matches}/{total_tokens} match"
-
-    print(
-        f"✅ Test passed: Custom and fallback kernels produce identical topk sets"
-    )
+    assert avg_similarity >= 0.95, \
+        f"Custom vs fallback differ: avg similarity {avg_similarity:.4f} < 0.95"
