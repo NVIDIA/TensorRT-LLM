@@ -1,23 +1,20 @@
 # Adapted from https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/gated_delta_rule/chunk.py
-# Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/attention/fla/chunk.py
 # -*- coding: utf-8 -*-
 
 from typing import Optional
 
 import torch
 from einops import rearrange
+from fla.modules.l2norm import l2norm_fwd
+from fla.ops.utils import chunk_local_cumsum
+from fla.utils import autocast_custom_fwd, input_guard
 
 from tensorrt_llm._torch.modules.fla.chunk_delta_h import \
     chunk_gated_delta_rule_fwd_h
 from tensorrt_llm._torch.modules.fla.chunk_o import chunk_fwd_o
 from tensorrt_llm._torch.modules.fla.chunk_scaled_dot_kkt import \
     chunk_scaled_dot_kkt_fwd
-from tensorrt_llm._torch.modules.fla.cumsum import chunk_local_cumsum
-from tensorrt_llm._torch.modules.fla.l2norm import l2norm_fwd
 from tensorrt_llm._torch.modules.fla.solve_tril import solve_tril
-from tensorrt_llm._torch.modules.fla.utils import (SUPPRESS_LEVEL,
-                                                   autocast_custom_fwd,
-                                                   input_guard)
 from tensorrt_llm._torch.modules.fla.wy_fast import recompute_w_u_fwd
 
 
@@ -66,10 +63,8 @@ def chunk_gated_delta_rule_fwd(
         scale=scale,
         cu_seqlens=cu_seqlens,
     )
-    if SUPPRESS_LEVEL < 3:
-        return g, o, A, final_state, None, None, None
-    elif SUPPRESS_LEVEL >= 3:
-        return g, o, A, final_state, w, h, v_new
+
+    return g, o, A, final_state
 
 
 class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
@@ -90,13 +85,11 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         cu_seqlens: Optional[torch.LongTensor] = None,
         use_qk_l2norm_in_kernel: bool = False,
     ):
-        pass
-
         if use_qk_l2norm_in_kernel:
-            q = l2norm_fwd(q)
-            k = l2norm_fwd(k)
+            q, _ = l2norm_fwd(q)
+            k, _ = l2norm_fwd(k)
 
-        g, o, A, final_state, w, h, v_new = chunk_gated_delta_rule_fwd(
+        g, o, A, final_state = chunk_gated_delta_rule_fwd(
             q=q,
             k=k,
             v=v,
@@ -120,9 +113,9 @@ def chunk_gated_delta_rule(
     scale: float = None,
     initial_state: torch.Tensor = None,
     output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: Optional[torch.LongTensor] = None,
     head_first: bool = False,
-    use_qk_l2norm_in_kernel: bool = False,
 ):
     r"""
     Args:
