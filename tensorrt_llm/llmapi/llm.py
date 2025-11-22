@@ -798,7 +798,10 @@ class BaseLLM:
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+    def __exit__(
+        self, exc_type, exc_value, traceback
+    ) -> Literal[
+            False]:  # https://github.com/microsoft/pyright/issues/7009#issuecomment-1894135045
         del exc_value, traceback
         self.shutdown()
         return False  # propagate exceptions
