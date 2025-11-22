@@ -37,7 +37,8 @@ class AllreduceResidualNorm(torch.nn.Module):
         self.norm = RMSNorm(hidden_size, 1e-5, dtype)
 
     def forward(self, x, residual):
-        x = torch.ops.auto_deploy.torch_dist_all_reduce.default(x)
+        # Use trtllm backend ops when running with MPI/TRT-LLM
+        x = torch.ops.auto_deploy.trtllm_dist_all_reduce.default(x)
         y = residual + x
         normed = self.norm(y)
         return normed, y
@@ -51,7 +52,8 @@ class AllreduceResidualNorm2(torch.nn.Module):
         self.norm = RMSNorm(hidden_size, 1e-5, dtype)
 
     def forward(self, x, residual):
-        x = torch.ops.auto_deploy.torch_dist_all_reduce.default(x)
+        # Use trtllm backend ops when running with MPI/TRT-LLM
+        x = torch.ops.auto_deploy.trtllm_dist_all_reduce.default(x)
         y = x + residual
         normed = self.norm(y)
         return normed, y
@@ -94,7 +96,7 @@ def _test_allreduce_fusion(port: int, ModuleCls):
     # Check if fused node in the graph
     has_fused_node = False
     for node in gm_transformed.graph.nodes:
-        if is_op(node, torch.ops.dist.fused_allreduce_residual_rmsnorm):
+        if is_op(node, torch.ops.dist.trtllm_fused_allreduce_residual_rmsnorm):
             has_fused_node = True
     assert has_fused_node, "Fused node not found."
 
