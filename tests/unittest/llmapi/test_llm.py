@@ -2051,11 +2051,16 @@ def validate_stats(
     results,
     pytorch_backend,
     max_tokens,
+    pp_size=1,
     use_overlap=False,
     enable_chunked_prefill=False,
     enable_iter_req_stats=False,
 ):
     assert results
+    for iter, result in enumerate(results):
+        ifbStats = result["inflightBatchingStats"]
+        print(f"iter: {iter}, ifbStats: {ifbStats}")
+
     expected_num_results = max_tokens if pytorch_backend else max_tokens + 1
     if enable_chunked_prefill:
         expected_num_results += 1
@@ -2063,47 +2068,59 @@ def validate_stats(
 
     context_iterations = 2 if enable_chunked_prefill else 1
     generation_iterations = max_tokens - 1
+    microbatch_id = 0
     for iter, result in enumerate(results):
         ifbStats = result["inflightBatchingStats"]
 
         if iter < context_iterations:
-            assert ifbStats["numScheduledRequests"] == 1
-            assert ifbStats["numContextRequests"] == 1
-            assert ifbStats["numGenRequests"] == 0
-            assert result["numActiveRequests"] == 1
+            assert ifbStats["numScheduledRequests"] == 1, f"iter: {iter}"
+            assert ifbStats["numContextRequests"] == 1, f"iter: {iter}"
+            assert ifbStats["numGenRequests"] == 0, f"iter: {iter}"
+            assert result["numActiveRequests"] == 1, f"iter: {iter}"
+            assert ifbStats["microBatchId"] == microbatch_id, f"iter: {iter}"
         elif iter < (context_iterations + generation_iterations):
-            assert ifbStats["numScheduledRequests"] == 1
-            assert ifbStats["numContextRequests"] == 0
-            assert ifbStats["numGenRequests"] == 1
-            assert result["numActiveRequests"] == 1
+            assert ifbStats["numScheduledRequests"] == 1, f"iter: {iter}"
+            assert ifbStats["numContextRequests"] == 0, f"iter: {iter}"
+            assert ifbStats["numGenRequests"] == 1, f"iter: {iter}"
+            assert result["numActiveRequests"] == 1, f"iter: {iter}"
+            assert ifbStats["microBatchId"] == microbatch_id, f"iter: {iter}"
         else:
-            assert ifbStats["numScheduledRequests"] == 0
-            assert ifbStats["numContextRequests"] == 0
-            assert ifbStats["numGenRequests"] == 0
-            assert result["numActiveRequests"] == 0
+            assert ifbStats["numScheduledRequests"] == 0, f"iter: {iter}"
+            assert ifbStats["numContextRequests"] == 0, f"iter: {iter}"
+            assert ifbStats["numGenRequests"] == 0, f"iter: {iter}"
+            assert result["numActiveRequests"] == 0, f"iter: {iter}"
+            assert ifbStats["microBatchId"] == microbatch_id, f"iter: {iter}"
+
+        # In pipeline parallel mode, increment microbatch_id for each context iteration except the last one,
+        # since the context chunks can be scheduled in each iteration.
+        if pp_size > 1 and iter < context_iterations - 1:
+            microbatch_id += 1
 
         if enable_iter_req_stats:
-            assert "requestStats" in result
+            assert "requestStats" in result, f"iter: {iter}"
             req_stats = result["requestStats"]
-            assert len(req_stats) == 1
+            assert len(req_stats) == 1, f"iter: {iter}"
             req_stat = req_stats[0]
             if iter < (context_iterations - 1):
                 # If use_overlap, the stats are one iteration ahead
                 assert req_stat[
-                    "stage"] == "GENERATION_IN_PROGRESS" if use_overlap else "CONTEXT_IN_PROGRESS"
+                    "stage"] == "GENERATION_IN_PROGRESS" if use_overlap else "CONTEXT_IN_PROGRESS", f"iter: {iter}"
                 assert req_stat[
-                    "contextPrefillPosition"] == 54 if use_overlap else 32
-                assert req_stat["numGeneratedTokens"] == 0
+                    "contextPrefillPosition"] == 54 if use_overlap else 32, f"iter: {iter}"
+                assert req_stat["numGeneratedTokens"] == 0, f"iter: {iter}"
             elif iter < (context_iterations - 1 + generation_iterations):
-                assert req_stat["stage"] == "GENERATION_IN_PROGRESS"
-                assert req_stat["contextPrefillPosition"] == 54
+                assert req_stat[
+                    "stage"] == "GENERATION_IN_PROGRESS", f"iter: {iter}"
+                assert req_stat["contextPrefillPosition"] == 54, f"iter: {iter}"
                 assert req_stat["numGeneratedTokens"] == iter - (
-                    context_iterations - 1) + 1
+                    context_iterations - 1) + 1, f"iter: {iter}"
             else:
-                assert req_stat["stage"] == "GENERATION_COMPLETE"
-                assert req_stat["contextPrefillPosition"] == 54
-                assert req_stat["numGeneratedTokens"] == max_tokens
-            assert req_stat["scheduled"] == True
+                assert req_stat[
+                    "stage"] == "GENERATION_COMPLETE", f"iter: {iter}"
+                assert req_stat["contextPrefillPosition"] == 54, f"iter: {iter}"
+                assert req_stat[
+                    "numGeneratedTokens"] == max_tokens, f"iter: {iter}"
+            assert req_stat["scheduled"] == True, f"iter: {iter}"
 
         expected_num_completed = 1 if iter == len(results) - 1 else 0
 
@@ -2179,6 +2196,7 @@ def llm_get_stats_test_harness(tp_size: int = 1,
         results = llm.get_stats(2)
 
         validate_stats(results=results,
+                       pp_size=pp_size,
                        pytorch_backend=pytorch_backend,
                        max_tokens=max_tokens,
                        use_overlap=use_overlap,
@@ -2329,6 +2347,7 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
             assert results
             if not use_overlap:
                 validate_stats(results=results,
+                               pp_size=pp_size,
                                pytorch_backend=pytorch_backend,
                                max_tokens=max_tokens,
                                use_overlap=use_overlap,

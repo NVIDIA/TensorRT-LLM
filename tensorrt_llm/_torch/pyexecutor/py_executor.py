@@ -697,7 +697,7 @@ class PyExecutor:
         return req_stats
 
     def _update_iter_stats(self, stats, iter_latency_ms, num_completed_requests,
-                           scheduled_batch) -> IterationStats:
+                           scheduled_batch, micro_batch_id) -> IterationStats:
         stats.iter_latency_ms = iter_latency_ms
 
         stats.num_queued_requests = self.executor_request_queue.get_request_queue_size(
@@ -738,7 +738,7 @@ class PyExecutor:
         stats.inflight_batching_stats.num_paused_requests = len(
             scheduled_batch.paused_requests)
         stats.inflight_batching_stats.avg_num_decoded_tokens_per_iter = 0
-        stats.inflight_batching_stats.micro_batch_id = 0
+        stats.inflight_batching_stats.micro_batch_id = micro_batch_id
         if stats.specdec_stats is not None:
             stats.specdec_stats.draft_overhead = 0.0 if iter_latency_ms <= 0.0 else float(
                 stats.specdec_stats.iter_latency_ms) / float(iter_latency_ms)
@@ -751,9 +751,13 @@ class PyExecutor:
         with self.stats_lock:
             self.stats.append((stats, req_stats))
 
-    def _process_iter_stats(self, finished_requests: list[LlmRequest],
-                            active_requests: List[LlmRequest],
-                            batch_state: BatchState):
+    def _process_iter_stats(
+        self,
+        finished_requests: list[LlmRequest],
+        active_requests: List[LlmRequest],
+        batch_state: BatchState,
+        micro_batch_id: int = 0,
+    ):
         iter_end_time = time.time()
         iter_latency_ms = (iter_end_time - batch_state.iter_start_time) * 1e3
         if batch_state.iter_stats is None:
@@ -766,9 +770,10 @@ class PyExecutor:
                 and self.enable_iter_perf_stats) else None
 
         self._append_iter_stats(
-            self._update_iter_stats(
-                batch_state.iter_stats, iter_latency_ms, len(finished_requests),
-                batch_state.sample_state.scheduled_requests), req_stats)
+            self._update_iter_stats(batch_state.iter_stats, iter_latency_ms,
+                                    len(finished_requests),
+                                    batch_state.sample_state.scheduled_requests,
+                                    micro_batch_id), req_stats)
 
     def _executor_loop_cleanup(self):
 
@@ -828,6 +833,7 @@ class PyExecutor:
                 self.num_scheduled_requests = scheduled_batch.batch_size
 
                 logger.debug(
+                    f'iteration {self.iter_counter}, microbatch {microbatch_id}, '
                     f'has {len(self.active_requests)} active_requests, '
                     f'scheduled {len(scheduled_batch.context_requests)} context requests and '
                     f'{len(scheduled_batch.generation_requests)} generation requests'
@@ -1008,9 +1014,11 @@ class PyExecutor:
                 microbatch_id = (microbatch_id + 1) % self.num_micro_batches
 
                 if self.enable_iter_perf_stats and previous_batch is not None:
+                    sample_state = previous_batch.sample_state
+                    sample_state.scheduled_requests.context_requests = previous_batch.scheduled_ctx_reqs
                     self._process_iter_stats(finished_requests,
                                              self.active_requests,
-                                             previous_batch)
+                                             previous_batch, microbatch_id)
 
                 self.iter_counter += 1
 
