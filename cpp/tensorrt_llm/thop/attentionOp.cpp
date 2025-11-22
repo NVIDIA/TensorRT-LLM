@@ -234,7 +234,7 @@ public:
                 }
                 if (mla_helix_is_inactive_rank.has_value())
                 {
-                    mla_params.helix_is_inactive_rank = mla_helix_is_inactive_rank->const_data_ptr<bool>();
+                    mla_params.helix_is_inactive_rank = mla_helix_is_inactive_rank->data_ptr<bool>();
                 }
             }
             else

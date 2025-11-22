@@ -296,7 +296,7 @@ class TrtllmAttentionWrapper:
         self.sparse_mla_topk = sparse_mla_topk
         self.helix_position_offsets = helix_position_offsets
         self.helix_is_inactive_rank = helix_is_inactive_rank
-        if self.helix_is_inactive_rank is not None:
+        if self.helix_is_inactive_rank is not None and not isinstance(self.helix_is_inactive_rank, torch.Tensor):
             self.helix_is_inactive_rank = torch.tensor(
                 self.helix_is_inactive_rank, dtype=torch.bool, pin_memory=True)
 
