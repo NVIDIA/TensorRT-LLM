@@ -968,7 +968,7 @@ class DraftTargetDecodingConfig(DecodingBaseConfig):
     decoding_type: ClassVar[str] = "Draft_Target"
 
     def supports_backend(self, backend: str) -> bool:
-        return backend == "pytorch"
+        return backend == "pytorch" or backend == "_autodeploy"
 
 
 class MTPDecodingConfig(DecodingBaseConfig):
@@ -2256,7 +2256,7 @@ class BaseLlmArgs(StrictBaseModel):
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
 
             elif isinstance(self.speculative_config, DraftTargetDecodingConfig):
-                assert self.backend in ['pytorch']
+                assert self.backend in ['pytorch', '_autodeploy']
                 assert self.speculative_config.max_draft_len > 0
                 assert self.speculative_config.speculative_model_dir is not None, "Path to draft model must be specified."
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.DRAFT_TOKENS_EXTERNAL
