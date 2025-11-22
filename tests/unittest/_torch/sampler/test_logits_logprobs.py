@@ -237,3 +237,194 @@ def test_generate_async_with_return_logits(
                 assert len(sequence.logprobs) == idx + 1
             else:
                 assert len(sequence.logprobs) == 0
+
+
+@pytest.mark.parametrize("logprobs_k", [0, 1, 3],
+                         ids=["top_0", "top_1", "top_3"])
+def test_sampled_token_always_in_logprobs(logprobs_k: int):
+    """Two scenarios:
+        - logprobs=0: Returns only sampled token (1 element)
+        - logprobs=K (K>0): Returns top-K tokens + sampled token if not in top-K (up to K+1 elements)
+    """
+    llm = LLM(model=os.path.join(llm_models_root(), "llama-models-v2",
+                                 "TinyLlama-1.1B-Chat-v1.0"), )
+
+    sampling_params = SamplingParams(
+        max_tokens=8,
+        temperature=0.7,
+        top_p=0.9,
+        logprobs=logprobs_k,
+    )
+
+    for output in llm.generate(["The future of AI is"],
+                               sampling_params=sampling_params):
+        print(f"\n{'='*80}")
+        print(f"Generated text: {output.outputs[0].text!r}")
+        print(f"Generated token IDs: {output.outputs[0].token_ids}")
+
+        logprobs = output.outputs[0].logprobs
+        token_ids = output.outputs[0].token_ids
+
+        assert len(logprobs) == sampling_params.max_tokens, \
+            f"Expected {sampling_params.max_tokens} logprob entries, got {len(logprobs)}"
+
+        for token_idx, (sampled_token_id,
+                        token_logprobs) in enumerate(zip(token_ids, logprobs)):
+            print(
+                f"\n  Token {token_idx}: ID={sampled_token_id}, Text={llm.tokenizer.decode([sampled_token_id])!r}"
+            )
+
+            assert sampled_token_id in token_logprobs, \
+                f"Token {token_idx}: Sampled token ID {sampled_token_id} not in logprobs dict: {token_logprobs.keys()}"
+
+            if logprobs_k == 0:
+                assert len(token_logprobs) == 1, \
+                    f"Token {token_idx}: Expected 1 logprob (sampled only), got {len(token_logprobs)}"
+            else:
+                assert len(token_logprobs) <= logprobs_k + 1, \
+                    f"Token {token_idx}: Expected at most {logprobs_k + 1} logprobs, got {len(token_logprobs)}"
+                assert len(token_logprobs) >= 1
+
+            sorted_tokens_by_prob = sorted(token_logprobs.items(),
+                                           key=lambda x: x[1].logprob,
+                                           reverse=True)
+
+            if logprobs_k > 0:
+                sampled_token_rank = token_logprobs[sampled_token_id].rank
+                sampled_in_topk = sampled_token_rank <= logprobs_k
+
+                if not sampled_in_topk:
+                    assert sorted_tokens_by_prob[-1][0] == sampled_token_id, \
+                        f"Token {token_idx}: Sampled token (ID={sampled_token_id}, rank={sampled_token_rank}) not in top-{logprobs_k}, " \
+                        f"should be last in sorted list, but last token is ID={sorted_tokens_by_prob[-1][0]}"
+
+            for rank_idx, (token_id,
+                           logprob_obj) in enumerate(sorted_tokens_by_prob,
+                                                     start=1):
+                token_text = llm.tokenizer.decode([token_id])
+                is_sampled = "← SAMPLED" if token_id == sampled_token_id else ""
+                print(f"    • Token {token_id:5d} ({token_text:15s}): "
+                      f"logprob={logprob_obj.logprob:8.4f}, "
+                      f"rank={logprob_obj.rank} {is_sampled}")
+
+                if logprobs_k > 0 and sampled_in_topk:
+                    assert logprob_obj.rank == rank_idx, \
+                        f"Token {token_idx}: Token {token_id} rank mismatch. " \
+                        f"Expected rank {rank_idx} (by sorted position), got {logprob_obj.rank}"
+
+        print(f"{'='*80}\n")
+
+
+@pytest.mark.parametrize("logprobs_k", [0, 2], ids=["top_0", "top_2"])
+def test_logprobs_with_grouped_samplings_strategies(logprobs_k: int):
+    """Test logprobs when requests are reordered by sampling strategy grouping"""
+    llm = LLM(
+        model=os.path.join(llm_models_root(), "llama-models-v2",
+                           "TinyLlama-1.1B-Chat-v1.0"),
+        max_batch_size=8,
+    )
+
+    test_prompts = [
+        "The capital of France is",
+        "The future of AI is",
+        "Hello, my name is",
+        "Write a short story about a cat",
+    ]
+
+    # Causes reordering: [0,1,2,3] → [0,2,1,3]
+    sampling_params_list = [
+        SamplingParams(max_tokens=6,
+                       temperature=0.8,
+                       top_k=50,
+                       logprobs=logprobs_k,
+                       return_generation_logits=True),
+        SamplingParams(max_tokens=6,
+                       temperature=0.8,
+                       top_p=0.9,
+                       logprobs=logprobs_k,
+                       return_generation_logits=True),
+        SamplingParams(max_tokens=6,
+                       temperature=0.8,
+                       top_k=50,
+                       logprobs=logprobs_k,
+                       return_generation_logits=True),
+        SamplingParams(max_tokens=6,
+                       temperature=0.8,
+                       top_p=0.9,
+                       logprobs=logprobs_k,
+                       return_generation_logits=True),
+    ]
+
+    outputs = list(
+        llm.generate(test_prompts, sampling_params=sampling_params_list))
+
+    for req_idx, output in enumerate(outputs):
+        generation_logits = output.outputs[0].generation_logits
+        token_ids = output.outputs[0].token_ids
+        logprobs = output.outputs[0].logprobs
+
+        assert generation_logits is not None
+        assert len(logprobs) == len(token_ids), "Logprobs length mismatch"
+
+        # generation_logits might be shorter than token_ids
+        num_logits = len(generation_logits)
+
+        for token_idx, (sampled_token_id, token_logprobs_dict) in enumerate(
+                zip(token_ids[:num_logits], logprobs[:num_logits])):
+            returned_logprob = token_logprobs_dict[sampled_token_id].logprob
+
+            logits_for_token = generation_logits[token_idx]
+            expected_logprobs = torch.nn.functional.log_softmax(
+                logits_for_token.to(dtype=torch.float32), dim=-1)
+            expected_logprob = expected_logprobs[sampled_token_id].item()
+
+            logprob_diff = abs(returned_logprob - expected_logprob)
+            print(
+                f"Req {req_idx}, Token {token_idx}: returned={returned_logprob:.6f}, expected={expected_logprob:.6f}, diff={logprob_diff:.6f}"
+            )
+
+            assert logprob_diff < 1e-4, \
+                f"Req {req_idx}, Token {token_idx}: Logprob mismatch! " \
+                f"Returned {returned_logprob:.6f} but expected {expected_logprob:.6f} " \
+                f"(diff={logprob_diff:.6f}). This indicates the logprob might be extracted from " \
+                f"the wrong token position."
+
+
+# def test_logprobs_match_hf_tp2():
+#     """Compare TensorRT-LLM logprobs against HuggingFace reference."""
+#     model_path = os.path.join(llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0")
+#     llm = LLM(
+#             model=model_path,
+#             tensor_parallel_size=2,
+#         )
+
+#     sampling_params = SamplingParams(
+#         max_tokens=10,
+#         temperature=0,
+#         logprobs=0,
+#     )
+
+#     hf_model = AutoModelForCausalLM.from_pretrained(modesl_path, torch_dtype=torch.bfloat16).to("cuda")
+#     hf_tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+#     output = list(llm.generate(prompts, sampling_params=sampling_params))[0]
+
+#     trtllm_token_ids = output.outputs[0].token_ids
+#     trtllm_logprobs = torch.tensor([list(lp.values())[0].logprob for lp in output.outputs[0].logprobs])
+
+#     base_ids = hf_tokenizer.encode(prompts[0], return_tensors="pt").to("cuda")
+#     hf_logprobs = []
+
+#     for i, token_id in enumerate(trtllm_token_ids):
+#         input_ids = torch.cat([base_ids, torch.tensor(trtllm_token_ids[:i], device="cuda").unsqueeze(0)], dim=1) if i > 0 else base_ids
+#         with torch.no_grad():
+#             logits = hf_model(input_ids).logits[0, -1, :]
+#         hf_logprobs.append(torch.log_softmax(logits, dim=-1)[token_id].item())
+
+#     hf_logprobs = torch.tensor(hf_logprobs)
+
+#     print(f"\nTensorRT-LLM logprobs: {trtllm_logprobs}")
+#     print(f"HuggingFace logprobs:  {hf_logprobs}")
+
+#     max_diff = (trtllm_logprobs - hf_logprobs).abs().max().item()
+#     assert max_diff < 0.1, f"Max logprob diff {max_diff:.4f} exceeds threshold"
