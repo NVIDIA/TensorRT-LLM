@@ -6,7 +6,8 @@ if [ -n "${GITHUB_MIRROR}" ]; then
     GITHUB_URL=${GITHUB_MIRROR}
 fi
 
-MOONCAKE_VERSION="0.3.7.post2"
+MOONCAKE_VERSION="v0.3.6.post1"
+MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
 MOONCAKE_INSTALL_PATH="/usr/local/Mooncake"
 
 apt-get update
@@ -45,21 +46,10 @@ make install
 cd ../..
 rm -rf yalantinglibs
 
-curl -L ${GITHUB_URL}/kvcache-ai/Mooncake/archive/refs/tags/v${MOONCAKE_VERSION}.tar.gz -o Mooncake-${MOONCAKE_VERSION}.tar.gz
-tar -xzf Mooncake-${MOONCAKE_VERSION}.tar.gz
-# Auto-detect extracted directory name
-MOONCAKE_DIR=$(tar -tzf Mooncake-${MOONCAKE_VERSION}.tar.gz | head -1 | cut -f1 -d"/")
-mv ${MOONCAKE_DIR} Mooncake
+git clone --depth 1 -b ${MOONCAKE_VERSION} ${MOONCAKE_REPO}
+tar -czf /third-party-source/Mooncake-${MOONCAKE_VERSION}.tar.gz Mooncake
 cd Mooncake
-
-# Manually download pybind11 submodule (since tarball doesn't include submodules)
-PYBIND11_VERSION="v2.13.6"
-mkdir -p extern
-curl -L ${GITHUB_URL}/pybind/pybind11/archive/refs/tags/${PYBIND11_VERSION}.tar.gz -o pybind11.tar.gz
-tar -xzf pybind11.tar.gz
-PYBIND11_DIR=$(tar -tzf pybind11.tar.gz | head -1 | cut -f1 -d"/")
-mv ${PYBIND11_DIR} extern/pybind11
-rm pybind11.tar.gz
+git submodule update --init --recursive --depth 1
 
 mkdir build && cd build
 cmake .. -DUSE_CUDA=ON -DBUILD_SHARED_LIBS=ON -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF \
