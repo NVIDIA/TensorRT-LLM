@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/customAllReduceUtils.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/mcastDevMemUtils.h"
+#include "tensorrt_llm/common/ncclUtils.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h"
@@ -437,44 +438,111 @@ private:
         torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& norm_weight,
         torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias)
     {
+        // Handle ProcessGroup path first - cannot extract NCCL comm for window registration
+        // Use ProcessGroup's allreduce directly and return early
+        if (mNcclComm.index() == 1)
+        {
+            auto torchPg = std::get<1>(mNcclComm);
+
+            torch::Tensor reduceOutput = input.clone();
+            std::vector tensors{reduceOutput};
+            PGCHECK_THROW(torchPg->allreduce(tensors, {c10d::ReduceOp::SUM}));
+
+            if (mOp == AllReduceFusionOp::NONE)
+            {
+                return {reduceOutput};
+            }
+
+            // Treat any other patterns as fallback cases.
+            return fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, reduceOutput);
+        }
+
+        // From here on, we have a raw NCCL comm - can proceed with window registration
+        auto rawComm = std::get<0>(mNcclComm);
+        ncclComm_t comm = *rawComm;
+        TLLM_CHECK_WITH_INFO(comm != nullptr, "NCCL communicator is null");
+        TLLM_LOG_DEBUG("[runNCCLAllReduceSymmetric] Using raw NCCL comm path (not ProcessGroup)");
+
+        using tensorrt_llm::common::nccl_util::NCCLWindowAllocator;
+        using tensorrt_llm::common::nccl_util::createNCCLWindowTensor;
 
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
         int size = input.numel();
-        auto& ub_manager = tensorrt_llm::runtime::ub::UserBuffersManager::get_instance();
-        auto ub_tensor0 = input;
-        auto ub_buffer0 = ub_manager.search_buffer(input.data_ptr());
-        if (ub_buffer0.invalid())
+        size_t bufferSizeBytes = size * input.element_size();
+
+        // Using unregistered input buffers with NCCL symmetric, requires a memcpy
+        // This is an overhead introduced with using NCCL_SYMMTRIC over NCCL.
+        // Both the memcpy and the perf benefit from using NCCL_SYMMETRIC scale linear with the message size.
+        // But a local memcpy is cheaper than the remote operations, so with larger message sizes the benefit is
+        // stronger. Additionally, the perf benefit scales with the number of ranks, since multimem enables O(const.)
+        // versus O(N) complexity. Hence we model this cutoff with a linear model. The numbers below were obtained on
+        // GB200, scanning different message sizes and ranks. You can determine the regression onset for each number of
+        // ranks to a single message size. And the following formula was obtained by fitting a linear model to the
+        // regression onset. It is possible to override this empirical heuristic with the TLLM_NCCL_MIN_REGISTRATION
+        // environment variable.
+        double const a = -4986.43478503;
+        double const b = 156716.52177552;
+        int nRanks;
+        NCCLCHECK_THROW(ncclCommCount(comm, &nRanks));
+        size_t minRegistrationThreshold = static_cast<size_t>(std::max(0.0, a * nRanks + b)) * input.element_size();
+        char const* envThreshold = std::getenv("TLLM_NCCL_MIN_REGISTRATION");
+        if (envThreshold != nullptr)
         {
-            auto [symmetric_input, symmetric_ub_buffer0]
-                = torch_ext::create_userbuffers_tensor(input.sizes(), input.scalar_type());
-            cudaMemcpyAsync(symmetric_ub_buffer0.addr, input.data_ptr(), size * input.element_size(),
-                cudaMemcpyDeviceToDevice, stream);
-            ub_buffer0 = symmetric_ub_buffer0;
-            ub_tensor0 = symmetric_input;
+            minRegistrationThreshold = static_cast<size_t>(std::atoi(envThreshold)) * input.element_size();
         }
 
-        TLLM_CHECK(!ub_buffer0.invalid());
-        auto [norm_out, ub_buffer1] = torch_ext::create_userbuffers_tensor(input.sizes(), input.scalar_type());
+        // Search for existing buffer
+        auto& allocator = NCCLWindowAllocator::getInstance();
+        auto windowBuffer0 = allocator.searchBuffer(comm, input.data_ptr());
 
-        std::visit(overloaded{[&, norm_out_ = norm_out](std::shared_ptr<ncclComm_t>& rawComm)
-                       {
-                           NCCLCHECK_THROW(ncclAllReduce(ub_buffer0.addr, norm_out_.mutable_data_ptr(), size,
-                               (*getDtypeMap())[mType], ncclSum, *rawComm, stream));
-                       },
-                       [&, norm_out_ = norm_out](c10::intrusive_ptr<c10d::ProcessGroup>& torchPg)
-                       {
-                           PGCHECK_THROW(PgHelper{torchPg}.allreduce(ub_tensor0, {c10d::ReduceOp::SUM}));
-                           std::ignore = norm_out_.copy_(ub_tensor0, true);
-                       }},
-            mNcclComm);
+        torch::Tensor inputTensor = input;
+        void* inputPtr = input.data_ptr();
+
+        // If buffer is not registered, decide whether to register based on size
+        if (!windowBuffer0.isValid())
+        {
+            if (bufferSizeBytes < minRegistrationThreshold)
+            {
+                // Small buffer: use input directly without window registration
+                TLLM_LOG_DEBUG(
+                    "[runNCCLAllReduceSymmetric] Buffer size %zu bytes < threshold %zu bytes, "
+                    "skipping window registration",
+                    bufferSizeBytes, minRegistrationThreshold);
+                // inputTensor and inputPtr remain pointing to original input
+            }
+            else
+            {
+                // Large buffer: create window buffer and copy input (can swap inputTensor reference)
+                auto [symmetricInput, symmetricBuffer0]
+                    = createNCCLWindowTensor(comm, input.sizes(), input.scalar_type());
+                TLLM_CUDA_CHECK(cudaMemcpyAsync(
+                    symmetricBuffer0.ptr, input.data_ptr(), bufferSizeBytes, cudaMemcpyDeviceToDevice, stream));
+                windowBuffer0 = symmetricBuffer0;
+                inputTensor = symmetricInput; // Swap to window-backed tensor
+                inputPtr = windowBuffer0.ptr;
+            }
+        }
+        else
+        {
+            // Buffer already registered - use it directly
+            inputPtr = windowBuffer0.ptr;
+        }
+
+        // Use window-backed output buffer
+        auto [normOut, windowBuffer1] = createNCCLWindowTensor(comm, input.sizes(), input.scalar_type());
+        torch::Tensor outputTensor = normOut;
+        void* outputPtr = windowBuffer1.ptr;
+
+        // Perform allreduce
+        NCCLCHECK_THROW(ncclAllReduce(inputPtr, outputPtr, size, (*getDtypeMap())[mType], ncclSum, comm, stream));
 
         if (mOp == AllReduceFusionOp::NONE)
         {
-            return {norm_out};
+            return {outputTensor};
         }
 
         // Treat any other patterns as fallback cases.
-        return fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, norm_out);
+        return fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, outputTensor);
     }
 
     std::vector<torch::Tensor> runLowPrecisionAllReduce(torch::Tensor const& input,
@@ -951,12 +1019,12 @@ private:
 
         if (ifFallbackToNCCL(seq_len, message_size_bytes, max_workspace_size))
         {
-            return AllReduceStrategyType::NCCL;
+            return AllReduceStrategyType::NCCL_SYMMETRIC;
         }
 
-        // This rule based heuristic only chooses between NCCL and MIN_LATENCY strategies.
-        // From this point, all fusion patterns are supported by all these strategies: NCCL, ONESHOT, TWOSHOT and
-        // MIN_LATENCY.
+        // This rule based heuristic only chooses between NCCL_SYMMETRIC and MIN_LATENCY strategies.
+        // From this point, all fusion patterns are supported by all these strategies: NCCL_SYMMETRIC, ONESHOT, TWOSHOT
+        // and MIN_LATENCY.
         if (mStrategy != AllReduceStrategyType::AUTO)
         {
             return mStrategy;
@@ -966,12 +1034,11 @@ private:
             return tensorrt_llm::utils::customAllReduceUtils::selectStrategyLookUpTable(
                 seq_len, hidden_size, mOp, mGroup.size());
         }
-        return AllReduceStrategyType::NCCL;
     }
 
     bool ifFallbackToNCCL(size_t seq_len, size_t message_size_bytes, size_t max_workspace_size)
     {
-        // If messageSize is less than maxWorkspaceSize, use NCCL, regardless of the fusion type.
+        // If messageSize is greater than maxWorkspaceSize or topology is unsuitable, use NCCL_SYMMETRIC fallback.
         if (message_size_bytes > max_workspace_size || !mIsP2PSupported || !mIsNVLINKSupported)
         {
             return true;
