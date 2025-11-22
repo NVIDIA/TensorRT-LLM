@@ -8,7 +8,7 @@ from torch import nn
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f, nvtx_range,
                                  nvtx_range_debug)
 from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.mapping import CpType, Mapping
 
 from ..attention_backend import (AttentionInputType, AttentionMetadata,
                                  FlashInferAttentionMetadata, TrtllmAttention,
@@ -676,6 +676,7 @@ class MLA(nn.Module):
         dense_bias: Optional[bool] = None,
         config: Optional[ModelConfig] = None,
         enable_unit_test: bool = False,
+        mapping_with_cp: Optional[Mapping] = None,
     ):
         """
         Initialize the MLA module.
@@ -709,6 +710,7 @@ class MLA(nn.Module):
         self.num_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        assert self.num_heads == self.num_key_value_heads, "num_heads must be equal to num_key_value_heads"
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
         self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
@@ -747,7 +749,11 @@ class MLA(nn.Module):
 
         # tensor parallel
         config = config or ModelConfig()
-        self.mapping = config.mapping
+        if mapping_with_cp is not None:
+            print("[MLA::__init__] OVERRIDING MAPPING WITH CP DETECTED.")
+            self.mapping = mapping_with_cp
+        else:
+            self.mapping = config.mapping
         tp_size = self.mapping.tp_size
         pp_size = self.mapping.pp_size
         cp_size = self.mapping.cp_size
@@ -755,6 +761,8 @@ class MLA(nn.Module):
             tp_size = 1
         if self.mapping.has_cp_ulysses():
             raise NotImplementedError("MLA doesn't support CP Ulyssees yet")
+        if self.mapping.cp_size > 1:
+            assert self.mapping.cp_config['cp_type'] == CpType.HELIX, f"CP type must be HELIX for MLA, but got {self.mapping.cp_config['cp_type']}."
 
         mapping = Mapping(
             world_size=tp_size * pp_size * cp_size,
@@ -1700,6 +1708,13 @@ class MLA(nn.Module):
             device=q.device,
         )
 
+        # Compute helix_position_offsets for helix parallelism.
+        if self.mapping.cp_size > 1:
+            assert position_ids is not None, "position_ids is required for helix parallelism."
+            helix_position_offsets = position_ids
+        else:
+            helix_position_offsets = None
+
         rope_stream = self.aux_stream if not has_fp8_kv_cache else None
         if self.k_b_proj_trans.dtype == torch.bfloat16:
             # [num_heads, num_tokens, self.qk_nope_head_dim]
@@ -1713,10 +1728,18 @@ class MLA(nn.Module):
             maybe_execute_in_parallel(
                 lambda: torch.ops.trtllm.bmm_out(
                     q_nope_t, self.k_b_proj_trans.transpose(1, 2), q_nope_out),
-                lambda: self.mqa.mla_rope_generation(
-                    fused_q, q_pe, latent_cache, attn_metadata, cu_q_seqlens,
-                    cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale,
-                    mla_bmm2_scale, quant_q_buffer),
+                lambda: self.mqa.mla_rope_generation(fused_q,
+                                                     q_pe,
+                                                     latent_cache,
+                                                     attn_metadata,
+                                                     cu_q_seqlens,
+                                                     cu_kv_seqlens,
+                                                     fmha_scheduler_counter,
+                                                     mla_bmm1_scale,
+                                                     mla_bmm2_scale,
+                                                     quant_q_buffer,
+                                                     helix_position_offsets=
+                                                     helix_position_offsets),
                 self.ln_events[0],
                 self.ln_events[1],
                 rope_stream,
@@ -1734,10 +1757,18 @@ class MLA(nn.Module):
                     q_nope_out,
                     self.k_b_proj_trans_dequant,
                 ),
-                lambda: self.mqa.mla_rope_generation(
-                    fused_q, q_pe, latent_cache, attn_metadata, cu_q_seqlens,
-                    cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale,
-                    mla_bmm2_scale, quant_q_buffer),
+                lambda: self.mqa.mla_rope_generation(fused_q,
+                                                     q_pe,
+                                                     latent_cache,
+                                                     attn_metadata,
+                                                     cu_q_seqlens,
+                                                     cu_kv_seqlens,
+                                                     fmha_scheduler_counter,
+                                                     mla_bmm1_scale,
+                                                     mla_bmm2_scale,
+                                                     quant_q_buffer,
+                                                     helix_position_offsets=
+                                                     helix_position_offsets),
                 self.ln_events[0],
                 self.ln_events[1],
                 rope_stream,
@@ -2058,7 +2089,6 @@ class MLA(nn.Module):
         else:
             raise NotImplementedError(
                 f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")
-
         return output
 
     def forward(
