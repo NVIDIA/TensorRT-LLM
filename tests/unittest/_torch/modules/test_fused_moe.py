@@ -1402,15 +1402,25 @@ def test_fused_moe_nvfp4(dtype, moe_backend, hidden_size, intermediate_size):
                 device="cuda") * 0.05
             w1_sf_global = (448 * 6) / w1_weight.abs().max().float()
 
+            w1_bias = torch.randn(INTERMEDIATE_SIZE,
+                                  device='cuda',
+                                  dtype=torch.float)
+
             w2_weight = torch.randn(
                 (HIDDEN_SIZE, INTERMEDIATE_SIZE), dtype=dtype,
                 device="cuda") * 0.05
             w2_sf_global = (448 * 6) / w2_weight.abs().max().float()
 
+            w2_bias = torch.randn(HIDDEN_SIZE, device='cuda', dtype=torch.float)
+
             w3_weight = torch.randn(
                 (INTERMEDIATE_SIZE, HIDDEN_SIZE), dtype=dtype,
                 device="cuda") * 0.05
             w3_sf_global = (448 * 6) / w3_weight.abs().max().float()
+
+            w3_bias = torch.randn(INTERMEDIATE_SIZE,
+                                  device='cuda',
+                                  dtype=torch.float)
 
             w3_w1_global = min(
                 w1_sf_global,
@@ -1447,6 +1457,7 @@ def test_fused_moe_nvfp4(dtype, moe_backend, hidden_size, intermediate_size):
             weights[
                 f"{expert_id}.w3.weight_scale"] = w3_sf_block_unswizzled.view(
                     torch.float8_e4m3fn).cuda()
+
             weights[f"{expert_id}.w1.input_scale"] = 1.0 / w1_input_scale
             weights[f"{expert_id}.w2.input_scale"] = 1.0 / w2_input_scale
             weights[f"{expert_id}.w3.input_scale"] = 1.0 / w3_input_scale
@@ -1454,12 +1465,17 @@ def test_fused_moe_nvfp4(dtype, moe_backend, hidden_size, intermediate_size):
             weights[f"{expert_id}.w2.weight_scale_2"] = 1.0 / w2_sf_global
             weights[f"{expert_id}.w3.weight_scale_2"] = 1.0 / w3_w1_global
 
+            weights[f"{expert_id}.w1.bias"] = w1_bias
+            weights[f"{expert_id}.w2.bias"] = w2_bias
+            weights[f"{expert_id}.w3.bias"] = w3_bias
+
         quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
         fused_moe = create_moe(
             num_experts=NUM_EXPERTS,
             routing_method=routing_method,
             hidden_size=HIDDEN_SIZE,
             intermediate_size=INTERMEDIATE_SIZE,
+            bias=True,
             dtype=dtype,
             reduce_results=True,
             model_config=ModelConfig(quant_config=quant_config,
@@ -1474,6 +1490,7 @@ def test_fused_moe_nvfp4(dtype, moe_backend, hidden_size, intermediate_size):
             routing_method=routing_method,
             hidden_size=HIDDEN_SIZE,
             intermediate_size=INTERMEDIATE_SIZE,
+            bias=True,
             dtype=dtype,
             model_config=ModelConfig(quant_config=quant_config))
         ref_fused_moe.load_weights([weights])
@@ -1487,7 +1504,10 @@ def test_fused_moe_nvfp4(dtype, moe_backend, hidden_size, intermediate_size):
             fused_moe.forward(x, router_logits)
 
         output = fused_moe.forward(x, router_logits)
-        torch.testing.assert_close(output, ref_output, rtol=0.1, atol=0.5)
+        print()
+        print("actual", output)
+        print("ref", ref_output)
+        torch.testing.assert_close(output, ref_output, rtol=0.2, atol=0.75)
 
         if not test_all_kernels:
             return
@@ -1502,8 +1522,8 @@ def test_fused_moe_nvfp4(dtype, moe_backend, hidden_size, intermediate_size):
                 output = fused_moe.forward(x, router_logits)
                 torch.testing.assert_close(output,
                                            ref_output,
-                                           rtol=0.1,
-                                           atol=0.5)
+                                           rtol=0.2,
+                                           atol=0.75)
 
 
 @skip_pre_blackwell

@@ -2054,6 +2054,10 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
             assert len(w2_weight.shape) == 1
             w2_weight = maybe_pad_for_weights(w2_weight, self.weight_alignment)
 
+            # Divide bias by tp_size as we shard along the hidden dimension.
+            # The bias is applied at each TP rank before the final accumulation.
+            w2_weight /= module.tp_size
+
         w2_weight_shard = load_weight_shard(w2_weight,
                                             module.tp_size,
                                             module.tp_rank,
@@ -2218,6 +2222,16 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
         module.fc31_scale_c.data.copy_(module.fc2_input_scale.data *
                                        module.fc31_alpha.data,
                                        non_blocking=True)
+
+        # Normalize biases to account for the global scale factors,
+        # matching the kernel's expectation (similar to test_moe.py logic).
+        if module.w3_w1_bias is not None:
+            # gemm1_bias * gemm1_scales_global * hidden_states_scale_global
+            module.w3_w1_bias.data.div_((module.fc31_alpha.data).view(-1, 1))
+
+        if module.w2_bias is not None:
+            # gemm2_bias * c_global_sf * gemm2_scales_global
+            module.w2_bias.data.div_((module.fc2_alpha.data).view(-1, 1))
 
         if self.need_load_shared_weights(module):
             local_shared_load_expert_ids = module.layer_load_balancer.get_load_expert_ids(
