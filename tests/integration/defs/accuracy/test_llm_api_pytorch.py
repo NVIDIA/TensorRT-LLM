@@ -255,8 +255,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         with LLM(model=target_model_dir,
                  **pytorch_config,
                  kv_cache_config=kv_cache_config,
-                 speculative_config=spec_config,
-                 build_config=None) as llm:
+                 speculative_config=spec_config) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
@@ -3040,8 +3039,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                   kv_cache_config=kv_cache_config,
                   enable_chunked_prefill=enable_chunked_prefill,
                   max_num_tokens=256 if enable_chunked_prefill else 8192,
-                  speculative_config=spec_config,
-                  build_config=None)
+                  speculative_config=spec_config)
 
         with llm:
             task = GSM8K(self.MODEL_NAME)
