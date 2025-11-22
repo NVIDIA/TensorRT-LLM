@@ -1346,7 +1346,13 @@ class MLA(nn.Module):
         latent_cache: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if False:  #get_sm_version() >= 100:
+        # TODO: current trtllm attention kernel does not support chunked prefill
+        use_sparse_mla_kvcache_bf16 = (
+            isinstance(self.mqa, TrtllmAttention)
+            and self.mqa.is_chunked_prefill_for_mla_context(attn_metadata)
+        ) or get_sm_version() < 100
+
+        if not use_sparse_mla_kvcache_bf16:
             return self.forward_absorption_context(q,
                                                    compressed_kv,
                                                    k_pe,
@@ -1372,7 +1378,7 @@ class MLA(nn.Module):
         latent_cache: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if False:  #get_sm_version() >= 100:
+        if get_sm_version() >= 100:
             return self.forward_absorption_generation(q,
                                                       compressed_kv,
                                                       k_pe,
