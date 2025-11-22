@@ -625,7 +625,10 @@ class ModelDrafter(Drafter):
                 target_model_req.py_draft_tokens.append(
                     draft_tokens_host[token_idx][req_idx])
                 py_draft_logits.append(draft_logits[token_idx][req_idx])
-            target_model_req.py_draft_logits = torch.stack(py_draft_logits)
+
+            # The overlap scheduler doesn't support rejection sampling yet, so we don't update the py_draft_logits to get it fallback to greedy sampling.
+            if self.disable_overlap_scheduler:
+                target_model_req.py_draft_logits = torch.stack(py_draft_logits)
 
     def process_dynamic_draft_outputs(
             self,

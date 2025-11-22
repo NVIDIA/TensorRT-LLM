@@ -58,8 +58,8 @@ import torch
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack
 
-from tensorrt_llm._torch.cute_dsl_kernels.blackwell.custom_pipeline import (
-    PipelineTmaUmma, PipelineUmmaAsync)
+from .custom_pipeline import PipelineTmaUmma, PipelineUmmaAsync
+from .utils import is_power_of_2
 
 
 class Sm100BlockScaledPersistentDenseGemmKernel:
@@ -1761,7 +1761,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         if cluster_shape_mn[0] % (2 if mma_tiler_mn[0] == 256 else 1) != 0:
             is_valid = False
         # Skip invalid cluster shape
-        is_power_of_2 = lambda x: x > 0 and (x & (x - 1)) == 0
         if (cluster_shape_mn[0] * cluster_shape_mn[1] > 16
                 or cluster_shape_mn[0] <= 0 or cluster_shape_mn[1] <= 0
                 # Special cluster shape check for scale factor multicasts.
@@ -1817,8 +1816,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             is_valid = False
         return is_valid
 
-    @staticmethod
+    @classmethod
     def can_implement(
+        cls,
         ab_dtype: Type[cutlass.Numeric],
         sf_dtype: Type[cutlass.Numeric],
         sf_vec_size: int,
@@ -1859,74 +1859,26 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         """
         can_implement = True
         # Skip unsupported types
-        if not Sm100BlockScaledPersistentDenseGemmKernel.is_valid_dtypes_and_scale_factor_vec_size(
+        if not cls.is_valid_dtypes_and_scale_factor_vec_size(
                 ab_dtype, sf_dtype, sf_vec_size, c_dtype):
             can_implement = False
         # Skip unsupported layouts
-        if not Sm100BlockScaledPersistentDenseGemmKernel.is_valid_layouts(
-                ab_dtype, c_dtype, a_major, b_major, c_major):
+        if not cls.is_valid_layouts(ab_dtype, c_dtype, a_major, b_major,
+                                    c_major):
             can_implement = False
         # Skip invalid mma tile shape and cluster shape
-        if not Sm100BlockScaledPersistentDenseGemmKernel.is_valid_mma_tiler_and_cluster_shape(
-                mma_tiler_mn, cluster_shape_mn):
+        if not cls.is_valid_mma_tiler_and_cluster_shape(mma_tiler_mn,
+                                                        cluster_shape_mn):
             can_implement = False
         # Skip illegal problem shape for load/store alignment
-        if not Sm100BlockScaledPersistentDenseGemmKernel.is_valid_tensor_alignment(
-                m, n, k, l, ab_dtype, c_dtype, a_major, b_major, c_major):
+        if not cls.is_valid_tensor_alignment(m, n, k, l, ab_dtype, c_dtype,
+                                             a_major, b_major, c_major):
             can_implement = False
         return can_implement
 
-
-@cute.jit
-def cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
-    sf_ref_tensor: cute.Tensor,
-    sf_mma_tensor: cute.Tensor,
-):
-    """Converts a scale factor tensor from MKL to an MMA-compatible layout.
-
-    Args:
-        sf_ref_tensor (cute.Tensor): The source tensor in MKL layout.
-        sf_mma_tensor (cute.Tensor): The destination tensor in the target MMA
-            layout M(32x4xrest_m) x K(4xrest_k) x L.
-    """
-    # sf_mma_tensor has flatten shape (32, 4, rest_m, 4, rest_k, l)
-    # group to ((32, 4, rest_m), (4, rest_k), l)
-    sf_mma_tensor = cute.group_modes(sf_mma_tensor, 0, 3)
-    sf_mma_tensor = cute.group_modes(sf_mma_tensor, 1, 3)
-    for i in cutlass.range(cute.size(sf_ref_tensor)):
-        mkl_coord = sf_ref_tensor.layout.get_hier_coord(i)
-        sf_mma_tensor[mkl_coord] = sf_ref_tensor[mkl_coord]
-
-
-class Sm100BlockScaledPersistentDenseGemmKernelWrapper:
-    compiled_gemm = {}
-
-    def __init__(
-        self,
-        sf_vec_size: int,
-        mma_tiler_mn: Tuple[int, int],
-        cluster_shape_mn: Tuple[int, int],
-    ):
-        """Initializes the GEMM kernel wrapper.
-
-        Args:
-            sf_vec_size (int): Scale factor vector size.
-            mma_tiler_mn (Tuple[int, int]): Shape of the MMA instruction tile
-                (M, N).
-            cluster_shape_mn (Tuple[int, int]): Cluster dimensions (M, N).
-        """
-        self.sf_vec_size = sf_vec_size
-        self.mma_tiler_mn = mma_tiler_mn
-        self.cluster_shape_mn = cluster_shape_mn
-
-    @staticmethod
-    def ceil_div(a, b):
-        """Computes ceiling division."""
-        return (a + b - 1) // b
-
     # fully dynamic shape
     @cute.jit
-    def __call__(
+    def wrapper(
         self,
         m,
         n,
@@ -2007,12 +1959,29 @@ class Sm100BlockScaledPersistentDenseGemmKernelWrapper:
                                           order=(2, 1, 4, 0, 3, 5),
                                       ))
 
-        Sm100BlockScaledPersistentDenseGemmKernel(
-            self.sf_vec_size,
-            self.mma_tiler_mn,
-            self.cluster_shape_mn,
-        )(a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_tensor, alpha,
-          max_active_clusters, current_stream, epilogue_op)
+        self(a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_tensor, alpha,
+             max_active_clusters, current_stream, epilogue_op)
+
+
+@cute.jit
+def cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
+    sf_ref_tensor: cute.Tensor,
+    sf_mma_tensor: cute.Tensor,
+):
+    """Converts a scale factor tensor from MKL to an MMA-compatible layout.
+
+    Args:
+        sf_ref_tensor (cute.Tensor): The source tensor in MKL layout.
+        sf_mma_tensor (cute.Tensor): The destination tensor in the target MMA
+            layout M(32x4xrest_m) x K(4xrest_k) x L.
+    """
+    # sf_mma_tensor has flatten shape (32, 4, rest_m, 4, rest_k, l)
+    # group to ((32, 4, rest_m), (4, rest_k), l)
+    sf_mma_tensor = cute.group_modes(sf_mma_tensor, 0, 3)
+    sf_mma_tensor = cute.group_modes(sf_mma_tensor, 1, 3)
+    for i in cutlass.range(cute.size(sf_ref_tensor)):
+        mkl_coord = sf_ref_tensor.layout.get_hier_coord(i)
+        sf_mma_tensor[mkl_coord] = sf_ref_tensor[mkl_coord]
 
 
 def run(

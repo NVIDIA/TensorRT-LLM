@@ -3956,15 +3956,23 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=extra_evaluator_kwargs)
 
     @pytest.mark.skip_less_device(4)
+    @pytest.mark.parametrize("overlap_scheduler", [True, False],
+                             ids=["overlap_scheduler", "no_overlap_scheduler"])
+    @pytest.mark.parametrize("one_model", [True, False],
+                             ids=["one_model", "two_model"])
     @pytest.mark.parametrize(
         "moe_backend",
         ["CUTLASS",
          pytest.param("TRTLLM", marks=skip_pre_blackwell), "TRITON"],
         ids=["cutlass", "trtllm", "triton"])
-    def test_eagle3(self, moe_backend, mocker):
+    def test_eagle3(self, moe_backend, one_model, overlap_scheduler, mocker):
         if moe_backend == "TRITON":
             if not IS_TRITON_KERNELS_AVAILABLE:
                 pytest.skip("Triton kernels are not available")
+
+        if get_sm_version() == 90 and moe_backend == "CUTLASS":
+            pytest.skip(
+                "https://nvbugs/5636916: Remaining Hopper Eagle Accuracy Issue")
 
         MAX_OUTPUT_LEN = 128179
         MAX_INPUT_LEN = 32768
@@ -3977,16 +3985,16 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         mocker.patch.object(GPQADiamond, "MAX_INPUT_LEN", MAX_INPUT_LEN)
 
         # https://nvbugs/5590408: 2-Model overlap scheduling has accuracy issue
-        pytorch_config = dict(disable_overlap_scheduler=True,
+        pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
                               cuda_graph_config=CudaGraphConfig())
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
                                         dtype="auto")
 
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
         draft_len = 3
         spec_config = EagleDecodingConfig(max_draft_len=draft_len,
                                           speculative_model_dir=eagle_model_dir,
-                                          eagle3_one_model=False)
+                                          eagle3_one_model=one_model)
 
         max_seq_len = MAX_INPUT_LEN + MAX_OUTPUT_LEN
         llm = LLM(self.MODEL_PATH,

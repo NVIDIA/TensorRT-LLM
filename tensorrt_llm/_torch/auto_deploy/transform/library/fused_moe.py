@@ -87,6 +87,10 @@ def _insert_fused_moe_ops(gm: GraphModule, backend: Literal["auto", "trtllm", "t
                     graph.get_attr(new_key_w_up),
                     graph.get_attr(new_key_w_down),
                 ),
+                kwargs={
+                    "mlp_style": mlp_style_val,
+                    "act_fn": act_fn_val,
+                },
             )
 
         node.replace_all_uses_with(new_node)

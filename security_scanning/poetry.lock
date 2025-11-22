@@ -2,13 +2,13 @@
 
 [[package]]
 name = "accelerate"
-version = "1.11.0"
+version = "1.12.0"
 description = "Accelerate"
 optional = false
 python-versions = ">=3.10.0"
 files = [
-    {file = "accelerate-1.11.0-py3-none-any.whl", hash = "sha256:a628fa6beb069b8e549460fc449135d5bd8d73e7a11fd09f0bc9fc4ace7f06f1"},
-    {file = "accelerate-1.11.0.tar.gz", hash = "sha256:bb1caf2597b4cd632b917b5000c591d10730bb024a79746f1ee205bba80bd229"},
+    {file = "accelerate-1.12.0-py3-none-any.whl", hash = "sha256:3e2091cd341423207e2f084a6654b1efcd250dc326f2a37d6dde446e07cabb11"},
+    {file = "accelerate-1.12.0.tar.gz", hash = "sha256:70988c352feb481887077d2ab845125024b2a137a5090d6d7a32b57d03a45df6"},
 ]
 
 [package.dependencies]
@@ -210,6 +210,17 @@ files = [
 [package.dependencies]
 frozenlist = ">=1.1.0"
 typing-extensions = {version = ">=4.2", markers = "python_version < \"3.13\""}
+
+[[package]]
+name = "annotated-doc"
+version = "0.0.4"
+description = "Document parameters, class attributes, return types, and variables inline, with Annotated."
+optional = false
+python-versions = ">=3.8"
+files = [
+    {file = "annotated_doc-0.0.4-py3-none-any.whl", hash = "sha256:571ac1dc6991c450b25a9c2d84a3705e2ae7a53467b5d111c24fa8baabbed320"},
+    {file = "annotated_doc-0.0.4.tar.gz", hash = "sha256:fbcda96e87e9c92ad167c2e53839e57503ecfda18804ea28102353485033faa4"},
+]
 
 [[package]]
 name = "annotated-types"
@@ -1007,13 +1018,13 @@ torch = ["torch"]
 
 [[package]]
 name = "exceptiongroup"
-version = "1.3.0"
+version = "1.3.1"
 description = "Backport of PEP 654 (exception groups)"
 optional = false
 python-versions = ">=3.7"
 files = [
-    {file = "exceptiongroup-1.3.0-py3-none-any.whl", hash = "sha256:4d111e6e0c13d0644cad6ddaa7ed0261a0b36971f6d23e7ec9b4b9097da78a10"},
-    {file = "exceptiongroup-1.3.0.tar.gz", hash = "sha256:b241f5885f560bc56a59ee63ca4c6a8bfa46ae4ad651af316d4e81817bb9fd88"},
+    {file = "exceptiongroup-1.3.1-py3-none-any.whl", hash = "sha256:a7a39a3bd276781e98394987d3a5701d0c4edffb633bb7a5144577f82c773598"},
+    {file = "exceptiongroup-1.3.1.tar.gz", hash = "sha256:8b412432c6055b0b7d14c310000ae93352ed6754f70fa8f7c34141f91c4e3219"},
 ]
 
 [package.dependencies]
@@ -1024,18 +1035,19 @@ test = ["pytest (>=6)"]
 
 [[package]]
 name = "fastapi"
-version = "0.117.1"
+version = "0.121.3"
 description = "FastAPI framework, high performance, easy to learn, fast to code, ready for production"
 optional = false
 python-versions = ">=3.8"
 files = [
-    {file = "fastapi-0.117.1-py3-none-any.whl", hash = "sha256:33c51a0d21cab2b9722d4e56dbb9316f3687155be6b276191790d8da03507552"},
-    {file = "fastapi-0.117.1.tar.gz", hash = "sha256:fb2d42082d22b185f904ca0ecad2e195b851030bd6c5e4c032d1c981240c631a"},
+    {file = "fastapi-0.121.3-py3-none-any.whl", hash = "sha256:0c78fc87587fcd910ca1bbf5bc8ba37b80e119b388a7206b39f0ecc95ebf53e9"},
+    {file = "fastapi-0.121.3.tar.gz", hash = "sha256:0055bc24fe53e56a40e9e0ad1ae2baa81622c406e548e501e717634e2dfbc40b"},
 ]
 
 [package.dependencies]
+annotated-doc = ">=0.0.2"
 pydantic = ">=1.7.4,<1.8 || >1.8,<1.8.1 || >1.8.1,<2.0.0 || >2.0.0,<2.0.1 || >2.0.1,<2.1.0 || >2.1.0,<3.0.0"
-starlette = ">=0.40.0,<0.49.0"
+starlette = ">=0.40.0,<0.51.0"
 typing-extensions = ">=4.8.0"
 
 [package.extras]
@@ -2102,15 +2114,25 @@ description = "A framework for machine learning on Apple silicon."
 optional = false
 python-versions = ">=3.10"
 files = [
+    {file = "mlx-0.30.0-cp310-cp310-macosx_14_0_arm64.whl", hash = "sha256:f861392df1ee0ee216188060a8ff2cd2ed4d2b34d4366102863d01d02acf2a7e"},
     {file = "mlx-0.30.0-cp310-cp310-macosx_15_0_arm64.whl", hash = "sha256:7f4a0c37cc3eee051ee5efade3200cb49bc7e9973b38e53db2dddacdb3896a71"},
+    {file = "mlx-0.30.0-cp310-cp310-macosx_26_0_arm64.whl", hash = "sha256:df9a48d181ba52da86b524b5e21f8c4eebd73393649127cde19ace75b26daa2c"},
     {file = "mlx-0.30.0-cp310-cp310-manylinux_2_35_x86_64.whl", hash = "sha256:3e2488ec30a1b17138050f0a33d9202c3cbdf67307b411d4ba3e116bd14484d0"},
+    {file = "mlx-0.30.0-cp311-cp311-macosx_14_0_arm64.whl", hash = "sha256:d5871a5f1ce5cba2f690d2c630a6672cc65a62326bcaa6db258185957a1f073f"},
     {file = "mlx-0.30.0-cp311-cp311-macosx_15_0_arm64.whl", hash = "sha256:302c3d52b4f68b80a8ee259489369524a3381fcc9aed12b17c1c537870c81fce"},
+    {file = "mlx-0.30.0-cp311-cp311-macosx_26_0_arm64.whl", hash = "sha256:d72443a461f2e92329edf344ded8460df53fd7ec3c04ddd2353ee4ceb34c0ff2"},
     {file = "mlx-0.30.0-cp311-cp311-manylinux_2_35_x86_64.whl", hash = "sha256:0beb015a6afef2f86dfbefe65c9022dce91dbe1651e1b4330ef32434602323e0"},
+    {file = "mlx-0.30.0-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:11fbae58b1e992afdec6709d5e281932871a0138582a794cdcc82ff895a28670"},
     {file = "mlx-0.30.0-cp312-cp312-macosx_15_0_arm64.whl", hash = "sha256:fc1994a4c9e60ccfe2ab9211c846be2ef7abc6fc3e53e1addb2cdf7468f61e7b"},
+    {file = "mlx-0.30.0-cp312-cp312-macosx_26_0_arm64.whl", hash = "sha256:a9f30c5c94b30b65f026162e91256473187e1de57c13dcc2aedb2fc33c07f2c1"},
     {file = "mlx-0.30.0-cp312-cp312-manylinux_2_35_x86_64.whl", hash = "sha256:1c4a2f5285bdd585aa6485a4fb5759ebc2721ba9381404ff867c136e84764e9b"},
+    {file = "mlx-0.30.0-cp313-cp313-macosx_14_0_arm64.whl", hash = "sha256:f46aaa6c562ba183e2a64a0e6ba15ed54f9027d9b7b1822e9eec7f59b13d610c"},
     {file = "mlx-0.30.0-cp313-cp313-macosx_15_0_arm64.whl", hash = "sha256:5edee9f1452703c0804e067f212c61d488b3ad7419b9fcacf337ffd35842f576"},
+    {file = "mlx-0.30.0-cp313-cp313-macosx_26_0_arm64.whl", hash = "sha256:b8ae92b61353d756bbd0668b065a4ee5ee35867b03d63c0c61134d656ed236fe"},
     {file = "mlx-0.30.0-cp313-cp313-manylinux_2_35_x86_64.whl", hash = "sha256:431009c531f8bdbf56f46b85d458d5526b40ea43178dbc85f37ed55e03e716be"},
+    {file = "mlx-0.30.0-cp314-cp314-macosx_14_0_arm64.whl", hash = "sha256:384819dccfd551aa1444acacedb9ed2619724b0e67fc361ab80d73b8a8a7618f"},
     {file = "mlx-0.30.0-cp314-cp314-macosx_15_0_arm64.whl", hash = "sha256:8982a7d7fd078988c12c3fc53da1670aa910dd8a7df1fc0b9fee7303394ac8ff"},
+    {file = "mlx-0.30.0-cp314-cp314-macosx_26_0_arm64.whl", hash = "sha256:392af721cb0bcf600162d7258923c15d39e197a64e23b6abd171e1aea79771c5"},
     {file = "mlx-0.30.0-cp314-cp314-manylinux_2_35_x86_64.whl", hash = "sha256:cf688c9dda18f2521d48f712515a47b145b37d5d0ab245eaf1a68f286af7ae66"},
 ]
 
@@ -2155,7 +2177,9 @@ description = "A framework for machine learning on Apple silicon."
 optional = false
 python-versions = ">=3.10"
 files = [
+    {file = "mlx_metal-0.30.0-py3-none-macosx_14_0_arm64.whl", hash = "sha256:f48543b10d13bf0591b3f99c6eb585dd2c2e5db379edae5df0f19a728cb41742"},
     {file = "mlx_metal-0.30.0-py3-none-macosx_15_0_arm64.whl", hash = "sha256:74bb5d10e0f24e21973d39430557bbd5d733c2a6599c3f1b87f9a0ff73fed2c8"},
+    {file = "mlx_metal-0.30.0-py3-none-macosx_26_0_arm64.whl", hash = "sha256:310fda8b2f7345865f3dd75a9b478e974f28d22e8ebf05f26af5adc0e8979cee"},
 ]
 
 [[package]]
@@ -4748,13 +4772,13 @@ numpy = "*"
 
 [[package]]
 name = "starlette"
-version = "0.48.0"
+version = "0.50.0"
 description = "The little ASGI library that shines."
 optional = false
-python-versions = ">=3.9"
+python-versions = ">=3.10"
 files = [
-    {file = "starlette-0.48.0-py3-none-any.whl", hash = "sha256:0764ca97b097582558ecb498132ed0c7d942f233f365b86ba37770e026510659"},
-    {file = "starlette-0.48.0.tar.gz", hash = "sha256:7e8cee469a8ab2352911528110ce9088fdc6a37d9876926e73da7ce4aa4c7a46"},
+    {file = "starlette-0.50.0-py3-none-any.whl", hash = "sha256:9e5391843ec9b6e472eed1365a78c8098cfceb7a74bfd4d6b1c0c0095efb3bca"},
+    {file = "starlette-0.50.0.tar.gz", hash = "sha256:a2a17b22203254bcbc2e1f926d2d55f3f9497f769416b3190768befe598fa3ca"},
 ]
 
 [package.dependencies]
@@ -5739,4 +5763,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.0"
 python-versions = ">=3.10,<3.13"
-content-hash = "a15ada10af61b9496dde99483c1c45333d7c9628d1da0cd41f13375dad83cb0e"
+content-hash = "6423e1b4e21e21f2d6ba5ea76ad6048b645097ec825d9c580c59f00ae95addc5"
