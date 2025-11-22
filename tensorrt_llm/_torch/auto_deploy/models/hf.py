@@ -110,6 +110,10 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         "use_cache": False,
     }
 
+    # The below maps from an entry in a model's config dict's `model_type` to the alternative
+    # `AutoModelForCausalLM` we would like to use.
+    _custom_model_mapping: Dict[str, Type[AutoModelForCausalLM]] = {}
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._quant_config_reader: QuantConfigReader | None = None
@@ -212,14 +216,27 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         """Build the model on the desired device."""
         model_config, unused_kwargs = self._get_model_config()
 
+        model_type = getattr(model_config, "model_type", "")
+        custom_model_cls = self._custom_model_mapping.get(model_type, None)
         with (init_empty_weights if device == "meta" else nullcontext)():
-            model = self.automodel_cls.from_config(
-                model_config,
-                **{
-                    "trust_remote_code": True,
-                    **unused_kwargs,
-                },
-            )
+            if custom_model_cls is not None:
+                # `_from_config` has some behavior we would like to use where possible. It is
+                # defined in the `PreTrainedModel` mixin.
+                if not hasattr(custom_model_cls, "_from_config"):
+                    raise ValueError(
+                        f"`{custom_model_cls.__name__}` must have a `_from_config` class method. "
+                        "Consider inheriting from `PreTrainedModel`."
+                    )
+                model = custom_model_cls._from_config(model_config, **unused_kwargs)
+            else:
+                model = self.automodel_cls.from_config(
+                    model_config,
+                    **{
+                        "trust_remote_code": True,
+                        **unused_kwargs,
+                    },
+                )
+
         if device == "meta":
             # post-init --> this must be called explicitly for HF models the way we initialize them
             # since this "gets lost" with the init_empty_weights context manager.
@@ -481,6 +498,23 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
 
     def get_export_infos(self, model: nn.Module) -> List[SubModuleExportInfo]:
         return [FullModelExportInfo()]
+
+    @classmethod
+    def register_custom_model_cls(
+        cls, model_type: str, custom_model_cls: Type[AutoModelForCausalLM]
+    ) -> None:
+        """Register a custom model implementation.
+
+        This is useful when the default `AutoModelForCausalLM` is not the one we want to use. For
+        example, when the model's code is in a HuggingFace repo that is out of date, or has
+        dependencies that TensorRT-LLM does not have, etc.
+
+        Args:
+            model_type: This should be the value for the `model_type` field in the model's config.
+            custom_model_cls: The `AutoModelForCausalLM` implementation that should be used for
+                `model_type`.
+        """
+        cls._custom_model_mapping[model_type] = custom_model_cls
 
 
 class _StateDictParamNameConverter:
