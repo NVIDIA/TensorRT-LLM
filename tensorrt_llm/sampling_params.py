@@ -2,13 +2,18 @@ import json
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, fields
-from typing import List, NamedTuple, Optional, Tuple, Union
+from typing import List, Literal, NamedTuple, Optional, Tuple, Union
 
 import torch
 from pydantic import BaseModel
 
 from tensorrt_llm.bindings import executor as tllme
 from tensorrt_llm.logger import logger
+
+# Logprobs mode:
+# - "processed_logprobs": return log-softmax of greedy sampled logits
+# TODO: add "return_raw_context_logits" and "return_raw_generation_logits" later
+LogprobsMode = Literal["processed_logprobs"]
 
 
 @dataclass(slots=True, kw_only=True)
@@ -44,6 +49,8 @@ class LogprobParams(NamedTuple):
     drop_context_logits: bool = False
     # Drop the geneation_logits once the logprobs are computed
     drop_generation_logits: bool = False
+    # Logprobs mode: controls whether to return logprobs before or after sampling modifications
+    logprobs_mode: LogprobsMode = "processed_logprobs"
 
 
 class LogitsProcessor(ABC):
@@ -174,6 +181,9 @@ class SamplingParams:
 
         logprobs (int, optional): Number of log probabilities to return per output token. Defaults to None.
         prompt_logprobs (int, optional): Number of log probabilities to return per prompt token. Defaults to None.
+        logprobs_mode (Literal['processed_logprobs']): Controls return logprobs after sampling modifications. Defaults to "processed_logprobs".
+            Options:
+            - "processed_logprobs": Return log-softmax of processed logits
         return_context_logits (bool): Controls if Result should contain the context logits. Defaults to False.
         return_generation_logits (bool): Controls if Result should contain the generation logits. Defaults to False.
         exclude_input_from_output (bool): Controls if output tokens in Result should include the input tokens. Defaults to True.
@@ -249,6 +259,9 @@ class SamplingParams:
     return_encoder_output: bool = False
     return_perf_metrics: bool = False
     additional_model_outputs: Optional[List[str]] = None
+
+    # Logprobs mode: controls whether to return logprobs before or after sampling modifications
+    logprobs_mode: LogprobsMode = "processed_logprobs"
 
     # Used in logprobs calculation in TRT flow to drop logits early if user did not explicitly request them.
     # Can be deprecated after migration to PyTorch backend.

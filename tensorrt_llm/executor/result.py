@@ -1016,6 +1016,13 @@ def compute_logprobs(
     - Generation logprobs (from generation_logits, TRT backend): used when backend doesn't compute them in sampler (e.g., TRT).
     - Generation logprobs (PyTorch backend): not used; computed in sampler, not here.
 
+    Args:
+        k_prompt_logprobs: Number of top logprobs to return for prompt tokens
+        k_logprobs: Number of top logprobs to return for generated tokens
+        context_logits: Logits for context/prompt tokens
+        generation_logits: Logits for generated tokens
+        output_token_ids: Token IDs of generated outputs
+
     Returns:
         LogProbsResult, a NamedTuple containing:
             - prompt: Optional[List[Dict[token_id, Logprob]]] logprobs for prompt tokens.
@@ -1034,6 +1041,7 @@ def compute_logprobs(
             logits = logits[:len(tokens)]
 
         logprobs = F.log_softmax(logits.to("cuda", dtype=torch.float32), dim=-1)
+
         topk_vals, topk_indices = torch.topk(logprobs, k=top_k, dim=-1)
 
         results: TokenLogprobs = []
