@@ -453,6 +453,18 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel,
         )
         self.load_lm_head_from_target = True
 
+        if model_config.pretrained_config.eagle_config.get(
+                "parallel_draft_step", 0) > 0:
+            from .modeling_medusa import MedusaForCausalLM
+            self.parallel_draft_heads = nn.ModuleList([
+                MedusaForCausalLM(model_config, start_layer_idx + i)
+                for i in range(
+                    model_config.pretrained_config.eagle_config.get(
+                        "parallel_draft_step", 0))
+            ])
+        else:
+            self.parallel_draft_heads = None
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,
