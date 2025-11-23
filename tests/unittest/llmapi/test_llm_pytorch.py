@@ -366,6 +366,7 @@ def _check_llama_7b_multi_lora_evict_load_new_adapters(
 
 
 @skip_gpu_memory_less_than_40gb
+@skip_ray  # https://nvbugs/5682551
 def test_llama_7b_multi_lora_evict_and_reload_lora_gpu_cache():
     """Test eviction and re-loading a previously evicted adapter from the LoRA GPU cache, within a single
     llm.generate call, that's repeated twice.
@@ -460,6 +461,7 @@ def test_llama_7b_peft_cache_config_affects_peft_cache_size():
             cuda_graph_config=None)
 
 
+@skip_ray  # https://nvbugs/5682551
 @skip_gpu_memory_less_than_40gb
 def test_llama_7b_lora_config_overrides_peft_cache_config():
     """Tests that cache size args in lora_config LLM arg override the cache size
