@@ -653,15 +653,15 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @skip_pre_blackwell
-    def test_fp8_tp2pp2(self):
-        model_path = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct-FP8"
+    def test_fp4_tp2pp2(self):
+        model_path = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct-FP4"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
         with LLM(model_path,
                  tensor_parallel_size=2,
                  pipeline_parallel_size=2,
                  max_batch_size=32,
                  kv_cache_config=kv_cache_config) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             sampling_params = SamplingParams(
                 max_tokens=256,
                 temperature=0.0,
@@ -2049,6 +2049,18 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                          32,
                          "TRTLLM",
                          marks=pytest.mark.skip_less_mpi_world_size(8)),
+            pytest.param(4,
+                         1,
+                         4,
+                         3,
+                         False,
+                         True,
+                         True,
+                         True,
+                         True,
+                         16,
+                         "CUTLASS",
+                         marks=pytest.mark.skip_less_mpi_world_size(4)),
             pytest.param(8,
                          1,
                          8,
@@ -2124,9 +2136,9 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
         ],
         ids=[
             "latency", "latency_trtllmgen", "latency_adp_lmtp",
-            "latency_trtllmgen_adp_lmtp", "throughput", "throughput_tp8",
-            "throughput_tp4", "throughput_mtp", "throughput_bs8_mtp",
-            "throughput_pp4_mtp"
+            "latency_trtllmgen_adp_lmtp", "latency_adp_lmtp_tp4", "throughput",
+            "throughput_tp8", "throughput_tp4", "throughput_mtp",
+            "throughput_bs8_mtp", "throughput_pp4_mtp"
         ])
     def test_nvfp4_multi_gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                               attention_dp, enable_lm_head_tp_in_adp,
@@ -3944,15 +3956,23 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=extra_evaluator_kwargs)
 
     @pytest.mark.skip_less_device(4)
+    @pytest.mark.parametrize("overlap_scheduler", [True, False],
+                             ids=["overlap_scheduler", "no_overlap_scheduler"])
+    @pytest.mark.parametrize("one_model", [True, False],
+                             ids=["one_model", "two_model"])
     @pytest.mark.parametrize(
         "moe_backend",
         ["CUTLASS",
          pytest.param("TRTLLM", marks=skip_pre_blackwell), "TRITON"],
         ids=["cutlass", "trtllm", "triton"])
-    def test_eagle3(self, moe_backend, mocker):
+    def test_eagle3(self, moe_backend, one_model, overlap_scheduler, mocker):
         if moe_backend == "TRITON":
             if not IS_TRITON_KERNELS_AVAILABLE:
                 pytest.skip("Triton kernels are not available")
+
+        if get_sm_version() == 90 and moe_backend == "CUTLASS":
+            pytest.skip(
+                "https://nvbugs/5636916: Remaining Hopper Eagle Accuracy Issue")
 
         MAX_OUTPUT_LEN = 128179
         MAX_INPUT_LEN = 32768
@@ -3965,16 +3985,16 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         mocker.patch.object(GPQADiamond, "MAX_INPUT_LEN", MAX_INPUT_LEN)
 
         # https://nvbugs/5590408: 2-Model overlap scheduling has accuracy issue
-        pytorch_config = dict(disable_overlap_scheduler=True,
+        pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
                               cuda_graph_config=CudaGraphConfig())
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
                                         dtype="auto")
 
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
         draft_len = 3
         spec_config = EagleDecodingConfig(max_draft_len=draft_len,
                                           speculative_model_dir=eagle_model_dir,
-                                          eagle3_one_model=False)
+                                          eagle3_one_model=one_model)
 
         max_seq_len = MAX_INPUT_LEN + MAX_OUTPUT_LEN
         llm = LLM(self.MODEL_PATH,
