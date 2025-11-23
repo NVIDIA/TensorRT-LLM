@@ -201,6 +201,10 @@ def test_allreduce_strategies(llm_root, shared_dataset, allreduce_strategy):  # 
             str(max_num_tokens),
         ]
 
+        # Only pass --model_path if it's a local filesystem path
+        if str(config["args"]["model"]).startswith("/"):
+            args.extend(["--model_path", str(config["args"]["model"])])
+
         try:
             with timeout(TEST_TIMEOUT_SECONDS):
                 result = runner.invoke(main, args, catch_exceptions=False)
