@@ -4,6 +4,8 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 
+from tensorrt_llm._torch.compilation.utils import \
+    get_capture_piecewise_cuda_graph_flag
 from tensorrt_llm._torch.utils import (Fp4QuantizedTensor, fp4_utils,
                                        get_last_power_of_2_num_tokens_buckets,
                                        last_positive_power_of_2,
@@ -46,6 +48,16 @@ def prepare_dummy_topk_and_hook(
     Returns:
         Tuple of (routing_logits_for_tuner, topk_weights_for_tuner, topk_ids_for_tuner, tuning_config_with_hook)
     """
+    cuda_graph_active = torch.cuda.is_current_stream_capturing(
+    ) or get_capture_piecewise_cuda_graph_flag()
+
+    # Reset seed each time it is called to ensure all EP rank is tuned with the same distribution
+    # Caveat: autotune must happen before cuda graph capture so each rank will be seeded identically.
+    # This is the case today, but there is no mechanism in place to guard against future changes.
+    if not cuda_graph_active:
+        torch.manual_seed(0)
+        torch.cuda.manual_seed(0)
+
     # Determine if we need dummy topk tensors (attention DP scenario)
     need_dummy_topk = (topk_weights is not None or topk_ids is not None)
 
