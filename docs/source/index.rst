@@ -73,6 +73,7 @@ Welcome to TensorRT LLM's Documentation!
    features/speculative-decoding.md
    features/checkpoint-loading.md
    features/auto_deploy/auto-deploy.md
+   features/kv-cache-connector.md
 
 
 .. toctree::
