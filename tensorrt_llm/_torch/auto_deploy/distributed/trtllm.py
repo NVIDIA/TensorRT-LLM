@@ -67,7 +67,9 @@ try:
                 norm_weight=norm_weight,
                 eps=eps,
             )
-            return trtllm_allreduce(tensor, ReduceOp.SUM, all_reduce_params=all_reduce_params)
+            return trtllm_allreduce(
+                tensor, ReduceOp.SUM, strategy=strategy, all_reduce_params=all_reduce_params
+            )
         else:
             # Fallback: unfused implementation using torch distributed
             # This is used in demollm mode without MPI

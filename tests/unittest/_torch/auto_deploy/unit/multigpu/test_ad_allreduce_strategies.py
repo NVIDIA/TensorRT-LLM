@@ -57,7 +57,7 @@ def timeout(seconds):
 @pytest.fixture(scope="module")
 def shared_dataset(llm_root):  # noqa: F811
     """Prepare dataset once for all tests in this module."""
-    model_name = "meta-llama/Llama-3.1-8B"
+    model_name = "meta-llama/Meta-Llama-3.1-8B-Instruct"
     config = get_small_model_config(model_name)
     with tempfile.TemporaryDirectory() as temp_dir:
         dataset_path = _prepare_dataset(
@@ -142,7 +142,7 @@ def test_allreduce_strategies(llm_root, shared_dataset, allreduce_strategy):  # 
     # Fixed timeout for all strategies (5 minutes should be enough)
     TEST_TIMEOUT_SECONDS = 300
 
-    model_name = "meta-llama/Llama-3.1-8B"
+    model_name = "meta-llama/Meta-Llama-3.1-8B-Instruct"
     config = get_small_model_config(model_name)
     tp_size = 2
     max_batch_size = 256
