@@ -8,6 +8,7 @@ import pytest
 import torch
 import torch.nn as nn
 import yaml
+from _model_test_utils import get_small_model_config
 from click.testing import CliRunner
 from utils.cpp_paths import llm_root  # noqa: F401
 
@@ -57,8 +58,11 @@ def timeout(seconds):
 def shared_dataset(llm_root):  # noqa: F811
     """Prepare dataset once for all tests in this module."""
     model_name = "meta-llama/Llama-3.1-8B"
+    config = get_small_model_config(model_name)
     with tempfile.TemporaryDirectory() as temp_dir:
-        dataset_path = _prepare_dataset(llm_root, temp_dir, model_name, num_requests=10)
+        dataset_path = _prepare_dataset(
+            llm_root, temp_dir, config["args"]["model"], num_requests=10
+        )
         # Read dataset content to return it (temp_dir will be deleted)
         with open(dataset_path, "r") as f:
             dataset_content = f.read()
@@ -139,6 +143,7 @@ def test_allreduce_strategies(llm_root, shared_dataset, allreduce_strategy):  # 
     TEST_TIMEOUT_SECONDS = 300
 
     model_name = "meta-llama/Llama-3.1-8B"
+    config = get_small_model_config(model_name)
     tp_size = 2
     max_batch_size = 256
     max_num_tokens = 8192
@@ -157,7 +162,7 @@ def test_allreduce_strategies(llm_root, shared_dataset, allreduce_strategy):  # 
         with open(extra_llm_api_options_path, "w") as f:
             yaml.dump(
                 {
-                    "model": model_name,
+                    **config["args"],
                     "max_batch_size": max_batch_size,
                     "max_num_tokens": max_num_tokens,
                     "max_seq_len": 256,
