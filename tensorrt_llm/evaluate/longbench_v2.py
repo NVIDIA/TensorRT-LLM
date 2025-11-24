@@ -375,34 +375,6 @@ class LongBenchV2(Evaluator):
 
         return 'none'
 
-    def _get_extra_end_token_ids(self) -> list:
-        """
-        Get extra end token IDs for specific chat templates.
-
-        Returns:
-            A list of token IDs that should be treated as end tokens for the current chat template.
-        """
-        extra_end_token_ids = []
-        if self.tokenizer is not None:
-            if self.chat_template_name == "llama3":
-                try:
-                    eot_id = self.tokenizer.encode("<|eot_id|>",
-                                                   add_special_tokens=False)[0]
-                    extra_end_token_ids.append(eot_id)
-                    logger.info(f"Added llama3 end token: {eot_id}")
-                except Exception as e:
-                    logger.warning(f"Failed to add llama3 end token: {e}")
-
-            if self.chat_template_name == "qwen":
-                try:
-                    im_end_id = self.tokenizer.encode(
-                        "<|im_end|>", add_special_tokens=False)[0]
-                    extra_end_token_ids.append(im_end_id)
-                    logger.info(f"Added qwen end token: {im_end_id}")
-                except Exception as e:
-                    logger.warning(f"Failed to add qwen end token: {e}")
-        return extra_end_token_ids
-
     def evaluate(self,
                  llm: Any,
                  sampling_params: Optional[SamplingParams] = None,
@@ -429,17 +401,6 @@ class LongBenchV2(Evaluator):
         else:
             logger.warning(
                 "LLM does not have tokenizer attribute. Truncation disabled.")
-
-        # Setup extra end token IDs for specific chat templates using a separate function
-        self.extra_end_token_ids = self._get_extra_end_token_ids()
-
-        # Update sampling params with extra end tokens if available
-        if self.extra_end_token_ids and sampling_params is not None:
-            if sampling_params.stop_token_ids is None:
-                sampling_params.stop_token_ids = self.extra_end_token_ids
-            else:
-                sampling_params.stop_token_ids = list(
-                    sampling_params.stop_token_ids) + self.extra_end_token_ids
 
         # Store llm reference for CoT second pass
         self.llm = llm
@@ -527,8 +488,6 @@ class LongBenchV2(Evaluator):
                         max_tokens=128,
                         temperature=0.6,
                         top_p=0.95,
-                        stop_token_ids=self.extra_end_token_ids
-                        if self.extra_end_token_ids else None,
                     )
 
                     try:
