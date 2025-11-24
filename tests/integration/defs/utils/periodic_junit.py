@@ -73,7 +73,8 @@ class PeriodicJUnitXML:
             interval: int = 18000,  # Default 5 hours
             batch_size: int = 10,
             logger=None,  # Optional logger (info, warning functions)
-            save_unfinished_test: bool = False,  # Save unfinished test name in output-dir/unfinished_test.txt if True
+            save_unfinished_test:
+        bool = False,  # Save unfinished test name in output-dir/unfinished_test.txt if True
     ):
         """
         Initialize periodic reporter.
