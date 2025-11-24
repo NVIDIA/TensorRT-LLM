@@ -20,8 +20,6 @@ from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
 
 
-# TODO refine codes
-# Has bug when we enable yarn now
 class QwenAttention(Attention):
 
     def __init__(
@@ -36,17 +34,6 @@ class QwenAttention(Attention):
                     config.rope_scaling["type"]),
                 rope=RopeParams.from_config(config),
                 mrope_section=config.rope_scaling.get('mrope_section', None))
-            # if "type" in config.rope_scaling:
-            #     pos_type = config.rope_scaling["type"]
-            # elif "rope_type" in config.rope_scaling:
-            #     pos_type = config.rope_scaling["rope_type"]
-            # else:
-            #     raise ValueError(
-            #         "rope_scaling must have type or rope_type field")
-            # pos_embd_params = PositionalEmbeddingParams(
-            #     type=PositionEmbeddingType.from_string(pos_type),
-            #     rope=RopeParams.from_config(config),
-            #     mrope_section=config.rope_scaling.get('mrope_section', None))
         else:
             pos_embd_params = PositionalEmbeddingParams(
                 type=PositionEmbeddingType.rope_gpt_neox,
@@ -67,6 +54,8 @@ class QwenAttention(Attention):
         )
 
 
+# TODO this is a workaround to support yarn on Qwen2.
+# We need refactor the codes to merge QwenYarnAttention and QwenAttention.
 class QwenYarnAttention(QKNormRoPEAttention):
 
     def __init__(
