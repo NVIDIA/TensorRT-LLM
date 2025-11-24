@@ -517,7 +517,9 @@ class Llama4DecoderLayer(DecoderLayer):
                     eps=self.post_attention_layernorm.variance_epsilon,
                 ))
 
-            if self.is_mlp_layer and self.is_nvfp4:
+            # Check if fusion_op is actually NVFP4
+            if self.is_mlp_layer and self.is_nvfp4 and \
+               self.pre_feed_forward_fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
                 act_fp4, act_sf, residual = allreduce_output
                 hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
             else:
@@ -563,13 +565,15 @@ class Llama4DecoderLayer(DecoderLayer):
             else:
                 # The next layernorm exists but it could be the last decoder layer.
                 # Adjust the scale and fusion pattern.
+                # Determine fusion_op dynamically without modifying instance attribute
                 if not (self.next_attn is not None and (self.is_nvfp4
                                                    or self.is_fp8_quant)) \
                 or not hasattr(self.next_attn.qkv_proj, 'input_scale'):
                     scale = None
-                    self.post_feed_forward_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
+                    post_feed_forward_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
                 else:
                     scale = self.next_attn.qkv_proj.input_scale
+                    post_feed_forward_fusion_op = self.post_feed_forward_fusion_op
 
                 # TODO: MIN_LATENCY_MODE is hardcoded to False
                 if cutlass_min_latency_mode:
@@ -592,15 +596,16 @@ class Llama4DecoderLayer(DecoderLayer):
                     allreduce_output = self.all_reduce(
                         hidden_states,
                         all_reduce_params=AllReduceParams(
-                            fusion_op=self.post_feed_forward_fusion_op,
+                            fusion_op=post_feed_forward_fusion_op,
                             residual=residual,
                             norm_weight=self.next_layer_layernorm.weight,
                             scale=scale,
                             eps=self.next_layer_layernorm.variance_epsilon,
                         ))
 
-                # Unpack the allreduce output
-                if self.next_attn is not None and self.is_nvfp4:
+                # Unpack the allreduce output - check if fusion_op is actually NVFP4
+                if self.next_attn is not None and self.is_nvfp4 and \
+                   post_feed_forward_fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
                     act_fp4, act_sf, residual = allreduce_output
                     hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
                 else:
@@ -727,7 +732,9 @@ class LlamaDecoderLayer(DecoderLayer):
                     scale=scale,
                     eps=self.post_attention_layernorm.variance_epsilon,
                 ))
-            if self.is_nvfp4:
+            # Check if fusion_op is actually NVFP4
+            if self.is_nvfp4 and \
+               self.pre_mlp_fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
                 act_fp4, act_sf, residual = all_reduce_output
                 hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
             else:
@@ -774,24 +781,28 @@ class LlamaDecoderLayer(DecoderLayer):
                 # The next layernorm exists but it could be the last decoder layer.
                 # Adjust the scale and fusion pattern.
 
+                # Determine fusion_op dynamically without modifying instance attribute
                 if not (self.next_attn is not None and (self.is_nvfp4
                                                    or self.is_fp8_quant)) \
                 or not hasattr(self.next_attn.qkv_proj, 'input_scale'):
                     scale = None
-                    self.post_mlp_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
+                    post_mlp_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
                 else:
                     scale = self.next_attn.qkv_proj.input_scale
+                    post_mlp_fusion_op = self.post_mlp_fusion_op
 
                 all_reduce_output = self.all_reduce(
                     hidden_states,
                     all_reduce_params=AllReduceParams(
-                        fusion_op=self.post_mlp_fusion_op,
+                        fusion_op=post_mlp_fusion_op,
                         residual=residual,
                         norm_weight=self.next_layer_layernorm.weight,
                         scale=scale,
                         eps=self.next_layer_layernorm.variance_epsilon,
                     ))
-                if self.next_attn is not None and self.is_nvfp4:
+                # Check if fusion_op is actually NVFP4 (not downgraded to RESIDUAL_RMS_NORM)
+                if self.next_attn is not None and self.is_nvfp4 and \
+                   post_mlp_fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
                     act_fp4, act_sf, residual = all_reduce_output
                     hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
                 else:
