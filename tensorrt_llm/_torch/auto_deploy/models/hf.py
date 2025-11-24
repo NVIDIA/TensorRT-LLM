@@ -110,8 +110,8 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         "use_cache": False,
     }
 
-    # The below maps from an entry in a model's config dict's `model_type` to the alternative
-    # `AutoModelForCausalLM` we would like to use.
+    # The below maps from a model's config class definition's name (str) to the alternative `AutoModelForCausalLM`
+    # implementation we would like to use.
     _custom_model_mapping: Dict[str, Type[AutoModelForCausalLM]] = {}
 
     def __init__(self, *args, **kwargs):
@@ -216,8 +216,8 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         """Build the model on the desired device."""
         model_config, unused_kwargs = self._get_model_config()
 
-        model_type = getattr(model_config, "model_type", "")
-        custom_model_cls = self._custom_model_mapping.get(model_type, None)
+        config_cls_name = type(model_config).__name__
+        custom_model_cls = self._custom_model_mapping.get(config_cls_name, None)
         with (init_empty_weights if device == "meta" else nullcontext)():
             if custom_model_cls is not None:
                 # `_from_config` has some behavior we would like to use where possible. It is
@@ -501,7 +501,7 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
 
     @classmethod
     def register_custom_model_cls(
-        cls, model_type: str, custom_model_cls: Type[AutoModelForCausalLM]
+        cls, config_cls_name: str, custom_model_cls: Type[AutoModelForCausalLM]
     ) -> None:
         """Register a custom model implementation.
 
@@ -510,11 +510,15 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         dependencies that TensorRT-LLM does not have, etc.
 
         Args:
-            model_type: This should be the value for the `model_type` field in the model's config.
+            config_cls_name: This should be the model's config class definition's `__name__` attribute.
             custom_model_cls: The `AutoModelForCausalLM` implementation that should be used for
                 `model_type`.
         """
-        cls._custom_model_mapping[model_type] = custom_model_cls
+        cls._custom_model_mapping[config_cls_name] = custom_model_cls
+
+    def __init_subclass__(cls, **kwargs):
+        """Hook when child classes are defined."""
+        cls._custom_model_mapping = {}
 
 
 class _StateDictParamNameConverter:
