@@ -476,7 +476,9 @@ def _process_column_sharding(
         # we are probably in fused QKV case with single linear node and 3 slice nodes
         assert len(linear_nodes) == 1
         linear_node = linear_nodes[0]
-        assert all(s.args[1] == 2 for s in linear_node.users), "Expecting slice nodes with dim=3"
+        assert all(
+            s.args[1] == 2 for s in filtered_nodes(linear_node.users, ops=torch.ops.aten.slice)
+        ), "Expecting slice nodes to slice tensor over dim=2"
         fused_weight_dims = [s.args[3] - s.args[2] for s in linear_node.users]
         weight_dim = linear_node.meta["val"].shape[2]
         if sum(fused_weight_dims) != weight_dim:
@@ -488,8 +490,9 @@ def _process_column_sharding(
                 )
                 return
 
+    added_nodes: int = 0
     for linear_node in linear_nodes:
-        transform_container.add(
+        added_nodes += transform_container.add(
             WeightShardingInfo.from_node(
                 linear_node,
                 split_dim=SplitDimension.COLUMN,
@@ -501,6 +504,9 @@ def _process_column_sharding(
                 layer_type=LayerType.MLP if min_local_shape == 1 else LayerType.ATTENTION,
             )
         )
+    if added_nodes == 0:
+        ad_logger.debug("No nodes were added for column sharding. Skipping.")
+        return 0
 
     nodes_to_validate = [
         n for n in subgraph_nodes if is_op(n, [torch.ops.aten.view, torch.ops.aten.reshape])
@@ -729,19 +735,10 @@ def detect_sharding_from_config(
                     ):
                         num_simple_shards += 1
                 else:
-                    ad_logger.warning(
-                        f"Unsupported sharding action {config}. Fallback to simple shard"
-                    )
-                    transform_container.add(
-                        WeightShardingInfo.from_node(
-                            lin_node,
-                            split_dim=SplitDimension.COLUMN,
-                            rank=rank,
-                            world_size=world_size,
-                            dist_op="all_gather",
-                            min_local_shape=1,
-                            layer_type=layer_type,
-                        )
+                    num_shards -= 1
+                    ad_logger.debug(
+                        f"Unsupported sharding action {config}. "
+                        f"Linear node {lin_node} will not be sharded."
                     )
                 # after successful match, break the loop
                 break
@@ -884,6 +881,27 @@ def detect_column_row_shard(
             # Extract head dimension. We cannot shard below the head_dim size.
             # Assume that head_dim is the last (innermost) dimension of the tensor
             min_local_shape = attention_nodes.pop().meta["val"].shape[-1]
+            # if the QKV projection is fused, check if num_kv_heads is divisible by world_size
+            if len(opening) == 1:
+                qkv_proj_node = opening[0]
+                slice_nodes = list(filtered_nodes(qkv_proj_node.users, ops=torch.ops.aten.slice))
+                if len(slice_nodes) > 0:
+                    # extract num_kv_heads * head_dim from the last slice node
+                    assert len(slice_nodes) == 3, "Expecting exactly 3 slice nodes for fused QKV"
+                    num_kv_heads = (
+                        slice_nodes[-1].args[3] - slice_nodes[-1].args[2]
+                    ) // min_local_shape
+                    if num_kv_heads % world_size != 0:
+                        ad_logger.debug(
+                            f"num_kv_heads {num_kv_heads} is not divisible by world_size {world_size}. "
+                            f"Falling back to simple shard."
+                        )
+                        num_simple_shards += _process_simple_shard(
+                            nodes_linear, rank, world_size, sharding_config
+                        )
+                        # TODO: handle the case where num_kv_heads is divisible by world_size
+                        continue
+
             num_attention_shards += 1
         else:
             layer_type = LayerType.MLP
