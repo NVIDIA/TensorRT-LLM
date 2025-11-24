@@ -57,7 +57,7 @@ class DeepSeekR1Parser(BaseReasoningParser):
             # text before reasoning start tag is dropped
             text = splits[2]
         splits = text.partition(self.reasoning_end)
-        reasoning_content, content = splits[0], splits[2]
+        reasoning_content, content = splits[0].strip(), splits[2].strip()
         return ReasoningParserResult(content=content,
                                      reasoning_content=reasoning_content)
 
