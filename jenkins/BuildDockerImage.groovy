@@ -31,6 +31,11 @@ TRIGGER_TYPE = env.triggerType ?: "manual"
 
 ENABLE_USE_WHEEL_FROM_BUILD_STAGE = params.useWheelFromBuildStage ?: false
 
+GITHUB_CREDENTIALS_ID = env.GithubCredencialId ?: 'github-cred-trtllm-ci'
+
+MODE = params.mode ?: "normal"
+MODE = "build_for_ci" // TODO: Remove after the CI job is stable
+
 WAIT_TIME_FOR_BUILD_STAGE = 60  // minutes
 
 BUILD_JOBS = "32"
@@ -329,6 +334,8 @@ def buildImage(config, imageKeyToTag)
                 args += " DEVEL_IMAGE=${dependentImageWithTag}"
                 if (target == "ngc-release") {
                     imageKeyToTag["NGC Devel Image ${config.arch}"] = dependentImageWithTag
+                } else if (MODE == "build_for_ci") {
+                    imageKeyToTag[config.stageName] = dependentImageWithTag
                 }
             }
         }
@@ -477,6 +484,12 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             dockerfileStage: "release",
         ],
     ]
+    if (MODE == "build_for_ci") {
+        buildConfigs = buildConfigs.findAll { key, config ->
+            key.contains("Build CI image")
+        }
+        echo "Build configs only for CI"
+    }
     // Override all fields in build config with default values
     buildConfigs.each { key, config ->
         defaultBuildConfig.each { defaultKey, defaultValue ->
@@ -484,6 +497,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
                 config[defaultKey] = defaultValue
             }
         }
+        config.stageName = key
         config.podConfig = createKubernetesPodConfig("build", config.arch, config.build_wheel)
     }
     echo "Build configs:"
@@ -515,6 +529,109 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
     // pipeline.failFast = params.enableFailFast
     pipeline.parallel buildJobs
 
+}
+
+
+def updateCIImageTag() {
+    echo "Update CI Image Tag"
+    // Update jenkins/current_image_tags.properties with newly built image tags and create a commit to the current PR
+
+    def imageTagKeys = [
+        "LLM_DOCKER_IMAGE",
+        "LLM_SBSA_DOCKER_IMAGE",
+        "LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE",
+        "LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"
+    ]
+
+    def newImageTags = [
+        "LLM_DOCKER_IMAGE" : imageKeyToTag["Build CI image (x86_64 tritondevel)"],
+        "LLM_SBSA_DOCKER_IMAGE" : imageKeyToTag["Build CI image (SBSA tritondevel)"],
+        "LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE" : imageKeyToTag["Build CI image (RockyLinux8 Python310)"],
+        "LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE" : imageKeyToTag["Build CI image (RockyLinux8 Python312)"],
+    ]
+
+
+    def filePath = "jenkins/current_image_tags.properties"
+
+    echo "Updating ${filePath} with new image tags"
+
+    // Read the current file lines
+    def lines = readFile(filePath).split("\n") as List
+
+    // Replace lines for our four keys
+    def updatedLines = lines.collect { line ->
+        def resultLine = line
+        imageTagKeys.each { key ->
+            if (line.startsWith(key + "=")) {
+                resultLine = "${key}=${newImageTags[key]}"
+            }
+        }
+        resultLine
+    }
+
+    // Write back the updated file
+    writeFile file: filePath, text: updatedLines.join("\n") + "\n"
+
+    withCredentials([usernamePassword(credentialsId: GITHUB_CREDENTIALS_ID, usernameVariable: 'GITHUB_USERNAME', passwordVariable: 'GITHUB_PASSWORD')]) {
+        // Setup git user if necessary
+        sh """
+        git config user.name "ci-bot"
+        """
+
+        // The user fork's repo URL, expected to be available in env.gitlabSourceRepoHttpUrl or can be customized as needed
+        def forkRepoUrl = env.gitlabSourceRepoHttpUrl ?: LLM_REPO
+
+        def currentBranch = env.gitlabBranch ?: params.branch
+
+        // Remove any possible existing remote named 'fork' to avoid duplication
+        sh """
+        git remote remove fork || true
+        """
+
+        // Add fork remote and pull the latest branch
+        sh """
+        git remote add fork ${forkRepoUrl}
+        git fetch fork ${currentBranch}
+        git checkout -B ${currentBranch} fork/${currentBranch}
+        """
+
+        // Get the 'Signed-off-by' field from the latest commit message
+        def lastSignedBy = sh(script: "git log -1 --pretty=format:'%B' | grep -i '^Signed-off-by:' | tail -1 | sed 's/^Signed-off-by:[ ]*//'", returnStdout: true).trim()
+
+        if (lastSignedBy) {
+            // Try to extract the user name and email from the Signed-off-by line
+            def matcher = lastSignedBy =~ /(.*)<(.+)>/
+            if (matcher.matches()) {
+                def signedName = matcher[0][1].trim()
+                def signedEmail = matcher[0][2].trim()
+                // Set git config user.name and user.email to match Signed-off-by for signed commit consistency
+                if (signedName && signedEmail) {
+                    echo "Setting git config user.name to '${signedName}' and user.email to '${signedEmail}' for consistency with Signed-off-by"
+                    sh """
+                    git config user.name "${signedName}"
+                    git config user.email "${signedEmail}"
+                    """
+                } else {
+                    echo "Failed to extract user.name and user.email from Signed-off-by, skipping git config update"
+                }
+            } else {
+                echo "Signed-off-by format parse failed: ${lastSignedBy}"
+            }
+        } else {
+            echo "No Signed-off-by found in the latest commit message"
+        }
+        sh """
+        git add ${filePath}
+        git commit -s -m "[auto] Update CI image tags with newly built images" || echo "No changes to commit"
+        """
+
+        // Push the changes to the user fork's branch
+        sh """
+        git push fork HEAD:${currentBranch}
+        """
+
+        echo "Committed and pushed updated ${filePath} to user fork branch: ${currentBranch}"
+    }
 }
 
 
@@ -583,7 +700,24 @@ pipeline {
                 }
             }
         }
+        stage("Update CI Image Tag") {
+            when {
+                expression {
+                    MODE == "build_for_ci"
+                }
+            }
+            steps {
+                script {
+                    updateCIImageTag()
+                }
+            }
+        }
         stage("Upload Artifacts") {
+            when {
+                expression {
+                    MODE != "build_for_ci"
+                }
+            }
             steps {
                 script {
                     String imageKeyToTagJson = writeJSON returnText: true, json: imageKeyToTag
@@ -597,7 +731,7 @@ pipeline {
         stage("Wait for Build Jobs Complete") {
             when {
                 expression {
-                    RUN_SANITY_CHECK
+                    RUN_SANITY_CHECK && MODE != "build_for_ci"
                 }
             }
             steps {
@@ -658,7 +792,7 @@ pipeline {
         stage("Sanity Check for NGC Images") {
             when {
                 expression {
-                    RUN_SANITY_CHECK
+                    RUN_SANITY_CHECK && MODE != "build_for_ci"
                 }
             }
             steps {
@@ -694,7 +828,7 @@ pipeline {
         stage("Register NGC Images for Security Checks") {
             when {
                 expression {
-                    return params.nspect_id && params.action == "push"
+                    return params.nspect_id && params.action == "push" && MODE != "build_for_ci"
                 }
             }
             steps {
