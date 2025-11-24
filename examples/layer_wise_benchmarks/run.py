@@ -10,7 +10,7 @@ import yaml
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tensorrt_llm._utils import local_mpi_rank, mpi_rank, mpi_world_size
-from tensorrt_llm.tools.layer_wise_benchmarks import BalanceMethod, get_runner_cls
+from tensorrt_llm.tools.layer_wise_benchmarks import BalanceMethod, get_runner_cls, mark_ranges
 
 
 def comma_separated_ints(s):
@@ -97,6 +97,7 @@ local_rank = local_mpi_rank()
 torch.cuda.set_device(local_rank)
 
 # Create KV cache manager
+mark_ranges()
 Runner = get_runner_cls(args.model)
 mapping = Runner.create_mapping(enable_attention_dp=args.enable_attention_dp)
 kv_cache_manager = Runner.create_kv_cache_manager(
@@ -203,7 +204,7 @@ for batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in itertools.product(
                     run_pack()
 
         balance_ratio_str = "" if balance_ratio is None else f"  balance={balance_ratio:.2g}"
-        nvtx_message = f"b={batch_size} s={seq_len_q} past={seq_len_kv_cache}{balance_ratio_str} EP{world_size}"
+        nvtx_message = f"b={batch_size} s={seq_len_q} past={seq_len_kv_cache}{balance_ratio_str} NP{world_size}"
         for i in range(args.warmup_times + args.run_times):
             events[i].record()
             with nvtx.annotate(nvtx_message):

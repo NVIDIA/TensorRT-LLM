@@ -6,20 +6,23 @@ import sqlite3
 import subprocess
 from pathlib import Path
 
+import jinja2
 import numpy as np
 import pandas as pd
 
 # Parse cmdline
 parser = argparse.ArgumentParser()
 parser.add_argument("--profile-dir", type=str, default="profiles")
-parser.add_argument("--world-size", type=int)
+parser.add_argument("--world-size", "--np", type=int)
 parser.add_argument("--rank", type=int, default=0)
 group = parser.add_mutually_exclusive_group(required=False)
-group.add_argument("--unknown-kernel-as-error", action="store_true", dest="unknown_kernel_as_error")
+group.add_argument("--error-on-unknown-kernel", action="store_true", dest="error_on_unknown_kernel")
 group.add_argument(
-    "--no-unknown-kernel-as-error", action="store_false", dest="unknown_kernel_as_error"
+    "--no-error-on-unknown-kernel", action="store_false", dest="error_on_unknown_kernel"
 )
+parser.set_defaults(error_on_unknown_kernel=None)
 args = parser.parse_args()
+print(args)
 
 
 def lazy_convert_sqlite(nsys_rep_file_path, sqlite_file_path):
@@ -81,8 +84,10 @@ def shortest_common_supersequence(a, b):
     return res
 
 
-nsys_rep_file_path = Path(args.profile_dir) / f"report_np{args.world_size}_rank{args.rank}.nsys-rep"
-sqlite_file_path = Path(args.profile_dir) / f"report_np{args.world_size}_rank{args.rank}.sqlite"
+profile_dir = Path(args.profile_dir)
+nsys_rep_file_path = profile_dir / f"report_np{args.world_size}_rank{args.rank}.nsys-rep"
+sqlite_file_path = profile_dir / f"report_np{args.world_size}_rank{args.rank}.sqlite"
+html_file_path = profile_dir / f"report_np{args.world_size}_rank{args.rank}.html"
 lazy_convert_sqlite(nsys_rep_file_path, sqlite_file_path)
 
 conn = sqlite3.connect(f"file:{sqlite_file_path}?mode=ro", uri=True)
@@ -121,12 +126,15 @@ for start, text in df.itertuples(index=False):
 query = """SELECT T1.start, T1.end, T2.value AS text
     FROM NVTX_EVENTS AS T1
     JOIN StringIds AS T2 ON T1.textId = T2.id
-    WHERE eventType = ? AND T2.value NOT LIKE ? AND domainId != ?"""
+    WHERE eventType = ? AND T2.value NOT LIKE ? AND T2.value NOT LIKE ? AND domainId != ?"""
 df = pd.read_sql_query(
-    query, conn, params=(event_id_NvtxPushPopRange, "layer_wise_benchmarks %", nccl_domain_id)
+    query,
+    conn,
+    params=(event_id_NvtxPushPopRange, "layer_wise_benchmarks %", "[DG]%", nccl_domain_id),
 )
 for start, end, text in df.itertuples(index=False):
     problem_id = bisect.bisect(problem_start, start) - 1
+    assert problem_id != -1
     if re.match(r"b=\d+ s=\d+ ", text):
         problem_set[problem_id]["text"] = text
         problem_set[problem_id]["runs"].append(start)
@@ -134,19 +142,23 @@ for start, end, text in df.itertuples(index=False):
     else:
         problem_set[problem_id]["ranges"].append((start, end, text))
 
-query = """SELECT unified.start, unified.end, unified.demangledName,
+query = """SELECT name FROM sqlite_master WHERE type = ?"""
+df = pd.read_sql_query(query, conn, params=("table",))
+tables = df["name"].tolist()
+unified_subquery = """SELECT T1.start, T1.end, T1.demangledName, T1.correlationId, T1.graphNodeId
+    FROM CUPTI_ACTIVITY_KIND_KERNEL AS T1"""
+if "CUPTI_ACTIVITY_KIND_MEMCPY" in tables:
+    unified_subquery += """ UNION ALL
+        SELECT T2.start, T2.end, -2 AS demangledName, T2.correlationId, T2.graphNodeId
+        FROM CUPTI_ACTIVITY_KIND_MEMCPY AS T2"""
+if "CUPTI_ACTIVITY_KIND_MEMSET" in tables:
+    unified_subquery += """ UNION ALL
+        SELECT T3.start, T3.end, -3 AS demangledName, T3.correlationId, T3.graphNodeId
+        FROM CUPTI_ACTIVITY_KIND_MEMSET AS T3"""
+query = f"""SELECT unified.start, unified.end, unified.demangledName,
        R.start AS runtime_start, R.end AS runtime_end,
        CGE2.start AS capture_start, CGE2.end AS capture_end
-FROM (
-    SELECT T1.start, T1.end, T1.demangledName, T1.correlationId, T1.graphNodeId
-    FROM CUPTI_ACTIVITY_KIND_KERNEL AS T1
-    UNION ALL
-    SELECT T2.start, T2.end, -2 AS demangledName, T2.correlationId, T2.graphNodeId
-    FROM CUPTI_ACTIVITY_KIND_MEMCPY AS T2
-    UNION ALL
-    SELECT T3.start, T3.end, -3 AS demangledName, T3.correlationId, T3.graphNodeId
-    FROM CUPTI_ACTIVITY_KIND_MEMSET AS T3
-) AS unified
+FROM ({unified_subquery}) AS unified
 JOIN CUPTI_ACTIVITY_KIND_RUNTIME AS R ON unified.correlationId = R.correlationId
 LEFT JOIN CUDA_GRAPH_NODE_EVENTS AS CGE1 ON unified.graphNodeId = CGE1.graphNodeId AND
                                             CGE1.originalGraphNodeId IS NOT NULL
@@ -189,6 +201,7 @@ for (
             capture_end,
         )
     )
+# TODO: Parse CTX phases
 
 query = "SELECT * FROM StringIds"
 df = pd.read_sql_query(query, conn)
@@ -220,22 +233,25 @@ for problem_id in range(len(kernels)):
 
 
 parser_keywords = [
-    ("Gemm", "nvjet"),
+    ("cuBLASGemm", "nvjet"),
+    ("splitKreduce", "splitKreduce_kernel"),
+    ("fusedAGemm", "fused_a_gemm_kernel"),
     ("RMSNorm", "RMSNormKernel"),
-    ("Cat", "CatArrayBatchedCopy"),
-    ("RoPE", "applyMLARope"),
-    ("fmha", "fmhaSm100fKernel_Qkv"),
+    ("torchCat", "CatArrayBatchedCopy"),
+    ("applyMLARope", "applyMLARope"),
+    ("fmhaSm100f", "fmhaSm100fKernel_Qkv"),
     ("fmhaReduction", "fmhaReductionKernel"),
     ("quant", "quantize_with_block_size"),
-    ("expandInput", "expandInputRowsKernel"),
-    ("computeStrides", "computeStridesTmaWarpSpecializedKernel"),
-    ("GroupGemm", "cutlass::device_kernel<cutlass::gemm::kernel::GemmUniversal"),
-    ("doActivation", "doActivationKernel"),
-    ("Gemm", "GemmUniversal"),
-    ("splitKreduce", "splitKreduce_kernel"),
-    ("topk", "deepseek_v3_topk_kernel"),
     ("AllGather", "ncclDevKernel_AllGather_"),
     ("ReduceScatter", "ncclDevKernel_ReduceScatter_"),
+    ("allreduce_oneshot", "allreduce_fusion_kernel_oneshot_lamport"),
+    ("allreduce_twoshot", "allreduce_fusion_kernel_twoshot_sync"),
+    ("expandInput", "expandInputRowsKernel"),
+    ("computeStrides", "computeStridesTmaWarpSpecializedKernel"),
+    ("cutlassGroupGemm", "cutlass::device_kernel<cutlass::gemm::kernel::GemmUniversal"),
+    ("doActivation", "doActivationKernel"),
+    ("cutlassGemm", "GemmUniversal"),
+    ("deepseek_v3_topk", "deepseek_v3_topk_kernel"),
     ("CountAndIndice", "computeCountAndIndiceDevice"),
     ("Cumsum", "computeCumsumDevice"),
     ("moveIndice", "moveIndiceDevice"),
@@ -246,9 +262,45 @@ parser_keywords = [
     ("mergePrefix", "mergeExpertPrefixSumKernel"),
     ("fusedBuildExpertMaps", "fusedBuildExpertMapsSortFirstTokenKernel"),
     ("swiglu", "silu_and_mul_kernel"),
-    ("add", "CUDAFunctor_add"),
-    ("Fill", "at::native::FillFunctor"),
-    ("red_fused_add_sum", "triton_red_fused_add_sum_0"),
+    ("torchAdd", "CUDAFunctor_add"),
+    ("torchFill", "at::native::FillFunctor"),
+    ("triton_fused_add_sum", "triton_red_fused_add_sum_0"),
+    ("torchCopy", "at::native::bfloat16_copy_kernel_cuda"),
+    ("torchDistribution", "distribution_elementwise_grid_stride_kernel"),
+    ("torchArange", "at::native::arange_cuda_out"),
+    ("torchDirectCopy", "at::native::direct_copy_kernel_cuda"),
+    ("torchBitonicSort", "at::native::bitonicSortKVInPlace"),
+    ("routingInitExpertCounts", "routingInitExpertCounts"),
+    ("routingIndicesCluster", "routingIndicesClusterKernel"),
+    ("routingIndicesCoop", "routingIndicesCoopKernel"),
+    ("bmm_4_44_32", "bmm_E2m1_E2m1E2m1_Fp32_t"),
+    ("finalize", "finalize::finalizeKernel"),
+    ("bmm_16_44_32", "bmm_Bfloat16_E2m1E2m1_Fp32_"),
+    ("deep_gemm_gemm", "deep_gemm::sm100_fp8_gemm_1d1d_impl<"),
+    ("per_token_quant", "_per_token_quant_and_transform_kernel"),
+    ("triton_fused_layer_norm", "triton_per_fused__to_copy_native_layer_norm_0"),
+    ("flashinferRoPE", "flashinfer::BatchQKApplyRotaryPosIdsCosSinCacheHeadParallelismKernel<"),
+    ("fp8_blockscale_gemm", "tensorrt_llm::kernels::fp8_blockscale_gemm"),
+    ("triton_fused_mul_squeeze", "triton_poi_fused_mul_squeeze_0"),
+    ("indexerKCacheScatter", "tensorrt_llm::kernels::indexerKCacheScatterUnifiedKernel"),
+    ("deep_gemm_mqa_logits", "deep_gemm::sm100_fp8_paged_mqa_logits<"),
+    ("topKPerRowDecode", "tensorrt_llm::kernels::topKPerRowDecode<"),
+    ("torchAdd<int>", "at::native::CUDAFunctorOnSelf_add"),
+    ("convert_req_index", "_convert_req_index_to_global_index_kernel_with_stride_factor"),
+    ("preprocess_after_permute", "_preprocess_after_permute_kernel"),
+    ("masked_index_copy_quant", "_masked_index_copy_group_quant_fp8"),
+    ("swiglu_quant", "_silu_and_mul_post_quant_kernel"),
+    ("masked_index_gather", "masked_index_gather_kernel"),
+    ("finalizeMoeRouting", "tensorrt_llm::kernels::cutlass_kernels::finalizeMoeRoutingKernel<"),
+    ("fused_qkvzba_split", "fused_qkvzba_split_reshape_cat_kernel"),
+    ("causal_conv1d_update", "tensorrt_llm::kernels::causal_conv1d::causal_conv1d_update_kernel<"),
+    ("fused_delta_rule_update", "fused_sigmoid_gating_delta_rule_update_kernel"),
+    ("layer_norm_fwd_1pass", "_layer_norm_fwd_1pass_kernel"),
+    ("torchGatherTopK", "at::native::sbtopk::gatherTopK<"),
+    ("softmax_warp_forward", "softmax_warp_forward<"),
+    ("torchSigmoid", "at::native::sigmoid_kernel_cuda"),
+    ("torchMul", "at::native::binary_internal::MulFunctor<"),
+    ("applyBiasRopeUpdateKVCache", "tensorrt_llm::kernels::applyBiasRopeUpdateKVCacheV2<"),
 ]
 warned_names = set()
 
@@ -265,7 +317,7 @@ def parse_kernel_name(demangledName):
     if name not in warned_names:
         print(f"Unknown kernel name: {name}")
         warned_names.add(name)
-        if args.unknown_kernel_as_error:
+        if args.error_on_unknown_kernel:
             raise NotImplementedError(f"Unknown kernel name: {name}")
     return name[:20]
 
@@ -274,21 +326,26 @@ converted_seqs = []
 for runs in kernels:
     converted_seq = []
     for i, (demangledName, _, _, ranges) in enumerate(runs[0]):
-        # TODO: Group by ranges
         name = parse_kernel_name(demangledName)
-        if ranges:
-            name = f"{ranges[0]}.{name}"
+        category = (*ranges, name)
         time_list = [run[i][2] - run[i][1] for run in runs]
         time_list = time_list[run_args["warmup_times"] :]
-        time = np.mean(time_list).tolist()
-        converted_seq.append((name, time))
+        t = np.mean(time_list).tolist()
+        converted_seq.append((category, t))
     converted_seqs.append(converted_seq)
 
 merged_title = []
 for converted_seq in converted_seqs:
     title = [name for name, _ in converted_seq]
     merged_title = shortest_common_supersequence(merged_title, title)
-print(merged_title)
+
+merged_data = [[0.0] * len(problem_set) for _ in merged_title]
+for problem_id, converted_seq in enumerate(converted_seqs):
+    cur = 0
+    for category, t in converted_seq:
+        cur = merged_title.index(category, cur)
+        merged_data[cur][problem_id] = t
+        cur += 1
 
 print("Problem set:")
 for problem in problem_set:
@@ -296,3 +353,43 @@ for problem in problem_set:
         f'- "{problem["text"]}"    {len(problem["runs"])} runs'
         f"    Ranges: [{', '.join(text for _, _, text in problem['ranges'])}]"
     )
+
+stack = []
+js_data = []
+js_stack = [js_data]
+max_title_len = max((len(title) - 1) * 3 + len(title[-1]) for title in merged_title)
+for title, time_data in zip(merged_title, merged_data):
+    while stack != list(title[: len(stack)]):
+        level_title = stack[-1]
+        stack.pop()
+        js_stack[-2].append(
+            {
+                "name": level_title,
+                "children": js_stack[-1],
+            }
+        )
+        js_stack.pop()
+    while len(stack) != len(title) - 1:
+        level_title = title[len(stack)]
+        stack.append(level_title)
+        level = len(stack)
+        print("|--" * (level - 1) + level_title)
+        js_stack.append([])
+    level = len(stack) + 1
+    print(
+        "|--" * (level - 1) + title[-1] + " " * (max_title_len - (level - 1) * 3 - len(title[-1])),
+        *[f"{x / 1000:-6.2f}" for x in time_data],
+    )
+    js_stack[-1].append(
+        {
+            "name": title[-1],
+            "time": [x / 1000 for x in time_data],
+        }
+    )
+# TODO: Print overlap and space
+# TODO: Statistics
+js_header_config = [{"name": problem["text"]} for problem in problem_set]
+loader = jinja2.FileSystemLoader(Path(__file__).parent)
+template = jinja2.Environment(loader=loader).get_template("template.html")
+with html_file_path.open("w") as f:
+    f.write(template.render(headerConfig=js_header_config, rawData=js_data))
