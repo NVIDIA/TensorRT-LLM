@@ -346,7 +346,6 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_fp8[throughput_laten
 accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4[latency_moe_trtllm_attention_dp] SKIP (https://nvbugs/5637220)
 llmapi/test_llm_examples.py::test_llmapi_example_multilora SKIP (https://nvbugs/5636857)
 unittest/_torch/modules/test_mla_helix.py::test_mla_helix_distributed SKIP (https://nvbugspro.nvidia.com/bug/5637012)
-accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[cutlass] SKIP (https://nvbugs/5636916)
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16_4gpus[tp4-attn_backend=TRTLLM-torch_compile=False] SKIP (https://nvbugs/5616182)
 examples/test_phi.py::test_llm_phi_quantization_1gpu[Phi-3-small-128k-instruct-fp8-bfloat16] SKIP (https://nvbugs/5465143)
 examples/test_multimodal.py::test_llm_multimodal_general[Mistral-Small-3.1-24B-Instruct-2503-pp:1-tp:1-bfloat16-bs:8-cpp_e2e:False-nb:1] SKIP (https://nvbugs/5644684)
@@ -415,3 +414,5 @@ unittest/llmapi/test_llm_pytorch.py::test_llm_context_only_timed_out_kv_cache_ex
 accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[False-4] SKIP (https://nvbugs/5680312, https://nvbugs/5636912)
 accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[False-2] SKIP (https://nvbugs/5680312, https://nvbugs/5636912)
 unittest/_torch/auto_deploy/unit/multigpu/test_ad_build_small_multi.py::test_build_ad[meta-llama/Meta-Llama-3.1-8B-Instruct-llm_extra_args0-2] SKIP (https://nvbugs/5680755)
+examples/test_ray.py::test_ray_disaggregated_serving[tp2] SKIP (https://nvbugs/5683039)
+full:H100_PCIe/unittest/llmapi/test_llm_pytorch.py::test_llama_7b_multi_lora_evict_and_reload_lora_gpu_cache SKIP (https://nvbugs/5682551)

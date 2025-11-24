@@ -248,9 +248,9 @@ class WideEPMoE(MoE):
 
     @cached_property
     def moe_alltoall_backend(self):
-        # "mnnvllatency" (default) or "mnnvlthroughput"
+        # "NVLINK_TWO_SIDED" (default) or "NVLINK_ONE_SIDED"
         return os.environ.get("TRTLLM_MOE_ALLTOALL_BACKEND",
-                              "mnnvllatency").strip().lower()
+                              "NVLINK_TWO_SIDED").strip().upper()
 
     def calculate_num_chunks(self, all_rank_num_tokens: List[int]) -> int:
         num_rows = sum(all_rank_num_tokens)
@@ -436,7 +436,7 @@ class WideEPMoE(MoE):
 
         if self.layer_load_balancer:
             self._load_balancer_done_wait_gpu_stage(is_first_call)
-            ignore_allreduce = self.enable_alltoall and self.alltoall_method_type == AlltoallMethodType.MNNVL and self.moe_alltoall_backend == "mnnvllatency"
+            ignore_allreduce = self.enable_alltoall and self.alltoall_method_type == AlltoallMethodType.MNNVL and self.moe_alltoall_backend == "NVLINK_TWO_SIDED"
             self._load_balancer_update_statistic(token_selected_experts,
                                                  is_first_call, is_last_call,
                                                  ignore_allreduce)
