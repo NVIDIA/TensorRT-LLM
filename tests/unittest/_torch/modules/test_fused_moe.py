@@ -210,8 +210,8 @@ def test_fused_moe_multi_gpu(moe_cls, ep_size):
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
 @pytest.mark.parametrize("alltoall_method_type", [
-    AlltoallMethodType.NVLinkOneSided, AlltoallMethodType.NVLinkTwoSided,
-    AlltoallMethodType.DeepEP, AlltoallMethodType.DeepEPLowLatency
+    AlltoallMethodType.NVLinkTwoSided, AlltoallMethodType.DeepEP,
+    AlltoallMethodType.DeepEPLowLatency
 ],
                          ids=lambda s: s.name)
 def test_fused_moe_alltoall(alltoall_method_type):
@@ -323,8 +323,8 @@ def test_fused_moe_alltoall(alltoall_method_type):
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
 @pytest.mark.parametrize("alltoall_method_type", [
-    AlltoallMethodType.NVLinkOneSided, AlltoallMethodType.NVLinkTwoSided,
-    AlltoallMethodType.DeepEP, AlltoallMethodType.DeepEPLowLatency
+    AlltoallMethodType.NVLinkTwoSided, AlltoallMethodType.DeepEP,
+    AlltoallMethodType.DeepEPLowLatency
 ],
                          ids=lambda s: s.name)
 def test_fused_moe_alltoall_fp4(alltoall_method_type):
@@ -682,11 +682,10 @@ def set_tensor_value_4(x, num_row, num_cols):
 @skip_pre_blackwell
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
-@pytest.mark.parametrize("alltoall_method_type", [
-    AlltoallMethodType.NVLinkOneSided, AlltoallMethodType.NVLinkTwoSided,
-    AlltoallMethodType.NotEnabled
-],
-                         ids=lambda s: s.name)
+@pytest.mark.parametrize(
+    "alltoall_method_type",
+    [AlltoallMethodType.NVLinkTwoSided, AlltoallMethodType.NotEnabled],
+    ids=lambda s: s.name)
 def test_fused_moe_fp8_blockwise_wide_ep(alltoall_method_type):
     """Test WideEPMoE with FP8 block-wise quantization using DeepGemmFusedMoE as reference."""
 

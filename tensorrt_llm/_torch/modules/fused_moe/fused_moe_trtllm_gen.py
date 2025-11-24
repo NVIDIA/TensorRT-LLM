@@ -141,7 +141,7 @@ class TRTLLMGenFusedMoE(MoE):
                 )
             else:
                 raise NotImplementedError(
-                    f"Not available alltoall method type: {self.alltoall_method_type!r}"
+                    f"Unsupported alltoall method type: {self.alltoall_method_type!r}"
                 )
 
         self._weights_created = False

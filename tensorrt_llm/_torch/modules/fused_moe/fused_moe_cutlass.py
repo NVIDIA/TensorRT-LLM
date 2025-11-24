@@ -164,7 +164,7 @@ class CutlassFusedMoE(MoE):
                 )
             else:
                 raise NotImplementedError(
-                    f"Not available alltoall method type: {self.alltoall_method_type!r}"
+                    f"Unsupported alltoall method type: {self.alltoall_method_type!r}"
                 )
 
         # If True, the router weight will be multiplied on the input rather than at the end of FC2

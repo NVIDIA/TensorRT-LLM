@@ -149,7 +149,7 @@ class WideEPMoE(MoE):
                                             hidden_size, self.num_slots)
             else:
                 raise NotImplementedError(
-                    f"Not available alltoall method type: {self.alltoall_method_type!r}"
+                    f"Unsupported alltoall method type: {self.alltoall_method_type!r}"
                 )
 
         self.use_fused_finalize = not model_config.moe_disable_finalize_fusion
@@ -619,7 +619,7 @@ class WideEPMoE(MoE):
                     x, x_sf, recv_expert_count, token_final_scales.dtype)
             else:
                 raise NotImplementedError(
-                    f"Not available alltoall method type: {self.alltoall_method_type!r}"
+                    f"Unsupported alltoall method type: {self.alltoall_method_type!r}"
                 )
 
         final_hidden_states = self.moe_op_impl.run_moe(
@@ -682,7 +682,7 @@ class WideEPMoE(MoE):
                         deep_ep_topk_weights, deep_ep_handle)
             else:
                 raise NotImplementedError(
-                    f"Not available alltoall method type: {self.alltoall_method_type!r}"
+                    f"Unsupported alltoall method type: {self.alltoall_method_type!r}"
                 )
 
         self._load_balancer_done_set_cpu_stage(is_last_call)
