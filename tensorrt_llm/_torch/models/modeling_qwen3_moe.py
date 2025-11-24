@@ -62,10 +62,11 @@ class Qwen3Gate(nn.Module):
                      weights: List[Dict],
                      allow_partial_loading: bool = False):
         assert len(weights) == 1
+        w = weights[0].get("weight")
         if not allow_partial_loading:
-            assert "weight" in weights[0]
-        if weights[0]["weight"] is not None:
-            self.weight.copy_(weights[0]["weight"][:])
+            assert w is not None, "Qwen3Gate expects weight when partial loading is disabled"
+        if w is not None:
+            self.weight.copy_(w[:])
 
     @property
     def routing_method(self) -> BaseMoeRoutingMethod:

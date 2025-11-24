@@ -54,12 +54,12 @@ class Eagle3Attention(Attention):
             tp_size = 1
         # Override the QKV projection. The number of input features
         # is twice as big for EAGLE3 draft models.
-        qkv_shard_indices_mapping = {
-            "q": (0, self.q_size),
-            "k": (self.q_size, self.kv_size),
-            "v": (self.q_size + self.kv_size, self.kv_size),
-        }
         if not self._next_layer_regular:
+            qkv_shard_indices_mapping = {
+                "q": (0, self.q_size),
+                "k": (self.q_size, self.kv_size),
+                "v": (self.q_size + self.kv_size, self.kv_size),
+            }
             self.qkv_proj = Linear(
                 2 * self.hidden_size,
                 tp_size * self.q_size + 2 * tp_size * self.kv_size,
@@ -72,7 +72,7 @@ class Eagle3Attention(Attention):
                 quant_config=model_config.get_quant_config(),
                 skip_create_weights_in_init=model_config.
                 skip_create_weights_in_init,
-            fused_weight_shard_indices_mapping=qkv_shard_indices_mapping,
+                fused_weight_shard_indices_mapping=qkv_shard_indices_mapping,
             )
 
 
