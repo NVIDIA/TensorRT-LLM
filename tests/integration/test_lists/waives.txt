@@ -367,7 +367,6 @@ examples/test_multimodal.py::test_llm_multimodal_general[nougat-base-pp:1-tp:1-b
 accuracy/test_llm_api_pytorch_multimodal.py::TestNVILA_8B::test_auto_dtype SKIP (https://nvbugs/5648441)
 accuracy/test_llm_api_pytorch_multimodal.py::TestVILA1_5_3B::test_auto_dtype SKIP (https://nvbugs/5648441)
 accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_nixl_backend SKIP (https://nvbugs/5651824)
-unittest/_torch/modules SKIP (https://nvbugs/5637037)
 accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype[False] SKIP (https://nvbugs/5651854)
 accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype[True] SKIP (https://nvbugs/5651854)
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_bf16_empty_batch[DeepSeek-V3-Lite-bf16] SKIP (https://nvbugs/5601682)
