@@ -78,6 +78,7 @@ add_library(
   moeCommOp.cpp
   moeAlltoAllOp.cpp
   moeLoadBalanceOp.cpp
+  moeAlignOp.cpp
   mxFp4BlockScaleMoe.cpp
   mxFp8Quantize.cpp
   fp8BlockScaleMoe.cpp

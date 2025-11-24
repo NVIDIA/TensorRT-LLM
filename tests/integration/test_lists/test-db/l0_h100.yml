@@ -110,6 +110,8 @@ l0_h100:
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[True-1]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[False]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[True]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_fp8
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_bf16
 - condition:
     ranges:
       system_gpu_count:
