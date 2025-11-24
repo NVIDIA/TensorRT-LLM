@@ -780,6 +780,8 @@ def rocket_update_kt_cache_gen_kernel(
     kt_page_size,
     tokens_per_block,
     max_kt_blocks_per_seq,
+    k_stride_0,
+    k_stride_1,
     DIM_BLOCK_SIZE: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
@@ -794,8 +796,8 @@ def rocket_update_kt_cache_gen_kernel(
     dim_indices = dim_block_start + dim_offsets
     dim_mask = dim_indices < head_dim
 
-    k_base = batch_idx * num_kv_heads * head_dim + kv_head_idx * head_dim
-    k_indices = k_base + dim_indices
+    k_base = batch_idx * k_stride_0 + kv_head_idx * head_dim * k_stride_1
+    k_indices = k_base + dim_indices * k_stride_1
     k_values = tl.load(k_ptr + k_indices, mask=dim_mask, other=0.0)
 
     kv_len = tl.load(kv_lens_ptr + batch_idx)
@@ -876,6 +878,8 @@ def triton_rocket_update_kt_cache_gen(
                                             kt_page_size,
                                             tokens_per_block,
                                             max_kt_blocks_per_seq,
+                                            k.stride(0),
+                                            k.stride(1),
                                             DIM_BLOCK_SIZE=128)
 
 
@@ -1066,6 +1070,10 @@ def rocket_paged_kt_cache_bmm_kernel(
     max_kt_blocks_per_seq,
     total_kt_tokens,
     sm_scale,
+    q_stride_0,
+    q_stride_1,
+    q_stride_2,
+    q_stride_3,
     Q_BLOCK_SIZE: tl.constexpr,
     KT_BLOCK_SIZE: tl.constexpr,
     DIM_BLOCK_SIZE: tl.constexpr,
@@ -1078,8 +1086,7 @@ def rocket_paged_kt_cache_bmm_kernel(
     kv_len = tl.load(kv_lens_ptr + batch_idx)
     num_kt_tokens = (kv_len + kt_page_size - 1) // kt_page_size
 
-    q_base = (batch_idx * num_kv_heads * num_heads_per_kv * head_dim +
-              kv_head_idx * num_heads_per_kv * head_dim)
+    q_base = batch_idx * q_stride_0 + kv_head_idx * q_stride_1
 
     q_head_offsets = tl.arange(0, Q_BLOCK_SIZE)
     q_head_mask = q_head_offsets < num_heads_per_kv
@@ -1089,8 +1096,8 @@ def rocket_paged_kt_cache_bmm_kernel(
     dim_indices = tl.arange(0, DIM_BLOCK_SIZE)
     dim_mask = dim_indices < head_dim
 
-    q_indices = q_base + q_head_offsets[:,
-                                        None] * head_dim + dim_indices[None, :]
+    q_indices = q_base + q_head_offsets[:, None] * q_stride_2 + dim_indices[
+        None, :] * q_stride_3
     q_values = tl.load(q_ptr + q_indices,
                        mask=q_head_mask[:, None] & dim_mask[None, :])
 
@@ -1219,6 +1226,10 @@ def triton_rocket_paged_kt_cache_bmm(
         max_kt_blocks_per_seq,
         total_kt_tokens,
         sm_scale,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
         Q_BLOCK_SIZE=Q_BLOCK_SIZE,
         KT_BLOCK_SIZE=KT_BLOCK_SIZE,
         DIM_BLOCK_SIZE=DIM_BLOCK_SIZE,

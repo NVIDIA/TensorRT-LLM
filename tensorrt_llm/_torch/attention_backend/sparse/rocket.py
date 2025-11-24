@@ -459,11 +459,6 @@ class RocketTrtllmAttention(TrtllmAttention):
             q = q[metadata.num_ctx_tokens:]
             k = k[metadata.num_ctx_tokens:]
 
-        if not q.is_contiguous():
-            q = q.contiguous()
-        if not k.is_contiguous():
-            k = k.contiguous()
-
         q = q.view(-1, self.num_kv_heads, self.num_heads // self.num_kv_heads,
                    self.head_dim)
 
@@ -1040,7 +1035,7 @@ class RocketKVCacheManager(KVCacheManager):
         kt_tokens_per_block = next_power_of_2(
             math.ceil(tokens_per_block / sparse_attn_config.page_size))
         kt_factor = 2
-        if sparse_attn_config.kt_cache_dtype == torch.float8_e5m2:
+        if sparse_attn_config.kt_cache_dtype == "float8_e5m2":
             kt_factor = 1
         kv_factor = 2 + kt_factor * kt_tokens_per_block / tokens_per_block
         mem_per_token *= kv_factor
