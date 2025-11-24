@@ -771,24 +771,26 @@ def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "
                 graph.get_attr(new_key_gemm2_dequant),
             ]
         # Create new node with get_attr for stacked parameters
+
         with graph.inserting_before(node):
+            args = (
+                hidden_states,
+                selected_experts,
+                routing_weights,
+                graph.get_attr(new_key_w1),
+                graph.get_attr(new_key_w2),
+                graph.get_attr(new_key_w3),
+                graph.get_attr(new_key_w1_input_scale),
+                graph.get_attr(new_key_w2_input_scale),
+                graph.get_attr(new_key_w3_input_scale),
+                graph.get_attr(new_key_w1_weight_scale),
+                graph.get_attr(new_key_w2_weight_scale),
+                graph.get_attr(new_key_w3_weight_scale),
+                *additional_args,
+            )
             new_node = graph.call_function(
                 replacement_op,
-                args=(
-                    hidden_states,
-                    selected_experts,
-                    routing_weights,
-                    graph.get_attr(new_key_w1),
-                    graph.get_attr(new_key_w2),
-                    graph.get_attr(new_key_w3),
-                    graph.get_attr(new_key_w1_input_scale),
-                    graph.get_attr(new_key_w2_input_scale),
-                    graph.get_attr(new_key_w3_input_scale),
-                    graph.get_attr(new_key_w1_weight_scale),
-                    graph.get_attr(new_key_w2_weight_scale),
-                    graph.get_attr(new_key_w3_weight_scale),
-                    *additional_args,
-                ),
+                args=args,
                 kwargs=node.kwargs,
             )
 
