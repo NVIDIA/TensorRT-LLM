@@ -1353,8 +1353,13 @@ def test_fused_moe_nvfp4(dtype, moe_backend):
 
     if moe_backend == "TRTLLM" and dtype == torch.float16:
         pytest.skip("TRTLLM NVFP4 MoE backend does not support float16 yet")
-    if moe_backend == "CUTEDSL" and dtype == torch.float16:
-        pytest.skip("CUTEDSL NVFP4 MoE backend does not support float16 yet")
+    if moe_backend == "CUTEDSL":
+        if dtype == torch.float16:
+            pytest.skip(
+                "CUTEDSL NVFP4 MoE backend does not support float16 yet")
+        if get_sm_version() != 100:
+            pytest.skip(
+                "CUTEDSL NVFP4 MoE backend is only supported on SM 100 GPUs")
 
     test_all_kernels = True
     if get_sm_version() == 120:
