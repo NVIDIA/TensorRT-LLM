@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import time
 
 import pytest
 import torch
@@ -51,6 +52,7 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     def test_nvfp4(self):
+        time.sleep(3600)
         model_path = f"{llm_models_root()}/nvfp4-quantized/Meta-Llama-3.1-8B"
         with LLM(model_path) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
@@ -3636,6 +3638,7 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
     )
     def test_nvfp4(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
                    overlap_scheduler, moe_backend, eagle3):
+        time.sleep(3600)
 
         if moe_backend == "TRTLLM" and (get_sm_version() == 120
                                         or get_sm_version() == 121):
