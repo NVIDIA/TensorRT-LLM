@@ -47,7 +47,6 @@ class QwenAttention(Attention):
             #     type=PositionEmbeddingType.from_string(pos_type),
             #     rope=RopeParams.from_config(config),
             #     mrope_section=config.rope_scaling.get('mrope_section', None))
-            print(f"pos_embd_params: {pos_embd_params}")
         else:
             pos_embd_params = PositionalEmbeddingParams(
                 type=PositionEmbeddingType.rope_gpt_neox,
