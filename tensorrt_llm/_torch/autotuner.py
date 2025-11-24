@@ -931,9 +931,6 @@ class AutoTuner:
         disable_short_profile = os.environ.get(
             "TLLM_AUTOTUNER_DISABLE_SHORT_PROFILE", "0") == "1"
         if fewer_repeat_avg_time > short_profile_threshold_ms and not disable_short_profile:
-            print(
-                f"[Autotuner] Few repeat estimated time is longer than {short_profile_threshold_ms}ms, directly use the few repeat estimated time to avoid redundant profiling."
-            )
             # directly use the few repeat estimated time to avoid redundant profiling
             avg_time = fewer_repeat_avg_time
         else:
