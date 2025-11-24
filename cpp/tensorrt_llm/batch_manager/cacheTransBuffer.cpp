@@ -394,10 +394,9 @@ std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> CacheTransBuf
         {
             TLLM_LOG_WARNING(
                 "CacheTransceiver getOrAllocateBuffers: bufferCoverTargetNum:%d < targetNum:%d, may use dynamic "
-                "buffer, "
-                "it's better to increase MaxTokensInBuffer in cacheTransceiverConfig, to make maxTokensInBuffer > max "
-                "ISL of the processed requests,  otherwise, the performance may "
-                "be degraded or transfer may fail, requestedNumberOfElements.size():%ld, mNumberOfElements:%ld, "
+                "buffer, it's better to increase MaxTokensInBuffer in cacheTransceiverConfig, to make "
+                "maxTokensInBuffer > max ISL of the processed requests,  otherwise, the performance may be degraded or "
+                "transfer may fail, requestedNumberOfElements.size():%ld, mNumberOfElements:%ld, "
                 "requestedNumberOfElements[0]:%ld",
                 bufferCoverTargetNum, targetNum, requestedNumberOfElements.size(), mNumberOfElements,
                 requestedNumberOfElements[0]);
