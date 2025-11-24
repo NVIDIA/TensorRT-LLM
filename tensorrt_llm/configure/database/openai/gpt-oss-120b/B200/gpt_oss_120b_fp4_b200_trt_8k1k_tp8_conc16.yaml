@@ -1,24 +1,16 @@
-constraints:
-  model: openai/gpt-oss-120b
-  gpu: B200_NVL
-  num_gpus: 8
-  target_isl: 8192
-  target_osl: 1024
-  target_concurrency: 16
 env_overrides:
   TRTLLM_ENABLE_PDL: 1
   NCCL_GRAPH_REGISTER: 0
-config:
-  cuda_graph_config:
-    enable_padding: true
-    max_batch_size: 16
-  enable_attention_dp: false
-  kv_cache_config:
-    dtype: fp8
-    enable_block_reuse: false
-    free_gpu_memory_fraction: 0.85
-  print_iter_log: true
-  stream_interval: 20
-  num_postprocess_workers: 4
-  moe_config:
-    backend: TRTLLM
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 16
+enable_attention_dp: false
+kv_cache_config:
+  dtype: fp8
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.85
+print_iter_log: true
+stream_interval: 20
+num_postprocess_workers: 4
+moe_config:
+  backend: TRTLLM
