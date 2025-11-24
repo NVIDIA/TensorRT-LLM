@@ -12,15 +12,29 @@ from .openai_server import RemoteOpenAIServer
 pytestmark = pytest.mark.threadleak(enabled=False)
 
 
-@pytest.fixture(scope="module", ids=["GPT-OSS-20B"])
-def model():
-    return "gpt_oss/gpt-oss-20b/"
+@pytest.fixture(scope="module",
+                params=[
+                    "gpt_oss/gpt-oss-20b", "DeepSeek-R1-Distill-Qwen-1.5B",
+                    "Qwen3/Qwen3-0.6B"
+                ])
+def model(request):
+    return request.param
 
 
 @pytest.fixture(scope="module")
 def server(model: str):
     model_path = get_model_path(model)
-    with RemoteOpenAIServer(model_path) as remote_server:
+
+    args = []
+    if model.startswith("Qwen3"):
+        args.extend(["--reasoning_parser", "qwen3"])
+    elif model.startswith("DeepSeek-R1"):
+        args.extend(["--reasoning_parser", "deepseek-r1"])
+
+    if not model.startswith("gpt_oss"):
+        args.extend(["--tool_parser", "qwen3"])
+
+    with RemoteOpenAIServer(model_path, args) as remote_server:
         yield remote_server
 
 
@@ -43,24 +57,30 @@ def check_reponse(response, prefix=""):
 
 def check_tool_calling(response, first_resp=True, prefix=""):
     reasoning_exist, tool_call_exist, message_exist = False, False, False
+    reasoning_content, message_content = "", ""
     function_call = None
     for output in response.output:
         if output.type == "reasoning":
             reasoning_exist = True
+            reasoning_content = output.content[0].text
         elif output.type == "function_call":
             tool_call_exist = True
             function_call = output
         elif output.type == "message":
             message_exist = True
+            message_content = output.content[0].text
 
+    err_msg = f"{prefix}Invalid tool calling {'1st' if first_resp else '2nd'} response:"
     if first_resp:
-        assert reasoning_exist and tool_call_exist, f"{prefix}Invalid tool calling 1st response"
-        assert not message_exist, f"{prefix}Invalid tool calling 1st response"
+        assert reasoning_exist, f"{err_msg} reasoning content not exists! ({reasoning_content})"
+        assert tool_call_exist, f"{err_msg} tool call content not exists! ({function_call})"
+        assert not message_exist, f"{err_msg} message content should not exist! ({message_content})"
 
         return function_call
     else:
-        assert reasoning_exist and message_exist, f"{prefix}Invalid tool calling 2nd response"
-        assert not tool_call_exist, f"{prefix}Invalid tool calling 2nd response"
+        assert reasoning_exist, f"{err_msg} reasoning content not exists! ({reasoning_content})"
+        assert message_exist, f"{err_msg} message content not exists! ({message_content})"
+        assert not tool_call_exist, f"{err_msg} tool call content should not exist! ({function_call})"
 
 
 @pytest.mark.asyncio(loop_scope="module")
@@ -124,6 +144,9 @@ def get_current_weather(location: str, format: str = "celsius") -> dict:
 
 @pytest.mark.asyncio(loop_scope="module")
 async def test_tool_calls(client: openai.AsyncOpenAI, model: str):
+    if model.startswith("DeepSeek-R1"):
+        pytest.skip("DeepSeek-R1 does not support tool calls")
+
     tool_get_current_weather = {
         "type": "function",
         "name": "get_current_weather",
@@ -193,6 +216,9 @@ async def test_streaming(client: openai.AsyncOpenAI, model: str):
 
 @pytest.mark.asyncio(loop_scope="module")
 async def test_streaming_tool_call(client: openai.AsyncOpenAI, model: str):
+    if model.startswith("DeepSeek-R1"):
+        pytest.skip("DeepSeek-R1 does not support tool calls")
+
     tool_get_current_weather = {
         "type": "function",
         "name": "get_current_weather",
@@ -230,6 +256,8 @@ async def test_streaming_tool_call(client: openai.AsyncOpenAI, model: str):
                     function_call = output
         elif isinstance(event, ResponseReasoningTextDeltaEvent):
             reasoning_deltas.append(event.delta)
+
+    assert function_call is not None, "function call not exists!"
 
     reasoning = "".join(reasoning_deltas)
     tool_args = json.loads(function_call.arguments)
