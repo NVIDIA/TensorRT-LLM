@@ -1,13 +1,19 @@
 from copy import deepcopy
 from dataclasses import dataclass
+import os
+import tempfile
 
 import pytest
 import torch
-from transformers import Starcoder2Config
+from peft import LoraConfig as PeftLoraConfig
+from peft import get_peft_model
+from transformers import AutoModelForCausalLM, Starcoder2Config
 from transformers import Starcoder2ForCausalLM as HFStarcoder2ForCausalLM
+from utils.llm_data import llm_models_root
 from utils.util import default_dtype
 
 import tensorrt_llm
+from tensorrt_llm import LLM
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -15,7 +21,10 @@ from tensorrt_llm._torch.models.modeling_starcoder2 import Starcoder2ForCausalLM
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
+from tensorrt_llm.executor.request import LoRARequest
+from tensorrt_llm.lora_manager import LoraConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.sampling_params import SamplingParams
 
 # Base config for all StarCoder2 models (based on HuggingFace configs)
 _STARCODER2_BASE_CONFIG = {
@@ -311,3 +320,144 @@ def test_starcoder2_allclose_to_hf(scenario: Scenario) -> None:
     if graph_runner is not None:
         graph_runner.clear()
     kv_cache_manager.shutdown()
+
+@torch.no_grad()
+def test_starcoder2_multi_lora() -> None:
+    """
+    Test StarCoder2 3b model with multiple synthetic LoRA adapters created using PEFT.
+    
+    This test creates dummy LoRA adapters for StarCoder2 and verifies that:
+    1. Multiple LoRA adapters can be loaded and used simultaneously
+    2. Different requests can use different LoRA adapters
+    3. The model produces reasonable outputs with LoRA adapters applied
+    """
+    
+    # Check if we have enough GPU memory (need ~10GB for StarCoder2-3B + LoRA)
+    _, total_mem = torch.cuda.mem_get_info()
+    min_mem_required = 10 * (2**30)  # 10 GB
+    if total_mem < min_mem_required:
+        pytest.skip("Insufficient GPU memory for StarCoder2 with LoRA test")
+    
+    # Check for pretrained model
+    try:
+        model_path = f"{llm_models_root()}/starcoder2-3b"
+        if not os.path.exists(model_path):
+            model_path = None
+    except:
+        model_path = None
+    
+    if model_path is None:
+        pytest.skip(
+            "StarCoder2 3b pretrained model not found. "
+        )
+    
+    # Target modules for LoRA - attention projections
+    target_modules = ['attn_q', 'attn_k', 'attn_v', 'attn_dense']
+    
+    # Set up temporary directory for LoRA adapters
+    with tempfile.TemporaryDirectory() as lora_dir:
+        print("Creating synthetic LoRA adapters for StarCoder2...")
+        
+        # Load the pretrained model to create LoRA adapters
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True
+        )
+        
+        # HuggingFace module names for StarCoder2 attention
+        hf_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+        
+        peft_lora_config = PeftLoraConfig(
+            r=8,  # LoRA rank
+            lora_alpha=16,
+            target_modules=hf_modules,
+            lora_dropout=0.0,
+            bias="none",
+            task_type="CAUSAL_LM"
+        )
+        
+        # Create two synthetic LoRA adapters with zeroed weights
+        lora_paths = []
+        for i in range(2):
+            print(f"Creating LoRA adapter {i+1}/2...")
+            lora_model = get_peft_model(model, peft_lora_config)
+            
+            # Zero out all LoRA parameters for deterministic testing
+            for name, param in lora_model.named_parameters():
+                if "lora_" in name:
+                    param.data.zero_()
+            
+            # Save the LoRA adapter
+            lora_path = f"{lora_dir}/lora_{i}"
+            lora_model.save_pretrained(lora_path)
+            lora_paths.append(lora_path)
+            print(f"Saved LoRA adapter to {lora_path}")
+        
+        del model
+        del lora_model
+        torch.cuda.empty_cache()
+        
+        # Configure TensorRT-LLM LoRA
+        trtllm_lora_config = LoraConfig(
+            lora_target_modules=target_modules,
+            max_lora_rank=8,
+            max_loras=2,
+            max_cpu_loras=2
+        )
+        
+        print(f"Initializing LLM with LoRA support...")
+        llm = LLM(
+            model_path,
+            lora_config=trtllm_lora_config,
+            # Disable CUDA graph for LoRA (LoRA is not supported with CUDA graphs yet)
+            cuda_graph_config=None
+        )
+        
+        try:
+            prompts = [
+                "def fibonacci(n):",
+                "def quick_sort(arr):",
+            ]
+            
+            lora_req1 = LoRARequest("lora-1", 0, lora_paths[0])
+            lora_req2 = LoRARequest("lora-2", 1, lora_paths[1])
+            lora_requests = [lora_req1, lora_req2]
+            
+            # Sampling parameters
+            sampling_params = SamplingParams(
+                max_tokens=50,
+                temperature=0.0,  # Greedy decoding for deterministic output
+            )
+            
+            print("Generating with multiple LoRA adapters...")
+            outputs = llm.generate(
+                prompts,
+                sampling_params,
+                lora_request=lora_requests
+            )
+            
+            # Verify we got outputs for both prompts
+            assert len(outputs) == 2, f"Expected 2 outputs, got {len(outputs)}"
+            
+            # Verify each output has text
+            for i, output in enumerate(outputs):
+                assert len(output.outputs) > 0, f"Output {i} has no results"
+                assert len(output.outputs[0].text) > 0, f"Output {i} generated empty text"
+                print(f"\nPrompt {i+1}: {prompts[i]}")
+                print(f"Output {i+1}: {output.outputs[0].text[:100]}...")
+            
+            # Test without LoRA for comparison
+            print("\nGenerating without LoRA adapters for comparison...")
+            outputs_no_lora = llm.generate(
+                prompts[:1], 
+                sampling_params,
+                lora_request=None
+            )
+            
+            assert len(outputs_no_lora) == 1
+            print(f"Output without LoRA: {outputs_no_lora[0].outputs[0].text[:100]}...")
+            
+        finally:
+            llm.shutdown()
