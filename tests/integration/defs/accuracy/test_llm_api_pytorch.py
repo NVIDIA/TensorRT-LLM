@@ -2670,7 +2670,7 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                 "MOE TRTLLM backend does not support SM version 120 or 121")
 
         moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
-        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+        kv_cache_config = KvCacheConfig(enable_block_reuse=True,
                                         free_gpu_memory_fraction=0.7,
                                         tokens_per_block=64)
         cuda_graph_config = CudaGraphConfig(
