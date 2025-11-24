@@ -122,13 +122,29 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
 
         Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
 
-        def downloadSucceed = false
+        def hasTimeoutTest = false
+        def downloadResultSucceed = false
 
         pipeline.stage('Submit Test Results') {
             sh "mkdir -p ${stageName}"
+            // Download timeout test results
+            def timeoutTestFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/unfinished_test.txt"
+            def downloadTimeoutTestCmd = "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${timeoutTestFilePath} ${stageName}/"
+            def downloadTimeoutTestSucceed = sh(script: downloadTimeoutTestCmd, returnStatus: true) == 0
+            if (downloadTimeoutTestSucceed) {
+                sh "ls ${stageName}"
+                def timeoutTestXml = generateTimeoutTestResultXml(stageName, "unfinished_test.txt")
+                if (timeoutTestXml != null) {
+                    sh "echo '${timeoutTestXml}' > ${stageName}/results-timeout.xml"
+                    hasTimeoutTest = true
+                }
+            }
+            // Download normal test results
             def resultsFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/results.xml"
-            downloadSucceed = Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -P ${remote.port} -r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${resultsFilePath} ${stageName}/", returnStatus: true, numRetries: 3) == 0
-            if (downloadSucceed) {
+            downloadResultSucceed = Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -P ${remote.port} -r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${resultsFilePath} ${stageName}/", returnStatus: true, numRetries: 3) == 0
+
+            echo "hasTimeoutTest: ${hasTimeoutTest}, downloadResultSucceed: ${downloadResultSucceed}"
+            if (hasTimeoutTest || downloadResultSucceed) {
                 sh "ls ${stageName}"
                 echo "Upload test results."
                 sh "tar -czvf results-${stageName}.tar.gz ${stageName}/"
@@ -142,7 +158,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
             }
         }
 
-        if (downloadSucceed) {
+        if (hasTimeoutTest || downloadResultSucceed) {
             junit(allowEmptyResults: true, testResults: "${stageName}/results*.xml")
         }
     }
@@ -781,6 +797,10 @@ def getPytestBaseCommandLine(
         "--cov=${trtllmWheelPath}/tensorrt_llm/",
         "--cov-report=",
         "--cov-config=${coverageConfigFile}",
+        "--periodic-junit",
+        "--periodic-interval=1800",     // 30 minutes
+        "--periodic-batch-size=1",
+        "--periodic-save-unfinished-test",
     ]
 
     if (perfMode) {
@@ -1258,6 +1278,10 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             sh "mkdir -p ${stageName}"
             finallyRunner()
             if (stageIsFailed) {
+                def timeoutTestXml = generateTimeoutTestResultXml(stageName, "unfinished_test.txt")
+                if (timeoutTestXml != null) {
+                    sh "echo '${timeoutTestXml}' > ${stageName}/results-timeout.xml"
+                }
                 def stageXml = generateStageFailTestResultXml(stageName, "Stage Failed", "Stage run failed without result", "results*.xml")
                 if (stageXml != null) {
                     sh "echo '${stageXml}' > ${stageName}/results-stage.xml"
@@ -1618,9 +1642,28 @@ def launchTestListCheck(pipeline)
     })
 }
 
+def generateTimeoutTestResultXml(stageName, testFilePath) {
+    String timeoutTests = sh(script: "cd ${stageName} && cat ${testFilePath}", returnStdout: true).trim()
+    echo "timeoutTests: ${timeoutTests}"
+
+    if (timeoutTests == null || timeoutTests == "") {
+        return null
+    }
+    def testList = timeoutTests.split("\n")
+    String xmlContent = """<?xml version="1.0" encoding="UTF-8"?><testsuites>
+        <testsuite name="${stageName}" errors="${testList.size()}" failures="0" skipped="0" tests="${testList.size()}" time="1.00">"""
+    testList.each { test ->
+        xmlContent += """<testcase name="${test}" classname="${stageName}" time="1.0">
+        <failure message="Test timeout"> Test timeout
+        </failure></testcase>"""
+    }
+    xmlContent += "</testsuite></testsuites>"
+    return xmlContent
+}
+
 def generateStageFailTestResultXml(stageName, subName, failureLog, resultPath) {
     String resultFiles = sh(script: "cd ${stageName} && ls -l ${resultPath} | wc -l", returnStdout: true).trim()
-    echo "${resultFiles}"
+    echo "resultFiles: ${resultFiles}"
     if (resultFiles != "0") {
         return null
     }

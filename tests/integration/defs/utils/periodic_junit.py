@@ -73,6 +73,7 @@ class PeriodicJUnitXML:
             interval: int = 18000,  # Default 5 hours
             batch_size: int = 10,
             logger=None,  # Optional logger (info, warning functions)
+            save_unfinished_test: bool = False,  # Save unfinished test name in output-dir/unfinished_test.txt if True
     ):
         """
         Initialize periodic reporter.
@@ -85,11 +86,13 @@ class PeriodicJUnitXML:
             interval: Time interval in seconds between saves (default: 18000 = 5 hours)
             batch_size: Number of tests before triggering a save (default: 10)
             logger: Optional dictionary with 'info' and 'warning' functions for logging
+            save_unfinished_test: If True, save unfinished test name in output-dir/unfinished_test.txt
         """
         self.xmlpath = os.path.abspath(xmlpath)
         self.time_interval = interval
         self.batch_size = batch_size
         self.logger = logger or {}
+        self.save_unfinished_test = save_unfinished_test
 
         self.completed_tests = 0
         self.last_save_time = time.time()
@@ -160,10 +163,41 @@ class PeriodicJUnitXML:
         # Collect the report for later batch processing (fast)
         self.pending_reports.append(report)
 
+        output_dir = os.path.dirname(self.xmlpath)
+        unfinished_test_path = os.path.join(output_dir, "unfinished_test.txt")
+
+        # save unfinished test nodeid to output-dir/unfinished_test.txt
+        if self.save_unfinished_test and report.when == "setup":
+            try:
+                # Create directory if it doesn't exist
+                os.makedirs(output_dir, exist_ok=True)
+                with open(unfinished_test_path, "a", encoding="utf-8") as f:
+                    f.write(report.nodeid + "\n")
+            except Exception as e:
+                self._log_warning(
+                    f"Error writing unfinished test {report.nodeid} to {unfinished_test_path}: {e}"
+                )
+
         # Only increment counter and check for save on teardown phase
         if report.when == "teardown":
             self.completed_tests += 1
             current_time = time.time()
+
+            if self.save_unfinished_test:
+                if os.path.exists(unfinished_test_path):
+                    try:
+                        with open(unfinished_test_path, "r+",
+                                  encoding="utf-8") as f:
+                            lines = f.readlines()
+                            f.seek(0)
+                            f.truncate()
+                            for line in lines:
+                                if line.strip() != report.nodeid:
+                                    f.write(line)
+                    except Exception as e:
+                        self._log_warning(
+                            f"Error clearing nodeid {report.nodeid} from {unfinished_test_path}: {e}"
+                        )
 
             # Flush if batch threshold reached OR time interval elapsed
             should_flush_by_time = (current_time -
