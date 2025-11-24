@@ -620,6 +620,46 @@ def finish_reason_mapping(finish_reason: str) -> str:
     raise RuntimeError("Should never reach here!")
 
 
+def _response_output_item_to_chat_completion_message(
+        item: Union[Dict,
+                    ResponseInputOutputItem]) -> ChatCompletionMessageParam:
+    if not isinstance(item, dict):
+        item = item.model_dump()
+
+    item_type = item.get("type", "")
+
+    match item_type:
+        case "":
+            if "role" in item:
+                return item
+            else:
+                raise ValueError(f"Invalid input message item: {item}")
+        case "message":
+            return {
+                "role": "assistant",
+                "content": item["content"][0]["text"],
+            }
+        case "reasoning":
+            return {
+                "role": "assistant",
+                "reasoning": item["content"][0]["text"],
+            }
+        case "function_call":
+            return {
+                "role": "function",
+                "content": item["arguments"],
+            }
+        case "function_call_output":
+            return {
+                "role": "tool",
+                "content": item["output"],
+                "tool_call_id": item["call_id"],
+            }
+        case _:
+            raise ValueError(
+                f"Unsupported input item type: {item_type}, item: {item}")
+
+
 async def _create_input_messages(
     request: ResponsesRequest,
     prev_msgs: List[ChatCompletionMessageParam],
@@ -643,15 +683,8 @@ async def _create_input_messages(
         messages.append({"role": "user", "content": request.input})
     else:
         for inp in request.input:
-            if inp.get("type", "") == "function_call_output":
-                tool_call_inp = {
-                    "role": "tool",
-                    "content": inp["output"],
-                    "tool_call_id": inp["call_id"],
-                }
-                messages.append(tool_call_inp)
-            else:
-                messages.append(inp)
+            messages.append(
+                _response_output_item_to_chat_completion_message(inp))
 
     return messages
 
@@ -824,7 +857,7 @@ async def request_preprocess(
         sampling_params.return_perf_metrics = True
 
     prev_msgs = []
-    if enable_store:
+    if enable_store and prev_response_id is not None:
         prev_msgs = await conversation_store.get_conversation_history(
             prev_response_id)
 
