@@ -77,7 +77,9 @@ def test_llm_get_stats(return_context_logits, use_overlap,
     "return_context_logits, use_overlap, enable_chunked_prefill, enable_iter_req_stats",
     [
         (False, False, False, True),
+        (False, False, True, True),
         (False, True, False, True),
+        (False, True, True, True),
     ])
 def test_llm_get_stats_async(return_context_logits, use_overlap,
                              enable_chunked_prefill, enable_iter_req_stats):

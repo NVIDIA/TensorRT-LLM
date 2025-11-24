@@ -2337,7 +2337,7 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
                     sampling_params=sampling_params):
                 print(output)
 
-        async def task1():
+        async def task1(repetition_index: int):
             results = []
             await asyncio.sleep(
                 3)  # ensure there's stats to collect for the assertion
@@ -2346,17 +2346,20 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
 
             assert results
             if not use_overlap:
-                validate_stats(results=results,
-                               pp_size=pp_size,
-                               pytorch_backend=pytorch_backend,
-                               max_tokens=max_tokens,
-                               use_overlap=use_overlap,
-                               enable_chunked_prefill=enable_chunked_prefill,
-                               enable_iter_req_stats=enable_iter_req_stats)
+                validate_stats(
+                    results=results,
+                    pp_size=pp_size,
+                    pytorch_backend=pytorch_backend,
+                    max_tokens=max_tokens,
+                    use_overlap=use_overlap,
+                    # After the first repetition, context will be reused and there will be no chunking.
+                    enable_chunked_prefill=enable_chunked_prefill
+                    if repetition_index == 0 else False,
+                    enable_iter_req_stats=enable_iter_req_stats)
 
         async def main():
-            for i in range(2):  # test recurrent usage
-                await asyncio.gather(task0(), task1())
+            for repetition_index in range(2):  # test recurrent usage
+                await asyncio.gather(task0(), task1(repetition_index))
 
         asyncio.run(main())
 
