@@ -1,9 +1,11 @@
-from unittest.mock import MagicMock, patch
+import copy
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
 import torch.nn as nn
 from accelerate.utils import modeling
+from transformers import AutoModelForCausalLM
 from transformers.models.llama4.configuration_llama4 import Llama4Config
 
 from tensorrt_llm._torch.auto_deploy.models.hf import (
@@ -16,6 +18,13 @@ class SimpleModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.linear = nn.Linear(10, 10)
+
+
+@pytest.fixture(autouse=True)
+def restore_custom_model_mapping():
+    old_mapping = copy.copy(AutoModelForCausalLMFactory._custom_model_mapping)
+    yield
+    AutoModelForCausalLMFactory._custom_model_mapping = old_mapping
 
 
 def test_hf_load_state_dict_with_device():
@@ -123,3 +132,54 @@ def test_recursive_update_config(mock_factory):
     # Check that complex nested updates were applied correctly
     assert config.text_config.rope_scaling["factor"] == 2.0
     assert config.text_config.rope_scaling["type"] == "linear"
+
+
+def test_register_custom_model_cls():
+    model_type = "foo"
+    custom_model_cls = MagicMock(spec=AutoModelForCausalLM)
+    AutoModelForCausalLMFactory.register_custom_model_cls(
+        model_type=model_type, custom_model_cls=custom_model_cls
+    )
+
+    assert AutoModelForCausalLMFactory._custom_model_mapping[model_type] == custom_model_cls
+
+
+class MyError(Exception):
+    pass
+
+
+def test_build_model_raises_when_custom_model_cls_does_not_have_from_config(mock_factory):
+    model_type = "foo"
+    custom_model_cls = MagicMock(spec=AutoModelForCausalLM, __name__="Foo")
+    AutoModelForCausalLMFactory.register_custom_model_cls(
+        model_type=model_type, custom_model_cls=custom_model_cls
+    )
+
+    with (
+        patch.object(
+            AutoModelForCausalLMFactory,
+            "_get_model_config",
+            return_value=(Mock(model_type=model_type), {}),
+        ),
+        pytest.raises(ValueError, match=r"from_config"),
+    ):
+        mock_factory.build_model(device="meta")
+
+
+def test_build_model_uses_custom_model_cls_from_config(mock_factory):
+    model_type = "foo"
+    custom_model_cls = MagicMock(spec=AutoModelForCausalLM)
+    custom_model_cls.configure_mock(_from_config=MagicMock(side_effect=MyError))
+    AutoModelForCausalLMFactory.register_custom_model_cls(
+        model_type=model_type, custom_model_cls=custom_model_cls
+    )
+
+    with (
+        patch.object(
+            AutoModelForCausalLMFactory,
+            "_get_model_config",
+            return_value=(Mock(model_type=model_type), {}),
+        ),
+        pytest.raises(MyError),
+    ):
+        mock_factory.build_model(device="meta")
