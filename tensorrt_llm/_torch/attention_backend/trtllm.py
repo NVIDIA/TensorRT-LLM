@@ -300,9 +300,9 @@ class TrtllmAttentionWrapper:
                  size_per_token // num_nvfp4_elements_per_container),
                 dtype=torch.uint8)
             # Create a sf (scaling factors) tensor for NVFP4 (use INT8 as the container dtype).
-            output_sf = q.new_empty(compute_swizzled_sf_shape(
-                num_tokens, size_per_token // scaling_vector_size),
-                                    dtype=torch.uint8)
+            padded_row, padded_col = compute_swizzled_sf_shape(
+                num_tokens, size_per_token // scaling_vector_size)
+            output_sf = q.new_empty(padded_row * padded_col, dtype=torch.uint8)
         else:
             output = q.new_empty((num_tokens, self.num_heads * v_head_size),
                                  dtype=out_dtype)
