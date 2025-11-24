@@ -99,6 +99,7 @@ class TuningConfig:
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
     tune_max_num_tokens: int = None
     inputs_pre_hook: Callable = None
+    use_cuda_graph: bool = True
 
 
 @dataclass(unsafe_hash=True)
@@ -522,9 +523,10 @@ class AutoTuner:
         repeat (int): Number of profiling iterations for averaging (default: 10)
         stream_delay_micro_secs (int): Delay on CUDA stream before the profiled kernel runs in microseconds (default: 1000)
     """
+    _CUDA_GRAPH_DELAY_MICRO_SECS = 100
     _instance = None
 
-    def __init__(self, warmup=3, repeat=10, stream_delay_micro_secs=1000):
+    def __init__(self, warmup=2, repeat=10, stream_delay_micro_secs=1000):
         self.repeat = repeat
         self.warmup = warmup
         self.stream_delay_micro_secs = stream_delay_micro_secs
@@ -533,8 +535,6 @@ class AutoTuner:
 
         # Add statistics tracking
         self.stats = AutoTunerStatistics()
-
-        self.profiling_debug = True
 
         # Current captured choose_one() contexts
         self._active_capture: Optional['AutoTuner.TacticsCapture'] = None
@@ -698,22 +698,24 @@ class AutoTuner:
             })
 
         input_shapes = tuple(self._get_input_sizes(inputs))
+        is_cache_hit, best_runner_id, best_tactic, min_time = self.profiling_cache.search_cache(
+            custom_op, runners, input_shapes, tuning_config)
+
         # Early return if it's not tuning, use cache found one or fallback one
         if not self.is_tuning_mode:
-            is_cache_hit, best_runner_id, best_tactic, min_time = self.profiling_cache.search_cache(
-                custom_op, runners, input_shapes, tuning_config)
             best_runner = runners[best_runner_id]
             # TODO: check the stored runner and tactic can implement this shape here
-            # Should not directly try (runner, tactic) here, or it will hurt a lot of inference perf.
-
-            # Record the cache miss config.
-            # Expect no cache miss in inference. Thus, any cache miss should be recorded.
+            # Log the cache miss. Expect no cache miss in inference.
             if not is_cache_hit:
                 logger.warning_once(
                     f"[AutoTunner] Using the fallback tactic, due to cache miss on input shapes={input_shapes}",
                     key=(custom_op, "warning_autotuning_cache_miss_fallback"))
 
             return (best_runner, best_tactic)
+
+        # If it's tuning mode and cache hit, return the best runner and tactic to avoid redundant profiling.
+        if self.is_tuning_mode and is_cache_hit:
+            return (runners[best_runner_id], best_tactic)
 
         assert len(runners) > 0, "At least one runner is required"
         assert all([isinstance(r, TunableRunner) for r in runners]), \
@@ -811,7 +813,12 @@ class AutoTuner:
             for tac in valid_tactics:
                 try:
                     time_measured = self._profile_single_kernel(
-                        runner, input_tensors, tac, **kwargs)
+                        runner=runner,
+                        inputs=input_tensors,
+                        tactic=tac,
+                        use_cuda_graph=tuning_config.use_cuda_graph,
+                        **kwargs,
+                    )
                 except Exception as e:
                     # Handle None tensors for optional inputs
                     shapes = self._get_input_sizes(input_tensors)
@@ -857,6 +864,7 @@ class AutoTuner:
         runner: TunableRunner,
         inputs: List[torch.Tensor],
         tactic: Any,
+        use_cuda_graph: bool = False,
         **kwargs,
     ) -> float:
         """Profile a single kernel implementation for performance measurement.
@@ -875,25 +883,62 @@ class AutoTuner:
             are used to ensure accurate timing.
         """
         stream = torch.cuda.current_stream()
-        # warm up, no timing
+        # If the warm up time is longer than 0.5ms, we will profile the kernel with fewer repeats.
+        profile_fewer_repeat = 2
+        short_profile_threshold_ms = 1
+
+        avg_time = float('inf')
+
+        def pure_profile(stream: torch.cuda.Stream, repeat: int):
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            graph = torch.cuda.CUDAGraph()
+
+            with torch.cuda.stream(stream):
+                if use_cuda_graph:
+                    with torch.cuda.graph(graph):
+                        for _ in range(repeat):
+                            runner(inputs, tactic=tactic, **kwargs)
+
+                stream.synchronize()
+
+                # Delay the profiled kernel launch to eliminate affects of host time overhead in profiling.
+                # TODO: This is build time sensitive, O(tactic_num * impl_num * num_profile * tunable_ops)
+                # Consider apply a preprofiling to estimate the kernel execution time, then decide the necessity.
+                if use_cuda_graph:
+                    delay_kernel(self._CUDA_GRAPH_DELAY_MICRO_SECS, stream)
+                else:
+                    delay_kernel(self.stream_delay_micro_secs, stream)
+
+                start.record()
+
+                if use_cuda_graph:
+                    graph.replay()
+                else:
+                    for _ in range(repeat):
+                        runner(inputs, tactic=tactic, **kwargs)
+
+                end.record()
+                stream.synchronize()
+
+                return start.elapsed_time(end) / repeat
+
         for _ in range(self.warmup):
             runner(inputs, tactic=tactic, **kwargs)
-        stream.synchronize()
 
-        # Delay the profiled kernel launch to eliminate affects of host time overhead in profiling.
-        # TODO: This is build time sensitive, O(tactic_num * impl_num * num_profile * tunable_ops)
-        # Consider apply a preprofiling to estimate the kernel execution time, then decide the necessity.
-        delay_kernel(self.stream_delay_micro_secs, stream)
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+        fewer_repeat_avg_time = pure_profile(stream, profile_fewer_repeat)
 
-        start.record(stream=stream)
-        for _ in range(self.repeat):
-            runner(inputs, tactic=tactic, **kwargs)
-        end.record(stream=stream)
-        stream.synchronize()
-
-        avg_time = start.elapsed_time(end) / self.repeat
+        disable_short_profile = os.environ.get(
+            "TLLM_AUTOTUNER_DISABLE_SHORT_PROFILE", "0") == "1"
+        if fewer_repeat_avg_time > short_profile_threshold_ms and not disable_short_profile:
+            print(
+                f"[Autotuner] Few repeat estimated time is longer than {short_profile_threshold_ms}ms, directly use the few repeat estimated time to avoid redundant profiling."
+            )
+            # directly use the few repeat estimated time to avoid redundant profiling
+            avg_time = fewer_repeat_avg_time
+        else:
+            # profile the kernel with the full repeat to get precise time
+            avg_time = pure_profile(stream, self.repeat)
 
         shapes = self._get_input_sizes(inputs)
         logger.debug(
@@ -932,9 +977,9 @@ class AutoTuner:
         dynamic_dims = []
 
         for spec in tuning_config.dynamic_tensor_specs:
-            assert inspect.isfunction(spec.gen_tuning_buckets) or isinstance(spec.gen_tuning_buckets, (list, tuple)), \
+            assert callable(spec.gen_tuning_buckets) or isinstance(spec.gen_tuning_buckets, (list, tuple)), \
                 "The given dynamic dimension must provide a opt value generation function or a list of opt values"
-            if inspect.isfunction(spec.gen_tuning_buckets):
+            if callable(spec.gen_tuning_buckets):
                 if tuning_config.tune_max_num_tokens is None:
                     # Use the current input size as the opt value
                     opt_shapes = spec.gen_tuning_buckets(
@@ -1044,18 +1089,34 @@ class AutoTuner:
         dtype = origin_tensor.dtype
         device = origin_tensor.device
         shapes = []
-        for d in dims:
+        for i, d in enumerate(dims):
             if isinstance(d, StaticDim):
+                assert d.val == origin_tensor.shape[i]
                 shapes.append(d.val)
             else:
                 # TODO: how to make sure the created Tensor has the min/max info
                 assert isinstance(d, DynamicDim)
                 shapes.append(d.opt)
+
+        if len(dims) == 2 and isinstance(dims[0], DynamicDim) and isinstance(
+                dims[1], StaticDim) and (dtype == torch.int32
+                                         or dtype == torch.int64):
+            # We should be carefully about int values, since they might be index like topk_index.
+            # We want to keep them legal, so just repeating input tensor.
+            repeat_times = (shapes[0] + origin_tensor.shape[0] -
+                            1) // origin_tensor.shape[0]
+            dup_tensor = origin_tensor.repeat(repeat_times, 1)[:shapes[0]]
+            return dup_tensor
+
         # TODO: FIXME, sometimes the content of the tensor can affect the performance, like MOE
         # One solution is to manituplate the tensor content to make it more like the real data
         # during the tuning process. This can by controlled in the preparation phase by the runner.
         # It must not use all zero tensors. Otherwise the timing results become unreliable.
-        return torch.randint(-5, 5, shapes, device=device).to(dtype)
+        if dtype == torch.float4_e2m1fn_x2:
+            return torch.randint(-5, 5, shapes,
+                                 device=device).to(torch.uint8).view(dtype)
+        else:
+            return torch.randint(-5, 5, shapes, device=device).to(dtype)
 
     def _prepare_input_tensors(
             self, profile: OptimizationProfile,

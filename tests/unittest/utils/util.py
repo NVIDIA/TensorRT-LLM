@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import faulthandler
 import math
 import os
 import time
@@ -472,7 +473,7 @@ skip_ray = pytest.mark.skipif(
     mpi_disabled(), reason="This test is skipped for Ray orchestrator.")
 
 
-@dataclass
+@dataclass(kw_only=True)
 class DeviceSleepCtl:
     _cancellation_requested: bool = False
 
@@ -485,10 +486,12 @@ class DeviceSleepCtl:
 
 
 @hostfunc
-def device_sleep(duration_s: float,
-                 *,
-                 ctl: DeviceSleepCtl,
-                 spin_s: float = 0.1):
+def device_sleep(
+    duration_s: float,
+    *,
+    ctl: DeviceSleepCtl,
+    spin_s: float = 0.1,
+):
     spin_iters = math.ceil(duration_s / spin_s)
     for _ in range(spin_iters):
         if ctl.cancellation_requested:
@@ -498,21 +501,37 @@ def device_sleep(duration_s: float,
 
 @contextmanager
 def assert_no_cuda_sync(
-        sync_timeout_s: float = 5) -> Generator[None, None, None]:
+    sync_timeout_s: float = 5, ) -> Generator[None, None, None]:
     """Check that the function does not stream synchronize."""
+    # NB: This implementation only assumes that the CUDA operations performed
+    #     in the guarded scope use the currently selected CUDA stream. This
+    #     should also cover custom Torch ops as well as non-Torch kernels.
+    #
+    #     Python's faulthandler is used to provide tracebacks which can help
+    #     pin-pointing synchronizing code. This is combined with PyTorch's
+    #     less general (instrumentation based) tooling, which is expected
+    #     to provide improved error reporting for those issues which it can
+    #     detect.
 
     sleep_finished_event = torch.cuda.Event()
     scope_finished_event = torch.cuda.Event()
 
     torch.cuda.synchronize()
     sleep_ctl = DeviceSleepCtl()
-    device_sleep(sync_timeout_s, ctl=sleep_ctl)
+    faulthandler.dump_traceback_later(sync_timeout_s)
+    device_sleep(2 * sync_timeout_s, ctl=sleep_ctl)  # cancelled below
     sleep_finished_event.record()
-    yield None
+    torch_debug_mode_orig = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        yield None
+    finally:
+        torch.cuda.set_sync_debug_mode(torch_debug_mode_orig)
     scope_finished_event.record()
 
     assert not sleep_finished_event.query(
     ), """sync code should return quickly"""
+    faulthandler.cancel_dump_traceback_later()
 
     sleep_ctl.cancel()
     scope_finished_event.synchronize()

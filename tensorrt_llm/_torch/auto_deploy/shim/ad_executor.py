@@ -10,6 +10,7 @@
 # limitations under the License.
 
 from collections import defaultdict
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
@@ -44,6 +45,13 @@ from ..llm_args import LlmArgs
 from ..transform.optimizer import InferenceOptimizer
 from ..utils.logger import ad_logger
 from .interface import CachedSequenceInterface, GetInferenceModel
+
+
+@dataclass
+class ReportingInfo:
+    print_log: bool = False
+    enable_iter_perf_stats: bool = False
+    enable_iter_req_stats: bool = False
 
 
 class _CacheManagerWithFakePool(KVCacheManager):
@@ -121,8 +129,13 @@ class ADEngine(ModelEngine):
             page_size=attn_page_size,
             max_num_tokens=max_num_tokens,
             vocab_size_padded=factory.vocab_size_padded,
+            chunk_size=factory.chunk_size,
         )
-
+        reporting_info = ReportingInfo(
+            print_log=False,
+            enable_iter_perf_stats=ad_config.enable_iter_perf_stats,
+            enable_iter_req_stats=ad_config.enable_iter_req_stats,
+        )
         # TODO (lucaslie): consider how we move args around InferenceOptimizer.__init__,
         # ADEngine.__init__, and ADEngine.build_from_config. Seems a bit unnatural atm.
 
@@ -130,7 +143,7 @@ class ADEngine(ModelEngine):
         build_and_optimize = InferenceOptimizer(factory=factory, config=ad_config.transforms)
 
         # construct engine
-        return cls(build_and_optimize, seq_info, device, max_beam_width)
+        return cls(build_and_optimize, seq_info, device, max_beam_width, reporting_info)
 
     @torch.inference_mode()
     def __init__(
@@ -139,14 +152,15 @@ class ADEngine(ModelEngine):
         seq_info: SequenceInfo,
         device: DeviceLikeType,
         max_beam_width: int = 1,
+        reporting_info: ReportingInfo = ReportingInfo(),
     ) -> None:
         """Initialize the engine with model and sequence information."""
         # NOTE (lucaslie): create a fake Namespace to satisfy PyExecutor requirements...
         # This is not correctly declared in the base ModelEngine class though...
         self.llm_args = SimpleNamespace()
-        self.llm_args.print_iter_log = False
-        self.llm_args.enable_iter_perf_stats = False
-        self.llm_args.enable_iter_req_stats = False
+        self.llm_args.print_iter_log = reporting_info.print_log
+        self.llm_args.enable_iter_perf_stats = reporting_info.enable_iter_perf_stats
+        self.llm_args.enable_iter_req_stats = reporting_info.enable_iter_req_stats
         self.llm_args.stream_interval = 1
         self.llm_args.attention_dp_config = None
         self.llm_args.batch_wait_timeout_ms = 0
@@ -154,6 +168,7 @@ class ADEngine(ModelEngine):
         self.llm_args.batch_wait_max_tokens_ratio = 0.0
         self.llm_args.max_num_tokens = seq_info.max_num_tokens
         self.iter_counter = 0
+        self.iter_states = {}
 
         # NOTE (lucaslie): not a declared base member in the base class; required by PyExecutor...
         self.max_beam_width = max_beam_width
@@ -167,7 +182,6 @@ class ADEngine(ModelEngine):
 
         # build model
         self.model = get_inference_model(self.cache_seq_interface)
-
         # start fresh with fixed seed
         torch.manual_seed(42)
 
@@ -198,6 +212,9 @@ class ADEngine(ModelEngine):
         extra_args: Dict[str, List[torch.Tensor]] = defaultdict(list)
 
         dummy_token = -1
+        num_ctx_requests = len(context_requests)
+        num_ctx_tokens = 0
+        num_generation_tokens = 0
 
         # look at context requests first
         for request in context_requests:
@@ -208,6 +225,7 @@ class ADEngine(ModelEngine):
             begin_compute = request.context_current_position
             end_compute = begin_compute + request.context_chunk_size
             prompt_tokens = all_prompt_tokens[begin_compute:end_compute]
+            num_ctx_tokens += len(prompt_tokens)
 
             input_ids.append(prompt_tokens)
             input_pos.append(begin_compute)
@@ -240,6 +258,7 @@ class ADEngine(ModelEngine):
                 input_pos.append(request.max_beam_num_tokens)
                 flat_gather_idx.append(request.py_batch_idx)
 
+            num_generation_tokens += 1
             request.py_batch_idx = request.seq_slot
 
             # store seq slot idx
@@ -269,6 +288,10 @@ class ADEngine(ModelEngine):
                 scatter_ref=dummy_token,
             )
 
+        self.iter_states["num_ctx_requests"] = num_ctx_requests
+        self.iter_states["num_ctx_tokens"] = num_ctx_tokens
+        # TODO: handle extend requests and draft requests for specdec
+        self.iter_states["num_generation_tokens"] = num_generation_tokens
         return last_logit_only
 
     @nvtx_range("ad_compute_logits")
@@ -296,6 +319,7 @@ class ADEngine(ModelEngine):
         # convert requests and store in sequence info object
         new_tokens = getattr(new_tensors_device, "new_tokens", None)
         last_logit_only = self._prepare_inputs(scheduled_requests, resource_manager, new_tokens)
+        self.iter_counter += 1
 
         # compute all logits
         logits = self._compute_logits()
@@ -324,7 +348,6 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     torch.cuda.set_device(rank)
     port = mpi_dist.broadcast(dist.get_free_port())  # use MPI broadcast to pick a free port
     dist.initialize_or_skip(rank, world_size, port)
-
     # some config
     assert ad_config.max_beam_width <= 1, "_autodeploy + beam_search is not supported"
 

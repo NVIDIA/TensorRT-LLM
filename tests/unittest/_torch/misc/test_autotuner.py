@@ -57,19 +57,19 @@ M = 32
 # add sleep to simulate bad perf
 def gemm_0(x, w):
     if x.shape[0] > M // 2:
-        delay_kernel(10000, torch.cuda.current_stream())
+        delay_kernel(100, torch.cuda.current_stream())
     return x @ w
 
 
 def gemm_1(x, w):
     if x.shape[0] <= M // 2:
-        delay_kernel(10000, torch.cuda.current_stream())
+        delay_kernel(100, torch.cuda.current_stream())
     return x @ w
 
 
 def gemm_fallback(x, w) -> torch.Tensor:
     # always the slowest
-    delay_kernel(100000, torch.cuda.current_stream())
+    delay_kernel(500, torch.cuda.current_stream())
     return x @ w
 
 

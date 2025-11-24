@@ -44,6 +44,7 @@ add_library(
   attentionOp.cpp
   causalConv1dOp.cpp
   convertSpecDecodingMaskToPackedMaskOp.cpp
+  cuteDslMoeUtilsOp.cpp
   cutlassScaledMM.cpp
   cublasScaledMM.cpp
   cublasFp4ScaledMM.cpp
@@ -77,6 +78,7 @@ add_library(
   moeCommOp.cpp
   moeAlltoAllOp.cpp
   moeLoadBalanceOp.cpp
+  moeAlignOp.cpp
   mxFp4BlockScaleMoe.cpp
   mxFp8Quantize.cpp
   fp8BlockScaleMoe.cpp

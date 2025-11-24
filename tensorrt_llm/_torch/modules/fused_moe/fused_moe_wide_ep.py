@@ -1,21 +1,20 @@
 import os
+from functools import cached_property
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
 from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
 from tensorrt_llm._utils import is_sm_100f, local_mpi_size
-from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ...distributed import AllReduce, allgather, reducescatter
+from ...distributed import allgather, reducescatter
 from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
 from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from .deep_ep_utils import buffer_pool, deep_ep_installed
 from .interface import AlltoallMethodType, MoE
-from .moe_load_balancer import get_moe_load_balancer
 from .ops import MoEOp, MoEOpSelector
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
                            DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
@@ -71,6 +70,7 @@ class WideEPMoE(MoE):
             dtype=dtype,
             reduce_results=reduce_results,
             model_config=model_config,
+            aux_stream_dict=aux_stream_dict,
             weight_loading_mode=weight_loading_mode,
             layer_idx=layer_idx,
         )
@@ -83,67 +83,7 @@ class WideEPMoE(MoE):
         # Store original hidden size before any potential padding
         self.unpadded_hidden_size = self.hidden_size
 
-        moe_load_balancer = get_moe_load_balancer()
-        self.layer_load_balancer = None
-        self.repeat_idx = 0
-        self.repeat_count = 1
-
         self.use_cuda_graph = model_config.use_cuda_graph
-
-        moe_load_balancer_config = model_config.moe_load_balancer
-        init_expert_size_per_partition = moe_load_balancer_config.num_local_slots if moe_load_balancer_config else self.num_experts // self.ep_size
-        self.initial_global_assignments = [
-            (ep_rank * self.num_experts // self.ep_size + local_slot_id) %
-            self.num_experts for ep_rank in range(self.ep_size)
-            for local_slot_id in range(init_expert_size_per_partition)
-        ]
-
-        if moe_load_balancer:
-            assert moe_load_balancer_config is not None
-            top_k = self.routing_method.experts_per_token
-            self.expert_size_per_partition = moe_load_balancer_config.num_local_slots
-            self.layer_load_balancer = moe_load_balancer.add_layer(
-                self.num_experts,
-                top_k,
-                self.expert_size_per_partition,
-                aux_stream=None if aux_stream_dict is None else
-                aux_stream_dict[AuxStreamType.MoeBalancer])
-            self.repeat_count = self.layer_load_balancer.get_repeat_count()
-            loaded_initial_global_assignments = moe_load_balancer_config.get_layer_initial_global_assignments(
-                self.layer_idx)
-            self.num_slots = moe_load_balancer_config.num_slots
-            if loaded_initial_global_assignments is not None:
-                assert isinstance(loaded_initial_global_assignments, list)
-                assert len(loaded_initial_global_assignments) == self.num_slots
-                assert self.num_slots >= self.num_experts
-                assert set(loaded_initial_global_assignments) == set(
-                    range(self.num_experts))
-                self.initial_global_assignments = loaded_initial_global_assignments
-            self.layer_load_balancer.set_initial_weight_assignments(
-                self.initial_global_assignments)
-            logger.info(
-                f"MoE load balancer enabled. num_experts = {num_experts}, num_slots = {self.num_slots}, ep_size = {self.ep_size}"
-            )
-            logger.info(
-                f"initial_global_assignments (layer {self.layer_idx}) = {self.initial_global_assignments}"
-            )
-        else:
-            assert num_experts % self.ep_size == 0
-            self.expert_size_per_partition = num_experts // self.ep_size
-            self.num_slots = num_experts
-        if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
-        ):
-            self.allreduce = AllReduce(mapping=model_config.mapping,
-                                       strategy=AllReduceStrategy.NCCL)
-        else:
-            self.allreduce = None
-
-        self.slot_start = self.ep_rank * self.expert_size_per_partition
-        self.slot_end = self.slot_start + self.expert_size_per_partition
-        self.initial_local_expert_ids = self.initial_global_assignments[
-            self.slot_start:self.slot_end]
-        assert len(
-            self.initial_local_expert_ids) == self.expert_size_per_partition
 
         # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled
         moe_max_num_tokens = model_config.max_num_tokens * model_config.mapping.dp_size
@@ -306,6 +246,12 @@ class WideEPMoE(MoE):
         """
         return self.alltoall_method_type != AlltoallMethodType.NotEnabled
 
+    @cached_property
+    def moe_alltoall_backend(self):
+        # "NVLINK_TWO_SIDED" (default) or "NVLINK_ONE_SIDED"
+        return os.environ.get("TRTLLM_MOE_ALLTOALL_BACKEND",
+                              "NVLINK_TWO_SIDED").strip().upper()
+
     def calculate_num_chunks(self, all_rank_num_tokens: List[int]) -> int:
         num_rows = sum(all_rank_num_tokens)
         return (num_rows + self.moe_max_num_tokens -
@@ -454,14 +400,12 @@ class WideEPMoE(MoE):
         all_rank_max_num_tokens = max(all_rank_num_tokens)
         if isinstance(x, Fp4QuantizedTensor):
             assert output_dtype is not None
-            output_dtype = output_dtype
         else:
             output_dtype = x.dtype
 
         is_first_call, is_last_call = repeating_info
 
-        if self.layer_load_balancer and is_first_call:
-            self.layer_load_balancer.start_wait_gpu_stage()
+        self._load_balancer_start_wait_gpu_stage(is_first_call)
 
         if not use_all_to_all or self.alltoall_method_type != AlltoallMethodType.MNNVL:
             alltoall_result_do_sum = True
@@ -491,20 +435,12 @@ class WideEPMoE(MoE):
                 token_final_scales = None
 
         if self.layer_load_balancer:
-            if is_first_call:
-                self.layer_load_balancer.done_wait_gpu_stage()
-            if use_all_to_all and self.alltoall_method_type == AlltoallMethodType.MNNVL:
-                self.layer_load_balancer.update_local_statistic(
-                    token_selected_experts,
-                    is_first_stage=is_first_call,
-                    is_last_stage=is_last_call)
-            else:
-                self.layer_load_balancer.update_statistic_with_local_ids(
-                    token_selected_experts,
-                    is_first_stage=is_first_call,
-                    is_last_stage=is_last_call,
-                    allreduce=self.allreduce)
-            token_selected_slots = self.layer_load_balancer.route(
+            self._load_balancer_done_wait_gpu_stage(is_first_call)
+            ignore_allreduce = self.enable_alltoall and self.alltoall_method_type == AlltoallMethodType.MNNVL and self.moe_alltoall_backend == "NVLINK_TWO_SIDED"
+            self._load_balancer_update_statistic(token_selected_experts,
+                                                 is_first_call, is_last_call,
+                                                 ignore_allreduce)
+            token_selected_slots = self._load_balancer_route(
                 token_selected_experts, self.use_dp)
         else:
             token_selected_slots = token_selected_experts
@@ -538,9 +474,8 @@ class WideEPMoE(MoE):
                 if self.enable_dummy_allreduce:
                     self.dummy_allreduce()
                 token_count = x.shape[0]
-                if is_last_call and self.layer_load_balancer is not None and not self.layer_load_balancer.is_static_routing(
-                ):
-                    loadbalancer_local_statistic_info = self.layer_load_balancer.get_local_statistic_tensor(
+                if is_last_call:
+                    loadbalancer_local_statistic_info = self._load_balancer_get_local_statistic_tensor(
                     )
                 else:
                     loadbalancer_local_statistic_info = None
@@ -552,7 +487,7 @@ class WideEPMoE(MoE):
                 if gathered_loadbalancer_local_statistic_info is not None:
                     gathered_loadbalancer_local_statistic_info = gathered_loadbalancer_local_statistic_info.view(
                         (self.mapping.moe_ep_size, self.num_experts))
-                    self.layer_load_balancer.update_statistic_with_gathered_statistic(
+                    self._load_balancer_update_statistic_with_gathered_statistic(
                         gathered_loadbalancer_local_statistic_info)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
                 if not use_postquant_alltoall:
@@ -717,8 +652,7 @@ class WideEPMoE(MoE):
             tuner_top_k=tuner_top_k,
         )
 
-        if self.layer_load_balancer and is_last_call:
-            self.layer_load_balancer.start_set_cpu_stage()
+        self._load_balancer_start_set_cpu_stage(is_last_call)
 
         # Only in cutlass_min_latency_mode, the output is a list of tensors.
         # Otherwise, the output should be unpacked as a single tensor.
@@ -761,8 +695,7 @@ class WideEPMoE(MoE):
                     f"Not available alltoall method type: {self.alltoall_method_type!r}"
                 )
 
-        if self.layer_load_balancer and is_last_call:
-            self.layer_load_balancer.done_set_cpu_stage()
+        self._load_balancer_done_set_cpu_stage(is_last_call)
 
         return final_hidden_states
 
@@ -828,7 +761,7 @@ class WideEPMoE(MoE):
             ] for idx_chunk in range(num_chunks)]
             all_rank_max_num_tokens_list = split_chunk(all_rank_max_num_tokens,
                                                        num_chunks)
-            chunk_size_list = all_rank_chunk_size_list[self.rank]
+            chunk_size_list = all_rank_chunk_size_list[self.parallel_rank]
             if use_all_to_all:
                 all_rank_num_tokens_list = [[
                     1 if val == 0 else val for val in val_list
@@ -916,7 +849,7 @@ class WideEPMoE(MoE):
                     self.event_dict[EventType.MoeChunkingOverlap].record()
                 self.event_dict[EventType.MoeChunkingOverlap].wait()
             outputs = torch.cat(outputs_list)
-        rank = self.mapping.tp_rank
+        rank = self.parallel_rank
         outputs = outputs[:all_rank_num_tokens[rank]]
         self.repeat_idx = 0 if self.repeat_idx == self.repeat_count - 1 else self.repeat_idx + 1
         return outputs
@@ -1003,62 +936,9 @@ class WideEPMoE(MoE):
             final_hidden_states = final_hidden_states[:0]
         return final_hidden_states
 
-    def register_parameter_weight_slot_fn(self, weight_name: str,
-                                          local_slot_id: int):
-        assert hasattr(
-            self,
-            weight_name), f"FusedMoE doesn't has weight attr: {weight_name}"
-        weight_tensor = getattr(self, weight_name).data[local_slot_id]
-        self.layer_load_balancer.register_weight_slot(local_slot_id,
-                                                      weight_name,
-                                                      weight_tensor)
-
-    def register_to_fix_weight_fn(self, weight_name: str):
-        assert hasattr(
-            self,
-            weight_name), f"FusedMoE doesn't has weight attr: {weight_name}"
-        param = getattr(self, weight_name)
-        weight_tensor = param.detach()
-        assert isinstance(
-            weight_tensor,
-            torch.Tensor), f'weight {weight_name} should be a tensor'
-        assert weight_tensor.is_contiguous(
-        ), f'weight {weight_name} should be a is_contiguous, shape={weight_tensor.shape}, strides={weight_tensor.is_contiguous()}'
-        assert weight_tensor.numel() * weight_tensor.element_size() == weight_tensor.untyped_storage().size(),\
-            f'weight {weight_name} shape={weight_tensor.shape} storage_size = {weight_tensor.untyped_storage().size()}, numel={weight_tensor.numel()}, eltsize={weight_tensor.element_size()}, dtype={weight_tensor.dtype}'
-        self.layer_load_balancer.make_tensor_host_accessible(weight_tensor)
-        param.data = weight_tensor
-
-    def register_all_parameter_slot_and_to_fix_weight_fns(
-            self, weight_and_tensor_dict: Dict[str, torch.Tensor]):
-        """
-        weight_and_tensor_dict: key is the name of the weight, value is the tensor of loaded shared tensor shard.
-            E.g. if num_experts=256 and 4 GPUs per node, then each rank need to load 256 / 4 = 64 expert weights for host sharing.
-            By this way, host_tensor_sharer can share the weights and each rank has access to all 256 experts.
-        """
-        for local_slot_id, expert_id in enumerate(
-                self.initial_local_expert_ids):
-            for weight_name in weight_and_tensor_dict:
-                self.layer_load_balancer.add_register_weight_fn(
-                    self.register_parameter_weight_slot_fn,
-                    (weight_name, local_slot_id))
-        for weight_name in weight_and_tensor_dict:
-            self.layer_load_balancer.add_to_migrate_weight_fn(
-                self.register_to_fix_weight_fn, (weight_name, ))
-
-        local_shared_load_expert_ids = self.layer_load_balancer.get_load_expert_ids(
-        )
-        for expert_id in range(self.num_experts):
-            for weight_name, weight_tensor in weight_and_tensor_dict.items():
-                if expert_id in local_shared_load_expert_ids:
-                    local_slot_id = local_shared_load_expert_ids.index(
-                        expert_id)
-                    self.layer_load_balancer.host_tensor_sharer.share_host_tensor_with_shape(
-                        expert_id, weight_name, weight_tensor[local_slot_id])
-                else:
-                    self.layer_load_balancer.host_tensor_sharer.pre_register_host_tensor_with_shape(
-                        expert_id, weight_name, weight_tensor.dtype,
-                        weight_tensor[0].shape)
+    def _supports_load_balancer(self) -> bool:
+        """WideEPMoE supports load balancer."""
+        return True
 
     def load_weights(self, weights: List[Dict]):
         assert self._weights_created

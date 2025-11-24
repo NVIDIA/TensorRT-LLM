@@ -4,12 +4,15 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 import torch
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm.llmapi import (CudaGraphConfig, EagleDecodingConfig,
                                  KvCacheConfig)
 
@@ -20,6 +23,72 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 def enforce_single_worker(monkeypatch):
     monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
     yield
+
+
+def test_kv_lens_runtime_with_eagle3_one_model():
+    """
+    Validates that kv_lens_runtime correctly excludes num_extra_kv_tokens when
+    preparing attention metadata during EAGLE3 one-model speculative decoding.
+
+    Background:
+    - EAGLE3 reserves num_extra_kv_tokens = max_draft_len - 1 in KV cache for draft token management
+    - kv_lens_runtime becomes host_past_key_value_lengths, which eventually becomes mMaxSeqLenKv in FMHA kernel
+    - Bug: mMaxSeqLenKv was incorrectly set to actual_kv_length + num_extra_kv_tokens
+    - Fix: mMaxSeqLenKv should be set to actual_kv_length only (without extra tokens)
+
+    This test validates the fix by directly testing the prepare() logic.
+    """
+
+    # Test parameters
+    num_seqs = 3
+    num_extra_kv_tokens = 7  # e.g., max_draft_len = 8, so extra = 7
+    prompt_lens = [50, 100, 75]  # These represent actual KV lengths
+    seq_lens_q = [1, 1, 1]  # 1 token each in generation
+    num_cached_tokens_per_seq = [
+        prompt_lens[i] - seq_lens_q[i] for i in range(num_seqs)
+    ]
+
+    # Create a mock KV cache manager
+    mock_kv_cache_manager = MagicMock()
+    mock_kv_cache_manager.tokens_per_block = 32
+    mock_kv_cache_manager.num_pools = 1
+    mock_kv_cache_manager.max_blocks_per_seq = 16
+    mock_kv_cache_manager.max_batch_size = num_seqs
+    mock_kv_cache_manager.max_seq_len = 512  # Large enough to hold our test sequences
+    mock_kv_cache_manager.impl.copy_batch_block_offsets = MagicMock()
+
+    attn_metadata = TrtllmAttentionMetadata(
+        max_num_requests=num_seqs,
+        max_num_tokens=sum(seq_lens_q),
+        kv_cache_manager=mock_kv_cache_manager,
+    )
+
+    # Set required attributes
+    attn_metadata.request_ids = list(range(1, num_seqs + 1))
+    attn_metadata.prompt_lens = prompt_lens
+    attn_metadata._seq_lens = torch.tensor(seq_lens_q, dtype=torch.int32)
+    # seq_lens_kv is the number of new KV tokens being added in this step (for generation, same as seq_lens_q)
+    attn_metadata._seq_lens_kv = torch.tensor(seq_lens_q, dtype=torch.int32)
+
+    # Set KV cache params with num_extra_kv_tokens (EAGLE3 one-model case)
+    attn_metadata.kv_cache_params = KVCacheParams(
+        use_cache=True,
+        num_cached_tokens_per_seq=num_cached_tokens_per_seq,
+        num_extra_kv_tokens=num_extra_kv_tokens)
+
+    attn_metadata.prepare()
+    actual_kv_lengths = torch.tensor(prompt_lens, dtype=torch.int32)
+
+    # kv_lens_runtime should equal actual KV lengths (without extra tokens)
+    kv_lens_runtime = attn_metadata.kv_lens_runtime[:num_seqs]
+    assert torch.equal(kv_lens_runtime, actual_kv_lengths), \
+        f"kv_lens_runtime should be {actual_kv_lengths.tolist()}, but got {kv_lens_runtime.tolist()}"
+
+    # Internal kv_lens should include extra tokens
+    kv_lens_internal = attn_metadata.kv_lens[:num_seqs]
+    expected_kv_lens_with_extra = actual_kv_lengths + num_extra_kv_tokens
+    assert torch.equal(kv_lens_internal, expected_kv_lens_with_extra), \
+        f"kv_lens should be {expected_kv_lens_with_extra.tolist()}, but got {kv_lens_internal.tolist()}"
 
 
 @pytest.mark.parametrize(
@@ -122,6 +191,7 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
             tok_ids.append(llm_spec.tokenizer.encode(prompts))
 
     sampling_params = SamplingParams(max_tokens=128, temperature=0)
+
     for i in range(len(tok_ids)):
         num_tokens = 0
         num_drafted = 0
@@ -515,7 +585,7 @@ def test_eagle3_cdl_sampling(disable_overlap_scheduler: bool):
 
     prompts = ["The president of the United States is"]
 
-    sampling_params = SamplingParams(max_tokens=20, temperature=0, top_p=0.9)
+    sampling_params = SamplingParams(max_tokens=20, temperature=1.0, top_p=0.9)
     llm_spec.generate(prompts, sampling_params)
     llm_spec.shutdown()
 

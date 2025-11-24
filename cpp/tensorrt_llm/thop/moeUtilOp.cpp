@@ -341,10 +341,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "moe_finalize_scale_op(Tensor gemm2_output, Tensor? biases, Tensor unpermuted_final_scales, Tensor "
         "unpermuted_row_to_permuted_row, Tensor permuted_row_to_unpermuted_row, Tensor token_selected_experts, Tensor "
         "expert_first_token_offset_tensor, bool enable_alltoall, SymInt num_rows, SymInt hidden_size, SymInt "
-        "unpadded_hidden_size, int "
-        "experts_per_token, int "
-        "num_experts_per_node, int tp_size, int tp_rank, int ep_size, int ep_rank)"
-        "-> (Tensor)");
+        "unpadded_hidden_size, int experts_per_token, int num_experts_per_node, int tp_size, int tp_rank, int ep_size, "
+        "int ep_rank) -> (Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

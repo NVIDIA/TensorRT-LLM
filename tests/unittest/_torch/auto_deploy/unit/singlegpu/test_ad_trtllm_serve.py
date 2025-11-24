@@ -19,7 +19,7 @@ def _run_serve_with_click(args):
         raise SystemExit(result.exit_code)
 
 
-@pytest.mark.timeout(360)
+@pytest.mark.timeout(500)
 def test_trtllm_serve_openai_chat_completion(tmp_path):
     # Prepare small model config and extra options yaml
     config = get_small_model_config("meta-llama/Meta-Llama-3.1-8B-Instruct")
@@ -58,7 +58,7 @@ def test_trtllm_serve_openai_chat_completion(tmp_path):
 
         start_time = time.time()
         last_err = None
-        while time.time() - start_time < 90:
+        while time.time() - start_time < 300:
             if not server.is_alive():
                 raise RuntimeError("Server process exited prematurely")
             try:

@@ -20,7 +20,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import cached_property
 from itertools import repeat
-from typing import Any, Callable, List, Optional, TypeVar, cast
+from typing import Any, Callable, List, Optional, Type, TypeVar, cast
 
 import numpy as np
 import torch
@@ -55,6 +55,7 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
 
+from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..speculative.spec_tree_manager import SpecTreeManager
 from .finish_reason import FinishedState
 from .llm_request import LlmRequest, LlmRequestState, get_draft_token_length
@@ -62,6 +63,7 @@ from .resource_manager import ResourceManager, ResourceManagerType
 from .sampling_utils import (
     GREEDY,
     GenericStrategyKeyType,
+    GroupedStrategySampler,
     SimpleGroupedStrategySampler,
     Strategy,
     UtilsSamplingParams,
@@ -268,7 +270,7 @@ def _request_strategy(request: LlmRequest, *, vocab_size: int) -> Strategy:
 def _group_requests_by_strategy_key(
     requests: Iterable[LlmRequest],
     *,
-    strategy_to_key: Callable[[Strategy], GenericStrategyKeyType],
+    strategy_to_key: Callable[[Strategy, bool], GenericStrategyKeyType],
     pin_memory: bool = False,
     vocab_size: int,
 ) -> dict[tuple[GenericStrategyKeyType, bool], tuple[torch.Tensor, List[Strategy]]]:
@@ -276,10 +278,15 @@ def _group_requests_by_strategy_key(
     group_dict: dict[tuple[GenericStrategyKeyType, bool], tuple[list[int], list[Strategy]]] = (
         defaultdict(lambda: ([], []))
     )
+
     for req_index, req in enumerate(requests):
         strategy = _request_strategy(req, vocab_size=vocab_size)
-        strategy_key = strategy_to_key(strategy)
-        speculation_needs_probs = req.py_draft_logits is not None and strategy is not GREEDY
+        speculation_needs_probs = (
+            # NB: This criterion needs to be consistent with the gating of rejection sampling in
+            #     process_draft_tokens.
+            TorchSampler._speculation_could_use_rejection_sampling(req, strategy)
+        )
+        strategy_key = strategy_to_key(strategy, speculation_needs_probs)
         group_dict_entry = group_dict[(strategy_key, speculation_needs_probs)]
         group_dict_entry[0].append(req_index)
         group_dict_entry[1].append(strategy)
@@ -608,6 +615,7 @@ class TorchSampler(Sampler):
         max_num_sequences: int
         max_beam_width: int
         max_total_draft_tokens: int
+        disable_flash_infer_sampling: bool = False
 
     def __init__(self, args: Args):
         self.max_seq_len = args.max_seq_len
@@ -642,6 +650,14 @@ class TorchSampler(Sampler):
                 ]  # `in FinishReason` clashes with PyBind11: `TypeError: 'pybind11_type' object is not iterable`
             }
 
+        self._grouped_sampler_cls: Type[GroupedStrategySampler]
+        if IS_FLASHINFER_AVAILABLE and not args.disable_flash_infer_sampling:
+            from .sampling_utils_flashinfer import FlashInferGroupedStrategySampler
+
+            self._grouped_sampler_cls = FlashInferGroupedStrategySampler
+        else:
+            self._grouped_sampler_cls = SimpleGroupedStrategySampler
+
         # Initialize seed for multi-GPU consistency
         self._global_seed = 42
         self._generator = None
@@ -662,7 +678,9 @@ class TorchSampler(Sampler):
         assert self._generator.device == device
         return self._generator
 
-    def get_spec_tree_manager(self, resource_manager: ResourceManager) -> Optional[SpecTreeManager]:
+    def get_spec_tree_manager(
+        self, resource_manager: Optional[ResourceManager]
+    ) -> Optional[SpecTreeManager]:
         if resource_manager is None:
             return None
         spec_resource_manager = resource_manager.get_resource_manager(
@@ -670,7 +688,7 @@ class TorchSampler(Sampler):
         )
         if spec_resource_manager is None or not hasattr(spec_resource_manager, "spec_tree_manager"):
             return None
-        return spec_resource_manager.spec_tree_manager
+        return spec_resource_manager.spec_tree_manager  # type: ignore
 
     @staticmethod
     def _meet_max_token_stop_criteria(request: LlmRequest, max_seq_len: int):
@@ -1011,6 +1029,17 @@ class TorchSampler(Sampler):
 
         return num_accepted
 
+    @staticmethod
+    def _speculation_could_use_rejection_sampling(
+        request: LlmRequest, strategy: Optional[Strategy] = None
+    ) -> bool:
+        if strategy is None:
+            strategy = _request_strategy(
+                request,
+                vocab_size=2**31,  # vocab_size does not affect greediness
+            )
+        return get_draft_token_length(request) > 0 and strategy != GREEDY
+
     def process_draft_tokens(
         self,
         request: LlmRequest,
@@ -1019,9 +1048,17 @@ class TorchSampler(Sampler):
         finish_reasons: FinishReasonsList,
         resource_manager: Optional[ResourceManager] = None,
     ) -> int:
-        if (
-            _request_strategy(request, vocab_size=2**31) == GREEDY
-            or request.py_draft_logits is None
+        if not (
+            self._speculation_could_use_rejection_sampling(request)
+            # NB: '_speculation_could_use_rejection_sampling' is called in sample_async, which precludes
+            #     inspection of .py_draft_logits, because it is not set yet when the overlap path
+            #     is used.
+            #
+            #     OTOH, some drafters (e.g. NGram) do not provide draft logits, precluding rejection
+            #     sampling. The current solution accepts that .py_target_probs may sometimes be
+            #     computed, even though .py_draft_logits may never be set and the target probs
+            #     may ultimately not be required.
+            and request.py_draft_logits is not None
         ):
             spec_tree_manager = self.get_spec_tree_manager(resource_manager)
             if spec_tree_manager is not None:
@@ -1082,7 +1119,8 @@ class TorchSampler(Sampler):
             )
             if get_draft_token_length(req) > 0:
                 req.py_num_accepted_draft_tokens = num_accepted
-                req.py_rewind_len = req.py_draft_pages_allocated - num_accepted
+                actual_draft_len = get_draft_token_length(req)
+                req.py_rewind_len = actual_draft_len - num_accepted
             else:
                 req.py_num_accepted_draft_tokens = 0
                 req.py_rewind_len = 0
@@ -1251,7 +1289,7 @@ class TorchSampler(Sampler):
             requests,
             pin_memory=True,
             vocab_size=logits_cuda.size(1),
-            strategy_to_key=SimpleGroupedStrategySampler.strategy_grouping_key,
+            strategy_to_key=self._grouped_sampler_cls.strategy_grouping_key,
         )
         generator_cuda = self.get_generator(cuda_device)
 
@@ -1308,7 +1346,7 @@ class TorchSampler(Sampler):
                 for _ in range(steps)
             ]
             group_next_tokens_cuda, group_softmax_cuda = (
-                SimpleGroupedStrategySampler.sample_grouped_strategies(
+                self._grouped_sampler_cls.sample_grouped_strategies(
                     strategy_key,
                     group_strategies_per_step,
                     group_logits_cuda,
@@ -1928,7 +1966,6 @@ class TRTLLMSampler(Sampler):
                 dtype=torch.int,
             ),
             "decoder_state": DecoderState(),
-            "decoding_input": [None] * self.num_micro_batches,
         }
 
         self.store["decoder_state"].setup(
@@ -2037,19 +2074,20 @@ class TRTLLMSampler(Sampler):
         if beam_width > 1:
             self._update_cache_indirection_buffer(scheduled_requests)
 
-        self.store["decoding_input"][self.micro_batch_idx] = make_decoding_batch_input(
+        make_decoding_batch_input(
+            self.store["decoder_input_buffers"][self.micro_batch_idx],
+            self.store["decoder_state"],
             scheduled_requests.context_requests,
             scheduled_requests.generation_requests,
             model_outputs["logits"],
             beam_width,
             num_context_logits_prefix_sum,
-            self.store["decoder_input_buffers"][self.micro_batch_idx],
-            self.store["decoder_state"],
             self.store["buffer_manager"],
         )
 
         self.algs.decoder.forward_async(
-            self.store["decoder_state"], self.store["decoding_input"][self.micro_batch_idx]
+            self.store["decoder_state"],
+            self.store["decoder_input_buffers"][self.micro_batch_idx],
         )
 
         finalize_events = {}
