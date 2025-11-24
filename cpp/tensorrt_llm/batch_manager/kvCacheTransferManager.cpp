@@ -315,6 +315,9 @@ void KVCacheTransferManager::offload(BlockPtr const& block, BlockPtr const& offl
 
 void KVCacheTransferManager::syncWithBufferManager()
 {
+    // Wait for the buffer manager stream to finish before any onboard/offload
+    mBufferManager.getStream().synchronize();
+
     tr::CudaEvent readyForOffloadEvent;
     mBufferManager.getStream().record(readyForOffloadEvent);
     mOffloadManager.getStream().wait(readyForOffloadEvent);
@@ -337,6 +340,10 @@ void KVCacheTransferManager::syncTransfers()
     tr::CudaEvent onboardEvent;
     mOnboardManager.getStream().record(onboardEvent);
     mBufferManager.getStream().wait(onboardEvent);
+
+   // Wait for the events to complete before clearing
+   mOffloadManager.getStream().synchronize();
+   mOnboardManager.getStream().synchronize();
 
     // Once we synchronize, clear our list of pending thransfers.
     mPendingReads.clear();
