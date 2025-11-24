@@ -346,7 +346,7 @@ class MoE(nn.Module):
             token_selected_experts: The selected experts of all tokens, has shape of [tokenCount * topK]
             is_first_call: Whether this is the first call for the same weights
             is_last_call: Whether this is the last call for the same weights
-            ignore_allreduce: Whether to ignore allreduce, if True, only update local statistics, need call _load_balancer_get_local_statistic_tensor to get the local statistic tensor and then do external allgather and then call _load_balancer_update_statistic_with_gathered_statistic to update the global statistics. MnnvlLatency supports this.
+            ignore_allreduce: Whether to ignore allreduce, if True, only update local statistics, need call _load_balancer_get_local_statistic_tensor to get the local statistic tensor and then do external allgather and then call _load_balancer_update_statistic_with_gathered_statistic to update the global statistics. NVLINK_TWO_SIDED supports this.
         """
         if self._using_dynamic_load_balancer():
             if ignore_allreduce:
