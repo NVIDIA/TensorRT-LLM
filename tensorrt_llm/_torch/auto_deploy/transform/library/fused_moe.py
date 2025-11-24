@@ -698,9 +698,6 @@ def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "
             .contiguous()
         )
 
-        gemm1_dequant = (w1_weight_scale_stacked * w1_input_scale_stacked[0]).squeeze()
-        gemm2_act_quant = (1.0 / w2_input_scale_stacked[0]).to(torch.float32)
-        gemm2_dequant = (w2_weight_scale_stacked * w2_input_scale_stacked[0]).squeeze()
         # Register stacked tensors as new parameters
         new_key_w1 = f"quant_moe_w1_stacked_{fused_key_counter}"
         new_key_w2 = f"quant_moe_w2_stacked_{fused_key_counter}"
@@ -711,9 +708,6 @@ def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "
         new_key_w1_weight_scale = f"quant_moe_w1_weight_scale_stacked_{fused_key_counter}"
         new_key_w2_weight_scale = f"quant_moe_w2_weight_scale_stacked_{fused_key_counter}"
         new_key_w3_weight_scale = f"quant_moe_w3_weight_scale_stacked_{fused_key_counter}"
-        new_key_gemm1_dequant = f"quant_moe_gemm1_dequant_stacked_{fused_key_counter}"
-        new_key_gemm2_act_quant = f"quant_moe_gemm2_act_quant_stacked_{fused_key_counter}"
-        new_key_gemm2_dequant = f"quant_moe_gemm2_dequant_stacked_{fused_key_counter}"
 
         fused_key_counter += 1
 
@@ -742,18 +736,34 @@ def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "
             new_key_w3_weight_scale,
             torch.nn.Parameter(w3_weight_scale_stacked, requires_grad=False),
         )
-        gm.register_parameter(
-            new_key_gemm1_dequant,
-            torch.nn.Parameter(gemm1_dequant, requires_grad=False),
-        )
-        gm.register_parameter(
-            new_key_gemm2_act_quant,
-            torch.nn.Parameter(gemm2_act_quant, requires_grad=False),
-        )
-        gm.register_parameter(
-            new_key_gemm2_dequant,
-            torch.nn.Parameter(gemm2_dequant, requires_grad=False),
-        )
+        additional_args = []
+        if backend == "trtllm":
+            # For optimization reasons, we precompute a few additional arguments to the trtllm_quant_fp8_moe_fused op
+            # to avoid computing them at runtime.
+            gemm1_dequant = (w1_weight_scale_stacked * w1_input_scale_stacked[0]).squeeze()
+            gemm2_act_quant = (1.0 / w2_input_scale_stacked[0]).to(torch.float32)
+            gemm2_dequant = (w2_weight_scale_stacked * w2_input_scale_stacked[0]).squeeze()
+
+            new_key_gemm1_dequant = f"quant_moe_gemm1_dequant_stacked_{fused_key_counter}"
+            new_key_gemm2_act_quant = f"quant_moe_gemm2_act_quant_stacked_{fused_key_counter}"
+            new_key_gemm2_dequant = f"quant_moe_gemm2_dequant_stacked_{fused_key_counter}"
+            gm.register_parameter(
+                new_key_gemm1_dequant,
+                torch.nn.Parameter(gemm1_dequant, requires_grad=False),
+            )
+            gm.register_parameter(
+                new_key_gemm2_act_quant,
+                torch.nn.Parameter(gemm2_act_quant, requires_grad=False),
+            )
+            gm.register_parameter(
+                new_key_gemm2_dequant,
+                torch.nn.Parameter(gemm2_dequant, requires_grad=False),
+            )
+            additional_args = [
+                graph.get_attr(new_key_gemm1_dequant),
+                graph.get_attr(new_key_gemm2_act_quant),
+                graph.get_attr(new_key_gemm2_dequant),
+            ]
         # Create new node with get_attr for stacked parameters
         with graph.inserting_before(node):
             new_node = graph.call_function(
@@ -771,9 +781,7 @@ def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "
                     graph.get_attr(new_key_w1_weight_scale),
                     graph.get_attr(new_key_w2_weight_scale),
                     graph.get_attr(new_key_w3_weight_scale),
-                    graph.get_attr(new_key_gemm1_dequant),
-                    graph.get_attr(new_key_gemm2_act_quant),
-                    graph.get_attr(new_key_gemm2_dequant),
+                    *additional_args,
                 ),
                 kwargs=node.kwargs,
             )
