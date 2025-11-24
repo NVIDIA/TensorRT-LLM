@@ -697,7 +697,12 @@ def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "
             .to(torch.float32)
             .contiguous()
         )
-
+        assert torch.all(w1_input_scale_stacked[0] == w1_input_scale_stacked), (
+            "All w1 scales should have the same value."
+        )
+        assert torch.all(w2_input_scale_stacked[0] == w2_input_scale_stacked), (
+            "All w2 scales should have the same value."
+        )
         # Register stacked tensors as new parameters
         new_key_w1 = f"quant_moe_w1_stacked_{fused_key_counter}"
         new_key_w2 = f"quant_moe_w2_stacked_{fused_key_counter}"
@@ -736,6 +741,7 @@ def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "
             new_key_w3_weight_scale,
             torch.nn.Parameter(w3_weight_scale_stacked, requires_grad=False),
         )
+
         additional_args = []
         if backend == "trtllm":
             # For optimization reasons, we precompute a few additional arguments to the trtllm_quant_fp8_moe_fused op

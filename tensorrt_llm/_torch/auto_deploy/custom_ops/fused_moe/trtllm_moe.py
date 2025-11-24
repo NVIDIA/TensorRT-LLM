@@ -163,12 +163,6 @@ def trtllm_quant_fp8_moe_fused(
     # - gemm2_dequant_scale: w2_weight_scale * w2_input_scale
     # - gemm1_input_dequant_scale: w1_input_scale
 
-    # Compute combined scales
-    # gemm1_dequant = (w1_weight_scale * w1_input_scale).contiguous().squeeze()
-    # gemm2_act_quant = (1.0 / w2_input_scale).contiguous().to(torch.float32)
-    # gemm2_dequant = (w2_weight_scale * w2_input_scale).contiguous().squeeze()
-    # gemm1_input_dequant = w1_input_scale.contiguous()
-
     assert gemm1_dequant.ndim == 1, "gemm1_dequant must be 1D"
     assert gemm2_dequant.ndim == 1, "gemm2_dequant must be 1D"
     quant_scales = [gemm1_dequant, gemm2_act_quant, gemm2_dequant, w1_input_scale]

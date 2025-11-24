@@ -3,7 +3,7 @@
 from typing import Callable, Dict, Tuple
 
 import torch
-from torch.fx import GraphModule, Node
+from torch.fx import GraphModule
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.multi_stream import record_event_wrapper
 
@@ -20,10 +20,7 @@ def _execute_op_in_aux_stream(
     num_replaced = 0
 
     # Collect targets first to avoid mutating while iterating
-    target_nodes: list[Node] = []
-    for n in graph.nodes:
-        if is_op(n, op_dict.keys()):
-            target_nodes.append(n)
+    target_nodes = [n for n in graph.nodes if is_op(n, op_dict.keys())]
 
     for n in target_nodes:
         target_input_node = None
@@ -32,8 +29,7 @@ def _execute_op_in_aux_stream(
                 target_input_node = input_node
                 break
 
-        if target_input_node is None:
-            raise ValueError(f"Target input node not found for node {n}")
+        assert target_input_node is not None, f"Target input node not found for node {n}"
         with graph.inserting_before(target_input_node):
             new_node = graph.call_function(
                 record_event_wrapper,

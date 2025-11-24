@@ -45,9 +45,7 @@ def replace_multi_stream_linear_with_aux_stream_wrapper(gm: GraphModule) -> Tupl
 
     # Collect targets first to avoid mutating while iterating
     target_nodes: list[Node] = []
-    for n in graph.nodes:
-        if is_op(n, torch.ops.auto_deploy.multi_stream_linear):
-            target_nodes.append(n)
+    target_nodes = [n for n in graph.nodes if is_op(n, torch.ops.auto_deploy.multi_stream_linear)]
 
     for n in target_nodes:
         target_input_node = None
