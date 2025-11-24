@@ -55,6 +55,7 @@ tensorrt_llm/scripts
 *docs/source/_cpp_gen*
 docs/source/**/*.rst
 !docs/source/examples/index.rst
+!docs/source/deployment-guide/comprehensive_table.rst
 *.swp
 
 # Testing
