@@ -93,3 +93,10 @@ The deployment guides below provide more detailed instructions for serving speci
    deployment-guide-for-gpt-oss-on-trtllm.md
    deployment-guide-for-qwen3-on-trtllm.md
    deployment-guide-for-qwen3-next-on-trtllm.md
+
+Comprehensive Configuration Database
+------------------------------------
+
+The table below lists all available pre-configured model scenarios in the TensorRT-LLM configuration database. Each row represents a specific model, GPU, and performance profile combination with recommended request settings.
+
+.. include:: comprehensive_table.rst
