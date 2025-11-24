@@ -4142,6 +4142,9 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/Qwen3-Next"
     MODEL_NAME = "Qwen3/Qwen3-Next-80B-A3B-Instruct"
 
+    # Default setting of `256` is too small
+    GSM8K_MAX_OUTPUT_LEN = 512
+
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,cuda_graph,overlap_scheduler",
@@ -4153,7 +4156,7 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
         ],
     )
     def test_bf16_4gpu(self, tp_size, pp_size, ep_size, cuda_graph,
-                       overlap_scheduler):
+                       overlap_scheduler, mocker):
         model_path = f"{self.MODEL_PATH}/Qwen3-Next-80B-A3B-Instruct"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         enable_block_reuse=False)
@@ -4172,6 +4175,8 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
         ) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -4184,7 +4189,7 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
          (4, 1, 4, False, False)],
         ids=["tp1", "tp4ep1", "tp4ep4", "no_cuda_graph_overlap"])
     def test_nvfp4(self, moe_backend, tp_size, pp_size, ep_size, cuda_graph,
-                   overlap_scheduler):
+                   overlap_scheduler, mocker):
         model_path = f"{self.MODEL_PATH}/qwen3-next-80b-instruct-nvfp4-ptq-fp8kv"
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
@@ -4204,6 +4209,8 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
                  moe_config=moe_config) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
