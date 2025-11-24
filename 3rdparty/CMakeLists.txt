@@ -39,7 +39,7 @@ FetchContent_Declare(
 FetchContent_Declare(
   deepgemm
   GIT_REPOSITORY https://github.com/ruoqianguo/DeepGEMM
-  GIT_TAG 54343662adbc33e9d98704fe9c934fe960129083 # swapab_sm100 branch
+  GIT_TAG 6cb8161516302550785d9af924d2778afef1f3f6 # swapab_sm100 branch
   GIT_SUBMODULES_RECURSE
   ON
   SOURCE_SUBDIR
