@@ -126,7 +126,6 @@ class QwenDecoderLayer(DecoderLayer):
         super().__init__()
         self.layer_idx = layer_idx
         config = model_config.pretrained_config
-        print(f"model_config: {model_config}")
 
         if getattr(config, "rope_scaling", None) is not None and getattr(
                 config.rope_scaling, "rope_type", None) == "yarn":
