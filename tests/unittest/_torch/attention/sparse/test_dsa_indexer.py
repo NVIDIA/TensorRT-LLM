@@ -18,8 +18,8 @@ from tensorrt_llm import deep_gemm
 from tensorrt_llm._torch.attention_backend.interface import (
     PositionalEmbeddingParams, RopeParams)
 from tensorrt_llm._torch.attention_backend.sparse.dsa import (
-    DSACacheManager, Indexer, compute_cu_seqlen_kv_bounds_nocache,
-    compute_cu_seqlen_kv_bounds_with_cache, split_prefill_chunks)
+    DSACacheManager, Indexer, compute_cu_seqlen_kv_bounds_with_cache,
+    split_prefill_chunks)
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import \
@@ -459,6 +459,12 @@ def _create_mock_metadata(request_ids,
                                                   device='cpu',
                                                   pin_memory=True,
                                                   dtype=torch.int64)
+            # Add host_ctx_cached_token_indptr for prepare_one_prefill_chunk
+            self.host_ctx_cached_token_indptr = torch.zeros(
+                (num_contexts + 1, ),
+                device='cpu',
+                pin_memory=True,
+                dtype=torch.int64)
             self.num_ctx_tokens = num_ctx_tokens
             self.num_tokens = num_tokens
             # Also set private attributes used by DSAtrtllmAttentionMetadata
@@ -475,6 +481,15 @@ def _create_mock_metadata(request_ids,
                          dim=0,
                          dtype=torch.int64,
                          out=self.host_gen_kv_indptr[1:num_generations + 1])
+            # Compute host_ctx_cached_token_indptr from num_cached_tokens
+            if num_contexts > 0:
+                cached_lens = torch.tensor(num_cached_tokens[:num_contexts],
+                                           dtype=torch.int64)
+                torch.cumsum(
+                    cached_lens,
+                    dim=0,
+                    dtype=torch.int64,
+                    out=self.host_ctx_cached_token_indptr[1:num_contexts + 1])
 
             # Add indexer-specific attributes
             self.indexer_max_chunk_size = indexer_max_chunk_size
@@ -973,8 +988,8 @@ def test_compute_cu_seqlen_bounds_nocache():
     num_contexts = 2
     num_ctx_tokens = 7
 
-    cu_seqlen_ks, cu_seqlen_ke = compute_cu_seqlen_kv_bounds_nocache(
-        seq_lens, num_contexts, num_ctx_tokens)
+    cu_seqlen_ks, cu_seqlen_ke = compute_cu_seqlen_kv_bounds_with_cache(
+        seq_lens, num_contexts, num_ctx_tokens, None)
 
     # Expected results:
     # Seq 0: tokens [0,1,2], KV [0,1,2]
@@ -1018,7 +1033,7 @@ def test_compute_cu_seqlen_bounds_with_cache():
     num_ctx_tokens = 7  # 3 + 4 new tokens total
 
     cu_seqlen_ks, cu_seqlen_ke = compute_cu_seqlen_kv_bounds_with_cache(
-        seq_lens, cached_token_lens, num_contexts, num_ctx_tokens)
+        seq_lens, num_contexts, num_ctx_tokens, cached_token_lens)
 
     # Expected results:
     #
@@ -1056,7 +1071,7 @@ def test_compute_cu_seqlen_bounds_with_cache_edge_cases():
     num_ctx_tokens = 5
 
     cu_seqlen_ks, cu_seqlen_ke = compute_cu_seqlen_kv_bounds_with_cache(
-        seq_lens, cached_token_lens, num_contexts, num_ctx_tokens)
+        seq_lens, num_contexts, num_ctx_tokens, cached_token_lens)
 
     # Seq 0: KV [0:2], Q tokens attend to [0,1), [0,2)
     # Seq 1: KV [2:5], Q tokens attend to [2,3), [2,4), [2,5)
@@ -1079,7 +1094,7 @@ def test_compute_cu_seqlen_bounds_with_cache_edge_cases():
     num_ctx_tokens = 2
 
     cu_seqlen_ks, cu_seqlen_ke = compute_cu_seqlen_kv_bounds_with_cache(
-        seq_lens, cached_token_lens, num_contexts, num_ctx_tokens)
+        seq_lens, num_contexts, num_ctx_tokens, cached_token_lens)
 
     # Seq 0: 5 cached + 1 new = 6 total KV, global [0:6]
     #   New Q token 0: attends to cached(5) + self(1) = [0, 6)
@@ -1102,7 +1117,7 @@ def test_compute_cu_seqlen_bounds_with_cache_edge_cases():
     num_ctx_tokens = 6
 
     cu_seqlen_ks, cu_seqlen_ke = compute_cu_seqlen_kv_bounds_with_cache(
-        seq_lens, cached_token_lens, num_contexts, num_ctx_tokens)
+        seq_lens, num_contexts, num_ctx_tokens, cached_token_lens)
 
     # Seq 0: 10 cached + 2 new = 12 total KV, global [0:12]
     #   Q token 0 (local 0): cached(10) + self(1) = [0, 11)
@@ -1132,7 +1147,7 @@ def test_compute_cu_seqlen_bounds_with_cache_edge_cases():
     num_ctx_tokens = 1
 
     cu_seqlen_ks, cu_seqlen_ke = compute_cu_seqlen_kv_bounds_with_cache(
-        seq_lens, cached_token_lens, num_contexts, num_ctx_tokens)
+        seq_lens, num_contexts, num_ctx_tokens, cached_token_lens)
 
     # Seq 0: 100 cached + 1 new = 101 total KV
     #   Q token 0: attends to all = [0, 101)
@@ -1161,7 +1176,7 @@ def test_compute_cu_seqlen_bounds_with_cache_properties():
         num_ctx_tokens = seq_lens.sum().item()
 
         cu_seqlen_ks, cu_seqlen_ke = compute_cu_seqlen_kv_bounds_with_cache(
-            seq_lens, cached_token_lens, num_contexts, num_ctx_tokens)
+            seq_lens, num_contexts, num_ctx_tokens, cached_token_lens)
 
         # Property 1: Output length matches num_ctx_tokens
         assert cu_seqlen_ks.shape[0] == num_ctx_tokens, \
@@ -2035,15 +2050,6 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk,
 def test_indexer_topk_multi_request_with_different_cache():
     """
     Test that custom topk kernel handles multi-request batches with different cached amounts.
-
-    Bug: When requests have different cached tokens (e.g., Req0: 0, Req1: 3584),
-    the kernel may select invalid indices from masked regions, producing fewer than 2048 valid topk.
-
-    This happens because:
-    1. fp8_mqa_logits masks cross-request positions to -inf
-    2. Radix histogram in indexer_topk_prefill_op doesn't properly skip -inf
-    3. Some -inf positions get selected → converted to negative local indices
-    4. After masking: fewer than 2048 valid indices remain
     """
     torch.manual_seed(42)
 
@@ -2142,7 +2148,6 @@ def test_indexer_topk_multi_request_with_different_cache():
     # Validate: custom and fallback should match
     print(f"\n=== Validation ===")
 
-    # First, check for INVALID negative indices (< -1) which indicate kernel bugs
     print(f"Checking for invalid negative indices:")
     for tok_id in [0, 255, 256, 492]:  # First/last of each request
         num_valid_custom = (topk_custom[tok_id] >= 0).sum().item()
@@ -2150,7 +2155,6 @@ def test_indexer_topk_multi_request_with_different_cache():
         min_val_custom = topk_custom[tok_id].min().item()
         min_val_fallback = topk_fallback[tok_id].min().item()
 
-        # Check for invalid negatives (not -1)
         has_invalid = min_val_custom < -1
         if has_invalid or num_valid_custom != num_valid_fallback:
             print(
@@ -2171,7 +2175,7 @@ def test_indexer_topk_multi_request_with_different_cache():
     host_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device='cpu')
     host_cached = torch.tensor(cached_tokens, dtype=torch.int32, device='cpu')
     cu_ks, cu_ke = compute_cu_seqlen_kv_bounds_with_cache(
-        host_seq_lens, host_cached, batch_size, total_tokens)
+        host_seq_lens, batch_size, total_tokens, host_cached)
 
     for tok_id in range(total_tokens):
         window_size = (cu_ke[tok_id] - cu_ks[tok_id]).item()
