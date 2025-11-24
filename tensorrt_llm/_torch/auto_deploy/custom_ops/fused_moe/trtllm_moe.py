@@ -130,6 +130,9 @@ def trtllm_quant_fp8_moe_fused(
         w1_weight_scale: Weight scales for w1 [E]
         w2_weight_scale: Weight scales for w2 [E]
         w3_weight_scale: Weight scales for w3 [E]
+        gemm1_dequant: Precomputed gemm1 dequant scale [E]
+        gemm2_act_quant: Precomputed gemm2 act quant scale [1]
+        gemm2_dequant: Precomputed gemm2 dequant scale [E]
         mlp_style: "gated_mlp" or "mlp"
         act_fn: "silu" for gated_mlp, "relu2" for mlp
 
@@ -149,14 +152,12 @@ def trtllm_quant_fp8_moe_fused(
     x_q_fp8 = _quantize_fp8(x2d, w1_input_scale[0])
 
     # Scales are stored in float32
-    # w1_weight_scale = w1_weight_scale.to(torch.float32)
-    # w2_weight_scale = w2_weight_scale.to(torch.float32)
-    w1_input_scale = w1_input_scale.to(torch.float32)[0]
-    # w2_input_scale = w2_input_scale.to(torch.float32)[0]
+    w1_input_scale = w1_input_scale[0]
 
     # Prepare quant_scales for TensorRT-LLM FP8 format:
     # [gemm1_dequant_scale, gemm2_act_quant_scale, gemm2_dequant_scale, gemm1_input_dequant_scale]
     # For gated MLP:
+    # These are precomputed in `fused_moe` transform
     # - gemm1_dequant_scale: w1_weight_scale * w1_input_scale (combined for w1 and w3)
     # - gemm2_act_quant_scale: 1 / w2_input_scale
     # - gemm2_dequant_scale: w2_weight_scale * w2_input_scale

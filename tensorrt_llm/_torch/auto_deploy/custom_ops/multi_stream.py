@@ -91,7 +91,7 @@ def aux_stream_wrapper(
     return output
 
 
-# bf16
+# trtllm bf16
 @torch.library.custom_op("auto_deploy::trtllm_moe_fused_aux", mutates_args=())
 def trtllm_moe_fused_aux(
     x: torch.Tensor,
@@ -213,7 +213,7 @@ def trtllm_quant_fp8_moe_fused_aux(
 
 
 @trtllm_quant_fp8_moe_fused_aux.register_fake
-def trtllm_quant_fp8_moe_fused_fake(
+def trtllm_quant_fp8_moe_fused_aux_fake(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
