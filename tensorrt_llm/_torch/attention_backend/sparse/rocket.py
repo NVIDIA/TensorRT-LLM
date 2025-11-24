@@ -75,10 +75,24 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
                                              dtype=torch.int32)
 
         # Context length of RocketKV key for each valid sequence
-        self.k_context_lens = torch.empty(
-            self.max_num_sequences,
-            device='cpu',
+        self.k_context_lens_cuda = self.get_empty(
+            self.cuda_graph_buffers,
+            (self.max_num_sequences, ),
             dtype=torch.int32,
+            cache_name="k_context_lens_cuda",
+            capture_graph=capture_graph,
+        )
+        self.k_context_lens = torch.zeros_like(self.k_context_lens_cuda,
+                                               device='cpu',
+                                               dtype=torch.int32)
+
+        # Start index of RocketKV key for each valid sequence
+        self.k_context_start_cuda = self.get_empty(
+            None,
+            (self.max_num_sequences, ),
+            dtype=torch.int32,
+            cache_name="k_context_start_cuda",
+            capture_graph=capture_graph,
         )
 
         # Cumulative context lengths for each sequence
@@ -231,6 +245,8 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # Only consider sequences that are long enough for sparse kv indices prediction in context phase
         self.k_context_lens[:valid_batch_size] = self.prompt_lens_cpu[
             valid_seq_indices] - self.window_size
+        self.k_context_lens_cuda[:valid_batch_size].copy_(
+            self.k_context_lens[:valid_batch_size], non_blocking=True)
 
         sparse_counts_ctx = torch.zeros(self.num_contexts,
                                         dtype=torch.int32,
@@ -399,12 +415,32 @@ class RocketTrtllmAttention(TrtllmAttention):
                 padding=self.kernel_size // 2,
                 stride=1)
 
-            selected_prefix_indices = scores.topk(
-                self.prompt_budget - self.window_size,
-                dim=-1).indices.sort().values.to(torch.int32)
+            # Use indexer topk prefill to select topk prefix indices
+            total_tasks = metadata.valid_batch_size * self.num_kv_heads
+
+            selected_prefix_indices = torch.empty(
+                (total_tasks, self.prompt_budget - self.window_size),
+                device=qkv_input.device,
+                dtype=torch.int32)
+
+            scores = scores.view(total_tasks, -1)
+
+            row_starts = metadata.k_context_start_cuda[:metadata.
+                                                       valid_batch_size].repeat_interleave(
+                                                           self.num_kv_heads)
+            row_ends = metadata.k_context_lens_cuda[:metadata.
+                                                    valid_batch_size].repeat_interleave(
+                                                        self.num_kv_heads)
+            torch.ops.trtllm.indexer_topk_prefill(
+                scores, row_starts, row_ends, selected_prefix_indices,
+                self.prompt_budget - self.window_size)
+
+            # Sort selected prefix indices to keep topk indices in ascending order
+            selected_prefix_indices = torch.sort(selected_prefix_indices,
+                                                 dim=-1).values
         else:
             selected_prefix_indices = torch.empty(
-                (0, self.num_kv_heads, self.prompt_budget - self.window_size),
+                (0, self.prompt_budget - self.window_size),
                 device=qkv_input.device,
                 dtype=torch.int32)
 
@@ -416,7 +452,7 @@ class RocketTrtllmAttention(TrtllmAttention):
             selected_prefix_indices, metadata.prompt_lens_cuda,
             metadata.valid_seq_indices_cuda, sparse_kv_offsets,
             metadata.num_contexts, metadata.total_sparse_ctx_indices,
-            self.window_size, self.prompt_budget)
+            self.window_size, self.prompt_budget, self.num_kv_heads)
 
         # Update KT cache
         kt_cache_tensor = metadata.kv_cache_manager.get_kt_buffers(

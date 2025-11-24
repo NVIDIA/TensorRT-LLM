@@ -672,7 +672,8 @@ def rocket_batch_to_flatten_kernel(
             token_mask = token_offsets < prefix_budget
 
             # Load from prefix_indices
-            prefix_indices = valid_idx_in_selected * num_kv_heads * prefix_budget + head_idx * prefix_budget + token_offsets
+            flattened_idx = valid_idx_in_selected * num_kv_heads + head_idx
+            prefix_indices = flattened_idx * prefix_budget + token_offsets
             prefix_values = tl.load(prefix_indices_ptr + prefix_indices,
                                     mask=token_mask,
                                     other=0)
@@ -717,14 +718,15 @@ def triton_rocket_batch_to_flatten(
         prefix_indices: torch.Tensor, input_lens: torch.Tensor,
         valid_seq_indices: torch.Tensor, output_offsets: torch.Tensor,
         batch_size: int, total_output_tokens: int, window_size: int,
-        prompt_budget: int) -> tuple[torch.Tensor, torch.Tensor]:
+        prompt_budget: int,
+        num_kv_heads: int) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Flatten indices considering both valid and invalid batches.
     For valid sequences, combines prefix_indices with dynamically computed window indices.
     For invalid sequences, generates sequential indices.
 
     Args:
-        prefix_indices: Selected prefix indices [valid_batch_size, num_kv_heads, prefix_budget]
+        prefix_indices: Selected prefix indices [valid_batch_size * num_kv_heads, prefix_budget]
         input_lens: Lengths for all sequences [batch_size]
         valid_seq_indices: Valid sequence indices [valid_batch_size]
         output_offsets: Offset for each batch [batch_size + 1]
@@ -732,11 +734,13 @@ def triton_rocket_batch_to_flatten(
         total_output_tokens: Total number of output tokens
         window_size: Size of sliding window at the end
         prompt_budget: Total number of tokens for valid sequences (prefix_budget + window_size)
+        num_kv_heads: Number of KV heads
 
     Returns:
         sparse_indices: Flattened sparse indices [num_kv_heads, total_output_tokens]
     """
-    valid_batch_size, num_kv_heads, prefix_budget = prefix_indices.shape
+    total_tasks, prefix_budget = prefix_indices.shape
+    valid_batch_size = total_tasks // num_kv_heads
 
     # Create output tensor
     sparse_indices = torch.empty((num_kv_heads, total_output_tokens),
