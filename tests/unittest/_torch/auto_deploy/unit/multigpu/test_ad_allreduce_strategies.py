@@ -186,24 +186,31 @@ def test_allreduce_strategies(llm_root, shared_dataset, allreduce_strategy):  # 
         args = [
             "--model",
             model_name,
-            "throughput",
-            "--backend",
-            "_autodeploy",
-            "--dataset",
-            str(dataset_path),
-            "--extra_llm_api_options",
-            extra_llm_api_options_path,
-            "--tp",
-            str(tp_size),
-            "--max_batch_size",
-            str(max_batch_size),
-            "--max_num_tokens",
-            str(max_num_tokens),
         ]
 
         # Only pass --model_path if it's a local filesystem path
+        # Note: --model_path must come BEFORE the subcommand (throughput)
         if str(config["args"]["model"]).startswith("/"):
             args.extend(["--model_path", str(config["args"]["model"])])
+
+        # Add the subcommand and its options
+        args.extend(
+            [
+                "throughput",
+                "--backend",
+                "_autodeploy",
+                "--dataset",
+                str(dataset_path),
+                "--extra_llm_api_options",
+                extra_llm_api_options_path,
+                "--tp",
+                str(tp_size),
+                "--max_batch_size",
+                str(max_batch_size),
+                "--max_num_tokens",
+                str(max_num_tokens),
+            ]
+        )
 
         try:
             with timeout(TEST_TIMEOUT_SECONDS):
