@@ -23,9 +23,10 @@ from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.quantization.utils.fp8_utils import (
-    resmooth_to_fp8_e8m0, transform_sf_into_required_layout)
+    per_token_quant_and_transform, resmooth_to_fp8_e8m0,
+    transform_sf_into_required_layout)
 
-from ..._utils import is_sm_100f
+from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
 from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
@@ -63,31 +64,34 @@ class TensorParallelMode(str, enum.Enum):
 
 
 def load_weight_shard(
-        weight,
-        tensor_parallel_size: int = 1,
-        tensor_parallel_rank: int = 0,
-        tensor_parallel_mode: Optional[TensorParallelMode] = None,
-        device: torch.device = torch.device('cpu'),
+    weight,
+    tensor_parallel_size: int = 1,
+    tensor_parallel_rank: int = 0,
+    tensor_parallel_mode: Optional[TensorParallelMode] = None,
+    device: torch.device = torch.device('cpu'),
+    return_slice_indices: bool = False,
 ) -> torch.Tensor:
     # Skip device transfers on integrated GPUs to conserve shared memory
     if weight.device.type != device.type and is_device_integrated():
         # For integrated GPU systems (e.g., DGX Spark), CPU and GPU share limited physical memory.
         # Avoiding device transfers reduces memory consumption and unnecessary data copies,
         # enabling support for larger models on memory-constrained systems.
-        logger.warning(
-            f"[load_weight_shard] Skipping device transfer from {weight.device} to {device} on integrated GPU to conserve shared memory."
-        )
+        logger.warning_once(
+            f"[load_weight_shard] Skipping device transfer from {weight.device} to {device} on integrated GPU to conserve shared memory.",
+            key="load_weight_shard_skip_device_transfer_with_integrated_gpu")
         device = weight.device
     if isinstance(weight, torch.Tensor):
         tensor_shape = weight.shape
 
         def maybe_convert_to_torch_tensor(tensor: torch.Tensor,
-                                          indices: slice = None):
+                                          indices: list[slice] | None = None):
             if indices is None:
                 # Avoid unnecessary copy
-                return tensor.to(device)
+                result = (tensor.to(device), [slice(d) for d in tensor.shape])
             else:
-                return tensor[indices].to(device)
+                result = (tensor[indices].to(device), indices)
+            return result if return_slice_indices else result[0]
+
     # WAR to check whether it is a safetensor slice since safetensor didn't register the type to the module
     # safetensors slice, supports lazy loading, type(weight) is `builtin.PySafeSlice`
     elif hasattr(weight, "get_shape"):
@@ -113,7 +117,7 @@ def load_weight_shard(
     slice_width = math.ceil(width / tensor_parallel_size)
     slice_start = tensor_parallel_rank * slice_width
     slice_end = min((tensor_parallel_rank + 1) * slice_width, width)
-    slice_obj = [slice(None)] * len(tensor_shape)
+    slice_obj = [slice(d) for d in tensor_shape]
     slice_obj[split_dim] = slice(slice_start, slice_end)
     return maybe_convert_to_torch_tensor(weight, tuple(slice_obj))
 
@@ -642,6 +646,10 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
                     module.weight_scale,
                     disable_ue8m0_cast=True,
                 )
+        elif get_sm_version() == 120:
+            act_input_fp8, act_input_sf = per_token_quant_and_transform(input)
+            output = torch.ops.trtllm.fp8_block_scaling_gemm(
+                act_input_fp8, module.weight, act_input_sf, module.weight_scale)
         else:
             act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
                 input)
@@ -727,8 +735,9 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
 
     def post_load_weights(self, module: Linear):
         super().post_load_weights(module)
-        if is_sm_100f() and not (module.use_cute_dsl_blockscaling_mm
-                                 or module.disable_deep_gemm):
+        if (is_sm_100f() and not (module.use_cute_dsl_blockscaling_mm
+                                 or module.disable_deep_gemm)) or \
+           get_sm_version() == 120:
             weight, weight_scale = resmooth_to_fp8_e8m0(module.weight,
                                                         module.weight_scale)
             transfromed_scale = transform_sf_into_required_layout(
@@ -824,9 +833,9 @@ class NVFP4LinearMethod(LinearMethodBase):
                                                      act_sf,
                                                      module.weight_scale,
                                                      module.alpha, module.dtype)
-        # Take the dim of out_features if padded.
+        # Take the dim of out_features if padded. Make sure the output is contiguous
         if output.shape[-1] > module.out_features:
-            output = output[..., :module.out_features]
+            output = output[..., :module.out_features].contiguous()
 
         if bias is not None:
             output = output + bias

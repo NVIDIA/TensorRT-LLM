@@ -19,17 +19,19 @@
 namespace tensorrt_llm::kernels::cutlass_kernels
 {
 
-// Note update moe.py to match
+// IMPORTANT: Keep the same order of activation functions in this enum and the activation functions in
+// cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_kernels.cu::doActivationKernel().
 enum class ActivationType
 {
-    Gelu = 0,
-    Relu,
-    Silu,
-    Swiglu,
-    Geglu,
-    SwigluBias,
-    Identity,
-    InvalidType
+    InvalidType = 0,
+    Identity = 1,
+    Gelu = 2,
+    Relu = 3,
+    Silu = 4,
+    Swiglu = 5,
+    Geglu = 6,
+    SwigluBias = 7,
+    Relu2 = 8,
 };
 
 } // namespace tensorrt_llm::kernels::cutlass_kernels

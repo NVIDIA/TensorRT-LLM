@@ -66,7 +66,8 @@ def _run_test(model, op, variant):
         {
             "fuse_rmsnorm": {
                 "stage": "post_load_fusion",
-                "backend": variant,
+                "gated_rmsnorm_backend": "triton",
+                "rmsnorm_backend": variant,
             },
         },
     )(None, gm)
@@ -102,4 +103,4 @@ def test_rmsnorm_fusion(eps, variant, op):
 def test_rmsnorm_fusion_nemotron_h():
     # Only the triton backend supports the nemotron h rmsnorm
     model = TestModel(eps=1e-6, use_nemotron_h=True)
-    _run_test(model, torch.ops.auto_deploy.triton_rms_norm, "triton")
+    _run_test(model, torch.ops.auto_deploy.triton_rms_norm, variant="triton")

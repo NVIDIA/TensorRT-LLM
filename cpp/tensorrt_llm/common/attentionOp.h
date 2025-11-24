@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -224,8 +224,12 @@ public:
         int32_t const* spec_decoding_generation_lengths = nullptr;
         bool spec_decoding_is_generation_length_variable = false;
         int32_t spec_decoding_max_generation_length = 1;
+        int64_t* spec_decoding_bl_tree_mask_offset = nullptr;
+        uint32_t* spec_decoding_bl_tree_mask = nullptr;
+        int32_t* spec_bl_tree_first_sparse_mask_offset_kv = nullptr;
         // optional when fuse_fp4_quant is enabled
         int32_t start_token_idx_sf = 0;
+        int32_t layer_idx = 0;
     };
 
     template <typename T, typename KVCacheBuffer>

@@ -5,6 +5,7 @@ from torch import nn
 
 from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
 from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.quantization import QuantAlgo
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import (PositionalEmbeddingParams,
@@ -54,7 +55,8 @@ class Exaone4Attention(QKNormRoPEAttention):
     def __init__(self,
                  model_config: ModelConfig[Exaone4Config],
                  layer_idx: Optional[int] = None,
-                 fuse_qk_norm_rope: bool = False):
+                 fuse_qk_norm_rope: bool = False,
+                 disable_deep_gemm: bool = False):
         config = model_config.pretrained_config
 
         self.attention_window_size = None
@@ -88,6 +90,7 @@ class Exaone4Attention(QKNormRoPEAttention):
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
+            disable_deep_gemm=disable_deep_gemm,
         )
 
     def forward(
@@ -128,9 +131,17 @@ class Exaone4DecoderLayer(DecoderLayer):
         self.is_quanted = model_config.quant_config and model_config.quant_config.quant_mode.has_any_quant(
         )
 
+        disable_deep_gemm = False
+        quant_config = getattr(model_config, "quant_config", None)
+        if quant_config is not None:
+            # EXAONE4 fp8 has an illegal memory access issue with deep_gemm.
+            disable_deep_gemm = getattr(quant_config, "quant_algo",
+                                        None) == QuantAlgo.FP8_BLOCK_SCALES
+
         self.self_attn = Exaone4Attention(
             model_config,
             layer_idx=layer_idx,
+            disable_deep_gemm=disable_deep_gemm,
         )
 
         self.mlp = GatedMLP(
@@ -140,6 +151,7 @@ class Exaone4DecoderLayer(DecoderLayer):
             dtype=config.torch_dtype,
             config=model_config,
             layer_idx=layer_idx,
+            disable_deep_gemm=disable_deep_gemm,
         )
 
         self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size,

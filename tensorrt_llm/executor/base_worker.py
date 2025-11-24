@@ -40,7 +40,30 @@ from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
 
 __all__ = [
     "BaseWorker",
+    "_init_hf_modules",
 ]
+
+
+def _init_hf_modules():
+    """Initialize cached HuggingFace modules for models with trust_remote_code=True.
+
+    This is safe to call multiple times (idempotent) and should be called:
+    1. At module import time (for main process and spawned subprocesses)
+    2. At worker_main entry (for forked processes or external MPI ranks)
+
+    References: https://github.com/vllm-project/vllm/pull/871
+    """
+    try:
+        from transformers.dynamic_module_utils import init_hf_modules
+        init_hf_modules()
+        logger.debug("HF modules initialized")
+    except ImportError as e:
+        logger.warning(f"ImportError initializing HF modules: {e}")
+    except Exception as e:
+        logger.error(f"Exception initializing HF modules: {e}")
+
+
+_init_hf_modules()
 
 
 class BaseWorker(GenerationExecutor):
@@ -463,25 +486,27 @@ class BaseWorker(GenerationExecutor):
             splited_prompt_len = int(len(prompt_token_ids) / cp_size)
             default_max_tokens = max_seq_len - splited_prompt_len - query_token_len
             if default_max_tokens <= 0:
-                logger.warning(
-                    f"`default_max_tokens` ({default_max_tokens}) should be greater than 0, "
+                # Raise error on `default_max_tokens` not enough, since max_tokens should be less than `default_max_tokens``
+                raise ValueError(
+                    f"`default_max_tokens` ({default_max_tokens}) must be greater than 0, "
                     f"`default_max_tokens` ({default_max_tokens}) = max_seq_len ({max_seq_len})"
                     f" - `splited_prompt_len` ({splited_prompt_len}) - `query_token_len` ({query_token_len})"
                 )
-                if max_tokens is None:
-                    raise ValueError(
-                        "`max_tokens` must be set when `default_max_tokens` is illegal"
-                    )
+
             # default_max_tokens is the biggest available value
             if max_tokens is None:
                 return default_max_tokens
-            elif max_tokens > default_max_tokens:
+            elif max_tokens > default_max_tokens and default_max_tokens > 0:
                 logger.warning(
                     f"User-specified `max_tokens` ({max_tokens}) is greater than deduced "
                     f"`default_max_tokens` ({default_max_tokens}), using default_max_tokens instead."
                 )
                 return default_max_tokens
-            return max_tokens
+            elif max_tokens <= 0:
+                raise ValueError(
+                    f"`max_tokens` ({max_tokens}) must be greater than 0")
+            else:
+                return max_tokens
 
         try:
             executor_request = tllm.Request(

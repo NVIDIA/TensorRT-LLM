@@ -10,10 +10,10 @@ and operates on a purely functional paradigm that is compatible with the torch c
 """
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from typing import Dict, List, Literal, Optional, Protocol, Sequence, Set, Tuple, Type, Union
 
 import torch
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from torch._ops import OpOverloadPacket
 from torch.fx import Node
 from torch.types import Number
@@ -24,11 +24,39 @@ from ..utils.logger import ad_logger
 Constant = Union[int, float, str, None]
 
 
-@dataclass
-class CacheConfig:
-    """A dataclass to hold information how to configure the cache."""
+class CacheConfig(BaseModel):
+    """Cache configuration for attention-related dtypes."""
 
-    dtype: Optional[torch.dtype] = None
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True,
+        extra="forbid",
+    )
+
+    dtype: Optional[torch.dtype] = Field(default=None, description="KV cache dtype.")
+    mamba_dtype: Optional[torch.dtype] = Field(default=None, description="Mamba cache dtype.")
+
+    @field_validator("dtype", "mamba_dtype", mode="before")
+    @classmethod
+    def _coerce_dtype(cls, value):
+        if value is None or isinstance(value, torch.dtype):
+            return value
+        if isinstance(value, str):
+            dtype = getattr(torch, value, None)
+            assert isinstance(dtype, torch.dtype), f"Invalid {dtype=}"
+            return dtype
+        return value
+
+    def __or__(self, other: "CacheConfig") -> "CacheConfig":
+        """Combine two CacheConfig objects field-wise using Python's `or` semantics.
+
+        For each field, selects the first non-None value between `self` and `other`.
+        """
+        if not isinstance(other, CacheConfig):
+            raise NotImplementedError(f"Cannot combine CacheConfig with {type(other)}")
+        merged_kwargs = {}
+        for field_name in type(self).model_fields.keys():
+            merged_kwargs[field_name] = getattr(self, field_name) or getattr(other, field_name)
+        return CacheConfig(**merged_kwargs)
 
 
 class SequenceInfo:
@@ -88,6 +116,7 @@ class SequenceInfo:
         page_size: int = 0,
         max_num_tokens: Optional[int] = None,
         vocab_size_padded: Optional[int] = None,
+        chunk_size: Optional[int] = None,
     ):
         """Initialize the SequenceInfo object.
 
@@ -114,7 +143,10 @@ class SequenceInfo:
         self.max_batch_size = max_batch_size
         self.page_size = page_size if page_size > 0 else max_seq_len
         self.vocab_size_padded = vocab_size_padded
-
+        self.chunk_size = chunk_size
+        # Chunk size is an input to a custom op, so we need to set a default value if it is not provided.
+        if self.chunk_size is None:
+            self.chunk_size = 128
         # NOTE (lucaslie): WAR to address issue when using flashinfer attention with
         # (max_batch_size, max_seq_len) input in trtllm runtime.
         # see https://github.com/NVIDIA/TensorRT-LLM/issues/4504
@@ -165,7 +197,7 @@ class SequenceInfo:
             "input_pos": torch.empty(self.max_batch_size, dtype=torch.int),
             "cache_loc": torch.empty(max_num_cache_loc_assignments, dtype=torch.int),
             "pages_per_seq": torch.empty(self.max_batch_size, dtype=torch.int),
-            "slot_idx": torch.empty(self.max_batch_size, dtype=torch.int),
+            "slot_idx": torch.empty(self.max_batch_size, dtype=torch.long),
             # OTHER FIELDS WHERE WE NEED EFFICIENT HOST<>DEVICE TRANSFER
             "_gather_idx": torch.empty(self.max_num_tokens, dtype=torch.int),
         }
@@ -175,7 +207,9 @@ class SequenceInfo:
         # NOTE: order of keys is relevant here!
         self._uncached_arg_names = ("input_ids", "position_ids")
         self._cached_arg_names = ("seq_len", "input_pos", "cache_loc", "pages_per_seq", "slot_idx")
-        self._cached_constants = ("page_size",)
+        # page_size is the size of attentionkv-cache pages.
+        # chunk_size is used in mamba prefill kernels to split the context into chunks.
+        self._cached_constants = ("page_size", "chunk_size")
         ############################################################################################
 
         # EXTRA TENSOR FIELDS ######################################################################

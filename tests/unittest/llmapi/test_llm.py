@@ -587,7 +587,6 @@ def llm_for_sampling_params():
     llm.shutdown()
 
 
-@pytest.mark.skip(reason="https://nvbugs/5504095")
 @pytest.mark.part0
 def test_user_specify_workspace():
     user_specified_ws_path = '/tmp/specified_workspace'
@@ -1805,13 +1804,14 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
             # in the 2nd reuse of llm.generate() in streaming mode
             kv_cache_args_extra["enable_block_reuse"] = False
     else:
+        build_config = BuildConfig(gather_context_logits=True)
         llm_args_extra["fast_build"] = True
+        llm_args_extra["build_config"] = build_config
 
     llm = LLM_CLASS(
         llama_model_path,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4,
                                       **kv_cache_args_extra),
-        build_config=BuildConfig(gather_context_logits=True),
         tensor_parallel_size=tp_size,
         gather_generation_logits=True,
         **llm_args_extra,

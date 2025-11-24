@@ -25,6 +25,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
+from ..attention_backend.trtllm import TrtllmAttention
 from ..distributed import MPIDist, TorchDist
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
@@ -215,7 +216,7 @@ def get_guided_decoding_config(guided_decoding_backend: str,
 
 def create_py_executor(
     llm_args: TorchLlmArgs,
-    checkpoint_dir: str = None,
+    checkpoint_dir: Optional[str] = None,
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
 ) -> PyExecutor:
@@ -349,10 +350,12 @@ def create_py_executor(
                               RestoreMode.PINNED):
             draft_spec_config = copy.copy(spec_config)
 
-            use_chain_drafter = (guided_decoding_config is None
-                                 and draft_spec_config._allow_chain_drafter and
-                                 draft_spec_config._allow_greedy_draft_tokens
-                                 and llm_args.attn_backend == "TRTLLM")
+            use_chain_drafter = (
+                guided_decoding_config is None
+                and draft_spec_config._allow_chain_drafter
+                and draft_spec_config._allow_greedy_draft_tokens
+                and llm_args.attn_backend == "TRTLLM"
+                and draft_spec_config.draft_len_schedule is None)
 
             logger.debug(f"USE CHAIN DRAFTER: {use_chain_drafter}")
             if use_chain_drafter:
@@ -384,11 +387,20 @@ def create_py_executor(
             # For DeepseekV3 MTP, we need to set the num_hidden_layers to 1 for the draft model
             if spec_config.spec_dec_mode.is_mtp_eagle():
                 draft_model_engine.model.model_config.pretrained_config.num_hidden_layers = 1
-            draft_model_engine.kv_cache_manager_key = ResourceManagerType.DRAFT_KV_CACHE_MANAGER
             draft_model_engine.load_weights_from_target_model(
                 model_engine.model)
     else:
         draft_model_engine = None
+
+    # TODO: Overlap scheduler is not supported for below cases:
+    # 1. non-CDL is used
+    # 2. non-TrtllmAttention attention backend is used
+    if has_draft_model_engine and (not use_chain_drafter or not issubclass(
+            draft_model_engine.attn_backend, TrtllmAttention)):
+        logger.warning(
+            "Overlap scheduler is not supported for non-CDL or non-TrtllmAttention backend."
+        )
+        llm_args.disable_overlap_scheduler = True
 
     # PyTorchModelEngine modifies these fields, update them
     model_engine_max_seq_len = model_engine.max_seq_len
@@ -401,6 +413,11 @@ def create_py_executor(
     if spec_config is not None:
         model_engine_max_seq_len += get_num_extra_kv_tokens(spec_config)
         model_engine_max_seq_len += spec_config.max_total_draft_tokens
+
+    if has_draft_model_engine and not llm_args.disable_overlap_scheduler:
+        logger.warning(
+            "Overlap scheduler is enabled for two-model speculative decoding. Rejection sampling will fallback to greedy sampling."
+        )
 
     max_seq_len = model_engine_max_seq_len
     max_num_tokens = model_engine.max_num_tokens
@@ -493,16 +510,19 @@ def create_py_executor(
                     )
 
     with allocation_scope(ExecutorMemoryType.SAMPLER, RestoreMode.PINNED):
-        sampler = instantiate_sampler(model_engine,
-                                      llm_args,
-                                      mapping,
-                                      max_batch_size=max_batch_size,
-                                      max_beam_width=max_beam_width,
-                                      max_seq_len=max_seq_len,
-                                      mm_encoder_only=mm_encoder_only,
-                                      speculative_config=spec_config,
-                                      decoding_config=decoding_config,
-                                      kv_cache_config=kv_cache_config)
+        sampler = instantiate_sampler(
+            model_engine,
+            llm_args,
+            mapping,
+            max_batch_size=max_batch_size,
+            max_beam_width=max_beam_width,
+            max_seq_len=max_seq_len,
+            mm_encoder_only=mm_encoder_only,
+            speculative_config=spec_config,
+            decoding_config=decoding_config,
+            kv_cache_config=kv_cache_config,
+            disable_flash_infer_sampling=llm_args._disable_flash_infer_sampling,
+        )
         logger.info(f"Using Sampler: {type(sampler).__name__}")
 
     if kv_connector_config is not None:
@@ -693,6 +713,9 @@ def create_py_executor(
             )
 
     _adjust_torch_mem_fraction()
+
+    if mapping.rank == 0:
+        logger.info(f"LLM Args:\n{llm_args}")
 
     py_executor.start_worker()
     return py_executor
