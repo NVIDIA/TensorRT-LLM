@@ -77,6 +77,7 @@ Welcome to TensorRT LLM's Documentation!
    features/ray-orchestrator.md
    features/torch_compile_and_piecewise_cuda_graph.md
    features/helix.md
+   features/kv-cache-connector.md
 
 
 .. toctree::
