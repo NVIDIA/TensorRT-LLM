@@ -18,7 +18,6 @@ import os
 import re
 import subprocess
 import tempfile
-import time
 from typing import Callable
 
 import pytest
@@ -747,7 +746,6 @@ def test_disaggregated_multi_gpu_with_mpirun_trt_backend(
                          indirect=True)
 def test_disaggregated_cuda_graph(disaggregated_test_root, llm_venv,
                                   disaggregated_example_root, llama_model_root):
-    time.sleep(3600)
     src_dst_dict = {
         llama_model_root:
         f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
