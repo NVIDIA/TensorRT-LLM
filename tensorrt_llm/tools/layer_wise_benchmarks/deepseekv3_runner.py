@@ -209,7 +209,13 @@ class DeepSeekV3Runner(RunnerMixin, RunnerBase):
         tensorrt_llm._torch.models.modeling_deepseekv3.DeepseekV3Gate = gate_cls_orig
 
     def replace_routing_method(self, balance_method: BalanceMethod, balance_ratio: float):
-        if self.model_config.moe_backend not in ["CUTLASS", "DEEPGEMM", "TRTLLM", "WIDEEP"]:
+        if self.model_config.moe_backend not in [
+            "CUTLASS",
+            "DEEPGEMM",
+            "TRTLLM",
+            "WIDEEP",
+            "CUTEDSL",
+        ]:
             raise NotImplementedError(
                 f'Not support replace routing method for moe_backend "{self.model_config.moe_backend}",'
                 f' please set balance_method to "NotModified"'

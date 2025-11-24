@@ -93,18 +93,31 @@ def _deduplicate_params_and_buffers(gm: fx.GraphModule) -> None:
 
 def _add_missing_load_hooks(gm: fx.GraphModule, model: nn.Module) -> None:
     """Adds back the state dict load hooks stripped away during export."""
-    hooks = {
+    pre_hooks = {
         k: mod._load_state_dict_pre_hooks
         for k, mod in model.named_modules()
         if mod._load_state_dict_pre_hooks
     }
 
     for mod_name, mod in gm.named_modules():
-        if mod_name in hooks:
-            for hook in hooks.pop(mod_name).values():
+        if mod_name in pre_hooks:
+            for hook in pre_hooks.pop(mod_name).values():
                 mod._register_load_state_dict_pre_hook(hook.hook, with_module=hook.with_module)
-    assert not (bool(hooks)), f"""Mismatch in names of exported and source modules with hooks.
-        The following module names were not found in exported module {list(hooks.keys())}"""
+    assert not (bool(pre_hooks)), f"""Mismatch in names of exported and source modules with hooks.
+        The following module names were not found in exported module {list(pre_hooks.keys())}"""
+
+    post_hooks = {
+        k: mod._load_state_dict_post_hooks
+        for k, mod in model.named_modules()
+        if mod._load_state_dict_post_hooks
+    }
+
+    for mod_name, mod in gm.named_modules():
+        if mod_name in post_hooks:
+            for hook in post_hooks.pop(mod_name).values():
+                mod.register_load_state_dict_post_hook(hook)
+    assert not (bool(post_hooks)), f"""Mismatch in names of exported and source modules with hooks.
+        The following module names were not found in exported module {list(post_hooks.keys())}"""
 
 
 def _add_load_hook_for_aliased_params(gm: fx.GraphModule, model: nn.Module) -> None:
