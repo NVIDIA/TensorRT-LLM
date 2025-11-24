@@ -93,18 +93,6 @@ NVCC_FLAGS += $(PREPROCESSOR_FLAGS)
 # The include directories.
 INCLUDE_DIRS += -I./src -I./generated -I$(CUDA)/include
 
-ifndef ENABLE_SM70
-GENCODE_SM70 =
-else
-GENCODE_SM70 = -gencode=arch=compute_70,code="sm_70"
-endif
-
-ifndef ENABLE_SM72
-GENCODE_SM72 =
-else
-GENCODE_SM72 = -gencode=arch=compute_72,code="sm_72"
-endif
-
 GENCODE_SM80 = -gencode=arch=compute_80,code=\"sm_80\"
 GENCODE_SM86 = -gencode=arch=compute_86,code=\"sm_86\"
 GENCODE_SM87 = -gencode=arch=compute_87,code=\"sm_87\"
