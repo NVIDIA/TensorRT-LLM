@@ -30,7 +30,83 @@ from ...models.modeling_utils import QuantConfig
 from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..utils import Fp4QuantizedTensor, unswizzle_sf
+# from .fused_moe.moe_load_balancer import advise_tensor_pageout
+import ctypes
+import mmap
 
+def advise_tensor_pageout(tensor, mode: str = "dontneed"):
+    """
+    Advise the OS to page out or discard the physical memory pages backing a CPU tensor.
+    This works only for tensors backed by an mmap'ed file or shared memory.
+
+    Parameters
+    ----------
+    tensor : torch.Tensor
+        A CPU tensor (usually created via torch.from_file() or numpy.memmap()).
+    mode : str, optional
+        "pageout"  -> use MADV_PAGEOUT (asynchronous pageout, Linux 4.5+)
+        "dontneed" -> use MADV_DONTNEED (immediate discard)
+
+    Raises
+    ------
+    ValueError
+        If the tensor is not on CPU or an invalid mode is given.
+    OSError
+        If the madvise() syscall fails (errno will be included).
+
+    Notes
+    -----
+    - Works only on Linux systems.
+    - This call only gives a *hint* to the kernel: the OS may decide to ignore it.
+    - Safe to call on mmap-backed tensors (data will be reloaded on next access).
+    - If called on a malloc-based tensor (not mmap), madvise() simply does nothing
+      and returns 0 (success) because the virtual address range is anonymous memory.
+      It does NOT crash or corrupt data.
+    """
+
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    MADV_PAGEOUT = 21
+    MADV_DONTNEED = 4
+
+    if not tensor.device.type == "cpu":
+        raise ValueError("Only CPU tensors are supported.")
+
+    # Get raw pointer and size in bytes
+    ptr = tensor.data_ptr()
+    nbytes = tensor.numel() * tensor.element_size()
+
+    # Only operate on complete pages within the tensor's memory range
+    # to avoid affecting memory outside the tensor boundaries
+    page_size = mmap.PAGESIZE
+
+    # Round up to the first complete page boundary inside the tensor
+    start_aligned = (ptr + page_size - 1) & ~(page_size - 1)
+
+    # Round down to the last complete page boundary inside the tensor
+    end_ptr = ptr + nbytes
+    end_aligned = end_ptr & ~(page_size - 1)
+
+    # Calculate the size of complete pages within the tensor
+    size = end_aligned - start_aligned
+
+    # If there are no complete pages within the tensor, skip madvise
+    if size <= 0:
+        return
+
+    # Choose advice mode
+    if mode == "pageout":
+        advice = MADV_PAGEOUT
+    elif mode == "dontneed":
+        advice = MADV_DONTNEED
+    else:
+        raise ValueError("mode must be 'pageout' or 'dontneed'.")
+
+    # Perform madvise() only on complete pages within the tensor
+    ret = libc.madvise(ctypes.c_void_p(start_aligned), ctypes.c_size_t(size),
+                       ctypes.c_int(advice))
+    if ret != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, f"madvise() failed with errno={err}")
 
 class WeightMode(str, enum.Enum):
     # weight of a vanilla layer
@@ -2100,6 +2176,12 @@ class Linear(nn.Module):
 
         weight_mode = self.weights_loading_config.weight_mode
         self.quant_method.load_weights(self, weights, weight_mode)
+
+        for w in weights:
+            for name, v in w.items():
+                if isinstance(v, torch.Tensor):
+                    print("Linear advise_tensor_pageout: ", name)
+                    advise_tensor_pageout(v)
 
     def post_load_weights(self):
         self.quant_method.post_load_weights(self)

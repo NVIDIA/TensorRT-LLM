@@ -39,6 +39,9 @@ from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
 
+import psutil
+import gc
+
 from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType
@@ -46,6 +49,7 @@ from tensorrt_llm.llmapi.utils import enable_llm_debug
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
+from tensorrt_llm._utils import mpi_rank
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
@@ -70,6 +74,86 @@ from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, EagerFusionConfig, filter_weights,
                              register_auto_model)
 
+import ctypes
+import mmap
+
+def advise_tensor_pageout(tensor, mode: str = "dontneed"):
+    """
+    Advise the OS to page out or discard the physical memory pages backing a CPU tensor.
+    This works only for tensors backed by an mmap'ed file or shared memory.
+
+    Parameters
+    ----------
+    tensor : torch.Tensor
+        A CPU tensor (usually created via torch.from_file() or numpy.memmap()).
+    mode : str, optional
+        "pageout"  -> use MADV_PAGEOUT (asynchronous pageout, Linux 4.5+)
+        "dontneed" -> use MADV_DONTNEED (immediate discard)
+
+    Raises
+    ------
+    ValueError
+        If the tensor is not on CPU or an invalid mode is given.
+    OSError
+        If the madvise() syscall fails (errno will be included).
+
+    Notes
+    -----
+    - Works only on Linux systems.
+    - This call only gives a *hint* to the kernel: the OS may decide to ignore it.
+    - Safe to call on mmap-backed tensors (data will be reloaded on next access).
+    - If called on a malloc-based tensor (not mmap), madvise() simply does nothing
+      and returns 0 (success) because the virtual address range is anonymous memory.
+      It does NOT crash or corrupt data.
+    """
+
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    MADV_PAGEOUT = 21
+    MADV_DONTNEED = 4
+
+    if not tensor.device.type == "cpu":
+        raise ValueError("Only CPU tensors are supported.")
+
+    # Get raw pointer and size in bytes
+    ptr = tensor.data_ptr()
+    nbytes = tensor.numel() * tensor.element_size()
+
+    # Only operate on complete pages within the tensor's memory range
+    # to avoid affecting memory outside the tensor boundaries
+    page_size = mmap.PAGESIZE
+
+    # Round up to the first complete page boundary inside the tensor
+    start_aligned = (ptr + page_size - 1) & ~(page_size - 1)
+
+    # Round down to the last complete page boundary inside the tensor
+    end_ptr = ptr + nbytes
+    end_aligned = end_ptr & ~(page_size - 1)
+
+    # Calculate the size of complete pages within the tensor
+    size = end_aligned - start_aligned
+
+    # If there are no complete pages within the tensor, skip madvise
+    if size <= 0:
+        return
+
+    # Choose advice mode
+    if mode == "pageout":
+        advice = MADV_PAGEOUT
+    elif mode == "dontneed":
+        advice = MADV_DONTNEED
+    else:
+        raise ValueError("mode must be 'pageout' or 'dontneed'.")
+
+    # Perform madvise() only on complete pages within the tensor
+    ret = libc.madvise(ctypes.c_void_p(start_aligned), ctypes.c_size_t(size),
+                       ctypes.c_int(advice))
+    if ret != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, f"madvise() failed with errno={err}")
+
+def print_debug(*args, **kwargs):
+    if mpi_rank() == 0:
+        print(*args, **kwargs)
 
 @triton.jit
 def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
@@ -143,6 +227,7 @@ class DeepseekV3WeightLoader:
         self.is_draft_model = is_draft_model
 
     def load_weights(self, weights: Dict):
+        host_weights = []
 
         def rename_moe_weight(weights: Dict, rename_rules: Dict):
             result = {}
@@ -171,7 +256,9 @@ class DeepseekV3WeightLoader:
             local_v_head_dim = v_head_dim if not is_scale else v_head_dim // 128
             local_kv_lora_rank = kv_lora_rank if not is_scale else kv_lora_rank // 128
 
-            kv_b_proj = weights[f"{module_name}.{weight_name}"][:].unflatten(
+            kv_b_proj_host = weights[f"{module_name}.{weight_name}"]
+            host_weights.extend(kv_b_proj_host)
+            kv_b_proj = kv_b_proj_host[:].unflatten(
                 0,
                 [
                     num_heads,
@@ -207,10 +294,14 @@ class DeepseekV3WeightLoader:
             local_v_head_dim = v_head_dim
             local_kv_lora_rank = kv_lora_rank
 
-            kv_b_proj = weights[f"{module_name}.{weight_name}"][:].cuda()
+            kv_b_proj_host = weights[f"{module_name}.{weight_name}"]
+            host_weights.extend(kv_b_proj_host)
+            kv_b_proj = kv_b_proj_host[:].cuda()
 
             weight_name = "weight_scale_inv"
-            kv_b_proj_scale = weights[f"{module_name}.{weight_name}"][:].cuda()
+            kv_b_proj_scale_host = weights[f"{module_name}.{weight_name}"]
+            host_weights.extend(kv_b_proj_scale_host)
+            kv_b_proj_scale = kv_b_proj_scale_host[:].cuda()
 
             kv_b_proj = weight_dequant(kv_b_proj, kv_b_proj_scale)
             kv_b_proj = kv_b_proj.unflatten(
@@ -272,8 +363,10 @@ class DeepseekV3WeightLoader:
         params_map = {'gate_up_proj': ['gate_proj', 'up_proj']}
         all_named_modules = dict(self.model.named_modules())
 
-        for name, module in tqdm(all_named_modules.items(),
-                                 desc="Loading weights"):
+        # for name, module in tqdm(all_named_modules.items(),
+        #                          desc="Loading weights"):
+        for name, module in all_named_modules.items():
+            print_debug(name)
             if len(module._parameters) <= 0 or name.startswith("draft_model"):
                 continue
             else:
@@ -346,19 +439,26 @@ class DeepseekV3WeightLoader:
                                 ).view(*attn_module.v_b_proj_dequant.shape).to(
                                     attn_module.v_b_proj_dequant.dtype))
                 elif names[-1] == "kv_a_proj_with_mqa":
-                    fused_a = weights[
-                        f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight"][:]
+                    fused_a_host=weights[
+                        f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight"]
+                    host_weights.extend(fused_a_host)
+                    fused_a = fused_a_host[:]
                     if not is_lite:
-                        q_a_proj = weights[
-                            f"{'.'.join(names[:-1])}.q_a_proj.weight"][:]
+                        q_a_proj_host=weights[
+                            f"{'.'.join(names[:-1])}.q_a_proj.weight"]
+                        host_weights.extend(q_a_proj_host)
+                        q_a_proj = q_a_proj_host[:]
                         fused_a = torch.cat([q_a_proj, fused_a], dim=0)
 
                     if f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight_scale_inv" in weights:
                         fused_a_scale = weights[
                             f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight_scale_inv"]
+                        host_weights.extend(fused_a_scale)
                         if not is_lite:
-                            q_a_proj_scale = weights[
-                                f"{'.'.join(names[:-1])}.q_a_proj.weight_scale_inv"][:]
+                            q_a_proj_scale_host=weights[
+                                f"{'.'.join(names[:-1])}.q_a_proj.weight_scale_inv"]
+                            host_weights.extend(q_a_proj_scale_host)
+                            q_a_proj_scale = q_a_proj_scale_host[:]
                             fused_a_scale = torch.cat(
                                 [q_a_proj_scale, fused_a_scale], dim=0)
 
@@ -372,6 +472,7 @@ class DeepseekV3WeightLoader:
                         module_weights.append(
                             filter_weights('.'.join(names[:-1] + [new_name]),
                                            weights))
+                    print_debug(f"1. Loading weights for {name}, module {module}")
                     module.load_weights(weights=module_weights)
                 elif names[-1] == "experts":
                     module_weights = filter_weights(name, weights)
@@ -380,18 +481,42 @@ class DeepseekV3WeightLoader:
                         "up_proj": "w3",
                         "gate_proj": "w1",
                     })
+                    print_debug(f"2. Loading weights for {name}, module {module}")
                     module.load_weights(weights=[module_weights])
                 elif names[-1] == "self_attn":
+                    print_debug(f"Skipping {name}, module {module}")
                     continue
                 elif names[-1] == "next_layer_layernorm":
+                    print_debug(f"Skipping {name}, module {module}")
                     continue
                 else:
                     module_weights = filter_weights(name, weights)
                     if hasattr(module, 'load_weights'):
+                        print_debug(f"3. Loading weights for {name}, module {module}")
                         module.load_weights(weights=[module_weights])
                     else:
                         for n, p in module.named_parameters():
-                            p.data.copy_(module_weights[n][:])
+                            w_host=module_weights[n]
+                            host_weights.extend(w_host)
+                            p.data.copy_(w_host[:])
+
+            for w in host_weights:
+                advise_tensor_pageout(w)
+            host_weights = []
+            gc.collect()
+
+            mem = psutil.virtual_memory()
+
+            total_gb = mem.total / (1024 ** 3)
+            used_gb = mem.used / (1024 ** 3)
+            available_gb = mem.available / (1024 ** 3)
+            percentage = mem.percent
+
+            # print_debug("====== memory usage =======")
+            # print_debug(f"Total memory (GB): {total_gb:.2f}")
+            print_debug(f"Used memory (GB): {used_gb:.2f}")
+            print_debug(f"Available memory (GB): {available_gb:.2f}")
+            # print_debug(f"Memory usage percentage (%): {percentage:.1f}")
 
 
 class DeepseekV3MTPHead(nn.Module):
@@ -771,12 +896,21 @@ class DeepseekV3Gate(DeepSeekV3MoeRoutingMethod):
 
     def load_weights(self, weights: List[Dict]):
         assert len(weights) == 1
+        host_weights = []
 
-        self.weight.copy_(weights[0]["weight"][:])
+        weight_host = weights[0]["weight"]
+        host_weights.extend(weight_host)
+        self.weight.copy_(weight_host[:])
 
+        e_score_correction_bias_host = weights[0]["e_score_correction_bias"]
+        host_weights.extend(e_score_correction_bias_host)
         self.e_score_correction_bias.copy_(
-            weights[0]["e_score_correction_bias"][:].to(
+            e_score_correction_bias_host[:].to(
                 self.e_score_correction_bias.dtype))
+
+        for w in host_weights:
+            advise_tensor_pageout(w)
+        host_weights = []
 
     def apply(self, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # topk routing

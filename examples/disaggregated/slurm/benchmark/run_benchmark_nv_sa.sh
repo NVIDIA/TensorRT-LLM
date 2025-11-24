@@ -70,6 +70,7 @@ for concurrency in ${concurrency_list}; do
 
     python "${BENCH_SCRIPT}" \
         --model "${model_name}" \
+        --trust-remote-code \
         --host "${hostname}" \
         --port "${port}" \
         --dataset-name random \

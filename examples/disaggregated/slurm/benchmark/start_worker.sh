@@ -26,6 +26,8 @@ for env_var in ${worker_env_var}; do
     echo "Exported: ${env_var}"
 done
 
+export ENROOT_ALLOW_DEV=yes
+
 if [ "${enable_pdl}" = "true" ]; then
     export TRTLLM_ENABLE_PDL=1
 fi

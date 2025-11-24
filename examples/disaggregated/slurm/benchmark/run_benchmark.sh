@@ -45,6 +45,7 @@ for concurrency in ${concurrency_list}; do
     mkdir -p ${log_path}/concurrency_${concurrency}
     python -m tensorrt_llm.serve.scripts.benchmark_serving \
         --model ${model_name} \
+        --trust-remote-code \
         --backend openai \
         --host ${hostname} \
         --port ${port} \
