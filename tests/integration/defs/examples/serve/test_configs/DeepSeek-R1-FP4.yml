@@ -1,0 +1,18 @@
+enable_iter_perf_stats: true
+print_iter_log: false
+cuda_graph_config:
+ max_batch_size: 16
+ enable_padding: false
+moe_config:
+ backend: TRTLLM
+ max_num_tokens: 32768
+speculative_config:
+  decoding_type: MTP
+  num_nextn_predict_layers: 3
+disable_overlap_scheduler: true
+enable_autotuner: true
+kv_cache_config:
+  free_gpu_memory_fraction: 0.6
+  enable_block_reuse: true
+  enable_partial_reuse: false
+enable_chunked_prefill: true

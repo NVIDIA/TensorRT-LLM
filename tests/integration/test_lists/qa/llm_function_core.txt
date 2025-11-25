@@ -755,6 +755,7 @@ examples/test_eagle.py::test_phi_eagle_1gpu[Phi-3-small-128k-instruct-eagle2]
 examples/test_eagle.py::test_phi_eagle_1gpu[Phi-3.5-mini-instruct-eagle2]
 
 examples/serve/test_serve.py::test_extra_llm_api_options
+examples/serve/test_serve.py::test_extra_llm_api_options_for_deepseek_r1_fp4 TIMEOUT (120)
 examples/serve/test_serve_negative.py::test_invalid_max_tokens
 examples/serve/test_serve_negative.py::test_invalid_temperature
 examples/serve/test_serve_negative.py::test_invalid_top_p[-0.1]
