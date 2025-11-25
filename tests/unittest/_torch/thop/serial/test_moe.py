@@ -1184,17 +1184,19 @@ class TestMoeFp4:
     @pytest.mark.parametrize("swiglu_beta", [0, 1], ids=lambda v: f"beta{v}")
     @pytest.mark.parametrize("swiglu_limit", [float("inf"), 1],
                              ids=lambda v: f"limit{v}")
-    def test_gptoss(self, num_tokens, hidden_size, intermediate_size,
-                    routing_info, swiglu_alpha, swiglu_beta, swiglu_limit):
+    def test_gptoss_style_nvfp4(self, num_tokens, hidden_size,
+                                intermediate_size, routing_info, swiglu_alpha,
+                                swiglu_beta, swiglu_limit):
 
-        self.run_moe_fp4_gptoss_test(num_tokens,
-                                     hidden_size,
-                                     intermediate_size,
-                                     routing_info,
-                                     use_autotune=False,
-                                     swiglu_alpha=swiglu_alpha,
-                                     swiglu_beta=swiglu_beta,
-                                     swiglu_limit=swiglu_limit)
+        self.run_moe_fp4_test(num_tokens,
+                              hidden_size,
+                              intermediate_size,
+                              routing_info,
+                              use_autotune=False,
+                              gptoss_style=True,
+                              swiglu_alpha=swiglu_alpha,
+                              swiglu_beta=swiglu_beta,
+                              swiglu_limit=swiglu_limit)
 
     @pytest.mark.parametrize("num_tokens", [1])
     @pytest.mark.parametrize("hidden_size", [1024])
@@ -1258,9 +1260,17 @@ class TestMoeFp4:
                               use_autotune=True,
                               use_topk_as_input=True)
 
-    def run_moe_fp4_test(self, num_tokens: int, hidden_size: int,
-                         intermediate_size: int, routing_info: dict,
-                         use_autotune: bool, use_topk_as_input: bool) -> None:
+    def run_moe_fp4_test(self,
+                         num_tokens: int,
+                         hidden_size: int,
+                         intermediate_size: int,
+                         routing_info: dict,
+                         use_autotune: bool,
+                         use_topk_as_input: bool = False,
+                         gptoss_style: bool = False,
+                         swiglu_alpha: float = None,
+                         swiglu_beta: float = None,
+                         swiglu_limit: float = None) -> None:
 
         torch.random.manual_seed(0)
 
@@ -1328,6 +1338,39 @@ class TestMoeFp4:
             device='cuda',
             dtype=torch.bfloat16)
 
+        gemm1_bias = None
+        gemm2_bias = None
+        swiglu_alpha_tensor = None
+        swiglu_beta_tensor = None
+        swiglu_limit_tensor = None
+
+        if gptoss_style:
+            gemm1_bias = 50 * torch.randn(num_experts,
+                                          2 * intermediate_size,
+                                          device='cuda',
+                                          dtype=torch.float)
+            gemm2_bias = 50 * torch.randn(
+                num_experts, hidden_size, device='cuda', dtype=torch.float)
+
+            # waived due to missing kernel support for bias in nvfp4
+            #gemm1_bias[:] = 0
+            #gemm2_bias[:] = 0
+
+            swiglu_alpha_tensor = torch.full((num_experts, ),
+                                             swiglu_alpha,
+                                             device='cuda',
+                                             dtype=torch.float)
+
+            swiglu_beta_tensor = torch.full((num_experts, ),
+                                            swiglu_beta,
+                                            device='cuda',
+                                            dtype=torch.float)
+
+            swiglu_limit_tensor = torch.full((num_experts, ),
+                                             swiglu_limit,
+                                             device='cuda',
+                                             dtype=torch.float)
+
         use_ue8m0 = False
         # Quantize hidden states. Produces scales for activations in 128x4 layout for ref impl.
         hidden_states_fp4_bytes, hidden_states_scale_fp4_bytes, hidden_states_scale_global = quant_fp4(
@@ -1381,285 +1424,6 @@ class TestMoeFp4:
         elif routing_method_type == RoutingMethodType.RenormalizeNaive:
             permute_info, scores = routing_reference_renormalize_naive(
                 expert_logits, top_k, padding)
-
-        args = moe_args(num_tokens, num_experts, hidden_size, intermediate_size,
-                        top_k, padding, hidden_states_fp4_bytes,
-                        hidden_states_scale_fp4_bytes,
-                        hidden_states_scale_global, scores,
-                        gemm1_weights_fp4_bytes, gemm1_scales_fp4_bytes,
-                        gemm1_scales_global, gemm2_weights_fp4_bytes,
-                        gemm2_scales_fp4_bytes, gemm2_scales_global,
-                        permute_info, False)
-        #
-        # Run the reference implementations
-        #
-        # It is important to run the reference implementation before the TRT-LLM kernel
-        # because the MoE shuffles the weights in-place.
-        output_dequant_reference, args_dequant = run_moe_reference_fp4(args)
-
-        # FIXME: this depends on the kernel internals
-        epilogue_tile_m = 128
-
-        # Reorder rows of W1 and scales for fused gated activation
-        gemm1_weights_fp4_interleaved = []
-        gemm1_scales_fp4_interleaved = []
-        for i in range(num_experts):
-            gemm1_weights_fp4_interleaved.append(
-                reorder_rows_for_gated_act_gemm(gemm1_weights_fp4[i].clone()))
-            gemm1_scales_fp4_interleaved.append(
-                reorder_rows_for_gated_act_gemm(
-                    gemm1_scales_linear_fp4[i].clone()))
-
-        # Stack weights and scales for all experts
-        gemm1_weights_fp4_interleaved = torch.stack(
-            gemm1_weights_fp4_interleaved).reshape(num_experts,
-                                                   2 * intermediate_size,
-                                                   hidden_size // 2)
-        gemm1_scales_fp4_interleaved = torch.stack(
-            gemm1_scales_fp4_interleaved).reshape(num_experts,
-                                                  2 * intermediate_size,
-                                                  hidden_size // 16)
-
-        # Shuffle weights and scaling factors for transposed mma output
-        gemm1_weights_fp4_shuffled = []
-        gemm1_scales_fp4_shuffled = []
-        gemm2_weights_fp4_shuffled = []
-        gemm2_scales_fp4_shuffled = []
-        for i in range(num_experts):
-            gemm1_weights_fp4_shuffled.append(
-                shuffle_matrix_a(
-                    gemm1_weights_fp4_interleaved[i].view(torch.uint8),
-                    epilogue_tile_m))
-            gemm1_scales_fp4_shuffled.append(
-                shuffle_matrix_sf_a(
-                    gemm1_scales_fp4_interleaved[i].view(torch.uint8),
-                    epilogue_tile_m))
-
-            gemm2_weights_fp4_shuffled.append(
-                shuffle_matrix_a(gemm2_weights_fp4[i].view(torch.uint8),
-                                 epilogue_tile_m))
-            gemm2_scales_fp4_shuffled.append(
-                shuffle_matrix_sf_a(
-                    gemm2_scales_linear_fp4[i].view(torch.uint8),
-                    epilogue_tile_m))
-
-        # Stack weights for all experts
-        gemm1_weights_fp4_shuffled = torch.stack(gemm1_weights_fp4_shuffled)
-        gemm1_scales_fp4_shuffled = torch.stack(gemm1_scales_fp4_shuffled).view(
-            torch.float8_e4m3fn).reshape(num_experts, 2 * intermediate_size,
-                                         hidden_size // 16)
-
-        gemm2_weights_fp4_shuffled = torch.stack(gemm2_weights_fp4_shuffled)
-        gemm2_scales_fp4_shuffled = torch.stack(gemm2_scales_fp4_shuffled).view(
-            torch.float8_e4m3fn).reshape(num_experts, hidden_size,
-                                         intermediate_size // 16)
-
-        #
-        # Run the TRT-LLM kernel
-        #
-
-        # c_global_sf: fc2_input_scale
-        scale_c_fc1 = args_dequant.c_global_sf * (
-            1.0 / args.gemm1_scales_global) * (1.0 /
-                                               args.hidden_states_scale_global)
-
-        # self.fc31_alpha
-        scale_gate_fc1 = (1.0 / args.gemm1_scales_global) * (
-            1.0 / args.hidden_states_scale_global)
-
-        # self.fc2_alpha
-        scale_c_fc2 = (1.0 / args_dequant.c_global_sf) * (
-            1.0 / args.gemm2_scales_global)
-
-        if use_topk_as_input:
-            topk_ids = permute_info["topKIndices"].to(torch.int32)
-            topk_weights = permute_info["topKLogits"].to(torch.bfloat16)
-            expert_logits = None
-        else:
-            topk_ids = None
-            topk_weights = None
-
-        AutoTuner.get().clear_cache()
-        with autotune(use_autotune):
-            output = torch.ops.trtllm.fp4_block_scale_moe_runner(
-                expert_logits,
-                routing_bias,
-                hidden_states_fp4,
-                hidden_states_scale_linear_fp4,
-                gemm1_weights_fp4_shuffled,
-                gemm1_scales_fp4_shuffled,
-                None,  # Bias
-                None,  # Alpha
-                None,  # Beta
-                None,  # Limit
-                gemm2_weights_fp4_shuffled,
-                gemm2_scales_fp4_shuffled,
-                None,  # Bias
-                scale_c_fc1,
-                scale_gate_fc1,
-                scale_c_fc2,
-                num_experts,
-                top_k,
-                n_groups,
-                top_k_groups,
-                intermediate_size,
-                0,
-                num_experts,
-                routed_scaling,
-                routing_method_type,
-                do_finalize=True,
-                topk_ids=topk_ids,
-                topk_weights=topk_weights)
-        torch.cuda.synchronize()
-        output_dequant_actual = output[0].to(torch.float)
-
-        check_accuracy(output_dequant_reference,
-                       output_dequant_actual,
-                       atol=0.1,
-                       rtol=0.85,
-                       percent=0.925)
-
-    def run_moe_fp4_gptoss_test(self, num_tokens: int, hidden_size: int,
-                                intermediate_size: int, routing_info: dict,
-                                use_autotune: bool, swiglu_alpha: float,
-                                swiglu_beta: float,
-                                swiglu_limit: float) -> None:
-        torch.random.manual_seed(0)
-
-        #
-        # Data Generation
-        #
-        num_experts = routing_info["num_experts"]
-        top_k = routing_info["top_k"]
-        n_groups = routing_info["n_groups"]
-        top_k_groups = routing_info["top_k_groups"]
-        routed_scaling = routing_info["routed_scaling"]
-        has_routing_bias = routing_info["has_routing_bias"]
-        routing_method_type = routing_info["routing_method_type"]
-        # Perfect expert distribution results in `num_tokens * top_k / num_experts` tokens per expert.
-        tile_tokens_dim = (num_tokens * top_k) // num_experts
-        # And pad the number of tokens to the next power of 2.
-        tile_tokens_dim = next_positive_power_of_2(tile_tokens_dim)
-        # At least padded to 8 tokens per CTA tile
-        tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
-        padding = tile_tokens_dim
-        if padding >= 256:
-            pytest.skip("Routing kernel requires that padding be less than 256")
-
-        assert top_k <= num_experts
-        assert top_k <= 10
-        assert num_experts % 4 == 0
-
-        if are_groups_valid(top_k_groups, n_groups):
-            assert top_k_groups <= 4
-            assert num_experts > n_groups
-            assert num_experts % n_groups == 0
-            assert top_k < (top_k_groups * num_experts / n_groups)
-
-        if routing_method_type == RoutingMethodType.DeepSeekV3:
-            expert_logits = torch.randn((num_tokens, num_experts),
-                                        device='cuda').to(torch.float)
-        elif routing_method_type == RoutingMethodType.RenormalizeNaive or routing_method_type == RoutingMethodType.Renormalize:
-            expert_logits = torch.randn((num_tokens, num_experts),
-                                        device='cuda').to(torch.bfloat16)
-
-        if has_routing_bias:
-            routing_bias = torch.randn(num_experts,
-                                       device="cuda",
-                                       dtype=torch.bfloat16)
-        else:
-            routing_bias = None
-
-        hidden_states = 2 * torch.randn(
-            (num_tokens, hidden_size), device='cuda', dtype=torch.bfloat16)
-        gemm1_weights = torch.randn(
-            (num_experts, 2 * intermediate_size, hidden_size),
-            device='cuda',
-            dtype=torch.bfloat16)
-        gemm1_bias = 50 * torch.randn(num_experts,
-                                      2 * intermediate_size,
-                                      device='cuda',
-                                      dtype=torch.float)
-        gemm2_weights = torch.randn(
-            (num_experts, hidden_size, intermediate_size),
-            device='cuda',
-            dtype=torch.bfloat16)
-        gemm2_bias = 50 * torch.randn(
-            num_experts, hidden_size, device='cuda', dtype=torch.float)
-
-        # waived due to missing kernel support for bias in nvfp4
-        #gemm1_bias[:] = 0
-        #gemm2_bias[:] = 0
-
-        use_ue8m0 = False
-        # Quantize hidden states. Produces scales for activations in 128x4 layout for ref impl.
-        hidden_states_fp4_bytes, hidden_states_scale_fp4_bytes, hidden_states_scale_global = quant_fp4(
-            hidden_states, use_ue8m0, True)
-
-        # We do it twice to get the linear layout for scales for the FP4 kernels.
-        _, hidden_states_scale_linear_fp4_bytes, _ = quant_fp4(
-            hidden_states, use_ue8m0, False)
-
-        hidden_states_fp4 = hidden_states_fp4_bytes.reshape(
-            num_tokens, hidden_size // 2)  # packed fp4
-
-        hidden_states_scale_linear_fp4 = hidden_states_scale_linear_fp4_bytes.view(
-            torch.float8_e4m3fn)  # fp8 scaling factors
-
-        # Quantize the weights for FC1. Produces scales for weights in 128x4 layout for ref impl.
-        gemm1_weights_fp4_bytes, gemm1_scales_fp4_bytes, gemm1_scales_global = quant_fp4_batches(
-            gemm1_weights, num_experts, use_ue8m0, True)
-        # We do it twice to get the linear layout for scales for the FP4 kernels.
-        _, gemm1_scales_linear_fp4_bytes, _ = quant_fp4_batches(
-            gemm1_weights, num_experts, use_ue8m0, False)
-
-        gemm1_weights_fp4 = gemm1_weights_fp4_bytes.view(
-            torch.float8_e4m3fn).reshape(num_experts, 2 * intermediate_size,
-                                         hidden_size // 2)  # packed fp4
-        gemm1_scales_linear_fp4 = gemm1_scales_linear_fp4_bytes.view(
-            torch.float8_e4m3fn).reshape(num_experts, 2 * intermediate_size,
-                                         hidden_size //
-                                         16)  # fp8 scaling factors
-
-        # Quantize the weights for FC2. Produces scales for weights in 128x4 layout for ref impl.
-        gemm2_weights_fp4_bytes, gemm2_scales_fp4_bytes, gemm2_scales_global = quant_fp4_batches(
-            gemm2_weights, num_experts, use_ue8m0, True)
-        # We do it twice to get the linear layout for scales for the FP4 kernels.
-        _, gemm2_scales_linear_fp4_bytes, _ = quant_fp4_batches(
-            gemm2_weights, num_experts, use_ue8m0, False)
-
-        gemm2_weights_fp4 = gemm2_weights_fp4_bytes.view(
-            torch.float8_e4m3fn).reshape(num_experts, hidden_size,
-                                         intermediate_size // 2)  # packed fp4
-        gemm2_scales_linear_fp4 = gemm2_scales_linear_fp4_bytes.view(
-            torch.float8_e4m3fn).reshape(num_experts, hidden_size,
-                                         intermediate_size //
-                                         16)  # fp8 scaling factors
-        if routing_method_type == RoutingMethodType.DeepSeekV3:
-            permute_info, scores = routing_reference_no_aux(
-                expert_logits, routing_bias, top_k, n_groups, top_k_groups,
-                routed_scaling, padding)
-        elif routing_method_type == RoutingMethodType.Renormalize:
-            permute_info, scores = routing_reference_renormalize(
-                expert_logits, top_k, padding)
-        elif routing_method_type == RoutingMethodType.RenormalizeNaive:
-            permute_info, scores = routing_reference_renormalize_naive(
-                expert_logits, top_k, padding)
-
-        swiglu_alpha_tensor = torch.full((num_experts, ),
-                                         swiglu_alpha,
-                                         device='cuda',
-                                         dtype=torch.float)
-
-        swiglu_beta_tensor = torch.full((num_experts, ),
-                                        swiglu_beta,
-                                        device='cuda',
-                                        dtype=torch.float)
-
-        swiglu_limit_tensor = torch.full((num_experts, ),
-                                         swiglu_limit,
-                                         device='cuda',
-                                         dtype=torch.float)
 
         args = moe_args(num_tokens,
                         num_experts,
@@ -1704,9 +1468,10 @@ class TestMoeFp4:
             gemm1_scales_fp4_interleaved.append(
                 reorder_rows_for_gated_act_gemm(
                     gemm1_scales_linear_fp4[i].clone()))
-            gemm1_bias_interleaved.append(
-                reorder_rows_for_gated_act_gemm(gemm1_bias[i].clone().reshape(
-                    -1, 1)))
+            if gemm1_bias is not None:
+                gemm1_bias_interleaved.append(
+                    reorder_rows_for_gated_act_gemm(
+                        gemm1_bias[i].clone().reshape(-1, 1)))
 
         # Stack weights and scales for all experts
         gemm1_weights_fp4_interleaved = torch.stack(
@@ -1734,8 +1499,10 @@ class TestMoeFp4:
                 shuffle_matrix_sf_a(
                     gemm1_scales_fp4_interleaved[i].view(torch.uint8),
                     epilogue_tile_m))
-            gemm1_bias_shuffled.append(
-                shuffle_matrix_a(gemm1_bias_interleaved[i], epilogue_tile_m))
+            if gemm1_bias is not None:
+                gemm1_bias_shuffled.append(
+                    shuffle_matrix_a(gemm1_bias_interleaved[i],
+                                     epilogue_tile_m))
 
             gemm2_weights_fp4_shuffled.append(
                 shuffle_matrix_a(gemm2_weights_fp4[i].view(torch.uint8),
@@ -1744,10 +1511,10 @@ class TestMoeFp4:
                 shuffle_matrix_sf_a(
                     gemm2_scales_linear_fp4[i].view(torch.uint8),
                     epilogue_tile_m))
-
-            gemm2_bias_shuffled.append(
-                shuffle_matrix_a(gemm2_bias[i].clone().reshape(-1, 1),
-                                 epilogue_tile_m))
+            if gemm2_bias is not None:
+                gemm2_bias_shuffled.append(
+                    shuffle_matrix_a(gemm2_bias[i].clone().reshape(-1, 1),
+                                     epilogue_tile_m))
 
         # Stack weights for all experts
         gemm1_weights_fp4_shuffled = torch.stack(gemm1_weights_fp4_shuffled)
@@ -1760,27 +1527,34 @@ class TestMoeFp4:
             torch.float8_e4m3fn).reshape(num_experts, hidden_size,
                                          intermediate_size // 16)
 
-        gemm1_bias_shuffled = torch.stack(gemm1_bias_shuffled).reshape(
-            num_experts, -1)
+        if gemm1_bias is not None:
+            gemm1_bias_shuffled = torch.stack(gemm1_bias_shuffled).reshape(
+                num_experts, -1)
+        else:
+            gemm1_bias_shuffled = None
 
-        gemm2_bias_shuffled = torch.stack(gemm2_bias_shuffled).reshape(
-            num_experts, -1)
-
-        # NOTE: correct the beta and clamp to account for the global scale factor
-        # Check cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/GemmGatedActOptions.h
-        # for more details
-        swiglu_beta_tensor = swiglu_beta_tensor * args.gemm1_scales_global * args.hidden_states_scale_global
-        swiglu_limit_tensor = swiglu_limit_tensor * args.gemm1_scales_global * args.hidden_states_scale_global
-        # Check cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/BatchedGemmInterface.h
-        # for more details
-        gemm1_bias_shuffled = gemm1_bias_shuffled * args.gemm1_scales_global[:,
-                                                                             None] * args.hidden_states_scale_global
-        gemm2_bias_shuffled = gemm2_bias_shuffled * args_dequant.c_global_sf * args.gemm2_scales_global[:,
-                                                                                                        None]
+        if gemm2_bias is not None:
+            gemm2_bias_shuffled = torch.stack(gemm2_bias_shuffled).reshape(
+                num_experts, -1)
+        else:
+            gemm2_bias_shuffled = None
 
         #
         # Run the TRT-LLM kernel
         #
+
+        if gptoss_style:
+            # NOTE: correct the beta and clamp to account for the global scale factor
+            # Check cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/GemmGatedActOptions.h
+            # for more details
+            swiglu_beta_tensor = swiglu_beta_tensor * args.gemm1_scales_global * args.hidden_states_scale_global
+            swiglu_limit_tensor = swiglu_limit_tensor * args.gemm1_scales_global * args.hidden_states_scale_global
+            # Check cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/BatchedGemmInterface.h
+            # for more details
+            gemm1_bias_shuffled = gemm1_bias_shuffled * args.gemm1_scales_global[:,
+                                                                                 None] * args.hidden_states_scale_global
+            gemm2_bias_shuffled = gemm2_bias_shuffled * args_dequant.c_global_sf * args.gemm2_scales_global[:,
+                                                                                                            None]
 
         # c_global_sf: fc2_input_scale
         scale_c_fc1 = args_dequant.c_global_sf * (
@@ -1795,6 +1569,14 @@ class TestMoeFp4:
         scale_c_fc2 = (1.0 / args_dequant.c_global_sf) * (
             1.0 / args.gemm2_scales_global)
 
+        if use_topk_as_input:
+            topk_ids = permute_info["topKIndices"].to(torch.int32)
+            topk_weights = permute_info["topKLogits"].to(torch.bfloat16)
+            expert_logits = None
+        else:
+            topk_ids = None
+            topk_weights = None
+
         AutoTuner.get().clear_cache()
         with autotune(use_autotune):
             output = torch.ops.trtllm.fp4_block_scale_moe_runner(
@@ -1804,13 +1586,13 @@ class TestMoeFp4:
                 hidden_states_scale_linear_fp4,
                 gemm1_weights_fp4_shuffled,
                 gemm1_scales_fp4_shuffled,
-                gemm1_bias_shuffled,
-                swiglu_alpha_tensor,
-                swiglu_beta_tensor,
-                swiglu_limit_tensor,
+                gemm1_bias_shuffled,  # Bias
+                swiglu_alpha_tensor,  # Alpha
+                swiglu_beta_tensor,  # Beta
+                swiglu_limit_tensor,  # Limit
                 gemm2_weights_fp4_shuffled,
                 gemm2_scales_fp4_shuffled,
-                gemm2_bias_shuffled,
+                gemm2_bias_shuffled,  # Bias
                 scale_c_fc1,
                 scale_gate_fc1,
                 scale_c_fc2,
@@ -1823,15 +1605,26 @@ class TestMoeFp4:
                 num_experts,
                 routed_scaling,
                 routing_method_type,
-                do_finalize=True)
+                do_finalize=True,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights)
         torch.cuda.synchronize()
         output_dequant_actual = output[0].to(torch.float)
 
+        if gptoss_style:
+            atol = 0.2
+            rtol = 0.2
+            percent = 0.85
+        else:
+            atol = 0.1
+            rtol = 0.85
+            percent = 0.925
+
         check_accuracy(output_dequant_reference,
                        output_dequant_actual,
-                       atol=0.2,
-                       rtol=0.2,
-                       percent=0.85)
+                       atol=atol,
+                       rtol=rtol,
+                       percent=percent)
 
     def run_moe_fp8_fp4_test(self, num_tokens: int, hidden_size: int,
                              intermediate_size: int, routing_info: dict,
