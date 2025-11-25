@@ -235,7 +235,7 @@ def compute_cu_seqlen_kv_bounds_with_cache(
     Args:
         seq_lens: current token lengths [num_contexts], dtype=torch.int32
         num_contexts: Number of sequences in the batch
-        num_ctx_tokens: Total number of NEW Q tokens across all sequences
+        num_ctx_tokens: Total number of context tokens across all sequences in current batch
         cached_token_lens: Cached KV token lengths [num_contexts], dtype=torch.int32 (optional)
 
     Returns:
@@ -260,7 +260,7 @@ def compute_cu_seqlen_kv_bounds_with_cache(
     # Each Q token's KV window starts at its request's KV sequence start
     cu_seqlen_ks = cu_kv_offsets[batch_ids]  # [num_ctx_tokens]
 
-    # Compute local Q position within each request (0-based, relative to NEW tokens)
+    # Compute local Q position within each request (0-based, relative to current batch context tokens)
     cu_q_offsets = torch.cat([
         torch.zeros(1, device=device, dtype=torch.int32),
         torch.cumsum(seq_lens, dim=0).to(torch.int32)
@@ -770,7 +770,7 @@ class Indexer(nn.Module):
         Args:
             metadata: Attention metadata
             chunk_specs: List of (req_idx, token_start_in_req, token_end_in_req, req_cum_start)
-                        - token_start_in_req, token_end_in_req are indices into NEW tokens
+                        - token_start_in_req, token_end_in_req are indices into current batch context tokens
                         - For multi-request: multiple specs from different requests (full requests)
                         - For intra-request: single spec from one request's Q-block
 
@@ -799,11 +799,11 @@ class Indexer(nn.Module):
                                         dtype=torch.int32,
                                         device='cpu') + num_cached
 
-            # Q token range in batch (indices into NEW tokens)
+            # Q token range in batch (indices into context tokens in the current batch)
             token_start = req_cum_start + token_start_in_req
             token_end = req_cum_start + token_end_in_req
 
-            # K token range: index into full KV slot mapping (cached + new)
+            # K token range: index into full KV slot mapping (cached + current batch context tokens)
             kv_offset_in_extended = metadata.host_ctx_kv_indptr[req_idx].item()
             total_kv_for_req = num_cached + token_end_in_req
             k_token_start = kv_offset_in_extended
@@ -838,11 +838,11 @@ class Indexer(nn.Module):
                 req_seq_lens_tensor, len(chunk_specs), num_q_tokens,
                 req_cached_lens_tensor)
 
-            # Global Q token ranges (indices into NEW tokens)
+            # Global Q token ranges (indices into ctx tokens in the current batch)
             token_start = chunk_specs[0][3]  # req_cum_start of first request
             token_end = token_start + num_q_tokens
 
-            # K token range: index into EXTENDED slot mapping (covers cached + new for all requests)
+            # K token range: index into full kv slot mapping (cached + current ctx tokens within the batch)
             kv_offset_in_extended = metadata.host_ctx_kv_indptr[
                 first_req_idx].item()
             total_kv_len = sum(req_seq_lens_tensor +
@@ -1016,7 +1016,7 @@ class Indexer(nn.Module):
                 num_cached = start_positions[req_idx].item()
                 total_kv = num_cached + num_new_tokens
 
-                # Compute slots for ALL KV positions (cached + new) for this request
+                # Compute slots for ALL KV positions (cached + current ctx tokens) for this request
                 for kv_pos in range(total_kv):
                     block_idx_in_seq = kv_pos // tokens_per_block
                     pos_in_block = kv_pos % tokens_per_block
@@ -1096,7 +1096,7 @@ class Indexer(nn.Module):
         """
         Gather K values from indexer cache for a specific chunk.
 
-        Uses pre-computed extended slot mappings that cover cached + new tokens.
+        Uses pre-computed extended slot mappings that cover cached + current batch context tokens.
         chunk.k_token_start/k_token_end directly index into the extended slot mapping.
 
         Args:
