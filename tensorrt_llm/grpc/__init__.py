@@ -30,8 +30,7 @@ Key Features:
 - Disaggregated inference support
 
 Usage:
-    python -m tensorrt_llm.entrypoints.grpc_server \\
-        --model /path/to/model \\
+    python -m tensorrt_llm.commands.serve grpc /path/to/model \\
         --host 0.0.0.0 \\
         --port 50051
 """
@@ -70,14 +69,24 @@ except ImportError:
     create_lora_request_from_proto = None
     create_disaggregated_params_from_proto = None
 
+# Try to import servicer
+try:
+    from .grpc_servicer import TrtLlmEngineServicer
+    SERVICER_AVAILABLE = True
+except ImportError:
+    SERVICER_AVAILABLE = False
+    TrtLlmEngineServicer = None
+
 __all__ = [
     "GRPC_MODULE_DIR",
     "PROTO_FILE",
     "PROTOS_AVAILABLE",
     "REQUEST_MANAGER_AVAILABLE",
+    "SERVICER_AVAILABLE",
     "trtllm_engine_pb2",
     "trtllm_engine_pb2_grpc",
     "GrpcRequestManager",
+    "TrtLlmEngineServicer",
     "create_sampling_params_from_proto",
     "create_lora_request_from_proto",
     "create_disaggregated_params_from_proto",
