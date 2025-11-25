@@ -138,6 +138,7 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
 
     profiler.start("trtllm init")
     if backend == 'pytorch':
+        llm_args.pop("build_config", None)
         llm = PyTorchLLM(**llm_args)
     elif backend == 'tensorrt':
         llm = LLM(**llm_args)
