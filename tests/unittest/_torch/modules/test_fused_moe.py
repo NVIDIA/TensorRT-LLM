@@ -11,6 +11,7 @@ import cloudpickle
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from _torch.helpers import (calc_woq_tolerence, per_block_cast_to_fp8,
                             per_block_cast_to_fp8_e8m0,
                             per_token_cast_to_fp8_e8m0)
@@ -1344,19 +1345,17 @@ def test_fused_moe_fp8_blockwise_cute_dsl_multi_gpu(ep_size, routing_method,
             assert r is True
 
 
-@skip_pre_blackwell
-@pytest.mark.parametrize("hidden_size, intermediate_size", [(512, 512),
-                                                            (2880, 2880)])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize(
-    "moe_backend",
-    [pytest.param("TRTLLM", marks=skip_blackwell_geforce), "CUTLASS"])
-@pytest.mark.parametrize("swiglu_alpha", [1, 0.1], ids=lambda v: f"alpha{v}")
-@pytest.mark.parametrize("swiglu_beta", [0, 1], ids=lambda v: f"beta{v}")
-@pytest.mark.parametrize("swiglu_limit", [float("inf"), 1],
-                         ids=lambda v: f"limit{v}")
-def test_fused_moe_nvfp4(dtype, moe_backend, hidden_size, intermediate_size,
-                         swiglu_alpha, swiglu_beta, swiglu_limit):
+def run_fused_moe_nvfp4(dtype,
+                        moe_backend,
+                        hidden_size=512,
+                        intermediate_size=512,
+                        num_experts=8,
+                        top_k=2,
+                        seq_len=4,
+                        gptoss_style=False,
+                        swiglu_alpha=None,
+                        swiglu_beta=None,
+                        swiglu_limit=None):
 
     if moe_backend == "TRTLLM" and dtype == torch.float16:
         pytest.skip("TRTLLM NVFP4 MoE backend does not support float16 yet")
@@ -1378,11 +1377,12 @@ def test_fused_moe_nvfp4(dtype, moe_backend, hidden_size, intermediate_size,
 
     with torch.device(f"cuda:{mapping.rank}"):
         SCALING_VECTOR_SIZE = 16
-        SEQ_LEN = 8192
+
+        SEQ_LEN = seq_len
         HIDDEN_SIZE = hidden_size
         INTERMEDIATE_SIZE = intermediate_size
-        NUM_EXPERTS = 32
-        TOP_K = 4
+        NUM_EXPERTS = num_experts
+        TOP_K = top_k
         routing_method = RenormalizeMoeRoutingMethod(top_k=TOP_K)
         torch.manual_seed(0)
         torch.cuda.manual_seed(0)
@@ -1399,25 +1399,29 @@ def test_fused_moe_nvfp4(dtype, moe_backend, hidden_size, intermediate_size,
                 device="cuda") * 0.05
             w1_sf_global = (448 * 6) / w1_weight.abs().max().float()
 
-            w1_bias = torch.randn(INTERMEDIATE_SIZE,
-                                  device='cuda',
-                                  dtype=torch.float)
-
             w2_weight = torch.randn(
                 (HIDDEN_SIZE, INTERMEDIATE_SIZE), dtype=dtype,
                 device="cuda") * 0.05
             w2_sf_global = (448 * 6) / w2_weight.abs().max().float()
-
-            w2_bias = torch.randn(HIDDEN_SIZE, device='cuda', dtype=torch.float)
 
             w3_weight = torch.randn(
                 (INTERMEDIATE_SIZE, HIDDEN_SIZE), dtype=dtype,
                 device="cuda") * 0.05
             w3_sf_global = (448 * 6) / w3_weight.abs().max().float()
 
-            w3_bias = torch.randn(INTERMEDIATE_SIZE,
-                                  device='cuda',
-                                  dtype=torch.float)
+            if gptoss_style:
+                w1_bias = torch.randn(INTERMEDIATE_SIZE,
+                                      device='cuda',
+                                      dtype=torch.float)
+                w2_bias = torch.randn(HIDDEN_SIZE,
+                                      device='cuda',
+                                      dtype=torch.float)
+                w3_bias = torch.randn(INTERMEDIATE_SIZE,
+                                      device='cuda',
+                                      dtype=torch.float)
+                weights[f"{expert_id}.w1.bias"] = w1_bias
+                weights[f"{expert_id}.w2.bias"] = w2_bias
+                weights[f"{expert_id}.w3.bias"] = w3_bias
 
             w3_w1_global = min(
                 w1_sf_global,
@@ -1461,22 +1465,22 @@ def test_fused_moe_nvfp4(dtype, moe_backend, hidden_size, intermediate_size,
             weights[f"{expert_id}.w2.weight_scale_2"] = 1.0 / w2_sf_global
             weights[f"{expert_id}.w3.weight_scale_2"] = 1.0 / w3_w1_global
 
-            weights[f"{expert_id}.w1.bias"] = w1_bias
-            weights[f"{expert_id}.w2.bias"] = w2_bias
-            weights[f"{expert_id}.w3.bias"] = w3_bias
-
-        swiglu_alpha_tensor = torch.full((NUM_EXPERTS, ),
-                                         swiglu_alpha,
-                                         device='cuda',
-                                         dtype=torch.float)
-        swiglu_beta_tensor = torch.full((NUM_EXPERTS, ),
-                                        swiglu_beta,
-                                        device='cuda',
-                                        dtype=torch.float)
-        swiglu_limit_tensor = torch.full((NUM_EXPERTS, ),
-                                         swiglu_limit,
-                                         device='cuda',
-                                         dtype=torch.float)
+        swiglu_alpha_tensor = None
+        swiglu_beta_tensor = None
+        swiglu_limit_tensor = None
+        if gptoss_style:
+            swiglu_alpha_tensor = torch.full((NUM_EXPERTS, ),
+                                             swiglu_alpha,
+                                             device='cuda',
+                                             dtype=torch.float)
+            swiglu_beta_tensor = torch.full((NUM_EXPERTS, ),
+                                            swiglu_beta,
+                                            device='cuda',
+                                            dtype=torch.float)
+            swiglu_limit_tensor = torch.full((NUM_EXPERTS, ),
+                                             swiglu_limit,
+                                             device='cuda',
+                                             dtype=torch.float)
 
         quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
         fused_moe = create_moe(
@@ -1484,11 +1488,11 @@ def test_fused_moe_nvfp4(dtype, moe_backend, hidden_size, intermediate_size,
             routing_method=routing_method,
             hidden_size=HIDDEN_SIZE,
             intermediate_size=INTERMEDIATE_SIZE,
-            bias=True,
             dtype=dtype,
             reduce_results=True,
             model_config=ModelConfig(quant_config=quant_config,
                                      moe_backend=moe_backend),
+            bias=gptoss_style,
             swiglu_alpha=swiglu_alpha_tensor,
             swiglu_beta=swiglu_beta_tensor,
             swiglu_limit=swiglu_limit_tensor,
@@ -1503,9 +1507,9 @@ def test_fused_moe_nvfp4(dtype, moe_backend, hidden_size, intermediate_size,
             routing_method=routing_method,
             hidden_size=HIDDEN_SIZE,
             intermediate_size=INTERMEDIATE_SIZE,
-            bias=True,
             dtype=dtype,
             model_config=ModelConfig(quant_config=quant_config),
+            bias=gptoss_style,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit)
@@ -1520,7 +1524,24 @@ def test_fused_moe_nvfp4(dtype, moe_backend, hidden_size, intermediate_size,
             fused_moe.forward(x, router_logits)
 
         output = fused_moe.forward(x, router_logits)
-        check_accuracy(output, ref_output, rtol=0.1, atol=0.1, percent=0.95)
+
+        if gptoss_style:
+            rtol = 0.1
+            atol = 0.1
+            percent = 0.95
+        else:
+            rtol = 1e-2
+            atol = 0.15
+            percent = None
+
+        if gptoss_style:
+            check_accuracy(output,
+                           ref_output,
+                           rtol=rtol,
+                           atol=atol,
+                           percent=percent)
+        else:
+            torch.testing.assert_close(output, ref_output, rtol=rtol, atol=atol)
 
         if not test_all_kernels:
             return
@@ -1533,11 +1554,48 @@ def test_fused_moe_nvfp4(dtype, moe_backend, hidden_size, intermediate_size,
         for tactic in all_tactics:
             with AutoTuner.get().replay(tactic), torch.inference_mode():
                 output = fused_moe.forward(x, router_logits)
-                check_accuracy(output,
-                               ref_output,
-                               rtol=0.1,
-                               atol=0.1,
-                               percent=0.95)
+                if gptoss_style:
+                    check_accuracy(output,
+                                   ref_output,
+                                   rtol=rtol,
+                                   atol=atol,
+                                   percent=percent)
+                else:
+                    torch.testing.assert_close(output,
+                                               ref_output,
+                                               rtol=rtol,
+                                               atol=atol)
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("moe_backend", [
+    pytest.param("TRTLLM", marks=skip_blackwell_geforce), "CUTLASS", "CUTEDSL"
+])
+def test_fused_moe_nvfp4(dtype, moe_backend):
+    run_fused_moe_nvfp4(dtype, moe_backend)
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("hidden_size, intermediate_size", [(512, 512),
+                                                            (2880, 2880)])
+@pytest.mark.parametrize("swiglu_alpha", [1, 0.1], ids=lambda v: f"alpha{v}")
+@pytest.mark.parametrize("swiglu_beta", [0, 1], ids=lambda v: f"beta{v}")
+@pytest.mark.parametrize("swiglu_limit", [float("inf"), 1],
+                         ids=lambda v: f"limit{v}")
+def test_fused_moe_nvfp4_gptoss_style(hidden_size, intermediate_size,
+                                      swiglu_alpha, swiglu_beta, swiglu_limit):
+    run_fused_moe_nvfp4(dtype=torch.bfloat16,
+                        moe_backend="TRTLLM",
+                        hidden_size=hidden_size,
+                        intermediate_size=intermediate_size,
+                        num_experts=32,
+                        top_k=4,
+                        seq_len=8192,
+                        gptoss_style=True,
+                        swiglu_alpha=swiglu_alpha,
+                        swiglu_beta=swiglu_beta,
+                        swiglu_limit=swiglu_limit)
 
 
 @skip_pre_blackwell
