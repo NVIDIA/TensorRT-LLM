@@ -2359,7 +2359,10 @@ def get_process_grid_from_config(config: ShardingTransformConfig) -> Tuple[int, 
                 f"does not match world size {world_size}. "
                 f"Skipping 2D sharding, applying only 1D EP sharding."
             )
-            return None
+            ep_size = world_size
+            tp_size = 1
+            ep_rank = rank
+            tp_rank = 0
     else:
         ep_size = world_size
         tp_size = 1
