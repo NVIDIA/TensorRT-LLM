@@ -256,12 +256,20 @@ class GPUClockLock:
                         f"GPU {gpu_idx}: Locked clocks to SM={target_sm_clk}MHz, MEM={target_mem_clk}MHz"
                     )
                 except pynvml.NVMLError as e:
-                    print_error(f"Failed to lock clocks for GPU {gpu_idx}: {e}")
                     # Rollback any GPUs that were successfully locked
                     self._rollback_locked_gpus(locked_gpus,
                                                original_clocks_backup)
-                    raise GPUClockLockFailFastError(
-                        f"Failed to lock clocks for GPU {gpu_idx}: {e}")
+
+                    # Only raise GPUClockLockFailFastError for non-permission errors
+                    if isinstance(e, pynvml.NVMLError_NoPermission):
+                        print_warning(
+                            f"Permission denied while locking GPU {gpu_idx}, continuing: {e}"
+                        )
+                    else:
+                        print_error(
+                            f"Failed to lock clocks for GPU {gpu_idx}: {e}")
+                        raise GPUClockLockFailFastError(
+                            f"Failed to lock clocks for GPU {gpu_idx}: {e}")
 
             # Phase 3: Only mark as locked if all GPUs succeeded
             self._original_clocks = original_clocks_backup
