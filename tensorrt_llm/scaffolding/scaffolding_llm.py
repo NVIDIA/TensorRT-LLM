@@ -22,9 +22,10 @@ class ScaffoldingRequest:
 class ScaffoldingLlm:
 
     def __init__(
-            self,
-            prototype_controller: Controller,
-            workers: Mapping[str, Worker],  # map of role to worker instance
+        self,
+        prototype_controller: Controller,
+        workers: Mapping[str, Worker],  # map of role to worker instance,
+        max_parallel_requests: int = 64,
     ):
         self.prototype_controller = prototype_controller
         self.workers = workers
@@ -41,7 +42,7 @@ class ScaffoldingLlm:
 
         # For top scheduler
         self.running_req_count = 0
-        self.max_parallel_requests = 64
+        self.max_parallel_requests = max_parallel_requests
         self.pending_queue = deque()
 
         self.output_task_collection = False

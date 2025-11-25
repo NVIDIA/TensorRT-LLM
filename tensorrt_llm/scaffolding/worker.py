@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import os
 from abc import ABC
 from typing import Callable, List, Optional
 
@@ -16,6 +17,12 @@ from .task import (AssistantMessage, ChatTask, DropKVCacheTask, GenerationTask,
                    MCPCallTask, StreamGenerationTask, Task, TaskStatus)
 
 ExecutorCls = GenerationExecutor
+
+
+# Helper function to check if deterministic mode is enabled
+def is_deterministic_mode():
+    """Check if SCAFFOLDING_DETERMINISTIC environment variable is set to enable deterministic inference."""
+    return int(os.environ.get("SCAFFOLDING_DETERMINISTIC", 0)) == 1
 
 
 class Worker(ABC):
@@ -78,7 +85,12 @@ class OpenaiWorker(Worker):
     def convert_task_params(self, task: GenerationTask | ChatTask):
         params = {
             "model": self.model,
+            "extra_body": {},
         }
+
+        if hasattr(task, "sub_request_markers") and os.environ.get(
+                'DEBUG_AGENT_HIERARCHY') == '1':
+            print(f"task.sub_request_markers is {task.sub_request_markers}")
 
         if not isinstance(task, ChatTask):
             params["prompt"] = task.input_str
@@ -100,6 +112,19 @@ class OpenaiWorker(Worker):
         add_param_if_not_none(params, "top_p", [task.top_p])
         add_param_if_not_none(params, "user", [task.user])
 
+        # Override parameters for deterministic inference
+        if is_deterministic_mode():
+            params["temperature"] = 0.0  # Deterministic sampling
+            params["top_p"] = 1.0  # Disable nucleus sampling
+            params["n"] = 1  # Only return one result
+            if "seed" not in params or params["seed"] is None:
+                params["seed"] = 42  # Fixed seed for reproducibility
+
+        if hasattr(task, "sub_request_markers"):
+            params["extra_body"]["agent_hierarchy"] = [
+                task.sub_request_markers[-1]
+            ]
+
         return params
 
     def fill_generation_task_with_response(self, task: GenerationTask,
@@ -114,8 +139,7 @@ class OpenaiWorker(Worker):
 
         # Make the API call
         try:
-            response = await self.async_client.completions.create(
-                max_completion_tokens=task.max_tokens, **params)
+            response = await self.async_client.completions.create(**params)
             self.fill_generation_task_with_response(task, response)
 
             return TaskStatus.SUCCESS
@@ -167,7 +191,7 @@ class TRTOpenaiWorker(OpenaiWorker):
     def convert_task_params(self, task: GenerationTask):
         params = super().convert_task_params(task)
         if task.top_k is not None:
-            params["extra_body"] = {"top_k": task.top_k}
+            params["extra_body"]["top_k"] = task.top_k
         return params
 
 

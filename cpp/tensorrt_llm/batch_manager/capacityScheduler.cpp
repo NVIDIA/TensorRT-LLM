@@ -16,11 +16,16 @@
  */
 
 #include "tensorrt_llm/batch_manager/capacityScheduler.h"
+#include "tensorrt_llm/batch_manager/agentTree.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/batch_manager/scheduledBlocksManager.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
+
+#include <algorithm>
+#include <cstdlib>
+#include <iostream>
 
 namespace tensorrt_llm::batch_manager
 {
@@ -30,6 +35,18 @@ using kv_cache_manager::BlockKeyHasher;
 
 namespace
 {
+
+// Helper function to check if debug printing is enabled via environment variable
+// Set environment variable DEBUG_AGENT_HIERARCHY=1 to enable debug printing
+bool isAgentHierarchyDebugEnabled()
+{
+    static bool enabled = []()
+    {
+        char const* envVar = std::getenv("DEBUG_AGENT_HIERARCHY");
+        return envVar != nullptr && std::string(envVar) == "1";
+    }();
+    return enabled;
+}
 
 std::tuple<std::unordered_set<BlockKey, BlockKeyHasher>, std::unordered_set<BlockKey, BlockKeyHasher>>
 prefillWithChunkedContextsAlreadyExecuting(RequestList const& activeRequests,
@@ -138,10 +155,11 @@ MaxUtilizationScheduler::MaxUtilizationScheduler(SizeType32 maxNumRequests, bool
 {
 }
 
-GuaranteedNoEvictScheduler::GuaranteedNoEvictScheduler(
-    SizeType32 maxNumRequests, LlmRequestState noScheduleUntilState, LlmRequestState noScheduleAfterState)
+GuaranteedNoEvictScheduler::GuaranteedNoEvictScheduler(SizeType32 maxNumRequests, LlmRequestState noScheduleUntilState,
+    LlmRequestState noScheduleAfterState, float agentPercentage, std::optional<std::vector<std::string>> agentTypes)
     : BaseCapacityScheduler(noScheduleUntilState, noScheduleAfterState)
     , mMaxNumRequests(maxNumRequests)
+    , mAgentTreeRoot(agent_tree::createAgentTreeRoot(agentPercentage, agentTypes))
 {
 }
 
@@ -276,12 +294,39 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
     // Otherwise, add just check that we can add pending requests.
     if (!StaticBatchScheduling || scheduledRequests.size() == 0)
     {
-        // Now check if we can add pending requests
         auto availablePeftPages = maxPeftCachePages - claimedPeftPages;
+
+        auto pendingDisGenInitRequestsSortedByAgentTree
+            = agent_tree::sortRequestsByAgentTree(mAgentTreeRoot, pendingDisGenInitRequests);
+
+        // Debug printing controlled by environment variable DEBUG_AGENT_HIERARCHY
+        auto printAgentHierarchy = [](RequestVector const& reqVec, std::string const& name)
+        {
+            if (!isAgentHierarchyDebugEnabled())
+            {
+                return;
+            }
+            std::cout << name << " nodeIds: ";
+            for (auto const& req : reqVec)
+            {
+                if (req->getAgentHierarchy().has_value())
+                {
+                    auto const& agentHierarchy = req->getAgentHierarchy().value();
+                    for (auto const& [nodeType, nodeId] : agentHierarchy)
+                    {
+                        std::cout << nodeId << " ";
+                    }
+                }
+            }
+            std::cout << std::endl;
+        };
+        printAgentHierarchy(pendingRequests, "before sorting");
+        auto pendingRequestsSortedByAgentTree = agent_tree::sortRequestsByAgentTree(mAgentTreeRoot, pendingRequests);
+        printAgentHierarchy(pendingRequestsSortedByAgentTree, "after sorting");
 
         // Loop over pending requests and add them if they can be scheduled
         // Start by trying to include disagg generation init requests
-        for (auto const& requests : {pendingDisGenInitRequests, pendingRequests})
+        for (auto const& requests : {pendingDisGenInitRequestsSortedByAgentTree, pendingRequestsSortedByAgentTree})
         {
             for (auto const& req : requests)
             {
@@ -460,7 +505,8 @@ bool trySchedulingRequestMaxUtilization(std::shared_ptr<LlmRequest> const& req, 
 
 CapacityScheduler::CapacityScheduler(SizeType32 maxNumRequests,
     executor::CapacitySchedulerPolicy capacitySchedulerPolicy, bool hasKvCacheManager, bool twoStepsLookAhead,
-    LlmRequestState noScheduleUntilState, LlmRequestState noScheduleAfterState)
+    LlmRequestState noScheduleUntilState, LlmRequestState noScheduleAfterState, float agentPercentage,
+    std::optional<std::vector<std::string>> agentTypes)
 {
     if (!hasKvCacheManager)
     {
@@ -473,7 +519,8 @@ CapacityScheduler::CapacityScheduler(SizeType32 maxNumRequests,
     }
     else if (capacitySchedulerPolicy == executor::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT)
     {
-        mScheduler = GuaranteedNoEvictScheduler{maxNumRequests, noScheduleUntilState, noScheduleAfterState};
+        mScheduler = GuaranteedNoEvictScheduler{
+            maxNumRequests, noScheduleUntilState, noScheduleAfterState, agentPercentage, std::move(agentTypes)};
     }
     else if (capacitySchedulerPolicy == executor::CapacitySchedulerPolicy::kSTATIC_BATCH)
     {
