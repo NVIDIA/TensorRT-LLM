@@ -1,4 +1,5 @@
 import copy
+import gc
 import importlib
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -687,6 +688,9 @@ def create_py_executor(
 
         with allocation_scope(ExecutorMemoryType.EXTRA_RESOURCES,
                               RestoreMode.PINNED):
+
+            # run gc.collect() to free memory of the previous py_executor, avoid cudaFree overlap with cuda graph capture
+            gc.collect()
             py_executor = create_py_executor_instance(
                 dist=dist,
                 resources=resources,
