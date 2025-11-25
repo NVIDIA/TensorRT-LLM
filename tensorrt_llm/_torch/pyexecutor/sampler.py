@@ -616,7 +616,7 @@ class TorchSampler(Sampler):
         max_num_sequences: int
         max_beam_width: int
         max_total_draft_tokens: int
-        disable_flash_infer_sampling: bool = False
+        disable_flashinfer_sampling: bool = False
 
     def __init__(self, args: Args):
         self.max_seq_len = args.max_seq_len
@@ -652,7 +652,7 @@ class TorchSampler(Sampler):
             }
 
         self._grouped_sampler_cls: Type[GroupedStrategySampler]
-        if IS_FLASHINFER_AVAILABLE and not args.disable_flash_infer_sampling:
+        if IS_FLASHINFER_AVAILABLE and not args.disable_flashinfer_sampling:
             from .sampling_utils_flashinfer import FlashInferGroupedStrategySampler
 
             self._grouped_sampler_cls = FlashInferGroupedStrategySampler
