@@ -44,7 +44,8 @@ class Result(GenerationResultBase):
 
 DuckLLM = namedtuple('DuckLLM', ['args', 'tokenizer', 'generate_async'])
 
-DEFAULT_TEST_TIMEOUT = 1800
+# TODO: Change back to 1800 when the disaggregated serving test slowdown issue is resolved.
+DEFAULT_TEST_TIMEOUT = 3600
 DEFAULT_SERVER_WAITING_TIMEOUT = 3600
 
 
@@ -145,6 +146,7 @@ def launch_disaggregated_llm(
 
     for i, port in enumerate(ctx_ports):
         env_ctx = os.environ.copy()
+        env_ctx["TRTLLM_USE_UCX_KVCACHE"] = "1"
         gpu_range = range(current_gpu_offset,
                           current_gpu_offset + ctx_total_gpus)
         env_ctx["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_range))
@@ -165,6 +167,7 @@ def launch_disaggregated_llm(
 
     for i, port in enumerate(gen_ports):
         env_gen = os.environ.copy()
+        env_ctx["TRTLLM_USE_UCX_KVCACHE"] = "1"
         gpu_range = range(current_gpu_offset,
                           current_gpu_offset + gen_total_gpus)
         env_gen["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_range))
@@ -1102,15 +1105,12 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             },
             "enable_chunked_prefill": True,
             "max_num_tokens": 256,
-            "max_batch_size":
-            1,  # max_batch_size=1 will stabilize the accuracy test result at a cost of speed
         }
         gen_server_config = {
             "cuda_graph_config": None,
             "cache_transceiver_config": {
                 "backend": "DEFAULT"
-            },
-            "max_batch_size": 1,
+            }
         }
         disaggregated_server_config = {
             "hostname": "localhost",

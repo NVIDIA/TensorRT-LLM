@@ -166,14 +166,8 @@ class NemotronHMamba2Mixer(nn.Module):
 
         # 1. Gated MLP's linear projection
         projected_states = self.in_proj(input_states)
-        d_mlp = (
-            projected_states.shape[-1]
-            - 2 * self.intermediate_size
-            - 2 * self.n_groups * self.ssm_state_size
-            - self.num_heads
-        ) // 2
-        _, _, gate, hidden_states_B_C, dt = projected_states.split(
-            [d_mlp, d_mlp, self.intermediate_size, self.conv_dim, self.num_heads], dim=-1
+        gate, hidden_states_B_C, dt = projected_states.split(
+            [self.intermediate_size, self.conv_dim, self.num_heads], dim=-1
         )
 
         # 2. Convolution sequence transformation
@@ -550,4 +544,4 @@ class NemotronHForCausalLM(NemotronHPreTrainedModel, GenerationMixin):
 
 
 # TODO: uncomment after removing patches (and make sure it is imported in `__init__.py`).
-# AutoModelForCausalLMFactory.register_custom_model_cls("nemotron_h", NemotronHForCausalLM)
+# AutoModelForCausalLMFactory.register_custom_model_cls("NemotronHConfig", NemotronHForCausalLM)
