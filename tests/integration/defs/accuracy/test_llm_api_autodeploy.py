@@ -181,6 +181,10 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
                     "sharding_source": ['factory', 'heuristic'],
                     "sharding_dims": ['ep', 'bmm'],
                 },
+                "multi_stream_moe": {
+                    "stage": "compile",
+                    "enabled": True,
+                },
                 # NOTE: some accuracy benchmarks may require fp32 precision for mamba cache
                 # "insert_cached_ssm_attention": {
                 #     "cache_config": {
