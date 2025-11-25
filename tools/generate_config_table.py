@@ -30,9 +30,13 @@ def generate_rst(yaml_path, output_file=None):
     sorted_models = sorted(model_groups.keys())
 
     for model in sorted_models:
+        lines.append(f".. start-{model}")
+        lines.append("")
         # Section Header for Model
+        lines.append(f".. _{model}:")
+        lines.append("")
         lines.append(model)
-        lines.append("=" * len(model))
+        lines.append("^" * len(model))
         lines.append("")
 
         # Table Header
@@ -98,14 +102,20 @@ def generate_rst(yaml_path, output_file=None):
                 full_config_path = os.path.join("tensorrt_llm/configure", config_path)
                 command = f"trtllm-serve {model} --extra_llm_api_options {full_config_path}"
 
+                config_filename = os.path.basename(full_config_path)
+                github_url = f"https://github.com/NVIDIA/TensorRT-LLM/blob/main/{full_config_path}"
+                config_link = f"`{config_filename} <{github_url}>`_"
+
                 lines.append(f"   * - {gpu}")
                 lines.append(f"     - {profile}")
                 lines.append(f"     - {isl} / {osl}")
                 lines.append(f"     - {conc}")
-                lines.append(f"     - {full_config_path}")
+                lines.append(f"     - {config_link}")
                 lines.append(f"     - ``{command}``")
 
         lines.append("")  # Space between tables
+        lines.append(f".. end-{model}")
+        lines.append("")
 
     # Output to file or stdout
     output_text = "\n".join(lines)

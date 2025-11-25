@@ -108,6 +108,16 @@ append: EOF
 ```
 ````
 
+### Pre-configured Scenarios
+
+The following table lists recommended configurations from the comprehensive database for different performance profiles.
+
+```{eval-rst}
+.. include:: comprehensive_table.rst
+   :start-after: .. start-openai/gpt-oss-120b
+   :end-before: .. end-openai/gpt-oss-120b
+```
+
 ### Launch the TensorRT LLM Server
 
 Below is an example command to launch the TensorRT LLM server with the GPT-OSS model from within the container. The command is specifically configured for the 1024/1024 Input/Output Sequence Length test. The explanation of each flag is shown in the “LLM API Options (YAML Configuration)” section.
