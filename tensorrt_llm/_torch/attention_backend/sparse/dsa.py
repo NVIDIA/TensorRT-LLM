@@ -334,30 +334,38 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             pin_memory=True,
         )
 
-        self.ctx_cached_token_indptr = self.get_empty(
-            self.cuda_graph_buffers,
-            (self.max_num_requests + 1, ),
-            cache_name="ctx_cached_token_indptr",
-            dtype=torch.int64,
-            capture_graph=capture_graph,
-        )
-        self.host_ctx_cached_token_indptr = torch.zeros_like(
-            self.ctx_cached_token_indptr,
-            device='cpu',
-            pin_memory=True,
-        )
-        self.ctx_kv_indptr = self.get_empty(
-            self.cuda_graph_buffers,
-            (self.max_num_requests + 1, ),
-            cache_name="ctx_kv_indptr",
-            dtype=torch.int64,
-            capture_graph=capture_graph,
-        )
-        self.host_ctx_kv_indptr = torch.zeros_like(
-            self.ctx_kv_indptr,
-            device='cpu',
-            pin_memory=True,
-        )
+        if not self.enable_context_mla_with_cached_kv:
+            self.ctx_cached_token_indptr = self.get_empty(
+                self.cuda_graph_buffers,
+                (self.max_num_requests + 1, ),
+                cache_name="ctx_cached_token_indptr",
+                dtype=torch.int64,
+                capture_graph=capture_graph,
+            )
+            self.host_ctx_cached_token_indptr = torch.zeros_like(
+                self.ctx_cached_token_indptr,
+                device='cpu',
+                pin_memory=True,
+            )
+            self.ctx_kv_indptr = self.get_empty(
+                self.cuda_graph_buffers,
+                (self.max_num_requests + 1, ),
+                cache_name="ctx_kv_indptr",
+                dtype=torch.int64,
+                capture_graph=capture_graph,
+            )
+            self.host_ctx_kv_indptr = torch.zeros_like(
+                self.ctx_kv_indptr,
+                device='cpu',
+                pin_memory=True,
+            )
+
+        # Only when MLA chunked prefill is enabled, we need to gather the full KV for indexer's logit computation.
+        # These buffers will be allocated dynamically in Indexer.prepare() based on actual total_kv_len to save memory.
+        if self.enable_context_mla_with_cached_kv:
+            self.slot_mapping_fp8_fullkv = None
+            self.slot_mapping_scale_fullkv = None
+
         # New generation buffers for dsa
         self.gen_cached_token_indptr = self.get_empty(
             self.cuda_graph_buffers,
@@ -974,26 +982,34 @@ class Indexer(nn.Module):
         for req_idx, req_id in enumerate(request_ids):
             num_tokens = seq_lens[req_idx].item()
             start_pos = start_positions[req_idx].item()
-            # Compute slots for each token in this request
-            for local_token_idx in range(num_tokens):
-                global_pos = start_pos + local_token_idx
-                block_idx_in_seq = global_pos // tokens_per_block
-                pos_in_block = global_pos % tokens_per_block
-                # Get physical block ID
-                if block_idx_in_seq < metadata.host_indexer_k_cache_block_offsets.shape[
-                        1]:
-                    block_id = metadata.host_indexer_k_cache_block_offsets[
-                        req_idx, block_idx_in_seq].item()
-                    if block_id >= 0:
-                        # Flat byte index for FP8 data
-                        fp8_flat_idx = block_id * block_stride + pos_in_block * head_dim
-                        metadata.host_slot_mapping_fp8[token_idx] = fp8_flat_idx
+            global_positions = torch.arange(start_pos,
+                                            start_pos + num_tokens,
+                                            dtype=torch.int64,
+                                            device='cpu')
 
-                        # Flat byte index for scale
-                        scale_flat_idx = block_id * block_stride + scale_base_offset + pos_in_block * scale_size
-                        metadata.host_slot_mapping_scale[
-                            token_idx] = scale_flat_idx
-                token_idx += 1
+            block_indices_in_seq = global_positions // tokens_per_block
+            pos_in_blocks = global_positions % tokens_per_block
+
+            max_blocks = metadata.host_indexer_k_cache_block_offsets.shape[1]
+            assert (block_indices_in_seq < max_blocks).all(), \
+                f"Block index out of bounds for req {req_idx}: max={max_blocks}, got indices up to {block_indices_in_seq.max().item()}"
+
+            # Gather block IDs
+            block_ids = metadata.host_indexer_k_cache_block_offsets[
+                req_idx, block_indices_in_seq]
+
+            assert (block_ids >= 0).all(), \
+                f"Unallocated block (block_id < 0) found for req {req_idx} at positions {torch.where(block_ids < 0)[0].tolist()}"
+
+            fp8_flat_indices = block_ids * block_stride + pos_in_blocks * head_dim
+            scale_flat_indices = block_ids * block_stride + scale_base_offset + pos_in_blocks * scale_size
+
+            metadata.host_slot_mapping_fp8[token_idx:token_idx +
+                                           num_tokens] = fp8_flat_indices
+            metadata.host_slot_mapping_scale[token_idx:token_idx +
+                                             num_tokens] = scale_flat_indices
+
+            token_idx += num_tokens
 
         metadata.slot_mapping_fp8[:total_tokens].copy_(
             metadata.host_slot_mapping_fp8[:total_tokens], non_blocking=True)
@@ -1005,37 +1021,50 @@ class Indexer(nn.Module):
         _need_full_kv_gathering = num_contexts > 0 and has_mla_chunked_prefill
         if _need_full_kv_gathering:
             total_kv_len = metadata.host_ctx_kv_indptr[num_contexts].item()
+            total_kv_per_request = seq_lens[:
+                                            num_contexts] + start_positions[:
+                                                                            num_contexts]
             host_slot_mapping_fp8_fullkv = torch.empty(total_kv_len,
-                                                       dtype=torch.int64)
+                                                       dtype=torch.int64,
+                                                       pin_memory=True)
             host_slot_mapping_scale_fullkv = torch.empty(total_kv_len,
-                                                         dtype=torch.int64)
+                                                         dtype=torch.int64,
+                                                         pin_memory=True)
 
             token_idx = 0
             for req_idx in range(num_contexts):  # Only context requests
-                num_new_tokens = seq_lens[req_idx].item()
-                num_cached = start_positions[req_idx].item()
-                total_kv = num_cached + num_new_tokens
+                total_kv = total_kv_per_request[req_idx].item()
+                kv_positions = torch.arange(total_kv,
+                                            dtype=torch.int64,
+                                            device='cpu')
 
-                # Compute slots for ALL KV positions (cached + current ctx tokens) for this request
-                for kv_pos in range(total_kv):
-                    block_idx_in_seq = kv_pos // tokens_per_block
-                    pos_in_block = kv_pos % tokens_per_block
-                    # Get physical block ID
-                    if block_idx_in_seq < metadata.host_indexer_k_cache_block_offsets.shape[
-                            1]:
-                        block_id = metadata.host_indexer_k_cache_block_offsets[
-                            req_idx, block_idx_in_seq].item()
-                        if block_id >= 0:
-                            # Flat byte index for FP8 data
-                            fp8_flat_idx = block_id * block_stride + pos_in_block * head_dim
-                            host_slot_mapping_fp8_fullkv[
-                                token_idx] = fp8_flat_idx
+                block_indices_in_seq = kv_positions // tokens_per_block
+                pos_in_blocks = kv_positions % tokens_per_block
 
-                            # Flat byte index for scale
-                            scale_flat_idx = block_id * block_stride + scale_base_offset + pos_in_block * scale_size
-                            host_slot_mapping_scale_fullkv[
-                                token_idx] = scale_flat_idx
-                    token_idx += 1
+                max_blocks = metadata.host_indexer_k_cache_block_offsets.shape[
+                    1]
+                assert (block_indices_in_seq < max_blocks).all(), \
+                    f"Block index out of bounds for req {req_idx}: max={max_blocks}, got indices up to {block_indices_in_seq.max().item()}"
+
+                # Gather block IDs
+                block_ids = metadata.host_indexer_k_cache_block_offsets[
+                    req_idx, block_indices_in_seq]
+
+                assert (block_ids >= 0).all(), \
+                    f"Unallocated block (block_id < 0) found for req {req_idx} at positions {torch.where(block_ids < 0)[0].tolist()}"
+
+                fp8_flat_indices = block_ids * block_stride + pos_in_blocks * head_dim
+                scale_flat_indices = block_ids * block_stride + scale_base_offset + pos_in_blocks * scale_size
+
+                host_slot_mapping_fp8_fullkv[token_idx:token_idx +
+                                             total_kv] = fp8_flat_indices
+                host_slot_mapping_scale_fullkv[token_idx:token_idx +
+                                               total_kv] = scale_flat_indices
+
+                token_idx += total_kv
+
+            assert token_idx == total_kv_len, \
+                f"host_slot_mapping_fp8_fullkv/host_slot_mapping_scale_fullkv length mismatch: token_idx={token_idx} != total_kv_len={total_kv_len}"
 
             # Store extended mappings for indexer full KV gathering
             metadata.slot_mapping_fp8_fullkv = host_slot_mapping_fp8_fullkv.cuda(

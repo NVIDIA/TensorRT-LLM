@@ -140,7 +140,8 @@ def run_llm(args, sparse_attention_config):
         False,  # sparse attention does not support kv cache reuse now
         free_gpu_memory_fraction=args.kv_cache_fraction,
         dtype=args.kv_cache_dtype,
-        tokens_per_block=64)
+        tokens_per_block=64,
+    )
 
     cuda_graph_config = CudaGraphConfig(
         batch_sizes=args.cuda_graph_batch_sizes,
