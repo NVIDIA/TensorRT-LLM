@@ -4169,7 +4169,7 @@ class TestDeepSeekR1LongBenchV2(LlmapiAccuracyTestHarness):
     def test_fp8_8gpus(self):
         model_dir = f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-0528"
         if not os.path.exists(model_dir):
-            pytest.skip(f"Model directory {original_model_dir} does not exist")
+            pytest.skip(f"Model directory {model_dir} does not exist")
 
         # Configure model settings
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
@@ -4192,7 +4192,7 @@ class TestDeepSeekR1LongBenchV2(LlmapiAccuracyTestHarness):
                               enable_autotuner=True)
 
         # Create LLM instance and evaluate
-        with LLM(temp_dir,
+        with LLM(model_dir,
                  tensor_parallel_size=8,
                  moe_expert_parallel_size=8,
                  max_num_tokens=32000,
@@ -4212,7 +4212,7 @@ class TestDeepSeekR1LongBenchV2(LlmapiAccuracyTestHarness):
     def test_nvfp4_4gpus(self):
         model_dir = f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-0528-FP4"
         if not os.path.exists(model_dir):
-            pytest.skip(f"Model directory {original_model_dir} does not exist")
+            pytest.skip(f"Model directory {model_dir} does not exist")
 
         # Configure model settings (no MOE config for FP4 version)
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
@@ -4232,7 +4232,7 @@ class TestDeepSeekR1LongBenchV2(LlmapiAccuracyTestHarness):
                               enable_autotuner=True)
 
         # Create LLM instance and evaluate
-        with LLM(temp_dir,
+        with LLM(model_dir,
                  tensor_parallel_size=4,
                  moe_expert_parallel_size=4,
                  max_num_tokens=32000,
