@@ -569,14 +569,14 @@ class TrtllmAttentionWrapper:
             self.sparse_attn_offsets,
             self.sparse_attn_indices_block_size,
             self.sparse_mla_topk,
+            self.skip_softmax_threshold,
+            self.skip_softmax_stat,
             cu_q_seqlens,
             cu_kv_seqlens,
             fmha_scheduler_counter,
             mla_bmm1_scale,
             mla_bmm2_scale,
             quant_q_buffer,
-            self.skip_softmax_threshold,
-            self.skip_softmax_stat,
         )
 
         if self.print_skip_softmax_stat:
