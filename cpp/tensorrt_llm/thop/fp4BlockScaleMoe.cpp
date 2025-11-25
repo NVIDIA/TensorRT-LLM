@@ -21,7 +21,6 @@
 #include "tensorrt_llm/thop/thUtils.h"
 #include <ATen/cuda/EmptyTensor.h>
 #include <ATen/ops/index_select.h>
-#include <iostream>
 
 namespace torch_ext
 {

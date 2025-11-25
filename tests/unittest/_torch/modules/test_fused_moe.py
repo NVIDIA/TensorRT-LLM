@@ -1344,20 +1344,6 @@ def test_fused_moe_fp8_blockwise_cute_dsl_multi_gpu(ep_size, routing_method,
             assert r is True
 
 
-def test_fp4_quantize_pad_unpad():
-    INTERMEDIATE_SIZE = 5760
-    HIDDEN_SIZE = 2880
-    weight = torch.randn(
-        (INTERMEDIATE_SIZE, HIDDEN_SIZE), dtype=torch.bfloat16,
-        device="cuda") * 0.05
-
-    from tensorrt_llm._torch.modules.fused_moe.quantization import \
-        _fp4_quantize_pad_unpad
-    weight_nvfp4, global_scale_factor, block_scale_factor = _fp4_quantize_pad_unpad(
-        weight, (1, 1))
-    # Current we don't check anything as this is just used for debugging purpose
-
-
 @skip_pre_blackwell
 @pytest.mark.parametrize("hidden_size, intermediate_size", [(512, 512),
                                                             (2880, 2880)])
@@ -1468,7 +1454,6 @@ def test_fused_moe_nvfp4(dtype, moe_backend, hidden_size, intermediate_size,
             weights[
                 f"{expert_id}.w3.weight_scale"] = w3_sf_block_unswizzled.view(
                     torch.float8_e4m3fn).cuda()
-
             weights[f"{expert_id}.w1.input_scale"] = 1.0 / w1_input_scale
             weights[f"{expert_id}.w2.input_scale"] = 1.0 / w2_input_scale
             weights[f"{expert_id}.w3.input_scale"] = 1.0 / w3_input_scale
@@ -1535,9 +1520,6 @@ def test_fused_moe_nvfp4(dtype, moe_backend, hidden_size, intermediate_size,
             fused_moe.forward(x, router_logits)
 
         output = fused_moe.forward(x, router_logits)
-        print()
-        print("actual", output)
-        print("ref", ref_output)
         check_accuracy(output, ref_output, rtol=0.1, atol=0.1, percent=0.95)
 
         if not test_all_kernels:
@@ -2690,7 +2672,8 @@ class RefGatedMLPFusedMoE(nn.Module):
                 dtype=self.dtype,
                 config=model_config,
                 use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
-                activation=custom_swiglu,
+                activation=custom_swiglu
+                if swiglu_alpha is not None else F.silu,
             ) for _ in range(self.num_experts)
         ])
 
