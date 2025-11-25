@@ -245,8 +245,8 @@ public:
         , mType(type)
         , mStrategy(strategy)
         , mOp(op)
-        , mEps(eps)
         , mIsMNNVLSupported(false)
+        , mEps(eps)
     {
     }
 
@@ -256,8 +256,8 @@ public:
         , mType(type)
         , mStrategy(strategy)
         , mOp(op)
-        , mEps(eps)
         , mIsMNNVLSupported(false)
+        , mEps(eps)
         , mNcclComm(process_group_)
     {
     }
@@ -491,6 +491,7 @@ private:
         NCCLCHECK_THROW(ncclCommCount(comm, &nRanks));
         size_t minRegistrationThreshold = static_cast<size_t>(std::max(0.0, a * nRanks + b)) * input.element_size();
         // Disable window registration if neither NVLink nor MNNVL is supported
+        // TODO replace in NCCL 2.29 with comm query
         if (!mIsNVLINKSupported && !mIsMNNVLSupported)
         {
             minRegistrationThreshold = std::numeric_limits<size_t>::max();
@@ -904,8 +905,8 @@ private:
 
         // 2. Check multicast support
         CUdevice cu_device;
-        auto& cuda_driver = tensorrt_llm::common::CUDADriverWrapper::getInstance();
-        TLLM_CU_CHECK(cuda_driver->cuDeviceGet(&cu_device, device_id));
+        TLLM_CU_CHECK(cuDeviceGet(&cu_device, device_id));
+        auto cuda_driver = tensorrt_llm::common::CUDADriverWrapper::getInstance();
 
         int multicast_supported = 0;
         TLLM_CU_CHECK(cuda_driver->cuDeviceGetAttribute(
@@ -1139,18 +1140,16 @@ private:
                            },
                            [&](c10::intrusive_ptr<c10d::ProcessGroup>& torchPg)
                            {
-                               // For ProcessGroup, use allgather
-                               // Create a sub-group for the ranks in mGroup
-                               std::vector<int> group_ranks(mGroup.begin(), mGroup.end());
-                               auto group_pg = torchPg->newGroup(group_ranks);
-                               if (group_pg)
+                               // For ProcessGroup, use allgather directly
+                               // Note: This assumes the ProcessGroup is already set up for the correct group
+                               std::vector<torch::Tensor> input_tensors
+                                   = {torch::tensor({local_mnnvl_status}, torch::kInt32)};
+                               std::vector<std::vector<torch::Tensor>> output_tensors(1);
+                               output_tensors[0].resize(mGroup.size());
+                               auto work = torchPg->allgather(output_tensors, input_tensors);
+                               if (work)
                                {
-                                   std::vector<torch::Tensor> input_tensors
-                                       = {torch::tensor({local_mnnvl_status}, torch::kInt32)};
-                                   std::vector<std::vector<torch::Tensor>> output_tensors(1);
-                                   output_tensors[0].resize(mGroup.size());
-                                   group_pg->allgather(output_tensors, input_tensors)->wait();
-
+                                   work->wait();
                                    for (size_t i = 0; i < mGroup.size(); ++i)
                                    {
                                        all_mnnvl_status[i] = output_tensors[0][i].item<int>();
