@@ -242,10 +242,12 @@ public:
     AllreduceOp(
         std::set<int> group, nvinfer1::DataType type, AllReduceStrategyType strategy, AllReduceFusionOp op, float eps)
         : mGroup(std::move(group))
+        , mIsNVLINKSupported(false)
+        , mIsP2PSupported(false)
+        , mIsMNNVLSupported(false)
         , mType(type)
         , mStrategy(strategy)
         , mOp(op)
-        , mIsMNNVLSupported(false)
         , mEps(eps)
     {
     }
@@ -253,10 +255,12 @@ public:
     AllreduceOp(std::set<int> group, c10::intrusive_ptr<c10d::ProcessGroup> const& process_group_,
         nvinfer1::DataType type, AllReduceStrategyType strategy, AllReduceFusionOp op, float eps)
         : mGroup(std::move(group))
+        , mIsNVLINKSupported(false)
+        , mIsP2PSupported(false)
+        , mIsMNNVLSupported(false)
         , mType(type)
         , mStrategy(strategy)
         , mOp(op)
-        , mIsMNNVLSupported(false)
         , mEps(eps)
         , mNcclComm(process_group_)
     {
@@ -1109,20 +1113,9 @@ private:
             std::visit(overloaded{[&](std::shared_ptr<ncclComm_t>& comm_ptr)
                            {
                                // For NCCL comm, use MPI to gather status
-                               // Map group ranks to positions
-                               std::vector<int> group_ranks(mGroup.begin(), mGroup.end());
-                               int my_group_pos = 0;
-                               for (size_t i = 0; i < group_ranks.size(); ++i)
-                               {
-                                   if (group_ranks[i] == rank)
-                                   {
-                                       my_group_pos = i;
-                                       break;
-                                   }
-                               }
-
                                // Use MPI allgather to collect MNNVL status
                                // Create a sub-communicator for the group
+                               std::vector<int> group_ranks(mGroup.begin(), mGroup.end());
                                MPI_Group world_group, new_group;
                                MPI_Comm group_comm;
                                MPI_Comm_group(COMM_SESSION, &world_group);
