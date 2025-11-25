@@ -291,7 +291,6 @@ def shard_weight_tensor(
     min_local_shape: int = 1,
     fused_weight_dims: Optional[list] = None,
     requires_grad: bool = False,
-    update_param: bool = True,
     custom_shard_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Size]:
     """Shard a weight tensor across ranks and register load hook.
@@ -307,7 +306,6 @@ def shard_weight_tensor(
         fused_weight_dims: List of dimensions for fused weights
         custom_shard_fn: Optional custom function to shard the tensor
         requires_grad: Whether the parameter should require gradients
-        update_param: Whether to update the parameter in the module
 
     Returns:
         Tuple of (sharded_tensor, sharded_shape)
@@ -366,11 +364,10 @@ def shard_weight_tensor(
     )
 
     # Update the parameter in the module
-    if update_param:
-        modname, _, param_name = param_key.rpartition(".")
-        submod = gm.get_submodule(modname)
-        param_new = nn.Parameter(sharded_weight.detach().clone(), requires_grad=requires_grad)
-        setattr(submod, param_name, param_new)
+    modname, _, param_name = param_key.rpartition(".")
+    submod = gm.get_submodule(modname)
+    param_new = nn.Parameter(sharded_weight.detach().clone(), requires_grad=requires_grad)
+    setattr(submod, param_name, param_new)
 
     return sharded_weight, sharded_shape
 
@@ -1147,16 +1144,26 @@ def _insert_sharded_moe(
 
     # if tp_size > 1, we do 2D EP+TP sharding.
     # we add TP sharding of all expert weights.
-    # for w1 in w1_list_sharded:
-    #     shard_weight_tensor(
-    #         gm=gm,
-    #         weight_tensor=w1,
-    #         param_key=weight_key,
-    #         dim=ShardingDimension.COLUMN,
-    #         rank=tp_rank,
-    #         world_size=tp_size,
-    #         min_local_shape=1,
-    #     )
+    for w_up in w1_list_sharded + w2_list_sharded:
+        shard_weight_tensor(
+            gm=gm,
+            weight_tensor=gm.get_parameter(w_up.target),
+            param_key=w_up.target,
+            dim=SplitDimension.COLUMN,
+            rank=tp_rank,
+            world_size=tp_size,
+        )
+    # here we don't need to add all-reduce: it's enough to have
+    # just one all-reduce after the whole EP+TP sharded MoE node.
+    for w_down in w3_list_sharded:
+        shard_weight_tensor(
+            gm=gm,
+            weight_tensor=gm.get_parameter(w_down.target),
+            param_key=w_down.target,
+            dim=SplitDimension.ROW,
+            rank=tp_rank,
+            world_size=tp_size,
+        )
 
     # -- Update args --
     args[1] = selected_experts_local
